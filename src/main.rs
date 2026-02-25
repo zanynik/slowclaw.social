@@ -307,6 +307,7 @@ Examples:
   zeroclaw cron list
   zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
   zeroclaw cron add '*/30 * * * *' 'Check system health'
+  zeroclaw cron add '*/15 * * * *' 'workspace-script scripts/sync.sh'
   zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
   zeroclaw cron add-every 60000 'Ping heartbeat'
   zeroclaw cron once 30m 'Run backup in 30 minutes'

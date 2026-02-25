@@ -3,6 +3,7 @@ use crate::cron::{
     next_run_for_schedule, schedule_cron_expression, validate_schedule, CronJob, CronJobPatch,
     CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
+use crate::security::SecurityPolicy;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
@@ -11,6 +12,31 @@ use uuid::Uuid;
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
+
+fn default_delivery_config_for_fork() -> DeliveryConfig {
+    let has_pocketbase = std::env::var("ZEROCLAW_POCKETBASE_URL")
+        .ok()
+        .or_else(|| std::env::var("POCKETBASE_URL").ok())
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+
+    if has_pocketbase {
+        let collection = std::env::var("ZEROCLAW_POCKETBASE_COLLECTION")
+            .ok()
+            .or_else(|| std::env::var("POCKETBASE_COLLECTION").ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "cron_runs".to_string());
+        DeliveryConfig {
+            mode: "pocketbase".to_string(),
+            channel: None,
+            to: Some(collection),
+            best_effort: true,
+        }
+    } else {
+        DeliveryConfig::default()
+    }
+}
 
 impl rusqlite::types::FromSql for JobType {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
@@ -33,6 +59,14 @@ pub fn add_shell_job(
     schedule: Schedule,
     command: &str,
 ) -> Result<CronJob> {
+    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    if !security.is_command_allowed(command) {
+        anyhow::bail!("Command not allowed by security policy: {command}");
+    }
+    if let Some(path) = security.forbidden_path_argument(command) {
+        anyhow::bail!("Command blocked by security policy (forbidden path): {path}");
+    }
+
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
@@ -41,6 +75,7 @@ pub fn add_shell_job(
     let schedule_json = serde_json::to_string(&schedule)?;
 
     let delete_after_run = matches!(schedule, Schedule::At { .. });
+    let default_delivery = default_delivery_config_for_fork();
 
     with_connection(config, |conn| {
         conn.execute(
@@ -54,7 +89,7 @@ pub fn add_shell_job(
                 command,
                 schedule_json,
                 name,
-                serde_json::to_string(&DeliveryConfig::default())?,
+                serde_json::to_string(&default_delivery)?,
                 if delete_after_run { 1 } else { 0 },
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
@@ -84,7 +119,7 @@ pub fn add_agent_job(
     let id = Uuid::new_v4().to_string();
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
-    let delivery = delivery.unwrap_or_default();
+    let delivery = delivery.unwrap_or_else(default_delivery_config_for_fork);
 
     with_connection(config, |conn| {
         conn.execute(

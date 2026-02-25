@@ -2619,41 +2619,23 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         crate::ChannelCommands::List => {
             println!("Channels:");
             println!("  ✅ CLI (always available)");
-            for (channel, configured) in config.channels_config.channels() {
-                println!(
-                    "  {} {}",
-                    if configured { "✅" } else { "❌" },
-                    channel.name()
-                );
-            }
-            if !cfg!(feature = "channel-matrix") {
-                println!(
-                    "  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`)."
-                );
-            }
-            if !cfg!(feature = "channel-lark") {
-                println!(
-                    "  ℹ️ Lark/Feishu channel support is disabled in this build (enable `channel-lark`)."
-                );
-            }
-            println!("\nTo start channels: zeroclaw channel start");
-            println!("To check health:    zeroclaw channel doctor");
-            println!("To configure:      zeroclaw onboard");
+            let _ = config;
+            println!("  🚫 External channel integrations are disabled in this fork.");
+            println!("  ✅ Cron/script scheduling remains available.");
             Ok(())
         }
         crate::ChannelCommands::Add {
             channel_type,
             config: _,
         } => {
-            anyhow::bail!(
-                "Channel type '{channel_type}' — use `zeroclaw onboard` to configure channels"
-            );
+            anyhow::bail!("External channel integrations are disabled in this fork ({channel_type})");
         }
         crate::ChannelCommands::Remove { name } => {
-            anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
+            anyhow::bail!("External channel integrations are disabled in this fork ({name})");
         }
         crate::ChannelCommands::BindTelegram { identity } => {
-            bind_telegram_identity(config, &identity).await
+            let _ = (config, identity);
+            anyhow::bail!("Telegram integration is disabled in this fork")
         }
     }
 }
@@ -2968,6 +2950,11 @@ fn collect_configured_channels(
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
+    let _ = &config;
+    println!("Channel doctor is disabled: external channel integrations were removed in this fork.");
+    println!("Use `zeroclaw cron ...` and PocketBase delivery instead.");
+    return Ok(());
+
     let mut channels = collect_configured_channels(&config, "health check");
 
     if let Some(ref ns) = config.channels_config.nostr {
@@ -3027,6 +3014,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    let _ = &config;
+    crate::health::mark_component_ok("channels");
+    println!("Channel runtime is disabled: external channel integrations were removed in this fork.");
+    return Ok(());
+
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,

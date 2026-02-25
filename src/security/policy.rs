@@ -114,6 +114,7 @@ impl Default for SecurityPolicy {
                 "head".into(),
                 "tail".into(),
                 "date".into(),
+                "workspace-script".into(),
             ],
             forbidden_paths: vec![
                 // System directories (blocked even when workspace_only=false)
@@ -644,7 +645,7 @@ impl SecurityPolicy {
                         "add" | "remove" | "install" | "clean" | "publish"
                     )
                 }),
-                "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
+                "touch" | "mkdir" | "mv" | "cp" | "ln" | "workspace-script" => true,
                 _ => false,
             };
 
@@ -815,6 +816,11 @@ impl SecurityPolicy {
                         || arg == "-c"
                 })
             }
+            "workspace-script" => {
+                // Pseudo-command handled by the cron scheduler. Only supports
+                // `workspace-script <relative-script-path> [args...]`.
+                args.first().is_some_and(|arg| !arg.starts_with('-'))
+            }
             _ => true,
         }
     }
@@ -980,16 +986,9 @@ impl SecurityPolicy {
     }
 
     pub fn resolved_path_violation_message(&self, resolved: &Path) -> String {
-        let guidance = if self.allowed_roots.is_empty() {
-            "Add the directory to [autonomy].allowed_roots (for example: allowed_roots = [\"/absolute/path\"]), or move the file into the workspace."
-        } else {
-            "Add a matching parent directory to [autonomy].allowed_roots, or move the file into the workspace."
-        };
-
         format!(
-            "Resolved path escapes workspace allowlist: {}. {}",
+            "Resolved path escapes workspace boundary: {}. Move the file into the workspace.",
             resolved.display(),
-            guidance
         )
     }
 
@@ -1050,21 +1049,12 @@ impl SecurityPolicy {
         Self {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
-            workspace_only: autonomy_config.workspace_only,
+            // This fork is hard-locked to workspace-only mode.
+            workspace_only: true,
             allowed_commands: autonomy_config.allowed_commands.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
-            allowed_roots: autonomy_config
-                .allowed_roots
-                .iter()
-                .map(|root| {
-                    let expanded = expand_user_path(root);
-                    if expanded.is_absolute() {
-                        expanded
-                    } else {
-                        workspace_dir.join(expanded)
-                    }
-                })
-                .collect(),
+            // Explicit outside-workspace roots are disabled in this fork.
+            allowed_roots: Vec::new(),
             max_actions_per_hour: autonomy_config.max_actions_per_hour,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,

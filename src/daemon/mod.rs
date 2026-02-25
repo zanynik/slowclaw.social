@@ -282,48 +282,17 @@ fn heartbeat_delivery_target(config: &Config) -> Result<Option<(String, String)>
     }
 }
 
-fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
+fn validate_heartbeat_channel_config(_config: &Config, channel: &str) -> Result<()> {
     match channel.to_ascii_lowercase().as_str() {
-        "telegram" => {
-            if config.channels_config.telegram.is_none() {
-                anyhow::bail!(
-                    "heartbeat.target is set to telegram but channels_config.telegram is not configured"
-                );
-            }
-        }
-        "discord" => {
-            if config.channels_config.discord.is_none() {
-                anyhow::bail!(
-                    "heartbeat.target is set to discord but channels_config.discord is not configured"
-                );
-            }
-        }
-        "slack" => {
-            if config.channels_config.slack.is_none() {
-                anyhow::bail!(
-                    "heartbeat.target is set to slack but channels_config.slack is not configured"
-                );
-            }
-        }
-        "mattermost" => {
-            if config.channels_config.mattermost.is_none() {
-                anyhow::bail!(
-                    "heartbeat.target is set to mattermost but channels_config.mattermost is not configured"
-                );
-            }
-        }
+        "pocketbase" => {}
         other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
     }
 
     Ok(())
 }
 
-fn has_supervised_channels(config: &Config) -> bool {
-    config
-        .channels_config
-        .channels_except_webhook()
-        .iter()
-        .any(|(_, ok)| *ok)
+fn has_supervised_channels(_config: &Config) -> bool {
+    false
 }
 
 #[cfg(test)]

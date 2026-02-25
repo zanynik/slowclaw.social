@@ -56,7 +56,7 @@ impl Tool for ScheduleTool {
                 },
                 "command": {
                     "type": "string",
-                    "description": "Shell command to execute. Required for create/add/once."
+                    "description": "Shell command to execute. Required for create/add/once. Use `workspace-script <relative/path>` to run a workspace script directly."
                 },
                 "approved": {
                     "type": "boolean",

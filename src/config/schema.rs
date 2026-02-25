@@ -1965,7 +1965,7 @@ pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised` (default), or `full`.
     pub level: AutonomyLevel,
     /// Restrict absolute filesystem paths to workspace-relative references. Default: `true`.
-    /// Resolved paths outside the workspace still require `allowed_roots`.
+    /// This fork hard-requires `true`.
     pub workspace_only: bool,
     /// Allowlist of executable names permitted for shell execution.
     pub allowed_commands: Vec<String>,
@@ -1999,9 +1999,7 @@ pub struct AutonomyConfig {
     #[serde(default = "default_always_ask")]
     pub always_ask: Vec<String>,
 
-    /// Extra directory roots the agent may read/write outside the workspace.
-    /// Supports absolute, `~/...`, and workspace-relative entries.
-    /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
+    /// Extra directory roots outside the workspace (disabled in this fork).
     #[serde(default)]
     pub allowed_roots: Vec<String>,
 
@@ -2049,6 +2047,7 @@ impl Default for AutonomyConfig {
                 "head".into(),
                 "tail".into(),
                 "date".into(),
+                "workspace-script".into(),
             ],
             forbidden_paths: vec![
                 "/etc".into(),
@@ -4236,6 +4235,16 @@ impl Config {
         if self.autonomy.max_actions_per_hour == 0 {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
         }
+        if !self.autonomy.workspace_only {
+            anyhow::bail!(
+                "autonomy.workspace_only=false is not supported in this workspace-only fork"
+            );
+        }
+        if !self.autonomy.allowed_roots.is_empty() {
+            anyhow::bail!(
+                "autonomy.allowed_roots is disabled in this workspace-only fork; keep it empty"
+            );
+        }
         for (i, env_name) in self.autonomy.shell_env_passthrough.iter().enumerate() {
             if !is_valid_env_var_name(env_name) {
                 anyhow::bail!(
@@ -4287,6 +4296,17 @@ impl Config {
         }
         if self.scheduler.max_tasks == 0 {
             anyhow::bail!("scheduler.max_tasks must be greater than 0");
+        }
+
+        if self
+            .channels_config
+            .channels()
+            .iter()
+            .any(|(_, configured)| *configured)
+        {
+            anyhow::bail!(
+                "External channel integrations (Telegram/Discord/Slack/etc. and webhook) are disabled in this fork"
+            );
         }
 
         // Model routes

@@ -1,13 +1,10 @@
-use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
-};
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
 use std::process::Stdio;
@@ -283,90 +280,227 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
-    if !delivery.mode.eq_ignore_ascii_case("announce") {
+    let mode = delivery.mode.trim();
+    if mode.is_empty() || mode.eq_ignore_ascii_case("none") {
         return Ok(());
     }
 
-    let channel = delivery
-        .channel
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for announce mode"))?;
-    let target = delivery
-        .to
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+    if mode.eq_ignore_ascii_case("announce") {
+        anyhow::bail!(
+            "delivery.mode='announce' is disabled in this fork (channel integrations removed); use delivery.mode='pocketbase'"
+        );
+    }
 
-    deliver_announcement(config, channel, target, output).await
+    if mode.eq_ignore_ascii_case("pocketbase") {
+        let collection = delivery
+            .to
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("cron_runs");
+        return deliver_pocketbase_cron_record(config, job, output, collection).await;
+    }
+
+    anyhow::bail!("unsupported delivery mode: {mode}")
 }
 
 pub(crate) async fn deliver_announcement(
-    config: &Config,
+    _config: &Config,
     channel: &str,
     target: &str,
     output: &str,
 ) -> Result<()> {
     match channel.to_ascii_lowercase().as_str() {
-        "telegram" => {
-            let tg = config
-                .channels_config
-                .telegram
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
-            let channel = TelegramChannel::new(
-                tg.bot_token.clone(),
-                tg.allowed_users.clone(),
-                tg.mention_only,
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
-        }
-        "discord" => {
-            let dc = config
-                .channels_config
-                .discord
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
-            let channel = DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
-        }
-        "slack" => {
-            let sl = config
-                .channels_config
-                .slack
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
-            let channel = SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.channel_id.clone(),
-                sl.allowed_users.clone(),
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
-        }
-        "mattermost" => {
-            let mm = config
-                .channels_config
-                .mattermost
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
-            let channel = MattermostChannel::new(
-                mm.url.clone(),
-                mm.bot_token.clone(),
-                mm.channel_id.clone(),
-                mm.allowed_users.clone(),
-                mm.thread_replies.unwrap_or(true),
-                mm.mention_only.unwrap_or(false),
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
+        "pocketbase" => {
+            let payload = serde_json::json!({
+                "source": "zeroclaw-heartbeat",
+                "output": output,
+                "created_at": Utc::now().to_rfc3339(),
+            });
+            post_pocketbase_record(target, payload).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
 
     Ok(())
+}
+
+async fn deliver_pocketbase_cron_record(
+    config: &Config,
+    job: &CronJob,
+    output: &str,
+    collection: &str,
+) -> Result<()> {
+    let payload = serde_json::json!({
+        "source": "zeroclaw-cron",
+        "job_id": job.id.clone(),
+        "job_name": job.name.clone(),
+        "job_type": match &job.job_type {
+            JobType::Shell => "shell",
+            JobType::Agent => "agent",
+        },
+        "command": if job.command.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(job.command.clone()) },
+        "prompt": job.prompt.clone(),
+        "schedule": serde_json::to_value(&job.schedule).unwrap_or(serde_json::Value::Null),
+        "workspace": config.workspace_dir.display().to_string(),
+        "output": output,
+        "created_at": Utc::now().to_rfc3339(),
+    });
+    post_pocketbase_record(collection, payload).await
+}
+
+fn pocketbase_base_url() -> Result<String> {
+    let raw = std::env::var("ZEROCLAW_POCKETBASE_URL")
+        .or_else(|_| std::env::var("POCKETBASE_URL"))
+        .context("PocketBase URL not configured (set ZEROCLAW_POCKETBASE_URL or POCKETBASE_URL)")?;
+    let trimmed = raw.trim().trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        anyhow::bail!("PocketBase URL is empty");
+    }
+    Ok(trimmed)
+}
+
+fn pocketbase_token() -> Option<String> {
+    std::env::var("ZEROCLAW_POCKETBASE_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("POCKETBASE_TOKEN").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn post_pocketbase_record(collection: &str, payload: serde_json::Value) -> Result<()> {
+    let base_url = pocketbase_base_url()?;
+    let collection = collection.trim();
+    if collection.is_empty() {
+        anyhow::bail!("PocketBase collection is required");
+    }
+
+    let url = format!("{base_url}/api/collections/{collection}/records");
+    let client = reqwest::Client::new();
+    let mut request = client.post(url).json(&payload);
+    if let Some(token) = pocketbase_token() {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request
+        .send()
+        .await
+        .context("PocketBase request failed")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("PocketBase write failed ({status}): {}", body.trim());
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceScriptInvocation {
+    rel_path: String,
+    args: Vec<String>,
+}
+
+fn parse_workspace_script_invocation(command: &str) -> Result<Option<WorkspaceScriptInvocation>> {
+    let trimmed = command.trim();
+    if !trimmed.starts_with("workspace-script") {
+        return Ok(None);
+    }
+    if trimmed.contains("&&")
+        || trimmed.contains("||")
+        || trimmed.contains(';')
+        || trimmed.contains('|')
+        || trimmed.contains('\n')
+    {
+        anyhow::bail!("workspace-script does not support command chaining");
+    }
+
+    let parts: Vec<String> = trimmed.split_whitespace().map(ToString::to_string).collect();
+    if parts.first().map(String::as_str) != Some("workspace-script") {
+        return Ok(None);
+    }
+    if parts.len() < 2 {
+        anyhow::bail!("workspace-script requires a relative script path");
+    }
+
+    Ok(Some(WorkspaceScriptInvocation {
+        rel_path: parts[1].clone(),
+        args: parts[2..].to_vec(),
+    }))
+}
+
+async fn run_workspace_script_with_timeout(
+    config: &Config,
+    security: &SecurityPolicy,
+    invocation: WorkspaceScriptInvocation,
+    timeout: Duration,
+) -> (bool, String) {
+    let candidate = config.workspace_dir.join(&invocation.rel_path);
+    let resolved = match candidate.canonicalize() {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                false,
+                format!(
+                    "workspace-script path error ({}): {e}",
+                    candidate.display()
+                ),
+            );
+        }
+    };
+
+    if !security.is_resolved_path_allowed(&resolved) {
+        return (false, security.resolved_path_violation_message(&resolved));
+    }
+    if !resolved.is_file() {
+        return (
+            false,
+            format!("workspace-script target is not a file: {}", resolved.display()),
+        );
+    }
+
+    let child = match Command::new(&resolved)
+        .args(&invocation.args)
+        .current_dir(&config.workspace_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return (
+                false,
+                format!(
+                    "workspace-script spawn error ({}): {e}",
+                    resolved.display()
+                ),
+            );
+        }
+    };
+
+    match time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let combined = format!(
+                "status={}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                stdout.trim(),
+                stderr.trim()
+            );
+            (output.status.success(), combined)
+        }
+        Ok(Err(e)) => (false, format!("workspace-script wait error: {e}")),
+        Err(_) => (
+            false,
+            format!(
+                "workspace-script timed out after {}s",
+                timeout.as_secs_f64()
+            ),
+        ),
+    }
 }
 
 async fn run_job_command(
@@ -425,6 +559,14 @@ async fn run_job_command_with_timeout(
             false,
             "blocked by security policy: action budget exhausted".to_string(),
         );
+    }
+
+    match parse_workspace_script_invocation(&job.command) {
+        Ok(Some(invocation)) => {
+            return run_workspace_script_with_timeout(config, security, invocation, timeout).await;
+        }
+        Ok(None) => {}
+        Err(e) => return (false, format!("invalid workspace-script invocation: {e}")),
     }
 
     let child = match Command::new("sh")
@@ -995,7 +1137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_if_configured_handles_none_and_invalid_channel() {
+    async fn deliver_if_configured_handles_none_and_disabled_announce_mode() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let mut job = test_job("echo ok");
@@ -1004,11 +1146,11 @@ mod tests {
 
         job.delivery = DeliveryConfig {
             mode: "announce".into(),
-            channel: Some("invalid".into()),
+            channel: Some("telegram".into()),
             to: Some("target".into()),
             best_effort: true,
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
-        assert!(err.to_string().contains("unsupported delivery channel"));
+        assert!(err.to_string().contains("delivery.mode='announce' is disabled"));
     }
 }

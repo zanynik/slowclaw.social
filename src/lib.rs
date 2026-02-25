@@ -190,7 +190,8 @@ timezone name to override.
 
 Examples:
   zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  zeroclaw cron add '*/30 * * * *' 'Check system health'")]
+  zeroclaw cron add '*/30 * * * *' 'Check system health'
+  zeroclaw cron add '*/15 * * * *' 'workspace-script scripts/sync.sh'")]
     Add {
         /// Cron expression
         expression: String,
