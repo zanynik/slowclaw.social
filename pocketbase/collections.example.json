@@ -1,0 +1,117 @@
+[
+  {
+    "name": "drafts",
+    "type": "base",
+    "fields": [
+      { "name": "text", "type": "text", "required": false },
+      { "name": "videoName", "type": "text", "required": false },
+      { "name": "createdAtClient", "type": "text", "required": false },
+      { "name": "updatedAtClient", "type": "text", "required": false }
+    ],
+    "listRule": "",
+    "viewRule": "",
+    "createRule": "",
+    "updateRule": "",
+    "deleteRule": ""
+  },
+  {
+    "name": "post_history",
+    "type": "base",
+    "fields": [
+      { "name": "provider", "type": "text", "required": true },
+      { "name": "text", "type": "text", "required": false },
+      { "name": "videoName", "type": "text", "required": false },
+      { "name": "uri", "type": "text", "required": false },
+      { "name": "cid", "type": "text", "required": false },
+      { "name": "status", "type": "text", "required": true },
+      { "name": "error", "type": "text", "required": false },
+      { "name": "createdAtClient", "type": "text", "required": false }
+    ],
+    "listRule": "",
+    "viewRule": "",
+    "createRule": "",
+    "updateRule": "",
+    "deleteRule": ""
+  },
+  {
+    "name": "chat_messages",
+    "type": "base",
+    "fields": [
+      { "name": "threadId", "type": "text", "required": true },
+      { "name": "role", "type": "text", "required": true },
+      { "name": "content", "type": "text", "required": false },
+      { "name": "status", "type": "text", "required": true },
+      { "name": "source", "type": "text", "required": false },
+      { "name": "replyToId", "type": "text", "required": false },
+      { "name": "error", "type": "text", "required": false },
+      { "name": "createdAtClient", "type": "text", "required": false },
+      { "name": "processedAt", "type": "text", "required": false }
+    ],
+    "listRule": "",
+    "viewRule": "",
+    "createRule": "",
+    "updateRule": "",
+    "deleteRule": ""
+  },
+  {
+    "name": "journal_entries",
+    "type": "base",
+    "fields": [
+      { "name": "title", "type": "text", "required": false },
+      { "name": "entryType", "type": "text", "required": true },
+      { "name": "source", "type": "text", "required": false },
+      { "name": "status", "type": "text", "required": false },
+      { "name": "workspacePath", "type": "text", "required": true },
+      { "name": "previewText", "type": "text", "required": false },
+      { "name": "textBody", "type": "text", "required": false },
+      { "name": "tagsCsv", "type": "text", "required": false },
+      { "name": "createdAtClient", "type": "text", "required": false }
+    ],
+    "listRule": "",
+    "viewRule": "",
+    "createRule": "",
+    "updateRule": "",
+    "deleteRule": ""
+  },
+  {
+    "name": "media_assets",
+    "type": "base",
+    "fields": [
+      { "name": "title", "type": "text", "required": false },
+      { "name": "entryId", "type": "text", "required": false },
+      { "name": "assetType", "type": "text", "required": true },
+      { "name": "mimeType", "type": "text", "required": false },
+      { "name": "source", "type": "text", "required": false },
+      { "name": "status", "type": "text", "required": false },
+      { "name": "workspacePath", "type": "text", "required": true },
+      { "name": "sizeBytes", "type": "text", "required": false },
+      { "name": "createdAtClient", "type": "text", "required": false }
+    ],
+    "listRule": "",
+    "viewRule": "",
+    "createRule": "",
+    "updateRule": "",
+    "deleteRule": ""
+  },
+  {
+    "name": "artifacts",
+    "type": "base",
+    "fields": [
+      { "name": "parentAssetId", "type": "text", "required": false },
+      { "name": "parentEntryId", "type": "text", "required": false },
+      { "name": "artifactType", "type": "text", "required": true },
+      { "name": "title", "type": "text", "required": false },
+      { "name": "status", "type": "text", "required": false },
+      { "name": "mimeType", "type": "text", "required": false },
+      { "name": "workspacePath", "type": "text", "required": true },
+      { "name": "previewText", "type": "text", "required": false },
+      { "name": "metadataJson", "type": "text", "required": false },
+      { "name": "createdAtClient", "type": "text", "required": false }
+    ],
+    "listRule": "",
+    "viewRule": "",
+    "createRule": "",
+    "updateRule": "",
+    "deleteRule": ""
+  }
+]

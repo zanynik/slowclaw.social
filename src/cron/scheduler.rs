@@ -286,9 +286,19 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     }
 
     if mode.eq_ignore_ascii_case("announce") {
-        anyhow::bail!(
-            "delivery.mode='announce' is disabled in this fork (channel integrations removed); use delivery.mode='pocketbase'"
-        );
+        let channel = delivery
+            .channel
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("delivery.channel is required when mode='announce'"))?;
+        let target = delivery
+            .to
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("delivery.to is required when mode='announce'"))?;
+        return deliver_announcement(config, channel, target, output).await;
     }
 
     if mode.eq_ignore_ascii_case("pocketbase") {
@@ -312,12 +322,17 @@ pub(crate) async fn deliver_announcement(
 ) -> Result<()> {
     match channel.to_ascii_lowercase().as_str() {
         "pocketbase" => {
-            let payload = serde_json::json!({
-                "source": "zeroclaw-heartbeat",
-                "output": output,
-                "created_at": Utc::now().to_rfc3339(),
-            });
-            post_pocketbase_record(target, payload).await?;
+            let content = if output.trim().is_empty() {
+                "Scheduled task executed".to_string()
+            } else {
+                output.trim().to_string()
+            };
+            let pb = crate::channels::PocketBaseChannel::from_env_defaults()?;
+            crate::channels::Channel::send(
+                &pb,
+                &crate::channels::SendMessage::new(content, target.to_string()),
+            )
+            .await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -331,8 +346,39 @@ async fn deliver_pocketbase_cron_record(
     output: &str,
     collection: &str,
 ) -> Result<()> {
+    let collection_trimmed = collection.trim();
+    if collection_trimmed.eq_ignore_ascii_case("chat_messages") {
+        let thread_id = job
+            .delivery
+            .channel
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "PocketBase chat delivery requires delivery.channel=<threadId> when delivery.to=chat_messages"
+                )
+            })?;
+        let now = Utc::now().to_rfc3339();
+        let content = if output.trim().is_empty() {
+            "Scheduled task executed".to_string()
+        } else {
+            output.trim().to_string()
+        };
+        let payload = serde_json::json!({
+            "threadId": thread_id,
+            "role": "assistant",
+            "content": content,
+            "status": "done",
+            "source": "slowclaw-cron",
+            "createdAtClient": now.clone(),
+            "processedAt": now,
+        });
+        return post_pocketbase_record("chat_messages", payload).await;
+    }
+
     let payload = serde_json::json!({
-        "source": "zeroclaw-cron",
+        "source": "slowclaw-cron",
         "job_id": job.id.clone(),
         "job_name": job.name.clone(),
         "job_type": match &job.job_type {
@@ -346,13 +392,24 @@ async fn deliver_pocketbase_cron_record(
         "output": output,
         "created_at": Utc::now().to_rfc3339(),
     });
-    post_pocketbase_record(collection, payload).await
+    post_pocketbase_record(collection_trimmed, payload).await
 }
 
 fn pocketbase_base_url() -> Result<String> {
     let raw = std::env::var("ZEROCLAW_POCKETBASE_URL")
         .or_else(|_| std::env::var("POCKETBASE_URL"))
-        .context("PocketBase URL not configured (set ZEROCLAW_POCKETBASE_URL or POCKETBASE_URL)")?;
+        .unwrap_or_else(|_| {
+            let host = std::env::var("ZEROCLAW_POCKETBASE_HOST")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = std::env::var("ZEROCLAW_POCKETBASE_PORT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u16>().ok())
+                .unwrap_or(8090);
+            format!("http://{host}:{port}")
+        });
     let trimmed = raw.trim().trim_end_matches('/').to_string();
     if trimmed.is_empty() {
         anyhow::bail!("PocketBase URL is empty");

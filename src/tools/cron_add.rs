@@ -56,8 +56,8 @@ impl Tool for CronAddTool {
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost), set \
-         delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
+         To deliver output to a channel, set \
+         delivery={\"mode\":\"announce\",\"channel\":\"pocketbase\",\"to\":\"<threadId>\"}. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
 
@@ -77,11 +77,11 @@ impl Tool for CronAddTool {
                 "model": { "type": "string" },
                 "delivery": {
                     "type": "object",
-                    "description": "Delivery config to send job output to a channel. Example: {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}",
+                    "description": "Delivery config to send job output to a channel. Example: {\"mode\":\"announce\",\"channel\":\"pocketbase\",\"to\":\"<threadId>\"}",
                     "properties": {
                         "mode": { "type": "string", "enum": ["none", "announce"], "description": "Set to 'announce' to deliver output to a channel" },
-                        "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost"], "description": "Channel type to deliver to" },
-                        "to": { "type": "string", "description": "Target: Discord channel ID, Telegram chat ID, Slack channel, etc." },
+                        "channel": { "type": "string", "enum": ["pocketbase"], "description": "Channel type to deliver to" },
+                        "to": { "type": "string", "description": "Target thread ID for PocketBase chat_messages" },
                         "best_effort": { "type": "boolean", "description": "If true, delivery failure does not fail the job" }
                     }
                 },

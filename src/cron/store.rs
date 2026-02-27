@@ -14,6 +14,10 @@ const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
 
 fn default_delivery_config_for_fork() -> DeliveryConfig {
+    if let Some(ctx_delivery) = crate::channels::default_cron_delivery_for_current_channel() {
+        return ctx_delivery;
+    }
+
     let has_pocketbase = std::env::var("ZEROCLAW_POCKETBASE_URL")
         .ok()
         .or_else(|| std::env::var("POCKETBASE_URL").ok())

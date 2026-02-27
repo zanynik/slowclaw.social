@@ -28,9 +28,10 @@ impl Tool for ScheduleTool {
 
     fn description(&self) -> &str {
         "Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. \
-         WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. \
-         To send a scheduled message to Discord/Telegram/Slack, use the cron_add tool with job_type='agent' \
-         and a delivery config like {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}."
+         By default, shell job output is logged. When invoked while handling a channel message \
+         (e.g. PocketBase app chat), created jobs inherit a default delivery target back to that channel. \
+         For explicit channel delivery, use the cron_add tool with a delivery config like \
+         {\"mode\":\"announce\",\"channel\":\"pocketbase\",\"to\":\"<threadId>\"}."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

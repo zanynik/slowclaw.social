@@ -17,6 +17,7 @@
 
 pub mod browser;
 pub mod browser_open;
+pub mod audio_to_video;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -57,6 +58,7 @@ pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
+pub use audio_to_video::AudioToVideoTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -226,6 +228,7 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
+        Arc::new(AudioToVideoTool::new(security.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),

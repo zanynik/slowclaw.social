@@ -72,6 +72,8 @@ mod migration;
 mod multimodal;
 mod observability;
 mod onboard;
+mod pocketbase_chat;
+mod pocketbase_sidecar;
 mod peripherals;
 mod providers;
 mod runtime;
@@ -117,12 +119,12 @@ enum EstopLevelArg {
     ToolFreeze,
 }
 
-/// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
+/// `SlowClaw` - Minimal workspace-first social automation.
 #[derive(Parser, Debug)]
-#[command(name = "zeroclaw")]
+#[command(name = "slowclaw")]
 #[command(author = "theonlyhennygod")]
 #[command(version)]
-#[command(about = "The fastest, smallest AI assistant.", long_about = None)]
+#[command(about = "Minimal workspace-only social automation.", long_about = None)]
 struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
@@ -170,10 +172,10 @@ Launches an interactive chat session with the configured AI provider. \
 Use --message for single-shot queries without entering interactive mode.
 
 Examples:
-  zeroclaw agent                              # interactive session
-  zeroclaw agent -m \"Summarize today's logs\"  # single message
-  zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
-  zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
+  slowclaw agent                              # interactive session
+  slowclaw agent -m \"Summarize today's logs\"  # single message
+  slowclaw agent -p anthropic --model claude-sonnet-4-20250514
+  slowclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
     Agent {
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
@@ -196,19 +198,19 @@ Examples:
         peripheral: Vec<String>,
     },
 
-    /// Start the gateway server (webhooks, websockets)
+    /// Start the gateway server (webhooks + static UI)
     #[command(long_about = "\
-Start the gateway server (webhooks, websockets).
+Start the gateway server (webhooks + static UI).
 
-Runs the HTTP/WebSocket gateway that accepts incoming webhook events \
-and WebSocket connections. Bind address defaults to the values in \
+Runs the HTTP gateway that accepts incoming webhook events and serves \
+the bundled web UI. Bind address defaults to the values in \
 your config file (gateway.host / gateway.port).
 
 Examples:
-  zeroclaw gateway                  # use config defaults
-  zeroclaw gateway -p 8080          # listen on port 8080
-  zeroclaw gateway --host 0.0.0.0   # bind to all interfaces
-  zeroclaw gateway -p 0             # random available port")]
+  slowclaw gateway                  # use config defaults
+  slowclaw gateway -p 8080          # listen on port 8080
+  slowclaw gateway --host 0.0.0.0   # bind to all interfaces
+  slowclaw gateway -p 0             # random available port")]
     Gateway {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -223,18 +225,18 @@ Examples:
     #[command(long_about = "\
 Start the long-running autonomous daemon.
 
-Launches the full ZeroClaw runtime: gateway server, all configured \
+Launches the full SlowClaw runtime: gateway server, all configured \
 channels (Telegram, Discord, Slack, etc.), heartbeat monitor, and \
-the cron scheduler. This is the recommended way to run ZeroClaw in \
+the cron scheduler. This is the recommended way to run SlowClaw in \
 production or as an always-on assistant.
 
-Use 'zeroclaw service install' to register the daemon as an OS \
+Use 'slowclaw service install' to register the daemon as an OS \
 service (systemd/launchd) for auto-start on boot.
 
 Examples:
-  zeroclaw daemon                   # use config defaults
-  zeroclaw daemon -p 9090           # gateway on port 9090
-  zeroclaw daemon --host 127.0.0.1  # localhost only")]
+  slowclaw daemon                   # use config defaults
+  slowclaw daemon -p 9090           # gateway on port 9090
+  slowclaw daemon --host 127.0.0.1  # localhost only")]
     Daemon {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -267,19 +269,19 @@ Examples:
     /// Engage, inspect, and resume emergency-stop states.
     ///
     /// Examples:
-    /// - `zeroclaw estop`
-    /// - `zeroclaw estop --level network-kill`
-    /// - `zeroclaw estop --level domain-block --domain "*.chase.com"`
-    /// - `zeroclaw estop --level tool-freeze --tool shell --tool browser`
-    /// - `zeroclaw estop status`
-    /// - `zeroclaw estop resume --network`
-    /// - `zeroclaw estop resume --domain "*.chase.com"`
-    /// - `zeroclaw estop resume --tool shell`
+    /// - `slowclaw estop`
+    /// - `slowclaw estop --level network-kill`
+    /// - `slowclaw estop --level domain-block --domain "*.chase.com"`
+    /// - `slowclaw estop --level tool-freeze --tool shell --tool browser`
+    /// - `slowclaw estop status`
+    /// - `slowclaw estop resume --network`
+    /// - `slowclaw estop resume --domain "*.chase.com"`
+    /// - `slowclaw estop resume --tool shell`
     Estop {
         #[command(subcommand)]
         estop_command: Option<EstopSubcommands>,
 
-        /// Level used when engaging estop from `zeroclaw estop`.
+        /// Level used when engaging estop from `slowclaw estop`.
         #[arg(long, value_enum)]
         level: Option<EstopLevelArg>,
 
@@ -304,15 +306,15 @@ Cron expressions use the standard 5-field format: \
 override with --tz and an IANA timezone name.
 
 Examples:
-  zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  zeroclaw cron add '*/30 * * * *' 'Check system health'
-  zeroclaw cron add '*/15 * * * *' 'workspace-script scripts/sync.sh'
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
-  zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes'
-  zeroclaw cron pause <task-id>
-  zeroclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
+  slowclaw cron list
+  slowclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
+  slowclaw cron add '*/30 * * * *' 'Check system health'
+  slowclaw cron add '*/15 * * * *' 'workspace-script scripts/sync.sh'
+  slowclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
+  slowclaw cron add-every 60000 'Ping heartbeat'
+  slowclaw cron once 30m 'Run backup in 30 minutes'
+  slowclaw cron pause <task-id>
+  slowclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
     Cron {
         #[command(subcommand)]
         cron_command: CronCommands,
@@ -331,16 +333,16 @@ Examples:
     #[command(long_about = "\
 Manage communication channels.
 
-Add, remove, list, and health-check channels that connect ZeroClaw \
+Add, remove, list, and health-check channels that connect SlowClaw \
 to messaging platforms. Supported channel types: telegram, discord, \
 slack, whatsapp, matrix, imessage, email.
 
 Examples:
-  zeroclaw channel list
-  zeroclaw channel doctor
-  zeroclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
-  zeroclaw channel remove my-bot
-  zeroclaw channel bind-telegram zeroclaw_user")]
+  slowclaw channel list
+  slowclaw channel doctor
+  slowclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
+  slowclaw channel remove my-bot
+  slowclaw channel bind-telegram slowclaw_user")]
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
@@ -379,9 +381,9 @@ Enumerate connected USB devices, identify known development boards \
 probe-rs / ST-Link.
 
 Examples:
-  zeroclaw hardware discover
-  zeroclaw hardware introspect /dev/ttyACM0
-  zeroclaw hardware info --chip STM32F401RETx")]
+  slowclaw hardware discover
+  slowclaw hardware introspect /dev/ttyACM0
+  slowclaw hardware info --chip STM32F401RETx")]
     Hardware {
         #[command(subcommand)]
         hardware_command: zeroclaw::HardwareCommands,
@@ -396,11 +398,11 @@ to the agent (GPIO, sensors, actuators). Supported boards: \
 nucleo-f401re, rpi-gpio, esp32, arduino-uno.
 
 Examples:
-  zeroclaw peripheral list
-  zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
-  zeroclaw peripheral add rpi-gpio native
-  zeroclaw peripheral flash --port /dev/cu.usbmodem12345
-  zeroclaw peripheral flash-nucleo")]
+  slowclaw peripheral list
+  slowclaw peripheral add nucleo-f401re /dev/ttyACM0
+  slowclaw peripheral add rpi-gpio native
+  slowclaw peripheral flash --port /dev/cu.usbmodem12345
+  slowclaw peripheral flash-nucleo")]
     Peripheral {
         #[command(subcommand)]
         peripheral_command: zeroclaw::PeripheralCommands,
@@ -415,11 +417,11 @@ Supports filtering by category and session, pagination, and \
 batch clearing with confirmation.
 
 Examples:
-  zeroclaw memory stats
-  zeroclaw memory list
-  zeroclaw memory list --category core --limit 10
-  zeroclaw memory get <key>
-  zeroclaw memory clear --category conversation --yes")]
+  slowclaw memory stats
+  slowclaw memory list
+  slowclaw memory list --category core --limit 10
+  slowclaw memory get <key>
+  slowclaw memory clear --category conversation --yes")]
     Memory {
         #[command(subcommand)]
         memory_command: MemoryCommands,
@@ -427,15 +429,15 @@ Examples:
 
     /// Manage configuration
     #[command(long_about = "\
-Manage ZeroClaw configuration.
+Manage SlowClaw configuration.
 
 Inspect and export configuration settings. Use 'schema' to dump \
 the full JSON Schema for the config file, which documents every \
 available key, type, and default value.
 
 Examples:
-  zeroclaw config schema              # print JSON Schema to stdout
-  zeroclaw config schema > schema.json")]
+  slowclaw config schema              # print JSON Schema to stdout
+  slowclaw config schema > schema.json")]
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
@@ -443,14 +445,14 @@ Examples:
 
     /// Generate shell completion script to stdout
     #[command(long_about = "\
-Generate shell completion scripts for `zeroclaw`.
+Generate shell completion scripts for `slowclaw`.
 
 The script is printed to stdout so it can be sourced directly:
 
 Examples:
-  source <(zeroclaw completions bash)
-  zeroclaw completions zsh > ~/.zfunc/_zeroclaw
-  zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish")]
+  source <(slowclaw completions bash)
+  slowclaw completions zsh > ~/.zfunc/_slowclaw
+  slowclaw completions fish > ~/.config/fish/completions/slowclaw.fish")]
     Completions {
         /// Target shell
         #[arg(value_enum)]
@@ -761,7 +763,7 @@ async fn main() -> Result<()> {
         let (_validator, enrollment_uri) =
             security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
         if let Some(uri) = enrollment_uri {
-            println!("Initialized OTP secret for ZeroClaw.");
+            println!("Initialized OTP secret for SlowClaw.");
             println!("Enrollment URI: {uri}");
         }
     }
@@ -792,9 +794,9 @@ async fn main() -> Result<()> {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
-                info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+                info!("🚀 Starting SlowClaw Gateway on {host} (random port)");
             } else {
-                info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+                info!("🚀 Starting SlowClaw Gateway on {host}:{port}");
             }
             gateway::run_gateway(&host, port, config).await
         }
@@ -803,15 +805,15 @@ async fn main() -> Result<()> {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
-                info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
+                info!("🧠 Starting SlowClaw Daemon on {host} (random port)");
             } else {
-                info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
+                info!("🧠 Starting SlowClaw Daemon on {host}:{port}");
             }
             daemon::run(config, host, port).await
         }
 
         Commands::Status => {
-            println!("🦀 ZeroClaw Status");
+            println!("🦀 SlowClaw Status");
             println!();
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
             println!("Workspace:   {}", config.workspace_dir.display());
@@ -1087,7 +1089,7 @@ fn handle_estop_command(
                 let (validator, enrollment_uri) =
                     security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
                 if let Some(uri) = enrollment_uri {
-                    println!("Initialized OTP secret for ZeroClaw.");
+                    println!("Initialized OTP secret for SlowClaw.");
                     println!("Enrollment URI: {uri}");
                 }
                 Some(validator)
@@ -1461,7 +1463,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         Err(e) => {
                             println!("Callback capture failed: {e}");
                             println!(
-                                "Run `zeroclaw auth paste-redirect --provider gemini --profile {profile}`"
+                                "Run `slowclaw auth paste-redirect --provider gemini --profile {profile}`"
                             );
                             return Ok(());
                         }
@@ -1546,7 +1548,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         Err(e) => {
                             println!("Callback capture failed: {e}");
                             println!(
-                                "Run `zeroclaw auth paste-redirect --provider openai-codex --profile {profile}`"
+                                "Run `slowclaw auth paste-redirect --provider openai-codex --profile {profile}`"
                             );
                             return Ok(());
                         }
@@ -1584,7 +1586,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 "openai-codex" => {
                     let pending = load_pending_oauth_login(config, "openai")?.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "No pending OpenAI login found. Run `zeroclaw auth login --provider openai-codex` first."
+                            "No pending OpenAI login found. Run `slowclaw auth login --provider openai-codex` first."
                         )
                     })?;
 
@@ -1628,7 +1630,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 "gemini" => {
                     let pending = load_pending_oauth_login(config, "gemini")?.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "No pending Gemini login found. Run `zeroclaw auth login --provider gemini` first."
+                            "No pending Gemini login found. Run `slowclaw auth login --provider gemini` first."
                         )
                     })?;
 
@@ -1746,7 +1748,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         }
                         None => {
                             bail!(
-                                "No OpenAI Codex auth profile found. Run `zeroclaw auth login --provider openai-codex`."
+                                "No OpenAI Codex auth profile found. Run `slowclaw auth login --provider openai-codex`."
                             )
                         }
                     }
@@ -1764,7 +1766,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         }
                         None => {
                             bail!(
-                                "No Gemini auth profile found. Run `zeroclaw auth login --provider gemini`."
+                                "No Gemini auth profile found. Run `slowclaw auth login --provider gemini`."
                             )
                         }
                     }
@@ -1875,7 +1877,7 @@ mod tests {
     #[test]
     fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
         let cli = Cli::try_parse_from([
-            "zeroclaw",
+            "slowclaw",
             "onboard",
             "--provider",
             "openrouter",
@@ -1910,7 +1912,7 @@ mod tests {
     #[test]
     fn completions_cli_parses_supported_shells() {
         for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
-            let cli = Cli::try_parse_from(["zeroclaw", "completions", shell])
+            let cli = Cli::try_parse_from(["slowclaw", "completions", shell])
                 .expect("completions invocation should parse");
             match cli.command {
                 Commands::Completions { .. } => {}
@@ -1926,14 +1928,14 @@ mod tests {
             .expect("completion generation should succeed");
         let script = String::from_utf8(output).expect("completion output should be valid utf-8");
         assert!(
-            script.contains("zeroclaw"),
+            script.contains("slowclaw"),
             "completion script should reference binary name"
         );
     }
 
     #[test]
     fn onboard_cli_accepts_force_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--force"])
+        let cli = Cli::try_parse_from(["slowclaw", "onboard", "--force"])
             .expect("onboard --force should parse");
 
         match cli.command {
@@ -1944,7 +1946,7 @@ mod tests {
 
     #[test]
     fn cli_parses_estop_default_engage() {
-        let cli = Cli::try_parse_from(["zeroclaw", "estop"]).expect("estop command should parse");
+        let cli = Cli::try_parse_from(["slowclaw", "estop"]).expect("estop command should parse");
 
         match cli.command {
             Commands::Estop {
@@ -1964,7 +1966,7 @@ mod tests {
 
     #[test]
     fn cli_parses_estop_resume_domain() {
-        let cli = Cli::try_parse_from(["zeroclaw", "estop", "resume", "--domain", "*.chase.com"])
+        let cli = Cli::try_parse_from(["slowclaw", "estop", "resume", "--domain", "*.chase.com"])
             .expect("estop resume command should parse");
 
         match cli.command {

@@ -91,3 +91,51 @@ The `docker` job in `.github/workflows/ci.yml` automatically verifies:
 1. Container does not run as root (UID 0)
 2. Runtime stage uses `:nonroot` variant
 3. Explicit `USER` directive with numeric UID exists
+
+## Workspace-Only Fork Hardening (Before Install)
+
+This workspace-only fork disables external messaging channels and hard-locks
+file access policy to the workspace. However, scheduled shell/script execution
+is still **process execution**, so strict confinement depends on the host setup.
+
+### Important Limitation
+
+The app enforces workspace boundaries in application policy (command/path checks,
+`workspace-script` validation, working directory control), but that is **not the
+same as a kernel-enforced sandbox** for arbitrary scripts.
+
+If a scheduled script itself executes unsafe commands, OS-level isolation is the
+real boundary.
+
+### Recommended Setup (Do This Before Installing)
+
+1. Use a dedicated OS user account for this app (no personal home data, no SSH keys).
+2. Use a dedicated workspace directory (for example `/srv/zeroclaw-workspace`) and do not symlink it to sensitive locations.
+3. Prefer running inside a container/VM for strongest isolation (recommended).
+4. If running on Linux host directly, install at least one sandbox backend:
+   - `bubblewrap` (`bwrap`)
+   - `firejail`
+   - Landlock-capable kernel/userspace (where supported)
+5. Restrict outbound network egress at the OS/firewall layer unless explicitly needed.
+6. Install PocketBase from an official release and verify checksums/signatures before placing the binary in `pocketbase/pocketbase` or `PATH`.
+7. Bind PocketBase to localhost only (default `127.0.0.1:8090`) unless you intentionally reverse-proxy it.
+8. Set file permissions on workspace scripts to least privilege and review them before scheduling.
+9. Keep secrets out of the workspace unless absolutely required; prefer environment variables or OS keychain storage.
+10. Back up `memory/` and `pb_data/` separately (they serve different purposes).
+
+### Scheduler Safety Guidance (This Fork)
+
+- Prefer `workspace-script <relative/path>` over complex shell strings.
+- Keep scripts small, reviewed, and checked into the workspace.
+- Avoid command chaining in scheduled commands (`&&`, `;`, pipes) unless necessary.
+- Run scripts against files under the workspace only.
+- Use `best_effort = true` delivery when testing PocketBase writes so failed DB writes do not block job execution.
+
+### PocketBase Sidecar Notes
+
+- The gateway attempts to start a local PocketBase sidecar automatically if a
+  `pocketbase` binary is found in `pocketbase/pocketbase`, `pocketbase/pocketbase.exe`,
+  or `PATH`.
+- Disable auto-start with `ZEROCLAW_POCKETBASE_DISABLE=1`.
+- Override binary path with `ZEROCLAW_POCKETBASE_BIN=/absolute/path/to/pocketbase`.
+- Override bind host/port with `ZEROCLAW_POCKETBASE_HOST` and `ZEROCLAW_POCKETBASE_PORT`.

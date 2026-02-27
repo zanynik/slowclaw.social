@@ -3,17 +3,21 @@ members = [".", "crates/robot-kit"]
 resolver = "2"
 
 [package]
-name = "zeroclaw"
+name = "slowclaw"
 version = "0.1.7"
 edition = "2021"
+default-run = "slowclaw"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
-repository = "https://github.com/zeroclaw-labs/zeroclaw"
+repository = "https://github.com/zanynik/slowclaw.social"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.87"
+
+[lib]
+name = "zeroclaw"
 
 [dependencies]
 # CLI - minimal and fast
@@ -27,9 +31,6 @@ tokio-stream = { version = "0.1.18", default-features = false, features = ["fs",
 
 # HTTP client - minimal features
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
-
-# Matrix client + E2EE decryption
-matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -82,9 +83,6 @@ hex = "0.4"
 # CSPRNG for secure token generation
 rand = "0.10"
 
-# serde-big-array for wa-rs storage (large array serialization)
-serde-big-array = { version = "0.5", optional = true }
-
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
@@ -93,9 +91,6 @@ async-trait = "0.1"
 
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
 ring = "0.17"
-
-# Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
-prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -114,26 +109,17 @@ glob = "0.3"
 # Binary discovery (init system detection)
 which = "8.0"
 
-# WebSocket client channels (Discord/Lark/DingTalk/Nostr)
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+# WebSocket client channels (removed in workspace-only fork)
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"] }
 regex = "1.10"
 hostname = "0.4.2"
 rustls = "0.23"
-rustls-pki-types = "1.14.0"
-tokio-rustls = "0.26.4"
-webpki-roots = "1.0.6"
-
-# email
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
-mail-parser = "0.11.2"
-async-imap = { version = "0.11",features = ["runtime-tokio"], default-features = false }
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
-tower = { version = "0.5", default-features = false }
-tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "macros"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout", "fs"] }
 http-body-util = "0.1"
 
 # Embed frontend assets into binary (web dashboard)
@@ -162,18 +148,6 @@ probe-rs = { version = "0.31", optional = true }
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
 
-# Terminal QR rendering for WhatsApp Web pairing flow.
-qrcode = { version = "0.14", optional = true }
-
-# WhatsApp Web client (wa-rs) — optional, enable with --features whatsapp-web
-# Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.
-wa-rs = { version = "0.2", optional = true, default-features = false }
-wa-rs-core = { version = "0.2", optional = true, default-features = false }
-wa-rs-binary = { version = "0.2", optional = true, default-features = false }
-wa-rs-proto = { version = "0.2", optional = true, default-features = false }
-wa-rs-ureq-http = { version = "0.2", optional = true }
-wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
-
 # Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.22", optional = true }
@@ -186,8 +160,8 @@ libc = "0.2"
 [features]
 default = []
 hardware = ["nusb", "tokio-serial"]
-channel-matrix = ["dep:matrix-sdk"]
-channel-lark = ["dep:prost"]
+channel-matrix = []
+channel-lark = []
 memory-postgres = ["dep:postgres"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 peripheral-rpi = ["rppal"]
@@ -204,8 +178,8 @@ landlock = ["sandbox-landlock"]
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
-# whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
-whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
+# whatsapp-web feature retained as no-op for CLI/config compatibility in this fork
+whatsapp-web = []
 
 [profile.release]
 opt-level = "z"      # Optimize for size

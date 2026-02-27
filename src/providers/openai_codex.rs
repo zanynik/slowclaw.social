@@ -276,8 +276,8 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
 
 fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     let id = normalize_model_id(model);
-    // gpt-5-codex currently supports only low|medium|high.
-    if id == "gpt-5-codex" {
+    // Some Codex-backed GPT-5 variants reject `minimal` and/or `xhigh`.
+    if id == "gpt-5" || id == "gpt-5-codex" {
         return match effort {
             "low" | "medium" | "high" => effort.to_string(),
             "minimal" => "low".to_string(),
@@ -832,6 +832,14 @@ mod tests {
         assert_eq!(
             clamp_reasoning_effort("gpt-5-codex", "medium"),
             "medium".to_string()
+        );
+        assert_eq!(
+            clamp_reasoning_effort("gpt-5", "xhigh"),
+            "high".to_string()
+        );
+        assert_eq!(
+            clamp_reasoning_effort("gpt-5", "minimal"),
+            "low".to_string()
         );
         assert_eq!(
             clamp_reasoning_effort("gpt-5.3-codex", "minimal"),
