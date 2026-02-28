@@ -212,6 +212,53 @@ cd web && npm run build
 cd .. && cargo build --release
 ```
 
+## Tauri v2 Mobile App (Scaffolded)
+
+This repo now includes a Tauri v2 scaffold at:
+
+- `web/src-tauri/`
+
+Included:
+
+- secure credential bridge commands (`get_secret`, `set_secret`, `delete_secret`) backed by OS keyring
+- `tauri.conf.json`
+- default capability file
+- npm scripts for iOS/Android init + dev
+
+### Prerequisites (macOS/iOS)
+
+Install before running mobile commands:
+
+- Xcode (full app)
+- Rust iOS targets:
+  - `rustup target add aarch64-apple-ios x86_64-apple-ios aarch64-apple-ios-sim`
+- CocoaPods:
+  - `brew install cocoapods`
+
+### First-time iOS setup
+
+```bash
+cd web
+npm install
+npm run tauri:ios:init
+```
+
+### Run on iOS simulator/device
+
+```bash
+cd web
+npm run tauri:ios:dev
+```
+
+### Notes
+
+- Gateway build still uses `npm run build` (`/_app/` asset base) for embedded Rust gateway UI.
+- Tauri build uses `npm run build:tauri` (`./` asset base) and is wired in `src-tauri/tauri.conf.json`.
+- After `tauri ios init`, open the generated Xcode project and set:
+  - camera + microphone usage descriptions
+  - local network usage description
+  - ATS exceptions for local HTTP testing if you keep laptop gateway on plain `http://`.
+
 ### Mobile Safari note (LAN HTTP)
 
 iPhone Safari on `http://<LAN-IP>:<port>` may not expose live `getUserMedia` recording APIs.

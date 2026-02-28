@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SlowClaw Social",
+  "version": "0.1.0",
+  "identifier": "social.slowclaw.mobile",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build:tauri",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "SlowClaw Social",
+        "width": 420,
+        "height": 900,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "capabilities": [
+        "default"
+      ],
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}
