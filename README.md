@@ -12,7 +12,7 @@ The binary name is `slowclaw`.
 ## What This Fork Keeps
 
 - Workspace-only file access policy (hard-enforced in app config/policy)
-- CLI + gateway (`/pair`, `/webhook`, `/health`, `/metrics`)
+- CLI + gateway (`/pair`, `/pair/new-code`, `/webhook`, `/health`, `/metrics`)
 - Cron scheduling
 - `workspace-script <relative/path>` scheduled command support
 - PocketBase delivery for cron/heartbeat output
@@ -90,6 +90,12 @@ Open:
 
 The gateway startup log prints the actual UI URL and whether PocketBase sidecar started.
 
+Recommended for full scheduling + chat worker runtime:
+
+```bash
+./target/release/slowclaw daemon
+```
+
 ### 5. Pair and send a webhook prompt (optional)
 
 If pairing is enabled, use the startup pairing code:
@@ -106,6 +112,27 @@ curl -X POST http://127.0.0.1:8080/webhook \
   -H 'Content-Type: application/json' \
   -d '{"message":"hello"}'
 ```
+
+### 6. Generate a new pairing code without logging out existing clients
+
+Use this when Mac is already paired and you want to pair phone too.
+
+```bash
+./target/release/slowclaw pair new-code --token '<existing_bearer_token>'
+```
+
+You can also set:
+
+```bash
+export ZEROCLAW_GATEWAY_TOKEN='<existing_bearer_token>'
+./target/release/slowclaw pair new-code
+```
+
+Notes:
+
+- Existing paired sessions remain valid.
+- `config.toml` stores hashed tokens, not plaintext bearer tokens.
+- You can copy the current token from the web UI: Profile -> Gateway & App Settings -> Show Token / Copy Token.
 
 ## PocketBase Setup
 
@@ -175,6 +202,21 @@ npm run build
 
 The gateway serves static assets under `/_app/` and uses SPA fallback for `/`.
 
+Important:
+
+- The web bundle is embedded in the Rust binary at compile time.
+- After `web` changes, rebuild both UI and binary:
+
+```bash
+cd web && npm run build
+cd .. && cargo build --release
+```
+
+### Mobile Safari note (LAN HTTP)
+
+iPhone Safari on `http://<LAN-IP>:<port>` may not expose live `getUserMedia` recording APIs.
+In this fork, Audio/Video buttons fall back to file/capture picker automatically when live recording is unavailable.
+
 ## Minimal Route Surface (Gateway)
 
 Exposed routes now:
@@ -182,12 +224,20 @@ Exposed routes now:
 - `GET /health`
 - `GET /metrics`
 - `POST /pair`
+- `POST /pair/new-code`
 - `POST /webhook`
+- `GET /api/chat/messages`
+- `POST /api/chat/messages`
+- `POST /api/media/upload`
+- `POST /api/journal/text`
+- `GET /api/library/items`
+- `GET /api/library/text`
+- `POST /api/library/save-text`
+- `GET /api/media/{path}`
 - `GET /` and `GET /_app/*` (static UI)
 
 Removed from the gateway surface in this fork:
 
-- `/api/*`
 - `/api/events`
 - `/ws/chat`
 - external channel webhook endpoints (`/whatsapp`, `/linq`, `/wati`, `/nextcloud-talk`, etc.)
@@ -202,8 +252,6 @@ Removed from the gateway surface in this fork:
 - `scripts/` — workspace scripts you schedule
 
 ## Validation Notes
-
-This environment did not have `cargo` installed during the modification pass, so compile verification was not run here.
 
 Recommended local checks:
 

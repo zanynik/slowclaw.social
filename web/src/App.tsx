@@ -1356,7 +1356,6 @@ function App() {
                     ref={audioCaptureRef}
                     type="file"
                     accept="audio/*"
-                    capture="user"
                     className="visually-hidden"
                     onChange={(e) => {
                       const file = e.target.files?.[0];
