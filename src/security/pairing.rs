@@ -89,6 +89,18 @@ impl PairingGuard {
         self.pairing_code.lock().clone()
     }
 
+    /// Generate and install a fresh one-time pairing code without affecting
+    /// existing paired bearer tokens. Returns `None` when pairing is disabled.
+    pub fn regenerate_pairing_code(&self) -> Option<String> {
+        if !self.require_pairing {
+            return None;
+        }
+        let code = generate_code();
+        let mut guard = self.pairing_code.lock();
+        *guard = Some(code.clone());
+        Some(code)
+    }
+
     /// Whether pairing is required at all.
     pub fn require_pairing(&self) -> bool {
         self.require_pairing

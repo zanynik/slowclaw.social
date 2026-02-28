@@ -200,6 +200,8 @@ function App() {
   });
   const [chatPairCode, setChatPairCode] = useState("");
   const [chatPairing, setChatPairing] = useState(false);
+  const [showGatewayToken, setShowGatewayToken] = useState(false);
+  const [gatewayTokenCopyStatus, setGatewayTokenCopyStatus] = useState("");
   const [themeMode, setThemeMode] = useState<ThemeMode>(defaultThemeMode);
   const [mobileTab, setMobileTab] = useState<MobileTab>(defaultMobileTab);
   const [journalSidebarOpen, setJournalSidebarOpen] = useState(false);
@@ -934,6 +936,31 @@ function App() {
 
   async function startRecording(type: "audio" | "video") {
     try {
+      const hasGetUserMedia =
+        typeof navigator !== "undefined" &&
+        !!navigator.mediaDevices &&
+        typeof navigator.mediaDevices.getUserMedia === "function";
+      const hasMediaRecorder =
+        typeof window !== "undefined" &&
+        typeof (window as any).MediaRecorder !== "undefined";
+      const insecureContext =
+        typeof window !== "undefined" &&
+        !window.isSecureContext &&
+        window.location.hostname !== "localhost" &&
+        window.location.hostname !== "127.0.0.1";
+
+      if (!hasGetUserMedia || !hasMediaRecorder || insecureContext) {
+        setRecordingHint(
+          `${type === "audio" ? "Audio" : "Video"} live recording is unavailable in this browser context. Using upload/capture picker instead.`
+        );
+        if (type === "audio") {
+          audioCaptureRef.current?.click();
+        } else {
+          videoCaptureRef.current?.click();
+        }
+        return;
+      }
+
       setRecordingHint(`Starting ${type} recording...`);
       setRecordingType(type);
       setIsRecording(true);
@@ -1086,6 +1113,20 @@ function App() {
       );
     } finally {
       setChatPairing(false);
+    }
+  }
+
+  async function copyGatewayToken() {
+    const token = chatGatewayToken.trim();
+    if (!token) {
+      setGatewayTokenCopyStatus("No token to copy");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(token);
+      setGatewayTokenCopyStatus("Token copied");
+    } catch {
+      setGatewayTokenCopyStatus("Copy failed");
     }
   }
 
@@ -1655,7 +1696,31 @@ function App() {
                   <button type="button" onClick={pairGatewayFromUi} disabled={chatPairing}>Pair</button>
                 </div>
                 {chatGatewayToken && (
-                  <p className="text-sm muted">Token synced: {chatGatewayToken.slice(0, 10)}...</p>
+                  <div className="stack" style={{ gap: "0.4rem" }}>
+                    <div className="row">
+                      <input
+                        type={showGatewayToken ? "text" : "password"}
+                        value={chatGatewayToken}
+                        readOnly
+                        style={{ flex: 1 }}
+                      />
+                    </div>
+                    <div className="row">
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => setShowGatewayToken((prev) => !prev)}
+                      >
+                        {showGatewayToken ? "Hide Token" : "Show Token"}
+                      </button>
+                      <button type="button" className="ghost" onClick={() => void copyGatewayToken()}>
+                        Copy Token
+                      </button>
+                    </div>
+                    <p className="text-sm muted">
+                      {gatewayTokenCopyStatus || "Token synced and ready to use for `slowclaw pair new-code`."}
+                    </p>
+                  </div>
                 )}
 
                 <p className="mt-2"><strong>PocketBase Server Link</strong></p>

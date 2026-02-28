@@ -266,6 +266,12 @@ Examples:
     /// Show system status (full details)
     Status,
 
+    /// Manage gateway pairing helpers
+    Pair {
+        #[command(subcommand)]
+        pair_command: PairCommands,
+    },
+
     /// Engage, inspect, and resume emergency-stop states.
     ///
     /// Examples:
@@ -464,6 +470,19 @@ Examples:
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout
     Schema,
+}
+
+#[derive(Subcommand, Debug)]
+enum PairCommands {
+    /// Mint a fresh one-time gateway pairing code without removing existing tokens
+    NewCode {
+        /// Gateway base URL (default: http://<gateway.host>:<gateway.port>)
+        #[arg(long)]
+        gateway_url: Option<String>,
+        /// Existing paired bearer token (or set ZEROCLAW_GATEWAY_TOKEN env var)
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -906,6 +925,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
+        Commands::Pair { pair_command } => handle_pair_command(pair_command, &config).await,
+
         Commands::Estop {
             estop_command,
             level,
@@ -1038,6 +1059,60 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+    }
+}
+
+async fn handle_pair_command(pair_command: PairCommands, config: &Config) -> Result<()> {
+    match pair_command {
+        PairCommands::NewCode { gateway_url, token } => {
+            let base_url = gateway_url.unwrap_or_else(|| {
+                format!(
+                    "http://{}:{}",
+                    config.gateway.host.trim(),
+                    config.gateway.port
+                )
+            });
+            let token = token
+                .or_else(|| std::env::var("ZEROCLAW_GATEWAY_TOKEN").ok())
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Bearer token required. Pass --token <token> or set ZEROCLAW_GATEWAY_TOKEN"
+                    )
+                })?;
+
+            let url = format!("{}/pair/new-code", base_url.trim_end_matches('/'));
+            let client = reqwest::Client::new();
+            let response = client
+                .post(&url)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .with_context(|| format!("Failed to contact gateway: {url}"))?;
+            let status = response.status();
+            let raw_body = response.text().await.unwrap_or_default();
+            let body: serde_json::Value = serde_json::from_str(&raw_body).unwrap_or_else(|_| {
+                serde_json::json!({ "error": format!("Invalid response ({status}): {raw_body}") })
+            });
+
+            if !status.is_success() {
+                let error = body
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Failed to mint new pairing code");
+                bail!("{error}");
+            }
+
+            let code = body
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("Gateway response missing code"))?;
+            println!("🔐 New one-time pairing code:");
+            println!("   {code}");
+            println!("Paste this into the mobile app pairing field.");
+            Ok(())
+        }
     }
 }
 

@@ -561,6 +561,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         );
     }
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
+    println!("  POST /pair/new-code — mint a fresh one-time pairing code (requires bearer)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
@@ -625,6 +626,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
+        .route("/pair/new-code", post(handle_pair_new_code))
         .route("/webhook", post(handle_webhook))
         .route("/api/chat/messages", get(handle_chat_list).post(handle_chat_send))
         .with_state(state.clone())
@@ -770,6 +772,30 @@ async fn handle_pair(
             (StatusCode::TOO_MANY_REQUESTS, Json(err))
         }
     }
+}
+
+/// POST /pair/new-code — generate a fresh one-time pairing code using an existing bearer token
+async fn handle_pair_new_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Pair new code") {
+        return err;
+    }
+    if !state.pairing.require_pairing() {
+        let err = serde_json::json!({"error": "Pairing is disabled in config"});
+        return (StatusCode::BAD_REQUEST, Json(err));
+    }
+    let Some(code) = state.pairing.regenerate_pairing_code() else {
+        let err = serde_json::json!({"error": "Failed to generate pairing code"});
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+    };
+    let body = serde_json::json!({
+        "ok": true,
+        "code": code,
+        "message": "New one-time pairing code generated"
+    });
+    (StatusCode::OK, Json(body))
 }
 
 async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
