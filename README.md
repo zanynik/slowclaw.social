@@ -40,7 +40,54 @@ Minimum recommendation:
 - container/VM (preferred) or Linux sandbox backend (`bwrap` / firejail / Landlock)
 - restrict network egress unless needed
 
-## Quick Start
+## Quick Start (Recommended)
+
+Use the unified Tauri desktop app. It starts frontend + PocketBase + SlowClaw daemon together.
+
+### 1. Prerequisites
+
+- Rust toolchain (`rustc`, `cargo`)
+- Node.js 18+
+- PocketBase binary available as Tauri sidecar:
+  - `web/src-tauri/binaries/pocketbase-aarch64-apple-darwin`
+- SlowClaw binary sidecar:
+  - `web/src-tauri/binaries/slowclaw-aarch64-apple-darwin`
+
+### 2. Run desktop app
+
+```bash
+cd web
+npm install
+npm run tauri dev
+```
+
+Desktop startup now:
+
+1. resolves Tauri `app_data_dir`,
+2. creates `app_data_dir/workspace`,
+3. runs non-interactive onboarding scaffold for new users,
+4. starts PocketBase sidecar (`127.0.0.1:8090`),
+5. starts SlowClaw daemon (`127.0.0.1:42617`) using app-local config/workspace.
+
+This means new users do not need pre-existing `~/.zeroclaw/workspace`.
+
+### 3. Desktop auth flow
+
+- In app `Settings`, sign in to Bluesky using:
+  - handle
+  - app password
+- Credentials are stored in OS keyring via Tauri commands (`get_secret`, `set_secret`).
+
+### 4. Mobile pairing flow (thin client)
+
+- On desktop `Settings`, click **Generate QR**.
+- Mobile app opens to QR scanner login.
+- Scan QR to import:
+  - local gateway URL (`http://<desktop-lan-ip>:42617`)
+  - gateway bearer token
+- Mobile then uses these for all gateway requests on local Wi-Fi.
+
+## CLI / Gateway Quick Start (Manual)
 
 ### 1. Prerequisites
 
@@ -86,7 +133,7 @@ Binary path:
 
 Open:
 
-- `http://127.0.0.1:8080/` (or your configured gateway port)
+- `http://127.0.0.1:42617/` (or your configured gateway port)
 
 The gateway startup log prints the actual UI URL and whether PocketBase sidecar started.
 
@@ -101,13 +148,13 @@ Recommended for full scheduling + chat worker runtime:
 If pairing is enabled, use the startup pairing code:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/pair -H 'X-Pairing-Code: <code>'
+curl -X POST http://127.0.0.1:42617/pair -H 'X-Pairing-Code: <code>'
 ```
 
 Then send prompts:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/webhook \
+curl -X POST http://127.0.0.1:42617/webhook \
   -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: application/json' \
   -d '{"message":"hello"}'
@@ -240,8 +287,9 @@ npm run tauri dev
 At app startup, Tauri now:
 
 1. launches PocketBase sidecar (127.0.0.1:8090),
-2. launches `slowclaw daemon` backend (127.0.0.1:42617),
-3. terminates both when the app exits.
+2. ensures app-local workspace/config scaffold exists (auto-onboard for new users),
+3. launches `slowclaw daemon` backend (127.0.0.1:42617),
+4. terminates both when the app exits.
 
 Sidecar orchestration is compiled only for desktop targets (`not(iOS/Android)`), so mobile builds stay thin-client only.
 
