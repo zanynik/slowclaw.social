@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "social.slowclaw.mobile",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run dev:tauri",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build:tauri",
     "frontendDist": "../dist"
@@ -21,13 +21,24 @@
     ],
     "security": {
       "capabilities": [
-        "default"
+        "default",
+        "sidecar-runtime"
       ],
       "csp": null
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "resources": [
+      "../../pb_migrations"
+    ],
+    "externalBin": [
+      "binaries/pocketbase",
+      "binaries/slowclaw"
+    ]
+  },
+  "plugins": {
+    "shell": {}
   }
 }

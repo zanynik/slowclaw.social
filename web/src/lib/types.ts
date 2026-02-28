@@ -58,3 +58,9 @@ export type LibraryItem = {
   editableText?: boolean;
   scope?: "journal" | "feed" | string;
 };
+
+export type GatewayQrPayload = {
+  gateway_url: string;
+  token: string;
+  qr_value: string;
+};

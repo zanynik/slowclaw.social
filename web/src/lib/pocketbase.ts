@@ -1,6 +1,15 @@
 import PocketBase from "pocketbase";
 import type { ClawChatMessage, PostHistoryItem, StoredDraft } from "./types";
 
+function resolveGatewayEndpoint(path: string, gatewayBaseUrl?: string): string {
+  if (!gatewayBaseUrl || !gatewayBaseUrl.trim()) {
+    return path;
+  }
+  const base = gatewayBaseUrl.trim().replace(/\/+$/, "");
+  const suffix = path.startsWith("/") ? path : `/${path}`;
+  return `${base}${suffix}`;
+}
+
 function defaultPocketBaseUrl() {
   if (typeof window === "undefined") {
     return "http://127.0.0.1:8090";
@@ -131,14 +140,18 @@ function mapChatRecord(item: any, fallbackThreadId: string): ClawChatMessage {
 
 export async function listClawChatMessagesViaGateway(
   threadId: string,
-  bearerToken?: string
+  bearerToken?: string,
+  gatewayBaseUrl?: string
 ): Promise<ClawChatMessage[]> {
   const params = new URLSearchParams({ threadId, limit: "200" });
-  const res = await fetch(`/api/chat/messages?${params.toString()}`, {
+  const res = await fetch(
+    resolveGatewayEndpoint(`/api/chat/messages?${params.toString()}`, gatewayBaseUrl),
+    {
     headers: bearerToken
       ? { Authorization: `Bearer ${bearerToken}` }
       : undefined
-  });
+    }
+  );
   const text = await res.text();
   let data: any = {};
   try {
@@ -160,9 +173,10 @@ export async function listClawChatMessagesViaGateway(
 export async function createClawChatUserMessageViaGateway(
   threadId: string,
   content: string,
-  bearerToken?: string
+  bearerToken?: string,
+  gatewayBaseUrl?: string
 ) {
-  const res = await fetch("/api/chat/messages", {
+  const res = await fetch(resolveGatewayEndpoint("/api/chat/messages", gatewayBaseUrl), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

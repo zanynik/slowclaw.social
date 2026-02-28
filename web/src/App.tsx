@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { AtpAgent } from "@atproto/api";
+import { QRCodeCanvas } from "qrcode.react";
 import {
   loginBluesky,
   postTextToBluesky,
@@ -32,12 +33,16 @@ import {
   deleteCredentialsSecure,
   loadCredentialsFallback,
   loadCredentialsSecure,
-  saveCredentialsSecure
+  loadGatewayTokenSecure,
+  saveBlueskySessionSecure,
+  saveCredentialsSecure,
+  saveGatewayTokenSecure
 } from "./lib/secureStorage";
 import type {
   ApiRequestState,
   BlueskyCredentials,
   ClawChatMessage,
+  GatewayQrPayload,
   LibraryItem,
   PostHistoryItem,
   StoredDraft
@@ -53,6 +58,7 @@ const initialApiRequest: ApiRequestState = {
 
 const CHAT_THREAD_STORAGE_KEY = "slowclaw.chat.thread_id";
 const CHAT_GATEWAY_TOKEN_STORAGE_KEY = "slowclaw.chat.gateway_token";
+const CHAT_GATEWAY_BASE_URL_STORAGE_KEY = "slowclaw.chat.gateway_base_url";
 const CHAT_USE_GATEWAY_STORAGE_KEY = "slowclaw.chat.use_gateway";
 const UI_THEME_STORAGE_KEY = "slowclaw.ui.theme";
 const UI_TAB_STORAGE_KEY = "slowclaw.ui.tab";
@@ -141,8 +147,57 @@ function defaultUseGatewayChatApi() {
   return window.location.port !== "5173";
 }
 
+function isTauriDesktopRuntime() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return Boolean((window as any).__TAURI_INTERNALS__);
+}
+
+function defaultGatewayBaseUrl() {
+  if (typeof window === "undefined") {
+    return "http://127.0.0.1:42617";
+  }
+  const saved = window.localStorage.getItem(CHAT_GATEWAY_BASE_URL_STORAGE_KEY);
+  if (saved && saved.trim()) {
+    return saved.trim().replace(/\/+$/, "");
+  }
+  const protocol = window.location.protocol === "https:" ? "https:" : "http:";
+  const host = window.location.hostname || "127.0.0.1";
+  return `${protocol}//${host}:42617`;
+}
+
+function derivePocketBaseUrlFromGateway(gatewayBaseUrl: string) {
+  try {
+    const parsed = new URL(gatewayBaseUrl);
+    parsed.port = "8090";
+    parsed.pathname = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return defaultPocketBaseUrlForUi();
+  }
+}
+
+function resolveGatewayResourceUrl(resourcePath: string, gatewayBaseUrl: string) {
+  if (!resourcePath) {
+    return resourcePath;
+  }
+  if (resourcePath.startsWith("http://") || resourcePath.startsWith("https://")) {
+    return resourcePath;
+  }
+  const base = gatewayBaseUrl.trim().replace(/\/+$/, "");
+  const suffix = resourcePath.startsWith("/") ? resourcePath : `/${resourcePath}`;
+  return `${base}${suffix}`;
+}
+
 function App() {
-  const [pbUrl, setPbUrl] = useState(defaultPocketBaseUrlForUi);
+  const isDesktopClient = isTauriDesktopRuntime();
+  const [gatewayBaseUrl, setGatewayBaseUrl] = useState(defaultGatewayBaseUrl);
+  const [pbUrl, setPbUrl] = useState(() =>
+    derivePocketBaseUrlFromGateway(defaultGatewayBaseUrl())
+  );
   const [creds, setCreds] = useState<BlueskyCredentials>(() => loadCredentialsFallback());
   const [agent, setAgent] = useState<AtpAgent | null>(null);
   const [session, setSession] = useState<BlueskySession | null>(null);
@@ -198,6 +253,9 @@ function App() {
     }
     return window.localStorage.getItem(CHAT_GATEWAY_TOKEN_STORAGE_KEY) || "";
   });
+  const [desktopQrLoading, setDesktopQrLoading] = useState(false);
+  const [desktopQrPayload, setDesktopQrPayload] = useState<GatewayQrPayload | null>(null);
+  const [desktopQrStatus, setDesktopQrStatus] = useState("");
   const [chatPairCode, setChatPairCode] = useState("");
   const [chatPairing, setChatPairing] = useState(false);
   const [showGatewayToken, setShowGatewayToken] = useState(false);
@@ -231,11 +289,29 @@ function App() {
     percent: number;
     label: string;
   } | null>(null);
+  const [mobileScannerActive, setMobileScannerActive] = useState(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    if (isTauriDesktopRuntime()) {
+      return false;
+    }
+    const savedToken = window.localStorage.getItem(CHAT_GATEWAY_TOKEN_STORAGE_KEY) || "";
+    const savedGateway = window.localStorage.getItem(CHAT_GATEWAY_BASE_URL_STORAGE_KEY) || "";
+    return !(savedToken.trim() && savedGateway.trim());
+  });
+  const [mobileScannerStatus, setMobileScannerStatus] = useState(
+    "Scan the desktop QR to connect."
+  );
+  const [mobileCameraPermissionError, setMobileCameraPermissionError] = useState("");
   const audioCaptureRef = useRef<HTMLInputElement | null>(null);
   const videoCaptureRef = useRef<HTMLInputElement | null>(null);
   const autosaveTimerRef = useRef<number | null>(null);
   const loadedTextPathRef = useRef<string>("");
   const loadedCaptionPathRef = useRef<string>("");
+  const mobileScannerVideoRef = useRef<HTMLVideoElement | null>(null);
+  const mobileScannerStreamRef = useRef<MediaStream | null>(null);
+  const mobileScannerRafRef = useRef<number | null>(null);
 
   // Recording State
   const [isRecording, setIsRecording] = useState(false);
@@ -267,6 +343,12 @@ function App() {
       if (!cancelled && secureCreds) {
         setCreds(secureCreds);
       }
+      if (!cancelled && isDesktopClient) {
+        const secureGatewayToken = await loadGatewayTokenSecure();
+        if (secureGatewayToken) {
+          setChatGatewayToken(secureGatewayToken);
+        }
+      }
       if (!cancelled) {
         setSecureStoreReady(true);
       }
@@ -294,11 +376,23 @@ function App() {
     if (typeof window === "undefined") {
       return;
     }
-    window.localStorage.setItem(
-      CHAT_GATEWAY_TOKEN_STORAGE_KEY,
-      chatGatewayToken.trim()
-    );
-  }, [chatGatewayToken]);
+    const normalized = chatGatewayToken.trim();
+    window.localStorage.setItem(CHAT_GATEWAY_TOKEN_STORAGE_KEY, normalized);
+    if (isDesktopClient && normalized) {
+      void saveGatewayTokenSecure(normalized);
+    }
+  }, [chatGatewayToken, isDesktopClient]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const normalized = gatewayBaseUrl.trim().replace(/\/+$/, "");
+    window.localStorage.setItem(CHAT_GATEWAY_BASE_URL_STORAGE_KEY, normalized);
+    if (normalized) {
+      setPbUrl(derivePocketBaseUrlFromGateway(normalized));
+    }
+  }, [gatewayBaseUrl]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -348,14 +442,14 @@ function App() {
     const token = chatGatewayToken.trim() || undefined;
     try {
       if (scope === "journal" || scope === "all") {
-        const items = await listLibraryItems("journal", token);
+        const items = await listLibraryItems("journal", token, gatewayBaseUrl);
         setJournalItems(items);
         if (items.length > 0 && !selectedJournalPath) {
           setSelectedJournalPath(items[0].path);
         }
       }
       if (scope === "feed" || scope === "all") {
-        const items = (await listLibraryItems("feed", token)).filter((item) => {
+        const items = (await listLibraryItems("feed", token, gatewayBaseUrl)).filter((item) => {
           const path = item.path.toLowerCase();
           if (path.endsWith(".caption.txt")) {
             return false;
@@ -389,7 +483,8 @@ function App() {
           filename: file.name || `${kind}-${Date.now()}`,
           title: journalDraftTitle.trim() || undefined
         },
-        token
+        token,
+        gatewayBaseUrl
       );
       setRecordingHint(
         `Saved ${kind} to workspace: ${String(result.path || file.name)} (${formatBytes(
@@ -416,7 +511,8 @@ function App() {
       const result = await createJournalTextViaGateway(
         journalDraftTitle.trim() || "Journal entry",
         content,
-        token
+        token,
+        gatewayBaseUrl
       );
       setJournalSaveStatus(`Saved: ${String(result.path || "journal entry")}`);
       setJournalDraftText("");
@@ -443,7 +539,7 @@ function App() {
     if (item.kind === "text") {
       const token = chatGatewayToken.trim() || undefined;
       try {
-        const content = await readLibraryText(item.path, token);
+        const content = await readLibraryText(item.path, token, gatewayBaseUrl);
         if (scope === "journal") {
           loadedTextPathRef.current = item.path;
           setSelectedJournalText(content);
@@ -466,7 +562,7 @@ function App() {
       const captionPath = sidecarCaptionPath(item);
       const token = chatGatewayToken.trim() || undefined;
       try {
-        const content = await readLibraryText(captionPath, token);
+        const content = await readLibraryText(captionPath, token, gatewayBaseUrl);
         loadedCaptionPathRef.current = captionPath;
         setFeedCaptionPath(captionPath);
         setFeedCaptionText(content);
@@ -493,7 +589,8 @@ function App() {
     setMediaPreviewLoading(true);
     try {
       const token = chatGatewayToken.trim() || undefined;
-      const res = await fetch(item.mediaUrl, {
+      const mediaUrl = resolveGatewayResourceUrl(item.mediaUrl, gatewayBaseUrl);
+      const res = await fetch(mediaUrl, {
         headers: token ? { Authorization: `Bearer ${token}` } : undefined
       });
       if (!res.ok) {
@@ -539,7 +636,7 @@ function App() {
         const content =
           selectedFeedItem?.path === item.path && selectedFeedText.trim()
             ? selectedFeedText
-            : await readLibraryText(item.path, token);
+            : await readLibraryText(item.path, token, gatewayBaseUrl);
         setPostProgress({ path: item.path, percent: 70, label: "Publishing text..." });
         const result = await postTextToBluesky(agent, session.did, content.trim());
         await persistHistory({
@@ -560,7 +657,7 @@ function App() {
         }
         const filename = item.path.split("/").pop() || "video.mp4";
         setPostProgress({ path: item.path, percent: 12, label: "Fetching video file..." });
-        const file = await fetchMediaAsFile(item.mediaUrl, filename, token);
+        const file = await fetchMediaAsFile(item.mediaUrl, filename, token, gatewayBaseUrl);
         const caption =
           selectedFeedItem?.path === item.path ? feedCaptionText : item.previewText || item.title;
         const result = await postVideoToBluesky(
@@ -624,7 +721,7 @@ function App() {
     const token = chatGatewayToken.trim() || undefined;
     setJournalSaveStatus(`Saving ${selectedJournalItem.path}...`);
     try {
-      await saveLibraryText(selectedJournalItem.path, selectedJournalText, token);
+      await saveLibraryText(selectedJournalItem.path, selectedJournalText, token, gatewayBaseUrl);
       setJournalSaveStatus(`Saved ${selectedJournalItem.path}`);
       await refreshLibrary("journal");
     } catch (error) {
@@ -657,11 +754,14 @@ function App() {
     if (!chatThreadId.trim()) {
       return;
     }
+    if (!gatewayBaseUrl.trim()) {
+      return;
+    }
     try {
       const threadId = chatThreadId.trim();
       const token = chatGatewayToken.trim() || undefined;
       const items = chatUseGatewayApi
-        ? await listClawChatMessagesViaGateway(threadId, token)
+        ? await listClawChatMessagesViaGateway(threadId, token, gatewayBaseUrl)
         : await listClawChatMessagesFromPocketBase(pb, threadId);
       setChatMessages(items);
       setChatStatus(
@@ -682,6 +782,7 @@ function App() {
       const { agent: nextAgent, session: nextSession } = await loginBluesky(creds);
       setAgent(nextAgent);
       setSession(nextSession);
+      void saveBlueskySessionSecure(nextSession);
       setAuthMessage(`Signed in as ${nextSession.handle}`);
     } catch (error) {
       setAgent(null);
@@ -859,7 +960,7 @@ function App() {
     try {
       const token = chatGatewayToken.trim() || undefined;
       if (chatUseGatewayApi) {
-        await createClawChatUserMessageViaGateway(threadId, content, token);
+        await createClawChatUserMessageViaGateway(threadId, content, token, gatewayBaseUrl);
       } else {
         await createClawChatUserMessage(pb, threadId, content);
       }
@@ -1099,7 +1200,7 @@ function App() {
     setChatPairing(true);
     setChatStatus("Pairing with gateway...");
     try {
-      const result = await pairGatewayClient(code);
+      const result = await pairGatewayClient(code, gatewayBaseUrl);
       if (!result.token) {
         throw new Error("Gateway returned no token");
       }
@@ -1130,6 +1231,168 @@ function App() {
     }
   }
 
+  function applyGatewayConnection(gatewayUrl: string, token: string) {
+    const normalizedUrl = gatewayUrl.trim().replace(/\/+$/, "");
+    const normalizedToken = token.trim();
+    if (!normalizedUrl || !normalizedToken) {
+      return;
+    }
+    setGatewayBaseUrl(normalizedUrl);
+    setChatGatewayToken(normalizedToken);
+    setChatStatus(`Connected to ${normalizedUrl}`);
+    setMobileScannerStatus(`Connected to ${normalizedUrl}`);
+    void refreshLibrary("all");
+    void refreshClawChat();
+  }
+
+  function parseGatewayQrPayload(rawValue: string): { gatewayUrl: string; token: string } | null {
+    const raw = rawValue.trim();
+    if (!raw) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(raw) as any;
+      const gatewayUrl = String(parsed.gatewayUrl || parsed.gateway_url || "").trim();
+      const token = String(parsed.token || "").trim();
+      if (!gatewayUrl || !token) {
+        return null;
+      }
+      return { gatewayUrl, token };
+    } catch {
+      return null;
+    }
+  }
+
+  async function invokeDesktopCommand<T>(cmd: string, args: Record<string, unknown> = {}) {
+    try {
+      const core = await import("@tauri-apps/api/core");
+      return await core.invoke<T>(cmd, args);
+    } catch {
+      return null;
+    }
+  }
+
+  async function generateDesktopPairingQr() {
+    setDesktopQrLoading(true);
+    setDesktopQrStatus("Generating a new mobile pairing token...");
+    try {
+      const payload = await invokeDesktopCommand<GatewayQrPayload>("generate_mobile_pairing_qr");
+      if (!payload?.qr_value || !payload.gateway_url || !payload.token) {
+        throw new Error("Desktop pairing payload was empty");
+      }
+      setDesktopQrPayload(payload);
+      setDesktopQrStatus("QR ready. Scan this from the mobile app.");
+    } catch (error) {
+      setDesktopQrStatus(
+        `QR generation failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setDesktopQrLoading(false);
+    }
+  }
+
+  function stopMobileScanner() {
+    if (mobileScannerRafRef.current) {
+      cancelAnimationFrame(mobileScannerRafRef.current);
+      mobileScannerRafRef.current = null;
+    }
+    if (mobileScannerStreamRef.current) {
+      mobileScannerStreamRef.current.getTracks().forEach((track) => track.stop());
+      mobileScannerStreamRef.current = null;
+    }
+    if (mobileScannerVideoRef.current) {
+      mobileScannerVideoRef.current.srcObject = null;
+    }
+    setMobileScannerActive(false);
+  }
+
+  useEffect(() => {
+    if (isDesktopClient) {
+      return;
+    }
+    const needsQrLogin = !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
+    if (!needsQrLogin || !mobileScannerActive) {
+      return;
+    }
+    let cancelled = false;
+    const BarcodeDetectorCtor = (window as any).BarcodeDetector;
+
+    const start = async () => {
+      if (!BarcodeDetectorCtor) {
+        setMobileCameraPermissionError("QR scanning needs BarcodeDetector support in this browser.");
+        setMobileScannerActive(false);
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        mobileScannerStreamRef.current = stream;
+        const video = mobileScannerVideoRef.current;
+        if (!video) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        video.srcObject = stream;
+        await video.play();
+        const detector = new BarcodeDetectorCtor({ formats: ["qr_code"] });
+        const scanFrame = async () => {
+          if (cancelled) {
+            return;
+          }
+          try {
+            if (video.readyState >= 2) {
+              const codes = await detector.detect(video);
+              if (codes && codes.length > 0) {
+                const value = String(codes[0].rawValue || "");
+                const parsed = parseGatewayQrPayload(value);
+                if (parsed) {
+                  applyGatewayConnection(parsed.gatewayUrl, parsed.token);
+                  stopMobileScanner();
+                  return;
+                }
+              }
+            }
+          } catch {
+            // ignore decode frame errors
+          }
+          mobileScannerRafRef.current = requestAnimationFrame(() => {
+            void scanFrame();
+          });
+        };
+        setMobileCameraPermissionError("");
+        setMobileScannerStatus("Scanner active. Point camera at desktop QR.");
+        void scanFrame();
+      } catch (error) {
+        setMobileCameraPermissionError(
+          `Unable to open camera (${error instanceof Error ? error.message : String(error)})`
+        );
+        setMobileScannerActive(false);
+      }
+    };
+    void start();
+
+    return () => {
+      cancelled = true;
+      if (mobileScannerRafRef.current) {
+        cancelAnimationFrame(mobileScannerRafRef.current);
+        mobileScannerRafRef.current = null;
+      }
+      if (mobileScannerStreamRef.current) {
+        mobileScannerStreamRef.current.getTracks().forEach((track) => track.stop());
+        mobileScannerStreamRef.current = null;
+      }
+      if (mobileScannerVideoRef.current) {
+        mobileScannerVideoRef.current.srcObject = null;
+      }
+    };
+  }, [isDesktopClient, mobileScannerActive, chatGatewayToken, gatewayBaseUrl]);
+
   useEffect(() => {
     void refreshClawChat();
     const timer = window.setInterval(() => {
@@ -1138,11 +1401,11 @@ function App() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [pb, chatThreadId, chatUseGatewayApi, chatGatewayToken]);
+  }, [pb, chatThreadId, chatUseGatewayApi, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     void refreshLibrary("all");
-  }, [chatGatewayToken]);
+  }, [chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     void refreshPostHistory();
@@ -1177,7 +1440,7 @@ function App() {
       return;
     }
     void loadMediaPreview(null);
-  }, [mobileTab, selectedFeedItem, selectedJournalItem, chatGatewayToken]);
+  }, [mobileTab, selectedFeedItem, selectedJournalItem, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     if (!selectedFeedItem || selectedFeedItem.kind !== "text") {
@@ -1192,7 +1455,7 @@ function App() {
     autosaveTimerRef.current = window.setTimeout(async () => {
       try {
         const token = chatGatewayToken.trim() || undefined;
-        await saveLibraryText(selectedFeedItem.path, selectedFeedText, token);
+        await saveLibraryText(selectedFeedItem.path, selectedFeedText, token, gatewayBaseUrl);
         setFeedEditStatus(`Autosaved ${selectedFeedItem.path}`);
       } catch (error) {
         setFeedEditStatus(
@@ -1205,7 +1468,7 @@ function App() {
         window.clearTimeout(autosaveTimerRef.current);
       }
     };
-  }, [selectedFeedText, selectedFeedItem, chatGatewayToken]);
+  }, [selectedFeedText, selectedFeedItem, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     if (!feedCaptionPath || loadedCaptionPathRef.current !== feedCaptionPath) {
@@ -1217,7 +1480,7 @@ function App() {
     const timer = window.setTimeout(async () => {
       try {
         const token = chatGatewayToken.trim() || undefined;
-        await saveLibraryText(feedCaptionPath, feedCaptionText, token);
+        await saveLibraryText(feedCaptionPath, feedCaptionText, token, gatewayBaseUrl);
         setFeedEditStatus(`Autosaved caption: ${feedCaptionPath}`);
       } catch (error) {
         setFeedEditStatus(
@@ -1228,11 +1491,67 @@ function App() {
     return () => {
       window.clearTimeout(timer);
     };
-  }, [feedCaptionText, feedCaptionPath, selectedFeedItem, chatGatewayToken]);
+  }, [feedCaptionText, feedCaptionPath, selectedFeedItem, chatGatewayToken, gatewayBaseUrl]);
 
   const journalList = journalItems;
   const feedList = feedItems;
   const postedHistory = history.filter((item) => item.status === "success");
+  const needsMobileQrLogin = !isDesktopClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
+
+  if (needsMobileQrLogin) {
+    return (
+      <div className="app-shell">
+        <main className="page-content">
+          <div className="stack">
+            <div className="card">
+              <h2>Connect To Desktop</h2>
+              <p className="text-sm muted">
+                Scan the QR from the desktop app to sync gateway URL + token.
+              </p>
+              <div className="stack" style={{ alignItems: "center", gap: "0.8rem" }}>
+                <video
+                  ref={mobileScannerVideoRef}
+                  style={{
+                    width: "100%",
+                    maxWidth: "360px",
+                    borderRadius: "14px",
+                    background: "#000",
+                    minHeight: "240px"
+                  }}
+                  playsInline
+                  muted
+                />
+                <div className="row">
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => setMobileScannerActive(true)}
+                    disabled={mobileScannerActive}
+                  >
+                    {mobileScannerActive ? "Scanning..." : "Start Scanner"}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={stopMobileScanner}
+                    disabled={!mobileScannerActive}
+                  >
+                    Stop
+                  </button>
+                </div>
+                <p className="text-sm muted text-center">{mobileScannerStatus}</p>
+                {mobileCameraPermissionError ? (
+                  <p className="text-sm text-center" style={{ color: "var(--danger)" }}>
+                    {mobileCameraPermissionError}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -1642,23 +1961,19 @@ function App() {
         {mobileTab === "profile" ? (
           <div className="stack">
             <div className="card">
-              <h2>Bluesky Login</h2>
+              <h2>Bluesky Login (Desktop)</h2>
               <form className="stack" onSubmit={handleLogin}>
-                <input
-                  value={creds.serviceUrl}
-                  onChange={(e) => setCreds(prev => ({ ...prev, serviceUrl: e.target.value }))}
-                  placeholder="https://bsky.social"
-                />
+                <p className="text-sm muted">Service: {creds.serviceUrl || "https://bsky.social"}</p>
                 <input
                   value={creds.handle}
                   onChange={(e) => setCreds(prev => ({ ...prev, handle: e.target.value }))}
-                  placeholder="Handle or Email"
+                  placeholder="Bluesky Handle or Email"
                 />
                 <input
                   type="password"
                   value={creds.appPassword}
                   onChange={(e) => setCreds(prev => ({ ...prev, appPassword: e.target.value }))}
-                  placeholder="App Password"
+                  placeholder="Bluesky App Password"
                 />
                 <div className="row">
                   <button type="submit" className="primary" style={{ flex: 1 }}>Sign In</button>
@@ -1684,16 +1999,28 @@ function App() {
             <div className="card">
               <h2>Gateway & App Settings</h2>
               <div className="stack">
-                <p><strong>Gateway Pairing Token</strong></p>
-                <div className="row">
-                  <input
-                    value={chatPairCode}
-                    onChange={(e) => setChatPairCode(e.target.value)}
-                    placeholder="Pairing Code"
-                    style={{ flex: 1 }}
-                  />
-                  <button type="button" onClick={pairGatewayFromUi} disabled={chatPairing}>Pair</button>
-                </div>
+                <p><strong>Gateway Base URL</strong></p>
+                <input
+                  value={gatewayBaseUrl}
+                  onChange={(e) => setGatewayBaseUrl(e.target.value)}
+                  placeholder="http://127.0.0.1:42617"
+                />
+
+                {!isDesktopClient && (
+                  <>
+                    <p><strong>Manual Pairing Code</strong></p>
+                    <div className="row">
+                      <input
+                        value={chatPairCode}
+                        onChange={(e) => setChatPairCode(e.target.value)}
+                        placeholder="Pairing Code"
+                        style={{ flex: 1 }}
+                      />
+                      <button type="button" onClick={pairGatewayFromUi} disabled={chatPairing}>Pair</button>
+                    </div>
+                  </>
+                )}
+
                 {chatGatewayToken && (
                   <div className="stack" style={{ gap: "0.4rem" }}>
                     <div className="row">
@@ -1717,8 +2044,32 @@ function App() {
                       </button>
                     </div>
                     <p className="text-sm muted">
-                      {gatewayTokenCopyStatus || "Token synced and ready to use for `slowclaw pair new-code`."}
+                      {gatewayTokenCopyStatus || "Gateway token synced for chat + media APIs."}
                     </p>
+                  </div>
+                )}
+
+                {isDesktopClient && (
+                  <div className="stack" style={{ gap: "0.8rem" }}>
+                    <div className="row-between">
+                      <p><strong>Pair Mobile With QR</strong></p>
+                      <button
+                        type="button"
+                        onClick={() => void generateDesktopPairingQr()}
+                        disabled={desktopQrLoading}
+                      >
+                        {desktopQrLoading ? "Generating..." : "Generate QR"}
+                      </button>
+                    </div>
+                    {desktopQrPayload && (
+                      <div className="stack" style={{ alignItems: "center", gap: "0.6rem" }}>
+                        <QRCodeCanvas value={desktopQrPayload.qr_value} size={220} includeMargin />
+                        <p className="text-sm muted text-center">
+                          Mobile gateway: {desktopQrPayload.gateway_url}
+                        </p>
+                      </div>
+                    )}
+                    {desktopQrStatus ? <p className="text-sm muted">{desktopQrStatus}</p> : null}
                   </div>
                 )}
 

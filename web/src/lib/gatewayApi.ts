@@ -1,5 +1,14 @@
 import type { LibraryItem } from "./types";
 
+function resolveGatewayEndpoint(path: string, gatewayBaseUrl?: string): string {
+  if (!gatewayBaseUrl || !gatewayBaseUrl.trim()) {
+    return path;
+  }
+  const base = gatewayBaseUrl.trim().replace(/\/+$/, "");
+  const suffix = path.startsWith("/") ? path : `/${path}`;
+  return `${base}${suffix}`;
+}
+
 function authHeaders(token?: string, contentType?: string): HeadersInit {
   return {
     ...(contentType ? { "Content-Type": contentType } : {}),
@@ -21,12 +30,12 @@ async function parseJsonOrThrow(res: Response) {
   return data;
 }
 
-export async function pairGatewayClient(oneTimeCode: string) {
+export async function pairGatewayClient(oneTimeCode: string, gatewayBaseUrl?: string) {
   const code = oneTimeCode.trim();
   if (!code) {
     throw new Error("Pairing code is required");
   }
-  const res = await fetch("/pair", {
+  const res = await fetch(resolveGatewayEndpoint("/pair", gatewayBaseUrl), {
     method: "POST",
     headers: {
       "X-Pairing-Code": code
@@ -42,21 +51,32 @@ export async function pairGatewayClient(oneTimeCode: string) {
 
 export async function listLibraryItems(
   scope: "all" | "journal" | "feed",
-  bearerToken?: string
+  bearerToken?: string,
+  gatewayBaseUrl?: string
 ): Promise<LibraryItem[]> {
   const params = new URLSearchParams({ scope, limit: "400" });
-  const res = await fetch(`/api/library/items?${params}`, {
+  const res = await fetch(
+    resolveGatewayEndpoint(`/api/library/items?${params}`, gatewayBaseUrl),
+    {
     headers: authHeaders(bearerToken)
-  });
+    }
+  );
   const data = await parseJsonOrThrow(res);
   return Array.isArray(data.items) ? (data.items as LibraryItem[]) : [];
 }
 
-export async function readLibraryText(path: string, bearerToken?: string): Promise<string> {
+export async function readLibraryText(
+  path: string,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<string> {
   const params = new URLSearchParams({ path });
-  const res = await fetch(`/api/library/text?${params}`, {
+  const res = await fetch(
+    resolveGatewayEndpoint(`/api/library/text?${params}`, gatewayBaseUrl),
+    {
     headers: authHeaders(bearerToken)
-  });
+    }
+  );
   const data = await parseJsonOrThrow(res);
   return String(data.content || "");
 }
@@ -64,9 +84,10 @@ export async function readLibraryText(path: string, bearerToken?: string): Promi
 export async function saveLibraryText(
   path: string,
   content: string,
-  bearerToken?: string
+  bearerToken?: string,
+  gatewayBaseUrl?: string
 ): Promise<void> {
-  const res = await fetch("/api/library/save-text", {
+  const res = await fetch(resolveGatewayEndpoint("/api/library/save-text", gatewayBaseUrl), {
     method: "POST",
     headers: authHeaders(bearerToken, "application/json"),
     body: JSON.stringify({ path, content })
@@ -77,9 +98,10 @@ export async function saveLibraryText(
 export async function createJournalTextViaGateway(
   title: string,
   content: string,
-  bearerToken?: string
+  bearerToken?: string,
+  gatewayBaseUrl?: string
 ) {
-  const res = await fetch("/api/journal/text", {
+  const res = await fetch(resolveGatewayEndpoint("/api/journal/text", gatewayBaseUrl), {
     method: "POST",
     headers: authHeaders(bearerToken, "application/json"),
     body: JSON.stringify({ title, content, source: "mobile-ui" })
@@ -90,7 +112,8 @@ export async function createJournalTextViaGateway(
 export async function uploadMediaViaGateway(
   file: Blob,
   options: { kind: "audio" | "video" | "image" | "file"; filename: string; title?: string; entryId?: string },
-  bearerToken?: string
+  bearerToken?: string,
+  gatewayBaseUrl?: string
 ) {
   const params = new URLSearchParams({
     kind: options.kind,
@@ -102,20 +125,28 @@ export async function uploadMediaViaGateway(
   if (options.entryId) {
     params.set("entry_id", options.entryId);
   }
-  const res = await fetch(`/api/media/upload?${params}`, {
+  const res = await fetch(
+    resolveGatewayEndpoint(`/api/media/upload?${params}`, gatewayBaseUrl),
+    {
     method: "POST",
     headers: authHeaders(bearerToken, file.type || "application/octet-stream"),
     body: file
-  });
+    }
+  );
   return parseJsonOrThrow(res);
 }
 
 export async function fetchMediaAsFile(
   mediaUrl: string,
   filename: string,
-  bearerToken?: string
+  bearerToken?: string,
+  gatewayBaseUrl?: string
 ): Promise<File> {
-  const res = await fetch(mediaUrl, { headers: authHeaders(bearerToken) });
+  const target =
+    mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")
+      ? mediaUrl
+      : resolveGatewayEndpoint(mediaUrl, gatewayBaseUrl);
+  const res = await fetch(target, { headers: authHeaders(bearerToken) });
   if (!res.ok) {
     throw new Error(`Failed to fetch media (${res.status})`);
   }

@@ -212,9 +212,9 @@ cd web && npm run build
 cd .. && cargo build --release
 ```
 
-## Tauri v2 Mobile App (Scaffolded)
+## Tauri v2 Unified Desktop App
 
-This repo now includes a Tauri v2 scaffold at:
+This repo now includes a Tauri v2 desktop scaffold at:
 
 - `web/src-tauri/`
 
@@ -222,8 +222,32 @@ Included:
 
 - secure credential bridge commands (`get_secret`, `set_secret`, `delete_secret`) backed by OS keyring
 - `tauri.conf.json`
-- default capability file
-- npm scripts for iOS/Android init + dev
+- capability files
+- sidecar bootstrap for:
+  - PocketBase
+  - SlowClaw daemon backend
+- single desktop dev loop via:
+  - `npm run tauri dev`
+
+### Desktop dev loop (frontend + backend + sidecars)
+
+```bash
+cd web
+npm install
+npm run tauri dev
+```
+
+At app startup, Tauri now:
+
+1. launches PocketBase sidecar (127.0.0.1:8090),
+2. launches `slowclaw daemon` backend (127.0.0.1:42617),
+3. terminates both when the app exits.
+
+Sidecar orchestration is compiled only for desktop targets (`not(iOS/Android)`), so mobile builds stay thin-client only.
+
+For packaging, place sidecar binaries in:
+
+- `web/src-tauri/binaries/`
 
 ### Prerequisites (macOS/iOS)
 
@@ -254,6 +278,7 @@ npm run tauri:ios:dev
 
 - Gateway build still uses `npm run build` (`/_app/` asset base) for embedded Rust gateway UI.
 - Tauri build uses `npm run build:tauri` (`./` asset base) and is wired in `src-tauri/tauri.conf.json`.
+- Desktop bundle sidecars are configured in `src-tauri/tauri.conf.json` `bundle.externalBin`.
 - After `tauri ios init`, open the generated Xcode project and set:
   - camera + microphone usage descriptions
   - local network usage description
