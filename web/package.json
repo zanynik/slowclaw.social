@@ -13,9 +13,9 @@
     "pb:bootstrap": "node ../scripts/pb-bootstrap.mjs",
     "tauri": "tauri",
     "tauri:ios:init": "tauri ios init",
-    "tauri:ios:dev": "tauri ios dev --open --host",
+    "tauri:ios:dev": "tauri ios dev --open --host --config src-tauri/tauri.ios.conf.json",
     "tauri:android:init": "tauri android init",
-    "tauri:android:dev": "tauri android dev --open --host"
+    "tauri:android:dev": "tauri android dev --open --host --config src-tauri/tauri.android.conf.json"
   },
   "dependencies": {
     "@atproto/api": "^0.13.24",

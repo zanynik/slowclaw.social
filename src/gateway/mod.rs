@@ -22,7 +22,7 @@ use chrono::Datelike;
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, Path as AxumPath, Query, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tower::ServiceExt as _;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeFile;
 use tower_http::timeout::TimeoutLayer;
@@ -628,6 +629,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/pair", post(handle_pair))
         .route("/pair/new-code", post(handle_pair_new_code))
         .route("/webhook", post(handle_webhook))
+        .route("/api/chat/latest-thread", get(handle_chat_latest_thread))
         .route("/api/chat/messages", get(handle_chat_list).post(handle_chat_send))
         .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
@@ -655,7 +657,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .merge(core_router)
         .merge(media_router)
         .route("/_app/{*path}", get(static_files::handle_static))
-        .fallback(get(static_files::handle_spa_fallback));
+        .fallback(get(static_files::handle_spa_fallback))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers(Any),
+        );
 
     // Run the server
     axum::serve(
@@ -949,6 +957,38 @@ async fn handle_chat_send(
     }
 }
 
+async fn handle_chat_latest_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Chat API") {
+        return err;
+    }
+
+    let Some(base_url) = state.pb_chat_base_url.as_deref() else {
+        let err = serde_json::json!({"error": "PocketBase chat bridge unavailable"});
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(err));
+    };
+
+    match fetch_latest_chat_thread_id(
+        base_url,
+        &state.pb_chat_collection,
+        state.pb_chat_token.as_deref(),
+    )
+    .await
+    {
+        Ok(thread_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "threadId": thread_id })),
+        ),
+        Err(e) => {
+            tracing::warn!("Chat latest-thread API failed: {e}");
+            let err = serde_json::json!({"error": e.to_string()});
+            (StatusCode::BAD_GATEWAY, Json(err))
+        }
+    }
+}
+
 fn pairing_auth_error(
     state: &AppState,
     headers: &HeaderMap,
@@ -975,6 +1015,74 @@ fn pairing_auth_error(
 #[derive(serde::Deserialize)]
 struct PocketBaseListRecords {
     items: Vec<serde_json::Value>,
+}
+
+async fn fetch_latest_chat_thread_id(
+    base_url: &str,
+    collection: &str,
+    token: Option<&str>,
+) -> Result<Option<String>> {
+    const PAGE_SIZE: usize = 100;
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/collections/{}/records",
+        base_url.trim_end_matches('/'),
+        collection.trim()
+    );
+
+    let mut best_ts = String::new();
+    let mut best_thread: Option<String> = None;
+
+    for page in 1..=5usize {
+        let page_str = page.to_string();
+        let page_size = PAGE_SIZE.to_string();
+        let mut req = client.get(&url).query(&[
+            ("page", page_str.as_str()),
+            ("perPage", page_size.as_str()),
+        ]);
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .send()
+            .await
+            .context("PocketBase chat latest-thread request failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("PocketBase chat latest-thread failed ({status}): {}", body.trim());
+        }
+        let list = resp
+            .json::<PocketBaseListRecords>()
+            .await
+            .context("PocketBase chat latest-thread decode failed")?;
+        let page_len = list.items.len();
+        for item in list.items {
+            let thread_id = item
+                .get("threadId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+            let Some(thread_id) = thread_id else {
+                continue;
+            };
+            let ts = item
+                .get("createdAtClient")
+                .or_else(|| item.get("created"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if ts >= best_ts {
+                best_ts = ts;
+                best_thread = Some(thread_id.to_string());
+            }
+        }
+        if page_len < PAGE_SIZE {
+            break;
+        }
+    }
+
+    Ok(best_thread)
 }
 
 async fn fetch_chat_thread_messages(
@@ -1158,9 +1266,10 @@ async fn handle_media_upload(
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| format!("upload-{}", Uuid::new_v4()));
+    let normalized_name = ensure_upload_filename_extension(&original_name, kind, &content_type);
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let rel_path = media_storage_rel_path(kind, &original_name);
+    let rel_path = media_storage_rel_path(kind, &normalized_name);
     let abs_path = workspace_dir.join(&rel_path);
     if let Some(parent) = abs_path.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -1418,6 +1527,67 @@ fn infer_media_kind_from_content_type(content_type: &str) -> &'static str {
     }
 }
 
+fn default_extension_for_upload(kind: &str, content_type: &str) -> &'static str {
+    let lower_ct = content_type.to_ascii_lowercase();
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "audio" => {
+            if lower_ct.contains("mpeg") {
+                "mp3"
+            } else if lower_ct.contains("wav") {
+                "wav"
+            } else if lower_ct.contains("flac") {
+                "flac"
+            } else if lower_ct.contains("aac") {
+                "aac"
+            } else if lower_ct.contains("webm") {
+                "webm"
+            } else {
+                "m4a"
+            }
+        }
+        "video" => {
+            if lower_ct.contains("webm") {
+                "webm"
+            } else if lower_ct.contains("quicktime") {
+                "mov"
+            } else {
+                "mp4"
+            }
+        }
+        "image" => {
+            if lower_ct.contains("png") {
+                "png"
+            } else if lower_ct.contains("webp") {
+                "webp"
+            } else {
+                "jpg"
+            }
+        }
+        _ => "bin",
+    }
+}
+
+fn ensure_upload_filename_extension(name: &str, kind: &str, content_type: &str) -> String {
+    let trimmed = name.trim();
+    let base = if trimmed.is_empty() {
+        format!("upload-{}", Uuid::new_v4())
+    } else {
+        trimmed.to_string()
+    };
+    let has_ext = StdPath::new(&base)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| !ext.trim().is_empty());
+    if has_ext {
+        return base;
+    }
+    format!(
+        "{}.{}",
+        base.trim_end_matches('.'),
+        default_extension_for_upload(kind, content_type)
+    )
+}
+
 fn safe_file_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len().min(128));
     for ch in name.chars() {
@@ -1595,26 +1765,34 @@ fn collect_library_items_recursive(
         if !meta.is_file() {
             continue;
         }
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let kind = match ext.as_str() {
-            "md" | "txt" | "json" | "srt" => "text",
-            "mp3" | "wav" | "m4a" | "aac" | "flac" => "audio",
-            "mp4" | "mov" | "webm" | "mkv" => "video",
-            "jpg" | "jpeg" | "png" | "webp" => "image",
-            _ => {
-                // Hide unknown binaries for a cleaner mobile UI.
-                continue;
-            }
-        };
         let rel = match path.strip_prefix(workspace_dir) {
             Ok(p) => p.to_string_lossy().to_string(),
             Err(_) => continue,
         };
         let rel_lower = rel.to_ascii_lowercase();
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let kind = if rel_lower.starts_with("journals/media/audio/") {
+            "audio"
+        } else if rel_lower.starts_with("journals/media/video/") {
+            "video"
+        } else if rel_lower.starts_with("journals/media/image/") {
+            "image"
+        } else {
+            match ext.as_str() {
+                "md" | "txt" | "json" | "srt" => "text",
+                "mp3" | "wav" | "m4a" | "aac" | "flac" => "audio",
+                "mp4" | "mov" | "webm" | "mkv" => "video",
+                "jpg" | "jpeg" | "png" | "webp" => "image",
+                _ => {
+                    // Hide unknown binaries for a cleaner mobile UI.
+                    continue;
+                }
+            }
+        };
 
         let scope_value = if rel.starts_with("posts/") || rel.starts_with("journals/processed/") {
             "feed"

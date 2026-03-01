@@ -5,17 +5,17 @@ import {
   loginBluesky,
   postTextToBluesky,
   postVideoToBluesky,
-  sendAuthedXrpcRequest,
   type BlueskySession
 } from "./lib/bluesky";
 import { AppBskyFeedDefs } from "@atproto/api";
 import {
-  createClawChatUserMessage,
   createClawChatUserMessageViaGateway,
   createPocketBaseClient,
+  ensurePocketBaseUserFromBluesky,
+  getLatestChatThreadViaGateway,
   listClawChatMessagesViaGateway,
-  listClawChatMessagesFromPocketBase,
   listDraftsFromPocketBase,
+  pocketBaseAuthLabel,
   listPostHistoryFromPocketBase,
   saveDraftToPocketBase,
   savePostHistoryToPocketBase
@@ -24,7 +24,6 @@ import {
   createJournalTextViaGateway,
   fetchMediaAsFile,
   listLibraryItems,
-  pairGatewayClient,
   readLibraryText,
   saveLibraryText,
   uploadMediaViaGateway
@@ -39,33 +38,30 @@ import {
   saveGatewayTokenSecure
 } from "./lib/secureStorage";
 import type {
-  ApiRequestState,
   BlueskyCredentials,
   ClawChatMessage,
   GatewayQrPayload,
   LibraryItem,
+  OpenAiDeviceCodeStatus,
   PostHistoryItem,
   StoredDraft
 } from "./lib/types";
 
-const initialApiRequest: ApiRequestState = {
-  method: "GET",
-  url: "xrpc/com.atproto.server.describeServer",
-  headersJson: "{}",
-  bodyJson: "{}",
-  includeBlueskyAuth: false
-};
-
 const CHAT_THREAD_STORAGE_KEY = "slowclaw.chat.thread_id";
 const CHAT_GATEWAY_TOKEN_STORAGE_KEY = "slowclaw.chat.gateway_token";
 const CHAT_GATEWAY_BASE_URL_STORAGE_KEY = "slowclaw.chat.gateway_base_url";
-const CHAT_USE_GATEWAY_STORAGE_KEY = "slowclaw.chat.use_gateway";
 const UI_THEME_STORAGE_KEY = "slowclaw.ui.theme";
 const UI_TAB_STORAGE_KEY = "slowclaw.ui.tab";
 const FEED_POSTED_PATHS_STORAGE_KEY = "slowclaw.feed.posted_paths";
+const DESKTOP_SECRET_SERVICE = "social.slowclaw.gateway";
+const PROVIDER_API_KEY_SECRET_ACCOUNT = "provider.api_key";
 
 type MobileTab = "journal" | "feed" | "chat" | "profile";
 type ThemeMode = "light" | "dark";
+type DesktopGatewayBootstrap = {
+  token?: string | null;
+  gatewayUrl?: string | null;
+};
 
 function defaultThemeMode(): ThemeMode {
   if (typeof window === "undefined") {
@@ -83,7 +79,7 @@ function defaultMobileTab(): MobileTab {
     return "journal";
   }
   const saved = window.localStorage.getItem(UI_TAB_STORAGE_KEY);
-  return saved === "feed" || saved === "chat" ? saved : "journal";
+  return saved === "feed" || saved === "chat" || saved === "profile" ? saved : "journal";
 }
 
 function formatBytes(bytes: number) {
@@ -130,21 +126,6 @@ function defaultPocketBaseUrlForUi() {
   const protocol = window.location.protocol === "https:" ? "https:" : "http:";
   const host = window.location.hostname || "127.0.0.1";
   return `${protocol}//${host}:8090`;
-}
-
-function defaultUseGatewayChatApi() {
-  if (typeof window === "undefined") {
-    return true;
-  }
-  const stored = window.localStorage.getItem(CHAT_USE_GATEWAY_STORAGE_KEY);
-  if (stored === "true") {
-    return true;
-  }
-  if (stored === "false") {
-    return false;
-  }
-  // Assume gateway-served UI should use gateway API; Vite dev usually runs on 5173.
-  return window.location.port !== "5173";
 }
 
 function isTauriDesktopRuntime() {
@@ -208,8 +189,6 @@ function App() {
   const [videoAlt, setVideoAlt] = useState("");
   const [isPosting, setIsPosting] = useState(false);
   const [status, setStatus] = useState<string>("");
-  const [apiRequest, setApiRequest] = useState<ApiRequestState>(initialApiRequest);
-  const [apiResponse, setApiResponse] = useState<string>("");
   const [drafts, setDrafts] = useState<StoredDraft[]>([]);
   const [history, setHistory] = useState<PostHistoryItem[]>([]);
   const [postedPaths, setPostedPaths] = useState<Record<string, true>>(() => {
@@ -237,16 +216,15 @@ function App() {
   });
   const [chatThreadId, setChatThreadId] = useState<string>(() => {
     if (typeof window === "undefined") {
-      return createThreadId();
+      return "";
     }
     const saved = window.localStorage.getItem(CHAT_THREAD_STORAGE_KEY);
-    return saved && saved.trim() ? saved.trim() : createThreadId();
+    return saved && saved.trim() ? saved.trim() : "";
   });
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState<ClawChatMessage[]>([]);
   const [chatStatus, setChatStatus] = useState("Chat idle");
   const [chatSending, setChatSending] = useState(false);
-  const [chatUseGatewayApi, setChatUseGatewayApi] = useState<boolean>(defaultUseGatewayChatApi);
   const [chatGatewayToken, setChatGatewayToken] = useState<string>(() => {
     if (typeof window === "undefined") {
       return "";
@@ -256,13 +234,9 @@ function App() {
   const [desktopQrLoading, setDesktopQrLoading] = useState(false);
   const [desktopQrPayload, setDesktopQrPayload] = useState<GatewayQrPayload | null>(null);
   const [desktopQrStatus, setDesktopQrStatus] = useState("");
-  const [chatPairCode, setChatPairCode] = useState("");
-  const [chatPairing, setChatPairing] = useState(false);
-  const [showGatewayToken, setShowGatewayToken] = useState(false);
-  const [gatewayTokenCopyStatus, setGatewayTokenCopyStatus] = useState("");
   const [themeMode, setThemeMode] = useState<ThemeMode>(defaultThemeMode);
   const [mobileTab, setMobileTab] = useState<MobileTab>(defaultMobileTab);
-  const [journalSidebarOpen, setJournalSidebarOpen] = useState(false);
+  const [journalSidebarOpen, setJournalSidebarOpen] = useState(isDesktopClient);
   const [feedSidebarOpen, setFeedSidebarOpen] = useState(false);
   const [journalItems, setJournalItems] = useState<LibraryItem[]>([]);
   const [feedItems, setFeedItems] = useState<LibraryItem[]>([]);
@@ -289,6 +263,12 @@ function App() {
     percent: number;
     label: string;
   } | null>(null);
+  const [aiSetupStatus, setAiSetupStatus] = useState<OpenAiDeviceCodeStatus | null>(null);
+  const [aiSetupBusy, setAiSetupBusy] = useState(false);
+  const [pbAuthMessage, setPbAuthMessage] = useState("");
+  const [pbAuthLabel, setPbAuthLabel] = useState("");
+  const [providerApiKey, setProviderApiKey] = useState("");
+  const [providerApiKeyStatus, setProviderApiKeyStatus] = useState("");
   const [mobileScannerActive, setMobileScannerActive] = useState(() => {
     if (typeof window === "undefined") {
       return false;
@@ -309,6 +289,7 @@ function App() {
   const autosaveTimerRef = useRef<number | null>(null);
   const loadedTextPathRef = useRef<string>("");
   const loadedCaptionPathRef = useRef<string>("");
+  const chatThreadHydratedRef = useRef(false);
   const mobileScannerVideoRef = useRef<HTMLVideoElement | null>(null);
   const mobileScannerStreamRef = useRef<MediaStream | null>(null);
   const mobileScannerRafRef = useRef<number | null>(null);
@@ -337,16 +318,70 @@ function App() {
   const pb = useMemo(() => createPocketBaseClient(pbUrl), [pbUrl]);
 
   useEffect(() => {
+    const label = pocketBaseAuthLabel(pb);
+    setPbAuthLabel(label);
+    if (pb.authStore.isValid) {
+      setPbAuthMessage(label ? `PocketBase signed in as ${label}` : "PocketBase signed in");
+    } else {
+      setPbAuthMessage("PocketBase not signed in");
+    }
+  }, [pb]);
+
+  useEffect(() => {
     let cancelled = false;
     (async () => {
       const secureCreds = await loadCredentialsSecure();
       if (!cancelled && secureCreds) {
         setCreds(secureCreds);
+        if (secureCreds.handle.trim() && secureCreds.appPassword.trim()) {
+          try {
+            const { agent: autoAgent, session: autoSession } = await loginBluesky(secureCreds);
+            if (!cancelled) {
+              setAgent(autoAgent);
+              setSession(autoSession);
+              setAuthMessage(`Signed in as ${autoSession.handle}`);
+            }
+            try {
+              const pbSync = await ensurePocketBaseUserFromBluesky(
+                pb,
+                secureCreds.handle,
+                secureCreds.appPassword,
+                autoSession.handle
+              );
+              if (!cancelled) {
+                const label = pocketBaseAuthLabel(pb);
+                setPbAuthLabel(label);
+                setPbAuthMessage(
+                  pbSync.created
+                    ? `PocketBase user provisioned and signed in (${label || pbSync.identity})`
+                    : `PocketBase signed in as ${label || pbSync.identity}`
+                );
+              }
+            } catch (error) {
+              if (!cancelled) {
+                setPbAuthMessage(
+                  `PocketBase auto-login failed (${error instanceof Error ? error.message : String(error)})`
+                );
+              }
+            }
+          } catch {
+            // Keep login-gated flow; user can sign in explicitly.
+          }
+        }
       }
       if (!cancelled && isDesktopClient) {
         const secureGatewayToken = await loadGatewayTokenSecure();
         if (secureGatewayToken) {
           setChatGatewayToken(secureGatewayToken);
+        } else {
+          await syncDesktopGatewayBootstrap();
+        }
+        const apiKeySecret = await invokeDesktopCommand<{ value: string | null }>("get_secret", {
+          req: { service: DESKTOP_SECRET_SERVICE, account: PROVIDER_API_KEY_SECRET_ACCOUNT }
+        });
+        if (apiKeySecret?.value) {
+          setProviderApiKey(apiKeySecret.value);
+          setProviderApiKeyStatus("Loaded saved API key");
         }
       }
       if (!cancelled) {
@@ -395,14 +430,25 @@ function App() {
   }, [gatewayBaseUrl]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
+    if (!isDesktopClient || chatGatewayToken.trim()) {
       return;
     }
-    window.localStorage.setItem(
-      CHAT_USE_GATEWAY_STORAGE_KEY,
-      chatUseGatewayApi ? "true" : "false"
-    );
-  }, [chatUseGatewayApi]);
+    let cancelled = false;
+    const run = async () => {
+      if (cancelled) {
+        return;
+      }
+      await syncDesktopGatewayBootstrap();
+    };
+    void run();
+    const timer = window.setInterval(() => {
+      void run();
+    }, 1200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [isDesktopClient, chatGatewayToken]);
 
   useEffect(() => {
     if (typeof document !== "undefined") {
@@ -418,6 +464,12 @@ function App() {
       window.localStorage.setItem(UI_TAB_STORAGE_KEY, mobileTab);
     }
   }, [mobileTab]);
+
+  useEffect(() => {
+    if (isDesktopClient && mobileTab === "journal") {
+      setJournalSidebarOpen(true);
+    }
+  }, [isDesktopClient, mobileTab]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -439,17 +491,32 @@ function App() {
   }, [mediaPreviewUrl]);
 
   async function refreshLibrary(scope: "journal" | "feed" | "all") {
-    const token = chatGatewayToken.trim() || undefined;
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
     try {
       if (scope === "journal" || scope === "all") {
-        const items = await listLibraryItems("journal", token, gatewayBaseUrl);
+        const items = (await listLibraryItems("journal", token || undefined, gatewayBaseUrl)).filter((item) => {
+          const path = item.path.toLowerCase();
+          if (!path.startsWith("journals/")) {
+            return false;
+          }
+          if (path.startsWith("journals/media/")) {
+            return true;
+          }
+          if (item.kind !== "text") {
+            return false;
+          }
+          return path.startsWith("journals/text/");
+        });
         setJournalItems(items);
         if (items.length > 0 && !selectedJournalPath) {
           setSelectedJournalPath(items[0].path);
         }
       }
       if (scope === "feed" || scope === "all") {
-        const items = (await listLibraryItems("feed", token, gatewayBaseUrl)).filter((item) => {
+        const items = (await listLibraryItems("feed", token || undefined, gatewayBaseUrl)).filter((item) => {
           const path = item.path.toLowerCase();
           if (path.endsWith(".caption.txt")) {
             return false;
@@ -473,7 +540,22 @@ function App() {
   }
 
   async function uploadJournalFile(file: File, kind: "audio" | "video") {
-    const token = chatGatewayToken.trim() || undefined;
+    let token = chatGatewayToken.trim();
+    if (!gatewayBaseUrl.trim()) {
+      setRecordingHint("Upload blocked (gateway URL missing). Pair mobile with desktop QR.");
+      return;
+    }
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token) {
+      setRecordingHint(
+        isDesktopClient
+          ? "Upload blocked (desktop gateway token not ready). Wait 2-3s or restart app."
+          : "Upload blocked (gateway token missing). Pair mobile with desktop QR."
+      );
+      return;
+    }
     setRecordingHint(`Uploading ${file.name}...`);
     try {
       const result = await uploadMediaViaGateway(
@@ -492,6 +574,10 @@ function App() {
         )})`
       );
       await refreshLibrary("journal");
+      const uploadedPath = String(result.path || "").trim();
+      if (uploadedPath) {
+        setSelectedJournalPath(uploadedPath);
+      }
     } catch (error) {
       setRecordingHint(
         `Upload failed (${error instanceof Error ? error.message : String(error)})`
@@ -751,23 +837,42 @@ function App() {
   }
 
   async function refreshClawChat() {
-    if (!chatThreadId.trim()) {
-      return;
-    }
     if (!gatewayBaseUrl.trim()) {
       return;
     }
     try {
-      const threadId = chatThreadId.trim();
-      const token = chatGatewayToken.trim() || undefined;
-      const items = chatUseGatewayApi
-        ? await listClawChatMessagesViaGateway(threadId, token, gatewayBaseUrl)
-        : await listClawChatMessagesFromPocketBase(pb, threadId);
+      let token = chatGatewayToken.trim();
+      if (!token && isDesktopClient) {
+        token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+      }
+      let threadId = chatThreadId.trim();
+      if (!threadId && token) {
+        const latest = await getLatestChatThreadViaGateway(token, gatewayBaseUrl).catch(() => null);
+        if (latest) {
+          threadId = latest;
+          setChatThreadId(latest);
+          chatThreadHydratedRef.current = true;
+        }
+      }
+      if (!threadId) {
+        setChatMessages([]);
+        setChatStatus("No chat thread yet. Send a message to start.");
+        return;
+      }
+
+      const items = await listClawChatMessagesViaGateway(threadId, token, gatewayBaseUrl);
+      if (items.length === 0 && token && !chatThreadHydratedRef.current) {
+        const latest = await getLatestChatThreadViaGateway(token, gatewayBaseUrl).catch(() => null);
+        chatThreadHydratedRef.current = true;
+        if (latest && latest !== threadId) {
+          setChatThreadId(latest);
+          setChatStatus(`Loaded latest chat thread: ${latest}`);
+          return;
+        }
+      }
+
       setChatMessages(items);
-      setChatStatus(
-        `Chat thread loaded (${items.length} messages) via ${chatUseGatewayApi ? "gateway" : "pocketbase"
-        }`
-      );
+      setChatStatus(`Chat thread loaded (${items.length} messages)`);
     } catch (error) {
       setChatStatus(
         `Chat unavailable (${error instanceof Error ? error.message : String(error)})`
@@ -782,8 +887,38 @@ function App() {
       const { agent: nextAgent, session: nextSession } = await loginBluesky(creds);
       setAgent(nextAgent);
       setSession(nextSession);
-      void saveBlueskySessionSecure(nextSession);
-      setAuthMessage(`Signed in as ${nextSession.handle}`);
+      await saveBlueskySessionSecure(nextSession);
+      try {
+        const pbSync = await ensurePocketBaseUserFromBluesky(
+          pb,
+          creds.handle,
+          creds.appPassword,
+          nextSession.handle
+        );
+        const label = pocketBaseAuthLabel(pb);
+        setPbAuthLabel(label);
+        setPbAuthMessage(
+          pbSync.created
+            ? `PocketBase user provisioned and signed in (${label || pbSync.identity})`
+            : `PocketBase signed in as ${label || pbSync.identity}`
+        );
+      } catch (error) {
+        setPbAuthMessage(
+          `PocketBase auto-login failed (${error instanceof Error ? error.message : String(error)})`
+        );
+      }
+      if (isDesktopClient) {
+        try {
+          await restartGatewayDaemonFromDesktop();
+          setAuthMessage(`Signed in as ${nextSession.handle}. Gateway restarted with new credentials.`);
+        } catch (error) {
+          setAuthMessage(
+            `Signed in as ${nextSession.handle}, but gateway restart failed (${error instanceof Error ? error.message : String(error)}).`
+          );
+        }
+      } else {
+        setAuthMessage(`Signed in as ${nextSession.handle}`);
+      }
     } catch (error) {
       setAgent(null);
       setSession(null);
@@ -885,85 +1020,34 @@ function App() {
     }
   }
 
-  async function sendApiRequest() {
-    setApiResponse("Sending...");
-    try {
-      const headers = JSON.parse(apiRequest.headersJson || "{}") as Record<string, string>;
-      const hasBody = apiRequest.method !== "GET";
-      const body = hasBody ? JSON.parse(apiRequest.bodyJson || "{}") : undefined;
-
-      let result: unknown;
-      if (apiRequest.includeBlueskyAuth && session) {
-        result = await sendAuthedXrpcRequest({
-          serviceUrl: creds.serviceUrl,
-          accessJwt: session.accessJwt,
-          method: apiRequest.method,
-          url: apiRequest.url,
-          headers,
-          body
-        });
-      } else {
-        const target = apiRequest.url.startsWith("http")
-          ? apiRequest.url
-          : `${creds.serviceUrl.replace(/\/+$/, "")}/${apiRequest.url.replace(/^\/+/, "")}`;
-
-        const res = await fetch(target, {
-          method: apiRequest.method,
-          headers,
-          body: hasBody ? JSON.stringify(body) : undefined
-        });
-        const textRes = await res.text();
-        let parsed: unknown = textRes;
-        try {
-          parsed = JSON.parse(textRes);
-        } catch {
-          // keep text
-        }
-        result = {
-          ok: res.ok,
-          status: res.status,
-          statusText: res.statusText,
-          data: parsed
-        };
-      }
-
-      setApiResponse(JSON.stringify(result, null, 2));
-    } catch (error) {
-      setApiResponse(
-        JSON.stringify(
-          {
-            error: error instanceof Error ? error.message : String(error)
-          },
-          null,
-          2
-        )
-      );
-    }
-  }
-
   async function sendClawChatMessage() {
     const content = chatInput.trim();
-    const threadId = chatThreadId.trim();
-    if (!threadId) {
-      setChatStatus("Set a thread ID first");
-      return;
-    }
     if (!content) {
       setChatStatus("Enter a message first");
       return;
     }
 
     setChatSending(true);
-    setChatStatus(
-      `Sending message via ${chatUseGatewayApi ? "gateway" : "PocketBase"}...`
-    );
+    setChatStatus("Sending message...");
     try {
-      const token = chatGatewayToken.trim() || undefined;
-      if (chatUseGatewayApi) {
-        await createClawChatUserMessageViaGateway(threadId, content, token, gatewayBaseUrl);
-      } else {
-        await createClawChatUserMessage(pb, threadId, content);
+      let token = chatGatewayToken.trim();
+      if (!token && isDesktopClient) {
+        token = (await syncDesktopGatewayBootstrap())?.trim() || "";
       }
+      if (!token) {
+        setChatStatus(
+          isDesktopClient
+            ? "Chat blocked (desktop gateway token not ready). Wait 2-3s or restart app."
+            : "Chat blocked (gateway token missing). Pair mobile with desktop QR."
+        );
+        return;
+      }
+      let threadId = chatThreadId.trim();
+      if (!threadId) {
+        threadId = createThreadId();
+        setChatThreadId(threadId);
+      }
+      await createClawChatUserMessageViaGateway(threadId, content, token, gatewayBaseUrl);
       setChatInput("");
       setChatStatus("Message queued (waiting for SlowClaw reply)");
       await refreshClawChat();
@@ -1191,46 +1275,6 @@ function App() {
     }
   }, [feedSource, agent, session]);
 
-  async function pairGatewayFromUi() {
-    const code = chatPairCode.trim();
-    if (!code) {
-      setChatStatus("Enter the one-time pairing code shown in the daemon terminal");
-      return;
-    }
-    setChatPairing(true);
-    setChatStatus("Pairing with gateway...");
-    try {
-      const result = await pairGatewayClient(code, gatewayBaseUrl);
-      if (!result.token) {
-        throw new Error("Gateway returned no token");
-      }
-      setChatGatewayToken(result.token);
-      setChatPairCode("");
-      setChatStatus(result.message || "Paired. Token saved in browser storage.");
-      await refreshClawChat();
-    } catch (error) {
-      setChatStatus(
-        `Pairing failed (${error instanceof Error ? error.message : String(error)})`
-      );
-    } finally {
-      setChatPairing(false);
-    }
-  }
-
-  async function copyGatewayToken() {
-    const token = chatGatewayToken.trim();
-    if (!token) {
-      setGatewayTokenCopyStatus("No token to copy");
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(token);
-      setGatewayTokenCopyStatus("Token copied");
-    } catch {
-      setGatewayTokenCopyStatus("Copy failed");
-    }
-  }
-
   function applyGatewayConnection(gatewayUrl: string, token: string) {
     const normalizedUrl = gatewayUrl.trim().replace(/\/+$/, "");
     const normalizedToken = token.trim();
@@ -1272,11 +1316,138 @@ function App() {
     }
   }
 
+  async function invokeDesktopCommandStrict<T>(cmd: string, args: Record<string, unknown> = {}) {
+    const core = await import("@tauri-apps/api/core");
+    return core.invoke<T>(cmd, args);
+  }
+
+  async function syncDesktopGatewayBootstrap(): Promise<string | null> {
+    if (!isDesktopClient) {
+      return null;
+    }
+    try {
+      const payload = await invokeDesktopCommandStrict<DesktopGatewayBootstrap>(
+        "get_desktop_gateway_bootstrap"
+      );
+      const nextUrl = String(payload.gatewayUrl || "").trim().replace(/\/+$/, "");
+      if (nextUrl) {
+        setGatewayBaseUrl((current) => {
+          const normalized = current.trim().replace(/\/+$/, "");
+          return normalized === nextUrl ? current : nextUrl;
+        });
+      }
+      const nextToken = String(payload.token || "").trim();
+      if (nextToken) {
+        setChatGatewayToken(nextToken);
+        return nextToken;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function restartGatewayDaemonFromDesktop() {
+    if (!isDesktopClient) {
+      return;
+    }
+    await invokeDesktopCommandStrict<string>("restart_gateway_daemon");
+  }
+
+  async function loadOpenAiDeviceCodeStatus() {
+    if (!isDesktopClient) {
+      return;
+    }
+    try {
+      const next = await invokeDesktopCommandStrict<OpenAiDeviceCodeStatus>(
+        "get_openai_device_code_status"
+      );
+      setAiSetupStatus(next);
+    } catch (error) {
+      setAiSetupStatus({
+        state: "error",
+        running: false,
+        completed: false,
+        message: `AI setup status unavailable (${error instanceof Error ? error.message : String(error)})`,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  async function startOpenAiDeviceCodeLogin() {
+    if (!isDesktopClient) {
+      setAiSetupStatus({
+        state: "error",
+        running: false,
+        completed: false,
+        message: "AI setup is desktop-only.",
+        error: "desktop-only"
+      });
+      return;
+    }
+    setAiSetupBusy(true);
+    try {
+      const next = await invokeDesktopCommandStrict<OpenAiDeviceCodeStatus>(
+        "start_openai_device_code_login"
+      );
+      setAiSetupStatus(next);
+    } catch (error) {
+      setAiSetupStatus({
+        state: "error",
+        running: false,
+        completed: false,
+        message: `Failed to start OpenAI setup (${error instanceof Error ? error.message : String(error)})`,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } finally {
+      setAiSetupBusy(false);
+    }
+  }
+
+  async function saveOptionalProviderApiKey() {
+    if (!isDesktopClient) {
+      setProviderApiKeyStatus("API key storage is desktop-only.");
+      return;
+    }
+    const trimmed = providerApiKey.trim();
+    setProviderApiKeyStatus(trimmed ? "Saving API key..." : "Clearing API key...");
+    try {
+      if (trimmed) {
+        await invokeDesktopCommandStrict("set_secret", {
+          req: {
+            service: DESKTOP_SECRET_SERVICE,
+            account: PROVIDER_API_KEY_SECRET_ACCOUNT,
+            value: trimmed
+          }
+        });
+      } else {
+        await invokeDesktopCommandStrict("delete_secret", {
+          req: {
+            service: DESKTOP_SECRET_SERVICE,
+            account: PROVIDER_API_KEY_SECRET_ACCOUNT
+          }
+        });
+      }
+      await restartGatewayDaemonFromDesktop();
+      setProviderApiKeyStatus(
+        trimmed
+          ? "API key saved. Gateway restarted."
+          : "API key cleared. Gateway restarted."
+      );
+    } catch (error) {
+      setProviderApiKeyStatus(
+        `Failed to apply API key (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
   async function generateDesktopPairingQr() {
     setDesktopQrLoading(true);
     setDesktopQrStatus("Generating a new mobile pairing token...");
     try {
-      const payload = await invokeDesktopCommand<GatewayQrPayload>("generate_mobile_pairing_qr");
+      const payload = await invokeDesktopCommandStrict<GatewayQrPayload>(
+        "generate_mobile_pairing_qr"
+      );
       if (!payload?.qr_value || !payload.gateway_url || !payload.token) {
         throw new Error("Desktop pairing payload was empty");
       }
@@ -1394,6 +1565,25 @@ function App() {
   }, [isDesktopClient, mobileScannerActive, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
+    if (!isDesktopClient) {
+      return;
+    }
+    void loadOpenAiDeviceCodeStatus();
+  }, [isDesktopClient]);
+
+  useEffect(() => {
+    if (!isDesktopClient || !aiSetupStatus?.running) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void loadOpenAiDeviceCodeStatus();
+    }, 1200);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isDesktopClient, aiSetupStatus?.running]);
+
+  useEffect(() => {
     void refreshClawChat();
     const timer = window.setInterval(() => {
       void refreshClawChat();
@@ -1401,7 +1591,7 @@ function App() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [pb, chatThreadId, chatUseGatewayApi, chatGatewayToken, gatewayBaseUrl]);
+  }, [chatThreadId, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     void refreshLibrary("all");
@@ -1497,6 +1687,43 @@ function App() {
   const feedList = feedItems;
   const postedHistory = history.filter((item) => item.status === "success");
   const needsMobileQrLogin = !isDesktopClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
+  const needsBlueskyLogin = !session;
+  const showDesktopJournalLayout = isDesktopClient && mobileTab === "journal";
+
+  const renderJournalSidebarContent = (closeOnSelect: boolean) => (
+    <>
+      <div className="row-between" style={{ marginBottom: "1.5rem" }}>
+        <h2>Recent Journals</h2>
+        <button type="button" className="ghost" onClick={() => void refreshLibrary("journal")}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+        </button>
+      </div>
+
+      {journalItems.length === 0 ? (
+        <p className="text-center muted">No journals found.</p>
+      ) : (
+        <div className="stack">
+          {journalItems.map(item => (
+            <div key={item.path} className="row-between" style={{ padding: "0.8rem", background: selectedJournalPath === item.path ? "color-mix(in srgb, var(--line) 40%, transparent)" : "transparent", borderRadius: "12px" }}>
+              <div
+                className="stack"
+                style={{ gap: '4px', flex: 1, cursor: 'pointer' }}
+                onClick={() => {
+                  void openLibraryItem(item, "journal");
+                  if (closeOnSelect) {
+                    setJournalSidebarOpen(false);
+                  }
+                }}
+              >
+                <div className="feed-title">{item.title}</div>
+                <div className="feed-time">{formatTimestamp(item.modifiedAt)} · {item.kind.toUpperCase()}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
 
   if (needsMobileQrLogin) {
     return (
@@ -1553,11 +1780,47 @@ function App() {
     );
   }
 
+  if (needsBlueskyLogin) {
+    return (
+      <div className="app-shell">
+        <main className="page-content">
+          <div className="stack">
+            <div className="card">
+              <h2>Sign In To Continue</h2>
+              <p className="text-sm muted">
+                Bluesky is the primary account login for this app.
+              </p>
+              <form className="stack" onSubmit={handleLogin}>
+                <p className="text-sm muted">Service: {creds.serviceUrl || "https://bsky.social"}</p>
+                <input
+                  value={creds.handle}
+                  onChange={(e) => setCreds(prev => ({ ...prev, handle: e.target.value }))}
+                  placeholder="Bluesky Handle or Email"
+                />
+                <input
+                  type="password"
+                  value={creds.appPassword}
+                  onChange={(e) => setCreds(prev => ({ ...prev, appPassword: e.target.value }))}
+                  placeholder="Bluesky App Password"
+                />
+                <button type="submit" className="primary">
+                  Sign In
+                </button>
+                {authMessage ? <p className="text-sm muted">{authMessage}</p> : null}
+                {pbAuthMessage ? <p className="text-sm muted">{pbAuthMessage}</p> : null}
+              </form>
+            </div>
+          </div>
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
         <div className="row" style={{ alignItems: "center", gap: "1rem" }}>
-          {mobileTab === "journal" && (
+          {mobileTab === "journal" && !showDesktopJournalLayout && (
             <button type="button" className="ghost" onClick={() => setJournalSidebarOpen(true)} style={{ padding: "0.2rem" }}>
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
             </button>
@@ -1580,35 +1843,23 @@ function App() {
         </div>
       </header>
 
-      <div className={`sidebar-overlay ${journalSidebarOpen ? 'open' : ''}`} onClick={() => setJournalSidebarOpen(false)}>
-        <div className={`sidebar ${journalSidebarOpen ? 'open' : ''}`} onClick={e => e.stopPropagation()}>
-          <div className="row-between" style={{ marginBottom: "1.5rem" }}>
-            <h2>Recent Journals</h2>
-            <button type="button" className="ghost" onClick={() => void refreshLibrary("journal")}>
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-            </button>
+      {!showDesktopJournalLayout ? (
+        <div className={`sidebar-overlay ${journalSidebarOpen ? 'open' : ''}`} onClick={() => setJournalSidebarOpen(false)}>
+          <div className={`sidebar ${journalSidebarOpen ? 'open' : ''}`} onClick={e => e.stopPropagation()}>
+            {renderJournalSidebarContent(true)}
           </div>
-
-          {journalItems.length === 0 ? (
-            <p className="text-center muted">No journals found.</p>
-          ) : (
-            <div className="stack">
-              {journalItems.map(item => (
-                <div key={item.path} className="row-between" style={{ padding: "0.8rem", background: selectedJournalPath === item.path ? "color-mix(in srgb, var(--line) 40%, transparent)" : "transparent", borderRadius: "12px" }}>
-                  <div className="stack" style={{ gap: '4px', flex: 1, cursor: 'pointer' }} onClick={() => { void openLibraryItem(item, "journal"); setJournalSidebarOpen(false); }}>
-                    <div className="feed-title">{item.title}</div>
-                    <div className="feed-time">{formatTimestamp(item.modifiedAt)} · {item.kind.toUpperCase()}</div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
-      </div>
+      ) : null}
 
       <main className="page-content">
         {mobileTab === "journal" ? (
-          <div className="stack">
+          <div className={showDesktopJournalLayout ? "journal-desktop-layout" : "stack"}>
+            {showDesktopJournalLayout ? (
+              <aside className="sidebar sidebar-desktop open">
+                {renderJournalSidebarContent(false)}
+              </aside>
+            ) : null}
+            <div className="stack journal-main">
             <div className="card">
               <div className="text-center">
                 <h2>Capture</h2>
@@ -1734,6 +1985,7 @@ function App() {
                 )}
               </div>
             )}
+            </div>
           </div>
         ) : null}
 
@@ -1999,55 +2251,15 @@ function App() {
             <div className="card">
               <h2>Gateway & App Settings</h2>
               <div className="stack">
-                <p><strong>Gateway Base URL</strong></p>
-                <input
-                  value={gatewayBaseUrl}
-                  onChange={(e) => setGatewayBaseUrl(e.target.value)}
-                  placeholder="http://127.0.0.1:42617"
-                />
+                <p className="text-sm muted">
+                  Chat and journal upload use desktop gateway auth automatically.
+                </p>
 
-                {!isDesktopClient && (
-                  <>
-                    <p><strong>Manual Pairing Code</strong></p>
-                    <div className="row">
-                      <input
-                        value={chatPairCode}
-                        onChange={(e) => setChatPairCode(e.target.value)}
-                        placeholder="Pairing Code"
-                        style={{ flex: 1 }}
-                      />
-                      <button type="button" onClick={pairGatewayFromUi} disabled={chatPairing}>Pair</button>
-                    </div>
-                  </>
-                )}
-
-                {chatGatewayToken && (
-                  <div className="stack" style={{ gap: "0.4rem" }}>
-                    <div className="row">
-                      <input
-                        type={showGatewayToken ? "text" : "password"}
-                        value={chatGatewayToken}
-                        readOnly
-                        style={{ flex: 1 }}
-                      />
-                    </div>
-                    <div className="row">
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={() => setShowGatewayToken((prev) => !prev)}
-                      >
-                        {showGatewayToken ? "Hide Token" : "Show Token"}
-                      </button>
-                      <button type="button" className="ghost" onClick={() => void copyGatewayToken()}>
-                        Copy Token
-                      </button>
-                    </div>
-                    <p className="text-sm muted">
-                      {gatewayTokenCopyStatus || "Gateway token synced for chat + media APIs."}
-                    </p>
-                  </div>
-                )}
+                <p className="text-sm muted">
+                  {chatGatewayToken
+                    ? "Gateway auth is ready for chat + journal uploads."
+                    : "Waiting for desktop gateway auth bootstrap."}
+                </p>
 
                 {isDesktopClient && (
                   <div className="stack" style={{ gap: "0.8rem" }}>
@@ -2072,26 +2284,102 @@ function App() {
                     {desktopQrStatus ? <p className="text-sm muted">{desktopQrStatus}</p> : null}
                   </div>
                 )}
-
-                <p className="mt-2"><strong>PocketBase Server Link</strong></p>
-                <input value={pbUrl} onChange={(e) => setPbUrl(e.target.value)} placeholder="http://127.0.0.1:8090" />
-
-                <p className="mt-2"><strong>Chat Thread ID</strong></p>
-                <div className="row">
-                  <input value={chatThreadId} onChange={(e) => setChatThreadId(e.target.value)} style={{ flex: 1 }} />
-                  <button type="button" onClick={() => setChatThreadId(createThreadId())}>New</button>
-                </div>
+                <p className="text-sm muted">
+                  {pbAuthMessage}
+                </p>
+                {pb.authStore.isValid && pbAuthLabel ? (
+                  <div className="badge success text-center" style={{ alignSelf: "flex-start" }}>
+                    PocketBase: {pbAuthLabel}
+                  </div>
+                ) : null}
               </div>
             </div>
 
             <div className="card">
               <div className="row-between">
-                <h2>API Requests Box</h2>
-                <button type="button" className="ghost" onClick={sendApiRequest}>Send</button>
+                <h2>AI Setup</h2>
+                <button
+                  type="button"
+                  onClick={() => void startOpenAiDeviceCodeLogin()}
+                  disabled={aiSetupBusy || !!aiSetupStatus?.running || !isDesktopClient}
+                >
+                  {aiSetupBusy
+                    ? "Starting..."
+                    : aiSetupStatus?.running
+                      ? "In Progress..."
+                      : "Start OpenAI Device Login"}
+                </button>
               </div>
-              <input value={apiRequest.url} onChange={(e) => setApiRequest(prev => ({ ...prev, url: e.target.value }))} placeholder="URL" />
-              <textarea rows={3} value={apiRequest.bodyJson} onChange={(e) => setApiRequest(prev => ({ ...prev, bodyJson: e.target.value }))} placeholder="JSON Body (if POST)" />
-              {apiResponse && <pre style={{ fontSize: '0.8rem', whiteSpace: 'pre-wrap', background: 'var(--bg)', padding: '1rem', borderRadius: '12px' }}>{apiResponse.slice(0, 500)}{apiResponse.length > 500 ? '...' : ''}</pre>}
+              {!isDesktopClient ? (
+                <p className="text-sm muted">AI setup runs on desktop only. Use the desktop app for this step.</p>
+              ) : (
+                <div className="stack">
+                  <p className="text-sm muted">
+                    Starts `slowclaw auth login --provider openai-codex --device-code` and waits for completion.
+                  </p>
+                  <div className="stack" style={{ gap: "0.4rem" }}>
+                    <p className="text-sm"><strong>Provider API Key (Optional)</strong></p>
+                    <input
+                      type="password"
+                      value={providerApiKey}
+                      onChange={(e) => setProviderApiKey(e.target.value)}
+                      placeholder="Optional: set ZEROCLAW_API_KEY for daemon"
+                    />
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void saveOptionalProviderApiKey()}
+                    >
+                      Save API Key
+                    </button>
+                    {providerApiKeyStatus ? (
+                      <p className="text-sm muted">{providerApiKeyStatus}</p>
+                    ) : null}
+                  </div>
+                  <div className="badge text-center" style={{ alignSelf: "flex-start" }}>
+                    State: {aiSetupStatus?.state || "idle"}
+                  </div>
+                  <p className="text-sm">{aiSetupStatus?.message || "Not started."}</p>
+                  {aiSetupStatus?.verificationUrl ? (
+                    <p className="text-sm">
+                      URL:{" "}
+                      <a href={aiSetupStatus.verificationUrl} target="_blank" rel="noreferrer">
+                        {aiSetupStatus.verificationUrl}
+                      </a>
+                    </p>
+                  ) : null}
+                  {aiSetupStatus?.fastLink ? (
+                    <p className="text-sm">
+                      Fast Link:{" "}
+                      <a href={aiSetupStatus.fastLink} target="_blank" rel="noreferrer">
+                        {aiSetupStatus.fastLink}
+                      </a>
+                    </p>
+                  ) : null}
+                  {aiSetupStatus?.userCode ? (
+                    <div className="row" style={{ alignItems: "center" }}>
+                      <input value={aiSetupStatus.userCode} readOnly style={{ flex: 1 }} />
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => void navigator.clipboard.writeText(aiSetupStatus.userCode || "")}
+                      >
+                        Copy Code
+                      </button>
+                    </div>
+                  ) : null}
+                  {aiSetupStatus?.completed ? (
+                    <p className="text-sm" style={{ color: "var(--success)" }}>
+                      OpenAI auth is complete and saved to the app workspace.
+                    </p>
+                  ) : null}
+                  {aiSetupStatus?.error ? (
+                    <p className="text-sm" style={{ color: "var(--danger)" }}>
+                      {aiSetupStatus.error}
+                    </p>
+                  ) : null}
+                </div>
+              )}
             </div>
           </div>
         ) : null}

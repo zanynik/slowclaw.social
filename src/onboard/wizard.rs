@@ -463,7 +463,7 @@ async fn run_quick_setup_with_home(
         .await
         .context("Failed to create workspace directory")?;
 
-    let provider_name = provider.unwrap_or("openrouter").to_string();
+    let provider_name = provider.unwrap_or("openai-codex").to_string();
     let model = model_override
         .map(str::to_string)
         .unwrap_or_else(|| default_model_for_provider(&provider_name));
@@ -691,7 +691,7 @@ fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
-        "openai-codex" => "gpt-5-codex".into(),
+        "openai-codex" => "gpt-5.3-codex".into(),
         "venice" => "zai-org-glm-5".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "mistral" => "mistral-large-latest".into(),

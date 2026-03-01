@@ -17,7 +17,7 @@
 
 pub mod browser;
 pub mod browser_open;
-pub mod audio_to_video;
+pub mod bg_run;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -58,7 +58,9 @@ pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
-pub use audio_to_video::AudioToVideoTool;
+pub use bg_run::{
+    format_bg_result_for_injection, BgJob, BgJobStatus, BgJobStore, BgRunTool, BgStatusTool,
+};
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -139,6 +141,22 @@ impl Tool for ArcDelegatingTool {
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
+}
+
+/// Add background tool execution capabilities to a tool registry
+pub fn add_bg_tools(tools: Vec<Box<dyn Tool>>) -> (Vec<Box<dyn Tool>>, BgJobStore) {
+    let bg_job_store = BgJobStore::new();
+    let tool_arcs: Vec<Arc<dyn Tool>> = tools
+        .into_iter()
+        .map(|t| Arc::from(t) as Arc<dyn Tool>)
+        .collect();
+    let tools_arc = Arc::new(tool_arcs);
+    let bg_run = BgRunTool::new(bg_job_store.clone(), Arc::clone(&tools_arc));
+    let bg_status = BgStatusTool::new(bg_job_store.clone());
+    let mut extended: Vec<Arc<dyn Tool>> = (*tools_arc).clone();
+    extended.push(Arc::new(bg_run));
+    extended.push(Arc::new(bg_status));
+    (boxed_registry_from_arcs(extended), bg_job_store)
 }
 
 /// Create the default tool registry
@@ -228,7 +246,6 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
-        Arc::new(AudioToVideoTool::new(security.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
@@ -348,7 +365,12 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(delegate_tool));
     }
 
-    boxed_registry_from_arcs(tool_arcs)
+    // Attach background execution wrappers to the finalized registry.
+    // This ensures `bg_run` / `bg_status` are available anywhere the
+    // runtime tool graph is used.
+    let built_tools = boxed_registry_from_arcs(tool_arcs);
+    let (extended_tools, _bg_job_store) = add_bg_tools(built_tools);
+    extended_tools
 }
 
 #[cfg(test)]

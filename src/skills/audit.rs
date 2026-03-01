@@ -6,6 +6,27 @@ use std::sync::OnceLock;
 
 const MAX_TEXT_FILE_BYTES: u64 = 512 * 1024;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SkillAuditOptions {
+    pub allow_scripts: bool,
+}
+
+// ─── Zip skill audit limits ───────────────────────────────────────────────────
+
+/// Maximum number of entries allowed in a skill zip archive.
+const ZIP_MAX_ENTRIES: usize = 1_000;
+
+/// Maximum total decompressed size across all entries (50 MB).
+/// Prevents zip-bomb extraction from filling disk.
+const ZIP_MAX_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Maximum decompressed size for a single entry (10 MB).
+const ZIP_MAX_SINGLE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Maximum allowed compression ratio per entry.
+/// A ratio above this threshold strongly suggests a zip bomb.
+const ZIP_MAX_COMPRESSION_RATIO: u64 = 100;
+
 #[derive(Debug, Clone, Default)]
 pub struct SkillAuditReport {
     pub files_scanned: usize,

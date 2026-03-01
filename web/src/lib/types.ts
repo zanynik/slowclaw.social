@@ -64,3 +64,14 @@ export type GatewayQrPayload = {
   token: string;
   qr_value: string;
 };
+
+export type OpenAiDeviceCodeStatus = {
+  state: string;
+  running: boolean;
+  completed: boolean;
+  message: string;
+  verificationUrl?: string | null;
+  userCode?: string | null;
+  fastLink?: string | null;
+  error?: string | null;
+};
