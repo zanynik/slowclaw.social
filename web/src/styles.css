@@ -319,6 +319,44 @@ textarea {
   transform: translateX(0);
 }
 
+.journal-desktop-layout {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.sidebar.sidebar-desktop {
+  position: sticky;
+  top: 96px;
+  width: 100%;
+  max-width: none;
+  height: calc(100vh - 120px);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  transform: none;
+  box-shadow: var(--shadow);
+}
+
+.journal-main {
+  min-width: 0;
+}
+
+@media (min-width: 1024px) {
+  .app-shell {
+    max-width: 1200px;
+  }
+}
+
+@media (max-width: 900px) {
+  .journal-desktop-layout {
+    display: block;
+  }
+  .sidebar.sidebar-desktop {
+    display: none;
+  }
+}
+
 /* Segmented Control (Tabs) */
 .segmented-control {
   display: flex;

@@ -1,29 +1,30 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { AtpAgent } from "@atproto/api";
+import { QRCodeCanvas } from "qrcode.react";
 import {
   loginBluesky,
   postTextToBluesky,
   postVideoToBluesky,
-  sendAuthedXrpcRequest,
   type BlueskySession
 } from "./lib/bluesky";
 import { AppBskyFeedDefs } from "@atproto/api";
 import {
-  createClawChatUserMessage,
   createClawChatUserMessageViaGateway,
   createPocketBaseClient,
+  ensurePocketBaseUserFromBluesky,
+  getLatestChatThreadViaGateway,
   listClawChatMessagesViaGateway,
-  listClawChatMessagesFromPocketBase,
   listDraftsFromPocketBase,
+  pocketBaseAuthLabel,
   listPostHistoryFromPocketBase,
   saveDraftToPocketBase,
   savePostHistoryToPocketBase
 } from "./lib/pocketbase";
 import {
+  archivePostedLibraryItem,
   createJournalTextViaGateway,
   fetchMediaAsFile,
   listLibraryItems,
-  pairGatewayClient,
   readLibraryText,
   saveLibraryText,
   uploadMediaViaGateway
@@ -32,34 +33,36 @@ import {
   deleteCredentialsSecure,
   loadCredentialsFallback,
   loadCredentialsSecure,
-  saveCredentialsSecure
+  loadGatewayTokenSecure,
+  saveBlueskySessionSecure,
+  saveCredentialsSecure,
+  saveGatewayTokenSecure
 } from "./lib/secureStorage";
 import type {
-  ApiRequestState,
   BlueskyCredentials,
   ClawChatMessage,
+  GatewayQrPayload,
   LibraryItem,
+  OpenAiDeviceCodeStatus,
   PostHistoryItem,
   StoredDraft
 } from "./lib/types";
 
-const initialApiRequest: ApiRequestState = {
-  method: "GET",
-  url: "xrpc/com.atproto.server.describeServer",
-  headersJson: "{}",
-  bodyJson: "{}",
-  includeBlueskyAuth: false
-};
-
 const CHAT_THREAD_STORAGE_KEY = "slowclaw.chat.thread_id";
 const CHAT_GATEWAY_TOKEN_STORAGE_KEY = "slowclaw.chat.gateway_token";
-const CHAT_USE_GATEWAY_STORAGE_KEY = "slowclaw.chat.use_gateway";
+const CHAT_GATEWAY_BASE_URL_STORAGE_KEY = "slowclaw.chat.gateway_base_url";
 const UI_THEME_STORAGE_KEY = "slowclaw.ui.theme";
 const UI_TAB_STORAGE_KEY = "slowclaw.ui.tab";
 const FEED_POSTED_PATHS_STORAGE_KEY = "slowclaw.feed.posted_paths";
+const DESKTOP_SECRET_SERVICE = "social.slowclaw.gateway";
+const PROVIDER_API_KEY_SECRET_ACCOUNT = "provider.api_key";
 
 type MobileTab = "journal" | "feed" | "chat" | "profile";
 type ThemeMode = "light" | "dark";
+type DesktopGatewayBootstrap = {
+  token?: string | null;
+  gatewayUrl?: string | null;
+};
 
 function defaultThemeMode(): ThemeMode {
   if (typeof window === "undefined") {
@@ -76,8 +79,21 @@ function defaultMobileTab(): MobileTab {
   if (typeof window === "undefined") {
     return "journal";
   }
+  if (window.innerWidth > 900) {
+    return "journal";
+  }
   const saved = window.localStorage.getItem(UI_TAB_STORAGE_KEY);
-  return saved === "feed" || saved === "chat" ? saved : "journal";
+  return saved === "feed" || saved === "chat" || saved === "profile" ? saved : "journal";
+}
+
+function useIsLargeScreen() {
+  const [isLarge, setIsLarge] = useState(typeof window !== "undefined" ? window.innerWidth > 900 : false);
+  useEffect(() => {
+    const handleResize = () => setIsLarge(window.innerWidth > 900);
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+  return isLarge;
 }
 
 function formatBytes(bytes: number) {
@@ -126,23 +142,59 @@ function defaultPocketBaseUrlForUi() {
   return `${protocol}//${host}:8090`;
 }
 
-function defaultUseGatewayChatApi() {
+function isTauriDesktopRuntime() {
   if (typeof window === "undefined") {
-    return true;
-  }
-  const stored = window.localStorage.getItem(CHAT_USE_GATEWAY_STORAGE_KEY);
-  if (stored === "true") {
-    return true;
-  }
-  if (stored === "false") {
     return false;
   }
-  // Assume gateway-served UI should use gateway API; Vite dev usually runs on 5173.
-  return window.location.port !== "5173";
+  return Boolean((window as any).__TAURI_INTERNALS__);
+}
+
+function defaultGatewayBaseUrl() {
+  if (typeof window === "undefined") {
+    return "http://127.0.0.1:42617";
+  }
+  const saved = window.localStorage.getItem(CHAT_GATEWAY_BASE_URL_STORAGE_KEY);
+  if (saved && saved.trim()) {
+    return saved.trim().replace(/\/+$/, "");
+  }
+  const protocol = window.location.protocol === "https:" ? "https:" : "http:";
+  const host = window.location.hostname || "127.0.0.1";
+  return `${protocol}//${host}:42617`;
+}
+
+function derivePocketBaseUrlFromGateway(gatewayBaseUrl: string) {
+  try {
+    const parsed = new URL(gatewayBaseUrl);
+    parsed.port = "8090";
+    parsed.pathname = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return defaultPocketBaseUrlForUi();
+  }
+}
+
+function resolveGatewayResourceUrl(resourcePath: string, gatewayBaseUrl: string) {
+  if (!resourcePath) {
+    return resourcePath;
+  }
+  if (resourcePath.startsWith("http://") || resourcePath.startsWith("https://")) {
+    return resourcePath;
+  }
+  const base = gatewayBaseUrl.trim().replace(/\/+$/, "");
+  const suffix = resourcePath.startsWith("/") ? resourcePath : `/${resourcePath}`;
+  return `${base}${suffix}`;
 }
 
 function App() {
-  const [pbUrl, setPbUrl] = useState(defaultPocketBaseUrlForUi);
+  const isDesktopClient = isTauriDesktopRuntime();
+  const isLargeScreen = useIsLargeScreen();
+  const isDesktopLayout = isDesktopClient || isLargeScreen;
+  const [gatewayBaseUrl, setGatewayBaseUrl] = useState(defaultGatewayBaseUrl);
+  const [pbUrl, setPbUrl] = useState(() =>
+    derivePocketBaseUrlFromGateway(defaultGatewayBaseUrl())
+  );
   const [creds, setCreds] = useState<BlueskyCredentials>(() => loadCredentialsFallback());
   const [agent, setAgent] = useState<AtpAgent | null>(null);
   const [session, setSession] = useState<BlueskySession | null>(null);
@@ -153,8 +205,6 @@ function App() {
   const [videoAlt, setVideoAlt] = useState("");
   const [isPosting, setIsPosting] = useState(false);
   const [status, setStatus] = useState<string>("");
-  const [apiRequest, setApiRequest] = useState<ApiRequestState>(initialApiRequest);
-  const [apiResponse, setApiResponse] = useState<string>("");
   const [drafts, setDrafts] = useState<StoredDraft[]>([]);
   const [history, setHistory] = useState<PostHistoryItem[]>([]);
   const [postedPaths, setPostedPaths] = useState<Record<string, true>>(() => {
@@ -182,26 +232,24 @@ function App() {
   });
   const [chatThreadId, setChatThreadId] = useState<string>(() => {
     if (typeof window === "undefined") {
-      return createThreadId();
+      return "";
     }
     const saved = window.localStorage.getItem(CHAT_THREAD_STORAGE_KEY);
-    return saved && saved.trim() ? saved.trim() : createThreadId();
+    return saved && saved.trim() ? saved.trim() : "";
   });
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState<ClawChatMessage[]>([]);
   const [chatStatus, setChatStatus] = useState("Chat idle");
   const [chatSending, setChatSending] = useState(false);
-  const [chatUseGatewayApi, setChatUseGatewayApi] = useState<boolean>(defaultUseGatewayChatApi);
   const [chatGatewayToken, setChatGatewayToken] = useState<string>(() => {
     if (typeof window === "undefined") {
       return "";
     }
     return window.localStorage.getItem(CHAT_GATEWAY_TOKEN_STORAGE_KEY) || "";
   });
-  const [chatPairCode, setChatPairCode] = useState("");
-  const [chatPairing, setChatPairing] = useState(false);
-  const [showGatewayToken, setShowGatewayToken] = useState(false);
-  const [gatewayTokenCopyStatus, setGatewayTokenCopyStatus] = useState("");
+  const [desktopQrLoading, setDesktopQrLoading] = useState(false);
+  const [desktopQrPayload, setDesktopQrPayload] = useState<GatewayQrPayload | null>(null);
+  const [desktopQrStatus, setDesktopQrStatus] = useState("");
   const [themeMode, setThemeMode] = useState<ThemeMode>(defaultThemeMode);
   const [mobileTab, setMobileTab] = useState<MobileTab>(defaultMobileTab);
   const [journalSidebarOpen, setJournalSidebarOpen] = useState(false);
@@ -215,9 +263,9 @@ function App() {
   const [selectedFeedItem, setSelectedFeedItem] = useState<LibraryItem | null>(null);
   const [selectedJournalText, setSelectedJournalText] = useState("");
   const [selectedFeedText, setSelectedFeedText] = useState("");
-  const [journalDraftTitle, setJournalDraftTitle] = useState("");
   const [journalDraftText, setJournalDraftText] = useState("");
   const [journalSaveStatus, setJournalSaveStatus] = useState("Journal idle");
+  const [isWritingNote, setIsWritingNote] = useState(false);
   const [feedCaptionText, setFeedCaptionText] = useState("");
   const [feedCaptionPath, setFeedCaptionPath] = useState<string>("");
   const [feedEditStatus, setFeedEditStatus] = useState("Feed idle");
@@ -231,11 +279,37 @@ function App() {
     percent: number;
     label: string;
   } | null>(null);
+  const [aiSetupStatus, setAiSetupStatus] = useState<OpenAiDeviceCodeStatus | null>(null);
+  const [aiSetupBusy, setAiSetupBusy] = useState(false);
+  const [pbAuthMessage, setPbAuthMessage] = useState("");
+  const [pbAuthLabel, setPbAuthLabel] = useState("");
+  const [providerApiKey, setProviderApiKey] = useState("");
+  const [providerApiKeyStatus, setProviderApiKeyStatus] = useState("");
+  const [mobileScannerActive, setMobileScannerActive] = useState(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    if (isTauriDesktopRuntime()) {
+      return false;
+    }
+    const savedToken = window.localStorage.getItem(CHAT_GATEWAY_TOKEN_STORAGE_KEY) || "";
+    const savedGateway = window.localStorage.getItem(CHAT_GATEWAY_BASE_URL_STORAGE_KEY) || "";
+    return !(savedToken.trim() && savedGateway.trim());
+  });
+  const [mobileScannerStatus, setMobileScannerStatus] = useState(
+    "Scan the desktop QR to connect."
+  );
+  const [mobileCameraPermissionError, setMobileCameraPermissionError] = useState("");
   const audioCaptureRef = useRef<HTMLInputElement | null>(null);
   const videoCaptureRef = useRef<HTMLInputElement | null>(null);
   const autosaveTimerRef = useRef<number | null>(null);
+  const journalAutosaveTimerRef = useRef<number | null>(null);
   const loadedTextPathRef = useRef<string>("");
   const loadedCaptionPathRef = useRef<string>("");
+  const chatThreadHydratedRef = useRef(false);
+  const mobileScannerVideoRef = useRef<HTMLVideoElement | null>(null);
+  const mobileScannerStreamRef = useRef<MediaStream | null>(null);
+  const mobileScannerRafRef = useRef<number | null>(null);
 
   // Recording State
   const [isRecording, setIsRecording] = useState(false);
@@ -261,11 +335,71 @@ function App() {
   const pb = useMemo(() => createPocketBaseClient(pbUrl), [pbUrl]);
 
   useEffect(() => {
+    const label = pocketBaseAuthLabel(pb);
+    setPbAuthLabel(label);
+    if (pb.authStore.isValid) {
+      setPbAuthMessage(label ? `PocketBase signed in as ${label}` : "PocketBase signed in");
+    } else {
+      setPbAuthMessage("PocketBase not signed in");
+    }
+  }, [pb]);
+
+  useEffect(() => {
     let cancelled = false;
     (async () => {
       const secureCreds = await loadCredentialsSecure();
       if (!cancelled && secureCreds) {
         setCreds(secureCreds);
+        if (secureCreds.handle.trim() && secureCreds.appPassword.trim()) {
+          try {
+            const { agent: autoAgent, session: autoSession } = await loginBluesky(secureCreds);
+            if (!cancelled) {
+              setAgent(autoAgent);
+              setSession(autoSession);
+              setAuthMessage(`Signed in as ${autoSession.handle}`);
+            }
+            try {
+              const pbSync = await ensurePocketBaseUserFromBluesky(
+                pb,
+                secureCreds.handle,
+                secureCreds.appPassword,
+                autoSession.handle
+              );
+              if (!cancelled) {
+                const label = pocketBaseAuthLabel(pb);
+                setPbAuthLabel(label);
+                setPbAuthMessage(
+                  pbSync.created
+                    ? `PocketBase user provisioned and signed in (${label || pbSync.identity})`
+                    : `PocketBase signed in as ${label || pbSync.identity}`
+                );
+              }
+            } catch (error) {
+              if (!cancelled) {
+                setPbAuthMessage(
+                  `PocketBase auto-login failed (${error instanceof Error ? error.message : String(error)})`
+                );
+              }
+            }
+          } catch {
+            // Keep login-gated flow; user can sign in explicitly.
+          }
+        }
+      }
+      if (!cancelled && isDesktopClient) {
+        const secureGatewayToken = await loadGatewayTokenSecure();
+        if (secureGatewayToken) {
+          setChatGatewayToken(secureGatewayToken);
+        } else {
+          await syncDesktopGatewayBootstrap();
+        }
+        const apiKeySecret = await invokeDesktopCommand<{ value: string | null }>("get_secret", {
+          req: { service: DESKTOP_SECRET_SERVICE, account: PROVIDER_API_KEY_SECRET_ACCOUNT }
+        });
+        if (apiKeySecret?.value) {
+          setProviderApiKey(apiKeySecret.value);
+          setProviderApiKeyStatus("Loaded saved API key");
+        }
       }
       if (!cancelled) {
         setSecureStoreReady(true);
@@ -294,21 +428,44 @@ function App() {
     if (typeof window === "undefined") {
       return;
     }
-    window.localStorage.setItem(
-      CHAT_GATEWAY_TOKEN_STORAGE_KEY,
-      chatGatewayToken.trim()
-    );
-  }, [chatGatewayToken]);
+    const normalized = chatGatewayToken.trim();
+    window.localStorage.setItem(CHAT_GATEWAY_TOKEN_STORAGE_KEY, normalized);
+    if (isDesktopClient && normalized) {
+      void saveGatewayTokenSecure(normalized);
+    }
+  }, [chatGatewayToken, isDesktopClient]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
-    window.localStorage.setItem(
-      CHAT_USE_GATEWAY_STORAGE_KEY,
-      chatUseGatewayApi ? "true" : "false"
-    );
-  }, [chatUseGatewayApi]);
+    const normalized = gatewayBaseUrl.trim().replace(/\/+$/, "");
+    window.localStorage.setItem(CHAT_GATEWAY_BASE_URL_STORAGE_KEY, normalized);
+    if (normalized) {
+      setPbUrl(derivePocketBaseUrlFromGateway(normalized));
+    }
+  }, [gatewayBaseUrl]);
+
+  useEffect(() => {
+    if (!isDesktopClient || chatGatewayToken.trim()) {
+      return;
+    }
+    let cancelled = false;
+    const run = async () => {
+      if (cancelled) {
+        return;
+      }
+      await syncDesktopGatewayBootstrap();
+    };
+    void run();
+    const timer = window.setInterval(() => {
+      void run();
+    }, 1200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [isDesktopClient, chatGatewayToken]);
 
   useEffect(() => {
     if (typeof document !== "undefined") {
@@ -324,6 +481,12 @@ function App() {
       window.localStorage.setItem(UI_TAB_STORAGE_KEY, mobileTab);
     }
   }, [mobileTab]);
+
+  useEffect(() => {
+    if (isDesktopLayout && mobileTab === "journal") {
+      setJournalSidebarOpen(true);
+    }
+  }, [isDesktopLayout, mobileTab]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -345,17 +508,32 @@ function App() {
   }, [mediaPreviewUrl]);
 
   async function refreshLibrary(scope: "journal" | "feed" | "all") {
-    const token = chatGatewayToken.trim() || undefined;
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
     try {
       if (scope === "journal" || scope === "all") {
-        const items = await listLibraryItems("journal", token);
+        const items = (await listLibraryItems("journal", token || undefined, gatewayBaseUrl)).filter((item) => {
+          const path = item.path.toLowerCase();
+          if (!path.startsWith("journals/")) {
+            return false;
+          }
+          if (path.startsWith("journals/media/")) {
+            return true;
+          }
+          if (item.kind !== "text") {
+            return false;
+          }
+          return path.startsWith("journals/text/") && path.endsWith(".txt");
+        });
         setJournalItems(items);
         if (items.length > 0 && !selectedJournalPath) {
           setSelectedJournalPath(items[0].path);
         }
       }
       if (scope === "feed" || scope === "all") {
-        const items = (await listLibraryItems("feed", token)).filter((item) => {
+        const items = (await listLibraryItems("feed", token || undefined, gatewayBaseUrl)).filter((item) => {
           const path = item.path.toLowerCase();
           if (path.endsWith(".caption.txt")) {
             return false;
@@ -379,17 +557,32 @@ function App() {
   }
 
   async function uploadJournalFile(file: File, kind: "audio" | "video") {
-    const token = chatGatewayToken.trim() || undefined;
+    let token = chatGatewayToken.trim();
+    if (!gatewayBaseUrl.trim()) {
+      setRecordingHint("Upload blocked (gateway URL missing). Pair mobile with desktop QR.");
+      return;
+    }
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token) {
+      setRecordingHint(
+        isDesktopClient
+          ? "Upload blocked (desktop gateway token not ready). Wait 2-3s or restart app."
+          : "Upload blocked (gateway token missing). Pair mobile with desktop QR."
+      );
+      return;
+    }
     setRecordingHint(`Uploading ${file.name}...`);
     try {
       const result = await uploadMediaViaGateway(
         file,
         {
           kind,
-          filename: file.name || `${kind}-${Date.now()}`,
-          title: journalDraftTitle.trim() || undefined
+          filename: file.name || `${kind}-${Date.now()}`
         },
-        token
+        token,
+        gatewayBaseUrl
       );
       setRecordingHint(
         `Saved ${kind} to workspace: ${String(result.path || file.name)} (${formatBytes(
@@ -397,6 +590,10 @@ function App() {
         )})`
       );
       await refreshLibrary("journal");
+      const uploadedPath = String(result.path || "").trim();
+      if (uploadedPath) {
+        setSelectedJournalPath(uploadedPath);
+      }
     } catch (error) {
       setRecordingHint(
         `Upload failed (${error instanceof Error ? error.message : String(error)})`
@@ -413,17 +610,28 @@ function App() {
     const token = chatGatewayToken.trim() || undefined;
     setJournalSaveStatus("Saving journal note...");
     try {
-      const result = await createJournalTextViaGateway(
-        journalDraftTitle.trim() || "Journal entry",
-        content,
-        token
-      );
-      setJournalSaveStatus(`Saved: ${String(result.path || "journal entry")}`);
-      setJournalDraftText("");
-      if (!journalDraftTitle.trim()) {
-        setJournalDraftTitle("");
+      let resultPath = "";
+      if (selectedJournalItem && selectedJournalItem.kind === "text") {
+        await saveLibraryText(selectedJournalItem.path, content, token, gatewayBaseUrl);
+        resultPath = selectedJournalItem.path;
+      } else if (selectedJournalItem && (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video")) {
+        const captionPath = sidecarCaptionPath(selectedJournalItem);
+        await saveLibraryText(captionPath, content, token, gatewayBaseUrl);
+        resultPath = captionPath;
+      } else {
+        const result = await createJournalTextViaGateway(
+          "Journal entry",
+          content,
+          token,
+          gatewayBaseUrl
+        );
+        resultPath = String(result.path || "");
       }
-      await refreshLibrary("journal");
+      setJournalSaveStatus(`Saved`);
+      if (!selectedJournalItem) {
+        await refreshLibrary("journal");
+        if (resultPath) setSelectedJournalPath(resultPath);
+      }
     } catch (error) {
       setJournalSaveStatus(
         `Save failed (${error instanceof Error ? error.message : String(error)})`
@@ -443,10 +651,11 @@ function App() {
     if (item.kind === "text") {
       const token = chatGatewayToken.trim() || undefined;
       try {
-        const content = await readLibraryText(item.path, token);
+        const content = await readLibraryText(item.path, token, gatewayBaseUrl);
         if (scope === "journal") {
           loadedTextPathRef.current = item.path;
           setSelectedJournalText(content);
+          setJournalDraftText(content);
         } else {
           loadedTextPathRef.current = item.path;
           setSelectedFeedText(content);
@@ -462,18 +671,30 @@ function App() {
           );
         }
       }
-    } else if (scope === "feed" && (item.kind === "video" || item.kind === "audio")) {
+    } else if (item.kind === "video" || item.kind === "audio") {
       const captionPath = sidecarCaptionPath(item);
       const token = chatGatewayToken.trim() || undefined;
       try {
-        const content = await readLibraryText(captionPath, token);
-        loadedCaptionPathRef.current = captionPath;
-        setFeedCaptionPath(captionPath);
-        setFeedCaptionText(content);
+        const content = await readLibraryText(captionPath, token, gatewayBaseUrl);
+        if (scope === "feed") {
+          loadedCaptionPathRef.current = captionPath;
+          setFeedCaptionPath(captionPath);
+          setFeedCaptionText(content);
+        } else {
+          loadedTextPathRef.current = captionPath;
+          setSelectedJournalText(content);
+          setJournalDraftText(content);
+        }
       } catch {
-        loadedCaptionPathRef.current = captionPath;
-        setFeedCaptionPath(captionPath);
-        setFeedCaptionText(item.previewText || item.title || "");
+        if (scope === "feed") {
+          loadedCaptionPathRef.current = captionPath;
+          setFeedCaptionPath(captionPath);
+          setFeedCaptionText(item.previewText || item.title || "");
+        } else {
+          loadedTextPathRef.current = captionPath;
+          setSelectedJournalText("");
+          setJournalDraftText("");
+        }
       }
     }
   }
@@ -493,7 +714,8 @@ function App() {
     setMediaPreviewLoading(true);
     try {
       const token = chatGatewayToken.trim() || undefined;
-      const res = await fetch(item.mediaUrl, {
+      const mediaUrl = resolveGatewayResourceUrl(item.mediaUrl, gatewayBaseUrl);
+      const res = await fetch(mediaUrl, {
         headers: token ? { Authorization: `Bearer ${token}` } : undefined
       });
       if (!res.ok) {
@@ -520,6 +742,31 @@ function App() {
     }
   }
 
+  async function archivePostedFeedSource(sourcePath: string, token?: string) {
+    const path = sourcePath.trim();
+    if (!path) {
+      return { archivedPath: "", archiveError: "Missing source path" };
+    }
+    try {
+      const result = await archivePostedLibraryItem(path, token, gatewayBaseUrl);
+      const archivedPath = String(result?.path || "");
+      if (selectedFeedPath === path) {
+        setSelectedFeedPath("");
+        setSelectedFeedItem(null);
+        setSelectedFeedText("");
+        setFeedCaptionPath("");
+        setFeedCaptionText("");
+      }
+      await refreshLibrary("feed");
+      return { archivedPath, archiveError: "" };
+    } catch (error) {
+      return {
+        archivedPath: "",
+        archiveError: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
   async function postFeedItemToBluesky(item: LibraryItem) {
     if (!agent || !session) {
       setFeedEditStatus("Sign in to Bluesky first");
@@ -539,7 +786,7 @@ function App() {
         const content =
           selectedFeedItem?.path === item.path && selectedFeedText.trim()
             ? selectedFeedText
-            : await readLibraryText(item.path, token);
+            : await readLibraryText(item.path, token, gatewayBaseUrl);
         setPostProgress({ path: item.path, percent: 70, label: "Publishing text..." });
         const result = await postTextToBluesky(agent, session.did, content.trim());
         await persistHistory({
@@ -551,16 +798,23 @@ function App() {
           cid: result.cid,
           status: "success"
         });
+        const { archivedPath, archiveError } = await archivePostedFeedSource(item.path, token);
         setPostedPaths((prev) => ({ ...prev, [item.path]: true }));
         setPostProgress({ path: item.path, percent: 100, label: "Posted." });
-        setFeedEditStatus(`Posted text: ${result.uri}`);
+        setFeedEditStatus(
+          archiveError
+            ? `Posted text: ${result.uri} (archive failed: ${archiveError})`
+            : archivedPath
+              ? `Posted text: ${result.uri} (archived: ${archivedPath})`
+              : `Posted text: ${result.uri}`
+        );
       } else if (item.kind === "video") {
         if (!item.mediaUrl) {
           throw new Error("Missing media URL");
         }
         const filename = item.path.split("/").pop() || "video.mp4";
         setPostProgress({ path: item.path, percent: 12, label: "Fetching video file..." });
-        const file = await fetchMediaAsFile(item.mediaUrl, filename, token);
+        const file = await fetchMediaAsFile(item.mediaUrl, filename, token, gatewayBaseUrl);
         const caption =
           selectedFeedItem?.path === item.path ? feedCaptionText : item.previewText || item.title;
         const result = await postVideoToBluesky(
@@ -589,9 +843,16 @@ function App() {
           cid: result.cid,
           status: "success"
         });
+        const { archivedPath, archiveError } = await archivePostedFeedSource(item.path, token);
         setPostedPaths((prev) => ({ ...prev, [item.path]: true }));
         setPostProgress({ path: item.path, percent: 100, label: "Posted." });
-        setFeedEditStatus(`Posted video: ${result.uri}`);
+        setFeedEditStatus(
+          archiveError
+            ? `Posted video: ${result.uri} (archive failed: ${archiveError})`
+            : archivedPath
+              ? `Posted video: ${result.uri} (archived: ${archivedPath})`
+              : `Posted video: ${result.uri}`
+        );
       } else {
         throw new Error(`Posting not supported for ${item.kind}`);
       }
@@ -624,7 +885,7 @@ function App() {
     const token = chatGatewayToken.trim() || undefined;
     setJournalSaveStatus(`Saving ${selectedJournalItem.path}...`);
     try {
-      await saveLibraryText(selectedJournalItem.path, selectedJournalText, token);
+      await saveLibraryText(selectedJournalItem.path, selectedJournalText, token, gatewayBaseUrl);
       setJournalSaveStatus(`Saved ${selectedJournalItem.path}`);
       await refreshLibrary("journal");
     } catch (error) {
@@ -654,20 +915,42 @@ function App() {
   }
 
   async function refreshClawChat() {
-    if (!chatThreadId.trim()) {
+    if (!gatewayBaseUrl.trim()) {
       return;
     }
     try {
-      const threadId = chatThreadId.trim();
-      const token = chatGatewayToken.trim() || undefined;
-      const items = chatUseGatewayApi
-        ? await listClawChatMessagesViaGateway(threadId, token)
-        : await listClawChatMessagesFromPocketBase(pb, threadId);
+      let token = chatGatewayToken.trim();
+      if (!token && isDesktopClient) {
+        token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+      }
+      let threadId = chatThreadId.trim();
+      if (!threadId && token) {
+        const latest = await getLatestChatThreadViaGateway(token, gatewayBaseUrl).catch(() => null);
+        if (latest) {
+          threadId = latest;
+          setChatThreadId(latest);
+          chatThreadHydratedRef.current = true;
+        }
+      }
+      if (!threadId) {
+        setChatMessages([]);
+        setChatStatus("No chat thread yet. Send a message to start.");
+        return;
+      }
+
+      const items = await listClawChatMessagesViaGateway(threadId, token, gatewayBaseUrl);
+      if (items.length === 0 && token && !chatThreadHydratedRef.current) {
+        const latest = await getLatestChatThreadViaGateway(token, gatewayBaseUrl).catch(() => null);
+        chatThreadHydratedRef.current = true;
+        if (latest && latest !== threadId) {
+          setChatThreadId(latest);
+          setChatStatus(`Loaded latest chat thread: ${latest}`);
+          return;
+        }
+      }
+
       setChatMessages(items);
-      setChatStatus(
-        `Chat thread loaded (${items.length} messages) via ${chatUseGatewayApi ? "gateway" : "pocketbase"
-        }`
-      );
+      setChatStatus(`Chat thread loaded (${items.length} messages)`);
     } catch (error) {
       setChatStatus(
         `Chat unavailable (${error instanceof Error ? error.message : String(error)})`
@@ -682,7 +965,38 @@ function App() {
       const { agent: nextAgent, session: nextSession } = await loginBluesky(creds);
       setAgent(nextAgent);
       setSession(nextSession);
-      setAuthMessage(`Signed in as ${nextSession.handle}`);
+      await saveBlueskySessionSecure(nextSession);
+      try {
+        const pbSync = await ensurePocketBaseUserFromBluesky(
+          pb,
+          creds.handle,
+          creds.appPassword,
+          nextSession.handle
+        );
+        const label = pocketBaseAuthLabel(pb);
+        setPbAuthLabel(label);
+        setPbAuthMessage(
+          pbSync.created
+            ? `PocketBase user provisioned and signed in (${label || pbSync.identity})`
+            : `PocketBase signed in as ${label || pbSync.identity}`
+        );
+      } catch (error) {
+        setPbAuthMessage(
+          `PocketBase auto-login failed (${error instanceof Error ? error.message : String(error)})`
+        );
+      }
+      if (isDesktopClient) {
+        try {
+          await restartGatewayDaemonFromDesktop();
+          setAuthMessage(`Signed in as ${nextSession.handle}. Gateway restarted with new credentials.`);
+        } catch (error) {
+          setAuthMessage(
+            `Signed in as ${nextSession.handle}, but gateway restart failed (${error instanceof Error ? error.message : String(error)}).`
+          );
+        }
+      } else {
+        setAuthMessage(`Signed in as ${nextSession.handle}`);
+      }
     } catch (error) {
       setAgent(null);
       setSession(null);
@@ -784,85 +1098,34 @@ function App() {
     }
   }
 
-  async function sendApiRequest() {
-    setApiResponse("Sending...");
-    try {
-      const headers = JSON.parse(apiRequest.headersJson || "{}") as Record<string, string>;
-      const hasBody = apiRequest.method !== "GET";
-      const body = hasBody ? JSON.parse(apiRequest.bodyJson || "{}") : undefined;
-
-      let result: unknown;
-      if (apiRequest.includeBlueskyAuth && session) {
-        result = await sendAuthedXrpcRequest({
-          serviceUrl: creds.serviceUrl,
-          accessJwt: session.accessJwt,
-          method: apiRequest.method,
-          url: apiRequest.url,
-          headers,
-          body
-        });
-      } else {
-        const target = apiRequest.url.startsWith("http")
-          ? apiRequest.url
-          : `${creds.serviceUrl.replace(/\/+$/, "")}/${apiRequest.url.replace(/^\/+/, "")}`;
-
-        const res = await fetch(target, {
-          method: apiRequest.method,
-          headers,
-          body: hasBody ? JSON.stringify(body) : undefined
-        });
-        const textRes = await res.text();
-        let parsed: unknown = textRes;
-        try {
-          parsed = JSON.parse(textRes);
-        } catch {
-          // keep text
-        }
-        result = {
-          ok: res.ok,
-          status: res.status,
-          statusText: res.statusText,
-          data: parsed
-        };
-      }
-
-      setApiResponse(JSON.stringify(result, null, 2));
-    } catch (error) {
-      setApiResponse(
-        JSON.stringify(
-          {
-            error: error instanceof Error ? error.message : String(error)
-          },
-          null,
-          2
-        )
-      );
-    }
-  }
-
   async function sendClawChatMessage() {
     const content = chatInput.trim();
-    const threadId = chatThreadId.trim();
-    if (!threadId) {
-      setChatStatus("Set a thread ID first");
-      return;
-    }
     if (!content) {
       setChatStatus("Enter a message first");
       return;
     }
 
     setChatSending(true);
-    setChatStatus(
-      `Sending message via ${chatUseGatewayApi ? "gateway" : "PocketBase"}...`
-    );
+    setChatStatus("Sending message...");
     try {
-      const token = chatGatewayToken.trim() || undefined;
-      if (chatUseGatewayApi) {
-        await createClawChatUserMessageViaGateway(threadId, content, token);
-      } else {
-        await createClawChatUserMessage(pb, threadId, content);
+      let token = chatGatewayToken.trim();
+      if (!token && isDesktopClient) {
+        token = (await syncDesktopGatewayBootstrap())?.trim() || "";
       }
+      if (!token) {
+        setChatStatus(
+          isDesktopClient
+            ? "Chat blocked (desktop gateway token not ready). Wait 2-3s or restart app."
+            : "Chat blocked (gateway token missing). Pair mobile with desktop QR."
+        );
+        return;
+      }
+      let threadId = chatThreadId.trim();
+      if (!threadId) {
+        threadId = createThreadId();
+        setChatThreadId(threadId);
+      }
+      await createClawChatUserMessageViaGateway(threadId, content, token, gatewayBaseUrl);
       setChatInput("");
       setChatStatus("Message queued (waiting for SlowClaw reply)");
       await refreshClawChat();
@@ -1090,45 +1353,313 @@ function App() {
     }
   }, [feedSource, agent, session]);
 
-  async function pairGatewayFromUi() {
-    const code = chatPairCode.trim();
-    if (!code) {
-      setChatStatus("Enter the one-time pairing code shown in the daemon terminal");
+  function applyGatewayConnection(gatewayUrl: string, token: string) {
+    const normalizedUrl = gatewayUrl.trim().replace(/\/+$/, "");
+    const normalizedToken = token.trim();
+    if (!normalizedUrl || !normalizedToken) {
       return;
     }
-    setChatPairing(true);
-    setChatStatus("Pairing with gateway...");
+    setGatewayBaseUrl(normalizedUrl);
+    setChatGatewayToken(normalizedToken);
+    setChatStatus(`Connected to ${normalizedUrl}`);
+    setMobileScannerStatus(`Connected to ${normalizedUrl}`);
+    void refreshLibrary("all");
+    void refreshClawChat();
+  }
+
+  function parseGatewayQrPayload(rawValue: string): { gatewayUrl: string; token: string } | null {
+    const raw = rawValue.trim();
+    if (!raw) {
+      return null;
+    }
     try {
-      const result = await pairGatewayClient(code);
-      if (!result.token) {
-        throw new Error("Gateway returned no token");
+      const parsed = JSON.parse(raw) as any;
+      const gatewayUrl = String(parsed.gatewayUrl || parsed.gateway_url || "").trim();
+      const token = String(parsed.token || "").trim();
+      if (!gatewayUrl || !token) {
+        return null;
       }
-      setChatGatewayToken(result.token);
-      setChatPairCode("");
-      setChatStatus(result.message || "Paired. Token saved in browser storage.");
-      await refreshClawChat();
-    } catch (error) {
-      setChatStatus(
-        `Pairing failed (${error instanceof Error ? error.message : String(error)})`
-      );
-    } finally {
-      setChatPairing(false);
+      return { gatewayUrl, token };
+    } catch {
+      return null;
     }
   }
 
-  async function copyGatewayToken() {
-    const token = chatGatewayToken.trim();
-    if (!token) {
-      setGatewayTokenCopyStatus("No token to copy");
+  async function invokeDesktopCommand<T>(cmd: string, args: Record<string, unknown> = {}) {
+    try {
+      const core = await import("@tauri-apps/api/core");
+      return await core.invoke<T>(cmd, args);
+    } catch {
+      return null;
+    }
+  }
+
+  async function invokeDesktopCommandStrict<T>(cmd: string, args: Record<string, unknown> = {}) {
+    const core = await import("@tauri-apps/api/core");
+    return core.invoke<T>(cmd, args);
+  }
+
+  async function syncDesktopGatewayBootstrap(): Promise<string | null> {
+    if (!isDesktopClient) {
+      return null;
+    }
+    try {
+      const payload = await invokeDesktopCommandStrict<DesktopGatewayBootstrap>(
+        "get_desktop_gateway_bootstrap"
+      );
+      const nextUrl = String(payload.gatewayUrl || "").trim().replace(/\/+$/, "");
+      if (nextUrl) {
+        setGatewayBaseUrl((current) => {
+          const normalized = current.trim().replace(/\/+$/, "");
+          return normalized === nextUrl ? current : nextUrl;
+        });
+      }
+      const nextToken = String(payload.token || "").trim();
+      if (nextToken) {
+        setChatGatewayToken(nextToken);
+        return nextToken;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function restartGatewayDaemonFromDesktop() {
+    if (!isDesktopClient) {
+      return;
+    }
+    await invokeDesktopCommandStrict<string>("restart_gateway_daemon");
+  }
+
+  async function loadOpenAiDeviceCodeStatus() {
+    if (!isDesktopClient) {
       return;
     }
     try {
-      await navigator.clipboard.writeText(token);
-      setGatewayTokenCopyStatus("Token copied");
-    } catch {
-      setGatewayTokenCopyStatus("Copy failed");
+      const next = await invokeDesktopCommandStrict<OpenAiDeviceCodeStatus>(
+        "get_openai_device_code_status"
+      );
+      setAiSetupStatus(next);
+    } catch (error) {
+      setAiSetupStatus({
+        state: "error",
+        running: false,
+        completed: false,
+        message: `AI setup status unavailable (${error instanceof Error ? error.message : String(error)})`,
+        error: error instanceof Error ? error.message : String(error)
+      });
     }
   }
+
+  async function startOpenAiDeviceCodeLogin() {
+    if (!isDesktopClient) {
+      setAiSetupStatus({
+        state: "error",
+        running: false,
+        completed: false,
+        message: "AI setup is desktop-only.",
+        error: "desktop-only"
+      });
+      return;
+    }
+    setAiSetupBusy(true);
+    try {
+      const next = await invokeDesktopCommandStrict<OpenAiDeviceCodeStatus>(
+        "start_openai_device_code_login"
+      );
+      setAiSetupStatus(next);
+    } catch (error) {
+      setAiSetupStatus({
+        state: "error",
+        running: false,
+        completed: false,
+        message: `Failed to start OpenAI setup (${error instanceof Error ? error.message : String(error)})`,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } finally {
+      setAiSetupBusy(false);
+    }
+  }
+
+  async function saveOptionalProviderApiKey() {
+    if (!isDesktopClient) {
+      setProviderApiKeyStatus("API key storage is desktop-only.");
+      return;
+    }
+    const trimmed = providerApiKey.trim();
+    setProviderApiKeyStatus(trimmed ? "Saving API key..." : "Clearing API key...");
+    try {
+      if (trimmed) {
+        await invokeDesktopCommandStrict("set_secret", {
+          req: {
+            service: DESKTOP_SECRET_SERVICE,
+            account: PROVIDER_API_KEY_SECRET_ACCOUNT,
+            value: trimmed
+          }
+        });
+      } else {
+        await invokeDesktopCommandStrict("delete_secret", {
+          req: {
+            service: DESKTOP_SECRET_SERVICE,
+            account: PROVIDER_API_KEY_SECRET_ACCOUNT
+          }
+        });
+      }
+      await restartGatewayDaemonFromDesktop();
+      setProviderApiKeyStatus(
+        trimmed
+          ? "API key saved. Gateway restarted."
+          : "API key cleared. Gateway restarted."
+      );
+    } catch (error) {
+      setProviderApiKeyStatus(
+        `Failed to apply API key (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function generateDesktopPairingQr() {
+    setDesktopQrLoading(true);
+    setDesktopQrStatus("Generating a new mobile pairing token...");
+    try {
+      const payload = await invokeDesktopCommandStrict<GatewayQrPayload>(
+        "generate_mobile_pairing_qr"
+      );
+      if (!payload?.qr_value || !payload.gateway_url || !payload.token) {
+        throw new Error("Desktop pairing payload was empty");
+      }
+      setDesktopQrPayload(payload);
+      setDesktopQrStatus("QR ready. Scan this from the mobile app.");
+    } catch (error) {
+      setDesktopQrStatus(
+        `QR generation failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setDesktopQrLoading(false);
+    }
+  }
+
+  function stopMobileScanner() {
+    if (mobileScannerRafRef.current) {
+      cancelAnimationFrame(mobileScannerRafRef.current);
+      mobileScannerRafRef.current = null;
+    }
+    if (mobileScannerStreamRef.current) {
+      mobileScannerStreamRef.current.getTracks().forEach((track) => track.stop());
+      mobileScannerStreamRef.current = null;
+    }
+    if (mobileScannerVideoRef.current) {
+      mobileScannerVideoRef.current.srcObject = null;
+    }
+    setMobileScannerActive(false);
+  }
+
+  useEffect(() => {
+    if (isDesktopClient) {
+      return;
+    }
+    const needsQrLogin = !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
+    if (!needsQrLogin || !mobileScannerActive) {
+      return;
+    }
+    let cancelled = false;
+    const BarcodeDetectorCtor = (window as any).BarcodeDetector;
+
+    const start = async () => {
+      if (!BarcodeDetectorCtor) {
+        setMobileCameraPermissionError("QR scanning needs BarcodeDetector support in this browser.");
+        setMobileScannerActive(false);
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        mobileScannerStreamRef.current = stream;
+        const video = mobileScannerVideoRef.current;
+        if (!video) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        video.srcObject = stream;
+        await video.play();
+        const detector = new BarcodeDetectorCtor({ formats: ["qr_code"] });
+        const scanFrame = async () => {
+          if (cancelled) {
+            return;
+          }
+          try {
+            if (video.readyState >= 2) {
+              const codes = await detector.detect(video);
+              if (codes && codes.length > 0) {
+                const value = String(codes[0].rawValue || "");
+                const parsed = parseGatewayQrPayload(value);
+                if (parsed) {
+                  applyGatewayConnection(parsed.gatewayUrl, parsed.token);
+                  stopMobileScanner();
+                  return;
+                }
+              }
+            }
+          } catch {
+            // ignore decode frame errors
+          }
+          mobileScannerRafRef.current = requestAnimationFrame(() => {
+            void scanFrame();
+          });
+        };
+        setMobileCameraPermissionError("");
+        setMobileScannerStatus("Scanner active. Point camera at desktop QR.");
+        void scanFrame();
+      } catch (error) {
+        setMobileCameraPermissionError(
+          `Unable to open camera (${error instanceof Error ? error.message : String(error)})`
+        );
+        setMobileScannerActive(false);
+      }
+    };
+    void start();
+
+    return () => {
+      cancelled = true;
+      if (mobileScannerRafRef.current) {
+        cancelAnimationFrame(mobileScannerRafRef.current);
+        mobileScannerRafRef.current = null;
+      }
+      if (mobileScannerStreamRef.current) {
+        mobileScannerStreamRef.current.getTracks().forEach((track) => track.stop());
+        mobileScannerStreamRef.current = null;
+      }
+      if (mobileScannerVideoRef.current) {
+        mobileScannerVideoRef.current.srcObject = null;
+      }
+    };
+  }, [isDesktopClient, mobileScannerActive, chatGatewayToken, gatewayBaseUrl]);
+
+  useEffect(() => {
+    if (!isDesktopClient) {
+      return;
+    }
+    void loadOpenAiDeviceCodeStatus();
+  }, [isDesktopClient]);
+
+  useEffect(() => {
+    if (!isDesktopClient || !aiSetupStatus?.running) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void loadOpenAiDeviceCodeStatus();
+    }, 1200);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isDesktopClient, aiSetupStatus?.running]);
 
   useEffect(() => {
     void refreshClawChat();
@@ -1138,11 +1669,11 @@ function App() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [pb, chatThreadId, chatUseGatewayApi, chatGatewayToken]);
+  }, [chatThreadId, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     void refreshLibrary("all");
-  }, [chatGatewayToken]);
+  }, [chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     void refreshPostHistory();
@@ -1177,7 +1708,7 @@ function App() {
       return;
     }
     void loadMediaPreview(null);
-  }, [mobileTab, selectedFeedItem, selectedJournalItem, chatGatewayToken]);
+  }, [mobileTab, selectedFeedItem, selectedJournalItem, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     if (!selectedFeedItem || selectedFeedItem.kind !== "text") {
@@ -1192,7 +1723,7 @@ function App() {
     autosaveTimerRef.current = window.setTimeout(async () => {
       try {
         const token = chatGatewayToken.trim() || undefined;
-        await saveLibraryText(selectedFeedItem.path, selectedFeedText, token);
+        await saveLibraryText(selectedFeedItem.path, selectedFeedText, token, gatewayBaseUrl);
         setFeedEditStatus(`Autosaved ${selectedFeedItem.path}`);
       } catch (error) {
         setFeedEditStatus(
@@ -1205,7 +1736,7 @@ function App() {
         window.clearTimeout(autosaveTimerRef.current);
       }
     };
-  }, [selectedFeedText, selectedFeedItem, chatGatewayToken]);
+  }, [selectedFeedText, selectedFeedItem, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     if (!feedCaptionPath || loadedCaptionPathRef.current !== feedCaptionPath) {
@@ -1217,7 +1748,7 @@ function App() {
     const timer = window.setTimeout(async () => {
       try {
         const token = chatGatewayToken.trim() || undefined;
-        await saveLibraryText(feedCaptionPath, feedCaptionText, token);
+        await saveLibraryText(feedCaptionPath, feedCaptionText, token, gatewayBaseUrl);
         setFeedEditStatus(`Autosaved caption: ${feedCaptionPath}`);
       } catch (error) {
         setFeedEditStatus(
@@ -1228,193 +1759,330 @@ function App() {
     return () => {
       window.clearTimeout(timer);
     };
-  }, [feedCaptionText, feedCaptionPath, selectedFeedItem, chatGatewayToken]);
+  }, [feedCaptionText, feedCaptionPath, selectedFeedItem, chatGatewayToken, gatewayBaseUrl]);
+
+  useEffect(() => {
+    if (!journalDraftText.trim()) return;
+    if (selectedJournalItem && selectedJournalItem.kind === "text" && loadedTextPathRef.current !== selectedJournalItem.path) return;
+    if (selectedJournalItem && journalDraftText === selectedJournalText) return;
+
+    if (journalAutosaveTimerRef.current) window.clearTimeout(journalAutosaveTimerRef.current);
+    journalAutosaveTimerRef.current = window.setTimeout(() => {
+      void saveJournalTextDraft();
+    }, 700);
+    return () => {
+      if (journalAutosaveTimerRef.current) window.clearTimeout(journalAutosaveTimerRef.current);
+    };
+  }, [journalDraftText, selectedJournalItem, selectedJournalText, chatGatewayToken, gatewayBaseUrl]);
 
   const journalList = journalItems;
   const feedList = feedItems;
   const postedHistory = history.filter((item) => item.status === "success");
+  const needsMobileQrLogin = !isDesktopClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
+  const needsBlueskyLogin = !session;
+  const showDesktopJournalLayout = isDesktopLayout && mobileTab === "journal";
+
+  const renderJournalSidebarContent = (closeOnSelect: boolean) => (
+    <>
+      <div className="row-between" style={{ marginBottom: "1.5rem" }}>
+        <h2>Recent Journals</h2>
+        <button type="button" className="ghost" onClick={() => void refreshLibrary("journal")}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+        </button>
+      </div>
+
+      {journalItems.length === 0 ? (
+        <p className="text-center muted">No journals found.</p>
+      ) : (
+        <div className="stack">
+          {journalItems.map(item => (
+            <div key={item.path} className="row-between" style={{ padding: "0.8rem", background: selectedJournalPath === item.path ? "color-mix(in srgb, var(--line) 40%, transparent)" : "transparent", borderRadius: "12px" }}>
+              <div
+                className="stack"
+                style={{ gap: '4px', flex: 1, cursor: 'pointer' }}
+                onClick={() => {
+                  void openLibraryItem(item, "journal");
+                  if (closeOnSelect) {
+                    setJournalSidebarOpen(false);
+                  }
+                }}
+              >
+                <div className="feed-title">{item.title}</div>
+                <div className="feed-time">{formatTimestamp(item.modifiedAt)} · {item.kind.toUpperCase()}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+
+  if (needsMobileQrLogin) {
+    return (
+      <div className="app-shell">
+        <main className="page-content">
+          <div className="stack">
+            <div className="card">
+              <h2>Connect To Desktop</h2>
+              <p className="text-sm muted">
+                Scan the QR from the desktop app to sync gateway URL + token.
+              </p>
+              <div className="stack" style={{ alignItems: "center", gap: "0.8rem" }}>
+                <video
+                  ref={mobileScannerVideoRef}
+                  style={{
+                    width: "100%",
+                    maxWidth: "360px",
+                    borderRadius: "14px",
+                    background: "#000",
+                    minHeight: "240px"
+                  }}
+                  playsInline
+                  muted
+                />
+                <div className="row">
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => setMobileScannerActive(true)}
+                    disabled={mobileScannerActive}
+                  >
+                    {mobileScannerActive ? "Scanning..." : "Start Scanner"}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={stopMobileScanner}
+                    disabled={!mobileScannerActive}
+                  >
+                    Stop
+                  </button>
+                </div>
+                <p className="text-sm muted text-center">{mobileScannerStatus}</p>
+                {mobileCameraPermissionError ? (
+                  <p className="text-sm text-center" style={{ color: "var(--danger)" }}>
+                    {mobileCameraPermissionError}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  if (needsBlueskyLogin) {
+    return (
+      <div className="app-shell">
+        <main className="page-content">
+          <div className="stack">
+            <div className="card">
+              <h2>Sign In To Continue</h2>
+              <p className="text-sm muted">
+                Bluesky is the primary account login for this app.
+              </p>
+              <form className="stack" onSubmit={handleLogin}>
+                <p className="text-sm muted">Service: {creds.serviceUrl || "https://bsky.social"}</p>
+                <input
+                  value={creds.handle}
+                  onChange={(e) => setCreds(prev => ({ ...prev, handle: e.target.value }))}
+                  placeholder="Bluesky Handle or Email"
+                />
+                <input
+                  type="password"
+                  value={creds.appPassword}
+                  onChange={(e) => setCreds(prev => ({ ...prev, appPassword: e.target.value }))}
+                  placeholder="Bluesky App Password"
+                />
+                <button type="submit" className="primary">
+                  Sign In
+                </button>
+                {authMessage ? <p className="text-sm muted">{authMessage}</p> : null}
+                {pbAuthMessage ? <p className="text-sm muted">{pbAuthMessage}</p> : null}
+              </form>
+            </div>
+          </div>
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div className="row" style={{ alignItems: "center", gap: "1rem" }}>
-          {mobileTab === "journal" && (
-            <button type="button" className="ghost" onClick={() => setJournalSidebarOpen(true)} style={{ padding: "0.2rem" }}>
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
-            </button>
-          )}
-          <h1>SlowClaw</h1>
-        </div>
-        <div className="topbar-actions">
-          <button
-            type="button"
-            className="ghost"
-            onClick={() => setThemeMode((prev) => (prev === "light" ? "dark" : "light"))}
-            title="Toggle theme"
-          >
-            {themeMode === "light" ? (
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="4.22" x2="19.78" y2="5.64"></line></svg>
-            ) : (
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+      {(!isWritingNote && !isRecording) && (
+        <header className="topbar">
+          <div className="row" style={{ alignItems: "center", gap: "1rem" }}>
+            {mobileTab === "journal" && !showDesktopJournalLayout && (
+              <button type="button" className="ghost" onClick={() => setJournalSidebarOpen(true)} style={{ padding: "0.2rem" }}>
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+              </button>
             )}
-          </button>
-        </div>
-      </header>
-
-      <div className={`sidebar-overlay ${journalSidebarOpen ? 'open' : ''}`} onClick={() => setJournalSidebarOpen(false)}>
-        <div className={`sidebar ${journalSidebarOpen ? 'open' : ''}`} onClick={e => e.stopPropagation()}>
-          <div className="row-between" style={{ marginBottom: "1.5rem" }}>
-            <h2>Recent Journals</h2>
-            <button type="button" className="ghost" onClick={() => void refreshLibrary("journal")}>
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+            <h1>SlowClaw</h1>
+          </div>
+          <div className="topbar-actions">
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setThemeMode((prev) => (prev === "light" ? "dark" : "light"))}
+              title="Toggle theme"
+            >
+              {themeMode === "light" ? (
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="4.22" x2="19.78" y2="5.64"></line></svg>
+              ) : (
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+              )}
             </button>
           </div>
+        </header>
+      )}
 
-          {journalItems.length === 0 ? (
-            <p className="text-center muted">No journals found.</p>
-          ) : (
-            <div className="stack">
-              {journalItems.map(item => (
-                <div key={item.path} className="row-between" style={{ padding: "0.8rem", background: selectedJournalPath === item.path ? "color-mix(in srgb, var(--line) 40%, transparent)" : "transparent", borderRadius: "12px" }}>
-                  <div className="stack" style={{ gap: '4px', flex: 1, cursor: 'pointer' }} onClick={() => { void openLibraryItem(item, "journal"); setJournalSidebarOpen(false); }}>
-                    <div className="feed-title">{item.title}</div>
-                    <div className="feed-time">{formatTimestamp(item.modifiedAt)} · {item.kind.toUpperCase()}</div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+      {mobileTab === "journal" && !showDesktopJournalLayout && !isWritingNote && !isRecording ? (
+        <div className={`sidebar-overlay ${journalSidebarOpen ? 'open' : ''}`} onClick={() => setJournalSidebarOpen(false)}>
+          <div className={`sidebar ${journalSidebarOpen ? 'open' : ''}`} onClick={e => e.stopPropagation()}>
+            {renderJournalSidebarContent(true)}
+          </div>
         </div>
-      </div>
+      ) : null}
 
       <main className="page-content">
         {mobileTab === "journal" ? (
-          <div className="stack">
-            <div className="card">
-              <div className="text-center">
-                <h2>Capture</h2>
-                <p className="text-sm mt-2">{recordingHint || "Record audio or video directly to workspace"}</p>
-              </div>
-              {isRecording ? (
-                <div className="stack" style={{ alignItems: "center", padding: "1rem" }}>
-                  {recordingType === "audio" && (
-                    <canvas ref={audioCanvasRef} width={300} height={100} style={{ width: "100%", maxWidth: "400px", borderRadius: "8px", background: "rgb(30, 30, 30)" }} />
-                  )}
-                  {recordingType === "video" && (
-                    <video ref={videoPreviewRef} style={{ width: "100%", maxWidth: "400px", borderRadius: "8px", background: "#000" }} muted playsInline />
-                  )}
-                  <div className="text-lg" style={{ fontWeight: 600, color: "var(--danger)" }}>
-                    {Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')}
+          <div className={showDesktopJournalLayout ? "journal-desktop-layout" : "stack"}>
+            {showDesktopJournalLayout && !isWritingNote && !isRecording ? (
+              <aside className="sidebar sidebar-desktop open">
+                {renderJournalSidebarContent(false)}
+              </aside>
+            ) : null}
+            <div className="stack journal-main">
+              {!isWritingNote && (
+                <div className="card">
+                  <div className="text-center">
+                    <h2>Capture</h2>
+                    <p className="text-sm mt-2">{recordingHint || "Record audio or video directly to workspace"}</p>
                   </div>
-                  <div className="row">
-                    <button type="button" className="danger" onClick={stopRecording}>Stop & Save</button>
-                    <button type="button" className="ghost" onClick={cancelRecording}>Cancel</button>
-                  </div>
-                </div>
-              ) : (
-                <div className="stack">
-                  <div className="record-btn-group">
-                    <button
-                      type="button"
-                      className="record-btn audio"
-                      onClick={() => void startRecording("audio")}
-                      title="Record Audio"
-                    >
-                      <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
-                    </button>
-                    <button
-                      type="button"
-                      className="record-btn video"
-                      onClick={() => void startRecording("video")}
-                      title="Record Video"
-                    >
-                      <svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
-                    </button>
-                  </div>
+                  {isRecording ? (
+                    <div className="stack" style={{ alignItems: "center", padding: "1rem" }}>
+                      {recordingType === "audio" && (
+                        <canvas ref={audioCanvasRef} width={300} height={100} style={{ width: "100%", maxWidth: "400px", borderRadius: "8px", background: "rgb(30, 30, 30)" }} />
+                      )}
+                      {recordingType === "video" && (
+                        <video ref={videoPreviewRef} style={{ width: "100%", maxWidth: "400px", borderRadius: "8px", background: "#000" }} muted playsInline />
+                      )}
+                      <div className="text-lg" style={{ fontWeight: 600, color: "var(--danger)" }}>
+                        {Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')}
+                      </div>
+                      <div className="row">
+                        <button type="button" className="danger" onClick={stopRecording}>Stop & Save</button>
+                        <button type="button" className="ghost" onClick={cancelRecording}>Cancel</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="stack">
+                      <div className="record-btn-group">
+                        <button
+                          type="button"
+                          className="record-btn audio"
+                          onClick={() => void startRecording("audio")}
+                          title="Record Audio"
+                        >
+                          <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
+                        </button>
+                        <button
+                          type="button"
+                          className="record-btn video"
+                          onClick={() => void startRecording("video")}
+                          title="Record Video"
+                        >
+                          <svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
+                        </button>
+                      </div>
 
-                  {audioDevices.length > 1 && (
-                    <div className="text-center mt-2">
-                      <select
-                        value={selectedAudioDeviceId}
-                        onChange={(e) => setSelectedAudioDeviceId(e.target.value)}
-                        className="text-sm"
-                        style={{ background: "transparent", border: "1px solid var(--line)", padding: "4px 8px", borderRadius: "12px", color: "var(--muted)" }}
-                      >
-                        {audioDevices.map(d => (
-                          <option key={d.deviceId} value={d.deviceId}>{d.label || 'Microphone'}</option>
-                        ))}
-                      </select>
+                      {audioDevices.length > 1 && (
+                        <div className="text-center mt-2">
+                          <select
+                            value={selectedAudioDeviceId}
+                            onChange={(e) => setSelectedAudioDeviceId(e.target.value)}
+                            className="text-sm"
+                            style={{ background: "transparent", border: "1px solid var(--line)", padding: "4px 8px", borderRadius: "12px", color: "var(--muted)" }}
+                          >
+                            {audioDevices.map(d => (
+                              <option key={d.deviceId} value={d.deviceId}>{d.label || 'Microphone'}</option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+
+                      <div className="row-center mt-2" style={{ gap: '1rem' }}>
+                        <button type="button" className="ghost text-sm" onClick={() => audioCaptureRef.current?.click()}>Upload Audio</button>
+                        <button type="button" className="ghost text-sm" onClick={() => videoCaptureRef.current?.click()}>Upload Video</button>
+                      </div>
+
+                      <input
+                        ref={audioCaptureRef}
+                        type="file"
+                        accept="audio/*"
+                        className="visually-hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) void uploadJournalFile(file, "audio");
+                          e.currentTarget.value = "";
+                        }}
+                      />
+                      <input
+                        ref={videoCaptureRef}
+                        type="file"
+                        accept="video/*"
+                        capture="environment"
+                        className="visually-hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) void uploadJournalFile(file, "video");
+                          e.currentTarget.value = "";
+                        }}
+                      />
                     </div>
                   )}
+                </div>
+              )}
 
-                  <div className="row-center mt-2" style={{ gap: '1rem' }}>
-                    <button type="button" className="ghost text-sm" onClick={() => audioCaptureRef.current?.click()}>Upload Audio</button>
-                    <button type="button" className="ghost text-sm" onClick={() => videoCaptureRef.current?.click()}>Upload Video</button>
+              {!isRecording && (
+                <div className="card" style={{ flex: isWritingNote ? 1 : undefined, minHeight: isWritingNote ? '60vh' : undefined }}>
+                  <div className="row-between">
+                    <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => { setJournalDraftText(""); setSelectedJournalItem(null); setMediaPreviewUrl(""); setJournalSaveStatus("Journal idle"); }}
+                        title="New Note"
+                        style={{ padding: '0.2rem 0.5rem', fontSize: '1.2rem' }}
+                      >
+                        +
+                      </button>
+                      <h2 style={{ margin: 0 }}>Note</h2>
+                    </div>
+                    <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+                      <span className="text-sm muted">{journalSaveStatus !== "Journal idle" ? journalSaveStatus : ""}</span>
+                      {isWritingNote && <button type="button" className="ghost" onClick={() => setIsWritingNote(false)}>Done</button>}
+                    </div>
                   </div>
-
-                  <input
-                    ref={audioCaptureRef}
-                    type="file"
-                    accept="audio/*"
-                    className="visually-hidden"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) void uploadJournalFile(file, "audio");
-                      e.currentTarget.value = "";
-                    }}
-                  />
-                  <input
-                    ref={videoCaptureRef}
-                    type="file"
-                    accept="video/*"
-                    capture="environment"
-                    className="visually-hidden"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) void uploadJournalFile(file, "video");
-                      e.currentTarget.value = "";
-                    }}
+                  {selectedJournalItem && mediaPreviewUrl && (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video") && (
+                    <div className="stack" style={{ marginBottom: '1rem' }}>
+                      {selectedJournalItem.kind === "audio" && <audio controls src={mediaPreviewUrl} style={{ width: '100%' }} />}
+                      {selectedJournalItem.kind === "video" && <video controls src={mediaPreviewUrl} className="media-viewer" style={{ marginTop: 0 }} />}
+                    </div>
+                  )}
+                  <textarea
+                    rows={isWritingNote ? 15 : 5}
+                    value={journalDraftText}
+                    onChange={(e) => setJournalDraftText(e.target.value)}
+                    onFocus={() => setIsWritingNote(true)}
+                    placeholder="Write your thoughts..."
+                    style={{ flex: isWritingNote ? 1 : undefined, resize: 'none' }}
                   />
                 </div>
               )}
 
-              <input
-                value={journalDraftTitle}
-                onChange={(e) => setJournalDraftTitle(e.target.value)}
-                placeholder="Title (used for uploads & notes)"
-              />
             </div>
-
-            <div className="card">
-              <div className="row-between">
-                <h2>Note</h2>
-                <button type="button" className="ghost" onClick={saveJournalTextDraft}>Save</button>
-              </div>
-              <textarea
-                rows={5}
-                value={journalDraftText}
-                onChange={(e) => setJournalDraftText(e.target.value)}
-                placeholder="Write your thoughts..."
-              />
-              {journalSaveStatus !== "Journal idle" && (
-                <p className="text-sm text-center muted">{journalSaveStatus}</p>
-              )}
-            </div>
-
-            {selectedJournalItem && mediaPreviewUrl && (
-              <div className="card">
-                <h3>Preview: {selectedJournalItem.title}</h3>
-                {selectedJournalItem.kind === "audio" && (
-                  <audio controls src={mediaPreviewUrl} style={{ width: '100%' }} />
-                )}
-                {selectedJournalItem.kind === "video" && (
-                  <video controls src={mediaPreviewUrl} className="media-viewer" />
-                )}
-                {selectedJournalItem.kind === "image" && (
-                  <img src={mediaPreviewUrl} alt="" className="media-viewer" />
-                )}
-              </div>
-            )}
           </div>
         ) : null}
 
@@ -1467,6 +2135,27 @@ function App() {
                           </div>
                           <div className="feed-body" style={{ marginTop: '8px', wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
                             {record.text}
+                          </div>
+                          {post.embed && post.embed.$type === "app.bsky.embed.images#view" && (
+                            <div className="feed-embed-images mt-2" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '0.5rem' }}>
+                              {(post.embed as any).images?.map((img: any, i: number) => (
+                                <img key={i} src={img.thumb || img.fullsize} alt={img.alt || "Embedded image"} style={{ width: '100%', height: '100%', maxHeight: '300px', objectFit: 'cover', borderRadius: '12px' }} />
+                              ))}
+                            </div>
+                          )}
+                          <div className="feed-stats row text-sm muted mt-2" style={{ gap: '1rem', marginTop: '0.8rem' }}>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
+                              {post.replyCount || 0}
+                            </span>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 1l4 4-4 4"></path><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><path d="M7 23l-4-4 4-4"></path><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
+                              {post.repostCount || 0}
+                            </span>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+                              {post.likeCount || 0}
+                            </span>
                           </div>
                           <div className="feed-actions">
                             <a href={`https://bsky.app/profile/${author.handle}/post/${post.uri.split("/").pop()}`} target="_blank" rel="noreferrer" className="ghost text-sm" style={{ textDecoration: "none", padding: "0.2rem 0.5rem" }}>View on Bluesky</a>
@@ -1642,23 +2331,19 @@ function App() {
         {mobileTab === "profile" ? (
           <div className="stack">
             <div className="card">
-              <h2>Bluesky Login</h2>
+              <h2>Bluesky Login (Desktop)</h2>
               <form className="stack" onSubmit={handleLogin}>
-                <input
-                  value={creds.serviceUrl}
-                  onChange={(e) => setCreds(prev => ({ ...prev, serviceUrl: e.target.value }))}
-                  placeholder="https://bsky.social"
-                />
+                <p className="text-sm muted">Service: {creds.serviceUrl || "https://bsky.social"}</p>
                 <input
                   value={creds.handle}
                   onChange={(e) => setCreds(prev => ({ ...prev, handle: e.target.value }))}
-                  placeholder="Handle or Email"
+                  placeholder="Bluesky Handle or Email"
                 />
                 <input
                   type="password"
                   value={creds.appPassword}
                   onChange={(e) => setCreds(prev => ({ ...prev, appPassword: e.target.value }))}
-                  placeholder="App Password"
+                  placeholder="Bluesky App Password"
                 />
                 <div className="row">
                   <button type="submit" className="primary" style={{ flex: 1 }}>Sign In</button>
@@ -1684,102 +2369,176 @@ function App() {
             <div className="card">
               <h2>Gateway & App Settings</h2>
               <div className="stack">
-                <p><strong>Gateway Pairing Token</strong></p>
-                <div className="row">
-                  <input
-                    value={chatPairCode}
-                    onChange={(e) => setChatPairCode(e.target.value)}
-                    placeholder="Pairing Code"
-                    style={{ flex: 1 }}
-                  />
-                  <button type="button" onClick={pairGatewayFromUi} disabled={chatPairing}>Pair</button>
-                </div>
-                {chatGatewayToken && (
-                  <div className="stack" style={{ gap: "0.4rem" }}>
-                    <div className="row">
-                      <input
-                        type={showGatewayToken ? "text" : "password"}
-                        value={chatGatewayToken}
-                        readOnly
-                        style={{ flex: 1 }}
-                      />
-                    </div>
-                    <div className="row">
+                <p className="text-sm muted">
+                  Chat and journal upload use desktop gateway auth automatically.
+                </p>
+
+                <p className="text-sm muted">
+                  {chatGatewayToken
+                    ? "Gateway auth is ready for chat + journal uploads."
+                    : "Waiting for desktop gateway auth bootstrap."}
+                </p>
+
+                {isDesktopClient && (
+                  <div className="stack" style={{ gap: "0.8rem" }}>
+                    <div className="row-between">
+                      <p><strong>Pair Mobile With QR</strong></p>
                       <button
                         type="button"
-                        className="ghost"
-                        onClick={() => setShowGatewayToken((prev) => !prev)}
+                        onClick={() => void generateDesktopPairingQr()}
+                        disabled={desktopQrLoading}
                       >
-                        {showGatewayToken ? "Hide Token" : "Show Token"}
-                      </button>
-                      <button type="button" className="ghost" onClick={() => void copyGatewayToken()}>
-                        Copy Token
+                        {desktopQrLoading ? "Generating..." : "Generate QR"}
                       </button>
                     </div>
-                    <p className="text-sm muted">
-                      {gatewayTokenCopyStatus || "Token synced and ready to use for `slowclaw pair new-code`."}
-                    </p>
+                    {desktopQrPayload && (
+                      <div className="stack" style={{ alignItems: "center", gap: "0.6rem" }}>
+                        <QRCodeCanvas value={desktopQrPayload.qr_value} size={220} includeMargin />
+                        <p className="text-sm muted text-center">
+                          Mobile gateway: {desktopQrPayload.gateway_url}
+                        </p>
+                      </div>
+                    )}
+                    {desktopQrStatus ? <p className="text-sm muted">{desktopQrStatus}</p> : null}
                   </div>
                 )}
-
-                <p className="mt-2"><strong>PocketBase Server Link</strong></p>
-                <input value={pbUrl} onChange={(e) => setPbUrl(e.target.value)} placeholder="http://127.0.0.1:8090" />
-
-                <p className="mt-2"><strong>Chat Thread ID</strong></p>
-                <div className="row">
-                  <input value={chatThreadId} onChange={(e) => setChatThreadId(e.target.value)} style={{ flex: 1 }} />
-                  <button type="button" onClick={() => setChatThreadId(createThreadId())}>New</button>
-                </div>
+                <p className="text-sm muted">
+                  {pbAuthMessage}
+                </p>
+                {pb.authStore.isValid && pbAuthLabel ? (
+                  <div className="badge success text-center" style={{ alignSelf: "flex-start" }}>
+                    PocketBase: {pbAuthLabel}
+                  </div>
+                ) : null}
               </div>
             </div>
 
             <div className="card">
               <div className="row-between">
-                <h2>API Requests Box</h2>
-                <button type="button" className="ghost" onClick={sendApiRequest}>Send</button>
+                <h2>AI Setup</h2>
+                <button
+                  type="button"
+                  onClick={() => void startOpenAiDeviceCodeLogin()}
+                  disabled={aiSetupBusy || !!aiSetupStatus?.running || !isDesktopClient}
+                >
+                  {aiSetupBusy
+                    ? "Starting..."
+                    : aiSetupStatus?.running
+                      ? "In Progress..."
+                      : "Start OpenAI Device Login"}
+                </button>
               </div>
-              <input value={apiRequest.url} onChange={(e) => setApiRequest(prev => ({ ...prev, url: e.target.value }))} placeholder="URL" />
-              <textarea rows={3} value={apiRequest.bodyJson} onChange={(e) => setApiRequest(prev => ({ ...prev, bodyJson: e.target.value }))} placeholder="JSON Body (if POST)" />
-              {apiResponse && <pre style={{ fontSize: '0.8rem', whiteSpace: 'pre-wrap', background: 'var(--bg)', padding: '1rem', borderRadius: '12px' }}>{apiResponse.slice(0, 500)}{apiResponse.length > 500 ? '...' : ''}</pre>}
+              {!isDesktopClient ? (
+                <p className="text-sm muted">AI setup runs on desktop only. Use the desktop app for this step.</p>
+              ) : (
+                <div className="stack">
+                  <p className="text-sm muted">
+                    Starts `slowclaw auth login --provider openai-codex --device-code` and waits for completion.
+                  </p>
+                  <div className="stack" style={{ gap: "0.4rem" }}>
+                    <p className="text-sm"><strong>Provider API Key (Optional)</strong></p>
+                    <input
+                      type="password"
+                      value={providerApiKey}
+                      onChange={(e) => setProviderApiKey(e.target.value)}
+                      placeholder="Optional: set ZEROCLAW_API_KEY for daemon"
+                    />
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void saveOptionalProviderApiKey()}
+                    >
+                      Save API Key
+                    </button>
+                    {providerApiKeyStatus ? (
+                      <p className="text-sm muted">{providerApiKeyStatus}</p>
+                    ) : null}
+                  </div>
+                  <div className="badge text-center" style={{ alignSelf: "flex-start" }}>
+                    State: {aiSetupStatus?.state || "idle"}
+                  </div>
+                  <p className="text-sm">{aiSetupStatus?.message || "Not started."}</p>
+                  {aiSetupStatus?.verificationUrl ? (
+                    <p className="text-sm">
+                      URL:{" "}
+                      <a href={aiSetupStatus.verificationUrl} target="_blank" rel="noreferrer">
+                        {aiSetupStatus.verificationUrl}
+                      </a>
+                    </p>
+                  ) : null}
+                  {aiSetupStatus?.fastLink ? (
+                    <p className="text-sm">
+                      Fast Link:{" "}
+                      <a href={aiSetupStatus.fastLink} target="_blank" rel="noreferrer">
+                        {aiSetupStatus.fastLink}
+                      </a>
+                    </p>
+                  ) : null}
+                  {aiSetupStatus?.userCode ? (
+                    <div className="row" style={{ alignItems: "center" }}>
+                      <input value={aiSetupStatus.userCode} readOnly style={{ flex: 1 }} />
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => void navigator.clipboard.writeText(aiSetupStatus.userCode || "")}
+                      >
+                        Copy Code
+                      </button>
+                    </div>
+                  ) : null}
+                  {aiSetupStatus?.completed ? (
+                    <p className="text-sm" style={{ color: "var(--success)" }}>
+                      OpenAI auth is complete and saved to the app workspace.
+                    </p>
+                  ) : null}
+                  {aiSetupStatus?.error ? (
+                    <p className="text-sm" style={{ color: "var(--danger)" }}>
+                      {aiSetupStatus.error}
+                    </p>
+                  ) : null}
+                </div>
+              )}
             </div>
           </div>
         ) : null}
       </main>
 
-      <nav className="bottom-nav">
-        <button
-          type="button"
-          className={mobileTab === "journal" ? "active" : ""}
-          onClick={() => setMobileTab("journal")}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
-          Journal
-        </button>
-        <button
-          type="button"
-          className={mobileTab === "feed" ? "active" : ""}
-          onClick={() => setMobileTab("feed")}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-          Feed
-        </button>
-        <button
-          type="button"
-          className={mobileTab === "chat" ? "active" : ""}
-          onClick={() => setMobileTab("chat")}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
-          Chat
-        </button>
-        <button
-          type="button"
-          className={mobileTab === "profile" ? "active" : ""}
-          onClick={() => setMobileTab("profile")}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
-          Settings
-        </button>
-      </nav>
+      {(!isWritingNote && !isRecording) && (
+        <nav className="bottom-nav">
+          <button
+            type="button"
+            className={mobileTab === "journal" ? "active" : ""}
+            onClick={() => setMobileTab("journal")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
+            Journal
+          </button>
+          <button
+            type="button"
+            className={mobileTab === "feed" ? "active" : ""}
+            onClick={() => setMobileTab("feed")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+            Feed
+          </button>
+          <button
+            type="button"
+            className={mobileTab === "chat" ? "active" : ""}
+            onClick={() => setMobileTab("chat")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+            Chat
+          </button>
+          <button
+            type="button"
+            className={mobileTab === "profile" ? "active" : ""}
+            onClick={() => setMobileTab("profile")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+            Settings
+          </button>
+        </nav>
+      )}
     </div>
   );
 }
