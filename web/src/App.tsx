@@ -607,7 +607,15 @@ function App() {
       setJournalSaveStatus("Write something first");
       return;
     }
-    const token = chatGatewayToken.trim() || undefined;
+
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      setJournalSaveStatus("Save blocked (gateway token missing).");
+      return;
+    }
     setJournalSaveStatus("Saving journal note...");
     try {
       let resultPath = "";
@@ -648,8 +656,8 @@ function App() {
       setSelectedFeedPath(item.path);
     }
 
+    const token = chatGatewayToken.trim() || undefined;
     if (item.kind === "text") {
-      const token = chatGatewayToken.trim() || undefined;
       try {
         const content = await readLibraryText(item.path, token, gatewayBaseUrl);
         if (scope === "journal") {
@@ -673,7 +681,6 @@ function App() {
       }
     } else if (item.kind === "video" || item.kind === "audio") {
       const captionPath = sidecarCaptionPath(item);
-      const token = chatGatewayToken.trim() || undefined;
       try {
         const content = await readLibraryText(captionPath, token, gatewayBaseUrl);
         if (scope === "feed") {
@@ -899,8 +906,8 @@ function App() {
     try {
       const result = await listDraftsFromPocketBase(pb);
       setDrafts(
-        result.items.map((item) => ({
-          id: item.id,
+        result.items.map((item: any) => ({
+          id: String(item.id || ""),
           text: String(item.text || ""),
           videoName: String(item.videoName || ""),
           created: String(item.createdAtClient || item.created || ""),
