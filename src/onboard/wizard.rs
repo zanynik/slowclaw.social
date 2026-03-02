@@ -5438,7 +5438,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
     ];
 
     // Create subdirectories
-    let subdirs = ["sessions", "memory", "state", "cron", "skills"];
+    let subdirs = ["sessions", "memory", "state", "cron", "skills", "scripts"];
     for dir in &subdirs {
         fs::create_dir_all(workspace_dir.join(dir)).await?;
     }
@@ -6003,7 +6003,7 @@ mod tests {
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
-        for dir in &["sessions", "memory", "state", "cron", "skills"] {
+        for dir in &["sessions", "memory", "state", "cron", "skills", "scripts"] {
             assert!(tmp.path().join(dir).is_dir(), "missing subdirectory: {dir}");
         }
     }

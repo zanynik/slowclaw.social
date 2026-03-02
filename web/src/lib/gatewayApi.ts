@@ -95,6 +95,23 @@ export async function saveLibraryText(
   await parseJsonOrThrow(res);
 }
 
+export async function archivePostedLibraryItem(
+  path: string,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+) {
+  const trimmedPath = path.trim();
+  if (!trimmedPath) {
+    throw new Error("Path is required");
+  }
+  const res = await fetch(resolveGatewayEndpoint("/api/library/archive-posted", gatewayBaseUrl), {
+    method: "POST",
+    headers: authHeaders(bearerToken, "application/json"),
+    body: JSON.stringify({ path: trimmedPath })
+  });
+  return parseJsonOrThrow(res);
+}
+
 export async function createJournalTextViaGateway(
   title: string,
   content: string,

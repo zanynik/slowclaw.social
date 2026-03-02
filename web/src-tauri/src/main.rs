@@ -9,6 +9,8 @@ use std::fmt::Write as _;
 use std::net::UdpSocket;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use std::net::{SocketAddr, TcpStream};
+#[cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use std::path::{Path, PathBuf};
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -70,18 +72,17 @@ const CORE_WORKSPACE_DIRS: &[&str] = &[
     "memory",
     "sessions",
     "skills",
+    "scripts",
     "state",
     "journals",
     "journals/text",
+    "journals/text/transcripts",
+    "journals/text/ocr",
     "journals/media",
     "journals/media/audio",
     "journals/media/video",
     "journals/media/image",
     "journals/processed",
-    "journals/pipeline",
-    "posts",
-    "outputs",
-    "artifacts",
 ];
 
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -515,6 +516,79 @@ fn repair_workspace_skeleton(paths: &DesktopPaths) -> Result<(), String> {
 }
 
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn repair_workspace_scripts(paths: &DesktopPaths) -> Result<(), String> {
+    let scripts_dir = paths.workspace_dir.join("scripts");
+    fs::create_dir_all(&scripts_dir).map_err(|e| {
+        format!(
+            "failed to create workspace scripts dir {}: {e}",
+            scripts_dir.display()
+        )
+    })?;
+    repair_shell_script_permissions_recursive(&scripts_dir)
+}
+
+#[cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))]
+fn repair_shell_script_permissions_recursive(root: &Path) -> Result<(), String> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| format!("failed to read workspace scripts dir {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!("failed to read workspace scripts entry in {}: {e}", dir.display())
+            })?;
+            let file_type = entry.file_type().map_err(|e| {
+                format!(
+                    "failed to read workspace scripts entry type {}: {e}",
+                    entry.path().display()
+                )
+            })?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let is_shell_script = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"));
+            if !is_shell_script {
+                continue;
+            }
+            let metadata = fs::metadata(&path).map_err(|e| {
+                format!(
+                    "failed to read shell script metadata {}: {e}",
+                    path.display()
+                )
+            })?;
+            let mut permissions = metadata.permissions();
+            let mode = permissions.mode();
+            if mode & 0o100 == 0 {
+                permissions.set_mode(mode | 0o100);
+                fs::set_permissions(&path, permissions).map_err(|e| {
+                    format!(
+                        "failed to set shell script execute permission {}: {e}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(any(target_os = "ios", target_os = "android"))))]
+fn repair_shell_script_permissions_recursive(_root: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 async fn run_sidecar_onboard_async(
     app: &tauri::AppHandle,
     paths: &DesktopPaths,
@@ -571,6 +645,9 @@ async fn ensure_workspace_ready_async(app: &tauri::AppHandle) -> Result<DesktopP
     }
     if workspace_skeleton_missing(&paths) {
         repair_workspace_skeleton(&paths)?;
+    }
+    if let Err(err) = repair_workspace_scripts(&paths) {
+        eprintln!("warning: workspace script permission repair skipped: {err}");
     }
 
     if !config_path.exists() {

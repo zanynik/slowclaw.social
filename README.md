@@ -9,6 +9,8 @@ A stripped-down fork of SlowClaw focused on one job:
 
 The binary name is `slowclaw`.
 
+Website: <https://slowclaw.social>
+
 ## What This Fork Keeps
 
 - Workspace-only file access policy (hard-enforced in app config/policy)
@@ -353,6 +355,7 @@ Exposed routes now:
 - `GET /api/library/items`
 - `GET /api/library/text`
 - `POST /api/library/save-text`
+- `POST /api/library/archive-posted`
 - `GET /api/media/{path}`
 - `GET /` and `GET /_app/*` (static UI)
 
@@ -370,6 +373,16 @@ Removed from the gateway surface in this fork:
 - `pocketbase/` — PocketBase binary/schema assets
 - `web/` — bundled web UI source/build
 - `scripts/` — workspace scripts you schedule
+
+## Journal Workspace Contract
+
+- raw captures: `journals/media/{audio|video|image}/...`
+- notes + machine text: `journals/text/...`
+- audio/video transcripts: `journals/text/transcripts/{audio|video}/...`
+- image OCR text: `journals/text/ocr/...`
+- feed candidates visible in UI: `journals/processed/...`
+- posted archive (not shown in feed): `posts/...`
+
 
 ## Validation Notes
 

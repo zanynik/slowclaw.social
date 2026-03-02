@@ -21,6 +21,7 @@ import {
   savePostHistoryToPocketBase
 } from "./lib/pocketbase";
 import {
+  archivePostedLibraryItem,
   createJournalTextViaGateway,
   fetchMediaAsFile,
   listLibraryItems,
@@ -78,8 +79,21 @@ function defaultMobileTab(): MobileTab {
   if (typeof window === "undefined") {
     return "journal";
   }
+  if (window.innerWidth > 900) {
+    return "journal";
+  }
   const saved = window.localStorage.getItem(UI_TAB_STORAGE_KEY);
   return saved === "feed" || saved === "chat" || saved === "profile" ? saved : "journal";
+}
+
+function useIsLargeScreen() {
+  const [isLarge, setIsLarge] = useState(typeof window !== "undefined" ? window.innerWidth > 900 : false);
+  useEffect(() => {
+    const handleResize = () => setIsLarge(window.innerWidth > 900);
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+  return isLarge;
 }
 
 function formatBytes(bytes: number) {
@@ -175,6 +189,8 @@ function resolveGatewayResourceUrl(resourcePath: string, gatewayBaseUrl: string)
 
 function App() {
   const isDesktopClient = isTauriDesktopRuntime();
+  const isLargeScreen = useIsLargeScreen();
+  const isDesktopLayout = isDesktopClient || isLargeScreen;
   const [gatewayBaseUrl, setGatewayBaseUrl] = useState(defaultGatewayBaseUrl);
   const [pbUrl, setPbUrl] = useState(() =>
     derivePocketBaseUrlFromGateway(defaultGatewayBaseUrl())
@@ -236,7 +252,7 @@ function App() {
   const [desktopQrStatus, setDesktopQrStatus] = useState("");
   const [themeMode, setThemeMode] = useState<ThemeMode>(defaultThemeMode);
   const [mobileTab, setMobileTab] = useState<MobileTab>(defaultMobileTab);
-  const [journalSidebarOpen, setJournalSidebarOpen] = useState(isDesktopClient);
+  const [journalSidebarOpen, setJournalSidebarOpen] = useState(false);
   const [feedSidebarOpen, setFeedSidebarOpen] = useState(false);
   const [journalItems, setJournalItems] = useState<LibraryItem[]>([]);
   const [feedItems, setFeedItems] = useState<LibraryItem[]>([]);
@@ -247,9 +263,9 @@ function App() {
   const [selectedFeedItem, setSelectedFeedItem] = useState<LibraryItem | null>(null);
   const [selectedJournalText, setSelectedJournalText] = useState("");
   const [selectedFeedText, setSelectedFeedText] = useState("");
-  const [journalDraftTitle, setJournalDraftTitle] = useState("");
   const [journalDraftText, setJournalDraftText] = useState("");
   const [journalSaveStatus, setJournalSaveStatus] = useState("Journal idle");
+  const [isWritingNote, setIsWritingNote] = useState(false);
   const [feedCaptionText, setFeedCaptionText] = useState("");
   const [feedCaptionPath, setFeedCaptionPath] = useState<string>("");
   const [feedEditStatus, setFeedEditStatus] = useState("Feed idle");
@@ -287,6 +303,7 @@ function App() {
   const audioCaptureRef = useRef<HTMLInputElement | null>(null);
   const videoCaptureRef = useRef<HTMLInputElement | null>(null);
   const autosaveTimerRef = useRef<number | null>(null);
+  const journalAutosaveTimerRef = useRef<number | null>(null);
   const loadedTextPathRef = useRef<string>("");
   const loadedCaptionPathRef = useRef<string>("");
   const chatThreadHydratedRef = useRef(false);
@@ -466,10 +483,10 @@ function App() {
   }, [mobileTab]);
 
   useEffect(() => {
-    if (isDesktopClient && mobileTab === "journal") {
+    if (isDesktopLayout && mobileTab === "journal") {
       setJournalSidebarOpen(true);
     }
-  }, [isDesktopClient, mobileTab]);
+  }, [isDesktopLayout, mobileTab]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -508,7 +525,7 @@ function App() {
           if (item.kind !== "text") {
             return false;
           }
-          return path.startsWith("journals/text/");
+          return path.startsWith("journals/text/") && path.endsWith(".txt");
         });
         setJournalItems(items);
         if (items.length > 0 && !selectedJournalPath) {
@@ -562,8 +579,7 @@ function App() {
         file,
         {
           kind,
-          filename: file.name || `${kind}-${Date.now()}`,
-          title: journalDraftTitle.trim() || undefined
+          filename: file.name || `${kind}-${Date.now()}`
         },
         token,
         gatewayBaseUrl
@@ -594,18 +610,28 @@ function App() {
     const token = chatGatewayToken.trim() || undefined;
     setJournalSaveStatus("Saving journal note...");
     try {
-      const result = await createJournalTextViaGateway(
-        journalDraftTitle.trim() || "Journal entry",
-        content,
-        token,
-        gatewayBaseUrl
-      );
-      setJournalSaveStatus(`Saved: ${String(result.path || "journal entry")}`);
-      setJournalDraftText("");
-      if (!journalDraftTitle.trim()) {
-        setJournalDraftTitle("");
+      let resultPath = "";
+      if (selectedJournalItem && selectedJournalItem.kind === "text") {
+        await saveLibraryText(selectedJournalItem.path, content, token, gatewayBaseUrl);
+        resultPath = selectedJournalItem.path;
+      } else if (selectedJournalItem && (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video")) {
+        const captionPath = sidecarCaptionPath(selectedJournalItem);
+        await saveLibraryText(captionPath, content, token, gatewayBaseUrl);
+        resultPath = captionPath;
+      } else {
+        const result = await createJournalTextViaGateway(
+          "Journal entry",
+          content,
+          token,
+          gatewayBaseUrl
+        );
+        resultPath = String(result.path || "");
       }
-      await refreshLibrary("journal");
+      setJournalSaveStatus(`Saved`);
+      if (!selectedJournalItem) {
+        await refreshLibrary("journal");
+        if (resultPath) setSelectedJournalPath(resultPath);
+      }
     } catch (error) {
       setJournalSaveStatus(
         `Save failed (${error instanceof Error ? error.message : String(error)})`
@@ -629,6 +655,7 @@ function App() {
         if (scope === "journal") {
           loadedTextPathRef.current = item.path;
           setSelectedJournalText(content);
+          setJournalDraftText(content);
         } else {
           loadedTextPathRef.current = item.path;
           setSelectedFeedText(content);
@@ -644,18 +671,30 @@ function App() {
           );
         }
       }
-    } else if (scope === "feed" && (item.kind === "video" || item.kind === "audio")) {
+    } else if (item.kind === "video" || item.kind === "audio") {
       const captionPath = sidecarCaptionPath(item);
       const token = chatGatewayToken.trim() || undefined;
       try {
         const content = await readLibraryText(captionPath, token, gatewayBaseUrl);
-        loadedCaptionPathRef.current = captionPath;
-        setFeedCaptionPath(captionPath);
-        setFeedCaptionText(content);
+        if (scope === "feed") {
+          loadedCaptionPathRef.current = captionPath;
+          setFeedCaptionPath(captionPath);
+          setFeedCaptionText(content);
+        } else {
+          loadedTextPathRef.current = captionPath;
+          setSelectedJournalText(content);
+          setJournalDraftText(content);
+        }
       } catch {
-        loadedCaptionPathRef.current = captionPath;
-        setFeedCaptionPath(captionPath);
-        setFeedCaptionText(item.previewText || item.title || "");
+        if (scope === "feed") {
+          loadedCaptionPathRef.current = captionPath;
+          setFeedCaptionPath(captionPath);
+          setFeedCaptionText(item.previewText || item.title || "");
+        } else {
+          loadedTextPathRef.current = captionPath;
+          setSelectedJournalText("");
+          setJournalDraftText("");
+        }
       }
     }
   }
@@ -703,6 +742,31 @@ function App() {
     }
   }
 
+  async function archivePostedFeedSource(sourcePath: string, token?: string) {
+    const path = sourcePath.trim();
+    if (!path) {
+      return { archivedPath: "", archiveError: "Missing source path" };
+    }
+    try {
+      const result = await archivePostedLibraryItem(path, token, gatewayBaseUrl);
+      const archivedPath = String(result?.path || "");
+      if (selectedFeedPath === path) {
+        setSelectedFeedPath("");
+        setSelectedFeedItem(null);
+        setSelectedFeedText("");
+        setFeedCaptionPath("");
+        setFeedCaptionText("");
+      }
+      await refreshLibrary("feed");
+      return { archivedPath, archiveError: "" };
+    } catch (error) {
+      return {
+        archivedPath: "",
+        archiveError: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
   async function postFeedItemToBluesky(item: LibraryItem) {
     if (!agent || !session) {
       setFeedEditStatus("Sign in to Bluesky first");
@@ -734,9 +798,16 @@ function App() {
           cid: result.cid,
           status: "success"
         });
+        const { archivedPath, archiveError } = await archivePostedFeedSource(item.path, token);
         setPostedPaths((prev) => ({ ...prev, [item.path]: true }));
         setPostProgress({ path: item.path, percent: 100, label: "Posted." });
-        setFeedEditStatus(`Posted text: ${result.uri}`);
+        setFeedEditStatus(
+          archiveError
+            ? `Posted text: ${result.uri} (archive failed: ${archiveError})`
+            : archivedPath
+              ? `Posted text: ${result.uri} (archived: ${archivedPath})`
+              : `Posted text: ${result.uri}`
+        );
       } else if (item.kind === "video") {
         if (!item.mediaUrl) {
           throw new Error("Missing media URL");
@@ -772,9 +843,16 @@ function App() {
           cid: result.cid,
           status: "success"
         });
+        const { archivedPath, archiveError } = await archivePostedFeedSource(item.path, token);
         setPostedPaths((prev) => ({ ...prev, [item.path]: true }));
         setPostProgress({ path: item.path, percent: 100, label: "Posted." });
-        setFeedEditStatus(`Posted video: ${result.uri}`);
+        setFeedEditStatus(
+          archiveError
+            ? `Posted video: ${result.uri} (archive failed: ${archiveError})`
+            : archivedPath
+              ? `Posted video: ${result.uri} (archived: ${archivedPath})`
+              : `Posted video: ${result.uri}`
+        );
       } else {
         throw new Error(`Posting not supported for ${item.kind}`);
       }
@@ -1683,12 +1761,26 @@ function App() {
     };
   }, [feedCaptionText, feedCaptionPath, selectedFeedItem, chatGatewayToken, gatewayBaseUrl]);
 
+  useEffect(() => {
+    if (!journalDraftText.trim()) return;
+    if (selectedJournalItem && selectedJournalItem.kind === "text" && loadedTextPathRef.current !== selectedJournalItem.path) return;
+    if (selectedJournalItem && journalDraftText === selectedJournalText) return;
+
+    if (journalAutosaveTimerRef.current) window.clearTimeout(journalAutosaveTimerRef.current);
+    journalAutosaveTimerRef.current = window.setTimeout(() => {
+      void saveJournalTextDraft();
+    }, 700);
+    return () => {
+      if (journalAutosaveTimerRef.current) window.clearTimeout(journalAutosaveTimerRef.current);
+    };
+  }, [journalDraftText, selectedJournalItem, selectedJournalText, chatGatewayToken, gatewayBaseUrl]);
+
   const journalList = journalItems;
   const feedList = feedItems;
   const postedHistory = history.filter((item) => item.status === "success");
   const needsMobileQrLogin = !isDesktopClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
   const needsBlueskyLogin = !session;
-  const showDesktopJournalLayout = isDesktopClient && mobileTab === "journal";
+  const showDesktopJournalLayout = isDesktopLayout && mobileTab === "journal";
 
   const renderJournalSidebarContent = (closeOnSelect: boolean) => (
     <>
@@ -1818,32 +1910,34 @@ function App() {
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div className="row" style={{ alignItems: "center", gap: "1rem" }}>
-          {mobileTab === "journal" && !showDesktopJournalLayout && (
-            <button type="button" className="ghost" onClick={() => setJournalSidebarOpen(true)} style={{ padding: "0.2rem" }}>
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
-            </button>
-          )}
-          <h1>SlowClaw</h1>
-        </div>
-        <div className="topbar-actions">
-          <button
-            type="button"
-            className="ghost"
-            onClick={() => setThemeMode((prev) => (prev === "light" ? "dark" : "light"))}
-            title="Toggle theme"
-          >
-            {themeMode === "light" ? (
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="4.22" x2="19.78" y2="5.64"></line></svg>
-            ) : (
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+      {(!isWritingNote && !isRecording) && (
+        <header className="topbar">
+          <div className="row" style={{ alignItems: "center", gap: "1rem" }}>
+            {mobileTab === "journal" && !showDesktopJournalLayout && (
+              <button type="button" className="ghost" onClick={() => setJournalSidebarOpen(true)} style={{ padding: "0.2rem" }}>
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+              </button>
             )}
-          </button>
-        </div>
-      </header>
+            <h1>SlowClaw</h1>
+          </div>
+          <div className="topbar-actions">
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setThemeMode((prev) => (prev === "light" ? "dark" : "light"))}
+              title="Toggle theme"
+            >
+              {themeMode === "light" ? (
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="4.22" x2="19.78" y2="5.64"></line></svg>
+              ) : (
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+              )}
+            </button>
+          </div>
+        </header>
+      )}
 
-      {!showDesktopJournalLayout ? (
+      {mobileTab === "journal" && !showDesktopJournalLayout && !isWritingNote && !isRecording ? (
         <div className={`sidebar-overlay ${journalSidebarOpen ? 'open' : ''}`} onClick={() => setJournalSidebarOpen(false)}>
           <div className={`sidebar ${journalSidebarOpen ? 'open' : ''}`} onClick={e => e.stopPropagation()}>
             {renderJournalSidebarContent(true)}
@@ -1854,137 +1948,140 @@ function App() {
       <main className="page-content">
         {mobileTab === "journal" ? (
           <div className={showDesktopJournalLayout ? "journal-desktop-layout" : "stack"}>
-            {showDesktopJournalLayout ? (
+            {showDesktopJournalLayout && !isWritingNote && !isRecording ? (
               <aside className="sidebar sidebar-desktop open">
                 {renderJournalSidebarContent(false)}
               </aside>
             ) : null}
             <div className="stack journal-main">
-            <div className="card">
-              <div className="text-center">
-                <h2>Capture</h2>
-                <p className="text-sm mt-2">{recordingHint || "Record audio or video directly to workspace"}</p>
-              </div>
-              {isRecording ? (
-                <div className="stack" style={{ alignItems: "center", padding: "1rem" }}>
-                  {recordingType === "audio" && (
-                    <canvas ref={audioCanvasRef} width={300} height={100} style={{ width: "100%", maxWidth: "400px", borderRadius: "8px", background: "rgb(30, 30, 30)" }} />
-                  )}
-                  {recordingType === "video" && (
-                    <video ref={videoPreviewRef} style={{ width: "100%", maxWidth: "400px", borderRadius: "8px", background: "#000" }} muted playsInline />
-                  )}
-                  <div className="text-lg" style={{ fontWeight: 600, color: "var(--danger)" }}>
-                    {Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')}
+              {!isWritingNote && (
+                <div className="card">
+                  <div className="text-center">
+                    <h2>Capture</h2>
+                    <p className="text-sm mt-2">{recordingHint || "Record audio or video directly to workspace"}</p>
                   </div>
-                  <div className="row">
-                    <button type="button" className="danger" onClick={stopRecording}>Stop & Save</button>
-                    <button type="button" className="ghost" onClick={cancelRecording}>Cancel</button>
-                  </div>
-                </div>
-              ) : (
-                <div className="stack">
-                  <div className="record-btn-group">
-                    <button
-                      type="button"
-                      className="record-btn audio"
-                      onClick={() => void startRecording("audio")}
-                      title="Record Audio"
-                    >
-                      <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
-                    </button>
-                    <button
-                      type="button"
-                      className="record-btn video"
-                      onClick={() => void startRecording("video")}
-                      title="Record Video"
-                    >
-                      <svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
-                    </button>
-                  </div>
+                  {isRecording ? (
+                    <div className="stack" style={{ alignItems: "center", padding: "1rem" }}>
+                      {recordingType === "audio" && (
+                        <canvas ref={audioCanvasRef} width={300} height={100} style={{ width: "100%", maxWidth: "400px", borderRadius: "8px", background: "rgb(30, 30, 30)" }} />
+                      )}
+                      {recordingType === "video" && (
+                        <video ref={videoPreviewRef} style={{ width: "100%", maxWidth: "400px", borderRadius: "8px", background: "#000" }} muted playsInline />
+                      )}
+                      <div className="text-lg" style={{ fontWeight: 600, color: "var(--danger)" }}>
+                        {Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')}
+                      </div>
+                      <div className="row">
+                        <button type="button" className="danger" onClick={stopRecording}>Stop & Save</button>
+                        <button type="button" className="ghost" onClick={cancelRecording}>Cancel</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="stack">
+                      <div className="record-btn-group">
+                        <button
+                          type="button"
+                          className="record-btn audio"
+                          onClick={() => void startRecording("audio")}
+                          title="Record Audio"
+                        >
+                          <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
+                        </button>
+                        <button
+                          type="button"
+                          className="record-btn video"
+                          onClick={() => void startRecording("video")}
+                          title="Record Video"
+                        >
+                          <svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
+                        </button>
+                      </div>
 
-                  {audioDevices.length > 1 && (
-                    <div className="text-center mt-2">
-                      <select
-                        value={selectedAudioDeviceId}
-                        onChange={(e) => setSelectedAudioDeviceId(e.target.value)}
-                        className="text-sm"
-                        style={{ background: "transparent", border: "1px solid var(--line)", padding: "4px 8px", borderRadius: "12px", color: "var(--muted)" }}
-                      >
-                        {audioDevices.map(d => (
-                          <option key={d.deviceId} value={d.deviceId}>{d.label || 'Microphone'}</option>
-                        ))}
-                      </select>
+                      {audioDevices.length > 1 && (
+                        <div className="text-center mt-2">
+                          <select
+                            value={selectedAudioDeviceId}
+                            onChange={(e) => setSelectedAudioDeviceId(e.target.value)}
+                            className="text-sm"
+                            style={{ background: "transparent", border: "1px solid var(--line)", padding: "4px 8px", borderRadius: "12px", color: "var(--muted)" }}
+                          >
+                            {audioDevices.map(d => (
+                              <option key={d.deviceId} value={d.deviceId}>{d.label || 'Microphone'}</option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+
+                      <div className="row-center mt-2" style={{ gap: '1rem' }}>
+                        <button type="button" className="ghost text-sm" onClick={() => audioCaptureRef.current?.click()}>Upload Audio</button>
+                        <button type="button" className="ghost text-sm" onClick={() => videoCaptureRef.current?.click()}>Upload Video</button>
+                      </div>
+
+                      <input
+                        ref={audioCaptureRef}
+                        type="file"
+                        accept="audio/*"
+                        className="visually-hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) void uploadJournalFile(file, "audio");
+                          e.currentTarget.value = "";
+                        }}
+                      />
+                      <input
+                        ref={videoCaptureRef}
+                        type="file"
+                        accept="video/*"
+                        capture="environment"
+                        className="visually-hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) void uploadJournalFile(file, "video");
+                          e.currentTarget.value = "";
+                        }}
+                      />
                     </div>
                   )}
+                </div>
+              )}
 
-                  <div className="row-center mt-2" style={{ gap: '1rem' }}>
-                    <button type="button" className="ghost text-sm" onClick={() => audioCaptureRef.current?.click()}>Upload Audio</button>
-                    <button type="button" className="ghost text-sm" onClick={() => videoCaptureRef.current?.click()}>Upload Video</button>
+              {!isRecording && (
+                <div className="card" style={{ flex: isWritingNote ? 1 : undefined, minHeight: isWritingNote ? '60vh' : undefined }}>
+                  <div className="row-between">
+                    <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => { setJournalDraftText(""); setSelectedJournalItem(null); setMediaPreviewUrl(""); setJournalSaveStatus("Journal idle"); }}
+                        title="New Note"
+                        style={{ padding: '0.2rem 0.5rem', fontSize: '1.2rem' }}
+                      >
+                        +
+                      </button>
+                      <h2 style={{ margin: 0 }}>Note</h2>
+                    </div>
+                    <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+                      <span className="text-sm muted">{journalSaveStatus !== "Journal idle" ? journalSaveStatus : ""}</span>
+                      {isWritingNote && <button type="button" className="ghost" onClick={() => setIsWritingNote(false)}>Done</button>}
+                    </div>
                   </div>
-
-                  <input
-                    ref={audioCaptureRef}
-                    type="file"
-                    accept="audio/*"
-                    className="visually-hidden"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) void uploadJournalFile(file, "audio");
-                      e.currentTarget.value = "";
-                    }}
-                  />
-                  <input
-                    ref={videoCaptureRef}
-                    type="file"
-                    accept="video/*"
-                    capture="environment"
-                    className="visually-hidden"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) void uploadJournalFile(file, "video");
-                      e.currentTarget.value = "";
-                    }}
+                  {selectedJournalItem && mediaPreviewUrl && (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video") && (
+                    <div className="stack" style={{ marginBottom: '1rem' }}>
+                      {selectedJournalItem.kind === "audio" && <audio controls src={mediaPreviewUrl} style={{ width: '100%' }} />}
+                      {selectedJournalItem.kind === "video" && <video controls src={mediaPreviewUrl} className="media-viewer" style={{ marginTop: 0 }} />}
+                    </div>
+                  )}
+                  <textarea
+                    rows={isWritingNote ? 15 : 5}
+                    value={journalDraftText}
+                    onChange={(e) => setJournalDraftText(e.target.value)}
+                    onFocus={() => setIsWritingNote(true)}
+                    placeholder="Write your thoughts..."
+                    style={{ flex: isWritingNote ? 1 : undefined, resize: 'none' }}
                   />
                 </div>
               )}
 
-              <input
-                value={journalDraftTitle}
-                onChange={(e) => setJournalDraftTitle(e.target.value)}
-                placeholder="Title (used for uploads & notes)"
-              />
-            </div>
-
-            <div className="card">
-              <div className="row-between">
-                <h2>Note</h2>
-                <button type="button" className="ghost" onClick={saveJournalTextDraft}>Save</button>
-              </div>
-              <textarea
-                rows={5}
-                value={journalDraftText}
-                onChange={(e) => setJournalDraftText(e.target.value)}
-                placeholder="Write your thoughts..."
-              />
-              {journalSaveStatus !== "Journal idle" && (
-                <p className="text-sm text-center muted">{journalSaveStatus}</p>
-              )}
-            </div>
-
-            {selectedJournalItem && mediaPreviewUrl && (
-              <div className="card">
-                <h3>Preview: {selectedJournalItem.title}</h3>
-                {selectedJournalItem.kind === "audio" && (
-                  <audio controls src={mediaPreviewUrl} style={{ width: '100%' }} />
-                )}
-                {selectedJournalItem.kind === "video" && (
-                  <video controls src={mediaPreviewUrl} className="media-viewer" />
-                )}
-                {selectedJournalItem.kind === "image" && (
-                  <img src={mediaPreviewUrl} alt="" className="media-viewer" />
-                )}
-              </div>
-            )}
             </div>
           </div>
         ) : null}
@@ -2038,6 +2135,27 @@ function App() {
                           </div>
                           <div className="feed-body" style={{ marginTop: '8px', wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
                             {record.text}
+                          </div>
+                          {post.embed && post.embed.$type === "app.bsky.embed.images#view" && (
+                            <div className="feed-embed-images mt-2" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '0.5rem' }}>
+                              {(post.embed as any).images?.map((img: any, i: number) => (
+                                <img key={i} src={img.thumb || img.fullsize} alt={img.alt || "Embedded image"} style={{ width: '100%', height: '100%', maxHeight: '300px', objectFit: 'cover', borderRadius: '12px' }} />
+                              ))}
+                            </div>
+                          )}
+                          <div className="feed-stats row text-sm muted mt-2" style={{ gap: '1rem', marginTop: '0.8rem' }}>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
+                              {post.replyCount || 0}
+                            </span>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 1l4 4-4 4"></path><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><path d="M7 23l-4-4 4-4"></path><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
+                              {post.repostCount || 0}
+                            </span>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+                              {post.likeCount || 0}
+                            </span>
                           </div>
                           <div className="feed-actions">
                             <a href={`https://bsky.app/profile/${author.handle}/post/${post.uri.split("/").pop()}`} target="_blank" rel="noreferrer" className="ghost text-sm" style={{ textDecoration: "none", padding: "0.2rem 0.5rem" }}>View on Bluesky</a>
@@ -2385,40 +2503,42 @@ function App() {
         ) : null}
       </main>
 
-      <nav className="bottom-nav">
-        <button
-          type="button"
-          className={mobileTab === "journal" ? "active" : ""}
-          onClick={() => setMobileTab("journal")}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
-          Journal
-        </button>
-        <button
-          type="button"
-          className={mobileTab === "feed" ? "active" : ""}
-          onClick={() => setMobileTab("feed")}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-          Feed
-        </button>
-        <button
-          type="button"
-          className={mobileTab === "chat" ? "active" : ""}
-          onClick={() => setMobileTab("chat")}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
-          Chat
-        </button>
-        <button
-          type="button"
-          className={mobileTab === "profile" ? "active" : ""}
-          onClick={() => setMobileTab("profile")}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
-          Settings
-        </button>
-      </nav>
+      {(!isWritingNote && !isRecording) && (
+        <nav className="bottom-nav">
+          <button
+            type="button"
+            className={mobileTab === "journal" ? "active" : ""}
+            onClick={() => setMobileTab("journal")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
+            Journal
+          </button>
+          <button
+            type="button"
+            className={mobileTab === "feed" ? "active" : ""}
+            onClick={() => setMobileTab("feed")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+            Feed
+          </button>
+          <button
+            type="button"
+            className={mobileTab === "chat" ? "active" : ""}
+            onClick={() => setMobileTab("chat")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+            Chat
+          </button>
+          <button
+            type="button"
+            className={mobileTab === "profile" ? "active" : ""}
+            onClick={() => setMobileTab("profile")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+            Settings
+          </button>
+        </nav>
+      )}
     </div>
   );
 }

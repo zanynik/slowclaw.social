@@ -57,6 +57,8 @@ export type LibraryItem = {
   mediaUrl?: string | null;
   editableText?: boolean;
   scope?: "journal" | "feed" | string;
+  extractedTextPath?: string | null;
+  extractionKind?: "transcript" | "ocr" | string | null;
 };
 
 export type GatewayQrPayload = {

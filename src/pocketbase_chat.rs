@@ -12,6 +12,9 @@ const DEFAULT_POLL_MS: u64 = 1_500;
 const MAX_PENDING_PER_POLL: usize = 8;
 const FETCH_PAGE_SIZE: usize = 30;
 const MAX_FETCH_PAGES: usize = 5;
+const THREAD_CONTEXT_MESSAGES: usize = 6;
+const THREAD_CONTEXT_ENTRY_MAX_CHARS: usize = 320;
+const THREAD_CONTEXT_CHAR_BUDGET: usize = 2_400;
 
 pub struct PocketBaseChatWorkerHandle {
     join: tokio::task::JoinHandle<()>,
@@ -106,6 +109,9 @@ struct ChatRecord {
     role: Option<String>,
     content: Option<String>,
     status: Option<String>,
+    #[serde(rename = "createdAtClient")]
+    created_at_client: Option<String>,
+    created: Option<String>,
 }
 
 async fn run_worker_loop(ctx: WorkerCtx) {
@@ -242,13 +248,28 @@ async fn poll_once(ctx: &WorkerCtx) -> Result<()> {
             thread_id.clone(),
             Some(thread_id.clone()),
         );
-        match crate::channels::with_channel_execution_context(
-            channel_ctx,
-            crate::agent::process_message(ctx.config.clone(), &content),
+        let contextual_content =
+            match build_thread_context_message(ctx, &thread_id, &record.id, &content).await {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        "PocketBase chat context build failed for thread '{}': {err:#}",
+                        thread_id
+                    );
+                    content.clone()
+                }
+            };
+        let timeout_secs = ctx.config.channels_config.message_timeout_secs.max(30);
+        let process_result = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            crate::channels::with_channel_execution_context(
+                channel_ctx,
+                crate::agent::process_message(ctx.config.clone(), &contextual_content),
+            ),
         )
-        .await
-        {
-            Ok(reply) => {
+        .await;
+        match process_result {
+            Ok(Ok(reply)) => {
                 let now = Utc::now().to_rfc3339();
                 if ctx.auto_save {
                     let _ = store_chat_memory(ctx, &thread_id, "assistant", reply.trim()).await;
@@ -277,7 +298,7 @@ async fn poll_once(ctx: &WorkerCtx) -> Result<()> {
                 )
                 .await?;
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 let now = Utc::now().to_rfc3339();
                 let error_text = crate::util::truncate_with_ellipsis(&format!("{err:#}"), 2000);
                 let _ = create_record(
@@ -306,10 +327,187 @@ async fn poll_once(ctx: &WorkerCtx) -> Result<()> {
                 )
                 .await?;
             }
+            Err(_) => {
+                let now = Utc::now().to_rfc3339();
+                let error_text = format!(
+                    "PocketBase chat processing timed out after {}s",
+                    timeout_secs
+                );
+                let _ = create_record(
+                    ctx,
+                    serde_json::json!({
+                        "threadId": thread_id,
+                        "role": "assistant",
+                        "content": "",
+                        "status": "error",
+                        "source": "slowclaw",
+                        "replyToId": record.id.clone(),
+                        "error": error_text.clone(),
+                        "createdAtClient": now.clone(),
+                        "processedAt": now.clone(),
+                    }),
+                )
+                .await;
+                patch_record(
+                    ctx,
+                    &record.id,
+                    serde_json::json!({
+                        "status": "error",
+                        "error": error_text,
+                        "processedAt": now,
+                    }),
+                )
+                .await?;
+            }
         }
     }
 
     Ok(())
+}
+
+async fn build_thread_context_message(
+    ctx: &WorkerCtx,
+    thread_id: &str,
+    current_record_id: &str,
+    current_content: &str,
+) -> Result<String> {
+    let history = fetch_thread_messages(ctx, thread_id).await?;
+    Ok(compose_thread_context_message(
+        current_content,
+        current_record_id,
+        &history,
+    ))
+}
+
+fn compose_thread_context_message(
+    current_content: &str,
+    current_record_id: &str,
+    history: &[ChatRecord],
+) -> String {
+    let current_trimmed = current_content.trim();
+    if current_trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut prior_turns: Vec<(String, String, String)> = history
+        .iter()
+        .filter(|record| record.id != current_record_id)
+        .filter_map(|record| {
+            let role = record
+                .role
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())?;
+            if !role.eq_ignore_ascii_case("user") && !role.eq_ignore_ascii_case("assistant") {
+                return None;
+            }
+            let content = record
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())?;
+            let normalized_role = role.to_ascii_lowercase();
+            let compacted = compact_context_content(content);
+            if compacted.is_empty() {
+                return None;
+            }
+            Some((message_sort_key(record).to_string(), normalized_role, compacted))
+        })
+        .collect();
+
+    if prior_turns.is_empty() {
+        return current_trimmed.to_string();
+    }
+
+    prior_turns.sort_by(|a, b| a.0.cmp(&b.0));
+    if prior_turns.len() > THREAD_CONTEXT_MESSAGES {
+        let keep_from = prior_turns.len() - THREAD_CONTEXT_MESSAGES;
+        prior_turns.drain(..keep_from);
+    }
+
+    let mut used_chars = 0usize;
+    let mut lines: Vec<String> = Vec::new();
+    for (_, role, content) in prior_turns {
+        let line = format!("- {role}: {content}");
+        let projected = used_chars + line.len() + 1;
+        if projected > THREAD_CONTEXT_CHAR_BUDGET {
+            break;
+        }
+        used_chars = projected;
+        lines.push(line);
+    }
+
+    if lines.is_empty() {
+        return current_trimmed.to_string();
+    }
+
+    format!(
+        "Recent thread context (oldest to newest):\n{}\n\nCurrent user message:\n{}",
+        lines.join("\n"),
+        current_trimmed
+    )
+}
+
+fn compact_context_content(content: &str) -> String {
+    let compacted = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::util::truncate_with_ellipsis(&compacted, THREAD_CONTEXT_ENTRY_MAX_CHARS)
+}
+
+fn message_sort_key(record: &ChatRecord) -> &str {
+    record
+        .created_at_client
+        .as_deref()
+        .or(record.created.as_deref())
+        .unwrap_or("")
+}
+
+async fn fetch_thread_messages(ctx: &WorkerCtx, thread_id: &str) -> Result<Vec<ChatRecord>> {
+    let url = format!("{}/api/collections/{}/records", ctx.base_url, ctx.collection);
+    let per_page = FETCH_PAGE_SIZE.to_string();
+    let mut items: Vec<ChatRecord> = Vec::new();
+
+    for page in 1..=MAX_FETCH_PAGES {
+        let page_str = page.to_string();
+        let response = authed_request(ctx, ctx.client.get(&url))
+            .query(&[
+                ("page", page_str.as_str()),
+                ("perPage", per_page.as_str()),
+            ])
+            .send()
+            .await
+            .context("PocketBase chat history request failed")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "PocketBase chat history fetch failed ({status}) for collection '{}': {}",
+                ctx.collection,
+                body.trim()
+            );
+        }
+
+        let list = response
+            .json::<PocketBaseList<ChatRecord>>()
+            .await
+            .context("PocketBase chat history JSON decode failed")?;
+        let page_len = list.items.len();
+
+        items.extend(list.items.into_iter().filter(|record| {
+            record
+                .thread_id
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| value == thread_id)
+        }));
+
+        if page_len < FETCH_PAGE_SIZE {
+            break;
+        }
+    }
+
+    items.sort_by(|a, b| message_sort_key(a).cmp(message_sort_key(b)));
+    Ok(items)
 }
 
 #[derive(Debug, Clone)]
@@ -654,4 +852,56 @@ fn env_flag(name: &str) -> bool {
         .ok()
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat_record(
+        id: &str,
+        role: &str,
+        content: &str,
+        created_at: &str,
+    ) -> ChatRecord {
+        ChatRecord {
+            id: id.to_string(),
+            thread_id: Some("thread-1".to_string()),
+            role: Some(role.to_string()),
+            content: Some(content.to_string()),
+            status: Some("done".to_string()),
+            created_at_client: Some(created_at.to_string()),
+            created: None,
+        }
+    }
+
+    #[test]
+    fn compose_thread_context_message_includes_recent_turns() {
+        let history = vec![
+            chat_record(
+                "a1",
+                "assistant",
+                "Want me to start organizing the audio recordings in your journal folder now?",
+                "2026-03-01T10:00:00Z",
+            ),
+            chat_record("u1", "user", "Yes please :)", "2026-03-01T10:00:05Z"),
+            chat_record("a2", "assistant", "What can I help with right now?", "2026-03-01T10:00:08Z"),
+            chat_record("u2", "user", "yes", "2026-03-01T10:00:09Z"),
+        ];
+
+        let composed = compose_thread_context_message("yes", "u2", &history);
+
+        assert!(composed.contains("Recent thread context"));
+        assert!(composed.contains("- assistant: Want me to start organizing"));
+        assert!(composed.contains("- user: Yes please :)"));
+        assert!(composed.contains("Current user message:\nyes"));
+        assert!(!composed.contains("- user: yes\n"));
+    }
+
+    #[test]
+    fn compose_thread_context_message_falls_back_to_current_message_when_no_history() {
+        let history = vec![chat_record("u2", "user", "yes", "2026-03-01T10:00:09Z")];
+        let composed = compose_thread_context_message("yes", "u2", &history);
+        assert_eq!(composed, "yes");
+    }
 }

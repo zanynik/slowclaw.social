@@ -57,6 +57,8 @@ pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
 const JOURNAL_TEXT_DIR: &str = "journals/text";
+const JOURNAL_TEXT_TRANSCRIPTS_DIR: &str = "journals/text/transcripts";
+const JOURNAL_TEXT_OCR_DIR: &str = "journals/text/ocr";
 const JOURNAL_MEDIA_DIR: &str = "journals/media";
 
 fn webhook_memory_key() -> String {
@@ -645,6 +647,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/library/items", get(handle_library_items))
         .route("/api/library/text", get(handle_library_text))
         .route("/api/library/save-text", post(handle_library_save_text))
+        .route("/api/library/archive-posted", post(handle_library_archive_posted))
         .route("/api/media/{*path}", get(handle_media_stream))
         .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_MEDIA_UPLOAD_BODY_SIZE))
@@ -1222,6 +1225,11 @@ struct SaveTextBody {
     content: String,
 }
 
+#[derive(serde::Deserialize)]
+struct ArchivePostedBody {
+    path: String,
+}
+
 async fn handle_media_upload(
     State(state): State<AppState>,
     Query(query): Query<MediaUploadQuery>,
@@ -1269,7 +1277,8 @@ async fn handle_media_upload(
     let normalized_name = ensure_upload_filename_extension(&original_name, kind, &content_type);
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let rel_path = media_storage_rel_path(kind, &normalized_name);
+    let capture_paths = media_capture_rel_paths(kind, &normalized_name);
+    let rel_path = capture_paths.media_rel_path.clone();
     let abs_path = workspace_dir.join(&rel_path);
     if let Some(parent) = abs_path.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -1308,6 +1317,27 @@ async fn handle_media_upload(
     }
     let _ = file.flush().await;
 
+    if let (Some(text_rel_path), Some(extraction_kind)) = (
+        capture_paths.extracted_text_rel_path.as_deref(),
+        capture_paths.extraction_kind,
+    ) {
+        if let Err(e) = create_extracted_text_stub(
+            &workspace_dir,
+            text_rel_path,
+            &capture_paths.media_rel_path,
+            extraction_kind,
+        )
+        .await
+        {
+            let _ = tokio::fs::remove_file(&abs_path).await;
+            let err = serde_json::json!({
+                "error": format!("Failed to initialize extracted text file: {e}")
+            });
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+        }
+
+    }
+
     let pb_record = match upsert_media_asset_metadata(
         &state,
         &rel_path,
@@ -1334,6 +1364,8 @@ async fn handle_media_upload(
         "bytes": bytes_written,
         "path": rel_path,
         "title": title,
+        "extractedTextPath": capture_paths.extracted_text_rel_path,
+        "extractionKind": capture_paths.extraction_kind,
         "metadata": pb_record,
     });
     (StatusCode::OK, Json(body)).into_response()
@@ -1514,6 +1546,68 @@ async fn handle_library_save_text(
     (StatusCode::OK, Json(serde_json::json!({"ok": true, "path": rel}))).into_response()
 }
 
+async fn handle_library_archive_posted(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ArchivePostedBody>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Library archive posted") {
+        return err.into_response();
+    }
+    let src_rel_path = body.path.trim().trim_start_matches('/').to_string();
+    let Some(dest_rel_path) = archive_destination_rel_path(&src_rel_path) else {
+        let err = serde_json::json!({
+            "error": "Only journals/processed/* paths can be archived to posts"
+        });
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    };
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let src_abs_path = workspace_dir.join(&src_rel_path);
+    let dest_abs_path = workspace_dir.join(&dest_rel_path);
+    if !src_abs_path.exists() || !src_abs_path.is_file() {
+        let err = serde_json::json!({"error": "Source file not found"});
+        return (StatusCode::NOT_FOUND, Json(err)).into_response();
+    }
+
+    if let Err(e) = move_file_if_exists(&src_abs_path, &dest_abs_path).await {
+        let err = serde_json::json!({"error": format!("Failed to archive posted file: {e}")});
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+    }
+
+    // Move known sidecar files together with the posted source.
+    let mut moved_sidecars: Vec<String> = Vec::new();
+    for suffix in [".caption.txt", ".srt", ".json"] {
+        let sidecar_from = workspace_dir.join(format!("{src_rel_path}{suffix}"));
+        let sidecar_to = workspace_dir.join(format!("{dest_rel_path}{suffix}"));
+        match move_file_if_exists(&sidecar_from, &sidecar_to).await {
+            Ok(true) => moved_sidecars.push(
+                sidecar_to
+                    .strip_prefix(&workspace_dir)
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("{dest_rel_path}{suffix}")),
+            ),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "failed moving posted sidecar '{}' -> '{}': {e}",
+                    sidecar_from.display(),
+                    sidecar_to.display()
+                );
+            }
+        }
+    }
+
+    let resp = serde_json::json!({
+        "ok": true,
+        "fromPath": src_rel_path,
+        "path": dest_rel_path,
+        "sidecarsMoved": moved_sidecars,
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
 fn infer_media_kind_from_content_type(content_type: &str) -> &'static str {
     let lower = content_type.to_ascii_lowercase();
     if lower.starts_with("audio/") {
@@ -1605,7 +1699,14 @@ fn safe_file_name(name: &str) -> String {
     }
 }
 
-fn media_storage_rel_path(kind: &str, original_name: &str) -> String {
+#[derive(Debug, Clone)]
+struct MediaCapturePaths {
+    media_rel_path: String,
+    extracted_text_rel_path: Option<String>,
+    extraction_kind: Option<&'static str>,
+}
+
+fn media_capture_rel_paths(kind: &str, original_name: &str) -> MediaCapturePaths {
     let now = chrono::Utc::now();
     let kind = kind.trim().to_ascii_lowercase();
     let kind_dir = match kind.as_str() {
@@ -1615,16 +1716,46 @@ fn media_storage_rel_path(kind: &str, original_name: &str) -> String {
         _ => "files",
     };
     let safe_name = safe_file_name(original_name);
-    format!(
+    let safe_stem = StdPath::new(&safe_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("capture");
+    let date_dir = format!("{:04}/{:02}/{:02}", now.year(), now.month(), now.day());
+    let timestamp = now.format("%H%M%S");
+    let media_rel_path = format!(
         "{}/{}/{:04}/{:02}/{:02}/{}_{}",
         JOURNAL_MEDIA_DIR,
         kind_dir,
         now.year(),
         now.month(),
         now.day(),
-        now.format("%H%M%S"),
+        timestamp,
         safe_name
-    )
+    );
+    let (extracted_text_rel_path, extraction_kind) = match kind_dir {
+        "audio" | "video" => (
+            Some(format!(
+                "{}/{}/{}/{}_{}.txt",
+                JOURNAL_TEXT_TRANSCRIPTS_DIR, kind_dir, date_dir, timestamp, safe_stem
+            )),
+            Some("transcript"),
+        ),
+        "image" => (
+            Some(format!(
+                "{}/{}/{}_{}.txt",
+                JOURNAL_TEXT_OCR_DIR, date_dir, timestamp, safe_stem
+            )),
+            Some("ocr"),
+        ),
+        _ => (None, None),
+    };
+    MediaCapturePaths {
+        media_rel_path,
+        extracted_text_rel_path,
+        extraction_kind,
+    }
 }
 
 fn text_journal_rel_path(title: &str) -> String {
@@ -1640,6 +1771,124 @@ fn text_journal_rel_path(title: &str) -> String {
         now.format("%H%M%S"),
         stem
     )
+}
+
+fn derived_extracted_text_rel_path(media_rel_path: &str, kind: &str) -> Option<(String, &'static str)> {
+    let normalized = media_rel_path.trim_start_matches('/');
+    let prefix = format!("{JOURNAL_MEDIA_DIR}/{kind}/");
+    let suffix = normalized.strip_prefix(&prefix)?;
+    let suffix_path = StdPath::new(suffix);
+    let stem = suffix_path.file_stem().and_then(|s| s.to_str())?.trim();
+    if stem.is_empty() {
+        return None;
+    }
+    let parent = suffix_path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| !p.is_empty());
+    match kind {
+        "audio" | "video" => {
+            let rel = if let Some(parent) = parent {
+                format!(
+                    "{}/{}/{}/{}.txt",
+                    JOURNAL_TEXT_TRANSCRIPTS_DIR, kind, parent, stem
+                )
+            } else {
+                format!("{}/{}/{}.txt", JOURNAL_TEXT_TRANSCRIPTS_DIR, kind, stem)
+            };
+            Some((rel, "transcript"))
+        }
+        "image" => {
+            let rel = if let Some(parent) = parent {
+                format!("{}/{}/{}.txt", JOURNAL_TEXT_OCR_DIR, parent, stem)
+            } else {
+                format!("{}/{}.txt", JOURNAL_TEXT_OCR_DIR, stem)
+            };
+            Some((rel, "ocr"))
+        }
+        _ => None,
+    }
+}
+
+async fn create_extracted_text_stub(
+    workspace_dir: &StdPath,
+    text_rel_path: &str,
+    media_rel_path: &str,
+    extraction_kind: &str,
+) -> Result<()> {
+    let abs_path = workspace_dir.join(text_rel_path);
+    if let Some(parent) = abs_path.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "Failed to create extracted text directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&abs_path)
+        .await
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to create extracted text file {}",
+                    abs_path.display()
+                )
+            });
+        }
+    };
+
+    let heading = if extraction_kind == "ocr" {
+        "OCR"
+    } else {
+        "TRANSCRIPT"
+    };
+    let template = format!(
+        "# {heading} PENDING\nsource_media_path: {media_rel_path}\nextraction_kind: {extraction_kind}\nstatus: pending\ncreated_at: {}\n\n",
+        chrono::Utc::now().to_rfc3339()
+    );
+    file.write_all(template.as_bytes())
+        .await
+        .context("Failed to write extracted text stub")?;
+    file.flush()
+        .await
+        .context("Failed to flush extracted text stub")?;
+    Ok(())
+}
+
+fn archive_destination_rel_path(processed_rel_path: &str) -> Option<String> {
+    let normalized = processed_rel_path.trim_start_matches('/');
+    let suffix = normalized.strip_prefix("journals/processed/")?;
+    if suffix.trim().is_empty() {
+        return None;
+    }
+    Some(format!("posts/{suffix}"))
+}
+
+async fn move_file_if_exists(from: &StdPath, to: &StdPath) -> Result<bool> {
+    if !from.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = to.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!("failed to create destination directory {}", parent.display())
+        })?;
+    }
+    if to.exists() {
+        tokio::fs::remove_file(to).await.with_context(|| {
+            format!("failed to remove existing destination file {}", to.display())
+        })?;
+    }
+    tokio::fs::rename(from, to).await.with_context(|| {
+        format!("failed to move '{}' -> '{}'", from.display(), to.display())
+    })?;
+    Ok(true)
 }
 
 fn resolve_workspace_media_path(workspace_dir: &StdPath, requested: &str) -> Option<PathBuf> {
@@ -1670,7 +1919,7 @@ fn resolve_workspace_text_path(workspace_dir: &StdPath, requested: &str) -> Opti
     if !parent_resolved.starts_with(workspace_dir) {
         return None;
     }
-    let allowed = ["journals", "memory", "state", "posts", "outputs", "artifacts"];
+    let allowed = ["journals", "memory", "state"];
     let rel_parent = parent_resolved.strip_prefix(workspace_dir).ok()?;
     let first = rel_parent.components().next()?.as_os_str().to_string_lossy();
     if !allowed.iter().any(|a| *a == first) {
@@ -1701,12 +1950,10 @@ fn list_workspace_library_items(
         }
         "feed" => {
             roots.push(workspace_dir.join("journals/processed"));
-            roots.push(workspace_dir.join("posts"));
             LibraryScope::Feed
         }
         _ => {
             roots.push(workspace_dir.join("journals"));
-            roots.push(workspace_dir.join("posts"));
             LibraryScope::All
         }
     };
@@ -1794,7 +2041,7 @@ fn collect_library_items_recursive(
             }
         };
 
-        let scope_value = if rel.starts_with("posts/") || rel.starts_with("journals/processed/") {
+        let scope_value = if rel.starts_with("journals/processed/") {
             "feed"
         } else {
             "journal"
@@ -1805,6 +2052,13 @@ fn collect_library_items_recursive(
             LibraryScope::Feed if !is_feed_item => continue,
             LibraryScope::Journal if is_feed_item => continue,
             _ => {}
+        }
+        if requested_scope == LibraryScope::Journal {
+            let is_journal_media = rel_lower.starts_with("journals/media/");
+            let is_journal_text = kind == "text" && rel_lower.starts_with("journals/text/");
+            if !is_journal_media && !is_journal_text {
+                continue;
+            }
         }
         if is_feed_item {
             if rel_lower.contains("/artifacts/")
@@ -1836,6 +2090,12 @@ fn collect_library_items_recursive(
         } else {
             String::new()
         };
+        let (extracted_text_path, extraction_kind) = match kind {
+            "audio" | "video" | "image" => derived_extracted_text_rel_path(&rel, kind)
+                .map(|(path, kind)| (serde_json::Value::String(path), serde_json::Value::String(kind.to_string())))
+                .unwrap_or((serde_json::Value::Null, serde_json::Value::Null)),
+            _ => (serde_json::Value::Null, serde_json::Value::Null),
+        };
         out.push(serde_json::json!({
             "id": rel.clone(),
             "path": rel.clone(),
@@ -1851,6 +2111,8 @@ fn collect_library_items_recursive(
             },
             "editableText": kind == "text",
             "scope": scope_value,
+            "extractedTextPath": extracted_text_path,
+            "extractionKind": extraction_kind,
         }));
     }
     Ok(())
@@ -2926,6 +3188,202 @@ mod tests {
 
         let key = whatsapp_memory_key(&msg);
         assert_eq!(key, "whatsapp_+1234567890_wamid-123");
+    }
+
+    #[test]
+    fn media_capture_rel_paths_include_extracted_text_targets() {
+        let audio = media_capture_rel_paths("audio", "voice-note.m4a");
+        assert!(audio.media_rel_path.starts_with("journals/media/audio/"));
+        assert_eq!(audio.extraction_kind, Some("transcript"));
+        assert!(
+            audio
+                .extracted_text_rel_path
+                .as_deref()
+                .is_some_and(|p| p.starts_with("journals/text/transcripts/audio/"))
+        );
+
+        let video = media_capture_rel_paths("video", "clip.mp4");
+        assert!(video.media_rel_path.starts_with("journals/media/video/"));
+        assert_eq!(video.extraction_kind, Some("transcript"));
+        assert!(
+            video
+                .extracted_text_rel_path
+                .as_deref()
+                .is_some_and(|p| p.starts_with("journals/text/transcripts/video/"))
+        );
+
+        let image = media_capture_rel_paths("image", "scan.png");
+        assert!(image.media_rel_path.starts_with("journals/media/image/"));
+        assert_eq!(image.extraction_kind, Some("ocr"));
+        assert!(
+            image
+                .extracted_text_rel_path
+                .as_deref()
+                .is_some_and(|p| p.starts_with("journals/text/ocr/"))
+        );
+    }
+
+    #[test]
+    fn derived_extracted_text_rel_path_matches_media_layout() {
+        let (audio_path, audio_kind) = derived_extracted_text_rel_path(
+            "journals/media/audio/2026/03/01/123456_voice-note.m4a",
+            "audio",
+        )
+        .expect("audio extracted text path");
+        assert_eq!(
+            audio_path,
+            "journals/text/transcripts/audio/2026/03/01/123456_voice-note.txt"
+        );
+        assert_eq!(audio_kind, "transcript");
+
+        let (video_path, video_kind) = derived_extracted_text_rel_path(
+            "journals/media/video/2026/03/01/123456_clip.mp4",
+            "video",
+        )
+        .expect("video extracted text path");
+        assert_eq!(
+            video_path,
+            "journals/text/transcripts/video/2026/03/01/123456_clip.txt"
+        );
+        assert_eq!(video_kind, "transcript");
+
+        let (image_path, image_kind) = derived_extracted_text_rel_path(
+            "journals/media/image/2026/03/01/123456_scan.png",
+            "image",
+        )
+        .expect("image extracted text path");
+        assert_eq!(image_path, "journals/text/ocr/2026/03/01/123456_scan.txt");
+        assert_eq!(image_kind, "ocr");
+    }
+
+    #[test]
+    fn resolve_workspace_text_path_allows_only_core_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace");
+
+        assert!(resolve_workspace_text_path(&workspace_dir, "journals/text/note.md").is_some());
+        assert!(resolve_workspace_text_path(&workspace_dir, "memory/session.md").is_some());
+        assert!(resolve_workspace_text_path(&workspace_dir, "state/runtime.json").is_some());
+
+        assert!(resolve_workspace_text_path(&workspace_dir, "posts/legacy.md").is_none());
+        assert!(resolve_workspace_text_path(&workspace_dir, "outputs/run.txt").is_none());
+        assert!(resolve_workspace_text_path(&workspace_dir, "artifacts/report.txt").is_none());
+    }
+
+    #[test]
+    fn list_workspace_library_items_journal_scope_only_lists_media_and_text() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_dir = temp.path().join("workspace");
+
+        let media_file = workspace_dir
+            .join("journals/media/audio/2026/03/01/123456_voice-note.m4a");
+        let text_file = workspace_dir.join("journals/text/2026/03/01/123456_note.md");
+        let processed_file = workspace_dir.join("journals/processed/2026/03/01/post.md");
+        let pipeline_file = workspace_dir.join("journals/pipeline/tmp/debug.txt");
+
+        for path in [&media_file, &text_file, &processed_file, &pipeline_file] {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create parent dirs");
+            }
+            std::fs::write(path, "test").expect("write test file");
+        }
+
+        let items = list_workspace_library_items(&workspace_dir, "journal", 100)
+            .expect("list journal items");
+        assert!(!items.is_empty());
+        let paths: Vec<String> = items
+            .iter()
+            .filter_map(|item| item.get("path").and_then(serde_json::Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect();
+        assert!(paths.iter().any(|p| p.starts_with("journals/media/")));
+        assert!(paths.iter().any(|p| p.starts_with("journals/text/")));
+        assert!(!paths.iter().any(|p| p.starts_with("journals/processed/")));
+        assert!(!paths.iter().any(|p| p.starts_with("journals/pipeline/")));
+    }
+
+    #[test]
+    fn list_workspace_library_items_feed_scope_reads_processed_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_dir = temp.path().join("workspace");
+
+        let processed_file = workspace_dir.join("journals/processed/2026/03/01/post.md");
+        let legacy_posts_file = workspace_dir.join("posts/legacy.md");
+        for path in [&processed_file, &legacy_posts_file] {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create parent dirs");
+            }
+            std::fs::write(path, "test").expect("write test file");
+        }
+
+        let items =
+            list_workspace_library_items(&workspace_dir, "feed", 100).expect("list feed items");
+        assert_eq!(items.len(), 1);
+        let path = items[0]
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .expect("path string");
+        assert!(path.starts_with("journals/processed/"));
+    }
+
+    #[tokio::test]
+    async fn create_extracted_text_stub_writes_pending_template() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_dir = temp.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace_dir)
+            .await
+            .expect("create workspace");
+
+        let text_path = "journals/text/transcripts/audio/2026/03/01/123456_voice-note.txt";
+        create_extracted_text_stub(
+            &workspace_dir,
+            text_path,
+            "journals/media/audio/2026/03/01/123456_voice-note.m4a",
+            "transcript",
+        )
+        .await
+        .expect("create extracted text stub");
+
+        let content = tokio::fs::read_to_string(workspace_dir.join(text_path))
+            .await
+            .expect("read extracted text stub");
+        assert!(content.contains("# TRANSCRIPT PENDING"));
+        assert!(content.contains("source_media_path: journals/media/audio/2026/03/01/123456_voice-note.m4a"));
+        assert!(content.contains("extraction_kind: transcript"));
+    }
+
+    #[test]
+    fn archive_destination_rel_path_requires_processed_root() {
+        assert_eq!(
+            archive_destination_rel_path("journals/processed/2026/03/01/post.md").as_deref(),
+            Some("posts/2026/03/01/post.md")
+        );
+        assert!(archive_destination_rel_path("posts/2026/03/01/post.md").is_none());
+        assert!(archive_destination_rel_path("journals/processed/").is_none());
+    }
+
+    #[tokio::test]
+    async fn move_file_if_exists_moves_file_to_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let from = temp.path().join("from/source.txt");
+        let to = temp.path().join("to/destination.txt");
+        tokio::fs::create_dir_all(from.parent().expect("from parent"))
+            .await
+            .expect("create from parent");
+        tokio::fs::write(&from, "payload")
+            .await
+            .expect("write source file");
+
+        let moved = move_file_if_exists(&from, &to)
+            .await
+            .expect("move file should succeed");
+        assert!(moved);
+        assert!(!from.exists());
+        let content = tokio::fs::read_to_string(&to)
+            .await
+            .expect("read destination file");
+        assert_eq!(content, "payload");
     }
 
     #[derive(Default)]

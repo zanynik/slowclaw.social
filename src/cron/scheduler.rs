@@ -472,7 +472,7 @@ fn parse_workspace_script_invocation(command: &str) -> Result<Option<WorkspaceSc
         anyhow::bail!("workspace-script does not support command chaining");
     }
 
-    let parts: Vec<String> = trimmed.split_whitespace().map(ToString::to_string).collect();
+    let parts = split_workspace_script_tokens(trimmed)?;
     if parts.first().map(String::as_str) != Some("workspace-script") {
         return Ok(None);
     }
@@ -484,6 +484,62 @@ fn parse_workspace_script_invocation(command: &str) -> Result<Option<WorkspaceSc
         rel_path: parts[1].clone(),
         args: parts[2..].to_vec(),
     }))
+}
+
+fn split_workspace_script_tokens(input: &str) -> Result<Vec<String>> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape_in_double = false;
+
+    for ch in input.chars() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        if in_double {
+            if escape_in_double {
+                current.push(ch);
+                escape_in_double = false;
+            } else if ch == '\\' {
+                escape_in_double = true;
+            } else if ch == '"' {
+                in_double = false;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if escape_in_double {
+        anyhow::bail!("workspace-script command cannot end with a trailing escape");
+    }
+    if in_single || in_double {
+        anyhow::bail!("workspace-script command has an unclosed quote");
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    Ok(tokens)
 }
 
 async fn run_workspace_script_with_timeout(
@@ -527,13 +583,50 @@ async fn run_workspace_script_with_timeout(
     {
         Ok(child) => child,
         Err(e) => {
-            return (
-                false,
-                format!(
-                    "workspace-script spawn error ({}): {e}",
-                    resolved.display()
-                ),
-            );
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                if let Some((interpreter, interpreter_args)) =
+                    resolve_workspace_script_interpreter(&resolved)
+                {
+                    match Command::new(&interpreter)
+                        .args(&interpreter_args)
+                        .arg(&resolved)
+                        .args(&invocation.args)
+                        .current_dir(&config.workspace_dir)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .kill_on_drop(true)
+                        .spawn()
+                    {
+                        Ok(child) => child,
+                        Err(fallback_err) => {
+                            return (
+                                false,
+                                format!(
+                                    "workspace-script spawn error ({}): {e}; interpreter fallback ({interpreter}) failed: {fallback_err}",
+                                    resolved.display()
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    return (
+                        false,
+                        format!(
+                            "workspace-script spawn error ({}): {e}; file is not executable and no fallback interpreter could be determined",
+                            resolved.display()
+                        ),
+                    );
+                }
+            } else {
+                return (
+                    false,
+                    format!(
+                        "workspace-script spawn error ({}): {e}",
+                        resolved.display()
+                    ),
+                );
+            }
         }
     };
 
@@ -558,6 +651,71 @@ async fn run_workspace_script_with_timeout(
             ),
         ),
     }
+}
+
+fn resolve_workspace_script_interpreter(path: &std::path::Path) -> Option<(String, Vec<String>)> {
+    if let Some(interpreter) = interpreter_from_shebang(path) {
+        return Some(interpreter);
+    }
+
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "sh" => Some(("sh".to_string(), Vec::new())),
+        "bash" => Some(("bash".to_string(), Vec::new())),
+        "zsh" => Some(("zsh".to_string(), Vec::new())),
+        "py" => Some(("python3".to_string(), Vec::new())),
+        _ => None,
+    }
+}
+
+fn interpreter_from_shebang(path: &std::path::Path) -> Option<(String, Vec<String>)> {
+    let content = std::fs::read(path).ok()?;
+    let line_end = content
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(content.len());
+    let first_line = std::str::from_utf8(&content[..line_end]).ok()?.trim();
+    let shebang = first_line.strip_prefix("#!")?.trim();
+    if shebang.is_empty() {
+        return None;
+    }
+
+    let tokens = split_workspace_script_tokens(shebang).ok()?;
+    if tokens.is_empty() {
+        return None;
+    }
+
+    if tokens[0].ends_with("/env") || tokens[0] == "env" {
+        return interpreter_from_env_tokens(&tokens[1..]);
+    }
+
+    Some((tokens[0].clone(), tokens[1..].to_vec()))
+}
+
+fn interpreter_from_env_tokens(tokens: &[String]) -> Option<(String, Vec<String>)> {
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if token == "-S" {
+            idx += 1;
+            break;
+        }
+        if token.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+
+    if idx >= tokens.len() {
+        return None;
+    }
+
+    Some((tokens[idx].clone(), tokens[idx + 1..].to_vec()))
 }
 
 async fn run_job_command(
@@ -748,6 +906,97 @@ mod tests {
             run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
         assert!(!success);
         assert!(output.contains("job timed out after"));
+    }
+
+    #[test]
+    fn parse_workspace_script_invocation_supports_quoted_args() {
+        let parsed = parse_workspace_script_invocation(
+            "workspace-script scripts/run.sh --title \"daily digest\" --tag 'alpha beta'",
+        )
+        .expect("parse should succeed")
+        .expect("invocation should parse");
+
+        assert_eq!(parsed.rel_path, "scripts/run.sh");
+        assert_eq!(
+            parsed.args,
+            vec![
+                "--title".to_string(),
+                "daily digest".to_string(),
+                "--tag".to_string(),
+                "alpha beta".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_workspace_script_invocation_preserves_backslashes() {
+        let parsed = parse_workspace_script_invocation(
+            r"workspace-script scripts\organize_journal_audio.sh --out .\journals\text",
+        )
+        .expect("parse should succeed")
+        .expect("invocation should parse");
+
+        assert_eq!(parsed.rel_path, r"scripts\organize_journal_audio.sh");
+        assert_eq!(parsed.args, vec!["--out".to_string(), r".\journals\text".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_script_shell_fallback_runs_non_executable_sh_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["workspace-script".into()];
+
+        let scripts_dir = config.workspace_dir.join("scripts");
+        tokio::fs::create_dir_all(&scripts_dir).await.unwrap();
+        let script_path = scripts_dir.join("nonexec.sh");
+        tokio::fs::write(&script_path, "echo nonexec-workspace-script-ok\n")
+            .await
+            .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let job = test_job("workspace-script scripts/nonexec.sh");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        assert!(output.contains("nonexec-workspace-script-ok"));
+        assert!(output.contains("status=exit status: 0"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_script_shebang_fallback_runs_non_executable_script_without_extension() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["workspace-script".into()];
+
+        let scripts_dir = config.workspace_dir.join("scripts");
+        tokio::fs::create_dir_all(&scripts_dir).await.unwrap();
+        let script_path = scripts_dir.join("organize_journal_audio");
+        tokio::fs::write(
+            &script_path,
+            "#!/usr/bin/env bash\necho shebang-nonexec-workspace-script-ok\n",
+        )
+        .await
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let job = test_job("workspace-script scripts/organize_journal_audio");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        assert!(output.contains("shebang-nonexec-workspace-script-ok"));
+        assert!(output.contains("status=exit status: 0"));
     }
 
     #[tokio::test]
