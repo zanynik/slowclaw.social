@@ -48,7 +48,6 @@ pub(crate) mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doctor;
 pub mod gateway;
-pub(crate) mod hardware;
 pub(crate) mod health;
 pub(crate) mod heartbeat;
 pub mod hooks;
@@ -59,11 +58,7 @@ pub(crate) mod migration;
 pub(crate) mod multimodal;
 pub mod observability;
 pub(crate) mod onboard;
-pub(crate) mod pocketbase_sidecar;
-pub(crate) mod pocketbase_chat;
-pub mod peripherals;
 pub mod providers;
-pub mod rag;
 pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
@@ -71,8 +66,13 @@ pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod tunnel;
 pub(crate) mod util;
+pub(crate) mod workflow_assets;
 
 pub use config::Config;
+
+pub async fn run_scheduler(config: Config) -> anyhow::Result<()> {
+    cron::scheduler::run(config).await
+}
 
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

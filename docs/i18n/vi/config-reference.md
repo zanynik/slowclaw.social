@@ -107,7 +107,7 @@ model = "anthropic/claude-sonnet-4-6"
 system_prompt = "You are a research assistant."
 max_depth = 2
 agentic = true
-allowed_tools = ["web_search", "http_request", "file_read"]
+allowed_tools = ["web_search_tool", "file_read", "file_write"]
 max_iterations = 8
 
 [agents.coder]
@@ -143,21 +143,15 @@ Lưu ý:
   - `ZEROCLAW_OPEN_SKILLS_DIR` ghi đè đường dẫn kho khi có giá trị.
 - Thứ tự ưu tiên: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` trong `config.toml` → mặc định `false`.
 
-## `[composio]`
+## Các Mục Tool Đã Loại Bỏ
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật công cụ OAuth do Composio quản lý |
-| `api_key` | chưa đặt | API key Composio cho tool `composio` |
-| `entity_id` | `default` | `user_id` mặc định gửi khi gọi connect/execute |
+Các section sau đã lỗi thời trong cấu hình workspace-only hiện tại và nên xem là đã loại bỏ/bị bỏ qua:
 
-Lưu ý:
-
-- Tương thích ngược: `enable = true` kiểu cũ được chấp nhận như bí danh cho `enabled = true`.
-- Nếu `enabled = false` hoặc thiếu `api_key`, tool `composio` không được đăng ký.
-- ZeroClaw yêu cầu Composio v3 tools với `toolkit_versions=latest` và thực thi với `version="latest"` để tránh bản tool mặc định cũ.
-- Luồng thông thường: gọi `connect`, hoàn tất OAuth trên trình duyệt, rồi chạy `execute` cho hành động mong muốn.
-- Nếu Composio trả lỗi thiếu connected-account, gọi `list_accounts` (tùy chọn với `app`) và truyền `connected_account_id` trả về cho `execute`.
+- `[composio]`
+- `[browser]` và `[browser.computer_use]`
+- `[http_request]`
+- `[hardware]`
+- `[peripherals]`
 
 ## `[cost]`
 
@@ -205,50 +199,6 @@ Lưu ý:
 - URL từ xa chỉ khi `allow_remote_fetch = true`
 - Kiểu MIME cho phép: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
 - Khi provider đang dùng không hỗ trợ vision, yêu cầu thất bại với lỗi capability có cấu trúc (`capability=vision`) thay vì bỏ qua ảnh.
-
-## `[browser]`
-
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật tool `browser_open` (mở URL trong trình duyệt mặc định hệ thống, không thu thập dữ liệu) |
-| `allowed_domains` | `[]` | Tên miền cho phép cho `browser_open` (khớp chính xác hoặc subdomain) |
-| `session_name` | chưa đặt | Tên phiên trình duyệt (cho tự động hóa agent-browser) |
-| `backend` | `agent_browser` | Backend tự động hóa: `"agent_browser"`, `"rust_native"`, `"computer_use"` hoặc `"auto"` |
-| `native_headless` | `true` | Chế độ headless cho backend rust-native |
-| `native_webdriver_url` | `http://127.0.0.1:9515` | URL endpoint WebDriver cho backend rust-native |
-| `native_chrome_path` | chưa đặt | Đường dẫn Chrome/Chromium tùy chọn cho backend rust-native |
-
-### `[browser.computer_use]`
-
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `endpoint` | `http://127.0.0.1:8787/v1/actions` | Endpoint sidecar cho hành động computer-use (chuột/bàn phím/screenshot cấp OS) |
-| `api_key` | chưa đặt | Bearer token tùy chọn cho sidecar computer-use (mã hóa khi lưu) |
-| `timeout_ms` | `15000` | Thời gian chờ mỗi hành động (mili giây) |
-| `allow_remote_endpoint` | `false` | Cho phép endpoint từ xa/công khai cho sidecar |
-| `window_allowlist` | `[]` | Danh sách cho phép tiêu đề cửa sổ/tiến trình gửi đến sidecar |
-| `max_coordinate_x` | chưa đặt | Giới hạn trục X cho hành động dựa trên tọa độ (tùy chọn) |
-| `max_coordinate_y` | chưa đặt | Giới hạn trục Y cho hành động dựa trên tọa độ (tùy chọn) |
-
-Lưu ý:
-
-- Khi `backend = "computer_use"`, agent ủy quyền hành động trình duyệt cho sidecar tại `computer_use.endpoint`.
-- `allow_remote_endpoint = false` (mặc định) từ chối mọi endpoint không phải loopback để tránh lộ ra ngoài.
-- Dùng `window_allowlist` để giới hạn cửa sổ OS mà sidecar có thể tương tác.
-
-## `[http_request]`
-
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật tool `http_request` cho tương tác API |
-| `allowed_domains` | `[]` | Tên miền cho phép (khớp chính xác hoặc subdomain) |
-| `max_response_size` | `1000000` | Kích thước response tối đa (byte, mặc định: 1 MB) |
-| `timeout_secs` | `30` | Thời gian chờ yêu cầu (giây) |
-
-Lưu ý:
-
-- Mặc định từ chối tất cả: nếu `allowed_domains` rỗng, mọi yêu cầu HTTP bị từ chối.
-- Dùng khớp tên miền chính xác hoặc subdomain (ví dụ `"api.example.com"`, `"example.com"`).
 
 ## `[gateway]`
 
@@ -434,65 +384,6 @@ Lưu ý:
 
 - WhatsApp Web yêu cầu build flag `whatsapp-web`.
 - Nếu cả Cloud lẫn Web đều có cấu hình, Cloud được ưu tiên để tương thích ngược.
-
-## `[hardware]`
-
-Cấu hình truy cập phần cứng vật lý (STM32, probe, serial).
-
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật truy cập phần cứng |
-| `transport` | `none` | Chế độ truyền: `"none"`, `"native"`, `"serial"` hoặc `"probe"` |
-| `serial_port` | chưa đặt | Đường dẫn cổng serial (ví dụ `"/dev/ttyACM0"`) |
-| `baud_rate` | `115200` | Tốc độ baud serial |
-| `probe_target` | chưa đặt | Chip đích cho probe (ví dụ `"STM32F401RE"`) |
-| `workspace_datasheets` | `false` | Bật RAG datasheet workspace (đánh chỉ mục PDF schematic để AI tra cứu chân) |
-
-Lưu ý:
-
-- Dùng `transport = "serial"` với `serial_port` cho kết nối USB-serial.
-- Dùng `transport = "probe"` với `probe_target` cho nạp qua debug-probe (ví dụ ST-Link).
-- Xem [hardware-peripherals-design.md](hardware-peripherals-design.md) để biết chi tiết giao thức.
-
-## `[peripherals]`
-
-Bo mạch ngoại vi trở thành tool agent khi được bật.
-
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật hỗ trợ ngoại vi (bo mạch trở thành tool agent) |
-| `boards` | `[]` | Danh sách cấu hình bo mạch |
-| `datasheet_dir` | chưa đặt | Đường dẫn tài liệu datasheet (tương đối workspace) cho RAG |
-
-Mỗi mục trong `boards`:
-
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `board` | _bắt buộc_ | Loại bo mạch: `"nucleo-f401re"`, `"rpi-gpio"`, `"esp32"`, v.v. |
-| `transport` | `serial` | Kiểu truyền: `"serial"`, `"native"`, `"websocket"` |
-| `path` | chưa đặt | Đường dẫn serial: `"/dev/ttyACM0"`, `"/dev/ttyUSB0"` |
-| `baud` | `115200` | Tốc độ baud cho serial |
-
-```toml
-[peripherals]
-enabled = true
-datasheet_dir = "docs/datasheets"
-
-[[peripherals.boards]]
-board = "nucleo-f401re"
-transport = "serial"
-path = "/dev/ttyACM0"
-baud = 115200
-
-[[peripherals.boards]]
-board = "rpi-gpio"
-transport = "native"
-```
-
-Lưu ý:
-
-- Đặt file `.md`/`.txt` datasheet đặt tên theo bo mạch (ví dụ `nucleo-f401re.md`, `rpi-gpio.md`) trong `datasheet_dir` cho RAG.
-- Xem [hardware-peripherals-design.md](hardware-peripherals-design.md) để biết giao thức bo mạch và ghi chú firmware.
 
 ## Giá trị mặc định liên quan bảo mật
 

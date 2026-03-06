@@ -62,6 +62,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
 /// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
+/// Temp-directory workspace overrides are ignored unless `ZEROCLAW_ALLOW_TEMP_WORKSPACE` is enabled.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
     /// Workspace directory - computed from home, not serialized
@@ -74,7 +75,7 @@ pub struct Config {
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
-    /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
+    /// Default provider ID or alias (e.g. `"openai-codex"`, `"openrouter"`, `"ollama"`). Default: `"openai-codex"`.
     #[serde(alias = "model_provider")]
     pub default_provider: Option<String>,
     /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
@@ -83,7 +84,10 @@ pub struct Config {
     /// Optional named provider profiles keyed by id (Codex app-server compatible layout).
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
-    /// Default model temperature (0.0–2.0). Default: `0.7`.
+    /// Provider behavior defaults (`[provider]` section).
+    #[serde(default)]
+    pub provider: ProviderConfig,
+    /// Default model temperature (0.0–2.0). Default: `0.2`.
     pub default_temperature: f64,
 
     /// Observability backend configuration (`[observability]`).
@@ -236,6 +240,34 @@ pub struct ModelProviderConfig {
     pub requires_openai_auth: bool,
 }
 
+/// Provider behavior defaults (`[provider]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderConfig {
+    /// Provider transport mode.
+    #[serde(default = "default_provider_transport_mode")]
+    pub transport: String,
+    /// Provider reasoning profile.
+    #[serde(default = "default_provider_reasoning_level")]
+    pub reasoning_level: String,
+}
+
+fn default_provider_transport_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_provider_reasoning_level() -> String {
+    "high".to_string()
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            transport: default_provider_transport_mode(),
+            reasoning_level: default_provider_reasoning_level(),
+        }
+    }
+}
+
 // ── Delegate Agents ──────────────────────────────────────────────
 
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
@@ -348,28 +380,37 @@ impl Default for HardwareConfig {
 
 // ── Transcription ────────────────────────────────────────────────
 
-fn default_transcription_api_url() -> String {
-    "https://api.groq.com/openai/v1/audio/transcriptions".into()
-}
-
 fn default_transcription_model() -> String {
-    "whisper-large-v3-turbo".into()
+    "base".into()
 }
 
 fn default_transcription_max_duration_secs() -> u64 {
     120
 }
 
-/// Voice transcription configuration (Whisper API via Groq).
+fn default_transcription_python_bin() -> String {
+    "python3".into()
+}
+
+fn default_transcription_device() -> String {
+    "auto".into()
+}
+
+fn default_transcription_compute_type() -> String {
+    "int8".into()
+}
+
+fn default_transcription_beam_size() -> u32 {
+    5
+}
+
+/// Voice transcription configuration (local faster-whisper runner).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TranscriptionConfig {
-    /// Enable voice transcription for channels that support it.
+    /// Enable journal media transcription.
     #[serde(default)]
     pub enabled: bool,
-    /// Whisper API endpoint URL.
-    #[serde(default = "default_transcription_api_url")]
-    pub api_url: String,
-    /// Whisper model name.
+    /// faster-whisper model name or local model path.
     #[serde(default = "default_transcription_model")]
     pub model: String,
     /// Optional language hint (ISO-639-1, e.g. "en", "ru").
@@ -378,16 +419,31 @@ pub struct TranscriptionConfig {
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
+    /// Python interpreter used to execute `scripts/transcribe_audio_journal.py`.
+    #[serde(default = "default_transcription_python_bin")]
+    pub python_bin: String,
+    /// faster-whisper device (`auto`, `cpu`, `cuda`).
+    #[serde(default = "default_transcription_device")]
+    pub device: String,
+    /// faster-whisper compute type (`int8`, `float16`, ...).
+    #[serde(default = "default_transcription_compute_type")]
+    pub compute_type: String,
+    /// Decoder beam size.
+    #[serde(default = "default_transcription_beam_size")]
+    pub beam_size: u32,
 }
 
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            api_url: default_transcription_api_url(),
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
+            python_bin: default_transcription_python_bin(),
+            device: default_transcription_device(),
+            compute_type: default_transcription_compute_type(),
+            beam_size: default_transcription_beam_size(),
         }
     }
 }
@@ -3591,10 +3647,11 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
             api_url: None,
-            default_provider: Some("openrouter".to_string()),
-            default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
+            default_provider: Some("openai-codex".to_string()),
+            default_model: Some("gpt-5.3-codex".to_string()),
             model_providers: HashMap::new(),
-            default_temperature: 0.7,
+            provider: ProviderConfig::default(),
+            default_temperature: 0.2,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -3638,6 +3695,7 @@ fn default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
 }
 
 const ACTIVE_WORKSPACE_STATE_FILE: &str = "active_workspace.toml";
+const ALLOW_TEMP_WORKSPACE_ENV: &str = "ZEROCLAW_ALLOW_TEMP_WORKSPACE";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ActiveWorkspaceState {
@@ -3662,6 +3720,22 @@ fn is_temp_directory(path: &Path) -> bool {
     let canon_temp = temp.canonicalize().unwrap_or_else(|_| temp.clone());
     let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     canon_path.starts_with(&canon_temp)
+}
+
+fn temp_workspace_override_enabled() -> bool {
+    std::env::var(ALLOW_TEMP_WORKSPACE_ENV)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn should_ignore_temp_workspace(path: &Path) -> bool {
+    is_temp_directory(path) && !temp_workspace_override_enabled()
 }
 
 async fn load_persisted_workspace_dirs(
@@ -3856,14 +3930,23 @@ async fn resolve_runtime_config_dirs(
     }
 
     if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+        let custom_workspace = custom_workspace.trim();
         if !custom_workspace.is_empty() {
-            let (zeroclaw_dir, workspace_dir) =
-                resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
-            return Ok((
-                zeroclaw_dir,
-                workspace_dir,
-                ConfigResolutionSource::EnvWorkspace,
-            ));
+            let workspace_root = PathBuf::from(custom_workspace);
+            if should_ignore_temp_workspace(&workspace_root) {
+                tracing::warn!(
+                    workspace = %workspace_root.display(),
+                    "{} points to a temp directory; ignoring for runtime resolution",
+                    ALLOW_TEMP_WORKSPACE_ENV
+                );
+            } else {
+                let (zeroclaw_dir, workspace_dir) = resolve_config_dir_for_workspace(&workspace_root);
+                return Ok((
+                    zeroclaw_dir,
+                    workspace_dir,
+                    ConfigResolutionSource::EnvWorkspace,
+                ));
+            }
         }
     }
 
@@ -4308,6 +4391,27 @@ impl Config {
                 "External channel integrations (Telegram/Discord/Slack/etc. and webhook) are disabled in this fork"
             );
         }
+        if self.composio.enabled {
+            anyhow::bail!("[composio] is not supported in this workspace-only build");
+        }
+        if self.browser.enabled {
+            anyhow::bail!("[browser] is not supported in this workspace-only build");
+        }
+        if self.http_request.enabled {
+            anyhow::bail!("[http_request] is not supported in this workspace-only build");
+        }
+        if self.web_fetch.enabled {
+            anyhow::bail!("[web_fetch] is not supported in this workspace-only build");
+        }
+        if self.hardware.enabled {
+            anyhow::bail!("[hardware] is not supported in this workspace-only build");
+        }
+        if self.peripherals.enabled || !self.peripherals.boards.is_empty() {
+            anyhow::bail!("[peripherals] is not supported in this workspace-only build");
+        }
+        if !self.runtime.kind.trim().eq_ignore_ascii_case("native") {
+            anyhow::bail!("runtime.kind must be 'native' in this workspace-only build");
+        }
 
         // Model routes
         for (i, route) in self.model_routes.iter().enumerate() {
@@ -4452,7 +4556,9 @@ impl Config {
         } else if let Ok(provider) = std::env::var("PROVIDER") {
             let should_apply_legacy_provider =
                 self.default_provider.as_deref().map_or(true, |configured| {
-                    configured.trim().eq_ignore_ascii_case("openrouter")
+                    let configured = configured.trim();
+                    configured.eq_ignore_ascii_case("openrouter")
+                        || configured.eq_ignore_ascii_case("openai-codex")
                 });
             if should_apply_legacy_provider && !provider.is_empty() {
                 self.default_provider = Some(provider);
@@ -4471,10 +4577,19 @@ impl Config {
 
         // Workspace directory: ZEROCLAW_WORKSPACE
         if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+            let workspace = workspace.trim();
             if !workspace.is_empty() {
-                let (_, workspace_dir) =
-                    resolve_config_dir_for_workspace(&PathBuf::from(workspace));
-                self.workspace_dir = workspace_dir;
+                let workspace_root = PathBuf::from(workspace);
+                if should_ignore_temp_workspace(&workspace_root) {
+                    tracing::warn!(
+                        workspace = %workspace_root.display(),
+                        "{} points to a temp directory; ignoring workspace override",
+                        ALLOW_TEMP_WORKSPACE_ENV
+                    );
+                } else {
+                    let (_, workspace_dir) = resolve_config_dir_for_workspace(&workspace_root);
+                    self.workspace_dir = workspace_dir;
+                }
             }
         }
 
@@ -4879,9 +4994,11 @@ mod tests {
     #[test]
     async fn config_default_has_sane_values() {
         let c = Config::default();
-        assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
-        assert!(c.default_model.as_deref().unwrap().contains("claude"));
-        assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
+        assert_eq!(c.default_provider.as_deref(), Some("openai-codex"));
+        assert_eq!(c.default_model.as_deref(), Some("gpt-5.3-codex"));
+        assert!((c.default_temperature - 0.2).abs() < f64::EPSILON);
+        assert_eq!(c.provider.transport, "auto");
+        assert_eq!(c.provider.reasoning_level, "high");
         assert!(c.api_key.is_none());
         assert!(!c.skills.open_skills_enabled);
         assert_eq!(
@@ -5091,6 +5208,7 @@ default_temperature = 0.7
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
+            provider: ProviderConfig::default(),
             default_temperature: 0.5,
             observability: ObservabilityConfig {
                 backend: "log".into(),
@@ -5329,6 +5447,7 @@ tool_dispatcher = "xml"
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
+            provider: ProviderConfig::default(),
             default_temperature: 0.9,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -6632,11 +6751,50 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
+        std::env::remove_var(ALLOW_TEMP_WORKSPACE_ENV);
         std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace");
         config.apply_env_overrides();
         assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+    }
+
+    #[test]
+    async fn env_override_workspace_ignores_temp_by_default() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        let original_workspace = config.workspace_dir.clone();
+        let temp_workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_env_workspace_{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        std::env::remove_var(ALLOW_TEMP_WORKSPACE_ENV);
+        std::env::set_var("ZEROCLAW_WORKSPACE", &temp_workspace);
+        config.apply_env_overrides();
+
+        assert_eq!(config.workspace_dir, original_workspace);
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+    }
+
+    #[test]
+    async fn env_override_workspace_allows_temp_with_opt_in() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        let temp_workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_env_workspace_{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        std::env::set_var(ALLOW_TEMP_WORKSPACE_ENV, "1");
+        std::env::set_var("ZEROCLAW_WORKSPACE", &temp_workspace);
+        config.apply_env_overrides();
+
+        assert_eq!(config.workspace_dir, temp_workspace.join("workspace"));
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var(ALLOW_TEMP_WORKSPACE_ENV);
     }
 
     #[test]
@@ -6646,6 +6804,7 @@ requires_openai_auth = true
         let default_workspace_dir = default_config_dir.join("workspace");
         let workspace_dir = default_config_dir.join("profile-a");
 
+        std::env::set_var(ALLOW_TEMP_WORKSPACE_ENV, "1");
         std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
@@ -6655,6 +6814,29 @@ requires_openai_auth = true
         assert_eq!(source, ConfigResolutionSource::EnvWorkspace);
         assert_eq!(config_dir, workspace_dir);
         assert_eq!(resolved_workspace_dir, workspace_dir.join("workspace"));
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var(ALLOW_TEMP_WORKSPACE_ENV);
+        let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn resolve_runtime_config_dirs_ignores_temp_env_workspace_by_default() {
+        let _env_guard = env_override_lock().await;
+        let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let default_workspace_dir = default_config_dir.join("workspace");
+        let workspace_dir = default_config_dir.join("profile-a");
+
+        std::env::remove_var(ALLOW_TEMP_WORKSPACE_ENV);
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        let (config_dir, resolved_workspace_dir, source) =
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+                .await
+                .unwrap();
+
+        assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
+        assert_eq!(config_dir, default_config_dir);
+        assert_eq!(resolved_workspace_dir, default_workspace_dir);
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
         let _ = fs::remove_dir_all(default_config_dir).await;
@@ -6753,6 +6935,7 @@ requires_openai_auth = true
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
+        std::env::set_var(ALLOW_TEMP_WORKSPACE_ENV, "1");
         std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -6762,6 +6945,7 @@ requires_openai_auth = true
         assert!(workspace_dir.join("config.toml").exists());
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var(ALLOW_TEMP_WORKSPACE_ENV);
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
@@ -6780,6 +6964,7 @@ requires_openai_auth = true
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
+        std::env::set_var(ALLOW_TEMP_WORKSPACE_ENV, "1");
         std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -6789,6 +6974,7 @@ requires_openai_auth = true
         assert!(config.config_path.exists());
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var(ALLOW_TEMP_WORKSPACE_ENV);
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
@@ -6818,6 +7004,7 @@ default_model = "legacy-model"
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
+        std::env::set_var(ALLOW_TEMP_WORKSPACE_ENV, "1");
         std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -6827,6 +7014,7 @@ default_model = "legacy-model"
         assert_eq!(config.default_model.as_deref(), Some("legacy-model"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var(ALLOW_TEMP_WORKSPACE_ENV);
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
@@ -6893,6 +7081,7 @@ default_model = "legacy-model"
         persist_active_workspace_config_dir(&marker_config_dir)
             .await
             .unwrap();
+        std::env::set_var(ALLOW_TEMP_WORKSPACE_ENV, "1");
         std::env::set_var("ZEROCLAW_WORKSPACE", &env_workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -6901,6 +7090,7 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var(ALLOW_TEMP_WORKSPACE_ENV);
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
@@ -7553,10 +7743,13 @@ default_model = "legacy-model"
     async fn transcription_config_defaults() {
         let tc = TranscriptionConfig::default();
         assert!(!tc.enabled);
-        assert!(tc.api_url.contains("groq.com"));
-        assert_eq!(tc.model, "whisper-large-v3-turbo");
+        assert_eq!(tc.model, "base");
         assert!(tc.language.is_none());
         assert_eq!(tc.max_duration_secs, 120);
+        assert_eq!(tc.python_bin, "python3");
+        assert_eq!(tc.device, "auto");
+        assert_eq!(tc.compute_type, "int8");
+        assert_eq!(tc.beam_size, 5);
     }
 
     #[test]
@@ -7570,7 +7763,7 @@ default_model = "legacy-model"
 
         assert!(parsed.transcription.enabled);
         assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
-        assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
+        assert_eq!(parsed.transcription.model, "base");
     }
 
     #[test]

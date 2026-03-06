@@ -1,0 +1,23 @@
+   Compiling aws-lc-sys v0.37.1
+    Checking objc2-app-kit v0.3.2
+    Checking chrono-tz v0.10.4
+error: failed to write to `/Users/nikhil/.gemini/antigravity/scratch/zeroclaw_modify/web/src-tauri/target/debug/deps/rmetako3Ckd/full.rmeta`: No space left on device (os error 28)
+
+error: could not compile `chrono-tz` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+warning: aws-lc-sys@0.37.1: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.37.1: Emitting configuration: cargo:rustc-cfg=universal_prefixed
+warning: aws-lc-sys@0.37.1: Building with: CC
+warning: aws-lc-sys@0.37.1: Symbol Prefix: Some("aws_lc_0_37_1")
+warning: aws-lc-sys@0.37.1: Target platform: 'aarch64-apple-darwin'
+warning: aws-lc-sys@0.37.1: Compilation of 'c11.c' succeeded - Ok(["/Users/nikhil/.gemini/antigravity/scratch/zeroclaw_modify/web/src-tauri/target/debug/build/aws-lc-sys-f88d3351c204f8fe/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.37.1: Compilation of 'stdalign_check.c' succeeded - Ok(["/Users/nikhil/.gemini/antigravity/scratch/zeroclaw_modify/web/src-tauri/target/debug/build/aws-lc-sys-f88d3351c204f8fe/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.37.1: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/Users/nikhil/.gemini/antigravity/scratch/zeroclaw_modify/web/src-tauri/target/debug/build/aws-lc-sys-f88d3351c204f8fe/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.37.1: Compilation of 'neon_sha3_check.c' succeeded - Ok(["/Users/nikhil/.gemini/antigravity/scratch/zeroclaw_modify/web/src-tauri/target/debug/build/aws-lc-sys-f88d3351c204f8fe/out/out-neon_sha3_check/7dfda64fdf5a526c-neon_sha3_check.o"]).
+warning: aws-lc-sys@0.37.1: ar: /Users/nikhil/.gemini/antigravity/scratch/zeroclaw_modify/web/src-tauri/target/debug/build/aws-lc-sys-f88d3351c204f8fe/out/libaws_lc_0_37_1_crypto.a: No space left on device
+error: failed to run custom build command for `aws-lc-sys v0.37.1`
+
+Caused by:
+error: couldn't create a temp dir: No space left on device (os error 28) at path "/Users/nikhil/.gemini/antigravity/scratch/zeroclaw_modify/web/src-tauri/target/debug/deps/rmetaksxefG"
+
+error: could not compile `objc2-app-kit` (lib) due to 1 previous error

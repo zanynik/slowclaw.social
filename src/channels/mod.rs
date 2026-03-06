@@ -301,27 +301,105 @@ pub fn build_system_prompt_with_mode(
     workspace_dir: &std::path::Path,
     model_name: &str,
     tools: &[(&str, &str)],
-    _skills: &[crate::skills::Skill],
+    skills: &[crate::skills::Skill],
     _identity_config: Option<&crate::config::IdentityConfig>,
     _bootstrap_max_chars: Option<usize>,
-    _native_tools: bool,
-    _skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
 ) -> String {
     use std::fmt::Write;
 
     let mut prompt = String::new();
+    let _ = writeln!(prompt, "## Runtime");
+    let _ = writeln!(prompt);
     let _ = writeln!(prompt, "You are SlowClaw running in a workspace-only fork.");
-    let _ = writeln!(prompt, "Current workspace: {}", workspace_dir.display());
-    let _ = writeln!(prompt, "Model: {model_name}");
-    prompt.push_str("External messaging channels are disabled except the internal PocketBase app channel.\\n");
-    prompt.push_str("Prefer workspace-local tools and scheduled tasks.\\n\\n");
+    let _ = writeln!(prompt, "Current workspace: `{}`", workspace_dir.display());
+    let _ = writeln!(prompt, "Model: `{model_name}`");
+    prompt.push_str("External messaging channels are disabled except the internal PocketBase app channel.\n");
+    prompt.push_str("Prefer workspace-local tools and scheduled tasks.\n\n");
 
     if !tools.is_empty() {
-        prompt.push_str("## Tools\\n");
+        prompt.push_str("## Tools\n");
         for (name, desc) in tools {
             let _ = writeln!(prompt, "- {name}: {desc}");
         }
+        prompt.push('\n');
+    }
+
+    if !skills.is_empty() {
+        prompt.push_str("## Skills\n\n");
+        prompt.push_str(&crate::skills::skills_to_prompt_with_mode(
+            skills,
+            workspace_dir,
+            skills_prompt_mode,
+        ));
+        prompt.push_str("\n\n");
+    }
+
+    prompt.push_str("## Your Task\n\n");
+    prompt.push_str("- Execute user requests accurately using workspace files and tools.\n");
+    prompt.push_str("- For implementation requests, create or edit files in the workspace instead of streaming full code in chat.\n");
+    prompt.push_str("- When generating feed-ready artifacts, prefer writing under `posts/`.\n");
+    if native_tools {
+        prompt.push_str("- Use native tool calling where supported by the provider.\n");
     }
 
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_system_prompt_with_mode;
+    use crate::config::SkillsPromptInjectionMode;
+    use crate::skills::Skill;
+    use std::path::{Path, PathBuf};
+
+    fn sample_skill() -> Skill {
+        Skill {
+            name: "daily_summary".to_string(),
+            description: "Generate daily summaries from recent notes".to_string(),
+            version: "0.1.0".to_string(),
+            author: None,
+            tags: vec!["workflow".to_string()],
+            tools: Vec::new(),
+            prompts: vec!["# Daily Summary Skill".to_string()],
+            location: Some(PathBuf::from("/tmp/workspace/skills/daily_summary/SKILL.md")),
+        }
+    }
+
+    #[test]
+    fn system_prompt_includes_skills_when_present() {
+        let prompt = build_system_prompt_with_mode(
+            Path::new("/tmp/workspace"),
+            "test-model",
+            &[("shell", "Execute shell commands")],
+            &[sample_skill()],
+            None,
+            None,
+            true,
+            SkillsPromptInjectionMode::Full,
+        );
+
+        assert!(prompt.contains("## Skills"));
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>daily_summary</name>"));
+        assert!(prompt.contains("## Your Task"));
+    }
+
+    #[test]
+    fn system_prompt_omits_skills_block_when_empty() {
+        let prompt = build_system_prompt_with_mode(
+            Path::new("/tmp/workspace"),
+            "test-model",
+            &[("shell", "Execute shell commands")],
+            &[],
+            None,
+            None,
+            true,
+            SkillsPromptInjectionMode::Full,
+        );
+
+        assert!(!prompt.contains("<available_skills>"));
+        assert!(prompt.contains("## Your Task"));
+    }
 }

@@ -58,3 +58,27 @@ export type LibraryItem = {
   editableText?: boolean;
   scope?: "journal" | "feed" | string;
 };
+
+export type GatewayQrPayload = {
+  gateway_url: string;
+  token?: string;
+  qr_value: string;
+};
+
+export type DesktopGatewayInfo = {
+  gateway_url: string;
+  running: boolean;
+  last_error?: string | null;
+  provider_api_key_set: boolean;
+};
+
+export type OpenAiDeviceCodeStatus = {
+  state: string;
+  running: boolean;
+  completed: boolean;
+  message: string;
+  verificationUrl?: string | null;
+  userCode?: string | null;
+  fastLink?: string | null;
+  error?: string | null;
+};

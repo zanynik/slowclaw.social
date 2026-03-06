@@ -1,42 +1,52 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import type { AtpAgent } from "@atproto/api";
-import { QRCodeCanvas } from "qrcode.react";
+import { lazy, Suspense, FormEvent, useEffect, useRef, useState } from "react";
+import type { AtpAgent, AppBskyFeedDefs } from "@atproto/api";
+import type { BlueskySession } from "./lib/bluesky";
+// ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
-  loginBluesky,
-  postTextToBluesky,
-  postVideoToBluesky,
-  type BlueskySession
-} from "./lib/bluesky";
-import { AppBskyFeedDefs } from "@atproto/api";
-import {
-  createClawChatUserMessageViaGateway,
-  createPocketBaseClient,
-  ensurePocketBaseUserFromBluesky,
-  getLatestChatThreadViaGateway,
-  listClawChatMessagesViaGateway,
-  listDraftsFromPocketBase,
-  pocketBaseAuthLabel,
-  listPostHistoryFromPocketBase,
-  saveDraftToPocketBase,
-  savePostHistoryToPocketBase
-} from "./lib/pocketbase";
-import {
-  archivePostedLibraryItem,
-  createJournalTextViaGateway,
-  fetchMediaAsFile,
-  listLibraryItems,
-  readLibraryText,
-  saveLibraryText,
-  uploadMediaViaGateway
-} from "./lib/gatewayApi";
+  saveJournalText,
+  saveJournalMedia,
+  listJournals,
+  getJournal,
+  updateJournalText,
+  deleteJournal,
+  summarizeJournal,
+  listSummaries,
+  generateWeeklyDigest,
+  saveDraft,
+  listDrafts,
+  deleteDraft,
+  savePostRecord,
+  listPostHistory,
+  getConfig,
+  saveConfig,
+  listJobs,
+  createJob,
+  toggleJob,
+  runJobNow,
+  checkOllama,
+  listOllamaModels,
+  startRecording as startNativeAudioRecording,
+  stopRecording as stopNativeAudioRecording,
+  blobToBase64,
+} from "./lib/tauriApi";
+import type {
+  JournalEntry,
+  JournalSummary,
+  Draft,
+  PostRecord,
+  AppConfig,
+  SchedulerJob,
+  OllamaStatus,
+} from "./lib/tauriApi";
+// ── Secure storage (keyring wrappers — unchanged) ────────────────────────────
 import {
   deleteCredentialsSecure,
+  loadGatewayTokenSecure,
   loadCredentialsFallback,
   loadCredentialsSecure,
-  loadGatewayTokenSecure,
+  saveGatewayTokenSecure,
   saveBlueskySessionSecure,
   saveCredentialsSecure,
-  saveGatewayTokenSecure
 } from "./lib/secureStorage";
 import type {
   BlueskyCredentials,
@@ -45,17 +55,48 @@ import type {
   LibraryItem,
   OpenAiDeviceCodeStatus,
   PostHistoryItem,
-  StoredDraft
+  StoredDraft,
 } from "./lib/types";
+import {
+  archivePostedLibraryItem,
+  createClawChatUserMessage as createClawChatUserMessageViaGateway,
+  createFeedWorkflowTemplate,
+  createJournalTextViaGateway,
+  createPostHistory,
+  deleteLibraryItem,
+  fetchMediaAsFile,
+  getJournalTranscriptionStatus,
+  getRuntimeConfig,
+  listClawChatMessages,
+  listDrafts as listDraftsViaGateway,
+  listFeedWorkflowSettings,
+  listLibraryItems,
+  listPostHistory as listPostHistoryViaGateway,
+  readLibraryText,
+  runFeedWorkflowNow,
+  saveDraft as saveDraftViaGateway,
+  saveLibraryText,
+  submitFeedWorkflowComment,
+  transcribeJournalMedia,
+  updateFeedWorkflowSettings,
+  updateRuntimeConfig,
+  uploadMediaViaGateway,
+} from "./lib/gatewayApi";
+import type { FeedWorkflowMode, FeedWorkflowSettingsItem } from "./lib/gatewayApi";
 
 const CHAT_THREAD_STORAGE_KEY = "slowclaw.chat.thread_id";
-const CHAT_GATEWAY_TOKEN_STORAGE_KEY = "slowclaw.chat.gateway_token";
 const CHAT_GATEWAY_BASE_URL_STORAGE_KEY = "slowclaw.chat.gateway_base_url";
+const CHAT_GATEWAY_TOKEN_STORAGE_KEY = "slowclaw.chat.gateway_token";
+const CHAT_PROVIDER_STORAGE_KEY = "slowclaw.settings.provider";
+const CHAT_MODEL_STORAGE_KEY = "slowclaw.settings.model";
+const LOCAL_JOURNAL_PATH_PREFIX = "journal://";
 const UI_THEME_STORAGE_KEY = "slowclaw.ui.theme";
 const UI_TAB_STORAGE_KEY = "slowclaw.ui.tab";
-const FEED_POSTED_PATHS_STORAGE_KEY = "slowclaw.feed.posted_paths";
+
 const DESKTOP_SECRET_SERVICE = "social.slowclaw.gateway";
 const PROVIDER_API_KEY_SECRET_ACCOUNT = "provider.api_key";
+let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
+const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
 type MobileTab = "journal" | "feed" | "chat" | "profile";
 type ThemeMode = "light" | "dark";
@@ -63,6 +104,13 @@ type DesktopGatewayBootstrap = {
   token?: string | null;
   gatewayUrl?: string | null;
 };
+
+async function loadBlueskyModule() {
+  if (!blueskyModulePromise) {
+    blueskyModulePromise = import("./lib/bluesky");
+  }
+  return blueskyModulePromise;
+}
 
 function defaultThemeMode(): ThemeMode {
   if (typeof window === "undefined") {
@@ -126,6 +174,110 @@ function sidecarCaptionPath(item: LibraryItem) {
   return `${item.path}.caption.txt`;
 }
 
+function fileStemFromPath(path: string) {
+  const filename = path.split("/").pop() || path;
+  return filename.replace(/\.[^/.]+$/, "");
+}
+
+function inferMediaMimeType(path: string, kind: LibraryItem["kind"], currentType?: string) {
+  const normalizedType = String(currentType || "").trim().toLowerCase();
+  if (normalizedType && normalizedType !== "application/octet-stream") {
+    return normalizedType;
+  }
+
+  const normalizedPath = path.toLowerCase();
+  if (kind === "audio") {
+    if (normalizedPath.endsWith(".mp3")) return "audio/mpeg";
+    if (normalizedPath.endsWith(".m4a") || normalizedPath.endsWith(".mp4")) return "audio/mp4";
+    if (normalizedPath.endsWith(".aac")) return "audio/aac";
+    if (normalizedPath.endsWith(".ogg")) return "audio/ogg";
+    if (normalizedPath.endsWith(".wav")) return "audio/wav";
+    if (normalizedPath.endsWith(".flac")) return "audio/flac";
+    return "audio/webm";
+  }
+  if (kind === "video") {
+    if (normalizedPath.endsWith(".mp4") || normalizedPath.endsWith(".m4v")) return "video/mp4";
+    if (normalizedPath.endsWith(".mov")) return "video/quicktime";
+    if (normalizedPath.endsWith(".mkv")) return "video/x-matroska";
+    return "video/webm";
+  }
+  if (kind === "image") {
+    if (normalizedPath.endsWith(".png")) return "image/png";
+    if (normalizedPath.endsWith(".gif")) return "image/gif";
+    if (normalizedPath.endsWith(".webp")) return "image/webp";
+    if (normalizedPath.endsWith(".svg")) return "image/svg+xml";
+    return "image/jpeg";
+  }
+  return normalizedType || "application/octet-stream";
+}
+
+function encodeWavFromFloat32(chunks: Float32Array[], sampleRate: number) {
+  const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const buffer = new ArrayBuffer(44 + totalSamples * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (offset: number, value: string) => {
+    for (let i = 0; i < value.length; i += 1) {
+      view.setUint8(offset + i, value.charCodeAt(i));
+    }
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + totalSamples * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, totalSamples * 2, true);
+
+  let offset = 44;
+  for (const chunk of chunks) {
+    for (let i = 0; i < chunk.length; i += 1) {
+      const sample = Math.max(-1, Math.min(1, chunk[i]));
+      view.setInt16(
+        offset,
+        sample < 0 ? Math.round(sample * 0x8000) : Math.round(sample * 0x7fff),
+        true
+      );
+      offset += 2;
+    }
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function journalTranscriptPathForMedia(item: LibraryItem) {
+  const normalized = item.path.replace(/^\/+/, "");
+  if (normalized.startsWith("journals/media/")) {
+    const relative = normalized.slice("journals/media/".length);
+    const stemmed = relative.replace(/\.[^/.]+$/, ".txt");
+    return `journals/text/transcriptions/${stemmed}`;
+  }
+  return `journals/text/transcriptions/${fileStemFromPath(item.path)}.txt`;
+}
+
+function legacyJournalTranscriptPathForMedia(item: LibraryItem) {
+  return `journals/text/transcript/${fileStemFromPath(item.path)}.txt`;
+}
+
+function localJournalPath(id: string) {
+  return `${LOCAL_JOURNAL_PATH_PREFIX}${id}`;
+}
+
+function localJournalIdFromPath(path: string) {
+  if (!path.startsWith(LOCAL_JOURNAL_PATH_PREFIX)) {
+    return null;
+  }
+  const id = path.slice(LOCAL_JOURNAL_PATH_PREFIX.length).trim();
+  return id || null;
+}
+
 function createThreadId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -133,20 +285,21 @@ function createThreadId() {
   return `thread-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function defaultPocketBaseUrlForUi() {
-  if (typeof window === "undefined") {
-    return "http://127.0.0.1:8090";
-  }
-  const protocol = window.location.protocol === "https:" ? "https:" : "http:";
-  const host = window.location.hostname || "127.0.0.1";
-  return `${protocol}//${host}:8090`;
-}
-
 function isTauriDesktopRuntime() {
   if (typeof window === "undefined") {
     return false;
   }
   return Boolean((window as any).__TAURI_INTERNALS__);
+}
+
+function isTauriMobileRuntime() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return (
+    Boolean((window as any).__TAURI_MOBILE__) ||
+    /iphone|ipad|android/i.test(window.navigator.userAgent || "")
+  );
 }
 
 function defaultGatewayBaseUrl() {
@@ -162,17 +315,22 @@ function defaultGatewayBaseUrl() {
   return `${protocol}//${host}:42617`;
 }
 
-function derivePocketBaseUrlFromGateway(gatewayBaseUrl: string) {
-  try {
-    const parsed = new URL(gatewayBaseUrl);
-    parsed.port = "8090";
-    parsed.pathname = "";
-    parsed.search = "";
-    parsed.hash = "";
-    return parsed.toString().replace(/\/+$/, "");
-  } catch {
-    return defaultPocketBaseUrlForUi();
+function normalizeGatewayToken(value: string) {
+  const token = value.trim();
+  return token === "desktop-local" ? "" : token;
+}
+
+function isMissingDesktopCommand(error: unknown, commandName?: string) {
+  const message = String(
+    error instanceof Error ? error.message : error ?? ""
+  ).toLowerCase();
+  if (!message) {
+    return false;
   }
+  if (commandName) {
+    return message.includes(`command ${commandName.toLowerCase()} not found`);
+  }
+  return message.includes("command") && message.includes("not found");
 }
 
 function resolveGatewayResourceUrl(resourcePath: string, gatewayBaseUrl: string) {
@@ -187,14 +345,316 @@ function resolveGatewayResourceUrl(resourcePath: string, gatewayBaseUrl: string)
   return `${base}${suffix}`;
 }
 
+type WorkflowBotMeta = {
+  key: string;
+  name: string;
+  avatar: string;
+  outputPrefix: string;
+};
+
+type WorkflowSettingsDraft = {
+  mode: FeedWorkflowMode;
+  days: number;
+  randomCount: number;
+  scheduleEnabled: boolean;
+  scheduleCron: string;
+  scheduleTz: string;
+  prompt: string;
+};
+
+type WorkflowRunStatus = {
+  workflowKey: string;
+  workflowBot: string;
+  status: "pending" | "processing" | "done" | "error";
+  summary: string;
+  detail: string;
+  updatedAt: string;
+  runMessageId: string;
+};
+
+type WorkflowTemplateDraft = {
+  name: string;
+  botName: string;
+  sourceKind: "text" | "audio";
+  prompt: string;
+  mode: FeedWorkflowMode;
+  days: number;
+  randomCount: number;
+  scheduleEnabled: boolean;
+  scheduleCron: string;
+  scheduleTz: string;
+  runNow: boolean;
+};
+
+function workflowBotByKey(key: string): WorkflowBotMeta {
+  const trimmed = key.trim();
+  const name = trimmed
+    .split("_")
+    .filter(Boolean)
+    .map((token) => `${token.slice(0, 1).toUpperCase()}${token.slice(1)}`)
+    .join(" ");
+  const displayName = name ? `${name}Bot` : "WorkflowBot";
+  const avatar = displayName.slice(0, 1).toUpperCase() || "W";
+  return {
+    key: trimmed,
+    name: displayName,
+    avatar,
+    outputPrefix: `posts/${trimmed}/`
+  };
+}
+
+function workflowBotMetaFromSettings(item: FeedWorkflowSettingsItem): WorkflowBotMeta {
+  const fallback = workflowBotByKey(item.workflowKey);
+  const workflowBot = String(item.workflowBot || "").trim();
+  const outputPrefix = String(item.outputPrefix || "").trim();
+  return {
+    key: item.workflowKey,
+    name: workflowBot || fallback.name,
+    avatar: (workflowBot || fallback.name).slice(0, 1).toUpperCase() || fallback.avatar,
+    outputPrefix: outputPrefix || fallback.outputPrefix
+  };
+}
+
+const WORKFLOW_RUN_SOURCES = new Set([
+  "workflow-settings-save",
+  "workflow-run-manual",
+  "workflow-template-create",
+  "workflow-quickfix"
+]);
+
+function defaultWorkflowTemplateDraft(): WorkflowTemplateDraft {
+  return {
+    name: "",
+    botName: "",
+    sourceKind: "text",
+    prompt: "Write in a clear, natural voice.",
+    mode: "date_range",
+    days: 7,
+    randomCount: 1,
+    scheduleEnabled: false,
+    scheduleCron: "0 9 * * *",
+    scheduleTz: "",
+    runNow: true
+  };
+}
+
+function workflowSettingsDraftFromItem(item: FeedWorkflowSettingsItem): WorkflowSettingsDraft {
+  return {
+    mode: item.mode,
+    days: Number.isFinite(item.days) ? Math.max(1, Math.min(30, Math.floor(item.days))) : 7,
+    randomCount: Number.isFinite(item.randomCount)
+      ? Math.max(1, Math.min(10, Math.floor(item.randomCount)))
+      : 1,
+    scheduleEnabled: Boolean(item.scheduleEnabled),
+    scheduleCron: String(item.scheduleCron || "").trim(),
+    scheduleTz: String(item.scheduleTz || "").trim(),
+    prompt: String(item.prompt || "").trim()
+  };
+}
+
+function workflowBotForPath(path: string, bots: WorkflowBotMeta[]): WorkflowBotMeta | null {
+  const normalized = path.trim().toLowerCase();
+  for (const bot of bots) {
+    const prefix = bot.outputPrefix.trim().toLowerCase().replace(/^\/+/, "");
+    if (!prefix) {
+      continue;
+    }
+    if (normalized.startsWith(prefix)) {
+      return bot;
+    }
+  }
+  return null;
+}
+
+function parseWorkflowRunStatus(
+  bot: WorkflowBotMeta,
+  messages: ClawChatMessage[]
+): WorkflowRunStatus | undefined {
+  if (!messages.length) {
+    return undefined;
+  }
+
+  let runMsg: ClawChatMessage | undefined;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (
+      msg.role === "user" &&
+      msg.content.startsWith("[run]") &&
+      msg.source &&
+      WORKFLOW_RUN_SOURCES.has(msg.source)
+    ) {
+      runMsg = msg;
+      break;
+    }
+  }
+  if (!runMsg) {
+    return undefined;
+  }
+
+  let replyMsg: ClawChatMessage | undefined;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (msg.role === "assistant" && msg.replyToId === runMsg.id) {
+      replyMsg = msg;
+      break;
+    }
+  }
+
+  let status: WorkflowRunStatus["status"] = "pending";
+  const runStatus = String(runMsg.status || "").toLowerCase();
+  const replyStatus = String(replyMsg?.status || "").toLowerCase();
+  if (runStatus === "processing") {
+    status = "processing";
+  } else if (runStatus === "error" || replyStatus === "error" || replyMsg?.error) {
+    status = "error";
+  } else if (runStatus === "done") {
+    status = "done";
+  }
+
+  let summary = `${bot.name} run queued`;
+  if (status === "processing") {
+    summary = `${bot.name} is running...`;
+  } else if (status === "error") {
+    summary = `${bot.name} run failed`;
+  } else if (status === "done") {
+    summary = `${bot.name} run completed`;
+  }
+
+  const detailSource = replyMsg?.error || replyMsg?.content || runMsg.error || runMsg.content || "";
+  const detail = detailSource.trim().slice(0, 1200);
+  const updatedAt = replyMsg?.updated || replyMsg?.created || runMsg.updated || runMsg.created || "";
+
+  return {
+    workflowKey: bot.key,
+    workflowBot: bot.name,
+    status,
+    summary,
+    detail,
+    updatedAt,
+    runMessageId: runMsg.id
+  };
+}
+
+function splitUrlAndSuffix(raw: string) {
+  const match = raw.match(/^(.*?)([),.!?:;'"]*)$/);
+  if (!match) {
+    return { url: raw, suffix: "" };
+  }
+  return { url: match[1], suffix: match[2] };
+}
+
+function renderLinkedText(text: string) {
+  if (!text) {
+    return "";
+  }
+  const parts = text.split(/(https?:\/\/[^\s]+)/g);
+  return parts.map((part, idx) => {
+    if (!part) {
+      return null;
+    }
+    if (!/^https?:\/\//i.test(part)) {
+      return <span key={`txt-${idx}`}>{part}</span>;
+    }
+    const { url, suffix } = splitUrlAndSuffix(part);
+    if (!/^https?:\/\//i.test(url)) {
+      return <span key={`txt-${idx}`}>{part}</span>;
+    }
+    return (
+      <span key={`txt-${idx}`}>
+        <a href={url} target="_blank" rel="noreferrer">
+          {url}
+        </a>
+        {suffix}
+      </span>
+    );
+  });
+}
+
+function renderBlueskyEmbed(embed: any) {
+  if (!embed || !embed.$type) {
+    return null;
+  }
+  if (embed.$type === "app.bsky.embed.images#view") {
+    const images = Array.isArray(embed.images) ? embed.images : [];
+    if (!images.length) {
+      return null;
+    }
+    return (
+      <div className="bluesky-embed-grid">
+        {images.map((img: any, i: number) => (
+          <img
+            key={`img-${i}`}
+            src={img.thumb || img.fullsize}
+            alt={img.alt || "Embedded image"}
+            className="bluesky-embed-image"
+          />
+        ))}
+      </div>
+    );
+  }
+  if (embed.$type === "app.bsky.embed.video#view") {
+    const playlist = String(embed.playlist || "").trim();
+    const thumbnail = String(embed.thumbnail || "").trim();
+    if (!playlist && !thumbnail) {
+      return null;
+    }
+    return (
+      <div className="bluesky-embed-video-wrap">
+        {playlist ? (
+          <video
+            className="bluesky-embed-video"
+            controls
+            preload="metadata"
+            playsInline
+            poster={thumbnail || undefined}
+            src={playlist}
+          />
+        ) : (
+          <img src={thumbnail} alt="Video preview" className="bluesky-embed-image" />
+        )}
+      </div>
+    );
+  }
+  if (embed.$type === "app.bsky.embed.external#view") {
+    const external = embed.external || {};
+    const uri = String(external.uri || "").trim();
+    if (!uri) {
+      return null;
+    }
+    return (
+      <a href={uri} target="_blank" rel="noreferrer" className="bluesky-external-card">
+        {external.thumb ? (
+          <img src={String(external.thumb)} alt={String(external.title || "Link preview")} className="bluesky-external-thumb" />
+        ) : null}
+        <div className="bluesky-external-body">
+          <div className="bluesky-external-title">{String(external.title || uri)}</div>
+          {external.description ? (
+            <div className="bluesky-external-desc">{String(external.description)}</div>
+          ) : null}
+          <div className="bluesky-external-domain">
+            {(() => {
+              try {
+                return new URL(uri).hostname;
+              } catch {
+                return uri;
+              }
+            })()}
+          </div>
+        </div>
+      </a>
+    );
+  }
+  if (embed.$type === "app.bsky.embed.recordWithMedia#view") {
+    return renderBlueskyEmbed(embed.media);
+  }
+  return null;
+}
+
 function App() {
   const isDesktopClient = isTauriDesktopRuntime();
   const isLargeScreen = useIsLargeScreen();
   const isDesktopLayout = isDesktopClient || isLargeScreen;
   const [gatewayBaseUrl, setGatewayBaseUrl] = useState(defaultGatewayBaseUrl);
-  const [pbUrl, setPbUrl] = useState(() =>
-    derivePocketBaseUrlFromGateway(defaultGatewayBaseUrl())
-  );
   const [creds, setCreds] = useState<BlueskyCredentials>(() => loadCredentialsFallback());
   const [agent, setAgent] = useState<AtpAgent | null>(null);
   const [session, setSession] = useState<BlueskySession | null>(null);
@@ -207,29 +667,12 @@ function App() {
   const [status, setStatus] = useState<string>("");
   const [drafts, setDrafts] = useState<StoredDraft[]>([]);
   const [history, setHistory] = useState<PostHistoryItem[]>([]);
-  const [postedPaths, setPostedPaths] = useState<Record<string, true>>(() => {
-    if (typeof window === "undefined") {
-      return {};
-    }
-    const raw = window.localStorage.getItem(FEED_POSTED_PATHS_STORAGE_KEY);
-    if (!raw) {
-      return {};
-    }
-    try {
-      const arr = JSON.parse(raw);
-      if (!Array.isArray(arr)) {
-        return {};
-      }
-      return arr
-        .filter((v): v is string => typeof v === "string" && !!v.trim())
-        .reduce<Record<string, true>>((acc, path) => {
-          acc[path] = true;
-          return acc;
-        }, {});
-    } catch {
-      return {};
-    }
-  });
+  const postedPathsSet = new Set(
+    history
+      .filter((h) => h.status === "success" && h.sourcePath)
+      .map((h) => h.sourcePath as string)
+  );
+  const isPathPosted = (path: string) => postedPathsSet.has(path);
   const [chatThreadId, setChatThreadId] = useState<string>(() => {
     if (typeof window === "undefined") {
       return "";
@@ -253,7 +696,9 @@ function App() {
   const [themeMode, setThemeMode] = useState<ThemeMode>(defaultThemeMode);
   const [mobileTab, setMobileTab] = useState<MobileTab>(defaultMobileTab);
   const [journalSidebarOpen, setJournalSidebarOpen] = useState(false);
+  const [journalDesktopSidebarCollapsed, setJournalDesktopSidebarCollapsed] = useState(false);
   const [feedSidebarOpen, setFeedSidebarOpen] = useState(false);
+  const [feedCreateWorkflowOpen, setFeedCreateWorkflowOpen] = useState(false);
   const [journalItems, setJournalItems] = useState<LibraryItem[]>([]);
   const [feedItems, setFeedItems] = useState<LibraryItem[]>([]);
   const [libraryStatus, setLibraryStatus] = useState("Library idle");
@@ -265,12 +710,49 @@ function App() {
   const [selectedFeedText, setSelectedFeedText] = useState("");
   const [journalDraftText, setJournalDraftText] = useState("");
   const [journalSaveStatus, setJournalSaveStatus] = useState("Journal idle");
+  const [pendingDeleteJournalItem, setPendingDeleteJournalItem] = useState<LibraryItem | null>(null);
+  const [pendingDeleteFeedItem, setPendingDeleteFeedItem] = useState<LibraryItem | null>(null);
+  const [journalTranscribing, setJournalTranscribing] = useState(false);
+  const [journalTranscriptionStatusByPath, setJournalTranscriptionStatusByPath] = useState<
+    Record<string, "idle" | "queued" | "running" | "done" | "error">
+  >({});
   const [isWritingNote, setIsWritingNote] = useState(false);
   const [feedCaptionText, setFeedCaptionText] = useState("");
   const [feedCaptionPath, setFeedCaptionPath] = useState<string>("");
   const [feedEditStatus, setFeedEditStatus] = useState("Feed idle");
+  const [feedDraftsByPath, setFeedDraftsByPath] = useState<Record<string, string>>({});
+  const [feedDraftSourceByPath, setFeedDraftSourceByPath] = useState<Record<string, string>>({});
+  const [feedDraftLoadingByPath, setFeedDraftLoadingByPath] = useState<Record<string, boolean>>({});
+  const [activeFeedCommentPath, setActiveFeedCommentPath] = useState("");
+  const [feedCommentDrafts, setFeedCommentDrafts] = useState<Record<string, string>>({});
+  const [feedCommentStatusByPath, setFeedCommentStatusByPath] = useState<Record<string, string>>(
+    {}
+  );
+  const [submittingFeedCommentPath, setSubmittingFeedCommentPath] = useState("");
+  const [activeWorkflowBotKey, setActiveWorkflowBotKey] = useState<string>("");
+  const [workflowBots, setWorkflowBots] = useState<WorkflowBotMeta[]>([]);
+  const [workflowSettingsByKey, setWorkflowSettingsByKey] = useState<
+    Record<string, FeedWorkflowSettingsItem | undefined>
+  >({});
+  const [workflowSettingsDraftByKey, setWorkflowSettingsDraftByKey] = useState<
+    Record<string, WorkflowSettingsDraft | undefined>
+  >({});
+  const [workflowSettingsStatusByKey, setWorkflowSettingsStatusByKey] = useState<
+    Record<string, string>
+  >({});
+  const [workflowSettingsLoading, setWorkflowSettingsLoading] = useState(false);
+  const [workflowSettingsSavingKey, setWorkflowSettingsSavingKey] = useState("");
+  const [workflowRunStatusByKey, setWorkflowRunStatusByKey] = useState<
+    Record<string, WorkflowRunStatus | undefined>
+  >({});
+  const [workflowTemplateDraft, setWorkflowTemplateDraft] = useState<WorkflowTemplateDraft>(
+    defaultWorkflowTemplateDraft
+  );
+  const [workflowTemplateSubmitting, setWorkflowTemplateSubmitting] = useState(false);
+  const [workflowTemplateStatus, setWorkflowTemplateStatus] = useState("");
   const [recordingHint, setRecordingHint] = useState("Ready to add a journal note, audio, or video.");
   const [mediaPreviewUrl, setMediaPreviewUrl] = useState<string>("");
+  const [mediaPreviewMime, setMediaPreviewMime] = useState<string>("");
   const [mediaPreviewLoading, setMediaPreviewLoading] = useState(false);
   const [postingFeedPath, setPostingFeedPath] = useState<string>("");
   const [feedPostedSectionOpen, setFeedPostedSectionOpen] = useState(false);
@@ -281,10 +763,16 @@ function App() {
   } | null>(null);
   const [aiSetupStatus, setAiSetupStatus] = useState<OpenAiDeviceCodeStatus | null>(null);
   const [aiSetupBusy, setAiSetupBusy] = useState(false);
-  const [pbAuthMessage, setPbAuthMessage] = useState("");
-  const [pbAuthLabel, setPbAuthLabel] = useState("");
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerApiKeyStatus, setProviderApiKeyStatus] = useState("");
+  const [settingsProvider, setSettingsProvider] = useState("");
+  const [settingsModel, setSettingsModel] = useState("");
+  const [settingsTranscriptionEnabled, setSettingsTranscriptionEnabled] = useState(false);
+  const [settingsTranscriptionModel, setSettingsTranscriptionModel] = useState("");
+  const [settingsAvailableTranscriptionModels, setSettingsAvailableTranscriptionModels] = useState<string[]>([]);
+  const [settingsConfigBusy, setSettingsConfigBusy] = useState(false);
+  const [settingsConfigStatus, setSettingsConfigStatus] = useState("");
+  const [settingsConfigLoaded, setSettingsConfigLoaded] = useState(false);
   const [mobileScannerActive, setMobileScannerActive] = useState(() => {
     if (typeof window === "undefined") {
       return false;
@@ -300,21 +788,26 @@ function App() {
     "Scan the desktop QR to connect."
   );
   const [mobileCameraPermissionError, setMobileCameraPermissionError] = useState("");
-  const audioCaptureRef = useRef<HTMLInputElement | null>(null);
-  const videoCaptureRef = useRef<HTMLInputElement | null>(null);
   const autosaveTimerRef = useRef<number | null>(null);
   const journalAutosaveTimerRef = useRef<number | null>(null);
+  const journalStatusTimerRef = useRef<number | null>(null);
+  const feedAutosaveTimersRef = useRef<Record<string, number>>({});
+  const feedDraftLoadingRef = useRef<Record<string, boolean>>({});
   const loadedTextPathRef = useRef<string>("");
   const loadedCaptionPathRef = useRef<string>("");
-  const chatThreadHydratedRef = useRef(false);
+  const activeTranscriptionPollRef = useRef<Record<string, boolean>>({});
+  const selectedJournalPathRef = useRef<string>("");
   const mobileScannerVideoRef = useRef<HTMLVideoElement | null>(null);
   const mobileScannerStreamRef = useRef<MediaStream | null>(null);
   const mobileScannerRafRef = useRef<number | null>(null);
+  const workflowPollAbortRef = useRef<AbortController | null>(null);
 
   // Recording State
   const [isRecording, setIsRecording] = useState(false);
+  const [captureMode, setCaptureMode] = useState<"audio" | "video" | null>(null);
   const [recordingType, setRecordingType] = useState<"audio" | "video" | null>(null);
   const [recordingTime, setRecordingTime] = useState(0);
+  const [videoOrientation, setVideoOrientation] = useState<"vertical" | "horizontal">("vertical");
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState<string>("");
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -324,25 +817,23 @@ function App() {
   const videoPreviewRef = useRef<HTMLVideoElement | null>(null);
   const audioCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const audioCaptureGainRef = useRef<GainNode | null>(null);
+  const audioPcmChunksRef = useRef<Float32Array[]>([]);
+  const audioSampleRateRef = useRef(44_100);
+  const usingWavAudioCaptureRef = useRef(false);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const syntheticAudioVizRef = useRef<boolean>(false);
   const animationFrameRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    selectedJournalPathRef.current = selectedJournalPath;
+  }, [selectedJournalPath]);
 
   // Bluesky Feed State
   const [feedSource, setFeedSource] = useState<"local" | "bluesky">("local");
   const [blueskyFeedItems, setBlueskyFeedItems] = useState<AppBskyFeedDefs.FeedViewPost[]>([]);
   const [blueskyFeedLoading, setBlueskyFeedLoading] = useState(false);
-
-  const pb = useMemo(() => createPocketBaseClient(pbUrl), [pbUrl]);
-
-  useEffect(() => {
-    const label = pocketBaseAuthLabel(pb);
-    setPbAuthLabel(label);
-    if (pb.authStore.isValid) {
-      setPbAuthMessage(label ? `PocketBase signed in as ${label}` : "PocketBase signed in");
-    } else {
-      setPbAuthMessage("PocketBase not signed in");
-    }
-  }, [pb]);
 
   useEffect(() => {
     let cancelled = false;
@@ -352,37 +843,15 @@ function App() {
         setCreds(secureCreds);
         if (secureCreds.handle.trim() && secureCreds.appPassword.trim()) {
           try {
-            const { agent: autoAgent, session: autoSession } = await loginBluesky(secureCreds);
+            const bluesky = await loadBlueskyModule();
+            const { agent: autoAgent, session: autoSession } = await bluesky.loginBluesky(secureCreds);
             if (!cancelled) {
               setAgent(autoAgent);
               setSession(autoSession);
               setAuthMessage(`Signed in as ${autoSession.handle}`);
             }
-            try {
-              const pbSync = await ensurePocketBaseUserFromBluesky(
-                pb,
-                secureCreds.handle,
-                secureCreds.appPassword,
-                autoSession.handle
-              );
-              if (!cancelled) {
-                const label = pocketBaseAuthLabel(pb);
-                setPbAuthLabel(label);
-                setPbAuthMessage(
-                  pbSync.created
-                    ? `PocketBase user provisioned and signed in (${label || pbSync.identity})`
-                    : `PocketBase signed in as ${label || pbSync.identity}`
-                );
-              }
-            } catch (error) {
-              if (!cancelled) {
-                setPbAuthMessage(
-                  `PocketBase auto-login failed (${error instanceof Error ? error.message : String(error)})`
-                );
-              }
-            }
           } catch {
-            // Keep login-gated flow; user can sign in explicitly.
+            // Bluesky login is optional; keep app booting without it.
           }
         }
       }
@@ -403,6 +872,9 @@ function App() {
       }
       if (!cancelled) {
         setSecureStoreReady(true);
+        if (isDesktopClient) {
+          invokeDesktopCommand("show_main_window").catch(() => { });
+        }
       }
     })();
     return () => {
@@ -441,9 +913,6 @@ function App() {
     }
     const normalized = gatewayBaseUrl.trim().replace(/\/+$/, "");
     window.localStorage.setItem(CHAT_GATEWAY_BASE_URL_STORAGE_KEY, normalized);
-    if (normalized) {
-      setPbUrl(derivePocketBaseUrlFromGateway(normalized));
-    }
   }, [gatewayBaseUrl]);
 
   useEffect(() => {
@@ -489,14 +958,6 @@ function App() {
   }, [isDesktopLayout, mobileTab]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    const paths = Object.keys(postedPaths);
-    window.localStorage.setItem(FEED_POSTED_PATHS_STORAGE_KEY, JSON.stringify(paths));
-  }, [postedPaths]);
-
-  useEffect(() => {
     return () => {
       if (mediaPreviewUrl) {
         URL.revokeObjectURL(mediaPreviewUrl);
@@ -504,32 +965,92 @@ function App() {
       if (autosaveTimerRef.current) {
         window.clearTimeout(autosaveTimerRef.current);
       }
+      if (journalStatusTimerRef.current) {
+        window.clearTimeout(journalStatusTimerRef.current);
+      }
+      workflowPollAbortRef.current?.abort();
     };
   }, [mediaPreviewUrl]);
 
+  function holdJournalStatus(message: string, holdMs: number = 2500) {
+    setJournalSaveStatus(message);
+    if (journalStatusTimerRef.current) {
+      window.clearTimeout(journalStatusTimerRef.current);
+    }
+    journalStatusTimerRef.current = window.setTimeout(() => {
+      setJournalSaveStatus((current) => (current === message ? "Journal idle" : current));
+    }, holdMs);
+  }
+
   async function refreshLibrary(scope: "journal" | "feed" | "all") {
-    let token = chatGatewayToken.trim();
+    const refreshLocalJournalLibrary = async () => {
+      const entries = await listJournals(300, 0);
+      const items: LibraryItem[] = entries.map((entry) => ({
+        id: entry.id,
+        path: localJournalPath(entry.id),
+        title: entry.title || "Journal entry",
+        kind: entry.kind,
+        sizeBytes: entry.content?.length ?? 0,
+        modifiedAt: Math.floor(
+          (Number.isFinite(Date.parse(entry.updatedAt))
+            ? Date.parse(entry.updatedAt)
+            : Date.now()) / 1000
+        ),
+        previewText: entry.content?.slice(0, 280) || "",
+        mediaUrl: null,
+        editableText: entry.kind === "text",
+        scope: "journal"
+      }));
+      setJournalItems(items);
+      if (items.length > 0 && !selectedJournalPath) {
+        setSelectedJournalPath(items[0].path);
+      }
+    };
+
+    const refreshGatewayJournalLibrary = async (bearerToken: string) => {
+      const items = (await listLibraryItems("journal", bearerToken || undefined, gatewayBaseUrl)).filter((item) => {
+        const path = item.path.toLowerCase();
+        if (!path.startsWith("journals/")) {
+          return false;
+        }
+        if (path.startsWith("journals/media/")) {
+          return true;
+        }
+        if (item.kind !== "text") {
+          return false;
+        }
+        if (path.startsWith("journals/text/transcript/") || path.startsWith("journals/text/transcriptions/")) {
+          return false;
+        }
+        return path.startsWith("journals/text/") && (path.endsWith(".txt") || path.endsWith(".md"));
+      });
+      setJournalItems(items);
+      if (items.length > 0 && !selectedJournalPath) {
+        setSelectedJournalPath(items[0].path);
+      }
+    };
+
+    let token = normalizeGatewayToken(chatGatewayToken);
     if (!token && isDesktopClient) {
-      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+      token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
     }
     try {
       if (scope === "journal" || scope === "all") {
-        const items = (await listLibraryItems("journal", token || undefined, gatewayBaseUrl)).filter((item) => {
-          const path = item.path.toLowerCase();
-          if (!path.startsWith("journals/")) {
-            return false;
+        if (isDesktopClient) {
+          try {
+            await refreshGatewayJournalLibrary(token);
+          } catch (gatewayError) {
+            try {
+              await refreshLocalJournalLibrary();
+            } catch (localError) {
+              if (isMissingDesktopCommand(localError, "list_journals")) {
+                throw gatewayError;
+              }
+              throw localError;
+            }
           }
-          if (path.startsWith("journals/media/")) {
-            return true;
-          }
-          if (item.kind !== "text") {
-            return false;
-          }
-          return path.startsWith("journals/text/") && path.endsWith(".txt");
-        });
-        setJournalItems(items);
-        if (items.length > 0 && !selectedJournalPath) {
-          setSelectedJournalPath(items[0].path);
+        } else {
+          await refreshGatewayJournalLibrary(token);
         }
       }
       if (scope === "feed" || scope === "all") {
@@ -544,9 +1065,6 @@ function App() {
           return true;
         });
         setFeedItems(items);
-        if (items.length > 0 && !selectedFeedPath) {
-          setSelectedFeedPath(items[0].path);
-        }
       }
       setLibraryStatus(`Library refreshed (${scope})`);
     } catch (error) {
@@ -566,33 +1084,62 @@ function App() {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
     if (!token) {
-      setRecordingHint(
-        isDesktopClient
-          ? "Upload blocked (desktop gateway token not ready). Wait 2-3s or restart app."
-          : "Upload blocked (gateway token missing). Pair mobile with desktop QR."
-      );
-      return;
+      if (isDesktopClient) {
+        token = "desktop-local";
+      } else {
+        setRecordingHint("Upload blocked (gateway token missing). Pair mobile with desktop QR.");
+        return;
+      }
     }
     setRecordingHint(`Uploading ${file.name}...`);
     try {
-      const result = await uploadMediaViaGateway(
-        file,
-        {
-          kind,
-          filename: file.name || `${kind}-${Date.now()}`
-        },
-        token,
-        gatewayBaseUrl
-      );
-      setRecordingHint(
-        `Saved ${kind} to workspace: ${String(result.path || file.name)} (${formatBytes(
-          Number(result.bytes || file.size || 0)
-        )})`
-      );
-      await refreshLibrary("journal");
-      const uploadedPath = String(result.path || "").trim();
-      if (uploadedPath) {
-        setSelectedJournalPath(uploadedPath);
+      try {
+        const result = await uploadMediaViaGateway(
+          file,
+          {
+            kind,
+            filename: file.name || `${kind}-${Date.now()}`
+          },
+          token,
+          gatewayBaseUrl
+        );
+        setRecordingHint(
+          `Saved ${kind} to workspace: ${String(result.path || file.name)} (${formatBytes(
+            Number(result.bytes || file.size || 0)
+          )})`
+        );
+        await refreshLibrary("journal");
+        const uploadedPath = String(result.path || "").trim();
+        if (uploadedPath) {
+          setSelectedJournalPath(uploadedPath);
+          const transcriptionStatus = String(result?.transcription?.status || "").toLowerCase();
+          if (kind === "audio" && (transcriptionStatus === "queued" || transcriptionStatus === "running")) {
+            setJournalTranscriptionStatusByPath((prev) => ({
+              ...prev,
+              [uploadedPath]: transcriptionStatus as "queued" | "running"
+            }));
+            setJournalSaveStatus("Transcription queued...");
+            void waitForTranscriptForMedia(uploadedPath, token || undefined);
+          }
+        }
+      } catch (gatewayError) {
+        if (!isDesktopClient) {
+          throw gatewayError;
+        }
+        try {
+          const dataB64 = await blobToBase64(file);
+          const saved = await saveJournalMedia(kind, file.name || `${kind}-${Date.now()}`, dataB64, "Journal entry");
+          setRecordingHint(
+            `Saved ${kind} locally: ${file.name || `${kind}-${Date.now()}`} (${formatBytes(file.size || 0)})`
+          );
+          await refreshLibrary("journal");
+          setSelectedJournalPath(localJournalPath(saved.id));
+        } catch (localError) {
+          if (isMissingDesktopCommand(localError, "save_journal_media")) {
+            throw gatewayError;
+          }
+          throw localError;
+        }
       }
     } catch (error) {
       setRecordingHint(
@@ -603,14 +1150,14 @@ function App() {
 
   async function saveJournalTextDraft() {
     const content = journalDraftText.trim();
-    if (!content) {
+    if (!content && !selectedJournalItem) {
       setJournalSaveStatus("Write something first");
       return;
     }
 
-    let token = chatGatewayToken.trim();
+    let token = normalizeGatewayToken(chatGatewayToken);
     if (!token && isDesktopClient) {
-      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+      token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
     }
     if (!token && !isDesktopClient) {
       setJournalSaveStatus("Save blocked (gateway token missing).");
@@ -619,26 +1166,84 @@ function App() {
     setJournalSaveStatus("Saving journal note...");
     try {
       let resultPath = "";
+      let nextSelectedPath = selectedJournalPath;
       if (selectedJournalItem && selectedJournalItem.kind === "text") {
-        await saveLibraryText(selectedJournalItem.path, content, token, gatewayBaseUrl);
-        resultPath = selectedJournalItem.path;
+        const localId = localJournalIdFromPath(selectedJournalItem.path);
+        if (localId) {
+          try {
+            const updated = await updateJournalText(localId, content);
+            resultPath = localJournalPath(updated.id);
+            nextSelectedPath = resultPath;
+          } catch (localError) {
+            if (!isMissingDesktopCommand(localError, "update_journal_text")) {
+              throw localError;
+            }
+            const result = await createJournalTextViaGateway(
+              "Journal entry",
+              content,
+              token || undefined,
+              gatewayBaseUrl
+            );
+            resultPath = String(result.path || "");
+            nextSelectedPath = resultPath;
+          }
+        } else {
+          try {
+            await saveLibraryText(selectedJournalItem.path, content, token || undefined, gatewayBaseUrl);
+            resultPath = selectedJournalItem.path;
+            nextSelectedPath = selectedJournalItem.path;
+          } catch (gatewayError) {
+            if (!isDesktopClient) {
+              throw gatewayError;
+            }
+            try {
+              const created = await saveJournalText("Journal entry", content);
+              resultPath = localJournalPath(created.id);
+              nextSelectedPath = resultPath;
+            } catch (localError) {
+              if (isMissingDesktopCommand(localError, "save_journal_text")) {
+                throw gatewayError;
+              }
+              throw localError;
+            }
+          }
+        }
       } else if (selectedJournalItem && (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video")) {
-        const captionPath = sidecarCaptionPath(selectedJournalItem);
-        await saveLibraryText(captionPath, content, token, gatewayBaseUrl);
-        resultPath = captionPath;
+        const draftPath =
+          loadedTextPathRef.current.trim() || journalTranscriptPathForMedia(selectedJournalItem);
+        await saveLibraryText(draftPath, content, token || undefined, gatewayBaseUrl);
+        resultPath = draftPath;
+        nextSelectedPath = selectedJournalItem.path;
       } else {
-        const result = await createJournalTextViaGateway(
-          "Journal entry",
-          content,
-          token,
-          gatewayBaseUrl
-        );
-        resultPath = String(result.path || "");
+        try {
+          const result = await createJournalTextViaGateway(
+            "Journal entry",
+            content,
+            token || undefined,
+            gatewayBaseUrl
+          );
+          resultPath = String(result.path || "");
+          nextSelectedPath = resultPath;
+        } catch (gatewayError) {
+          if (!isDesktopClient) {
+            throw gatewayError;
+          }
+          try {
+            const created = await saveJournalText("Journal entry", content);
+            resultPath = localJournalPath(created.id);
+            nextSelectedPath = resultPath;
+          } catch (localError) {
+            if (isMissingDesktopCommand(localError, "save_journal_text")) {
+              throw gatewayError;
+            }
+            throw localError;
+          }
+        }
       }
-      setJournalSaveStatus(`Saved`);
-      if (!selectedJournalItem) {
-        await refreshLibrary("journal");
-        if (resultPath) setSelectedJournalPath(resultPath);
+      holdJournalStatus("Saved");
+      await refreshLibrary("journal");
+      if (nextSelectedPath) {
+        setSelectedJournalPath(nextSelectedPath);
       }
     } catch (error) {
       setJournalSaveStatus(
@@ -647,8 +1252,247 @@ function App() {
     }
   }
 
+  async function deleteJournalItem(item: LibraryItem) {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token) {
+      if (isDesktopClient) {
+        token = "desktop-local";
+      } else {
+        setJournalSaveStatus("Delete blocked (gateway token missing).");
+        return;
+      }
+    }
+
+    setJournalSaveStatus(`Deleting ${item.title}...`);
+    try {
+      await deleteLibraryItem(item.path, token || undefined, gatewayBaseUrl);
+      setPendingDeleteJournalItem(null);
+      if (selectedJournalPath === item.path) {
+        setSelectedJournalPath("");
+        setSelectedJournalItem(null);
+        setSelectedJournalText("");
+        setJournalDraftText("");
+        loadedTextPathRef.current = "";
+      }
+      await refreshLibrary("journal");
+      setJournalSaveStatus("Deleted");
+    } catch (error) {
+      setJournalSaveStatus(
+        `Delete failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function deleteFeedItem(item: LibraryItem) {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token) {
+      if (isDesktopClient) {
+        token = "desktop-local";
+      } else {
+        setFeedEditStatus("Delete blocked (gateway token missing).");
+        return;
+      }
+    }
+
+    setFeedEditStatus(`Deleting ${item.title}...`);
+    try {
+      await deleteLibraryItem(item.path, token || undefined, gatewayBaseUrl);
+      setPendingDeleteFeedItem(null);
+      setFeedItems((prev) => prev.filter((entry) => entry.path !== item.path));
+      setFeedDraftsByPath((prev) =>
+        Object.fromEntries(Object.entries(prev).filter(([path]) => path !== item.path))
+      );
+      setFeedDraftSourceByPath((prev) =>
+        Object.fromEntries(Object.entries(prev).filter(([path]) => path !== item.path))
+      );
+      setFeedDraftLoadingByPath((prev) =>
+        Object.fromEntries(Object.entries(prev).filter(([path]) => path !== item.path))
+      );
+      if (selectedFeedPath === item.path) {
+        setSelectedFeedPath("");
+        setSelectedFeedItem(null);
+        setSelectedFeedText("");
+        setFeedCaptionPath("");
+        setFeedCaptionText("");
+      }
+      setFeedEditStatus("Deleted");
+    } catch (error) {
+      setFeedEditStatus(
+        `Delete failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function waitForTranscriptForMedia(
+    mediaPath: string,
+    token: string | undefined,
+    {
+      maxAttempts = 45,
+      pollMs = 2000
+    }: { maxAttempts?: number; pollMs?: number } = {}
+  ) {
+    const normalizedPath = mediaPath.trim();
+    if (!normalizedPath) {
+      return;
+    }
+    if (activeTranscriptionPollRef.current[normalizedPath]) {
+      return;
+    }
+    activeTranscriptionPollRef.current[normalizedPath] = true;
+    const isStillSelected = () => selectedJournalPathRef.current === mediaPath;
+    try {
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        try {
+          const statusResult = await getJournalTranscriptionStatus(
+            mediaPath,
+            token,
+            gatewayBaseUrl
+          );
+          const status = String(statusResult.status || "").toLowerCase();
+          if (status === "done") {
+            setJournalTranscriptionStatusByPath((prev) => ({
+              ...prev,
+              [normalizedPath]: "done"
+            }));
+            const transcriptPath = String(statusResult.path || "");
+            const transcriptText = String(statusResult.text || "");
+            if (isStillSelected()) {
+              loadedTextPathRef.current = transcriptPath;
+              setSelectedJournalText(transcriptText);
+              setJournalDraftText(transcriptText);
+              setJournalSaveStatus("Transcription ready");
+              setJournalTranscribing(false);
+            }
+            return;
+          }
+          if (status === "error") {
+            setJournalTranscriptionStatusByPath((prev) => ({
+              ...prev,
+              [normalizedPath]: "error"
+            }));
+            if (isStillSelected()) {
+              setJournalTranscribing(false);
+              setJournalSaveStatus(
+                `Transcription failed (${String(statusResult.error || "unknown error")})`
+              );
+            }
+            return;
+          }
+          if (status === "queued" || status === "running") {
+            setJournalTranscriptionStatusByPath((prev) => ({
+              ...prev,
+              [normalizedPath]: status as "queued" | "running"
+            }));
+            if (isStillSelected()) {
+              setJournalTranscribing(true);
+              setJournalSaveStatus(
+                status === "queued" ? "Transcription queued..." : "Transcription in progress..."
+              );
+            }
+          } else {
+            setJournalTranscriptionStatusByPath((prev) => ({
+              ...prev,
+              [normalizedPath]: "idle"
+            }));
+            if (isStillSelected()) {
+              setJournalTranscribing(false);
+            }
+            return;
+          }
+        } catch {
+          if (isStillSelected()) {
+            setJournalTranscribing(false);
+          }
+          return;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, pollMs));
+      }
+      if (isStillSelected()) {
+        setJournalSaveStatus("Transcription still in queue. Check back in a moment.");
+      }
+    } finally {
+      delete activeTranscriptionPollRef.current[normalizedPath];
+    }
+  }
+
+  async function transcribeSelectedJournalMedia() {
+    if (!selectedJournalItem || selectedJournalItem.kind !== "audio") {
+      return;
+    }
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      setJournalSaveStatus("Transcription blocked (gateway token missing).");
+      return;
+    }
+
+    setJournalTranscribing(true);
+    setJournalTranscriptionStatusByPath((prev) => ({
+      ...prev,
+      [selectedJournalItem.path]: "queued"
+    }));
+    setJournalSaveStatus("Queueing transcription...");
+    try {
+      const result = await transcribeJournalMedia(
+        selectedJournalItem.path,
+        token || undefined,
+        gatewayBaseUrl
+      );
+      const status = String(result.status || "").toLowerCase();
+      if (status === "done") {
+        const transcriptPath = String(result.path || journalTranscriptPathForMedia(selectedJournalItem));
+        const transcriptText = String(result.text || "");
+        setJournalTranscriptionStatusByPath((prev) => ({
+          ...prev,
+          [selectedJournalItem.path]: "done"
+        }));
+        loadedTextPathRef.current = transcriptPath;
+        setSelectedJournalText(transcriptText);
+        setJournalDraftText(transcriptText);
+        setJournalSaveStatus("Transcription ready");
+        setJournalTranscribing(false);
+        return;
+      }
+      if (status === "error") {
+        setJournalTranscriptionStatusByPath((prev) => ({
+          ...prev,
+          [selectedJournalItem.path]: "error"
+        }));
+        throw new Error(String(result.error || "unknown transcription error"));
+      }
+      if (status === "queued" || status === "running") {
+        setJournalTranscriptionStatusByPath((prev) => ({
+          ...prev,
+          [selectedJournalItem.path]: status as "queued" | "running"
+        }));
+      }
+      await waitForTranscriptForMedia(
+        selectedJournalItem.path,
+        token || undefined
+      );
+    } catch (error) {
+      setJournalTranscriptionStatusByPath((prev) => ({
+        ...prev,
+        [selectedJournalItem.path]: "error"
+      }));
+      setJournalSaveStatus(
+        `Transcription failed (${error instanceof Error ? error.message : String(error)})`
+      );
+      setJournalTranscribing(false);
+    }
+  }
+
   async function openLibraryItem(item: LibraryItem, scope: "journal" | "feed") {
     if (scope === "journal") {
+      setJournalTranscribing(false);
       setSelectedJournalItem(item);
       setSelectedJournalPath(item.path);
     } else {
@@ -659,7 +1503,10 @@ function App() {
     const token = chatGatewayToken.trim() || undefined;
     if (item.kind === "text") {
       try {
-        const content = await readLibraryText(item.path, token, gatewayBaseUrl);
+        const localId = localJournalIdFromPath(item.path);
+        const content = localId
+          ? (await getJournal(localId)).content || ""
+          : await readLibraryText(item.path, token, gatewayBaseUrl);
         if (scope === "journal") {
           loadedTextPathRef.current = item.path;
           setSelectedJournalText(content);
@@ -680,30 +1527,116 @@ function App() {
         }
       }
     } else if (item.kind === "video" || item.kind === "audio") {
-      const captionPath = sidecarCaptionPath(item);
-      try {
-        const content = await readLibraryText(captionPath, token, gatewayBaseUrl);
-        if (scope === "feed") {
-          loadedCaptionPathRef.current = captionPath;
-          setFeedCaptionPath(captionPath);
-          setFeedCaptionText(content);
-        } else {
-          loadedTextPathRef.current = captionPath;
-          setSelectedJournalText(content);
-          setJournalDraftText(content);
+      const transcriptPath = journalTranscriptPathForMedia(item);
+      const legacyTranscriptPath = legacyJournalTranscriptPathForMedia(item);
+      const legacyCaptionPath = sidecarCaptionPath(item);
+      const candidatePaths =
+        scope === "journal"
+          ? [transcriptPath, legacyTranscriptPath, legacyCaptionPath]
+          : [legacyCaptionPath];
+
+      let loadedContent = "";
+      let loadedPath = candidatePaths[0];
+      let hasLoadedPath = false;
+      for (const candidatePath of candidatePaths) {
+        try {
+          loadedContent = await readLibraryText(candidatePath, token, gatewayBaseUrl);
+          loadedPath = candidatePath;
+          hasLoadedPath = true;
+          break;
+        } catch {
+          // Try next candidate path.
         }
-      } catch {
-        if (scope === "feed") {
-          loadedCaptionPathRef.current = captionPath;
-          setFeedCaptionPath(captionPath);
-          setFeedCaptionText(item.previewText || item.title || "");
+      }
+
+      if (scope === "feed") {
+        loadedCaptionPathRef.current = loadedPath;
+        setFeedCaptionPath(loadedPath);
+        if (hasLoadedPath) {
+          setFeedCaptionText(loadedContent);
         } else {
-          loadedTextPathRef.current = captionPath;
+          setFeedCaptionText(item.previewText || item.title || "");
+        }
+      } else {
+        loadedTextPathRef.current = loadedPath;
+        if (hasLoadedPath) {
+          setSelectedJournalText(loadedContent);
+          setJournalDraftText(loadedContent);
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [item.path]: "done"
+          }));
+          setJournalTranscribing(false);
+        } else {
           setSelectedJournalText("");
           setJournalDraftText("");
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [item.path]: prev[item.path] || "idle"
+          }));
+        }
+
+        try {
+          const statusResult = await getJournalTranscriptionStatus(item.path, token, gatewayBaseUrl);
+          const status = String(statusResult.status || "").toLowerCase();
+          if (status === "done") {
+            setJournalTranscriptionStatusByPath((prev) => ({
+              ...prev,
+              [item.path]: "done"
+            }));
+            const transcriptText = String(statusResult.text || "");
+            const transcriptPath = String(statusResult.path || loadedPath);
+            if (!hasLoadedPath && transcriptText.trim()) {
+              loadedTextPathRef.current = transcriptPath;
+              setSelectedJournalText(transcriptText);
+              setJournalDraftText(transcriptText);
+            }
+            setJournalTranscribing(false);
+          } else if (status === "queued" || status === "running") {
+            setJournalTranscriptionStatusByPath((prev) => ({
+              ...prev,
+              [item.path]: status as "queued" | "running"
+            }));
+            setJournalTranscribing(true);
+            setJournalSaveStatus(
+              status === "queued" ? "Transcription queued..." : "Transcription in progress..."
+            );
+            void waitForTranscriptForMedia(item.path, token);
+          } else if (status === "error") {
+            setJournalTranscriptionStatusByPath((prev) => ({
+              ...prev,
+              [item.path]: "error"
+            }));
+            setJournalTranscribing(false);
+          } else {
+            setJournalTranscriptionStatusByPath((prev) => ({
+              ...prev,
+              [item.path]: prev[item.path] || "idle"
+            }));
+            setJournalTranscribing(false);
+          }
+        } catch {
+          setJournalTranscribing(false);
         }
       }
     }
+  }
+
+  function resetJournalSession() {
+    setJournalDraftText("");
+    setSelectedJournalText("");
+    setSelectedJournalItem(null);
+    setSelectedJournalPath("");
+    loadedTextPathRef.current = "";
+    setJournalTranscribing(false);
+    setJournalSaveStatus("Journal idle");
+    setMediaPreviewUrl((prev) => {
+      if (prev) {
+        URL.revokeObjectURL(prev);
+      }
+      return "";
+    });
+    setMediaPreviewMime("");
   }
 
   async function loadMediaPreview(item: LibraryItem | null) {
@@ -713,6 +1646,7 @@ function App() {
         URL.revokeObjectURL(mediaPreviewUrl);
         setMediaPreviewUrl("");
       }
+      setMediaPreviewMime("");
       return;
     }
     if (!(item.kind === "audio" || item.kind === "video" || item.kind === "image")) {
@@ -720,15 +1654,34 @@ function App() {
     }
     setMediaPreviewLoading(true);
     try {
-      const token = chatGatewayToken.trim() || undefined;
-      const mediaUrl = resolveGatewayResourceUrl(item.mediaUrl, gatewayBaseUrl);
-      const res = await fetch(mediaUrl, {
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined
-      });
-      if (!res.ok) {
-        throw new Error(`Preview load failed (${res.status})`);
+      let blob: Blob;
+      const localId = localJournalIdFromPath(item.path);
+      if (localId) {
+        const journal = await getJournal(localId);
+        const filePath = String(journal.filePath || "").trim();
+        if (!filePath) {
+          throw new Error("Local media file path missing");
+        }
+        const { readFile } = await import("@tauri-apps/plugin-fs");
+        const bytes = await readFile(filePath);
+        blob = new Blob([bytes], { type: inferMediaMimeType(filePath, item.kind) });
+      } else {
+        const token = chatGatewayToken.trim() || undefined;
+        const mediaUrl = resolveGatewayResourceUrl(item.mediaUrl || "", gatewayBaseUrl);
+        const res = await fetch(mediaUrl, {
+          headers: token ? { Authorization: `Bearer ${token}` } : undefined
+        });
+        if (!res.ok) {
+          throw new Error(`Preview load failed (${res.status})`);
+        }
+        const fetchedBlob = await res.blob();
+        const resolvedType = inferMediaMimeType(item.path, item.kind, fetchedBlob.type);
+        blob =
+          resolvedType === fetchedBlob.type
+            ? fetchedBlob
+            : new Blob([fetchedBlob], { type: resolvedType });
       }
-      const blob = await res.blob();
+      setMediaPreviewMime(blob.type || inferMediaMimeType(item.path, item.kind));
       const nextUrl = URL.createObjectURL(blob);
       setMediaPreviewUrl((prev) => {
         if (prev) {
@@ -737,16 +1690,97 @@ function App() {
         return nextUrl;
       });
     } catch (error) {
-      setFeedEditStatus(
+      setJournalSaveStatus(
         `Preview unavailable (${error instanceof Error ? error.message : String(error)})`
       );
       if (mediaPreviewUrl) {
         URL.revokeObjectURL(mediaPreviewUrl);
         setMediaPreviewUrl("");
       }
+      setMediaPreviewMime("");
     } finally {
       setMediaPreviewLoading(false);
     }
+  }
+
+  async function ensureFeedDraftLoaded(item: LibraryItem) {
+    if (!(item.kind === "text" || item.kind === "audio" || item.kind === "video")) {
+      return;
+    }
+    if (feedDraftSourceByPath[item.path] || feedDraftLoadingRef.current[item.path]) {
+      return;
+    }
+
+    feedDraftLoadingRef.current[item.path] = true;
+    setFeedDraftLoadingByPath((prev) => ({ ...prev, [item.path]: true }));
+
+    const token = chatGatewayToken.trim() || undefined;
+    try {
+      if (item.kind === "text") {
+        const content = await readLibraryText(item.path, token, gatewayBaseUrl);
+        setFeedDraftsByPath((prev) => ({ ...prev, [item.path]: content }));
+        setFeedDraftSourceByPath((prev) => ({ ...prev, [item.path]: item.path }));
+        return;
+      }
+
+      const captionPath = sidecarCaptionPath(item);
+      let content = item.previewText || item.title || "";
+      let sourcePath = captionPath;
+      try {
+        content = await readLibraryText(captionPath, token, gatewayBaseUrl);
+      } catch {
+        // Use inline preview text when no caption sidecar exists yet.
+      }
+      setFeedDraftsByPath((prev) => ({ ...prev, [item.path]: content }));
+      setFeedDraftSourceByPath((prev) => ({ ...prev, [item.path]: sourcePath }));
+    } catch (error) {
+      setFeedDraftsByPath((prev) => ({
+        ...prev,
+        [item.path]: item.previewText || item.title || ""
+      }));
+      setFeedEditStatus(
+        `Feed load failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      delete feedDraftLoadingRef.current[item.path];
+      setFeedDraftLoadingByPath((prev) => ({ ...prev, [item.path]: false }));
+    }
+  }
+
+  function scheduleFeedDraftSave(item: LibraryItem, nextValue: string) {
+    if (!(item.kind === "text" || item.kind === "audio" || item.kind === "video")) {
+      return;
+    }
+    const savePath = item.kind === "text" ? item.path : feedDraftSourceByPath[item.path] || sidecarCaptionPath(item);
+    if (!savePath) {
+      return;
+    }
+    const existingTimer = feedAutosaveTimersRef.current[item.path];
+    if (existingTimer) {
+      window.clearTimeout(existingTimer);
+    }
+    feedAutosaveTimersRef.current[item.path] = window.setTimeout(async () => {
+      try {
+        const token = chatGatewayToken.trim() || undefined;
+        await saveLibraryText(savePath, nextValue, token, gatewayBaseUrl);
+        setFeedEditStatus(`Autosaved ${savePath}`);
+      } catch (error) {
+        setFeedEditStatus(
+          `Autosave failed (${error instanceof Error ? error.message : String(error)})`
+        );
+      } finally {
+        delete feedAutosaveTimersRef.current[item.path];
+      }
+    }, 700);
+  }
+
+  function updateFeedDraft(item: LibraryItem, nextValue: string) {
+    setFeedDraftsByPath((prev) => ({ ...prev, [item.path]: nextValue }));
+    setFeedDraftSourceByPath((prev) => ({
+      ...prev,
+      [item.path]: item.kind === "text" ? item.path : prev[item.path] || sidecarCaptionPath(item)
+    }));
+    scheduleFeedDraftSave(item, nextValue);
   }
 
   async function archivePostedFeedSource(sourcePath: string, token?: string) {
@@ -774,12 +1808,474 @@ function App() {
     }
   }
 
+  function toggleFeedCommentComposer(path: string) {
+    setActiveFeedCommentPath((current) => (current === path ? "" : path));
+  }
+
+  async function loadFeedWorkflowSettings() {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      return;
+    }
+
+    setWorkflowSettingsLoading(true);
+    try {
+      const items = await listFeedWorkflowSettings(token || undefined, gatewayBaseUrl);
+      const byKey: Record<string, FeedWorkflowSettingsItem | undefined> = {};
+      const drafts: Record<string, WorkflowSettingsDraft | undefined> = {};
+      const bots: WorkflowBotMeta[] = [];
+      for (const item of items) {
+        const key = item.workflowKey.trim();
+        if (!key) {
+          continue;
+        }
+        byKey[key] = item;
+        drafts[key] = workflowSettingsDraftFromItem(item);
+        bots.push(workflowBotMetaFromSettings(item));
+      }
+
+      bots.sort((a, b) => a.name.localeCompare(b.name));
+      setWorkflowBots(bots);
+      setWorkflowSettingsByKey(byKey);
+      setWorkflowSettingsDraftByKey(drafts);
+      if (activeWorkflowBotKey && !byKey[activeWorkflowBotKey]) {
+        setActiveWorkflowBotKey("");
+      }
+      void loadWorkflowRunStatuses(bots);
+    } catch (error) {
+      setFeedEditStatus(
+        `Workflow settings unavailable (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setWorkflowSettingsLoading(false);
+    }
+  }
+
+  async function loadWorkflowRunStatuses(targetBots?: WorkflowBotMeta[]) {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      return;
+    }
+
+    const bots = targetBots ?? workflowBots;
+    if (!bots.length) {
+      setWorkflowRunStatusByKey({});
+      return;
+    }
+
+    const next: Record<string, WorkflowRunStatus | undefined> = {};
+
+    await Promise.all(
+      bots.map(async (bot) => {
+        try {
+          const messages = await listClawChatMessages(
+            `workflow:${bot.key}`,
+            token || undefined,
+            gatewayBaseUrl
+          );
+          next[bot.key] = parseWorkflowRunStatus(bot, messages);
+        } catch {
+          next[bot.key] = undefined;
+        }
+      })
+    );
+
+    let shouldRefreshFeed = false;
+    for (const bot of bots) {
+      const prevStatus = workflowRunStatusByKey[bot.key]?.status;
+      const nextStatus = next[bot.key]?.status;
+      if (
+        (prevStatus === "pending" || prevStatus === "processing") &&
+        (nextStatus === "done" || nextStatus === "error")
+      ) {
+        shouldRefreshFeed = true;
+      }
+    }
+    setWorkflowRunStatusByKey(next);
+    if (shouldRefreshFeed) {
+      void refreshLibrary("feed");
+    }
+  }
+
+  async function triggerManualWorkflowRun(botKey: string) {
+    const bot = workflowBots.find((item) => item.key === botKey) || workflowBotByKey(botKey);
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      setFeedEditStatus("Run blocked (gateway token missing).");
+      return;
+    }
+
+    setFeedEditStatus(`Queueing ${bot.name} run...`);
+    try {
+      const result = await runFeedWorkflowNow(botKey, token || undefined, gatewayBaseUrl);
+      setFeedEditStatus(`${result.workflowBot || bot.name} run queued`);
+      void loadWorkflowRunStatuses();
+    } catch (error) {
+      setFeedEditStatus(
+        `Run failed to queue (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  function openWorkflowSettingsForBot(botKey: string) {
+    setFeedSidebarOpen(false);
+    setFeedCreateWorkflowOpen(false);
+    setActiveWorkflowBotKey(botKey);
+    setFeedEditStatus("Feed idle");
+    if (!workflowSettingsByKey[botKey]) {
+      void loadFeedWorkflowSettings();
+    }
+  }
+
+  function openWorkflowTemplateForm() {
+    setFeedSidebarOpen(false);
+    setActiveWorkflowBotKey("");
+    setFeedCreateWorkflowOpen(true);
+    setWorkflowTemplateStatus("");
+  }
+
+  async function saveWorkflowSettings(botKey: string) {
+    const bot = workflowBots.find((item) => item.key === botKey) || workflowBotByKey(botKey);
+    const draft = workflowSettingsDraftByKey[botKey];
+    if (!draft) {
+      return;
+    }
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      setWorkflowSettingsStatusByKey((prev) => ({
+        ...prev,
+        [botKey]: "Save blocked (gateway token missing)."
+      }));
+      return;
+    }
+
+    setWorkflowSettingsSavingKey(botKey);
+    setWorkflowSettingsStatusByKey((prev) => ({
+      ...prev,
+      [botKey]: "Saving workflow settings..."
+    }));
+    try {
+      const result = await updateFeedWorkflowSettings(
+        {
+          workflowKey: botKey,
+          mode: draft.mode,
+          days: draft.days,
+          randomCount: draft.randomCount,
+          scheduleEnabled: draft.scheduleEnabled,
+          scheduleCron: draft.scheduleCron.trim(),
+          scheduleTz: draft.scheduleTz.trim(),
+          prompt: draft.prompt.trim() || undefined
+        },
+        token || undefined,
+        gatewayBaseUrl
+      );
+      const item = result.item;
+      setWorkflowSettingsByKey((prev) => ({ ...prev, [botKey]: item }));
+      setWorkflowSettingsDraftByKey((prev) => ({
+        ...prev,
+        [botKey]: workflowSettingsDraftFromItem(item)
+      }));
+      setWorkflowSettingsStatusByKey((prev) => ({
+        ...prev,
+        [botKey]: result.runQueued
+          ? `Saved ${bot.name} settings and queued a run`
+          : `Saved ${bot.name} settings`
+      }));
+      setFeedEditStatus(
+        result.runQueued
+          ? `${bot.name} run queued with updated settings`
+          : `${bot.name} settings saved`
+      );
+      void loadWorkflowRunStatuses();
+      void refreshLibrary("feed");
+      window.setTimeout(() => {
+        void refreshLibrary("feed");
+      }, 2000);
+    } catch (error) {
+      setWorkflowSettingsStatusByKey((prev) => ({
+        ...prev,
+        [botKey]: `Save failed (${error instanceof Error ? error.message : String(error)})`
+      }));
+    } finally {
+      setWorkflowSettingsSavingKey("");
+    }
+  }
+
+  async function submitWorkflowTemplateCreate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const draft = workflowTemplateDraft;
+    if (!draft.name.trim()) {
+      setWorkflowTemplateStatus("Workflow name is required.");
+      return;
+    }
+
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      setWorkflowTemplateStatus("Create blocked (gateway token missing).");
+      return;
+    }
+
+    setWorkflowTemplateSubmitting(true);
+    setWorkflowTemplateStatus("Creating workflow...");
+    try {
+      const result = await createFeedWorkflowTemplate(
+        {
+          name: draft.name.trim(),
+          botName: draft.botName.trim() || undefined,
+          sourceKind: draft.sourceKind,
+          prompt: draft.prompt.trim() || undefined,
+          mode: draft.mode,
+          days: draft.days,
+          randomCount: draft.randomCount,
+          scheduleEnabled: draft.scheduleEnabled,
+          scheduleCron: draft.scheduleCron.trim() || undefined,
+          scheduleTz: draft.scheduleTz.trim() || undefined,
+          runNow: draft.runNow
+        },
+        token || undefined,
+        gatewayBaseUrl
+      );
+      if (result.queued && result.threadId && result.messageId) {
+        const botLabel = result.workflowBot || result.workflowKey || draft.name.trim();
+        setWorkflowTemplateStatus(
+          `Creating ${botLabel}...${result.creationSummary ? ` ${result.creationSummary}` : ""}`
+        );
+        setFeedEditStatus(`Workflow ${botLabel} creation queued`);
+        void pollWorkflowTemplateCreateResult(
+          result.workflowKey,
+          result.workflowBot,
+          result.threadId,
+          result.messageId
+        );
+        return;
+      }
+      if (!result.created) {
+        setWorkflowTemplateStatus(
+          `Create failed (${result.creationSummary || "workflow was not created"})`
+        );
+        return;
+      }
+      setWorkflowTemplateStatus(
+        `Created ${result.workflowBot || result.workflowKey}${result.runQueued ? " and queued the first run" : ""
+        }.${result.creationSummary ? ` ${result.creationSummary}` : ""}`
+      );
+      setFeedEditStatus(`Workflow ${result.workflowBot || result.workflowKey} created`);
+      setFeedCreateWorkflowOpen(false);
+      setWorkflowTemplateDraft(defaultWorkflowTemplateDraft());
+      void loadWorkflowRunStatuses();
+      void refreshLibrary("feed");
+      void loadFeedWorkflowSettings();
+      window.setTimeout(() => {
+        void refreshLibrary("feed");
+      }, 2000);
+    } catch (error) {
+      setWorkflowTemplateStatus(
+        `Create failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setWorkflowTemplateSubmitting(false);
+    }
+  }
+
+  async function submitWorkflowCommentForFeedItem(item: LibraryItem) {
+    const bot = workflowBotForPath(item.path, workflowBots);
+    if (!bot) {
+      setFeedEditStatus("This feed item is not mapped to an editable workflow yet.");
+      return;
+    }
+
+    const draft = (feedCommentDrafts[item.path] || "").trim();
+    if (!draft) {
+      setFeedCommentStatusByPath((prev) => ({
+        ...prev,
+        [item.path]: "Enter a comment first."
+      }));
+      return;
+    }
+
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      setFeedCommentStatusByPath((prev) => ({
+        ...prev,
+        [item.path]: "Comment blocked (gateway token missing)."
+      }));
+      return;
+    }
+
+    setSubmittingFeedCommentPath(item.path);
+    setFeedCommentStatusByPath((prev) => ({
+      ...prev,
+      [item.path]: `Sending request to ${bot.name}...`
+    }));
+    try {
+      const result = await submitFeedWorkflowComment(
+        item.path,
+        draft,
+        token || undefined,
+        gatewayBaseUrl
+      );
+      setFeedCommentDrafts((prev) => ({ ...prev, [item.path]: "" }));
+      setFeedCommentStatusByPath((prev) => ({
+        ...prev,
+        [item.path]: result.message || `Queued update for ${result.workflowBot || bot.name}`
+      }));
+      setActiveFeedCommentPath("");
+      if (result.queued && result.threadId && result.messageId) {
+        setFeedEditStatus(`Workflow update queued for ${result.workflowBot || bot.name}`);
+        void loadWorkflowRunStatuses();
+        void pollWorkflowCommentResult(item.path, result.threadId, result.messageId);
+      } else {
+        setFeedEditStatus(result.message || `Update applied for ${result.workflowBot || bot.name}`);
+        void loadWorkflowRunStatuses();
+      }
+    } catch (error) {
+      setFeedCommentStatusByPath((prev) => ({
+        ...prev,
+        [item.path]: `Comment failed (${error instanceof Error ? error.message : String(error)})`
+      }));
+    } finally {
+      setSubmittingFeedCommentPath("");
+    }
+  }
+
+  async function pollChatResult(opts: {
+    threadId: string;
+    messageId: string;
+    maxAttempts: number;
+    onDone: (reply: ClawChatMessage) => void;
+    onError: (errText: string) => void;
+    onTimeout?: () => void;
+  }) {
+    // Abort any previous poll
+    workflowPollAbortRef.current?.abort();
+    const controller = new AbortController();
+    workflowPollAbortRef.current = controller;
+
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      return;
+    }
+
+    for (let attempt = 0; attempt < opts.maxAttempts; attempt += 1) {
+      if (controller.signal.aborted) {
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 2500));
+      if (controller.signal.aborted) {
+        return;
+      }
+      try {
+        const messages = await listClawChatMessages(opts.threadId, token || undefined, gatewayBaseUrl);
+        const userMessage = messages.find((msg) => msg.id === opts.messageId);
+        const reply = messages.find(
+          (msg) => msg.replyToId === opts.messageId && msg.role === "assistant"
+        );
+
+        if (reply && (reply.status === "error" || !!reply.error)) {
+          opts.onError(reply.error || reply.content || "operation failed");
+          return;
+        }
+        if (userMessage?.status === "error") {
+          opts.onError(userMessage.error || "operation failed");
+          return;
+        }
+
+        const userStatus = String(userMessage?.status || "").toLowerCase();
+        if (reply && (reply.status === "done" || userStatus === "done")) {
+          opts.onDone(reply);
+          return;
+        }
+      } catch {
+        // Keep polling within the attempt budget.
+      }
+    }
+
+    opts.onTimeout?.();
+  }
+
+  async function pollWorkflowTemplateCreateResult(
+    workflowKey: string,
+    workflowBot: string,
+    threadId: string,
+    messageId: string
+  ) {
+    const botLabel = workflowBot || workflowKey || "workflow";
+    await pollChatResult({
+      threadId,
+      messageId,
+      maxAttempts: 72,
+      onDone: (reply) => {
+        const successText = (reply.content || `Created ${botLabel}.`).trim();
+        setWorkflowTemplateStatus(successText);
+        setFeedEditStatus(`Workflow ${botLabel} created`);
+        setFeedCreateWorkflowOpen(false);
+        setWorkflowTemplateDraft(defaultWorkflowTemplateDraft());
+        void loadWorkflowRunStatuses();
+        void refreshLibrary("feed");
+        void loadFeedWorkflowSettings();
+        window.setTimeout(() => {
+          void refreshLibrary("feed");
+        }, 2000);
+      },
+      onError: (errText) => {
+        setWorkflowTemplateStatus(`Create failed (${errText})`);
+        setFeedEditStatus("Workflow creation failed");
+      },
+      onTimeout: () => {
+        setWorkflowTemplateStatus(
+          `Create status pending for ${botLabel}. Open chat thread ${threadId} for details.`
+        );
+      }
+    });
+  }
+
+  async function pollWorkflowCommentResult(path: string, threadId: string, messageId: string) {
+    await pollChatResult({
+      threadId,
+      messageId,
+      maxAttempts: 12,
+      onDone: (reply) => {
+        const successText = reply.content || "Workflow modification applied.";
+        setFeedCommentStatusByPath((prev) => ({ ...prev, [path]: successText }));
+        setFeedEditStatus("Workflow comment applied");
+      },
+      onError: (errText) => {
+        setFeedCommentStatusByPath((prev) => ({
+          ...prev,
+          [path]: `Modification failed (${errText})`
+        }));
+        setFeedEditStatus("Workflow comment failed");
+      }
+    });
+  }
+
   async function postFeedItemToBluesky(item: LibraryItem) {
     if (!agent || !session) {
       setFeedEditStatus("Sign in to Bluesky first");
       return;
     }
-    if (postedPaths[item.path]) {
+    if (isPathPosted(item.path)) {
       setFeedEditStatus(`Already posted: ${item.title}`);
       return;
     }
@@ -791,11 +2287,12 @@ function App() {
       if (item.kind === "text") {
         setPostProgress({ path: item.path, percent: 25, label: "Loading text..." });
         const content =
-          selectedFeedItem?.path === item.path && selectedFeedText.trim()
-            ? selectedFeedText
+          feedDraftsByPath[item.path]?.trim()
+            ? feedDraftsByPath[item.path]
             : await readLibraryText(item.path, token, gatewayBaseUrl);
         setPostProgress({ path: item.path, percent: 70, label: "Publishing text..." });
-        const result = await postTextToBluesky(agent, session.did, content.trim());
+        const bluesky = await loadBlueskyModule();
+        const result = await bluesky.postTextToBluesky(agent, session.did, content.trim());
         await persistHistory({
           provider: "bluesky",
           text: content.trim(),
@@ -806,7 +2303,7 @@ function App() {
           status: "success"
         });
         const { archivedPath, archiveError } = await archivePostedFeedSource(item.path, token);
-        setPostedPaths((prev) => ({ ...prev, [item.path]: true }));
+
         setPostProgress({ path: item.path, percent: 100, label: "Posted." });
         setFeedEditStatus(
           archiveError
@@ -822,9 +2319,9 @@ function App() {
         const filename = item.path.split("/").pop() || "video.mp4";
         setPostProgress({ path: item.path, percent: 12, label: "Fetching video file..." });
         const file = await fetchMediaAsFile(item.mediaUrl, filename, token, gatewayBaseUrl);
-        const caption =
-          selectedFeedItem?.path === item.path ? feedCaptionText : item.previewText || item.title;
-        const result = await postVideoToBluesky(
+        const caption = feedDraftsByPath[item.path] ?? item.previewText ?? item.title;
+        const bluesky = await loadBlueskyModule();
+        const result = await bluesky.postVideoToBluesky(
           agent,
           creds.serviceUrl,
           session.accessJwt,
@@ -851,7 +2348,7 @@ function App() {
           status: "success"
         });
         const { archivedPath, archiveError } = await archivePostedFeedSource(item.path, token);
-        setPostedPaths((prev) => ({ ...prev, [item.path]: true }));
+
         setPostProgress({ path: item.path, percent: 100, label: "Posted." });
         setFeedEditStatus(
           archiveError
@@ -889,11 +2386,46 @@ function App() {
     if (!selectedJournalItem || selectedJournalItem.kind !== "text") {
       return;
     }
-    const token = chatGatewayToken.trim() || undefined;
+    const token = normalizeGatewayToken(chatGatewayToken) || undefined;
     setJournalSaveStatus(`Saving ${selectedJournalItem.path}...`);
     try {
-      await saveLibraryText(selectedJournalItem.path, selectedJournalText, token, gatewayBaseUrl);
-      setJournalSaveStatus(`Saved ${selectedJournalItem.path}`);
+      const localId = localJournalIdFromPath(selectedJournalItem.path);
+      if (localId) {
+        try {
+          await updateJournalText(localId, selectedJournalText);
+        } catch (localError) {
+          if (!isMissingDesktopCommand(localError, "update_journal_text")) {
+            throw localError;
+          }
+          const created = await createJournalTextViaGateway(
+            "Journal entry",
+            selectedJournalText,
+            token,
+            gatewayBaseUrl
+          );
+          const createdPath = String(created.path || "").trim();
+          if (createdPath) {
+            setSelectedJournalPath(createdPath);
+          }
+        }
+      } else {
+        try {
+          await saveLibraryText(selectedJournalItem.path, selectedJournalText, token, gatewayBaseUrl);
+        } catch (gatewayError) {
+          if (!isDesktopClient) {
+            throw gatewayError;
+          }
+          try {
+            await saveJournalText("Journal entry", selectedJournalText);
+          } catch (localError) {
+            if (isMissingDesktopCommand(localError, "save_journal_text")) {
+              throw gatewayError;
+            }
+            throw localError;
+          }
+        }
+      }
+      holdJournalStatus(`Saved ${selectedJournalItem.path}`);
       await refreshLibrary("journal");
     } catch (error) {
       setJournalSaveStatus(
@@ -904,19 +2436,19 @@ function App() {
 
   async function refreshDrafts() {
     try {
-      const result = await listDraftsFromPocketBase(pb);
+      const result = await listDraftsViaGateway(chatGatewayToken.trim() || undefined, gatewayBaseUrl);
       setDrafts(
-        result.items.map((item: any) => ({
+        result.map((item) => ({
           id: String(item.id || ""),
           text: String(item.text || ""),
           videoName: String(item.videoName || ""),
-          created: String(item.createdAtClient || item.created || ""),
-          updated: String(item.updatedAtClient || item.updated || "")
+          created: String(item.created || ""),
+          updated: String(item.updated || "")
         }))
       );
     } catch (error) {
       setStatus(
-        `PocketBase drafts unavailable (${error instanceof Error ? error.message : String(error)})`
+        `Drafts unavailable (${error instanceof Error ? error.message : String(error)})`
       );
     }
   }
@@ -931,30 +2463,13 @@ function App() {
         token = (await syncDesktopGatewayBootstrap())?.trim() || "";
       }
       let threadId = chatThreadId.trim();
-      if (!threadId && token) {
-        const latest = await getLatestChatThreadViaGateway(token, gatewayBaseUrl).catch(() => null);
-        if (latest) {
-          threadId = latest;
-          setChatThreadId(latest);
-          chatThreadHydratedRef.current = true;
-        }
-      }
       if (!threadId) {
         setChatMessages([]);
         setChatStatus("No chat thread yet. Send a message to start.");
         return;
       }
 
-      const items = await listClawChatMessagesViaGateway(threadId, token, gatewayBaseUrl);
-      if (items.length === 0 && token && !chatThreadHydratedRef.current) {
-        const latest = await getLatestChatThreadViaGateway(token, gatewayBaseUrl).catch(() => null);
-        chatThreadHydratedRef.current = true;
-        if (latest && latest !== threadId) {
-          setChatThreadId(latest);
-          setChatStatus(`Loaded latest chat thread: ${latest}`);
-          return;
-        }
-      }
+      const items = await listClawChatMessages(threadId, token, gatewayBaseUrl);
 
       setChatMessages(items);
       setChatStatus(`Chat thread loaded (${items.length} messages)`);
@@ -969,29 +2484,11 @@ function App() {
     e.preventDefault();
     setAuthMessage("Signing in...");
     try {
-      const { agent: nextAgent, session: nextSession } = await loginBluesky(creds);
+      const bluesky = await loadBlueskyModule();
+      const { agent: nextAgent, session: nextSession } = await bluesky.loginBluesky(creds);
       setAgent(nextAgent);
       setSession(nextSession);
       await saveBlueskySessionSecure(nextSession);
-      try {
-        const pbSync = await ensurePocketBaseUserFromBluesky(
-          pb,
-          creds.handle,
-          creds.appPassword,
-          nextSession.handle
-        );
-        const label = pocketBaseAuthLabel(pb);
-        setPbAuthLabel(label);
-        setPbAuthMessage(
-          pbSync.created
-            ? `PocketBase user provisioned and signed in (${label || pbSync.identity})`
-            : `PocketBase signed in as ${label || pbSync.identity}`
-        );
-      } catch (error) {
-        setPbAuthMessage(
-          `PocketBase auto-login failed (${error instanceof Error ? error.message : String(error)})`
-        );
-      }
       if (isDesktopClient) {
         try {
           await restartGatewayDaemonFromDesktop();
@@ -1020,8 +2517,8 @@ function App() {
       created: new Date().toISOString()
     };
     try {
-      await saveDraftToPocketBase(pb, draft);
-      setStatus("Draft saved to PocketBase");
+      await saveDraftViaGateway(draft, chatGatewayToken.trim() || undefined, gatewayBaseUrl);
+      setStatus("Draft saved");
       await refreshDrafts();
     } catch (error) {
       setStatus(
@@ -1033,15 +2530,15 @@ function App() {
   async function persistHistory(item: PostHistoryItem) {
     setHistory((prev) => [item, ...prev].slice(0, 20));
     try {
-      await savePostHistoryToPocketBase(pb, item);
+      await createPostHistory(item, chatGatewayToken.trim() || undefined, gatewayBaseUrl);
     } catch {
-      // Local UI history remains available even if PocketBase write fails.
+      // Local UI history remains available even if history sync fails.
     }
   }
 
   async function refreshPostHistory() {
     try {
-      const items = await listPostHistoryFromPocketBase(pb);
+      const items = await listPostHistoryViaGateway(chatGatewayToken.trim() || undefined, gatewayBaseUrl);
       setHistory((prev) => {
         if (prev.length === 0) {
           return items.slice(0, 20);
@@ -1049,7 +2546,7 @@ function App() {
         return prev;
       });
     } catch {
-      // Keep local-only history if PocketBase query fails.
+      // Keep local-only history if backend query fails.
     }
   }
 
@@ -1067,7 +2564,7 @@ function App() {
     setStatus("Posting to Bluesky...");
     try {
       const result = videoFile
-        ? await postVideoToBluesky(
+        ? await (await loadBlueskyModule()).postVideoToBluesky(
           agent,
           creds.serviceUrl,
           session.accessJwt,
@@ -1076,7 +2573,7 @@ function App() {
           videoFile,
           videoAlt
         )
-        : await postTextToBluesky(agent, session.did, text);
+        : await (await loadBlueskyModule()).postTextToBluesky(agent, session.did, text);
 
       const item: PostHistoryItem = {
         provider: "bluesky",
@@ -1120,12 +2617,12 @@ function App() {
         token = (await syncDesktopGatewayBootstrap())?.trim() || "";
       }
       if (!token) {
-        setChatStatus(
-          isDesktopClient
-            ? "Chat blocked (desktop gateway token not ready). Wait 2-3s or restart app."
-            : "Chat blocked (gateway token missing). Pair mobile with desktop QR."
-        );
-        return;
+        if (isDesktopClient) {
+          token = "desktop-local";
+        } else {
+          setChatStatus("Chat blocked (gateway token missing). Pair mobile with desktop QR.");
+          return;
+        }
       }
       let threadId = chatThreadId.trim();
       if (!threadId) {
@@ -1162,34 +2659,90 @@ function App() {
     void fetchAudioDevices();
   }, []);
 
+  useEffect(() => {
+    if (!isRecording || recordingType !== "audio" || !audioCanvasRef.current) {
+      return;
+    }
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    drawAudioVisualizer();
+  }, [isRecording, recordingType, themeMode]);
+
+  useEffect(() => {
+    if (!isRecording || recordingType !== "video" || !videoPreviewRef.current || !mediaStreamRef.current) {
+      return;
+    }
+    const video = videoPreviewRef.current;
+    if (video.srcObject !== mediaStreamRef.current) {
+      video.srcObject = mediaStreamRef.current;
+    }
+    video.play().catch(() => {
+      // Preview can fail silently on some platforms; recording still proceeds.
+    });
+  }, [isRecording, recordingType, videoOrientation]);
+
   function drawAudioVisualizer() {
-    if (!analyserRef.current || !audioCanvasRef.current) return;
+    if (!audioCanvasRef.current) return;
     const canvas = audioCanvasRef.current;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
     const analyser = analyserRef.current;
-    const bufferLength = analyser.frequencyBinCount;
+    const bg = themeMode === "dark" ? "#121417" : "#f2f6f4";
+    const line = themeMode === "dark" ? "#36d3a6" : "#169b79";
+    const centerLine = themeMode === "dark" ? "rgba(255,255,255,0.14)" : "rgba(0,0,0,0.12)";
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const cssWidth = canvas.clientWidth || 720;
+    const cssHeight = canvas.clientHeight || 170;
+    const targetWidth = Math.floor(cssWidth * dpr);
+    const targetHeight = Math.floor(cssHeight * dpr);
+    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+    }
+    const width = canvas.width;
+    const height = canvas.height;
+    const bufferLength = analyser ? analyser.frequencyBinCount : 256;
     const dataArray = new Uint8Array(bufferLength);
+    let syntheticT = 0;
 
     function draw() {
       animationFrameRef.current = requestAnimationFrame(draw);
-      analyser.getByteTimeDomainData(dataArray);
+      if (analyser) {
+        analyser.getByteTimeDomainData(dataArray);
+      } else {
+        syntheticT += 0.08;
+      }
       if (!ctx) return;
 
-      ctx.fillStyle = "rgb(30, 30, 30)"; // Fit minimal theme
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, width, height);
+      ctx.strokeStyle = centerLine;
+      ctx.lineWidth = Math.max(1, dpr);
+      ctx.beginPath();
+      ctx.moveTo(0, height / 2);
+      ctx.lineTo(width, height / 2);
+      ctx.stroke();
 
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = "rgb(0, 200, 100)";
+      ctx.lineWidth = Math.max(2, 2 * dpr);
+      ctx.strokeStyle = line;
       ctx.beginPath();
 
-      const sliceWidth = canvas.width * 1.0 / bufferLength;
+      const sliceWidth = width / bufferLength;
       let x = 0;
 
       for (let i = 0; i < bufferLength; i++) {
-        const v = dataArray[i] / 128.0;
-        const y = v * canvas.height / 2;
+        let y = height / 2;
+        if (analyser) {
+          const v = dataArray[i] / 128.0;
+          y = v * (height / 2);
+        } else {
+          const amp = Math.sin((i / 16) + syntheticT) * (height * 0.12);
+          const wobble = Math.sin((i / 7) + syntheticT * 1.3) * (height * 0.05);
+          y = (height / 2) + amp + wobble;
+        }
 
         if (i === 0) {
           ctx.moveTo(x, y);
@@ -1198,14 +2751,21 @@ function App() {
         }
         x += sliceWidth;
       }
-      ctx.lineTo(canvas.width, canvas.height / 2);
+      ctx.lineTo(width, height / 2);
       ctx.stroke();
     }
     draw();
   }
 
-  async function startRecording(type: "audio" | "video") {
+  async function startLiveRecording(type: "audio" | "video") {
+    if (isRecording) {
+      return;
+    }
     try {
+      const isTauriRuntime =
+        typeof window !== "undefined" &&
+        (Boolean((window as any).__TAURI_INTERNALS__) || Boolean((window as any).__TAURI_MOBILE__));
+      const isMobileRuntime = isTauriMobileRuntime();
       const hasGetUserMedia =
         typeof navigator !== "undefined" &&
         !!navigator.mediaDevices &&
@@ -1216,22 +2776,43 @@ function App() {
       const insecureContext =
         typeof window !== "undefined" &&
         !window.isSecureContext &&
+        !isTauriRuntime &&
         window.location.hostname !== "localhost" &&
         window.location.hostname !== "127.0.0.1";
 
-      if (!hasGetUserMedia || !hasMediaRecorder || insecureContext) {
-        setRecordingHint(
-          `${type === "audio" ? "Audio" : "Video"} live recording is unavailable in this browser context. Using upload/capture picker instead.`
-        );
-        if (type === "audio") {
-          audioCaptureRef.current?.click();
-        } else {
-          videoCaptureRef.current?.click();
-        }
+      if (type === "audio" && isMobileRuntime) {
+        setRecordingHint("Starting audio recording...");
+        setRecordingType("audio");
+        setIsRecording(true);
+        setRecordingTime(0);
+        recordingChunksRef.current = [];
+        syntheticAudioVizRef.current = true;
+        analyserRef.current = null;
+        await startNativeAudioRecording();
+        drawAudioVisualizer();
+        recordingTimerRef.current = window.setInterval(() => {
+          setRecordingTime((prev) => prev + 1);
+        }, 1000);
+        setRecordingHint("Recording audio...");
         return;
       }
 
-      setRecordingHint(`Starting ${type} recording...`);
+      // For Tauri runtimes, skip the capability bail-out: WKWebView (macOS) and
+      // WebView2 (Windows) lazily expose navigator.mediaDevices depending on
+      // entitlements / permissions.  Let the try/catch surface specific, actionable
+      // errors (permission denied, device not found, timeout, etc.) rather than a
+      // generic "not supported" wall.
+      if (!isTauriRuntime && (!hasGetUserMedia || !hasMediaRecorder || insecureContext)) {
+        setRecordingHint(
+          insecureContext
+            ? `Recording requires a secure context (HTTPS or localhost).`
+            : `${type === "audio" ? "Microphone" : "Camera"} recording is not supported in this browser.`
+        );
+        setCaptureMode(null);
+        return;
+      }
+
+      setRecordingHint(`Starting ${type === "audio" ? "microphone" : "camera"}…`);
       setRecordingType(type);
       setIsRecording(true);
       setRecordingTime(0);
@@ -1242,11 +2823,36 @@ function App() {
         constraints.audio = selectedAudioDeviceId ? { deviceId: { exact: selectedAudioDeviceId } } : true;
       } else {
         constraints.audio = true;
-        constraints.video = { facingMode: "user" };
+        const isVertical = videoOrientation === "vertical";
+        constraints.video = {
+          facingMode: "user",
+          width: { ideal: isVertical ? 720 : 1280 },
+          height: { ideal: isVertical ? 1280 : 720 },
+          aspectRatio: { ideal: isVertical ? 9 / 16 : 16 / 9 }
+        };
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      // getUserMedia can hang forever when the OS permission prompt never
+      // appears (e.g. missing entitlements on macOS Tauri).  Race it against
+      // a timeout so the UI doesn't freeze.
+      const gumPromise = navigator.mediaDevices.getUserMedia(constraints);
+      const timeoutMs = 15_000;
+      const timeoutPromise = new Promise<never>((_resolve, reject) => {
+        setTimeout(
+          () => reject(new DOMException(
+            "Timed out waiting for media access — check system privacy settings.",
+            "TimeoutError"
+          )),
+          timeoutMs
+        );
+      });
+
+      const stream = await Promise.race([gumPromise, timeoutPromise]);
       mediaStreamRef.current = stream;
+
+      // Re-enumerate now that permission has been granted — labels and deviceIds
+      // are only populated after the first getUserMedia call succeeds.
+      void fetchAudioDevices();
 
       if (type === "audio") {
         const audioCtx = new AudioContext();
@@ -1256,63 +2862,206 @@ function App() {
         analyser.fftSize = 2048;
         source.connect(analyser);
         analyserRef.current = analyser;
+        syntheticAudioVizRef.current = false;
+        audioPcmChunksRef.current = [];
+        audioSampleRateRef.current = audioCtx.sampleRate;
+        usingWavAudioCaptureRef.current = true;
+
+        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        const captureGain = audioCtx.createGain();
+        captureGain.gain.value = 0;
+        processor.onaudioprocess = (event) => {
+          const input = event.inputBuffer.getChannelData(0);
+          audioPcmChunksRef.current.push(new Float32Array(input));
+        };
+        source.connect(processor);
+        processor.connect(captureGain);
+        captureGain.connect(audioCtx.destination);
+        audioProcessorRef.current = processor;
+        audioCaptureGainRef.current = captureGain;
         drawAudioVisualizer();
       } else if (type === "video" && videoPreviewRef.current) {
         videoPreviewRef.current.srcObject = stream;
         videoPreviewRef.current.play().catch(console.error);
+
+        const isMacDesktop = (() => {
+          if (typeof navigator === "undefined") {
+            return false;
+          }
+          const platform = String(navigator.platform || "").toLowerCase();
+          const userAgent = String(navigator.userAgent || "").toLowerCase();
+          return platform.includes("mac") || userAgent.includes("mac os");
+        })();
+
+        const pickMimeType = (kind: "audio" | "video"): string => {
+          const candidates = kind === "audio"
+            ? [
+                "audio/webm;codecs=opus",
+                "audio/webm",
+                "audio/ogg;codecs=opus",
+                "audio/ogg",
+                "audio/mp4"
+              ]
+            : isMacDesktop
+              ? ["video/mp4;codecs=avc1,mp4a.40.2", "video/mp4", "video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"]
+              : ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm", "video/mp4;codecs=avc1,mp4a.40.2", "video/mp4"];
+          return candidates.find((t) => {
+            try { return MediaRecorder.isTypeSupported(t); } catch { return false; }
+          }) ?? "";
+        };
+        const mimeType = pickMimeType(type);
+        const recorderOptions = mimeType ? { mimeType } : {};
+        const mediaRecorder = new MediaRecorder(stream, recorderOptions);
+        mediaRecorderRef.current = mediaRecorder;
+
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            recordingChunksRef.current.push(event.data);
+          }
+        };
+
+        mediaRecorder.onstop = async () => {
+          if (recordingChunksRef.current.length > 0) {
+            const actualMime = mediaRecorder.mimeType || "video/webm";
+            const ext = actualMime.includes("mp4") ? "mp4" : actualMime.includes("ogg") ? "ogg" : "webm";
+            const blob = new Blob(recordingChunksRef.current, { type: actualMime });
+            const file = new File([blob], `${type}-${Date.now()}.${ext}`, { type: actualMime });
+            await uploadJournalFile(file, type);
+          }
+          cleanupRecording();
+        };
+
+        mediaRecorder.start(1000);
       }
-
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          recordingChunksRef.current.push(event.data);
-        }
-      };
-
-      mediaRecorder.onstop = async () => {
-        if (recordingChunksRef.current.length > 0) {
-          const blob = new Blob(recordingChunksRef.current, { type: type === "audio" ? "audio/webm" : "video/webm" });
-          const file = new File([blob], `${type}-${Date.now()}.webm`, { type: blob.type });
-          await uploadJournalFile(file, type);
-        }
-        cleanupRecording();
-      };
-
-      mediaRecorder.start(1000);
       recordingTimerRef.current = window.setInterval(() => {
         setRecordingTime(prev => prev + 1);
       }, 1000);
       setRecordingHint(`Recording ${type}...`);
 
     } catch (err) {
-      setRecordingHint(`Failed to start recording: ${err instanceof Error ? err.message : String(err)}`);
+      const device = type === "audio" ? "Microphone" : "Camera";
+      let hint = `Failed to start recording: ${err instanceof Error ? err.message : String(err)}`;
+
+      // TypeError: navigator.mediaDevices is undefined / getUserMedia is not a function
+      if (err instanceof TypeError) {
+        hint = `${device} API is unavailable. On macOS, open System Settings → Privacy & Security → ${device} and ensure this app is allowed.`;
+      } else if (err instanceof DOMException) {
+        switch (err.name) {
+          case "NotAllowedError":
+          case "PermissionDeniedError":
+            hint = `${device} access was denied. Please allow ${device.toLowerCase()} permission in System Settings → Privacy & Security.`;
+            break;
+          case "NotFoundError":
+          case "DevicesNotFoundError":
+            hint = `No ${device.toLowerCase()} found. Please connect one and try again.`;
+            break;
+          case "NotReadableError":
+          case "TrackStartError":
+            hint = `${device} is in use by another application. Please close it and try again.`;
+            break;
+          case "TimeoutError":
+            hint = `Timed out waiting for ${device.toLowerCase()} access. Open System Settings → Privacy & Security → ${device} and ensure this app is allowed, then try again.`;
+            break;
+          case "OverconstrainedError":
+            hint = `The selected ${device.toLowerCase()} couldn't satisfy the requested settings. Retrying with defaults…`;
+            try {
+              const fallback = await navigator.mediaDevices.getUserMedia(
+                type === "audio" ? { audio: true } : { audio: true, video: true }
+              );
+              fallback.getTracks().forEach((t) => t.stop());
+            } catch {
+              // Suppress — hint already set
+            }
+            break;
+        }
+      }
+      setRecordingHint(hint);
+      setCaptureMode(null);
       cleanupRecording();
     }
   }
 
-  function stopRecording() {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      if (recordingTimerRef.current) {
-        clearInterval(recordingTimerRef.current);
-        recordingTimerRef.current = null;
-      }
-      setRecordingHint("Processing recording...");
+  async function stopLiveRecording() {
+    if (!isRecording) {
+      return;
     }
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    setRecordingHint("Processing recording...");
+    if (recordingType === "audio" && isTauriMobileRuntime() && !mediaRecorderRef.current) {
+      try {
+        const blob = await stopNativeAudioRecording();
+        const file = new File([blob], `audio-${Date.now()}.m4a`, {
+          type: blob.type || "audio/m4a"
+        });
+        await uploadJournalFile(file, "audio");
+      } catch (error) {
+        setRecordingHint(
+          `Failed to save recording: ${error instanceof Error ? error.message : String(error)}`
+        );
+      } finally {
+        cleanupRecording();
+      }
+      return;
+    }
+    if (recordingType === "audio" && usingWavAudioCaptureRef.current && !mediaRecorderRef.current) {
+      try {
+        const blob = encodeWavFromFloat32(audioPcmChunksRef.current, audioSampleRateRef.current);
+        const file = new File([blob], `audio-${Date.now()}.wav`, {
+          type: "audio/wav"
+        });
+        await uploadJournalFile(file, "audio");
+      } catch (error) {
+        setRecordingHint(
+          `Failed to save recording: ${error instanceof Error ? error.message : String(error)}`
+        );
+      } finally {
+        cleanupRecording();
+      }
+      return;
+    }
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      return;
+    }
+    cleanupRecording();
   }
 
-  function cancelRecording() {
+  async function cancelRecording() {
+    if (!isRecording) {
+      setCaptureMode(null);
+      cleanupRecording();
+      return;
+    }
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    if (recordingType === "audio" && isTauriMobileRuntime() && !mediaRecorderRef.current) {
+      try {
+        await stopNativeAudioRecording();
+      } catch {
+        // Ignore native stop errors on cancel.
+      } finally {
+        setRecordingHint("Recording cancelled.");
+        cleanupRecording();
+      }
+      return;
+    }
+    if (recordingType === "audio" && usingWavAudioCaptureRef.current && !mediaRecorderRef.current) {
+      audioPcmChunksRef.current = [];
+      setRecordingHint("Recording cancelled.");
+      cleanupRecording();
+      return;
+    }
     if (mediaRecorderRef.current && isRecording) {
       recordingChunksRef.current = [];
       mediaRecorderRef.current.stop();
-      if (recordingTimerRef.current) {
-        clearInterval(recordingTimerRef.current);
-        recordingTimerRef.current = null;
-      }
       setRecordingHint("Recording cancelled.");
     } else {
+      setCaptureMode(null);
       cleanupRecording();
     }
   }
@@ -1326,16 +3075,30 @@ function App() {
       void audioContextRef.current.close();
       audioContextRef.current = null;
     }
+    if (audioProcessorRef.current) {
+      audioProcessorRef.current.disconnect();
+      audioProcessorRef.current = null;
+    }
+    if (audioCaptureGainRef.current) {
+      audioCaptureGainRef.current.disconnect();
+      audioCaptureGainRef.current = null;
+    }
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
     }
+    syntheticAudioVizRef.current = false;
+    analyserRef.current = null;
+    audioPcmChunksRef.current = [];
+    usingWavAudioCaptureRef.current = false;
+    mediaRecorderRef.current = null;
     if (videoPreviewRef.current) {
       videoPreviewRef.current.srcObject = null;
     }
     setIsRecording(false);
     setRecordingType(null);
     setRecordingTime(0);
+    setCaptureMode(null);
   }
 
   async function fetchBlueskyFeed() {
@@ -1359,6 +3122,44 @@ function App() {
       void fetchBlueskyFeed();
     }
   }, [feedSource, agent, session]);
+
+  useEffect(() => {
+    if (feedSource !== "local") {
+      setFeedSidebarOpen(false);
+      setFeedCreateWorkflowOpen(false);
+      return;
+    }
+    if (mobileTab !== "feed") {
+      setFeedSidebarOpen(false);
+      setFeedCreateWorkflowOpen(false);
+      return;
+    }
+    void loadFeedWorkflowSettings();
+  }, [feedSource, mobileTab, chatGatewayToken, gatewayBaseUrl]);
+
+  useEffect(() => {
+    if (feedSource !== "local" || mobileTab !== "feed") {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      if (cancelled) {
+        return;
+      }
+      await Promise.all([loadWorkflowRunStatuses(), refreshLibrary("feed")]);
+    };
+
+    void poll();
+    const timer = window.setInterval(() => {
+      void poll();
+    }, 4000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [feedSource, mobileTab, chatGatewayToken, gatewayBaseUrl, workflowBots]);
 
   function applyGatewayConnection(gatewayUrl: string, token: string) {
     const normalizedUrl = gatewayUrl.trim().replace(/\/+$/, "");
@@ -1526,6 +3327,164 @@ function App() {
     }
   }
 
+  async function loadRuntimeConfigForSettings() {
+    let token = normalizeGatewayToken(chatGatewayToken);
+    if (!token && isDesktopClient) {
+      token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
+    }
+
+    if (isDesktopClient) {
+      setSettingsConfigLoaded(false);
+      setSettingsConfigStatus("Loading local config...");
+      try {
+        const cfg = await getConfig();
+        const savedProvider = window.localStorage.getItem(CHAT_PROVIDER_STORAGE_KEY);
+        const savedModel = window.localStorage.getItem(CHAT_MODEL_STORAGE_KEY);
+        setSettingsProvider((savedProvider && savedProvider.trim()) || "ollama");
+        setSettingsModel((savedModel && savedModel.trim()) || cfg.ollamaModel || "");
+        setSettingsTranscriptionEnabled(Boolean(cfg.transcriptionEnabled));
+        setSettingsTranscriptionModel(cfg.ollamaModel || "");
+        let models = await listOllamaModels().catch(() => [] as string[]);
+        if (!models.length && gatewayBaseUrl.trim()) {
+          try {
+            const runtimeCfg = await getRuntimeConfig(token || undefined, gatewayBaseUrl);
+            models =
+              runtimeCfg.availableTranscriptionModels && runtimeCfg.availableTranscriptionModels.length > 0
+                ? [...runtimeCfg.availableTranscriptionModels]
+                : [];
+            const runtimeModel = runtimeCfg.transcriptionModel || "";
+            if (runtimeModel && !models.includes(runtimeModel)) {
+              models.unshift(runtimeModel);
+            }
+          } catch {
+            // Keep local model-only list when gateway runtime config is unavailable.
+          }
+        }
+        if (cfg.ollamaModel && !models.includes(cfg.ollamaModel)) {
+          models.unshift(cfg.ollamaModel);
+        }
+        setSettingsAvailableTranscriptionModels(models);
+        setSettingsConfigStatus("Config loaded (local)");
+        setSettingsConfigLoaded(true);
+        return;
+      } catch (localError) {
+        if (!isMissingDesktopCommand(localError, "get_config")) {
+          setSettingsConfigStatus(
+            `Config unavailable (${localError instanceof Error ? localError.message : String(localError)}). You can still edit and save manually.`
+          );
+          setSettingsConfigLoaded(true);
+          return;
+        }
+      }
+    }
+
+    if (!gatewayBaseUrl.trim()) {
+      setSettingsConfigStatus("Config unavailable (gateway URL missing). You can still edit and save manually.");
+      setSettingsConfigLoaded(true);
+      return;
+    }
+
+    setSettingsConfigLoaded(false);
+    setSettingsConfigStatus("Loading current config...");
+    try {
+      const cfg = await getRuntimeConfig(token || undefined, gatewayBaseUrl);
+      setSettingsProvider(cfg.defaultProvider || "");
+      setSettingsModel(cfg.defaultModel || "");
+      setSettingsTranscriptionEnabled(Boolean(cfg.transcriptionEnabled));
+      const currentTranscriptionModel = cfg.transcriptionModel || "";
+      setSettingsTranscriptionModel(currentTranscriptionModel);
+      const availableModels =
+        cfg.availableTranscriptionModels && cfg.availableTranscriptionModels.length > 0
+          ? [...cfg.availableTranscriptionModels]
+          : [];
+      if (currentTranscriptionModel && !availableModels.includes(currentTranscriptionModel)) {
+        availableModels.unshift(currentTranscriptionModel);
+      }
+      setSettingsAvailableTranscriptionModels(availableModels);
+      setSettingsConfigStatus("Config loaded");
+      setSettingsConfigLoaded(true);
+    } catch (error) {
+      setSettingsConfigStatus(
+        `Config unavailable (${error instanceof Error ? error.message : String(error)}). You can still edit and save manually.`
+      );
+      setSettingsConfigLoaded(true);
+    }
+  }
+
+  async function saveRuntimeConfigFromSettings() {
+    const provider = settingsProvider.trim();
+    const model = settingsModel.trim();
+    if (!provider || !model) {
+      setSettingsConfigStatus("Provider and model are required.");
+      return;
+    }
+    if (settingsTranscriptionEnabled && !settingsTranscriptionModel.trim()) {
+      setSettingsConfigStatus("Pick a transcription model.");
+      return;
+    }
+    let token = normalizeGatewayToken(chatGatewayToken);
+    if (!token && isDesktopClient) {
+      token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
+    }
+
+    setSettingsConfigBusy(true);
+    setSettingsConfigStatus(isDesktopClient ? "Saving local config..." : "Saving config...");
+    try {
+      if (isDesktopClient) {
+        try {
+          const cfg = await getConfig();
+          await saveConfig({
+            ...cfg,
+            ollamaModel: model,
+            transcriptionEnabled: settingsTranscriptionEnabled
+          });
+          window.localStorage.setItem(CHAT_PROVIDER_STORAGE_KEY, provider);
+          window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, model);
+          setSettingsConfigLoaded(true);
+          if (provider !== "ollama") {
+            setSettingsConfigStatus("Saved local config. Note: desktop local chat currently uses Ollama.");
+          } else {
+            setSettingsConfigStatus("Config saved (local).");
+          }
+          return;
+        } catch (localError) {
+          const missingGet = isMissingDesktopCommand(localError, "get_config");
+          const missingSave = isMissingDesktopCommand(localError, "save_config");
+          if (!missingGet && !missingSave) {
+            throw localError;
+          }
+          setSettingsConfigStatus("Local config command unavailable, saving via gateway...");
+        }
+      } else if (!token) {
+        setSettingsConfigStatus("Save blocked (gateway token missing).");
+        return;
+      }
+
+      await updateRuntimeConfig(
+        {
+          defaultProvider: provider,
+          defaultModel: model,
+          transcriptionEnabled: settingsTranscriptionEnabled,
+          transcriptionModel: settingsTranscriptionModel.trim(),
+          availableTranscriptionModels: settingsAvailableTranscriptionModels
+        },
+        token || undefined,
+        gatewayBaseUrl
+      );
+      setSettingsConfigStatus("Config saved. Restarting/applying...");
+      if (isDesktopClient) {
+        await restartGatewayDaemonFromDesktop();
+      }
+      window.location.reload();
+    } catch (error) {
+      setSettingsConfigStatus(
+        `Save failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setSettingsConfigBusy(false);
+    }
+  }
+
   async function generateDesktopPairingQr() {
     setDesktopQrLoading(true);
     setDesktopQrStatus("Generating a new mobile pairing token...");
@@ -1669,6 +3628,13 @@ function App() {
   }, [isDesktopClient, aiSetupStatus?.running]);
 
   useEffect(() => {
+    if (mobileTab !== "profile") {
+      return;
+    }
+    void loadRuntimeConfigForSettings();
+  }, [mobileTab, chatGatewayToken, gatewayBaseUrl]);
+
+  useEffect(() => {
     void refreshClawChat();
     const timer = window.setInterval(() => {
       void refreshClawChat();
@@ -1676,7 +3642,7 @@ function App() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [chatThreadId, chatGatewayToken, gatewayBaseUrl]);
+  }, [chatThreadId, chatGatewayToken, gatewayBaseUrl, isDesktopClient]);
 
   useEffect(() => {
     void refreshLibrary("all");
@@ -1684,7 +3650,7 @@ function App() {
 
   useEffect(() => {
     void refreshPostHistory();
-  }, [pbUrl]);
+  }, [chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     const item = journalItems.find((entry) => entry.path === selectedJournalPath) || null;
@@ -1697,25 +3663,29 @@ function App() {
   }, [journalItems, selectedJournalPath]);
 
   useEffect(() => {
-    const item = feedItems.find((entry) => entry.path === selectedFeedPath) || null;
-    setSelectedFeedItem(item);
-    if (item) {
-      void openLibraryItem(item, "feed");
-    } else {
-      setSelectedFeedText("");
-      setFeedCaptionText("");
-      setFeedCaptionPath("");
+    const activePaths = new Set(feedItems.map((item) => item.path));
+    setFeedDraftsByPath((prev) =>
+      Object.fromEntries(Object.entries(prev).filter(([path]) => activePaths.has(path)))
+    );
+    setFeedDraftSourceByPath((prev) =>
+      Object.fromEntries(Object.entries(prev).filter(([path]) => activePaths.has(path)))
+    );
+    setFeedDraftLoadingByPath((prev) =>
+      Object.fromEntries(Object.entries(prev).filter(([path]) => activePaths.has(path)))
+    );
+    for (const item of feedItems) {
+      void ensureFeedDraftLoaded(item);
     }
-  }, [feedItems, selectedFeedPath]);
+  }, [feedItems, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
-    const item = mobileTab === "feed" ? selectedFeedItem : selectedJournalItem;
+    const item = mobileTab === "feed" ? null : selectedJournalItem;
     if (item && (item.kind === "audio" || item.kind === "video" || item.kind === "image")) {
       void loadMediaPreview(item);
       return;
     }
     void loadMediaPreview(null);
-  }, [mobileTab, selectedFeedItem, selectedJournalItem, chatGatewayToken, gatewayBaseUrl]);
+  }, [mobileTab, selectedJournalItem, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     if (!selectedFeedItem || selectedFeedItem.kind !== "text") {
@@ -1769,7 +3739,7 @@ function App() {
   }, [feedCaptionText, feedCaptionPath, selectedFeedItem, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
-    if (!journalDraftText.trim()) return;
+    if (!selectedJournalItem && !journalDraftText.trim()) return;
     if (selectedJournalItem && selectedJournalItem.kind === "text" && loadedTextPathRef.current !== selectedJournalItem.path) return;
     if (selectedJournalItem && journalDraftText === selectedJournalText) return;
 
@@ -1782,20 +3752,48 @@ function App() {
     };
   }, [journalDraftText, selectedJournalItem, selectedJournalText, chatGatewayToken, gatewayBaseUrl]);
 
+  useEffect(() => {
+    return () => {
+      for (const timer of Object.values(feedAutosaveTimersRef.current)) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, []);
+
   const journalList = journalItems;
   const feedList = feedItems;
   const postedHistory = history.filter((item) => item.status === "success");
   const needsMobileQrLogin = !isDesktopClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
-  const needsBlueskyLogin = !session;
+  const isCaptureZenMode = mobileTab === "journal" && (isRecording || captureMode !== null);
+  const hideChrome = isWritingNote || isCaptureZenMode;
   const showDesktopJournalLayout = isDesktopLayout && mobileTab === "journal";
+  const showDesktopJournalSidebar =
+    showDesktopJournalLayout &&
+    !hideChrome &&
+    !journalDesktopSidebarCollapsed;
+  const isMediaTranscriptMode =
+    !!selectedJournalItem &&
+    (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video");
+  const isFreshNoteMode = !selectedJournalItem;
+  const selectedJournalTranscriptionStatus =
+    selectedJournalItem?.kind === "audio"
+      ? journalTranscriptionStatusByPath[selectedJournalItem.path] || "idle"
+      : "idle";
 
-  const renderJournalSidebarContent = (closeOnSelect: boolean) => (
+  const renderJournalSidebarContent = (closeOnSelect: boolean, mode: "mobile" | "desktop") => (
     <>
       <div className="row-between" style={{ marginBottom: "1.5rem" }}>
-        <h2>Recent Journals</h2>
-        <button type="button" className="ghost" onClick={() => void refreshLibrary("journal")}>
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-        </button>
+        <h2>Journals</h2>
+        {mode === "mobile" ? (
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => setJournalSidebarOpen(false)}
+            title="Close recent journals"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>
+          </button>
+        ) : null}
       </div>
 
       {journalItems.length === 0 ? (
@@ -1817,6 +3815,17 @@ function App() {
                 <div className="feed-title">{item.title}</div>
                 <div className="feed-time">{formatTimestamp(item.modifiedAt)} · {item.kind.toUpperCase()}</div>
               </div>
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => {
+                  setPendingDeleteJournalItem(item);
+                }}
+                title={`Delete ${item.title}`}
+                style={{ padding: "0.35rem" }}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg>
+              </button>
             </div>
           ))}
         </div>
@@ -1879,51 +3888,41 @@ function App() {
     );
   }
 
-  if (needsBlueskyLogin) {
-    return (
-      <div className="app-shell">
-        <main className="page-content">
-          <div className="stack">
-            <div className="card">
-              <h2>Sign In To Continue</h2>
-              <p className="text-sm muted">
-                Bluesky is the primary account login for this app.
-              </p>
-              <form className="stack" onSubmit={handleLogin}>
-                <p className="text-sm muted">Service: {creds.serviceUrl || "https://bsky.social"}</p>
-                <input
-                  value={creds.handle}
-                  onChange={(e) => setCreds(prev => ({ ...prev, handle: e.target.value }))}
-                  placeholder="Bluesky Handle or Email"
-                />
-                <input
-                  type="password"
-                  value={creds.appPassword}
-                  onChange={(e) => setCreds(prev => ({ ...prev, appPassword: e.target.value }))}
-                  placeholder="Bluesky App Password"
-                />
-                <button type="submit" className="primary">
-                  Sign In
-                </button>
-                {authMessage ? <p className="text-sm muted">{authMessage}</p> : null}
-                {pbAuthMessage ? <p className="text-sm muted">{pbAuthMessage}</p> : null}
-              </form>
-            </div>
-          </div>
-        </main>
-      </div>
-    );
-  }
-
   return (
     <div className="app-shell">
-      {(!isWritingNote && !isRecording) && (
+      {!hideChrome && (
         <header className="topbar">
           <div className="row" style={{ alignItems: "center", gap: "1rem" }}>
             {mobileTab === "journal" && !showDesktopJournalLayout && (
               <button type="button" className="ghost" onClick={() => setJournalSidebarOpen(true)} style={{ padding: "0.2rem" }}>
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
               </button>
+            )}
+            {mobileTab === "journal" && (
+              <div className="topbar-action-group">
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={resetJournalSession}
+                  title="Start a new journal session"
+                >
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                </button>
+                {showDesktopJournalLayout && (
+                  <button
+                    type="button"
+                    className={`ghost ${journalDesktopSidebarCollapsed ? "active-icon-btn" : ""}`}
+                    onClick={() => setJournalDesktopSidebarCollapsed((prev) => !prev)}
+                    title={journalDesktopSidebarCollapsed ? "Show recent journals" : "Collapse recent journals"}
+                  >
+                    {journalDesktopSidebarCollapsed ? (
+                      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M9 3v18"></path><polyline points="14 9 17 12 14 15"></polyline></svg>
+                    ) : (
+                      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M9 3v18"></path><polyline points="17 9 14 12 17 15"></polyline></svg>
+                    )}
+                  </button>
+                )}
+              </div>
             )}
             <h1>SlowClaw</h1>
           </div>
@@ -1940,48 +3939,128 @@ function App() {
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
               )}
             </button>
+            <button
+              type="button"
+              className={`ghost ${mobileTab === "profile" ? "active-icon-btn" : ""}`}
+              onClick={() => setMobileTab("profile")}
+              title="Settings"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82L4.21 7.1a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+            </button>
           </div>
         </header>
       )}
 
-      {mobileTab === "journal" && !showDesktopJournalLayout && !isWritingNote && !isRecording ? (
+      {mobileTab === "journal" && !showDesktopJournalLayout && !hideChrome ? (
         <div className={`sidebar-overlay ${journalSidebarOpen ? 'open' : ''}`} onClick={() => setJournalSidebarOpen(false)}>
           <div className={`sidebar ${journalSidebarOpen ? 'open' : ''}`} onClick={e => e.stopPropagation()}>
-            {renderJournalSidebarContent(true)}
+            {renderJournalSidebarContent(true, "mobile")}
+          </div>
+        </div>
+      ) : null}
+
+      {pendingDeleteJournalItem ? (
+        <div className="confirm-overlay" onClick={() => setPendingDeleteJournalItem(null)}>
+          <div className="confirm-dialog card" onClick={(e) => e.stopPropagation()}>
+            <div className="stack-sm">
+              <h3>Delete Journal?</h3>
+              <p className="text-sm muted">
+                This will permanently remove "{pendingDeleteJournalItem.title}" from the workspace.
+              </p>
+            </div>
+            <div className="row" style={{ justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => setPendingDeleteJournalItem(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger"
+                onClick={() => void deleteJournalItem(pendingDeleteJournalItem)}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {pendingDeleteFeedItem ? (
+        <div className="confirm-overlay" onClick={() => setPendingDeleteFeedItem(null)}>
+          <div className="confirm-dialog card" onClick={(e) => e.stopPropagation()}>
+            <div className="stack-sm">
+              <h3>Delete Feed Item?</h3>
+              <p className="text-sm muted">
+                This will permanently remove "{pendingDeleteFeedItem.title}" from the workspace feed.
+              </p>
+            </div>
+            <div className="row" style={{ justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => setPendingDeleteFeedItem(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger"
+                onClick={() => void deleteFeedItem(pendingDeleteFeedItem)}
+              >
+                Delete
+              </button>
+            </div>
           </div>
         </div>
       ) : null}
 
       <main className="page-content">
         {mobileTab === "journal" ? (
-          <div className={showDesktopJournalLayout ? "journal-desktop-layout" : "stack"}>
-            {showDesktopJournalLayout && !isWritingNote && !isRecording ? (
+          <div className={showDesktopJournalSidebar ? "journal-desktop-layout" : "stack"}>
+            {showDesktopJournalSidebar ? (
               <aside className="sidebar sidebar-desktop open">
-                {renderJournalSidebarContent(false)}
+                {renderJournalSidebarContent(false, "desktop")}
               </aside>
             ) : null}
-            <div className="stack journal-main">
-              {!isWritingNote && (
+            <div className={`stack journal-main ${isWritingNote ? "journal-main-writing" : ""}`}>
+              {!isWritingNote && !isCaptureZenMode && (
                 <div className="card">
                   <div className="text-center">
                     <h2>Capture</h2>
                     <p className="text-sm mt-2">{recordingHint || "Record audio or video directly to workspace"}</p>
                   </div>
-                  {isRecording ? (
-                    <div className="stack" style={{ alignItems: "center", padding: "1rem" }}>
-                      {recordingType === "audio" && (
-                        <canvas ref={audioCanvasRef} width={300} height={100} style={{ width: "100%", maxWidth: "400px", borderRadius: "8px", background: "rgb(30, 30, 30)" }} />
+                  {selectedJournalItem &&
+                    (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video") ? (
+                    <div className="stack" style={{ marginTop: "1rem" }}>
+                      {mediaPreviewLoading ? (
+                        <p className="text-sm muted text-center">Loading media preview...</p>
+                      ) : mediaPreviewUrl ? (
+                        <>
+                          {selectedJournalItem.kind === "audio" ? (
+                            <div className="audio-preview-shell">
+                              <div className="audio-preview-meta">
+                                <div className="audio-preview-icon" aria-hidden>
+                                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
+                                </div>
+                                <div className="stack-sm" style={{ gap: "0.2rem" }}>
+                                  <span className="section-label">Audio Preview</span>
+                                  <span className="text-sm muted">{selectedJournalItem.title || "Recorded audio"}</span>
+                                </div>
+                              </div>
+                              <audio controls style={{ width: "100%" }}>
+                                <source src={mediaPreviewUrl} type={mediaPreviewMime || undefined} />
+                              </audio>
+                            </div>
+                          ) : (
+                            <video controls src={mediaPreviewUrl} className="media-viewer" style={{ marginTop: 0 }} />
+                          )}
+                        </>
+                      ) : (
+                        <p className="text-sm muted text-center">Media preview unavailable.</p>
                       )}
-                      {recordingType === "video" && (
-                        <video ref={videoPreviewRef} style={{ width: "100%", maxWidth: "400px", borderRadius: "8px", background: "#000" }} muted playsInline />
-                      )}
-                      <div className="text-lg" style={{ fontWeight: 600, color: "var(--danger)" }}>
-                        {Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')}
-                      </div>
-                      <div className="row">
-                        <button type="button" className="danger" onClick={stopRecording}>Stop & Save</button>
-                        <button type="button" className="ghost" onClick={cancelRecording}>Cancel</button>
-                      </div>
                     </div>
                   ) : (
                     <div className="stack">
@@ -1989,7 +4068,11 @@ function App() {
                         <button
                           type="button"
                           className="record-btn audio"
-                          onClick={() => void startRecording("audio")}
+                          onClick={() => {
+                            setCaptureMode("audio");
+                            setRecordingHint("Preparing audio capture...");
+                            void startLiveRecording("audio");
+                          }}
                           title="Record Audio"
                         >
                           <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
@@ -1997,7 +4080,10 @@ function App() {
                         <button
                           type="button"
                           className="record-btn video"
-                          onClick={() => void startRecording("video")}
+                          onClick={() => {
+                            setCaptureMode("video");
+                            setRecordingHint("Choose orientation and start recording.");
+                          }}
                           title="Record Video"
                         >
                           <svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
@@ -2018,73 +4104,153 @@ function App() {
                           </select>
                         </div>
                       )}
-
-                      <div className="row-center mt-2" style={{ gap: '1rem' }}>
-                        <button type="button" className="ghost text-sm" onClick={() => audioCaptureRef.current?.click()}>Upload Audio</button>
-                        <button type="button" className="ghost text-sm" onClick={() => videoCaptureRef.current?.click()}>Upload Video</button>
-                      </div>
-
-                      <input
-                        ref={audioCaptureRef}
-                        type="file"
-                        accept="audio/*"
-                        className="visually-hidden"
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (file) void uploadJournalFile(file, "audio");
-                          e.currentTarget.value = "";
-                        }}
-                      />
-                      <input
-                        ref={videoCaptureRef}
-                        type="file"
-                        accept="video/*"
-                        capture="environment"
-                        className="visually-hidden"
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (file) void uploadJournalFile(file, "video");
-                          e.currentTarget.value = "";
-                        }}
-                      />
                     </div>
                   )}
                 </div>
               )}
 
-              {!isRecording && (
-                <div className="card" style={{ flex: isWritingNote ? 1 : undefined, minHeight: isWritingNote ? '60vh' : undefined }}>
+              {isCaptureZenMode && (
+                <div className="card capture-zen">
                   <div className="row-between">
-                    <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={() => { setJournalDraftText(""); setSelectedJournalItem(null); setMediaPreviewUrl(""); setJournalSaveStatus("Journal idle"); }}
-                        title="New Note"
-                        style={{ padding: '0.2rem 0.5rem', fontSize: '1.2rem' }}
-                      >
-                        +
-                      </button>
-                      <h2 style={{ margin: 0 }}>Note</h2>
+                    <button
+                      type="button"
+                      className="ghost text-sm"
+                      onClick={cancelRecording}
+                    >
+                      Back
+                    </button>
+                    <div className="capture-zen-timer">
+                      {Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, "0")}
                     </div>
+                  </div>
+                  <div className="capture-stage">
+                    {captureMode === "audio" ? (
+                      <div className="capture-audio-shell">
+                        <p className="text-sm muted">Audio capture</p>
+                        <canvas ref={audioCanvasRef} width={720} height={220} className="audio-zen-canvas" />
+                        <div className="capture-audio-feedback">
+                          <span className="pulse-dot" />
+                          <span>{isRecording ? "Listening" : "Starting microphone..."}</span>
+                        </div>
+                      </div>
+                    ) : null}
+                    {captureMode === "video" ? (
+                      <div className="capture-video-shell">
+                        {!isRecording ? (
+                          <div className="stack" style={{ gap: "0.8rem", alignItems: "center" }}>
+                            <p className="text-sm muted" style={{ margin: 0 }}>
+                              Choose orientation to start video capture
+                            </p>
+                            <div className="row-center" style={{ gap: "0.6rem" }}>
+                              <button
+                                type="button"
+                                className={videoOrientation === "vertical" ? "primary text-sm" : "ghost text-sm"}
+                                onClick={() => setVideoOrientation("vertical")}
+                              >
+                                Vertical
+                              </button>
+                              <button
+                                type="button"
+                                className={videoOrientation === "horizontal" ? "primary text-sm" : "ghost text-sm"}
+                                onClick={() => setVideoOrientation("horizontal")}
+                              >
+                                Horizontal
+                              </button>
+                            </div>
+                            <button
+                              type="button"
+                              className="primary"
+                              onClick={() => void startLiveRecording("video")}
+                            >
+                              Start Recording
+                            </button>
+                          </div>
+                        ) : (
+                          <video
+                            ref={videoPreviewRef}
+                            className={`video-zen-preview ${videoOrientation === "vertical" ? "vertical" : "horizontal"}`}
+                            muted
+                            playsInline
+                          />
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="row-center" style={{ gap: "0.7rem" }}>
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => void stopLiveRecording()}
+                      disabled={!isRecording}
+                    >
+                      Stop & Save
+                    </button>
+                    <button type="button" className="ghost" onClick={cancelRecording}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {!isCaptureZenMode && (
+                <div
+                  className={`card ${isWritingNote || isMediaTranscriptMode || isFreshNoteMode ? "note-card-expanded" : ""}`}
+                  style={{ flex: isWritingNote || isMediaTranscriptMode || isFreshNoteMode ? 1 : undefined }}
+                >
+                  <div className="row-between">
+                    <h2 style={{ margin: 0 }}>Session</h2>
                     <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
                       <span className="text-sm muted">{journalSaveStatus !== "Journal idle" ? journalSaveStatus : ""}</span>
                       {isWritingNote && <button type="button" className="ghost" onClick={() => setIsWritingNote(false)}>Done</button>}
                     </div>
                   </div>
-                  {selectedJournalItem && mediaPreviewUrl && (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video") && (
-                    <div className="stack" style={{ marginBottom: '1rem' }}>
-                      {selectedJournalItem.kind === "audio" && <audio controls src={mediaPreviewUrl} style={{ width: '100%' }} />}
-                      {selectedJournalItem.kind === "video" && <video controls src={mediaPreviewUrl} className="media-viewer" style={{ marginTop: 0 }} />}
-                    </div>
-                  )}
+                  {selectedJournalItem &&
+                    selectedJournalItem.kind === "audio" &&
+                    !journalDraftText.trim() && (
+                      <div className="row" style={{ marginBottom: "0.6rem" }}>
+                        <button
+                          type="button"
+                          className="primary"
+                          onClick={() => void transcribeSelectedJournalMedia()}
+                          disabled={
+                            journalTranscribing ||
+                            selectedJournalTranscriptionStatus === "queued" ||
+                            selectedJournalTranscriptionStatus === "running"
+                          }
+                        >
+                          {journalTranscribing ||
+                            selectedJournalTranscriptionStatus === "queued" ||
+                            selectedJournalTranscriptionStatus === "running" ? (
+                            <span className="row" style={{ gap: "0.45rem", alignItems: "center" }}>
+                              <span className="btn-spinner" aria-hidden />
+                              {selectedJournalTranscriptionStatus === "queued"
+                                ? "Queued..."
+                                : "Transcribing..."}
+                            </span>
+                          ) : (
+                            "Transcribe audio"
+                          )}
+                        </button>
+                      </div>
+                    )}
                   <textarea
-                    rows={isWritingNote ? 15 : 5}
+                    rows={isWritingNote || isMediaTranscriptMode || isFreshNoteMode ? 15 : 5}
                     value={journalDraftText}
                     onChange={(e) => setJournalDraftText(e.target.value)}
-                    onFocus={() => setIsWritingNote(true)}
+                    onFocus={() => {
+                      if (!isMediaTranscriptMode) {
+                        setIsWritingNote(true);
+                      }
+                    }}
                     placeholder="Write your thoughts..."
-                    style={{ flex: isWritingNote ? 1 : undefined, resize: 'none' }}
+                    style={{
+                      flex: isWritingNote || isMediaTranscriptMode || isFreshNoteMode ? 1 : undefined,
+                      resize: "none",
+                      minHeight:
+                        isWritingNote || isMediaTranscriptMode || isFreshNoteMode
+                          ? "100%"
+                          : undefined
+                    }}
                   />
                 </div>
               )}
@@ -2098,9 +4264,36 @@ function App() {
             <div className="card">
               <div className="row-between">
                 <h2>Your Feed</h2>
-                <button type="button" className="ghost" onClick={() => feedSource === "bluesky" ? void fetchBlueskyFeed() : void refreshLibrary("feed")}>
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-                </button>
+                <div className="row" style={{ gap: "0.35rem", alignItems: "center" }}>
+                  {feedSource === "local" ? (
+                    <button
+                      type="button"
+                      className={`feed-plus-btn ${feedSidebarOpen ? "active" : ""}`}
+                      onClick={() => {
+                        setFeedSidebarOpen((prev) => !prev);
+                        setFeedCreateWorkflowOpen(false);
+                      }}
+                      title="Open workflow drawer"
+                    >
+                      +
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => {
+                      if (feedSource === "bluesky") {
+                        void fetchBlueskyFeed();
+                      } else {
+                        void refreshLibrary("feed");
+                        void loadFeedWorkflowSettings();
+                        void loadWorkflowRunStatuses();
+                      }
+                    }}
+                  >
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+                  </button>
+                </div>
               </div>
 
               <div className="segmented-control mt-2 mb-2">
@@ -2120,6 +4313,519 @@ function App() {
                 </button>
               </div>
 
+              {feedSource === "local" && feedSidebarOpen ? (
+                <div className="feed-workflow-drawer">
+                  <div className="row-between">
+                    <h3 style={{ margin: 0 }}>Workflow Bots</h3>
+                    <button
+                      type="button"
+                      className="ghost text-sm"
+                      onClick={() => setFeedSidebarOpen(false)}
+                    >
+                      Close
+                    </button>
+                  </div>
+                  <div className="feed-workflow-bot-list">
+                    {workflowBots.map((bot) => {
+                      const saved = workflowSettingsByKey[bot.key];
+                      return (
+                        <button
+                          key={bot.key}
+                          type="button"
+                          className="feed-workflow-bot-row"
+                          onClick={() => openWorkflowSettingsForBot(bot.key)}
+                        >
+                          <span className="feed-bot-chip">
+                            <span className="feed-bot-avatar">{bot.avatar}</span>
+                            <span>{bot.name}</span>
+                          </span>
+                          <span className="text-sm muted">
+                            {saved?.scheduleEnabled ? "Scheduled" : "Manual"}
+                          </span>
+                        </button>
+                      );
+                    })}
+                    {!workflowBots.length ? (
+                      <p className="text-sm muted" style={{ margin: 0 }}>
+                        No workflow bots yet. Create one to start generating feed posts.
+                      </p>
+                    ) : null}
+                  </div>
+                  <button
+                    type="button"
+                    className="primary text-sm"
+                    style={{ width: "100%", borderRadius: "10px" }}
+                    onClick={openWorkflowTemplateForm}
+                  >
+                    Create Workflow
+                  </button>
+                </div>
+              ) : null}
+
+              {feedSource === "local" && feedCreateWorkflowOpen ? (
+                <form className="workflow-settings-panel stack" onSubmit={submitWorkflowTemplateCreate}>
+                  <div className="row-between">
+                    <h3 style={{ margin: 0 }}>Create Workflow</h3>
+                    <button
+                      type="button"
+                      className="ghost text-sm"
+                      onClick={() => setFeedCreateWorkflowOpen(false)}
+                    >
+                      Close
+                    </button>
+                  </div>
+                  <label className="stack" style={{ gap: "0.35rem" }}>
+                    <span className="text-sm">Workflow name</span>
+                    <input
+                      value={workflowTemplateDraft.name}
+                      onChange={(e) =>
+                        setWorkflowTemplateDraft((prev) => ({ ...prev, name: e.target.value }))
+                      }
+                      placeholder="Weekly tweet digest"
+                    />
+                  </label>
+                  <label className="stack" style={{ gap: "0.35rem" }}>
+                    <span className="text-sm">Bot name (optional)</span>
+                    <input
+                      value={workflowTemplateDraft.botName}
+                      onChange={(e) =>
+                        setWorkflowTemplateDraft((prev) => ({ ...prev, botName: e.target.value }))
+                      }
+                      placeholder="TweetDigestBot"
+                    />
+                  </label>
+                  <label className="stack" style={{ gap: "0.35rem" }}>
+                    <span className="text-sm">Source type</span>
+                    <select
+                      value={workflowTemplateDraft.sourceKind}
+                      onChange={(e) =>
+                        setWorkflowTemplateDraft((prev) => ({
+                          ...prev,
+                          sourceKind: e.target.value === "audio" ? "audio" : "text"
+                        }))
+                      }
+                    >
+                      <option value="text">Journal text notes</option>
+                      <option value="audio">Audio insights</option>
+                    </select>
+                  </label>
+                  <label className="stack" style={{ gap: "0.35rem" }}>
+                    <span className="text-sm">Prompt</span>
+                    <textarea
+                      rows={3}
+                      value={workflowTemplateDraft.prompt}
+                      onChange={(e) =>
+                        setWorkflowTemplateDraft((prev) => ({ ...prev, prompt: e.target.value }))
+                      }
+                      placeholder="Write in a clear, natural voice."
+                    />
+                  </label>
+                  <label className="stack" style={{ gap: "0.35rem" }}>
+                    <span className="text-sm">Selection mode</span>
+                    <select
+                      value={workflowTemplateDraft.mode}
+                      onChange={(e) =>
+                        setWorkflowTemplateDraft((prev) => ({
+                          ...prev,
+                          mode: e.target.value === "random" ? "random" : "date_range"
+                        }))
+                      }
+                    >
+                      <option value="date_range">Recent notes</option>
+                      <option value="random">Random files</option>
+                    </select>
+                  </label>
+                  {workflowTemplateDraft.mode === "date_range" ? (
+                    <label className="stack" style={{ gap: "0.35rem" }}>
+                      <span className="text-sm">Days back</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={30}
+                        value={workflowTemplateDraft.days}
+                        onChange={(e) =>
+                          setWorkflowTemplateDraft((prev) => ({
+                            ...prev,
+                            days: Math.max(1, Math.min(30, Number(e.target.value || 1)))
+                          }))
+                        }
+                      />
+                    </label>
+                  ) : (
+                    <label className="stack" style={{ gap: "0.35rem" }}>
+                      <span className="text-sm">Random file count</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={10}
+                        value={workflowTemplateDraft.randomCount}
+                        onChange={(e) =>
+                          setWorkflowTemplateDraft((prev) => ({
+                            ...prev,
+                            randomCount: Math.max(1, Math.min(10, Number(e.target.value || 1)))
+                          }))
+                        }
+                      />
+                    </label>
+                  )}
+                  <label className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
+                    <input
+                      type="checkbox"
+                      checked={workflowTemplateDraft.scheduleEnabled}
+                      onChange={(e) =>
+                        setWorkflowTemplateDraft((prev) => ({
+                          ...prev,
+                          scheduleEnabled: e.target.checked
+                        }))
+                      }
+                    />
+                    <span className="text-sm">Run on schedule</span>
+                  </label>
+                  {workflowTemplateDraft.scheduleEnabled ? (
+                    <div className="stack" style={{ gap: "0.45rem" }}>
+                      <label className="stack" style={{ gap: "0.35rem" }}>
+                        <span className="text-sm">Cron expression</span>
+                        <input
+                          value={workflowTemplateDraft.scheduleCron}
+                          onChange={(e) =>
+                            setWorkflowTemplateDraft((prev) => ({
+                              ...prev,
+                              scheduleCron: e.target.value
+                            }))
+                          }
+                          placeholder="0 9 * * *"
+                        />
+                      </label>
+                      <label className="stack" style={{ gap: "0.35rem" }}>
+                        <span className="text-sm">Timezone (optional)</span>
+                        <input
+                          value={workflowTemplateDraft.scheduleTz}
+                          onChange={(e) =>
+                            setWorkflowTemplateDraft((prev) => ({
+                              ...prev,
+                              scheduleTz: e.target.value
+                            }))
+                          }
+                          placeholder="Europe/Berlin"
+                        />
+                      </label>
+                    </div>
+                  ) : null}
+                  <label className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
+                    <input
+                      type="checkbox"
+                      checked={workflowTemplateDraft.runNow}
+                      onChange={(e) =>
+                        setWorkflowTemplateDraft((prev) => ({ ...prev, runNow: e.target.checked }))
+                      }
+                    />
+                    <span className="text-sm">Run immediately after create</span>
+                  </label>
+                  <div className="feed-comment-actions">
+                    <button
+                      type="submit"
+                      className="primary text-sm"
+                      style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
+                      disabled={workflowTemplateSubmitting}
+                    >
+                      {workflowTemplateSubmitting ? "Creating..." : "Create Workflow"}
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost text-sm"
+                      style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
+                      onClick={() => setFeedCreateWorkflowOpen(false)}
+                      disabled={workflowTemplateSubmitting}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  {workflowTemplateStatus ? (
+                    <div className="feed-comment-status">{workflowTemplateStatus}</div>
+                  ) : null}
+                </form>
+              ) : null}
+
+              {feedSource === "local" && feedEditStatus !== "Feed idle" ? (
+                <p className="text-sm muted">{feedEditStatus}</p>
+              ) : null}
+
+              {feedSource === "local" ? (
+                <div className="stack">
+                  {workflowBots.map((bot) => {
+                    const run = workflowRunStatusByKey[bot.key];
+                    if (!run) {
+                      return null;
+                    }
+                    if (run.status === "done") {
+                      return null;
+                    }
+                    return (
+                      <div key={`run-${bot.key}`} className="workflow-run-card">
+                        <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
+                          <div className="row" style={{ gap: "0.5rem", alignItems: "center" }}>
+                            <span className="feed-bot-chip">
+                              <span className="feed-bot-avatar">{bot.avatar}</span>
+                              <span>{bot.name}</span>
+                            </span>
+                            {run.status === "pending" || run.status === "processing" ? (
+                              <span className="workflow-run-spinner" aria-hidden />
+                            ) : null}
+                            <span className="text-sm">{run.summary}</span>
+                          </div>
+                          {run.status === "error" ? (
+                            <button
+                              type="button"
+                              className="ghost text-sm"
+                              onClick={() => void triggerManualWorkflowRun(bot.key)}
+                            >
+                              Retry
+                            </button>
+                          ) : null}
+                        </div>
+                        {run.detail ? (
+                          <pre className="workflow-run-detail">{run.detail}</pre>
+                        ) : null}
+                        <div className="text-sm muted">
+                          Updated: {run.updatedAt ? formatTimestamp(run.updatedAt) : "just now"}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
+
+              {feedSource === "local" && activeWorkflowBotKey
+                ? (() => {
+                  const bot = workflowBotByKey(activeWorkflowBotKey);
+                  const saved = workflowSettingsByKey[activeWorkflowBotKey];
+                  const draft =
+                    workflowSettingsDraftByKey[activeWorkflowBotKey] ||
+                    (saved ? workflowSettingsDraftFromItem(saved) : undefined);
+                  const status = workflowSettingsStatusByKey[activeWorkflowBotKey] || "";
+                  const isSaving = workflowSettingsSavingKey === activeWorkflowBotKey;
+
+                  return (
+                    <div className="workflow-settings-panel">
+                      <div className="row-between">
+                        <h3 style={{ margin: 0 }}>{bot.name} Settings</h3>
+                        <button
+                          type="button"
+                          className="ghost text-sm"
+                          onClick={() => setActiveWorkflowBotKey("")}
+                        >
+                          Close
+                        </button>
+                      </div>
+
+                      {!draft ? (
+                        <p className="text-sm muted" style={{ marginTop: "0.6rem" }}>
+                          {workflowSettingsLoading
+                            ? "Loading workflow settings..."
+                            : "Workflow settings are not available yet."}
+                        </p>
+                      ) : (
+                        <div className="stack" style={{ marginTop: "0.6rem" }}>
+                          <label className="stack" style={{ gap: "0.35rem" }}>
+                            <span className="text-sm">Prompt</span>
+                            <textarea
+                              rows={3}
+                              value={draft.prompt}
+                              onChange={(e) =>
+                                setWorkflowSettingsDraftByKey((prev) => ({
+                                  ...prev,
+                                  [activeWorkflowBotKey]: {
+                                    ...draft,
+                                    prompt: e.target.value
+                                  }
+                                }))
+                              }
+                              placeholder="E.g., Write a casual tweet about this."
+                            />
+                          </label>
+
+                          <label className="stack" style={{ gap: "0.35rem" }}>
+                            <span className="text-sm">Selection mode</span>
+                            <select
+                              value={draft.mode}
+                              onChange={(e) =>
+                                setWorkflowSettingsDraftByKey((prev) => ({
+                                  ...prev,
+                                  [activeWorkflowBotKey]: {
+                                    ...draft,
+                                    mode: (e.target.value === "random" ? "random" : "date_range") as FeedWorkflowMode
+                                  }
+                                }))
+                              }
+                            >
+                              <option value="date_range">Recent notes (date range)</option>
+                              <option value="random">Random notes</option>
+                            </select>
+                          </label>
+
+                          {draft.mode === "date_range" ? (
+                            <label className="stack" style={{ gap: "0.35rem" }}>
+                              <span className="text-sm">Days back</span>
+                              <input
+                                type="number"
+                                min={1}
+                                max={30}
+                                value={draft.days}
+                                onChange={(e) =>
+                                  setWorkflowSettingsDraftByKey((prev) => ({
+                                    ...prev,
+                                    [activeWorkflowBotKey]: {
+                                      ...draft,
+                                      days: Math.max(1, Math.min(30, Number(e.target.value || 1)))
+                                    }
+                                  }))
+                                }
+                              />
+                            </label>
+                          ) : (
+                            <label className="stack" style={{ gap: "0.35rem" }}>
+                              <span className="text-sm">Random file count</span>
+                              <input
+                                type="number"
+                                min={1}
+                                max={10}
+                                value={draft.randomCount}
+                                onChange={(e) =>
+                                  setWorkflowSettingsDraftByKey((prev) => ({
+                                    ...prev,
+                                    [activeWorkflowBotKey]: {
+                                      ...draft,
+                                      randomCount: Math.max(
+                                        1,
+                                        Math.min(10, Number(e.target.value || 1))
+                                      )
+                                    }
+                                  }))
+                                }
+                              />
+                            </label>
+                          )}
+
+                          <label className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
+                            <input
+                              type="checkbox"
+                              checked={draft.scheduleEnabled}
+                              onChange={(e) =>
+                                setWorkflowSettingsDraftByKey((prev) => ({
+                                  ...prev,
+                                  [activeWorkflowBotKey]: {
+                                    ...draft,
+                                    scheduleEnabled: e.target.checked
+                                  }
+                                }))
+                              }
+                            />
+                            <span className="text-sm">Run on schedule</span>
+                          </label>
+
+                          {draft.scheduleEnabled ? (
+                            <div className="stack" style={{ gap: "0.45rem" }}>
+                              <label className="stack" style={{ gap: "0.35rem" }}>
+                                <span className="text-sm">Frequency</span>
+                                <select
+                                  value={
+                                    ["0 * * * *", "0 9 * * *", "0 9 * * 1"].includes(draft.scheduleCron)
+                                      ? draft.scheduleCron
+                                      : "custom"
+                                  }
+                                  onChange={(e) => {
+                                    if (e.target.value !== "custom") {
+                                      setWorkflowSettingsDraftByKey((prev) => ({
+                                        ...prev,
+                                        [activeWorkflowBotKey]: {
+                                          ...draft,
+                                          scheduleCron: e.target.value
+                                        }
+                                      }))
+                                    }
+                                  }}
+                                >
+                                  <option value="0 * * * *">Every Hour</option>
+                                  <option value="0 9 * * *">Every Day at 9 AM</option>
+                                  <option value="0 9 * * 1">Every Monday at 9 AM</option>
+                                  <option value="custom">Custom...</option>
+                                </select>
+                              </label>
+                              {["0 * * * *", "0 9 * * *", "0 9 * * 1"].includes(draft.scheduleCron) ? null : (
+                                <label className="stack" style={{ gap: "0.35rem" }}>
+                                  <span className="text-sm">Custom Cron Expression</span>
+                                  <input
+                                    value={draft.scheduleCron}
+                                    onChange={(e) =>
+                                      setWorkflowSettingsDraftByKey((prev) => ({
+                                        ...prev,
+                                        [activeWorkflowBotKey]: {
+                                          ...draft,
+                                          scheduleCron: e.target.value
+                                        }
+                                      }))
+                                    }
+                                    placeholder="0 9 * * *"
+                                  />
+                                </label>
+                              )}
+                              <label className="stack" style={{ gap: "0.35rem" }}>
+                                <span className="text-sm">Timezone (optional)</span>
+                                <input
+                                  value={draft.scheduleTz}
+                                  onChange={(e) =>
+                                    setWorkflowSettingsDraftByKey((prev) => ({
+                                      ...prev,
+                                      [activeWorkflowBotKey]: {
+                                        ...draft,
+                                        scheduleTz: e.target.value
+                                      }
+                                    }))
+                                  }
+                                  placeholder="Europe/Berlin"
+                                />
+                              </label>
+                              <p className="text-sm muted">
+                                Cron format: minute hour day month weekday.
+                              </p>
+                            </div>
+                          ) : null}
+
+                          {saved?.commandPreview ? (
+                            <p className="text-sm muted">
+                              Command: <code>{saved.commandPreview}</code>
+                            </p>
+                          ) : null}
+
+                          <div className="feed-comment-actions">
+                            <button
+                              type="button"
+                              className="primary text-sm"
+                              style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
+                              onClick={() => void saveWorkflowSettings(activeWorkflowBotKey)}
+                              disabled={isSaving}
+                            >
+                              {isSaving ? "Saving..." : "Save Settings"}
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost text-sm"
+                              style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
+                              onClick={() => void loadFeedWorkflowSettings()}
+                              disabled={workflowSettingsLoading || isSaving}
+                            >
+                              Reload
+                            </button>
+                          </div>
+
+                          {status ? <div className="feed-comment-status">{status}</div> : null}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()
+                : null}
+
               {feedSource === "bluesky" ? (
                 blueskyFeedLoading ? (
                   <p className="text-center muted" style={{ padding: "2rem" }}>Loading Bluesky timeline...</p>
@@ -2131,41 +4837,84 @@ function App() {
                       const post = feedItem.post;
                       const author = post.author;
                       const record = post.record as any;
+                      const text = String(record?.text || "");
+                      const embedNode = renderBlueskyEmbed(post.embed as any);
+                      const facetLinks = Array.isArray(record?.facets)
+                        ? record.facets
+                            .flatMap((facet: any) =>
+                              Array.isArray(facet?.features) ? facet.features : []
+                            )
+                            .map((feature: any) => String(feature?.uri || "").trim())
+                            .filter((uri: string) => uri.startsWith("http://") || uri.startsWith("https://"))
+                        : [];
+                      const textLinks = Array.from(text.matchAll(/https?:\/\/[^\s]+/g)).map((match) =>
+                        String(match[0] || "").trim()
+                      );
+                      const fallbackLinks = Array.from(new Set([...facetLinks, ...textLinks]));
+                      const hasExternalEmbed =
+                        Boolean(post.embed && (post.embed as any).$type === "app.bsky.embed.external#view") ||
+                        Boolean(
+                          post.embed &&
+                            (post.embed as any).$type === "app.bsky.embed.recordWithMedia#view" &&
+                            (post.embed as any).media?.$type === "app.bsky.embed.external#view"
+                        );
                       return (
                         <div key={`${post.cid}-${idx}`} className="feed-item">
                           <div className="feed-header">
-                            <div className="feed-title" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                              {author.avatar && <img src={author.avatar} alt="" style={{ width: '24px', height: '24px', borderRadius: '50%', objectFit: "cover" }} />}
-                              <strong>{author.displayName || author.handle}</strong> <span className="muted text-sm" style={{ fontWeight: 'normal' }}>@{author.handle}</span>
+                            <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                              {author.avatar && <img src={author.avatar} alt="" style={{ width: "36px", height: "36px", borderRadius: "50%", objectFit: "cover" }} />}
+                              <div className="stack-sm" style={{ gap: "0.05rem" }}>
+                                <strong>{author.displayName || author.handle}</strong>
+                                <span className="muted text-sm" style={{ fontWeight: "normal" }}>
+                                  @{author.handle}
+                                </span>
+                              </div>
                             </div>
                             <div className="feed-time">{formatTimestamp(post.indexedAt)}</div>
                           </div>
-                          <div className="feed-body" style={{ marginTop: '8px', wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
-                            {record.text}
+                          <div className="feed-body" style={{ marginTop: "8px", wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
+                            {renderLinkedText(text)}
                           </div>
-                          {post.embed && post.embed.$type === "app.bsky.embed.images#view" && (
-                            <div className="feed-embed-images mt-2" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '0.5rem' }}>
-                              {(post.embed as any).images?.map((img: any, i: number) => (
-                                <img key={i} src={img.thumb || img.fullsize} alt={img.alt || "Embedded image"} style={{ width: '100%', height: '100%', maxHeight: '300px', objectFit: 'cover', borderRadius: '12px' }} />
+                          {embedNode}
+                          {!hasExternalEmbed && fallbackLinks.length > 0 ? (
+                            <div className="stack" style={{ gap: "0.5rem" }}>
+                              {fallbackLinks.map((url) => (
+                                <a
+                                  key={`${post.cid}-${url}`}
+                                  href={url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="bluesky-external-card"
+                                >
+                                  <div className="bluesky-external-body">
+                                    <div className="bluesky-external-title">{url}</div>
+                                    <div className="bluesky-external-domain">
+                                      {(() => {
+                                        try {
+                                          return new URL(url).hostname;
+                                        } catch {
+                                          return url;
+                                        }
+                                      })()}
+                                    </div>
+                                  </div>
+                                </a>
                               ))}
                             </div>
-                          )}
-                          <div className="feed-stats row text-sm muted mt-2" style={{ gap: '1rem', marginTop: '0.8rem' }}>
-                            <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                          ) : null}
+                          <div className="feed-stats row text-sm muted mt-2" style={{ gap: "1rem", marginTop: "0.8rem" }}>
+                            <span style={{ display: "flex", alignItems: "center", gap: "0.3rem" }}>
                               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
                               {post.replyCount || 0}
                             </span>
-                            <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                            <span style={{ display: "flex", alignItems: "center", gap: "0.3rem" }}>
                               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 1l4 4-4 4"></path><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><path d="M7 23l-4-4 4-4"></path><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
                               {post.repostCount || 0}
                             </span>
-                            <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                            <span style={{ display: "flex", alignItems: "center", gap: "0.3rem" }}>
                               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
                               {post.likeCount || 0}
                             </span>
-                          </div>
-                          <div className="feed-actions">
-                            <a href={`https://bsky.app/profile/${author.handle}/post/${post.uri.split("/").pop()}`} target="_blank" rel="noreferrer" className="ghost text-sm" style={{ textDecoration: "none", padding: "0.2rem 0.5rem" }}>View on Bluesky</a>
                           </div>
                         </div>
                       );
@@ -2176,76 +4925,152 @@ function App() {
                 <p className="text-center muted">No items in your workspace feed yet.</p>
               ) : (
                 <div className="stack">
-                  {feedItems.map(item => (
-                    <div key={item.path} className="feed-item">
-                      <div className="feed-header">
-                        <div className="feed-title">{item.title}</div>
-                        <div className="feed-time">{formatTimestamp(item.modifiedAt)}</div>
-                      </div>
-                      <div className="feed-body">
-                        {item.previewText ? item.previewText : <span className="muted">[{item.kind.toUpperCase()} File attached]</span>}
-                      </div>
-                      <div className="feed-actions">
-                        {(item.kind === "text" || item.kind === "video") && (
+                  {feedItems.map(item => {
+                    const workflowBot = workflowBotForPath(item.path, workflowBots);
+                    const isCommentOpen = activeFeedCommentPath === item.path;
+                    const commentDraft = feedCommentDrafts[item.path] || "";
+                    const commentStatus = feedCommentStatusByPath[item.path] || "";
+                    const isCommentSubmitting = submittingFeedCommentPath === item.path;
+                    const isDraftLoading = !!feedDraftLoadingByPath[item.path];
+                    const inlineDraft = feedDraftsByPath[item.path];
+                    const inlineText = inlineDraft ?? item.previewText ?? item.title;
+                    const canEditInline = item.kind === "text" || item.kind === "audio" || item.kind === "video";
+                    return (
+                      <div key={item.path} className="feed-item feed-item-card">
+                        <div className="feed-header">
+                          <div className="feed-title stack-sm">
+                            {workflowBot && (
+                              <button
+                                type="button"
+                                className="feed-bot-chip"
+                                onClick={() => {
+                                  openWorkflowSettingsForBot(workflowBot.key);
+                                }}
+                                title={`Open ${workflowBot.name} settings`}
+                              >
+                                <span className="feed-bot-avatar">{workflowBot.avatar}</span>
+                                <span>{workflowBot.name}</span>
+                              </button>
+                            )}
+                            <span>{item.title}</span>
+                          </div>
+                          <div className="feed-time">{formatTimestamp(item.modifiedAt)}</div>
+                        </div>
+                        {canEditInline ? (
+                          <textarea
+                            rows={1}
+                            className="feed-inline-editor"
+                            value={inlineText}
+                            ref={(node) => {
+                              if (!node) {
+                                return;
+                              }
+                              node.style.height = "0px";
+                              node.style.height = `${node.scrollHeight}px`;
+                            }}
+                            onChange={(e) => {
+                              e.target.style.height = "0px";
+                              e.target.style.height = `${e.target.scrollHeight}px`;
+                              updateFeedDraft(item, e.target.value);
+                            }}
+                            placeholder={isDraftLoading ? "Loading post..." : "Write your post"}
+                            disabled={isDraftLoading}
+                          />
+                        ) : (
+                          <div className="feed-body">
+                            {item.previewText ? item.previewText : <span className="muted">[{item.kind.toUpperCase()} File attached]</span>}
+                          </div>
+                        )}
+                        <div className="feed-actions">
+                          {(item.kind === "text" || item.kind === "video") && (
+                            <button
+                              type="button"
+                              className="primary text-sm"
+                              style={{ padding: '0.4rem 0.8rem', borderRadius: '8px' }}
+                              onClick={() => void postFeedItemToBluesky(item)}
+                              disabled={postingFeedPath === item.path || !!isPathPosted(item.path)}
+                            >
+                              {isPathPosted(item.path)
+                                ? "Posted"
+                                : postingFeedPath === item.path
+                                  ? "Posting..."
+                                  : "Like & Post"}
+                            </button>
+                          )}
+                          {workflowBot && (
+                            <button
+                              type="button"
+                              className="ghost text-sm"
+                              style={{ padding: '0.4rem 0.8rem', borderRadius: '8px' }}
+                              onClick={() => toggleFeedCommentComposer(item.path)}
+                            >
+                              {isCommentOpen ? "Hide Comment" : "Comment"}
+                            </button>
+                          )}
                           <button
                             type="button"
-                            className="primary text-sm"
-                            style={{ padding: '0.4rem 0.8rem', borderRadius: '8px' }}
-                            onClick={() => void postFeedItemToBluesky(item)}
-                            disabled={postingFeedPath === item.path || !!postedPaths[item.path]}
+                            className="ghost text-sm"
+                            style={{ padding: '0.4rem 0.8rem', borderRadius: '8px', color: 'var(--error)' }}
+                            onClick={() => setPendingDeleteFeedItem(item)}
                           >
-                            {postedPaths[item.path]
-                              ? "Posted"
-                              : postingFeedPath === item.path
-                                ? "Posting..."
-                                : "Like & Post"}
+                            Delete
                           </button>
-                        )}
-                        <button
-                          type="button"
-                          className="ghost text-sm"
-                          style={{ padding: '0.4rem 0.8rem', borderRadius: '8px' }}
-                          onClick={() => void openLibraryItem(item, "feed")}
-                        >
-                          View Details
-                        </button>
-                      </div>
-
-                      {selectedFeedItem?.path === item.path && mediaPreviewUrl && (
-                        <div className="stack mt-2">
-                          {selectedFeedItem.kind === "video" && (
-                            <video controls src={mediaPreviewUrl} className="media-viewer" />
-                          )}
-                          {selectedFeedItem.kind === "audio" && (
-                            <audio controls src={mediaPreviewUrl} style={{ width: '100%' }} />
-                          )}
-                          {selectedFeedItem.kind === "image" && (
-                            <img src={mediaPreviewUrl} alt="" className="media-viewer" />
-                          )}
                         </div>
-                      )}
 
-                      {selectedFeedItem?.path === item.path && selectedFeedItem.kind === "text" && (
-                        <textarea
-                          rows={6}
-                          value={selectedFeedText}
-                          onChange={(e) => setSelectedFeedText(e.target.value)}
-                          style={{ marginTop: '0.5rem' }}
-                        />
-                      )}
-                      {postProgress?.path === item.path && (
-                        <div className="post-progress-wrap">
-                          <div className="post-progress-text">{postProgress.label}</div>
-                          <div className="post-progress-track">
-                            <div
-                              className="post-progress-fill"
-                              style={{ width: `${Math.max(0, Math.min(100, postProgress.percent))}%` }}
-                            />
+                        <div className={`feed-comment-panel ${isCommentOpen ? "open" : ""}`}>
+                          {isCommentOpen && (
+                            <>
+                              <textarea
+                                rows={3}
+                                className="feed-comment-input"
+                                placeholder={`Comment to modify ${workflowBot?.name || "workflow"}...`}
+                                value={commentDraft}
+                                onChange={(e) =>
+                                  setFeedCommentDrafts((prev) => ({
+                                    ...prev,
+                                    [item.path]: e.target.value
+                                  }))
+                                }
+                              />
+                              <div className="feed-comment-actions">
+                                <button
+                                  type="button"
+                                  className="primary text-sm"
+                                  style={{ padding: '0.35rem 0.75rem', borderRadius: '8px' }}
+                                  onClick={() => void submitWorkflowCommentForFeedItem(item)}
+                                  disabled={isCommentSubmitting}
+                                >
+                                  {isCommentSubmitting ? "Sending..." : "Send Comment"}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="ghost text-sm"
+                                  style={{ padding: '0.35rem 0.75rem', borderRadius: '8px' }}
+                                  onClick={() => setActiveFeedCommentPath("")}
+                                  disabled={isCommentSubmitting}
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </>
+                          )}
+                          {commentStatus ? <div className="feed-comment-status">{commentStatus}</div> : null}
+                        </div>
+
+                        {postProgress?.path === item.path && (
+                          <div className="post-progress-wrap">
+                            <div className="post-progress-text">{postProgress.label}</div>
+                            <div className="post-progress-track">
+                              <div
+                                className="post-progress-fill"
+                                style={{ width: `${Math.max(0, Math.min(100, postProgress.percent))}%` }}
+                              />
+                            </div>
                           </div>
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                        )}
+                      </div>
+                    );
+                  })}
                   {postedHistory.length > 0 && (
                     <div className="posted-history">
                       <button
@@ -2338,6 +5163,79 @@ function App() {
         {mobileTab === "profile" ? (
           <div className="stack">
             <div className="card">
+              <div className="row-between">
+                <h2>Configuration</h2>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => void loadRuntimeConfigForSettings()}
+                  disabled={settingsConfigBusy}
+                >
+                  Refresh
+                </button>
+              </div>
+              <div className="stack">
+                <input
+                  value={settingsProvider}
+                  onChange={(e) => setSettingsProvider(e.target.value)}
+                  placeholder="Default provider (e.g. openrouter, ollama, openai)"
+                  disabled={settingsConfigBusy}
+                />
+                <input
+                  value={settingsModel}
+                  onChange={(e) => setSettingsModel(e.target.value)}
+                  placeholder="Default model"
+                  disabled={settingsConfigBusy}
+                />
+                <label className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
+                  <input
+                    type="checkbox"
+                    checked={settingsTranscriptionEnabled}
+                    onChange={(e) => setSettingsTranscriptionEnabled(e.target.checked)}
+                    disabled={settingsConfigBusy}
+                  />
+                  <span className="text-sm">Enable transcription</span>
+                </label>
+                <label className="stack" style={{ gap: "0.4rem" }}>
+                  <span className="text-sm">Transcription model</span>
+                  {settingsAvailableTranscriptionModels.length === 0 ? (
+                    <p className="text-sm muted">
+                      No local transcription models detected yet.
+                    </p>
+                  ) : null}
+                  <select
+                    value={settingsTranscriptionModel}
+                    onChange={(e) => setSettingsTranscriptionModel(e.target.value)}
+                    disabled={
+                      settingsConfigBusy ||
+                      settingsAvailableTranscriptionModels.length === 0
+                    }
+                  >
+                    {settingsAvailableTranscriptionModels.map((modelName) => (
+                      <option key={modelName} value={modelName}>
+                        {modelName}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-sm muted">
+                    Only locally available models are listed to avoid downloads.
+                  </p>
+                </label>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => void saveRuntimeConfigFromSettings()}
+                  disabled={settingsConfigBusy}
+                >
+                  {settingsConfigBusy ? "Saving..." : "Save Configuration"}
+                </button>
+                {settingsConfigStatus ? (
+                  <p className="text-sm muted">{settingsConfigStatus}</p>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="card">
               <h2>Bluesky Login (Desktop)</h2>
               <form className="stack" onSubmit={handleLogin}>
                 <p className="text-sm muted">Service: {creds.serviceUrl || "https://bsky.social"}</p>
@@ -2373,144 +5271,136 @@ function App() {
               </form>
             </div>
 
-            <div className="card">
-              <h2>Gateway & App Settings</h2>
-              <div className="stack">
-                <p className="text-sm muted">
-                  Chat and journal upload use desktop gateway auth automatically.
-                </p>
+            {isDesktopClient && (
+              <>
+                <div className="card">
+                  <h2>Gateway & App Settings</h2>
+                  <div className="stack">
+                    <p className="text-sm muted">
+                      Chat and journal upload use desktop gateway auth automatically.
+                    </p>
 
-                <p className="text-sm muted">
-                  {chatGatewayToken
-                    ? "Gateway auth is ready for chat + journal uploads."
-                    : "Waiting for desktop gateway auth bootstrap."}
-                </p>
+                    <p className="text-sm muted">
+                      {chatGatewayToken
+                        ? "Gateway auth is ready for chat + journal uploads."
+                        : "Waiting for desktop gateway auth bootstrap."}
+                    </p>
 
-                {isDesktopClient && (
-                  <div className="stack" style={{ gap: "0.8rem" }}>
-                    <div className="row-between">
-                      <p><strong>Pair Mobile With QR</strong></p>
-                      <button
-                        type="button"
-                        onClick={() => void generateDesktopPairingQr()}
-                        disabled={desktopQrLoading}
-                      >
-                        {desktopQrLoading ? "Generating..." : "Generate QR"}
-                      </button>
-                    </div>
-                    {desktopQrPayload && (
-                      <div className="stack" style={{ alignItems: "center", gap: "0.6rem" }}>
-                        <QRCodeCanvas value={desktopQrPayload.qr_value} size={220} includeMargin />
-                        <p className="text-sm muted text-center">
-                          Mobile gateway: {desktopQrPayload.gateway_url}
-                        </p>
+                    <div className="stack" style={{ gap: "0.8rem" }}>
+                      <div className="row-between">
+                        <p><strong>Pair Mobile With QR</strong></p>
+                        <button
+                          type="button"
+                          onClick={() => void generateDesktopPairingQr()}
+                          disabled={desktopQrLoading}
+                        >
+                          {desktopQrLoading ? "Generating..." : "Generate QR"}
+                        </button>
                       </div>
-                    )}
-                    {desktopQrStatus ? <p className="text-sm muted">{desktopQrStatus}</p> : null}
+                      {desktopQrPayload && (
+                        <div className="stack" style={{ alignItems: "center", gap: "0.6rem" }}>
+                          <Suspense fallback={<div className="text-sm muted text-center" style={{ width: 220, height: 220, display: "flex", alignItems: "center", justifyContent: "center" }}>Loading...</div>}>
+                            <QRCodeCanvas value={desktopQrPayload.qr_value} size={220} includeMargin />
+                          </Suspense>
+                          <p className="text-sm muted text-center">
+                            Mobile gateway: {desktopQrPayload.gateway_url}
+                          </p>
+                        </div>
+                      )}
+                      {desktopQrStatus ? <p className="text-sm muted">{desktopQrStatus}</p> : null}
+                    </div>
                   </div>
-                )}
-                <p className="text-sm muted">
-                  {pbAuthMessage}
-                </p>
-                {pb.authStore.isValid && pbAuthLabel ? (
-                  <div className="badge success text-center" style={{ alignSelf: "flex-start" }}>
-                    PocketBase: {pbAuthLabel}
-                  </div>
-                ) : null}
-              </div>
-            </div>
+                </div>
 
-            <div className="card">
-              <div className="row-between">
-                <h2>AI Setup</h2>
-                <button
-                  type="button"
-                  onClick={() => void startOpenAiDeviceCodeLogin()}
-                  disabled={aiSetupBusy || !!aiSetupStatus?.running || !isDesktopClient}
-                >
-                  {aiSetupBusy
-                    ? "Starting..."
-                    : aiSetupStatus?.running
-                      ? "In Progress..."
-                      : "Start OpenAI Device Login"}
-                </button>
-              </div>
-              {!isDesktopClient ? (
-                <p className="text-sm muted">AI setup runs on desktop only. Use the desktop app for this step.</p>
-              ) : (
-                <div className="stack">
-                  <p className="text-sm muted">
-                    Starts `slowclaw auth login --provider openai-codex --device-code` and waits for completion.
-                  </p>
-                  <div className="stack" style={{ gap: "0.4rem" }}>
-                    <p className="text-sm"><strong>Provider API Key (Optional)</strong></p>
-                    <input
-                      type="password"
-                      value={providerApiKey}
-                      onChange={(e) => setProviderApiKey(e.target.value)}
-                      placeholder="Optional: set ZEROCLAW_API_KEY for daemon"
-                    />
+                <div className="card">
+                  <div className="row-between">
+                    <h2>AI Setup</h2>
                     <button
                       type="button"
-                      className="ghost"
-                      onClick={() => void saveOptionalProviderApiKey()}
+                      onClick={() => void startOpenAiDeviceCodeLogin()}
+                      disabled={aiSetupBusy || !!aiSetupStatus?.running}
                     >
-                      Save API Key
+                      {aiSetupBusy
+                        ? "Starting..."
+                        : aiSetupStatus?.running
+                          ? "In Progress..."
+                          : "Start OpenAI Device Login"}
                     </button>
-                    {providerApiKeyStatus ? (
-                      <p className="text-sm muted">{providerApiKeyStatus}</p>
-                    ) : null}
                   </div>
-                  <div className="badge text-center" style={{ alignSelf: "flex-start" }}>
-                    State: {aiSetupStatus?.state || "idle"}
-                  </div>
-                  <p className="text-sm">{aiSetupStatus?.message || "Not started."}</p>
-                  {aiSetupStatus?.verificationUrl ? (
-                    <p className="text-sm">
-                      URL:{" "}
-                      <a href={aiSetupStatus.verificationUrl} target="_blank" rel="noreferrer">
-                        {aiSetupStatus.verificationUrl}
-                      </a>
+                  <div className="stack">
+                    <p className="text-sm muted">
+                      Starts `slowclaw auth login --provider openai-codex --device-code` and waits for completion.
                     </p>
-                  ) : null}
-                  {aiSetupStatus?.fastLink ? (
-                    <p className="text-sm">
-                      Fast Link:{" "}
-                      <a href={aiSetupStatus.fastLink} target="_blank" rel="noreferrer">
-                        {aiSetupStatus.fastLink}
-                      </a>
-                    </p>
-                  ) : null}
-                  {aiSetupStatus?.userCode ? (
-                    <div className="row" style={{ alignItems: "center" }}>
-                      <input value={aiSetupStatus.userCode} readOnly style={{ flex: 1 }} />
+                    <div className="stack" style={{ gap: "0.4rem" }}>
+                      <p className="text-sm"><strong>Provider API Key (Optional)</strong></p>
+                      <input
+                        type="password"
+                        value={providerApiKey}
+                        onChange={(e) => setProviderApiKey(e.target.value)}
+                        placeholder="Optional: set ZEROCLAW_API_KEY for daemon"
+                      />
                       <button
                         type="button"
                         className="ghost"
-                        onClick={() => void navigator.clipboard.writeText(aiSetupStatus.userCode || "")}
+                        onClick={() => void saveOptionalProviderApiKey()}
                       >
-                        Copy Code
+                        Save API Key
                       </button>
+                      {providerApiKeyStatus ? (
+                        <p className="text-sm muted">{providerApiKeyStatus}</p>
+                      ) : null}
                     </div>
-                  ) : null}
-                  {aiSetupStatus?.completed ? (
-                    <p className="text-sm" style={{ color: "var(--success)" }}>
-                      OpenAI auth is complete and saved to the app workspace.
-                    </p>
-                  ) : null}
-                  {aiSetupStatus?.error ? (
-                    <p className="text-sm" style={{ color: "var(--danger)" }}>
-                      {aiSetupStatus.error}
-                    </p>
-                  ) : null}
+                    <div className="badge text-center" style={{ alignSelf: "flex-start" }}>
+                      State: {aiSetupStatus?.state || "idle"}
+                    </div>
+                    <p className="text-sm">{aiSetupStatus?.message || "Not started."}</p>
+                    {aiSetupStatus?.verificationUrl ? (
+                      <p className="text-sm">
+                        URL:{" "}
+                        <a href={aiSetupStatus.verificationUrl} target="_blank" rel="noreferrer">
+                          {aiSetupStatus.verificationUrl}
+                        </a>
+                      </p>
+                    ) : null}
+                    {aiSetupStatus?.fastLink ? (
+                      <p className="text-sm">
+                        Fast Link:{" "}
+                        <a href={aiSetupStatus.fastLink} target="_blank" rel="noreferrer">
+                          {aiSetupStatus.fastLink}
+                        </a>
+                      </p>
+                    ) : null}
+                    {aiSetupStatus?.userCode ? (
+                      <div className="row" style={{ alignItems: "center" }}>
+                        <input value={aiSetupStatus.userCode} readOnly style={{ flex: 1 }} />
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() => void navigator.clipboard.writeText(aiSetupStatus.userCode || "")}
+                        >
+                          Copy Code
+                        </button>
+                      </div>
+                    ) : null}
+                    {aiSetupStatus?.completed ? (
+                      <p className="text-sm" style={{ color: "var(--success)" }}>
+                        OpenAI auth is complete and saved to the app workspace.
+                      </p>
+                    ) : null}
+                    {aiSetupStatus?.error ? (
+                      <p className="text-sm" style={{ color: "var(--danger)" }}>
+                        {aiSetupStatus.error}
+                      </p>
+                    ) : null}
+                  </div>
                 </div>
-              )}
-            </div>
+              </>
+            )}
           </div>
         ) : null}
       </main>
 
-      {(!isWritingNote && !isRecording) && (
+      {!hideChrome && (
         <nav className="bottom-nav">
           <button
             type="button"
@@ -2535,14 +5425,6 @@ function App() {
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
             Chat
-          </button>
-          <button
-            type="button"
-            className={mobileTab === "profile" ? "active" : ""}
-            onClick={() => setMobileTab("profile")}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
-            Settings
           </button>
         </nav>
       )}

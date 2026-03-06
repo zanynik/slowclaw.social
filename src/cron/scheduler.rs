@@ -4,7 +4,7 @@ use crate::cron::{
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
 use std::process::Stdio;
@@ -170,7 +170,6 @@ async fn run_agent_job(
                 None,
                 model_override,
                 config.default_temperature,
-                vec![],
                 false,
             )
             .await
@@ -301,16 +300,6 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return deliver_announcement(config, channel, target, output).await;
     }
 
-    if mode.eq_ignore_ascii_case("pocketbase") {
-        let collection = delivery
-            .to
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("cron_runs");
-        return deliver_pocketbase_cron_record(config, job, output, collection).await;
-    }
-
     anyhow::bail!("unsupported delivery mode: {mode}")
 }
 
@@ -335,118 +324,6 @@ pub(crate) async fn deliver_announcement(
             .await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
-    }
-
-    Ok(())
-}
-
-async fn deliver_pocketbase_cron_record(
-    config: &Config,
-    job: &CronJob,
-    output: &str,
-    collection: &str,
-) -> Result<()> {
-    let collection_trimmed = collection.trim();
-    if collection_trimmed.eq_ignore_ascii_case("chat_messages") {
-        let thread_id = job
-            .delivery
-            .channel
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "PocketBase chat delivery requires delivery.channel=<threadId> when delivery.to=chat_messages"
-                )
-            })?;
-        let now = Utc::now().to_rfc3339();
-        let content = if output.trim().is_empty() {
-            "Scheduled task executed".to_string()
-        } else {
-            output.trim().to_string()
-        };
-        let payload = serde_json::json!({
-            "threadId": thread_id,
-            "role": "assistant",
-            "content": content,
-            "status": "done",
-            "source": "slowclaw-cron",
-            "createdAtClient": now.clone(),
-            "processedAt": now,
-        });
-        return post_pocketbase_record("chat_messages", payload).await;
-    }
-
-    let payload = serde_json::json!({
-        "source": "slowclaw-cron",
-        "job_id": job.id.clone(),
-        "job_name": job.name.clone(),
-        "job_type": match &job.job_type {
-            JobType::Shell => "shell",
-            JobType::Agent => "agent",
-        },
-        "command": if job.command.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(job.command.clone()) },
-        "prompt": job.prompt.clone(),
-        "schedule": serde_json::to_value(&job.schedule).unwrap_or(serde_json::Value::Null),
-        "workspace": config.workspace_dir.display().to_string(),
-        "output": output,
-        "created_at": Utc::now().to_rfc3339(),
-    });
-    post_pocketbase_record(collection_trimmed, payload).await
-}
-
-fn pocketbase_base_url() -> Result<String> {
-    let raw = std::env::var("ZEROCLAW_POCKETBASE_URL")
-        .or_else(|_| std::env::var("POCKETBASE_URL"))
-        .unwrap_or_else(|_| {
-            let host = std::env::var("ZEROCLAW_POCKETBASE_HOST")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "127.0.0.1".to_string());
-            let port = std::env::var("ZEROCLAW_POCKETBASE_PORT")
-                .ok()
-                .and_then(|v| v.trim().parse::<u16>().ok())
-                .unwrap_or(8090);
-            format!("http://{host}:{port}")
-        });
-    let trimmed = raw.trim().trim_end_matches('/').to_string();
-    if trimmed.is_empty() {
-        anyhow::bail!("PocketBase URL is empty");
-    }
-    Ok(trimmed)
-}
-
-fn pocketbase_token() -> Option<String> {
-    std::env::var("ZEROCLAW_POCKETBASE_TOKEN")
-        .ok()
-        .or_else(|| std::env::var("POCKETBASE_TOKEN").ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-async fn post_pocketbase_record(collection: &str, payload: serde_json::Value) -> Result<()> {
-    let base_url = pocketbase_base_url()?;
-    let collection = collection.trim();
-    if collection.is_empty() {
-        anyhow::bail!("PocketBase collection is required");
-    }
-
-    let url = format!("{base_url}/api/collections/{collection}/records");
-    let client = reqwest::Client::new();
-    let mut request = client.post(url).json(&payload);
-    if let Some(token) = pocketbase_token() {
-        request = request.bearer_auth(token);
-    }
-
-    let response = request
-        .send()
-        .await
-        .context("PocketBase request failed")?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("PocketBase write failed ({status}): {}", body.trim());
     }
 
     Ok(())
@@ -516,15 +393,30 @@ async fn run_workspace_script_with_timeout(
         );
     }
 
-    let child = match Command::new(&resolved)
-        .args(&invocation.args)
+    let mut cmd = Command::new(&resolved);
+    cmd.args(&invocation.args)
         .current_dir(&config.workspace_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let mut path_items: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+                .map(|raw| std::env::split_paths(&raw).collect())
+                .unwrap_or_default();
+            if !path_items.iter().any(|item| item == exe_dir) {
+                path_items.insert(0, exe_dir.to_path_buf());
+            }
+            if let Ok(joined) = std::env::join_paths(path_items) {
+                cmd.env("PATH", joined);
+            }
+        }
+        cmd.env("ZEROCLAW_AGENT_BIN", exe_path);
+    }
+
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             return (

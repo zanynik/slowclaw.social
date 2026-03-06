@@ -4,7 +4,7 @@ A stripped-down fork of SlowClaw focused on one job:
 
 - run in a single workspace
 - execute/schedule workspace scripts
-- write results to PocketBase
+- persist app data locally in SQLite
 - serve a simple bundled web UI
 
 The binary name is `slowclaw`.
@@ -16,9 +16,9 @@ The binary name is `slowclaw`.
 - Cron scheduling
 - `workspace-script <relative/path>` scheduled command support
 - PocketBase delivery for cron/heartbeat output
-- PocketBase sidecar auto-start (if `pocketbase` binary is available)
+- Gateway-managed local SQLite store for chat/drafts/history metadata
 - `memory/` folder structure (unchanged)
-- Bundled web UI (replaced with the MySky/PocketBase-based frontend)
+- Bundled web UI (local-first gateway API frontend)
 
 ## What This Fork Removes
 
@@ -47,26 +47,12 @@ Minimum recommendation:
 Required:
 
 - Rust toolchain (`rustc`, `cargo`)
-- PocketBase binary (optional but strongly recommended for this fork's default flow)
 
 Optional (for rebuilding the web UI):
 
 - Node.js 18+
 
-### 2. Place PocketBase binary
-
-The gateway can auto-start PocketBase if it finds a binary in one of these locations:
-
-- `./pocketbase/pocketbase`
-- `./pocketbase/pocketbase.exe` (Windows)
-- `PATH`
-- `ZEROCLAW_POCKETBASE_BIN=/absolute/path/to/pocketbase`
-
-The sidecar will store data in:
-
-- `./pb_data/`
-
-### 3. Build
+### 2. Build
 
 ```bash
 cargo build --release
@@ -78,7 +64,7 @@ Binary path:
 ./target/release/slowclaw
 ```
 
-### 4. Run the gateway (serves UI + starts PocketBase sidecar if available)
+### 3. Run the gateway (serves UI + starts local store)
 
 ```bash
 ./target/release/slowclaw gateway
@@ -88,7 +74,7 @@ Open:
 
 - `http://127.0.0.1:8080/` (or your configured gateway port)
 
-The gateway startup log prints the actual UI URL and whether PocketBase sidecar started.
+The gateway startup log prints the actual UI URL and local store path.
 
 Recommended for full scheduling + chat worker runtime:
 
@@ -96,7 +82,7 @@ Recommended for full scheduling + chat worker runtime:
 ./target/release/slowclaw daemon
 ```
 
-### 5. Pair and send a webhook prompt (optional)
+### 4. Pair and send a webhook prompt (optional)
 
 If pairing is enabled, use the startup pairing code:
 
@@ -113,7 +99,22 @@ curl -X POST http://127.0.0.1:8080/webhook \
   -d '{"message":"hello"}'
 ```
 
-### 6. Generate a new pairing code without logging out existing clients
+### Workspace path recommendation (journals, media, artifacts)
+
+Use a stable config/workspace root so files are easy to find:
+
+```bash
+export ZEROCLAW_CONFIG_DIR="$HOME/.zeroclaw"
+```
+
+Avoid pointing `ZEROCLAW_WORKSPACE` at temporary directories (`/tmp`, OS temp folders).  
+By default, temp workspace overrides are ignored unless you explicitly opt in with:
+
+```bash
+export ZEROCLAW_ALLOW_TEMP_WORKSPACE=1
+```
+
+### 5. Generate a new pairing code without logging out existing clients
 
 Use this when Mac is already paired and you want to pair phone too.
 
@@ -134,29 +135,18 @@ Notes:
 - `config.toml` stores hashed tokens, not plaintext bearer tokens.
 - You can copy the current token from the web UI: Profile -> Gateway & App Settings -> Show Token / Copy Token.
 
-## PocketBase Setup
+## Local Store Migration
 
-This fork now includes PocketBase project assets copied from the merged UI project:
+On first gateway boot, SlowClaw initializes `state/local_data.db` and automatically checks for
+legacy PocketBase data directories (including `Application Support/.../pocketbase/pb_data`).
 
-- `pb_migrations/`
-- `pocketbase/collections.example.json`
-- `scripts/pb-bootstrap.mjs`
+If found, it imports legacy records (`chat_messages`, `drafts`, `post_history`,
+`journal_entries`, `media_assets`, `artifacts`) before serving traffic.
 
-Environment variables:
-
-- `ZEROCLAW_POCKETBASE_DISABLE=1` disable sidecar auto-start
-- `ZEROCLAW_POCKETBASE_BIN=/path/to/pocketbase` choose binary
-- `ZEROCLAW_POCKETBASE_HOST=127.0.0.1` override host
-- `ZEROCLAW_POCKETBASE_PORT=8090` override port
-- `ZEROCLAW_POCKETBASE_URL=http://127.0.0.1:8090` cron delivery target
-- `ZEROCLAW_POCKETBASE_TOKEN=...` optional auth token for writes
-- `ZEROCLAW_POCKETBASE_COLLECTION=cron_runs` optional collection name
-
-Bootstrap/create collections (including `chat_messages`) after PocketBase is running:
+Optional override for migration source:
 
 ```bash
-cd web
-PB_URL=http://127.0.0.1:8090 PB_EMAIL=admin@example.com PB_PASSWORD='your-admin-password' npm run pb:bootstrap
+ZEROCLAW_LEGACY_POCKETBASE_DATA_DIR=/absolute/path/to/pb_data ./target/release/slowclaw gateway
 ```
 
 ## Scheduling Workspace Scripts
@@ -190,7 +180,7 @@ Notes:
 
 ## Web UI (Merged From `phone_app_mysky`)
 
-The bundled UI is now a PocketBase-backed React app (replacing the old dashboard).
+The bundled UI is now a local-first React app backed by gateway APIs (replacing the old dashboard).
 
 To rebuild the UI bundle:
 
@@ -292,9 +282,9 @@ Removed from the gateway surface in this fork:
 ## Project Layout (Important Directories)
 
 - `memory/` — agent memory structure (kept intact for future use)
-- `pb_data/` — PocketBase runtime data
-- `pb_migrations/` — PocketBase migrations
-- `pocketbase/` — PocketBase binary/schema assets
+- `pb_data/` — legacy PocketBase runtime data (auto-import source)
+- `pb_migrations/` — legacy PocketBase migrations
+- `pocketbase/` — legacy PocketBase binary/schema assets
 - `web/` — bundled web UI source/build
 - `scripts/` — workspace scripts you schedule
 

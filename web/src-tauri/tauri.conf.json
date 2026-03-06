@@ -14,9 +14,10 @@
       {
         "label": "main",
         "title": "SlowClaw Social",
-        "width": 420,
+        "width": 1180,
         "height": 900,
-        "resizable": true
+        "resizable": true,
+        "visible": false
       }
     ],
     "security": {
@@ -28,6 +29,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "externalBin": []
   }
 }

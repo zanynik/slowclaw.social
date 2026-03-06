@@ -52,18 +52,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # Observability - Prometheus metrics
 prometheus = { version = "0.14", default-features = false }
 
-# Base64 encoding (screenshots, image data)
+# Base64 encoding (multimodal payload handling)
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # URL encoding for web search
 urlencoding = "2.1"
 
-# HTML to plain text conversion (web_fetch tool)
-nanohtml2text = "0.2"
-
-# Optional Rust-native browser automation backend
-fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
 
 # Error handling
 anyhow = "1.0"
@@ -119,7 +113,7 @@ rustls = "0.23"
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "macros"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
-tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout", "fs"] }
+tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout", "fs", "cors"] }
 http-body-util = "0.1"
 
 # Embed frontend assets into binary (web dashboard)
@@ -134,23 +128,8 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 
-# Serial port for peripheral communication (STM32, etc.)
-tokio-serial = { version = "5", default-features = false, optional = true }
-
-# USB device enumeration (hardware discovery) — only on platforms nusb supports
-# (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
-[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-nusb = { version = "0.2", default-features = false, optional = true }
-
-# probe-rs for STM32/Nucleo memory read (Phase B)
-probe-rs = { version = "0.31", optional = true }
-
-# PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
-pdf-extract = { version = "0.10", optional = true }
-
 # Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
-rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
 # Unix-specific dependencies (for root check, etc.)
@@ -159,25 +138,21 @@ libc = "0.2"
 
 [features]
 default = []
-hardware = ["nusb", "tokio-serial"]
+hardware = []
 channel-matrix = []
 channel-lark = []
 memory-postgres = ["dep:postgres"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
-peripheral-rpi = ["rppal"]
-# Browser backend feature alias used by cfg(feature = "browser-native")
-browser-native = ["dep:fantoccini"]
-# Backward-compatible alias for older invocations
-fantoccini = ["browser-native"]
+peripheral-rpi = []
+browser-native = []
+fantoccini = []
 # Sandbox feature aliases used by cfg(feature = "sandbox-*")
 sandbox-landlock = ["dep:landlock"]
 sandbox-bubblewrap = []
 # Backward-compatible alias for older invocations
 landlock = ["sandbox-landlock"]
-# probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
-probe = ["dep:probe-rs"]
-# rag-pdf = PDF ingestion for datasheet RAG
-rag-pdf = ["dep:pdf-extract"]
+probe = []
+rag-pdf = []
 # whatsapp-web feature retained as no-op for CLI/config compatibility in this fork
 whatsapp-web = []
 

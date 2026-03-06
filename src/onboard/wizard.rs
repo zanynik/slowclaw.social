@@ -4,10 +4,10 @@ use crate::config::schema::{
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    HeartbeatConfig, HardwareConfig, HardwareTransport, IMessageConfig, LarkConfig, MatrixConfig,
+    MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig,
+    TelegramConfig, WebhookConfig,
 };
-use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
 };
@@ -135,14 +135,18 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         default_provider: Some(provider),
         default_model: Some(model),
         model_providers: std::collections::HashMap::new(),
-        default_temperature: 0.7,
+        provider: crate::config::schema::ProviderConfig::default(),
+        default_temperature: 0.2,
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
-        agent: crate::config::schema::AgentConfig::default(),
+        agent: crate::config::schema::AgentConfig {
+            parallel_tools: true,
+            ..crate::config::schema::AgentConfig::default()
+        },
         skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
@@ -463,7 +467,7 @@ async fn run_quick_setup_with_home(
         .await
         .context("Failed to create workspace directory")?;
 
-    let provider_name = provider.unwrap_or("openrouter").to_string();
+    let provider_name = provider.unwrap_or("openai-codex").to_string();
     let model = model_override
         .map(str::to_string)
         .unwrap_or_else(|| default_model_for_provider(&provider_name));
@@ -486,14 +490,18 @@ async fn run_quick_setup_with_home(
         default_provider: Some(provider_name.clone()),
         default_model: Some(model.clone()),
         model_providers: std::collections::HashMap::new(),
-        default_temperature: 0.7,
+        provider: crate::config::schema::ProviderConfig::default(),
+        default_temperature: 0.2,
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
-        agent: crate::config::schema::AgentConfig::default(),
+        agent: crate::config::schema::AgentConfig {
+            parallel_tools: true,
+            ..crate::config::schema::AgentConfig::default()
+        },
         skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
@@ -691,7 +699,7 @@ fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
-        "openai-codex" => "gpt-5-codex".into(),
+        "openai-codex" => "gpt-5.3-codex".into(),
         "venice" => "zai-org-glm-5".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "mistral" => "mistral-large-latest".into(),
@@ -2994,188 +3002,13 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
 // ── Step 6: Hardware (Physical World) ───────────────────────────
 
 fn setup_hardware() -> Result<HardwareConfig> {
-    print_bullet("ZeroClaw can talk to physical hardware (LEDs, sensors, motors).");
-    print_bullet("Scanning for connected devices...");
-    println!();
-
-    // ── Auto-discovery ──
-    let devices = hardware::discover_hardware();
-
-    if devices.is_empty() {
-        println!(
-            "  {} {}",
-            style("ℹ").dim(),
-            style("No hardware devices detected on this system.").dim()
-        );
-        println!(
-            "  {} {}",
-            style("ℹ").dim(),
-            style("You can enable hardware later in config.toml under [hardware].").dim()
-        );
-    } else {
-        println!(
-            "  {} {} device(s) found:",
-            style("✓").green().bold(),
-            devices.len()
-        );
-        for device in &devices {
-            let detail = device
-                .detail
-                .as_deref()
-                .map(|d| format!(" ({d})"))
-                .unwrap_or_default();
-            let path = device
-                .device_path
-                .as_deref()
-                .map(|p| format!(" → {p}"))
-                .unwrap_or_default();
-            println!(
-                "    {} {}{}{} [{}]",
-                style("›").cyan(),
-                style(&device.name).green(),
-                style(&detail).dim(),
-                style(&path).dim(),
-                style(device.transport.to_string()).cyan()
-            );
-        }
-    }
-    println!();
-
-    let options = vec![
-        "🚀 Native — direct GPIO on this Linux board (Raspberry Pi, Orange Pi, etc.)",
-        "🔌 Tethered — control an Arduino/ESP32/Nucleo plugged into USB",
-        "🔬 Debug Probe — flash/read MCUs via SWD/JTAG (probe-rs)",
-        "☁️  Software Only — no hardware access (default)",
-    ];
-
-    let recommended = hardware::recommended_wizard_default(&devices);
-
-    let choice = Select::new()
-        .with_prompt("  How should ZeroClaw interact with the physical world?")
-        .items(&options)
-        .default(recommended)
-        .interact()?;
-
-    let mut hw_config = hardware::config_from_wizard_choice(choice, &devices);
-
-    // ── Serial: pick a port if multiple found ──
-    if hw_config.transport_mode() == hardware::HardwareTransport::Serial {
-        let serial_devices: Vec<&hardware::DiscoveredDevice> = devices
-            .iter()
-            .filter(|d| d.transport == hardware::HardwareTransport::Serial)
-            .collect();
-
-        if serial_devices.len() > 1 {
-            let port_labels: Vec<String> = serial_devices
-                .iter()
-                .map(|d| {
-                    format!(
-                        "{} ({})",
-                        d.device_path.as_deref().unwrap_or("unknown"),
-                        d.name
-                    )
-                })
-                .collect();
-
-            let port_idx = Select::new()
-                .with_prompt("  Multiple serial devices found — select one")
-                .items(&port_labels)
-                .default(0)
-                .interact()?;
-
-            hw_config.serial_port = serial_devices[port_idx].device_path.clone();
-        } else if serial_devices.is_empty() {
-            // User chose serial but no device discovered — ask for manual path
-            let manual_port: String = Input::new()
-                .with_prompt("  Serial port path (e.g. /dev/ttyUSB0)")
-                .default("/dev/ttyUSB0".into())
-                .interact_text()?;
-            hw_config.serial_port = Some(manual_port);
-        }
-
-        // Baud rate
-        let baud_options = vec![
-            "115200 (default, recommended)",
-            "9600 (legacy Arduino)",
-            "57600",
-            "230400",
-            "Custom",
-        ];
-        let baud_idx = Select::new()
-            .with_prompt("  Serial baud rate")
-            .items(&baud_options)
-            .default(0)
-            .interact()?;
-
-        hw_config.baud_rate = match baud_idx {
-            1 => 9600,
-            2 => 57600,
-            3 => 230_400,
-            4 => {
-                let custom: String = Input::new()
-                    .with_prompt("  Custom baud rate")
-                    .default("115200".into())
-                    .interact_text()?;
-                custom.parse::<u32>().unwrap_or(115_200)
-            }
-            _ => 115_200,
-        };
-    }
-
-    // ── Probe: ask for target chip ──
-    if hw_config.transport_mode() == hardware::HardwareTransport::Probe
-        && hw_config.probe_target.is_none()
-    {
-        let target: String = Input::new()
-            .with_prompt("  Target MCU chip (e.g. STM32F411CEUx, nRF52840_xxAA)")
-            .default("STM32F411CEUx".into())
-            .interact_text()?;
-        hw_config.probe_target = Some(target);
-    }
-
-    // ── Datasheet RAG ──
-    if hw_config.enabled {
-        let datasheets = Confirm::new()
-            .with_prompt("  Enable datasheet RAG? (index PDF schematics for AI pin lookups)")
-            .default(true)
-            .interact()?;
-        hw_config.workspace_datasheets = datasheets;
-    }
-
-    // ── Summary ──
-    if hw_config.enabled {
-        let transport_label = match hw_config.transport_mode() {
-            hardware::HardwareTransport::Native => "Native GPIO".to_string(),
-            hardware::HardwareTransport::Serial => format!(
-                "Serial → {} @ {} baud",
-                hw_config.serial_port.as_deref().unwrap_or("?"),
-                hw_config.baud_rate
-            ),
-            hardware::HardwareTransport::Probe => format!(
-                "Probe (SWD/JTAG) → {}",
-                hw_config.probe_target.as_deref().unwrap_or("?")
-            ),
-            hardware::HardwareTransport::None => "Software Only".to_string(),
-        };
-
-        println!(
-            "  {} Hardware: {} | datasheets: {}",
-            style("✓").green().bold(),
-            style(&transport_label).green(),
-            if hw_config.workspace_datasheets {
-                style("on").green().to_string()
-            } else {
-                style("off").dim().to_string()
-            }
-        );
-    } else {
-        println!(
-            "  {} Hardware: {}",
-            style("✓").green().bold(),
-            style("disabled (software only)").dim()
-        );
-    }
-
+    print_bullet("Hardware setup is disabled in this workspace-only build.");
+    let hw_config = HardwareConfig::default();
+    println!(
+        "  {} Hardware: {}",
+        style("✓").green().bold(),
+        style("disabled (software only)").dim()
+    );
     Ok(hw_config)
 }
 
@@ -5443,6 +5276,9 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
         fs::create_dir_all(workspace_dir.join(dir)).await?;
     }
 
+    let workflow_assets = crate::workflow_assets::ensure_workspace_workflow_assets(workspace_dir)
+        .context("Failed to seed default workflow assets")?;
+
     let mut created = 0;
     let mut skipped = 0;
 
@@ -5462,6 +5298,12 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
         style(created).green(),
         style(skipped).dim(),
         style(subdirs.len()).green()
+    );
+    println!(
+        "  {} Seeded workflow bot creation assets: {} created, {} existing",
+        style("✓").green().bold(),
+        style(workflow_assets.created).green(),
+        style(workflow_assets.existing).dim()
     );
 
     // Show workspace tree
@@ -5603,10 +5445,10 @@ fn print_summary(config: &Config) {
         if config.hardware.enabled {
             let mode = config.hardware.transport_mode();
             match mode {
-                hardware::HardwareTransport::Native => {
+                HardwareTransport::Native => {
                     style("Native GPIO (direct)").green().to_string()
                 }
-                hardware::HardwareTransport::Serial => format!(
+                HardwareTransport::Serial => format!(
                     "{}",
                     style(format!(
                         "Serial → {} @ {} baud",
@@ -5615,7 +5457,7 @@ fn print_summary(config: &Config) {
                     ))
                     .green()
                 ),
-                hardware::HardwareTransport::Probe => format!(
+                HardwareTransport::Probe => format!(
                     "{}",
                     style(format!(
                         "Probe → {}",
@@ -5623,7 +5465,7 @@ fn print_summary(config: &Config) {
                     ))
                     .green()
                 ),
-                hardware::HardwareTransport::None => "disabled (software only)".to_string(),
+                HardwareTransport::None => "disabled (software only)".to_string(),
             }
         } else {
             "disabled (software only)".to_string()
@@ -5849,10 +5691,12 @@ mod tests {
         assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
         assert_eq!(config.default_model.as_deref(), Some("custom-model-946"));
         assert_eq!(config.api_key.as_deref(), Some("sk-issue946"));
+        assert!(config.agent.parallel_tools);
 
         let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
         assert!(config_raw.contains("default_provider = \"openrouter\""));
         assert!(config_raw.contains("default_model = \"custom-model-946\""));
+        assert!(config_raw.contains("parallel_tools = true"));
     }
 
     #[tokio::test]
@@ -5876,6 +5720,7 @@ mod tests {
         let expected = default_model_for_provider("anthropic");
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
         assert_eq!(config.default_model.as_deref(), Some(expected.as_str()));
+        assert!(config.agent.parallel_tools);
     }
 
     #[tokio::test]
@@ -6447,7 +6292,7 @@ mod tests {
             "anthropic/claude-sonnet-4.6"
         );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
-        assert_eq!(default_model_for_provider("openai-codex"), "gpt-5-codex");
+        assert_eq!(default_model_for_provider("openai-codex"), "gpt-5.3-codex");
         assert_eq!(
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-5-20250929"

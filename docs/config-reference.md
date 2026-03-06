@@ -97,7 +97,7 @@ Notes:
 | `method` | `totp` | OTP method (`totp`, `pairing`, `cli-prompt`) |
 | `token_ttl_secs` | `30` | TOTP time-step window in seconds |
 | `cache_valid_secs` | `300` | Cache window for recently validated OTP codes |
-| `gated_actions` | `["shell","file_write","browser_open","browser","memory_forget"]` | Tool actions protected by OTP |
+| `gated_actions` | `["shell","file_write","memory_forget"]` | Tool actions protected by OTP |
 | `gated_domains` | `[]` | Explicit domain patterns requiring OTP (`*.example.com`, `login.example.com`) |
 | `gated_domain_categories` | `[]` | Domain preset categories (`banking`, `medical`, `government`, `identity_providers`) |
 
@@ -116,7 +116,7 @@ enabled = true
 method = "totp"
 token_ttl_secs = 30
 cache_valid_secs = 300
-gated_actions = ["shell", "browser_open"]
+gated_actions = ["shell", "file_write"]
 gated_domains = ["*.chase.com", "accounts.google.com"]
 gated_domain_categories = ["banking"]
 ```
@@ -164,7 +164,7 @@ model = "anthropic/claude-sonnet-4-6"
 system_prompt = "You are a research assistant."
 max_depth = 2
 agentic = true
-allowed_tools = ["web_search", "http_request", "file_read"]
+allowed_tools = ["web_search_tool", "file_read", "file_write"]
 max_iterations = 8
 
 [agents.coder]
@@ -204,21 +204,15 @@ Notes:
 - `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
 - Skill loading and `zeroclaw skills install` both apply a static security audit. Skills that contain symlinks, script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
 
-## `[composio]`
+## Removed Tool Sections
 
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `false` | Enable Composio managed OAuth tools |
-| `api_key` | unset | Composio API key used by the `composio` tool |
-| `entity_id` | `default` | Default `user_id` sent on connect/execute calls |
+The following config sections are obsolete in the current workspace-only runtime profile and should be treated as removed/ignored:
 
-Notes:
-
-- Backward compatibility: legacy `enable = true` is accepted as an alias for `enabled = true`.
-- If `enabled = false` or `api_key` is missing, the `composio` tool is not registered.
-- ZeroClaw requests Composio v3 tools with `toolkit_versions=latest` and executes tools with `version="latest"` to avoid stale default tool revisions.
-- Typical flow: call `connect`, complete browser OAuth, then run `execute` for the desired tool action.
-- If Composio returns a missing connected-account reference error, call `list_accounts` (optionally with `app`) and pass the returned `connected_account_id` to `execute`.
+- `[composio]`
+- `[browser]` and `[browser.computer_use]`
+- `[http_request]`
+- `[hardware]`
+- `[peripherals]`
 
 ## `[cost]`
 
@@ -266,51 +260,6 @@ Notes:
 - Remote URL only when `allow_remote_fetch = true`
 - Allowed MIME types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
 - When the active provider does not support vision, requests fail with a structured capability error (`capability=vision`) instead of silently dropping images.
-
-## `[browser]`
-
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `false` | Enable `browser_open` tool (opens URLs in the system browser without scraping) |
-| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
-| `session_name` | unset | Browser session name (for agent-browser automation) |
-| `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
-| `native_headless` | `true` | Headless mode for rust-native backend |
-| `native_webdriver_url` | `http://127.0.0.1:9515` | WebDriver endpoint URL for rust-native backend |
-| `native_chrome_path` | unset | Optional Chrome/Chromium executable path for rust-native backend |
-
-### `[browser.computer_use]`
-
-| Key | Default | Purpose |
-|---|---|---|
-| `endpoint` | `http://127.0.0.1:8787/v1/actions` | Sidecar endpoint for computer-use actions (OS-level mouse/keyboard/screenshot) |
-| `api_key` | unset | Optional bearer token for computer-use sidecar (stored encrypted) |
-| `timeout_ms` | `15000` | Per-action request timeout in milliseconds |
-| `allow_remote_endpoint` | `false` | Allow remote/public endpoint for computer-use sidecar |
-| `window_allowlist` | `[]` | Optional window title/process allowlist forwarded to sidecar policy |
-| `max_coordinate_x` | unset | Optional X-axis boundary for coordinate-based actions |
-| `max_coordinate_y` | unset | Optional Y-axis boundary for coordinate-based actions |
-
-Notes:
-
-- When `backend = "computer_use"`, the agent delegates browser actions to the sidecar at `computer_use.endpoint`.
-- `allow_remote_endpoint = false` (default) rejects any non-loopback endpoint to prevent accidental public exposure.
-- Use `window_allowlist` to restrict which OS windows the sidecar can interact with.
-
-## `[http_request]`
-
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `false` | Enable `http_request` tool for API interactions |
-| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact/subdomain match, or `"*"` for all public domains) |
-| `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
-| `timeout_secs` | `30` | Request timeout in seconds |
-
-Notes:
-
-- Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
-- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
-- Local/private targets are still blocked even when `"*"` is configured.
 
 ## `[gateway]`
 
@@ -569,65 +518,6 @@ Notes:
 - Webhook endpoint is `POST /nextcloud-talk`.
 - `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides `webhook_secret` when set.
 - See [nextcloud-talk-setup.md](nextcloud-talk-setup.md) for setup and troubleshooting.
-
-## `[hardware]`
-
-Hardware wizard configuration for physical-world access (STM32, probe, serial).
-
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `false` | Whether hardware access is enabled |
-| `transport` | `none` | Transport mode: `"none"`, `"native"`, `"serial"`, or `"probe"` |
-| `serial_port` | unset | Serial port path (e.g. `"/dev/ttyACM0"`) |
-| `baud_rate` | `115200` | Serial baud rate |
-| `probe_target` | unset | Probe target chip (e.g. `"STM32F401RE"`) |
-| `workspace_datasheets` | `false` | Enable workspace datasheet RAG (index PDF schematics for AI pin lookups) |
-
-Notes:
-
-- Use `transport = "serial"` with `serial_port` for USB-serial connections.
-- Use `transport = "probe"` with `probe_target` for debug-probe flashing (e.g. ST-Link).
-- See [hardware-peripherals-design.md](hardware-peripherals-design.md) for protocol details.
-
-## `[peripherals]`
-
-Higher-level peripheral board configuration. Boards become agent tools when enabled.
-
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `false` | Enable peripheral support (boards become agent tools) |
-| `boards` | `[]` | Board configurations |
-| `datasheet_dir` | unset | Path to datasheet docs (relative to workspace) for RAG retrieval |
-
-Each entry in `boards`:
-
-| Key | Default | Purpose |
-|---|---|---|
-| `board` | _required_ | Board type: `"nucleo-f401re"`, `"rpi-gpio"`, `"esp32"`, etc. |
-| `transport` | `serial` | Transport: `"serial"`, `"native"`, `"websocket"` |
-| `path` | unset | Path for serial: `"/dev/ttyACM0"`, `"/dev/ttyUSB0"` |
-| `baud` | `115200` | Baud rate for serial |
-
-```toml
-[peripherals]
-enabled = true
-datasheet_dir = "docs/datasheets"
-
-[[peripherals.boards]]
-board = "nucleo-f401re"
-transport = "serial"
-path = "/dev/ttyACM0"
-baud = 115200
-
-[[peripherals.boards]]
-board = "rpi-gpio"
-transport = "native"
-```
-
-Notes:
-
-- Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
-- See [hardware-peripherals-design.md](hardware-peripherals-design.md) for board protocol and firmware notes.
 
 ## Security-Relevant Defaults
 

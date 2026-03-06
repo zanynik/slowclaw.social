@@ -25,8 +25,6 @@ Last verified: **February 21, 2026**.
 | `migrate` | Import from external runtimes (currently OpenClaw) |
 | `config` | Export machine-readable config schema |
 | `completions` | Generate shell completion scripts to stdout |
-| `hardware` | Discover and introspect USB hardware |
-| `peripheral` | Configure and flash peripherals |
 
 ## Command Groups
 
@@ -53,7 +51,6 @@ Last verified: **February 21, 2026**.
 - `zeroclaw agent`
 - `zeroclaw agent -m "Hello"`
 - `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
-- `zeroclaw agent --peripheral <board:path>`
 
 Tip:
 
@@ -193,20 +190,6 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 - `zeroclaw completions elvish`
 
 `completions` is stdout-only by design so scripts can be sourced directly without log/warning contamination.
-
-### `hardware`
-
-- `zeroclaw hardware discover`
-- `zeroclaw hardware introspect <path>`
-- `zeroclaw hardware info [--chip <chip_name>]`
-
-### `peripheral`
-
-- `zeroclaw peripheral list`
-- `zeroclaw peripheral add <board> <path>`
-- `zeroclaw peripheral flash [--port <serial_port>]`
-- `zeroclaw peripheral setup-uno-q [--host <ip_or_host>]`
-- `zeroclaw peripheral flash-nucleo`
 
 ## Validation Tip
 

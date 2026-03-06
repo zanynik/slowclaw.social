@@ -10,3 +10,8 @@ linker = "armv7a-linux-androideabi21-clang"
 
 [target.aarch64-linux-android]
 linker = "aarch64-linux-android21-clang"
+
+[build]
+# Keep all workspace Rust artifacts in one shared directory to avoid
+# duplicate target trees (e.g. root + web/src-tauri) exhausting disk space.
+target-dir = "target"

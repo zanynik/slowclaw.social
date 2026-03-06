@@ -8,11 +8,9 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod static_files;
+pub mod local_store;
 
-use crate::channels::{
-    Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
-};
-use crate::config::Config;
+use crate::config::{Config, TranscriptionConfig};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
@@ -20,22 +18,23 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use chrono::Datelike;
 use axum::{
-    body::Bytes,
     extract::{ConnectInfo, Path as AxumPath, Query, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
 use http_body_util::BodyExt as _;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path as StdPath, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use tower::ServiceExt as _;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeFile;
 use tower_http::timeout::TimeoutLayer;
@@ -47,6 +46,8 @@ pub const MAX_BODY_SIZE: usize = 65_536;
 pub const MAX_MEDIA_UPLOAD_BODY_SIZE: usize = 1_073_741_824;
 /// Request timeout (30s) — prevents slow-loris attacks
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Workflow template creation timeout (5 min) to allow agent script generation.
+pub const WORKFLOW_TEMPLATE_TIMEOUT_SECS: u64 = 300;
 /// Media upload timeout (30 min) to tolerate large uploads over Wi-Fi/VPN.
 pub const MEDIA_UPLOAD_TIMEOUT_SECS: u64 = 1_800;
 /// Sliding window used by gateway rate limiting.
@@ -60,22 +61,6 @@ const JOURNAL_MEDIA_DIR: &str = "journals/media";
 
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
-}
-
-fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
-    format!("whatsapp_{}_{}", msg.sender, msg.id)
-}
-
-fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
-    format!("linq_{}_{}", msg.sender, msg.id)
-}
-
-fn wati_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
-    format!("wati_{}_{}", msg.sender, msg.id)
-}
-
-fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
-    format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -281,6 +266,20 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     }
 }
 
+fn desktop_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers(Any)
+}
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -296,21 +295,44 @@ pub struct AppState {
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
-    pub whatsapp: Option<Arc<WhatsAppChannel>>,
-    /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
-    pub whatsapp_app_secret: Option<Arc<str>>,
-    pub linq: Option<Arc<LinqChannel>>,
-    /// Linq webhook signing secret for signature verification
-    pub linq_signing_secret: Option<Arc<str>>,
-    pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
-    /// Nextcloud Talk webhook secret for signature verification
-    pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
-    pub wati: Option<Arc<WatiChannel>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
     pub pb_chat_base_url: Option<String>,
     pub pb_chat_collection: String,
     pub pb_chat_token: Option<String>,
+    journal_transcription_jobs: Arc<Mutex<HashMap<String, JournalTranscriptionJob>>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalTranscriptionJob {
+    status: String,
+    transcript_path: Option<String>,
+    error: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Clone, Debug)]
+struct TranscriptionModelCacheEntry {
+    cache_key: String,
+    models: Vec<String>,
+    cached_at: Instant,
+}
+
+static TRANSCRIPTION_MODEL_CACHE: OnceLock<Mutex<Option<TranscriptionModelCacheEntry>>> =
+    OnceLock::new();
+
+const TRANSCRIPTION_MODEL_CACHE_TTL_SECS: u64 = 600;
+
+impl JournalTranscriptionJob {
+    fn queued() -> Self {
+        Self {
+            status: "queued".to_string(),
+            transcript_path: None,
+            error: None,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -327,6 +349,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
 
+    if let Err(err) = ensure_workflow_bot_creation_skill(&config.workspace_dir) {
+        tracing::warn!("Failed to ensure workflow bot creation skill: {err}");
+    }
+
     // ── Hooks ──────────────────────────────────────────────────────
     let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
         Some(std::sync::Arc::new(crate::hooks::HookRunner::new()))
@@ -339,17 +365,27 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let pocketbase_sidecar = match crate::pocketbase_sidecar::maybe_start(&config).await {
-        Ok(sidecar) => sidecar,
-        Err(err) => {
-            tracing::warn!("PocketBase sidecar startup failed: {err}");
-            None
-        }
-    };
-    let pocketbase_chat_worker = crate::pocketbase_chat::maybe_spawn_gateway_worker(
-        config.clone(),
-        pocketbase_sidecar.as_ref().map(|pb| pb.url.clone()),
-    );
+    let local_bootstrap = local_store::initialize(&config.workspace_dir)
+        .context("Failed to initialize local gateway store")?;
+    if local_bootstrap.migrated_from_legacy {
+        println!(
+            "  💾 Local store migration complete from {}",
+            local_bootstrap
+                .legacy_source
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "unknown source".to_string())
+        );
+        println!(
+            "     chat_messages={} drafts={} post_history={} journal_entries={} media_assets={} artifacts={}",
+            local_bootstrap.migrated_chat_messages,
+            local_bootstrap.migrated_drafts,
+            local_bootstrap.migrated_post_history,
+            local_bootstrap.migrated_journal_entries,
+            local_bootstrap.migrated_media_assets,
+            local_bootstrap.migrated_artifacts
+        );
+    }
 
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         config.default_provider.as_deref().unwrap_or("openrouter"),
@@ -384,113 +420,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                     .then(|| Arc::<str>::from(hash_webhook_secret(trimmed_secret)))
             })
         });
-
-    // WhatsApp channel (if configured)
-    let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
-        .channels_config
-        .whatsapp
-        .as_ref()
-        .filter(|wa| wa.is_cloud_config())
-        .map(|wa| {
-            Arc::new(WhatsAppChannel::new(
-                wa.access_token.clone().unwrap_or_default(),
-                wa.phone_number_id.clone().unwrap_or_default(),
-                wa.verify_token.clone().unwrap_or_default(),
-                wa.allowed_numbers.clone(),
-            ))
-        });
-
-    // WhatsApp app secret for webhook signature verification
-    // Priority: environment variable > config file
-    let whatsapp_app_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_WHATSAPP_APP_SECRET")
-        .ok()
-        .and_then(|secret| {
-            let secret = secret.trim();
-            (!secret.is_empty()).then(|| secret.to_owned())
-        })
-        .or_else(|| {
-            config.channels_config.whatsapp.as_ref().and_then(|wa| {
-                wa.app_secret
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|secret| !secret.is_empty())
-                    .map(ToOwned::to_owned)
-            })
-        })
-        .map(Arc::from);
-
-    // Linq channel (if configured)
-    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
-        Arc::new(LinqChannel::new(
-            lq.api_token.clone(),
-            lq.from_phone.clone(),
-            lq.allowed_senders.clone(),
-        ))
-    });
-
-    // Linq signing secret for webhook signature verification
-    // Priority: environment variable > config file
-    let linq_signing_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINQ_SIGNING_SECRET")
-        .ok()
-        .and_then(|secret| {
-            let secret = secret.trim();
-            (!secret.is_empty()).then(|| secret.to_owned())
-        })
-        .or_else(|| {
-            config.channels_config.linq.as_ref().and_then(|lq| {
-                lq.signing_secret
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|secret| !secret.is_empty())
-                    .map(ToOwned::to_owned)
-            })
-        })
-        .map(Arc::from);
-
-    // WATI channel (if configured)
-    let wati_channel: Option<Arc<WatiChannel>> =
-        config.channels_config.wati.as_ref().map(|wati_cfg| {
-            Arc::new(WatiChannel::new(
-                wati_cfg.api_token.clone(),
-                wati_cfg.api_url.clone(),
-                wati_cfg.tenant_id.clone(),
-                wati_cfg.allowed_numbers.clone(),
-            ))
-        });
-
-    // Nextcloud Talk channel (if configured)
-    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
-            Arc::new(NextcloudTalkChannel::new(
-                nc.base_url.clone(),
-                nc.app_token.clone(),
-                nc.allowed_users.clone(),
-            ))
-        });
-
-    // Nextcloud Talk webhook secret for signature verification
-    // Priority: environment variable > config file
-    let nextcloud_talk_webhook_secret: Option<Arc<str>> =
-        std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
-            .ok()
-            .and_then(|secret| {
-                let secret = secret.trim();
-                (!secret.is_empty()).then(|| secret.to_owned())
-            })
-            .or_else(|| {
-                config
-                    .channels_config
-                    .nextcloud_talk
-                    .as_ref()
-                    .and_then(|nc| {
-                        nc.webhook_secret
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|secret| !secret.is_empty())
-                            .map(ToOwned::to_owned)
-                    })
-            })
-            .map(Arc::from);
 
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
@@ -538,28 +467,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  🌐 Public URL: {url}");
     }
     println!("  🌐 Web UI: http://{display_addr}/");
-    if let Some(pb) = pocketbase_sidecar.as_ref() {
-        println!(
-            "  🗄️ PocketBase: {url} (pid: {}, bin: {})",
-            pb.pid().map_or_else(|| "n/a".to_string(), |pid| pid.to_string()),
-            pb.bin_path.display(),
-            url = pb.url
-        );
-    } else {
-        println!(
-            "  🗄️ PocketBase: sidecar not started (install `pocketbase` or set ZEROCLAW_POCKETBASE_BIN)"
-        );
-    }
-    if let Some(worker) = pocketbase_chat_worker.as_ref() {
-        println!(
-            "  💬 PocketBase chat bridge: {} ({})",
-            worker.collection, worker.base_url
-        );
-    } else {
-        println!(
-            "  💬 PocketBase chat bridge: disabled (set ZEROCLAW_POCKETBASE_URL or start sidecar)"
-        );
-    }
+    println!(
+        "  💾 Local store: {}",
+        local_bootstrap.db_path.display()
+    );
+    println!("  📁 Workspace: {}", config.workspace_dir.display());
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /pair/new-code — mint a fresh one-time pairing code (requires bearer)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
@@ -601,24 +513,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
         idempotency_store,
-        whatsapp: whatsapp_channel,
-        whatsapp_app_secret,
-        linq: linq_channel,
-        linq_signing_secret,
-        nextcloud_talk: nextcloud_talk_channel,
-        nextcloud_talk_webhook_secret,
-        wati: wati_channel,
         observer,
-        pb_chat_base_url: pocketbase_chat_worker.as_ref().map(|w| w.base_url.clone()),
-        pb_chat_collection: pocketbase_chat_worker
-            .as_ref()
-            .map(|w| w.collection.clone())
-            .unwrap_or_else(|| "chat_messages".to_string()),
-        pb_chat_token: std::env::var("ZEROCLAW_POCKETBASE_TOKEN")
-            .ok()
-            .or_else(|| std::env::var("POCKETBASE_TOKEN").ok())
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty()),
+        pb_chat_base_url: None,
+        pb_chat_collection: "chat_messages".to_string(),
+        pb_chat_token: None,
+        journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Core API/UI router (small request bodies)
@@ -627,8 +526,26 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/pair/new-code", post(handle_pair_new_code))
+        .route(
+            "/api/config/runtime",
+            get(handle_runtime_config).post(handle_runtime_config_update),
+        )
         .route("/webhook", post(handle_webhook))
         .route("/api/chat/messages", get(handle_chat_list).post(handle_chat_send))
+        .route(
+            "/api/feed/workflow-comment",
+            post(handle_feed_workflow_comment),
+        )
+        .route(
+            "/api/feed/workflow-settings",
+            get(handle_feed_workflow_settings).post(handle_feed_workflow_settings_update),
+        )
+        .route("/api/feed/workflow-run", post(handle_feed_workflow_run))
+        .route("/api/drafts", get(handle_drafts_list).post(handle_drafts_upsert))
+        .route(
+            "/api/post-history",
+            get(handle_post_history_list).post(handle_post_history_create),
+        )
         .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -636,13 +553,32 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ));
 
+    // Workflow template creation can take longer because it invokes the agent to generate scripts.
+    let workflow_template_router = Router::new()
+        .route(
+            "/api/feed/workflow-template",
+            post(handle_feed_workflow_template_create),
+        )
+        .with_state(state.clone())
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(WORKFLOW_TEMPLATE_TIMEOUT_SECS),
+        ));
+
     // Journal/media endpoints (large uploads + file streaming)
     let media_router = Router::new()
         .route("/api/media/upload", post(handle_media_upload))
         .route("/api/journal/text", post(handle_journal_text))
+        .route("/api/journal/transcribe", post(handle_journal_transcribe))
+        .route(
+            "/api/journal/transcribe/status",
+            get(handle_journal_transcribe_status),
+        )
         .route("/api/library/items", get(handle_library_items))
         .route("/api/library/text", get(handle_library_text))
         .route("/api/library/save-text", post(handle_library_save_text))
+        .route("/api/library/delete", post(handle_library_delete))
         .route("/api/media/{*path}", get(handle_media_stream))
         .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_MEDIA_UPLOAD_BODY_SIZE))
@@ -653,9 +589,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     let app = Router::new()
         .merge(core_router)
+        .merge(workflow_template_router)
         .merge(media_router)
         .route("/_app/{*path}", get(static_files::handle_static))
-        .fallback(get(static_files::handle_spa_fallback));
+        .fallback(get(static_files::handle_spa_fallback))
+        .layer(desktop_cors_layer());
 
     // Run the server
     axum::serve(
@@ -663,12 +601,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await?;
-
-    if let Some(worker) = pocketbase_chat_worker.as_ref() {
-        worker.abort();
-    }
-    drop(pocketbase_chat_worker);
-    drop(pocketbase_sidecar);
 
     Ok(())
 }
@@ -709,6 +641,76 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
         [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
         body,
     )
+}
+
+async fn handle_runtime_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Runtime config") {
+        return err.into_response();
+    }
+    let config = state.config.lock().clone();
+    let transcription_models = available_local_transcription_models();
+    let body = serde_json::json!({
+        "defaultProvider": config.default_provider.unwrap_or_default(),
+        "defaultModel": config.default_model.unwrap_or_default(),
+        "transcriptionEnabled": config.transcription.enabled,
+        "transcriptionModel": config.transcription.model,
+        "availableTranscriptionModels": transcription_models,
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+async fn handle_runtime_config_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RuntimeConfigUpdateBody>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Runtime config update") {
+        return err.into_response();
+    }
+
+    let provider = body.default_provider.trim();
+    if provider.is_empty() {
+        let err = serde_json::json!({"error": "defaultProvider is required"});
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
+    let model = body.default_model.trim();
+    if model.is_empty() {
+        let err = serde_json::json!({"error": "defaultModel is required"});
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
+
+    let mut next = state.config.lock().clone();
+    next.default_provider = Some(provider.to_string());
+    next.default_model = Some(model.to_string());
+    next.transcription.enabled = body.transcription_enabled;
+    if let Some(transcription_model) = body
+        .transcription_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        next.transcription.model = transcription_model.to_string();
+    }
+
+    if let Err(e) = next.save().await {
+        let err = serde_json::json!({"error": format!("Failed to save config: {e}")});
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+    }
+    *state.config.lock() = next.clone();
+
+    let resp = serde_json::json!({
+        "ok": true,
+        "restartRequired": true,
+        "defaultProvider": next.default_provider.unwrap_or_default(),
+        "defaultModel": next.default_model.unwrap_or_default(),
+        "transcriptionEnabled": next.transcription.enabled,
+        "transcriptionModel": next.transcription.model,
+        "availableTranscriptionModels": available_local_transcription_models(),
+    });
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 /// POST /pair — exchange one-time code for bearer token
@@ -872,6 +874,1470 @@ struct ChatSendBody {
     content: String,
 }
 
+#[derive(serde::Deserialize)]
+struct DraftListQuery {
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct DraftUpsertBody {
+    id: Option<String>,
+    text: Option<String>,
+    #[serde(rename = "videoName")]
+    video_name: Option<String>,
+    #[serde(rename = "createdAtClient")]
+    created_at_client: Option<String>,
+    #[serde(rename = "updatedAtClient")]
+    updated_at_client: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PostHistoryListQuery {
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct PostHistoryCreateBody {
+    provider: Option<String>,
+    text: Option<String>,
+    #[serde(rename = "videoName")]
+    video_name: Option<String>,
+    #[serde(rename = "sourcePath")]
+    source_path: Option<String>,
+    uri: Option<String>,
+    cid: Option<String>,
+    status: Option<String>,
+    error: Option<String>,
+    #[serde(rename = "createdAtClient")]
+    created_at_client: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct FeedWorkflowCommentBody {
+    path: String,
+    comment: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum FeedWorkflowMode {
+    #[default]
+    DateRange,
+    Random,
+}
+
+impl FeedWorkflowMode {
+    fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::DateRange => "date_range",
+            Self::Random => "random",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "date_range" => Some(Self::DateRange),
+            "random" => Some(Self::Random),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FeedWorkflowSettings {
+    #[serde(default)]
+    mode: FeedWorkflowMode,
+    #[serde(default = "default_feed_workflow_days")]
+    days: u32,
+    #[serde(default = "default_feed_workflow_random_count")]
+    random_count: u32,
+    #[serde(default)]
+    schedule_enabled: bool,
+    #[serde(default)]
+    schedule_cron: String,
+    #[serde(default)]
+    schedule_tz: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedWorkflowSettingsUpdateBody {
+    workflow_key: String,
+    mode: Option<String>,
+    days: Option<u32>,
+    random_count: Option<u32>,
+    schedule_enabled: Option<bool>,
+    schedule_cron: Option<String>,
+    schedule_tz: Option<String>,
+    prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedWorkflowRunBody {
+    workflow_key: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedWorkflowTemplateCreateBody {
+    name: String,
+    #[serde(default)]
+    bot_name: Option<String>,
+    #[serde(default)]
+    source_kind: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    days: Option<u32>,
+    #[serde(default)]
+    random_count: Option<u32>,
+    #[serde(default)]
+    schedule_enabled: Option<bool>,
+    #[serde(default)]
+    schedule_cron: Option<String>,
+    #[serde(default)]
+    schedule_tz: Option<String>,
+    #[serde(default)]
+    run_now: Option<bool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedWorkflowSettingsResponseItem {
+    workflow_key: String,
+    workflow_bot: String,
+    script_path: String,
+    output_prefix: String,
+    mode: FeedWorkflowMode,
+    days: u32,
+    random_count: u32,
+    schedule_enabled: bool,
+    schedule_cron: String,
+    schedule_tz: Option<String>,
+    schedule_job_id: Option<String>,
+    schedule_next_run: Option<String>,
+    prompt: Option<String>,
+    command_preview: String,
+    editable_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FeedWorkflowRecord {
+    workflow_key: String,
+    workflow_bot: String,
+    script_path: String,
+    output_prefix: String,
+    #[serde(default)]
+    editable_files: Vec<String>,
+    #[serde(default = "workflow_default_settings")]
+    settings: FeedWorkflowSettings,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct FeedWorkflowSettingsStore {
+    #[serde(default)]
+    workflows: HashMap<String, FeedWorkflowRecord>,
+}
+
+fn default_feed_workflow_days() -> u32 {
+    7
+}
+
+fn default_feed_workflow_random_count() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone)]
+struct FeedWorkflowDefinition {
+    key: String,
+    bot_name: String,
+    editable_files: Vec<String>,
+    output_prefix: String,
+    script_path: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct LegacyFeedWorkflowSettingsStore {
+    #[serde(default)]
+    workflows: HashMap<String, FeedWorkflowSettings>,
+}
+
+fn default_workflow_schedule_cron() -> String {
+    "0 9 * * *".to_string()
+}
+
+fn workflow_default_settings() -> FeedWorkflowSettings {
+    FeedWorkflowSettings {
+        mode: FeedWorkflowMode::DateRange,
+        days: default_feed_workflow_days(),
+        random_count: default_feed_workflow_random_count(),
+        schedule_enabled: false,
+        schedule_cron: default_workflow_schedule_cron(),
+        schedule_tz: None,
+        prompt: None,
+    }
+}
+
+fn default_workflow_bot_name(workflow_key: &str) -> String {
+    let mut title = String::new();
+    for token in workflow_key.split('_').filter(|value| !value.is_empty()) {
+        if !title.is_empty() {
+            title.push(' ');
+        }
+        let mut chars = token.chars();
+        if let Some(first) = chars.next() {
+            title.push(first.to_ascii_uppercase());
+            title.push_str(chars.as_str());
+        }
+    }
+    if title.is_empty() {
+        "WorkflowBot".to_string()
+    } else {
+        format!("{title} Bot").replace(' ', "")
+    }
+}
+
+fn normalize_workflow_output_prefix(prefix: &str, workflow_key: &str) -> String {
+    let trimmed = prefix.trim().trim_start_matches('/').replace('\\', "/");
+    let mut normalized = if trimmed.is_empty() {
+        format!("posts/{workflow_key}/")
+    } else {
+        trimmed
+    };
+    if !normalized.starts_with("posts/") {
+        normalized = format!("posts/{workflow_key}/");
+    }
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
+}
+
+fn normalize_workflow_script_path(script_path: &str, workflow_key: &str) -> String {
+    let fallback = format!("scripts/{workflow_key}_skill/run_{workflow_key}.py");
+    let trimmed = script_path.trim().trim_start_matches('/').replace('\\', "/");
+    if trimmed.is_empty() {
+        return fallback;
+    }
+    if trimmed.contains("..") {
+        return fallback;
+    }
+    if !trimmed.starts_with("scripts/") {
+        return fallback;
+    }
+    trimmed
+}
+
+fn normalize_workflow_record(workflow_key: &str, mut record: FeedWorkflowRecord) -> FeedWorkflowRecord {
+    record.workflow_key = workflow_key.to_string();
+    record.workflow_bot = record
+        .workflow_bot
+        .trim()
+        .to_string()
+        .if_empty_then(|| default_workflow_bot_name(workflow_key));
+    record.script_path = normalize_workflow_script_path(&record.script_path, workflow_key);
+    record.output_prefix = normalize_workflow_output_prefix(&record.output_prefix, workflow_key);
+    record.settings = normalize_workflow_settings(record.settings);
+
+    let mut editable = Vec::new();
+    for path in &record.editable_files {
+        let cleaned = path.trim().trim_start_matches('/').replace('\\', "/");
+        if cleaned.is_empty() || cleaned.contains("..") {
+            continue;
+        }
+        if !editable.contains(&cleaned) {
+            editable.push(cleaned);
+        }
+    }
+    if !editable.iter().any(|path| path == &record.script_path) {
+        editable.push(record.script_path.clone());
+    }
+    let skill_default = format!("skills/{workflow_key}/SKILL.md");
+    if !editable.iter().any(|path| path == &skill_default) {
+        editable.push(skill_default);
+    }
+    record.editable_files = editable;
+    record
+}
+
+trait StringExt {
+    fn if_empty_then<F: FnOnce() -> String>(self, fallback: F) -> String;
+}
+
+impl StringExt for String {
+    fn if_empty_then<F: FnOnce() -> String>(self, fallback: F) -> String {
+        if self.trim().is_empty() {
+            fallback()
+        } else {
+            self
+        }
+    }
+}
+
+fn feed_workflow_definition_from_record(record: &FeedWorkflowRecord) -> FeedWorkflowDefinition {
+    FeedWorkflowDefinition {
+        key: record.workflow_key.clone(),
+        bot_name: record.workflow_bot.clone(),
+        editable_files: record.editable_files.clone(),
+        output_prefix: record.output_prefix.clone(),
+        script_path: record.script_path.clone(),
+    }
+}
+
+fn workflow_definitions(store: &FeedWorkflowSettingsStore) -> Vec<FeedWorkflowDefinition> {
+    let mut defs: Vec<FeedWorkflowDefinition> = store
+        .workflows
+        .values()
+        .map(feed_workflow_definition_from_record)
+        .collect();
+    defs.sort_by(|a, b| a.key.cmp(&b.key));
+    defs
+}
+
+fn workflow_definition_by_key(
+    store: &FeedWorkflowSettingsStore,
+    key: &str,
+) -> Option<FeedWorkflowDefinition> {
+    let normalized = key.trim().to_ascii_lowercase();
+    store
+        .workflows
+        .get(&normalized)
+        .map(feed_workflow_definition_from_record)
+}
+
+fn workflow_for_feed_path(
+    store: &FeedWorkflowSettingsStore,
+    path: &str,
+) -> Option<FeedWorkflowDefinition> {
+    let normalized_path = path.trim_start_matches('/').to_ascii_lowercase();
+    workflow_definitions(store)
+        .into_iter()
+        .find(|workflow| normalized_path.starts_with(&workflow.output_prefix.to_ascii_lowercase()))
+}
+
+fn normalize_workflow_settings(mut settings: FeedWorkflowSettings) -> FeedWorkflowSettings {
+    settings.days = settings.days.clamp(1, 30);
+    settings.random_count = settings.random_count.clamp(1, 10);
+    settings.schedule_cron = settings.schedule_cron.trim().to_string();
+    if settings.schedule_cron.is_empty() {
+        settings.schedule_cron = default_workflow_schedule_cron();
+    }
+    settings.schedule_tz = settings
+        .schedule_tz
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        });
+    settings
+}
+
+fn workflow_settings_store_path(workspace_dir: &StdPath) -> PathBuf {
+    workspace_dir
+        .join("state")
+        .join("feed_workflow_settings.json")
+}
+
+fn load_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedWorkflowSettingsStore> {
+    let path = workflow_settings_store_path(workspace_dir);
+    if !path.exists() {
+        return Ok(FeedWorkflowSettingsStore::default());
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read workflow settings store {}", path.display()))?;
+    if let Ok(mut parsed) = serde_json::from_str::<FeedWorkflowSettingsStore>(&raw) {
+        parsed.workflows = parsed
+            .workflows
+            .into_iter()
+            .map(|(key, record)| {
+                let normalized_key = sanitize_workflow_key(&key);
+                (normalized_key.clone(), normalize_workflow_record(&normalized_key, record))
+            })
+            .collect();
+        return Ok(parsed);
+    }
+
+    let legacy: LegacyFeedWorkflowSettingsStore = serde_json::from_str(&raw)
+        .with_context(|| format!("Invalid workflow settings JSON {}", path.display()))?;
+    let mut migrated = FeedWorkflowSettingsStore::default();
+    for (legacy_key, legacy_settings) in legacy.workflows {
+        let key = sanitize_workflow_key(&legacy_key);
+        let record = FeedWorkflowRecord {
+            workflow_key: key.clone(),
+            workflow_bot: default_workflow_bot_name(&key),
+            script_path: format!("scripts/{key}_skill/run_{key}.py"),
+            output_prefix: format!("posts/{key}/"),
+            editable_files: vec![
+                format!("scripts/{key}_skill/run_{key}.py"),
+                format!("skills/{key}/SKILL.md"),
+            ],
+            settings: normalize_workflow_settings(legacy_settings),
+        };
+        migrated
+            .workflows
+            .insert(key.clone(), normalize_workflow_record(&key, record));
+    }
+    Ok(migrated)
+}
+
+fn save_feed_workflow_settings_store(
+    workspace_dir: &StdPath,
+    store: &FeedWorkflowSettingsStore,
+) -> Result<()> {
+    let path = workflow_settings_store_path(workspace_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create workflow settings directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let body = serde_json::to_string_pretty(store)?;
+    std::fs::write(&path, body)
+        .with_context(|| format!("Failed to write workflow settings store {}", path.display()))
+}
+
+fn workflow_cron_job_name(workflow_key: &str) -> String {
+    format!("workflow:{workflow_key}")
+}
+
+fn workflow_command_preview(workflow: &FeedWorkflowDefinition, settings: &FeedWorkflowSettings) -> String {
+    let mut parts = vec![
+        "workspace-script".to_string(),
+        workflow.script_path.trim_start_matches('/').to_string(),
+        "--mode".to_string(),
+        settings.mode.as_cli_value().to_string(),
+    ];
+
+    match settings.mode {
+        FeedWorkflowMode::DateRange => {
+            parts.push("--days".to_string());
+            parts.push(settings.days.to_string());
+        }
+        FeedWorkflowMode::Random => {
+            parts.push("--random-count".to_string());
+            parts.push(settings.random_count.to_string());
+        }
+    }
+
+    if let Some(prompt) = &settings.prompt {
+        parts.push("--prompt".to_string());
+        parts.push(format!("\"{prompt}\""));
+    }
+
+    parts.join(" ")
+}
+
+fn select_primary_workflow_job(
+    config: &Config,
+    workflow_key: &str,
+) -> Result<Option<crate::cron::CronJob>> {
+    let target_name = workflow_cron_job_name(workflow_key);
+    let mut jobs: Vec<crate::cron::CronJob> = crate::cron::list_jobs(config)?
+        .into_iter()
+        .filter(|job| job.name.as_deref() == Some(target_name.as_str()))
+        .collect();
+    jobs.sort_by_key(|job| job.created_at);
+
+    if jobs.len() > 1 {
+        let keep_id = jobs
+            .first()
+            .map(|job| job.id.clone())
+            .unwrap_or_default();
+        for dup in jobs.iter().skip(1) {
+            if let Err(err) = crate::cron::remove_job(config, &dup.id) {
+                tracing::warn!(
+                    "Failed to remove duplicate workflow cron job {} ({}): {err}",
+                    dup.id,
+                    workflow_key
+                );
+            }
+        }
+        jobs.retain(|job| job.id == keep_id);
+    }
+
+    Ok(jobs.into_iter().next())
+}
+
+fn upsert_workflow_schedule_with_command(
+    config: &Config,
+    workflow_key: &str,
+    settings: &FeedWorkflowSettings,
+    command: String,
+) -> Result<Option<crate::cron::CronJob>> {
+    let existing = select_primary_workflow_job(config, workflow_key)?;
+    if !settings.schedule_enabled {
+        if let Some(job) = existing {
+            crate::cron::remove_job(config, &job.id)?;
+        }
+        return Ok(None);
+    }
+
+    if !config.cron.enabled {
+        anyhow::bail!("cron scheduling is disabled in config (cron.enabled=false)");
+    }
+
+    let expr = settings.schedule_cron.trim();
+    if expr.is_empty() {
+        anyhow::bail!("schedule cron expression is required when schedule is enabled");
+    }
+
+    let schedule = crate::cron::Schedule::Cron {
+        expr: expr.to_string(),
+        tz: settings.schedule_tz.clone(),
+    };
+    let name = workflow_cron_job_name(workflow_key);
+
+    if let Some(job) = existing {
+        let patch = crate::cron::CronJobPatch {
+            schedule: Some(schedule),
+            command: Some(command),
+            name: Some(name),
+            enabled: Some(true),
+            ..crate::cron::CronJobPatch::default()
+        };
+        let updated = crate::cron::update_job(config, &job.id, patch)?;
+        Ok(Some(updated))
+    } else {
+        let created = crate::cron::add_shell_job(config, Some(name), schedule, &command)?;
+        Ok(Some(created))
+    }
+}
+
+fn upsert_workflow_schedule(
+    config: &Config,
+    workflow: &FeedWorkflowDefinition,
+    settings: &FeedWorkflowSettings,
+) -> Result<Option<crate::cron::CronJob>> {
+    let command = workflow_command_preview(workflow, settings);
+    upsert_workflow_schedule_with_command(config, &workflow.key, settings, command)
+}
+
+fn workflow_settings_response_item(
+    workflow: &FeedWorkflowDefinition,
+    settings: FeedWorkflowSettings,
+    schedule_job: Option<&crate::cron::CronJob>,
+) -> FeedWorkflowSettingsResponseItem {
+    FeedWorkflowSettingsResponseItem {
+        workflow_key: workflow.key.to_string(),
+        workflow_bot: workflow.bot_name.to_string(),
+        script_path: workflow.script_path.to_string(),
+        output_prefix: workflow.output_prefix.to_string(),
+        mode: settings.mode,
+        days: settings.days,
+        random_count: settings.random_count,
+        schedule_enabled: schedule_job.is_some(),
+        schedule_cron: schedule_job
+            .and_then(|job| match &job.schedule {
+                crate::cron::Schedule::Cron { expr, .. } => Some(expr.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| settings.schedule_cron.clone()),
+        schedule_tz: schedule_job
+            .and_then(|job| match &job.schedule {
+                crate::cron::Schedule::Cron { tz, .. } => tz.clone(),
+                _ => None,
+            })
+            .or(settings.schedule_tz.clone()),
+        schedule_job_id: schedule_job.map(|job| job.id.clone()),
+        schedule_next_run: schedule_job.map(|job| job.next_run.to_rfc3339()),
+        prompt: settings.prompt.clone(),
+        command_preview: workflow_command_preview(workflow, &settings),
+        editable_files: workflow
+            .editable_files
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+    }
+}
+
+fn build_manual_workflow_job(workflow_key: &str, bot_name: &str, command: String) -> crate::cron::CronJob {
+    let now = chrono::Utc::now();
+    crate::cron::CronJob {
+        id: format!("workflow_manual_{}", Uuid::new_v4().simple()),
+        expression: "manual".to_string(),
+        schedule: crate::cron::Schedule::At { at: now },
+        command,
+        prompt: None,
+        name: Some(format!("{} ({workflow_key})", bot_name)),
+        job_type: crate::cron::JobType::Shell,
+        session_target: crate::cron::SessionTarget::Isolated,
+        model: None,
+        enabled: true,
+        delivery: crate::cron::DeliveryConfig::default(),
+        delete_after_run: false,
+        created_at: now,
+        next_run: now,
+        last_run: None,
+        last_status: None,
+        last_output: None,
+    }
+}
+
+const WORKFLOW_SELF_HEAL_MAX_ATTEMPTS: usize = 1;
+const WORKFLOW_TEMPLATE_AGENT_TIMEOUT_SECS: u64 = 180;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkflowEditableFileStamp {
+    size: u64,
+    modified_secs: u64,
+}
+
+fn workflow_editable_file_stamp(path: &StdPath) -> Option<WorkflowEditableFileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(WorkflowEditableFileStamp {
+        size: meta.len(),
+        modified_secs: modified,
+    })
+}
+
+fn capture_workflow_editable_file_stamps(
+    workspace_dir: &StdPath,
+    workflow: &FeedWorkflowDefinition,
+) -> HashMap<String, Option<WorkflowEditableFileStamp>> {
+    let mut out = HashMap::with_capacity(workflow.editable_files.len());
+    for rel in &workflow.editable_files {
+        let abs = workspace_dir.join(rel);
+        out.insert(rel.to_string(), workflow_editable_file_stamp(&abs));
+    }
+    out
+}
+
+fn changed_workflow_editable_files(
+    before: &HashMap<String, Option<WorkflowEditableFileStamp>>,
+    after: &HashMap<String, Option<WorkflowEditableFileStamp>>,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (path, before_stamp) in before {
+        let after_stamp = after.get(path).copied().flatten();
+        if *before_stamp != after_stamp {
+            changed.push(path.clone());
+        }
+    }
+    changed
+}
+
+fn maybe_apply_workflow_run_quickfix(
+    workspace_dir: &StdPath,
+    workflow: &FeedWorkflowDefinition,
+    error_text: &str,
+) -> Result<Option<String>> {
+    let lowered = error_text.to_ascii_lowercase();
+    let is_prompt_arg_failure =
+        lowered.contains("unrecognized arguments") && lowered.contains("--prompt");
+    if !is_prompt_arg_failure {
+        return Ok(None);
+    }
+
+    let script_rel = workflow.script_path.trim_start_matches('/');
+    if script_rel.is_empty() || !script_rel.ends_with(".py") {
+        return Ok(None);
+    }
+    if !workflow
+        .editable_files
+        .iter()
+        .any(|path| path.trim_start_matches('/') == script_rel)
+    {
+        return Ok(None);
+    }
+
+    let script_abs = workspace_dir.join(script_rel);
+    if !script_abs.exists() {
+        return Ok(None);
+    }
+
+    let script_content = std::fs::read_to_string(&script_abs).with_context(|| {
+        format!(
+            "failed to read workflow script for deterministic quick fix {}",
+            script_abs.display()
+        )
+    })?;
+    if script_content.contains("\"--prompt\"") || script_content.contains("'--prompt'") {
+        return Ok(None);
+    }
+
+    let prompt_default = if script_content.contains("USER_PROMPT") {
+        "USER_PROMPT"
+    } else {
+        "\"\""
+    };
+    let prompt_arg_line = format!("    parser.add_argument(\"--prompt\", default={prompt_default})\n");
+    let insertion_anchors = [
+        "    parser.add_argument(\"--random-count\", type=int, default=1)\n",
+        "    parser.add_argument(\"--days\", type=int, default=7)\n",
+        "    parser = argparse.ArgumentParser(description=\"Generated workflow bot script\")\n",
+    ];
+
+    let mut patched_content = None;
+    for anchor in insertion_anchors {
+        if let Some(pos) = script_content.find(anchor) {
+            let insert_at = pos + anchor.len();
+            let mut next = String::with_capacity(script_content.len() + prompt_arg_line.len());
+            next.push_str(&script_content[..insert_at]);
+            next.push_str(&prompt_arg_line);
+            next.push_str(&script_content[insert_at..]);
+            patched_content = Some(next);
+            break;
+        }
+    }
+
+    let Some(next_content) = patched_content else {
+        return Ok(None);
+    };
+
+    std::fs::write(&script_abs, next_content).with_context(|| {
+        format!(
+            "failed to write workflow script quick fix for {}",
+            script_abs.display()
+        )
+    })?;
+
+    Ok(Some(format!(
+        "Applied deterministic quick fix: added `--prompt` CLI argument support to `{script_rel}`."
+    )))
+}
+
+fn workflow_self_heal_prompt(
+    workflow: &FeedWorkflowDefinition,
+    bot_name: &str,
+    command: &str,
+    error_text: &str,
+    attempt: usize,
+    max_attempts: usize,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(
+        "You are the workflow supervisor. A workflow execution failed and must be self-healed.\n\n",
+    );
+    prompt.push_str("## Workflow\n");
+    prompt.push_str(&format!("- Bot: {bot_name}\n"));
+    prompt.push_str(&format!("- Key: {}\n", workflow.key));
+    prompt.push_str(&format!("- Target command: `{command}`\n"));
+    prompt.push_str(&format!(
+        "- Attempt: {attempt}/{max_attempts}\n\n"
+    ));
+
+    prompt.push_str("## Failure Output\n");
+    prompt.push_str("```text\n");
+    prompt.push_str(error_text.trim());
+    prompt.push_str("\n```\n\n");
+
+    prompt.push_str("## Allowed Files (strict)\n");
+    for file in &workflow.editable_files {
+        prompt.push_str(&format!("- `{file}`\n"));
+    }
+    prompt.push('\n');
+
+    prompt.push_str("## Constraints\n");
+    prompt.push_str("- Edit only allowed files.\n");
+    prompt.push_str("- Keep behavior deterministic and production-safe.\n");
+    prompt.push_str(&format!(
+        "- Keep feed output rooted under `{}`.\n",
+        workflow.output_prefix
+    ));
+    prompt.push_str("- Make minimal focused edits that fix the observed failure.\n");
+    prompt.push_str("- You must apply direct file edits to at least one allowed file.\n");
+    prompt.push_str("- Do not introduce new dependencies.\n\n");
+
+    prompt.push_str("After edits, reply with a concise summary of changed files and why.\n");
+    prompt
+}
+
+async fn try_self_heal_workflow_run(
+    state: &AppState,
+    workflow: &FeedWorkflowDefinition,
+    workflow_key: &str,
+    bot_name: &str,
+    command: &str,
+    thread_id: &str,
+    user_id: &str,
+    initial_error: &str,
+    workspace_dir: &StdPath,
+) -> Option<String> {
+    let mut last_error = initial_error.to_string();
+    let config = state.config.lock().clone();
+
+    for attempt in 1..=WORKFLOW_SELF_HEAL_MAX_ATTEMPTS {
+        match maybe_apply_workflow_run_quickfix(workspace_dir, workflow, &last_error) {
+            Ok(Some(message)) => {
+                let _ = local_store::create_chat_message(
+                    workspace_dir,
+                    thread_id,
+                    "assistant",
+                    &message,
+                    "done",
+                    "workflow-quickfix",
+                    Some(user_id),
+                    None,
+                );
+
+                let retry_job = build_manual_workflow_job(workflow_key, bot_name, command.to_string());
+                let (retry_success, retry_output) =
+                    crate::cron::scheduler::execute_job_now(&config, &retry_job).await;
+                let retry_trimmed = truncate_with_ellipsis(retry_output.trim(), 4000);
+                if retry_success {
+                    let detail = if retry_trimmed.is_empty() {
+                        "Workflow run completed after quick fix.".to_string()
+                    } else {
+                        format!("Workflow run completed after quick fix.\n\n{retry_trimmed}")
+                    };
+                    return Some(detail);
+                }
+
+                last_error = if retry_trimmed.is_empty() {
+                    "Workflow run failed after deterministic quick fix.".to_string()
+                } else {
+                    retry_trimmed
+                };
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let err_text = truncate_with_ellipsis(
+                    &format!("quick fix failed before self-heal: {err:#}"),
+                    2000,
+                );
+                let _ = local_store::create_chat_message(
+                    workspace_dir,
+                    thread_id,
+                    "assistant",
+                    "",
+                    "error",
+                    "workflow-quickfix",
+                    Some(user_id),
+                    Some(&err_text),
+                );
+                last_error = err_text;
+            }
+        }
+
+        let start_msg = format!(
+            "Run failed. Starting self-heal attempt {attempt}/{WORKFLOW_SELF_HEAL_MAX_ATTEMPTS}..."
+        );
+        let _ = local_store::create_chat_message(
+            workspace_dir,
+            thread_id,
+            "assistant",
+            &start_msg,
+            "processing",
+            "workflow-supervisor",
+            Some(user_id),
+            None,
+        );
+
+        let prompt = workflow_self_heal_prompt(
+            workflow,
+            bot_name,
+            command,
+            &last_error,
+            attempt,
+            WORKFLOW_SELF_HEAL_MAX_ATTEMPTS,
+        );
+        let before_stamps = capture_workflow_editable_file_stamps(workspace_dir, workflow);
+
+        let channel_ctx = crate::channels::ChannelExecutionContext::new(
+            "local",
+            thread_id.to_string(),
+            Some(thread_id.to_string()),
+        );
+        let heal_result = crate::channels::with_channel_execution_context(
+            channel_ctx,
+            crate::agent::process_message(config.clone(), &prompt),
+        )
+        .await;
+
+        match heal_result {
+            Ok(reply) => {
+                let after_stamps = capture_workflow_editable_file_stamps(workspace_dir, workflow);
+                let changed_files = changed_workflow_editable_files(&before_stamps, &after_stamps);
+                if changed_files.is_empty() {
+                    let reply_preview = truncate_with_ellipsis(reply.trim(), 600);
+                    let no_edit_error = if reply_preview.is_empty() {
+                        "Self-heal attempt completed but did not modify any allowed files."
+                            .to_string()
+                    } else {
+                        format!(
+                            "Self-heal attempt completed but did not modify any allowed files. \
+Agent reply preview: {reply_preview}"
+                        )
+                    };
+                    let _ = local_store::create_chat_message(
+                        workspace_dir,
+                        thread_id,
+                        "assistant",
+                        "",
+                        "error",
+                        "workflow-supervisor",
+                        Some(user_id),
+                        Some(&no_edit_error),
+                    );
+                    last_error = no_edit_error;
+                    continue;
+                }
+
+                let reply_text = if reply.trim().is_empty() {
+                    format!(
+                        "Self-heal attempt {attempt} applied file changes.\n\nEdited files:\n- {}",
+                        changed_files.join("\n- ")
+                    )
+                } else {
+                    format!(
+                        "{}\n\nEdited files:\n- {}",
+                        reply.trim(),
+                        changed_files.join("\n- ")
+                    )
+                };
+                let _ = local_store::create_chat_message(
+                    workspace_dir,
+                    thread_id,
+                    "assistant",
+                    &reply_text,
+                    "done",
+                    "workflow-supervisor",
+                    Some(user_id),
+                    None,
+                );
+            }
+            Err(err) => {
+                let err_text = truncate_with_ellipsis(&format!("{err:#}"), 2000);
+                let _ = local_store::create_chat_message(
+                    workspace_dir,
+                    thread_id,
+                    "assistant",
+                    "",
+                    "error",
+                    "workflow-supervisor",
+                    Some(user_id),
+                    Some(&err_text),
+                );
+                last_error = err_text;
+                continue;
+            }
+        }
+
+        let retry_job = build_manual_workflow_job(workflow_key, bot_name, command.to_string());
+        let (retry_success, retry_output) =
+            crate::cron::scheduler::execute_job_now(&config, &retry_job).await;
+        let retry_trimmed = truncate_with_ellipsis(retry_output.trim(), 4000);
+        if retry_success {
+            let detail = if retry_trimmed.is_empty() {
+                "Workflow run completed after self-heal.".to_string()
+            } else {
+                format!("Workflow run completed after self-heal.\n\n{retry_trimmed}")
+            };
+            return Some(detail);
+        }
+
+        last_error = if retry_trimmed.is_empty() {
+            "Workflow run failed after self-heal retry.".to_string()
+        } else {
+            retry_trimmed
+        };
+    }
+
+    None
+}
+
+async fn run_local_agent_prompt_in_thread(
+    state: &AppState,
+    thread_id: &str,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let channel_ctx = crate::channels::ChannelExecutionContext::new(
+        "local",
+        thread_id.to_string(),
+        Some(thread_id.to_string()),
+    );
+    let config = state.config.lock().clone();
+    crate::channels::with_channel_execution_context(
+        channel_ctx,
+        crate::agent::process_message(config, prompt),
+    )
+    .await
+}
+
+fn queue_workflow_run(
+    state: AppState,
+    workflow_key: String,
+    bot_name: String,
+    command: String,
+    source: &'static str,
+) -> Result<String> {
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let thread_id = format!("workflow:{workflow_key}");
+    let user_content = format!(
+        "[run] Triggered {} for {} using command: {}",
+        source, bot_name, command
+    );
+
+    let user_record = local_store::create_chat_message(
+        &workspace_dir,
+        &thread_id,
+        "user",
+        &user_content,
+        "pending",
+        source,
+        None,
+        None,
+    )?;
+    let user_id = user_record
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let state_for_worker = state.clone();
+    let workspace_for_worker = workspace_dir.clone();
+    let thread_id_for_worker = thread_id.clone();
+    let user_id_for_worker = user_id.clone();
+    let workflow_key_for_worker = workflow_key.clone();
+    let bot_name_for_worker = bot_name.clone();
+    let command_for_worker = command.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            local_store::patch_chat_status(
+                &workspace_for_worker,
+                &user_id_for_worker,
+                "processing",
+                None,
+            )
+        {
+            tracing::warn!("Failed to update workflow-run status to processing: {err}");
+        }
+
+        let config = state_for_worker.config.lock().clone();
+        let job = build_manual_workflow_job(
+            &workflow_key_for_worker,
+            &bot_name_for_worker,
+            command_for_worker.clone(),
+        );
+        let (success, output) = crate::cron::scheduler::execute_job_now(&config, &job).await;
+        let output_trimmed = crate::util::truncate_with_ellipsis(output.trim(), 4000);
+
+        if success {
+            let reply = if output_trimmed.is_empty() {
+                "Workflow run completed.".to_string()
+            } else {
+                output_trimmed
+            };
+            if let Err(err) = local_store::create_chat_message(
+                &workspace_for_worker,
+                &thread_id_for_worker,
+                "assistant",
+                &reply,
+                "done",
+                "workflow-runner",
+                Some(&user_id_for_worker),
+                None,
+            ) {
+                tracing::warn!("Failed to persist workflow-run success reply: {err}");
+            }
+            if let Err(err) = local_store::patch_chat_status(
+                &workspace_for_worker,
+                &user_id_for_worker,
+                "done",
+                None,
+            ) {
+                tracing::warn!("Failed to mark workflow-run as done: {err}");
+            }
+        } else {
+            let error_text = if output_trimmed.is_empty() {
+                "Workflow run failed.".to_string()
+            } else {
+                output_trimmed
+            };
+            let workflow_store =
+                load_feed_workflow_settings_store(&workspace_for_worker).unwrap_or_default();
+            let healed_output = if let Some(workflow) =
+                workflow_definition_by_key(&workflow_store, &workflow_key_for_worker)
+            {
+                if let Err(err) = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "processing",
+                    None,
+                ) {
+                    tracing::warn!(
+                        "Failed to mark workflow-run as processing before self-heal: {err}"
+                    );
+                }
+
+                try_self_heal_workflow_run(
+                    &state_for_worker,
+                    &workflow,
+                    &workflow_key_for_worker,
+                    &bot_name_for_worker,
+                    &command_for_worker,
+                    &thread_id_for_worker,
+                    &user_id_for_worker,
+                    &error_text,
+                    &workspace_for_worker,
+                )
+                .await
+            } else {
+                None
+            };
+
+            if let Some(detail) = healed_output {
+                let _ = local_store::create_chat_message(
+                    &workspace_for_worker,
+                    &thread_id_for_worker,
+                    "assistant",
+                    &detail,
+                    "done",
+                    "workflow-runner",
+                    Some(&user_id_for_worker),
+                    None,
+                );
+                if let Err(err) = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "done",
+                    None,
+                ) {
+                    tracing::warn!("Failed to mark workflow-run as done after self-heal: {err}");
+                }
+            } else {
+                let final_error = format!("Workflow run failed.\n\n{error_text}");
+                let _ = local_store::create_chat_message(
+                    &workspace_for_worker,
+                    &thread_id_for_worker,
+                    "assistant",
+                    "",
+                    "error",
+                    "workflow-runner",
+                    Some(&user_id_for_worker),
+                    Some(&final_error),
+                );
+                if let Err(err) = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "error",
+                    Some(&final_error),
+                ) {
+                    tracing::warn!("Failed to mark workflow-run as error: {err}");
+                }
+            }
+        }
+    });
+
+    Ok(thread_id)
+}
+
+fn sanitize_workflow_key(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '_' | '-' | ' ') {
+            out.push('_');
+        }
+    }
+
+    let collapsed = out
+        .split('_')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if collapsed.is_empty() {
+        "workflow".to_string()
+    } else {
+        collapsed
+    }
+}
+
+const WORKFLOW_BOT_CREATION_SKILL_REL_PATH: &str = "skills/workflow_bot_creation/SKILL.md";
+
+fn ensure_workflow_bot_creation_skill(workspace_dir: &StdPath) -> Result<String> {
+    let abs = workspace_dir.join(WORKFLOW_BOT_CREATION_SKILL_REL_PATH);
+    if !abs.exists() {
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create workflow bot creation skill directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::write(
+            &abs,
+            include_str!("../../skills/workflow_bot_creation/SKILL.md"),
+        )
+        .with_context(|| format!("failed to write workflow bot creation skill {}", abs.display()))?;
+    }
+    std::fs::read_to_string(&abs)
+        .with_context(|| format!("failed to read workflow bot creation skill {}", abs.display()))
+}
+
+fn render_workflow_script_stub(source_kind: &str, output_dir: &str, user_prompt: &str) -> String {
+    let output_literal =
+        serde_json::to_string(output_dir.trim()).unwrap_or_else(|_| "\"posts/workflow\"".to_string());
+    let user_prompt_literal =
+        serde_json::to_string(user_prompt.trim()).unwrap_or_else(|_| "\"\"".to_string());
+    let default_source_root = if source_kind == "audio" {
+        "journals/media/audio"
+    } else {
+        "journals/text"
+    };
+    let source_root_literal = serde_json::to_string(default_source_root).unwrap_or_else(|_| "\"journals/text\"".to_string());
+
+    format!(
+        "#!/usr/bin/env python3\n\
+from __future__ import annotations\n\
+\n\
+import argparse\n\
+import datetime as dt\n\
+import json\n\
+import random\n\
+from pathlib import Path\n\
+\n\
+DEFAULT_SOURCE_ROOT = {source_root_literal}\n\
+DEFAULT_OUTPUT_DIR = {output_literal}\n\
+USER_PROMPT = {user_prompt_literal}\n\
+\n\
+def parse_args() -> argparse.Namespace:\n\
+    parser = argparse.ArgumentParser(description=\"Generated workflow bot script\")\n\
+    parser.add_argument(\"--mode\", choices=[\"date_range\", \"random\"], default=\"date_range\")\n\
+    parser.add_argument(\"--days\", type=int, default=7)\n\
+    parser.add_argument(\"--random-count\", type=int, default=1)\n\
+    parser.add_argument(\"--prompt\", default=USER_PROMPT)\n\
+    parser.add_argument(\"--workspace\", default=\".\")\n\
+    parser.add_argument(\"--source-root\", default=DEFAULT_SOURCE_ROOT)\n\
+    parser.add_argument(\"--output-dir\", default=DEFAULT_OUTPUT_DIR)\n\
+    parser.add_argument(\"--seed\", type=int, default=None)\n\
+    return parser.parse_args()\n\
+\n\
+def collect_files(root: Path) -> list[Path]:\n\
+    if not root.exists():\n\
+        return []\n\
+    files = [path for path in root.rglob(\"*\") if path.is_file()]\n\
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)\n\
+    return files\n\
+\n\
+def select_files(files: list[Path], args: argparse.Namespace) -> list[Path]:\n\
+    if not files:\n\
+        return []\n\
+    if args.mode == \"random\":\n\
+        target = max(1, min(args.random_count, len(files)))\n\
+        rng = random.Random(args.seed)\n\
+        picked = rng.sample(files, target)\n\
+        picked.sort(key=lambda p: p.stat().st_mtime, reverse=True)\n\
+        return picked\n\
+\n\
+    now = dt.datetime.now(dt.timezone.utc)\n\
+    start = now - dt.timedelta(days=max(0, args.days))\n\
+    selected = []\n\
+    for path in files:\n\
+        modified = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)\n\
+        if modified >= start:\n\
+            selected.append(path)\n\
+    return selected\n\
+\n\
+def rel(path: Path, workspace: Path) -> str:\n\
+    return str(path.resolve().relative_to(workspace.resolve())).replace('\\\\', '/')\n\
+\n\
+def main() -> int:\n\
+    args = parse_args()\n\
+    workspace = Path(args.workspace).resolve()\n\
+    source_root = (workspace / args.source_root).resolve()\n\
+    output_dir = (workspace / args.output_dir).resolve()\n\
+    posts_root = (workspace / \"posts\").resolve()\n\
+    if not str(output_dir).startswith(str(posts_root)):\n\
+        print(json.dumps({{\"ok\": False, \"error\": \"output-dir must be under posts/\"}}))\n\
+        return 2\n\
+\n\
+    files = collect_files(source_root)\n\
+    selected = select_files(files, args)\n\
+    output_dir.mkdir(parents=True, exist_ok=True)\n\
+    stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d_%H%M%S')\n\
+    out_path = output_dir / f\"{{stamp}}_summary.md\"\n\
+\n\
+    lines = [\n\
+        f\"{{args.prompt}}\",\n\
+        \"\",\n\
+        \"## Selected Journal Files\",\n\
+        \"\",\n\
+    ]\n\
+    if not selected:\n\
+        lines.append(\"- none\")\n\
+    for path in selected:\n\
+        lines.append(f\"- `{{rel(path, workspace)}}`\")\n\
+\n\
+    lines.append(\"\")\n\
+    lines.append(\"## Notes\")\n\
+    lines.append(\"\")\n\
+    lines.append(\"Edit this script to implement specialized behavior for this workflow bot.\")\n\
+    out_path.write_text(\"\\n\".join(lines) + \"\\n\", encoding=\"utf-8\")\n\
+\n\
+    print(json.dumps({{\"ok\": True, \"output\": rel(out_path, workspace), \"selected\": [rel(p, workspace) for p in selected]}}))\n\
+    return 0\n\
+\n\
+if __name__ == \"__main__\":\n\
+    raise SystemExit(main())\n"
+    )
+}
+
+fn render_workflow_creation_prompt(
+    workflow_name: &str,
+    workflow_key: &str,
+    workflow_bot: &str,
+    source_kind: &str,
+    source_root: &str,
+    script_rel: &str,
+    skill_rel: &str,
+    output_dir_rel: &str,
+    user_prompt: &str,
+    creation_skill_markdown: &str,
+    script_body: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Use the workflow bot creation skill below to implement a new workflow bot.\n\n");
+    prompt.push_str(&format!(
+        "Skill file: `{WORKFLOW_BOT_CREATION_SKILL_REL_PATH}`\n\n"
+    ));
+    prompt.push_str("## Bot Creation Skill (verbatim)\n");
+    prompt.push_str("```markdown\n");
+    prompt.push_str(creation_skill_markdown.trim());
+    prompt.push_str("\n```\n\n");
+
+    prompt.push_str("## Workflow Request\n");
+    prompt.push_str(&format!("- Name: {workflow_name}\n"));
+    prompt.push_str(&format!("- Key: {workflow_key}\n"));
+    prompt.push_str(&format!("- Bot: {workflow_bot}\n"));
+    prompt.push_str(&format!("- Source kind: {source_kind}\n"));
+    prompt.push_str(&format!("- Source root: `{source_root}`\n"));
+    prompt.push_str(&format!("- User intent: \"{}\"\n\n", user_prompt.trim()));
+
+    prompt.push_str("## Required Files\n");
+    prompt.push_str(&format!("- Script (must exist): `{script_rel}`\n"));
+    prompt.push_str(&format!("- Skill (must exist): `{skill_rel}`\n"));
+    prompt.push_str(&format!("- Output directory root: `{output_dir_rel}`\n\n"));
+
+    prompt.push_str("## Script File Payload (authoritative)\n");
+    prompt.push_str("Use this full script content as the source template, then overwrite the script file with your updated implementation.\n");
+    prompt.push_str("Do not respond with only a file path reference.\n\n");
+    prompt.push_str(&format!("### `{script_rel}` initial content\n"));
+    prompt.push_str("```python\n");
+    prompt.push_str(script_body.trim());
+    prompt.push_str("\n```\n\n");
+
+    prompt.push_str("## Hard Requirements\n");
+    prompt.push_str("- The script must support: `--mode`, `--days`, `--random-count`.\n");
+    prompt.push_str("- `--mode` values: `date_range` and `random`.\n");
+    prompt.push_str("- Script must read journal context from the journal folder (`journals/...`).\n");
+    prompt.push_str("- Script must publish outputs under the posts folder (`posts/...`).\n");
+    prompt.push_str("- Keep execution deterministic for file selection behavior.\n");
+    prompt.push_str("- Keep edits minimal, production-safe, and dependency-light.\n");
+    prompt.push_str("- Do not include metadata headers in the output file. Only output the generated content. If generating multiple distinct items, save each as a separate file.\n");
+    prompt.push_str(&format!("- Replace `{script_rel}` with your full updated script content (not a patch description).\n"));
+    prompt.push_str("- Use the `file_write` tool to save your changes directly to the file.\n");
+    prompt.push_str("- Do direct file edits. Do not just describe code.\n\n");
+    prompt.push_str("- You must modify the script implementation from the initial template stub.\n\n");
+
+    prompt.push_str("After editing, reply with a concise summary of modified files and behavior.\n");
+    prompt
+}
+
+fn validate_workflow_script_contract(script_abs: &StdPath) -> Result<()> {
+    let raw = std::fs::read_to_string(script_abs)
+        .with_context(|| format!("failed to read generated script {}", script_abs.display()))?;
+    let required_fragments = [
+        "--mode",
+        "date_range",
+        "random",
+        "--days",
+        "--random-count",
+        "journals/",
+        "posts/",
+    ];
+    for fragment in required_fragments {
+        if !raw.contains(fragment) {
+            anyhow::bail!(
+                "generated workflow script is missing required fragment `{fragment}` (file: {})",
+                script_abs.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn render_template_skill_markdown(
+    skill_name: &str,
+    source_kind: &str,
+    script_rel_path: &str,
+    output_dir: &str,
+) -> String {
+    let source_hint = if source_kind == "audio" {
+        "`journals/media/audio` (with transcriptions in `journals/text/transcriptions`)"
+    } else {
+        "`journals/text`"
+    };
+    format!(
+        "# {skill_name} Workflow\n\n\
+Use this skill to generate feed-ready posts from {source_hint}.\n\n\
+## Script\n\n\
+- `{script_rel_path}`\n\n\
+## Default Command\n\n\
+```bash\n\
+workspace-script {script_rel_path} --mode date_range --days 7\n\
+```\n\n\
+## Output\n\n\
+- `{output_dir}`\n"
+    )
+}
+
+fn workflow_comment_prompt(
+    workflow: &FeedWorkflowDefinition,
+    feed_item_path: &str,
+    comment: &str,
+) -> String {
+    let mut prompt = String::from(
+        "Apply this workflow modification request by editing files in the workspace.\n\n",
+    );
+    prompt.push_str("## Request Context\n");
+    prompt.push_str(&format!("- Workflow: {} ({})\n", workflow.bot_name, workflow.key));
+    prompt.push_str(&format!("- Feed item path: `{}`\n", feed_item_path));
+    prompt.push_str(&format!("- User comment: \"{}\"\n\n", comment.trim()));
+
+    prompt.push_str("## Allowed Files\n");
+    for file in &workflow.editable_files {
+        prompt.push_str(&format!("- `{file}`\n"));
+    }
+    prompt.push('\n');
+
+    prompt.push_str("## Guardrails\n");
+    prompt.push_str("- Edit only files from the allowed list.\n");
+    prompt.push_str("- Keep behavior deterministic and production-safe.\n");
+    prompt.push_str(&format!(
+        "- Keep feed output rooted under `{}`.\n",
+        workflow.output_prefix
+    ));
+    prompt.push_str("- Do not return full code in chat; make direct file edits.\n");
+    prompt.push_str("- Keep changes minimal and focused on the user request.\n\n");
+
+    prompt.push_str("After editing, reply with a concise summary of what changed.\n");
+    prompt
+}
+
+fn maybe_apply_workflow_comment_quickfix(
+    _workspace_dir: &StdPath,
+    _workflow: &FeedWorkflowDefinition,
+    _feed_item_path: &str,
+    _comment: &str,
+) -> Result<Option<String>> {
+    Ok(None)
+}
+
 async fn handle_chat_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -881,10 +2347,7 @@ async fn handle_chat_list(
         return err;
     }
 
-    let Some(base_url) = state.pb_chat_base_url.as_deref() else {
-        let err = serde_json::json!({"error": "PocketBase chat bridge unavailable"});
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(err));
-    };
+    let workspace_dir = state.config.lock().workspace_dir.clone();
     let thread_id = query
         .thread_id
         .as_deref()
@@ -893,20 +2356,12 @@ async fn handle_chat_list(
         .unwrap_or("default");
     let limit = query.limit.unwrap_or(200).clamp(1, 500);
 
-    match fetch_chat_thread_messages(
-        base_url,
-        &state.pb_chat_collection,
-        state.pb_chat_token.as_deref(),
-        thread_id,
-        limit,
-    )
-    .await
-    {
+    match local_store::list_chat_messages(&workspace_dir, thread_id, limit) {
         Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))),
         Err(e) => {
             tracing::warn!("Chat API list failed: {e}");
             let err = serde_json::json!({"error": e.to_string()});
-            (StatusCode::BAD_GATEWAY, Json(err))
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
 }
@@ -920,10 +2375,6 @@ async fn handle_chat_send(
         return err;
     }
 
-    let Some(base_url) = state.pb_chat_base_url.as_deref() else {
-        let err = serde_json::json!({"error": "PocketBase chat bridge unavailable"});
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(err));
-    };
     let thread_id = body.thread_id.trim();
     let content = body.content.trim();
     if thread_id.is_empty() || content.is_empty() {
@@ -931,20 +2382,1145 @@ async fn handle_chat_send(
         return (StatusCode::BAD_REQUEST, Json(err));
     }
 
-    match create_chat_user_message(
-        base_url,
-        &state.pb_chat_collection,
-        state.pb_chat_token.as_deref(),
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    match local_store::create_chat_message(
+        &workspace_dir,
         thread_id,
+        "user",
         content,
-    )
-    .await
-    {
-        Ok(record) => (StatusCode::OK, Json(record)),
+        "pending",
+        "gateway-ui",
+        None,
+        None,
+    ) {
+        Ok(record) => {
+            if state.auto_save {
+                let key = format!("chat_{}_{}", thread_id, Uuid::new_v4());
+                let mem = state.mem.clone();
+                let content_copy = content.to_string();
+                tokio::spawn(async move {
+                    let _ = mem
+                        .store(&key, &content_copy, MemoryCategory::Conversation, None)
+                        .await;
+                });
+            }
+
+            let user_id = record
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let thread_id_owned = thread_id.to_string();
+            let content_owned = content.to_string();
+            let state_for_worker = state.clone();
+            let workspace_for_worker = workspace_dir.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    local_store::patch_chat_status(&workspace_for_worker, &user_id, "processing", None)
+                {
+                    tracing::warn!("Chat worker status update failed: {err}");
+                }
+
+                let channel_ctx = crate::channels::ChannelExecutionContext::new(
+                    "local",
+                    thread_id_owned.clone(),
+                    Some(thread_id_owned.clone()),
+                );
+                let config = state_for_worker.config.lock().clone();
+                let result = crate::channels::with_channel_execution_context(
+                    channel_ctx,
+                    crate::agent::process_message(config, &content_owned),
+                )
+                .await;
+
+                match result {
+                    Ok(reply) => {
+                        let reply_text = if reply.trim().is_empty() {
+                            "(empty response)"
+                        } else {
+                            reply.trim()
+                        };
+                        if let Err(err) = local_store::create_chat_message(
+                            &workspace_for_worker,
+                            &thread_id_owned,
+                            "assistant",
+                            reply_text,
+                            "done",
+                            "slowclaw",
+                            Some(&user_id),
+                            None,
+                        ) {
+                            tracing::warn!("Chat worker failed to save assistant reply: {err}");
+                        }
+                        if let Err(err) =
+                            local_store::patch_chat_status(&workspace_for_worker, &user_id, "done", None)
+                        {
+                            tracing::warn!("Chat worker failed to mark done: {err}");
+                        }
+                        if state_for_worker.auto_save {
+                            let key = format!("chat_{}_{}", thread_id_owned, Uuid::new_v4());
+                            let _ = state_for_worker
+                                .mem
+                                .store(&key, reply_text, MemoryCategory::Conversation, None)
+                                .await;
+                        }
+                    }
+                    Err(err) => {
+                        let err_text =
+                            crate::util::truncate_with_ellipsis(&format!("{err:#}"), 2000);
+                        let _ = local_store::create_chat_message(
+                            &workspace_for_worker,
+                            &thread_id_owned,
+                            "assistant",
+                            "",
+                            "error",
+                            "slowclaw",
+                            Some(&user_id),
+                            Some(&err_text),
+                        );
+                        if let Err(update_err) = local_store::patch_chat_status(
+                            &workspace_for_worker,
+                            &user_id,
+                            "error",
+                            Some(&err_text),
+                        ) {
+                            tracing::warn!("Chat worker failed to persist error status: {update_err}");
+                        }
+                    }
+                }
+            });
+
+            (StatusCode::OK, Json(record))
+        }
         Err(e) => {
             tracing::warn!("Chat API send failed: {e}");
             let err = serde_json::json!({"error": e.to_string()});
-            (StatusCode::BAD_GATEWAY, Json(err))
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+async fn handle_feed_workflow_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Feed workflow settings") {
+        return err;
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let config_snapshot = state.config.lock().clone();
+
+    let store = match load_feed_workflow_settings_store(&workspace_dir) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!("Failed to load workflow settings store: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            );
+        }
+    };
+
+    let mut items = Vec::new();
+    for workflow in workflow_definitions(&store) {
+        let configured = store
+            .workflows
+            .get(&workflow.key)
+            .map(|record| record.settings.clone())
+            .unwrap_or_else(workflow_default_settings);
+        let settings = normalize_workflow_settings(configured);
+
+        let schedule_job = match select_primary_workflow_job(&config_snapshot, &workflow.key) {
+            Ok(job) => job,
+            Err(err) => {
+                tracing::warn!("Failed to load cron state for {}: {err}", workflow.key);
+                None
+            }
+        };
+
+        items.push(workflow_settings_response_item(
+            &workflow,
+            settings,
+            schedule_job.as_ref(),
+        ));
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "items": items,
+        })),
+    )
+}
+
+async fn handle_feed_workflow_settings_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FeedWorkflowSettingsUpdateBody>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Feed workflow settings update") {
+        return err;
+    }
+
+    let workflow_key = body.workflow_key.trim().to_ascii_lowercase();
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let mut store = match load_feed_workflow_settings_store(&workspace_dir) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!("Failed to load workflow settings store for update: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            );
+        }
+    };
+
+    let Some(workflow) = workflow_definition_by_key(&store, &workflow_key) else {
+        let err = serde_json::json!({
+            "error": "unknown workflowKey",
+            "supportedWorkflowKeys": store.workflows.keys().collect::<Vec<_>>(),
+        });
+        return (StatusCode::BAD_REQUEST, Json(err));
+    };
+
+    let Some(mut workflow_record) = store.workflows.get(&workflow.key).cloned() else {
+        let err = serde_json::json!({"error": "workflow record missing"});
+        return (StatusCode::BAD_REQUEST, Json(err));
+    };
+    let mut next = workflow_record.settings.clone();
+
+    if let Some(raw_mode) = body.mode.as_deref() {
+        let Some(parsed_mode) = FeedWorkflowMode::parse(raw_mode) else {
+            let err = serde_json::json!({"error": "mode must be one of: date_range, random"});
+            return (StatusCode::BAD_REQUEST, Json(err));
+        };
+        next.mode = parsed_mode;
+    }
+    if let Some(days) = body.days {
+        next.days = days;
+    }
+    if let Some(random_count) = body.random_count {
+        next.random_count = random_count;
+    }
+    if let Some(schedule_enabled) = body.schedule_enabled {
+        next.schedule_enabled = schedule_enabled;
+    }
+    if let Some(schedule_cron) = body.schedule_cron {
+        next.schedule_cron = schedule_cron;
+    }
+    if let Some(schedule_tz) = body.schedule_tz {
+        next.schedule_tz = Some(schedule_tz);
+    }
+    if let Some(prompt) = body.prompt {
+        next.prompt = Some(prompt);
+    }
+
+    next = normalize_workflow_settings(next);
+    if next.schedule_enabled && next.schedule_cron.is_empty() {
+        let err = serde_json::json!({"error": "scheduleCron is required when scheduleEnabled=true"});
+        return (StatusCode::BAD_REQUEST, Json(err));
+    }
+
+    let config_snapshot = state.config.lock().clone();
+    let schedule_job = match upsert_workflow_schedule(&config_snapshot, &workflow, &next) {
+        Ok(job) => job,
+        Err(err) => {
+            tracing::warn!("Workflow schedule update failed for {}: {err}", workflow.key);
+            let payload = serde_json::json!({
+                "error": format!("{err:#}"),
+            });
+            return (StatusCode::BAD_REQUEST, Json(payload));
+        }
+    };
+
+    workflow_record.settings = next.clone();
+    store.workflows.insert(workflow.key.to_string(), workflow_record);
+    if let Err(err) = save_feed_workflow_settings_store(&workspace_dir, &store) {
+        tracing::warn!("Failed to persist workflow settings: {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        );
+    }
+
+    let run_command = workflow_command_preview(&workflow, &next);
+    let run_thread_id = match queue_workflow_run(
+        state.clone(),
+        workflow.key.to_string(),
+        workflow.bot_name.to_string(),
+        run_command,
+        "workflow-settings-save",
+    ) {
+        Ok(thread_id) => Some(thread_id),
+        Err(err) => {
+            tracing::warn!("Failed to queue workflow run after settings save: {err}");
+            None
+        }
+    };
+
+    let item = workflow_settings_response_item(&workflow, next, schedule_job.as_ref());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "updated": true,
+            "item": item,
+            "runQueued": run_thread_id.is_some(),
+            "runThreadId": run_thread_id,
+        })),
+    )
+}
+
+async fn handle_feed_workflow_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FeedWorkflowRunBody>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Feed workflow run") {
+        return err;
+    }
+
+    let workflow_key = body.workflow_key.trim().to_ascii_lowercase();
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let store = load_feed_workflow_settings_store(&workspace_dir).unwrap_or_default();
+    let Some(workflow) = workflow_definition_by_key(&store, &workflow_key) else {
+        let err = serde_json::json!({
+            "error": "unknown workflowKey",
+            "supportedWorkflowKeys": store.workflows.keys().collect::<Vec<_>>(),
+        });
+        return (StatusCode::BAD_REQUEST, Json(err));
+    };
+
+    let configured = store
+        .workflows
+        .get(&workflow.key)
+        .map(|record| record.settings.clone())
+        .unwrap_or_else(workflow_default_settings);
+    let settings = normalize_workflow_settings(configured);
+    let command = workflow_command_preview(&workflow, &settings);
+
+    match queue_workflow_run(
+        state.clone(),
+        workflow.key.to_string(),
+        workflow.bot_name.to_string(),
+        command,
+        "workflow-run-manual",
+    ) {
+        Ok(thread_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "queued": true,
+                "threadId": thread_id,
+                "workflowKey": workflow.key,
+                "workflowBot": workflow.bot_name,
+            })),
+        ),
+        Err(err) => {
+            tracing::warn!("Failed to queue manual workflow run: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+        }
+    }
+}
+
+async fn handle_feed_workflow_template_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FeedWorkflowTemplateCreateBody>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Feed workflow template create") {
+        return err;
+    }
+
+    let name = body.name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "name is required"})),
+        );
+    }
+
+    let workflow_key = sanitize_workflow_key(name);
+    let source_kind = body
+        .source_kind
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("text")
+        .to_ascii_lowercase();
+    let source_kind = if source_kind == "audio" { "audio" } else { "text" };
+
+    let workflow_bot = body
+        .bot_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| default_workflow_bot_name(&workflow_key));
+    let prompt = body
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Write in a clear, natural voice.");
+
+    let default_mode = body
+        .mode
+        .as_deref()
+        .and_then(FeedWorkflowMode::parse)
+        .unwrap_or(FeedWorkflowMode::DateRange);
+    let mut settings = FeedWorkflowSettings {
+        mode: default_mode,
+        days: body.days.unwrap_or(default_feed_workflow_days()),
+        random_count: body.random_count.unwrap_or(default_feed_workflow_random_count()),
+        schedule_enabled: body.schedule_enabled.unwrap_or(false),
+        schedule_cron: body.schedule_cron.unwrap_or_else(default_workflow_schedule_cron),
+        schedule_tz: body.schedule_tz,
+        prompt: Some(prompt.to_string()),
+    };
+    settings = normalize_workflow_settings(settings);
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let store = match load_feed_workflow_settings_store(&workspace_dir) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!("Failed to load workflow settings store for create: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            );
+        }
+    };
+    if workflow_definition_by_key(&store, &workflow_key).is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "workflow key already exists"})),
+        );
+    }
+
+    let output_dir_rel = format!("posts/{workflow_key}");
+    let script_rel = format!("scripts/{}_skill/run_{}.py", workflow_key, workflow_key);
+    let skill_rel = format!("skills/{workflow_key}/SKILL.md");
+    let script_abs = workspace_dir.join(&script_rel);
+    let skill_abs = workspace_dir.join(&skill_rel);
+
+    let script_body = render_workflow_script_stub(source_kind, &output_dir_rel, prompt);
+    let skill_body = render_template_skill_markdown(name, source_kind, &script_rel, &output_dir_rel);
+
+    if let Some(parent) = script_abs.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("failed to create script directory: {err}")})),
+            );
+        }
+    }
+    if let Some(parent) = skill_abs.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("failed to create skill directory: {err}")})),
+            );
+        }
+    }
+    if let Err(err) = std::fs::create_dir_all(workspace_dir.join(&output_dir_rel)) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to create output directory: {err}")})),
+        );
+    }
+
+    if let Err(err) = std::fs::write(&script_abs, &script_body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to write script: {err}")})),
+        );
+    }
+    if let Err(err) = std::fs::write(&skill_abs, skill_body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to write skill: {err}")})),
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script_abs, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let creation_skill_markdown = match ensure_workflow_bot_creation_skill(&workspace_dir) {
+        Ok(markdown) => markdown,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{err:#}")})),
+            )
+        }
+    };
+    let source_root = if source_kind == "audio" {
+        "journals/media/audio"
+    } else {
+        "journals/text"
+    };
+    let creation_prompt = render_workflow_creation_prompt(
+        name,
+        &workflow_key,
+        &workflow_bot,
+        source_kind,
+        source_root,
+        &script_rel,
+        &skill_rel,
+        &output_dir_rel,
+        prompt,
+        &creation_skill_markdown,
+        &script_body,
+    );
+
+    let creation_thread_id = format!("workflow:create:{workflow_key}");
+    let creation_user_content = format!(
+        "[create] name={name}; key={workflow_key}; script={script_rel}; output={output_dir_rel}; source={source_kind}"
+    );
+    let creation_user_record = match local_store::create_chat_message(
+        &workspace_dir,
+        &creation_thread_id,
+        "user",
+        &creation_user_content,
+        "pending",
+        "workflow-template-create",
+        None,
+        None,
+    ) {
+        Ok(record) => record,
+        Err(err) => {
+            tracing::warn!("Failed to persist workflow template create request: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            );
+        }
+    };
+    let creation_user_id = creation_user_record
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let run_now = body.run_now.unwrap_or(true);
+    let output_prefix = format!("{output_dir_rel}/");
+    let preview_def = FeedWorkflowDefinition {
+        key: workflow_key.clone(),
+        bot_name: workflow_bot.clone(),
+        editable_files: vec![
+            script_rel.clone(),
+            skill_rel.clone(),
+            WORKFLOW_BOT_CREATION_SKILL_REL_PATH.to_string(),
+        ],
+        output_prefix: output_prefix.clone(),
+        script_path: script_rel.clone(),
+    };
+    let command_preview = workflow_command_preview(&preview_def, &settings);
+
+    let state_for_worker = state.clone();
+    let workspace_for_worker = workspace_dir.clone();
+    let thread_id_for_worker = creation_thread_id.clone();
+    let user_id_for_worker = creation_user_id.clone();
+    let workflow_key_for_worker = workflow_key.clone();
+    let workflow_bot_for_worker = workflow_bot.clone();
+    let script_rel_for_worker = script_rel.clone();
+    let skill_rel_for_worker = skill_rel.clone();
+    let output_dir_for_worker = output_dir_rel.clone();
+    let output_prefix_for_worker = output_prefix.clone();
+    let settings_for_worker = settings.clone();
+    let script_abs_for_worker = script_abs.clone();
+    let script_body_for_worker = script_body.clone();
+    let creation_prompt_for_worker = creation_prompt.clone();
+
+    tokio::spawn(async move {
+        let persist_error = |message: &str| {
+            let _ = local_store::create_chat_message(
+                &workspace_for_worker,
+                &thread_id_for_worker,
+                "assistant",
+                "",
+                "error",
+                "workflow-template-create",
+                Some(&user_id_for_worker),
+                Some(message),
+            );
+            if let Err(update_err) = local_store::patch_chat_status(
+                &workspace_for_worker,
+                &user_id_for_worker,
+                "error",
+                Some(message),
+            ) {
+                tracing::warn!(
+                    "Failed to persist workflow-template-create error status: {update_err}"
+                );
+            }
+        };
+
+        if let Err(err) = local_store::patch_chat_status(
+            &workspace_for_worker,
+            &user_id_for_worker,
+            "processing",
+            None,
+        ) {
+            tracing::warn!("Failed to mark workflow-template-create as processing: {err}");
+        }
+
+        let creation_result = tokio::time::timeout(
+            Duration::from_secs(WORKFLOW_TEMPLATE_AGENT_TIMEOUT_SECS),
+            run_local_agent_prompt_in_thread(
+                &state_for_worker,
+                &thread_id_for_worker,
+                &creation_prompt_for_worker,
+            ),
+        )
+        .await;
+        let creation_reply = match creation_result {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(err)) => {
+                let err_text = truncate_with_ellipsis(
+                    &format!("workflow bot creation agent failed: {err:#}"),
+                    2000,
+                );
+                persist_error(&err_text);
+                return;
+            }
+            Err(_) => {
+                let err_text = format!(
+                    "workflow bot creation agent timed out after {}s",
+                    WORKFLOW_TEMPLATE_AGENT_TIMEOUT_SECS
+                );
+                persist_error(&err_text);
+                return;
+            }
+        };
+
+        if let Err(err) = validate_workflow_script_contract(&script_abs_for_worker) {
+            let err_text = truncate_with_ellipsis(
+                &format!("generated script failed workflow contract validation: {err:#}"),
+                2000,
+            );
+            persist_error(&err_text);
+            return;
+        }
+        let final_script = match std::fs::read_to_string(&script_abs_for_worker) {
+            Ok(raw) => raw,
+            Err(err) => {
+                let err_text =
+                    truncate_with_ellipsis(&format!("failed to read generated script: {err}"), 2000);
+                persist_error(&err_text);
+                return;
+            }
+        };
+        if final_script.trim() == script_body_for_worker.trim() {
+            persist_error(
+                "workflow bot creation agent left the template script unchanged; creation aborted",
+            );
+            return;
+        }
+
+        let mut worker_store = match load_feed_workflow_settings_store(&workspace_for_worker) {
+            Ok(store) => store,
+            Err(err) => {
+                let err_text = truncate_with_ellipsis(
+                    &format!("failed to load workflow settings store: {err:#}"),
+                    2000,
+                );
+                persist_error(&err_text);
+                return;
+            }
+        };
+        if workflow_definition_by_key(&worker_store, &workflow_key_for_worker).is_some() {
+            persist_error("workflow key already exists");
+            return;
+        }
+
+        let mut workflow_record = FeedWorkflowRecord {
+            workflow_key: workflow_key_for_worker.clone(),
+            workflow_bot: workflow_bot_for_worker.clone(),
+            script_path: script_rel_for_worker.clone(),
+            output_prefix: output_prefix_for_worker.clone(),
+            editable_files: vec![
+                script_rel_for_worker.clone(),
+                skill_rel_for_worker.clone(),
+                WORKFLOW_BOT_CREATION_SKILL_REL_PATH.to_string(),
+            ],
+            settings: settings_for_worker.clone(),
+        };
+        workflow_record = normalize_workflow_record(&workflow_key_for_worker, workflow_record);
+        let workflow_def = feed_workflow_definition_from_record(&workflow_record);
+        let command = workflow_command_preview(&workflow_def, &settings_for_worker);
+
+        let config_snapshot = state_for_worker.config.lock().clone();
+        if let Err(err) = upsert_workflow_schedule_with_command(
+            &config_snapshot,
+            &workflow_key_for_worker,
+            &settings_for_worker,
+            command.clone(),
+        ) {
+            let err_text = truncate_with_ellipsis(
+                &format!("failed to upsert workflow schedule: {err:#}"),
+                2000,
+            );
+            persist_error(&err_text);
+            return;
+        }
+
+        worker_store
+            .workflows
+            .insert(workflow_key_for_worker.clone(), workflow_record);
+        if let Err(err) = save_feed_workflow_settings_store(&workspace_for_worker, &worker_store) {
+            let err_text = truncate_with_ellipsis(
+                &format!("failed to persist workflow settings store: {err:#}"),
+                2000,
+            );
+            persist_error(&err_text);
+            return;
+        }
+
+        let run_thread_id = if run_now {
+            match queue_workflow_run(
+                state_for_worker.clone(),
+                workflow_key_for_worker.clone(),
+                workflow_bot_for_worker.clone(),
+                command.clone(),
+                "workflow-template-create",
+            ) {
+                Ok(thread_id) => Some(thread_id),
+                Err(err) => {
+                    tracing::warn!("Failed to queue workflow run after template creation: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut summary = format!(
+            "Workflow `{}` ({}) created.\n\nScript: `{}`\nOutput: `{}`\n",
+            workflow_bot_for_worker,
+            workflow_key_for_worker,
+            script_rel_for_worker,
+            output_dir_for_worker
+        );
+        if let Some(thread_id) = &run_thread_id {
+            summary.push_str(&format!("\nInitial run queued: `{thread_id}`\n"));
+        } else if run_now {
+            summary.push_str("\nInitial run requested, but queueing failed.\n");
+        } else {
+            summary.push_str("\nInitial run not requested.\n");
+        }
+        let reply_preview = truncate_with_ellipsis(creation_reply.trim(), 1200);
+        if !reply_preview.is_empty() {
+            summary.push_str("\nAgent summary:\n");
+            summary.push_str(&reply_preview);
+        }
+
+        if let Err(err) = local_store::create_chat_message(
+            &workspace_for_worker,
+            &thread_id_for_worker,
+            "assistant",
+            &summary,
+            "done",
+            "workflow-template-create",
+            Some(&user_id_for_worker),
+            None,
+        ) {
+            tracing::warn!("Failed to persist workflow-template-create success message: {err}");
+        }
+        if let Err(err) =
+            local_store::patch_chat_status(&workspace_for_worker, &user_id_for_worker, "done", None)
+        {
+            tracing::warn!("Failed to mark workflow-template-create as done: {err}");
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "created": false,
+            "queued": true,
+            "threadId": creation_thread_id,
+            "messageId": creation_user_id,
+            "workflowKey": workflow_key,
+            "workflowBot": workflow_bot,
+            "scriptPath": script_rel,
+            "skillPath": skill_rel,
+            "outputDir": output_dir_rel,
+            "outputPrefix": output_prefix,
+            "commandPreview": command_preview,
+            "scheduleJobId": serde_json::Value::Null,
+            "runQueued": false,
+            "runThreadId": serde_json::Value::Null,
+            "creationSummary": "Workflow creation queued.",
+        })),
+    )
+}
+
+async fn handle_feed_workflow_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FeedWorkflowCommentBody>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Feed workflow comment") {
+        return err;
+    }
+
+    let requested_path = body.path.trim().trim_start_matches('/').to_string();
+    let comment = body.comment.trim();
+    if requested_path.is_empty() || comment.is_empty() {
+        let err = serde_json::json!({"error": "path and comment are required"});
+        return (StatusCode::BAD_REQUEST, Json(err));
+    }
+    if comment.chars().count() > 1500 {
+        let err = serde_json::json!({"error": "comment is too long (max 1500 characters)"});
+        return (StatusCode::BAD_REQUEST, Json(err));
+    }
+    if !requested_path.starts_with("posts/") {
+        let err = serde_json::json!({"error": "workflow comments are only supported for posts/* feed items"});
+        return (StatusCode::BAD_REQUEST, Json(err));
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let store = load_feed_workflow_settings_store(&workspace_dir).unwrap_or_default();
+    let Some(workflow) = workflow_for_feed_path(&store, &requested_path) else {
+        let supported_prefixes: Vec<String> = workflow_definitions(&store)
+            .into_iter()
+            .map(|item| item.output_prefix)
+            .collect();
+        let err = serde_json::json!({
+            "error": "No editable workflow is mapped to this feed path yet",
+            "supportedPrefixes": supported_prefixes,
+        });
+        return (StatusCode::BAD_REQUEST, Json(err));
+    };
+
+    let Some(resolved_target) = resolve_workspace_text_path(&workspace_dir, &requested_path) else {
+        let err = serde_json::json!({"error": "invalid feed item path"});
+        return (StatusCode::BAD_REQUEST, Json(err));
+    };
+    if !resolved_target.exists() || !resolved_target.is_file() {
+        let err = serde_json::json!({"error": "feed item file not found"});
+        return (StatusCode::NOT_FOUND, Json(err));
+    }
+
+    let quickfix_result =
+        maybe_apply_workflow_comment_quickfix(&workspace_dir, &workflow, &requested_path, comment);
+    match quickfix_result {
+        Ok(Some(quickfix_message)) => {
+            let thread_id = format!("workflow:{}", workflow.key);
+            let user_content = format!("[{requested_path}] {comment}");
+            let user_record = match local_store::create_chat_message(
+                &workspace_dir,
+                &thread_id,
+                "user",
+                &user_content,
+                "done",
+                "feed-comment",
+                None,
+                None,
+            ) {
+                Ok(record) => record,
+                Err(err) => {
+                    tracing::warn!("Failed to persist feed workflow quickfix request: {err}");
+                    let payload = serde_json::json!({"error": err.to_string()});
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(payload));
+                }
+            };
+            let user_id = user_record
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if let Err(err) = local_store::create_chat_message(
+                &workspace_dir,
+                &thread_id,
+                "assistant",
+                &quickfix_message,
+                "done",
+                "workflow-quickfix",
+                Some(&user_id),
+                None,
+            ) {
+                tracing::warn!("Failed to persist workflow quickfix assistant message: {err}");
+            }
+
+            let configured = load_feed_workflow_settings_store(&workspace_dir)
+                .ok()
+                .and_then(|loaded| {
+                    loaded
+                        .workflows
+                        .get(&workflow.key)
+                        .map(|record| record.settings.clone())
+                })
+                .unwrap_or_else(workflow_default_settings);
+            let settings = normalize_workflow_settings(configured);
+            let command = workflow_command_preview(&workflow, &settings);
+            let run_thread_id = queue_workflow_run(
+                state.clone(),
+                workflow.key.to_string(),
+                workflow.bot_name.to_string(),
+                command,
+                "workflow-quickfix",
+            )
+            .ok();
+
+            let response_message = if run_thread_id.is_some() {
+                format!("{quickfix_message} Rerun queued.")
+            } else {
+                quickfix_message.clone()
+            };
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "queued": run_thread_id.is_some(),
+                    "threadId": run_thread_id.unwrap_or(thread_id),
+                    "workflowKey": workflow.key,
+                    "workflowBot": workflow.bot_name,
+                    "editableFiles": workflow.editable_files,
+                    "messageId": user_id,
+                    "message": response_message,
+                    "quickfixApplied": true,
+                })),
+            );
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(
+                "workflow quickfix check failed for {} on {}: {err}",
+                workflow.key,
+                requested_path
+            );
+        }
+    }
+
+    let thread_id = format!("workflow:{}", workflow.key);
+    let user_content = format!("[{requested_path}] {comment}");
+    let user_record = match local_store::create_chat_message(
+        &workspace_dir,
+        &thread_id,
+        "user",
+        &user_content,
+        "pending",
+        "feed-comment",
+        None,
+        None,
+    ) {
+        Ok(record) => record,
+        Err(err) => {
+            tracing::warn!("Failed to persist feed workflow comment: {err}");
+            let payload = serde_json::json!({"error": err.to_string()});
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(payload));
+        }
+    };
+
+    let user_id = user_record
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let prompt = workflow_comment_prompt(&workflow, &requested_path, comment);
+    let thread_id_for_worker = thread_id.clone();
+    let workspace_for_worker = workspace_dir.clone();
+    let state_for_worker = state.clone();
+    let user_id_for_worker = user_id.clone();
+
+    tokio::spawn(async move {
+        if let Err(err) =
+            local_store::patch_chat_status(
+                &workspace_for_worker,
+                &user_id_for_worker,
+                "processing",
+                None,
+            )
+        {
+            tracing::warn!("Failed to update feed-comment status to processing: {err}");
+        }
+
+        let channel_ctx = crate::channels::ChannelExecutionContext::new(
+            "local",
+            thread_id_for_worker.clone(),
+            Some(thread_id_for_worker.clone()),
+        );
+        let config = state_for_worker.config.lock().clone();
+        let result = crate::channels::with_channel_execution_context(
+            channel_ctx,
+            crate::agent::process_message(config, &prompt),
+        )
+        .await;
+
+        match result {
+            Ok(reply) => {
+                let reply_text = if reply.trim().is_empty() {
+                    "Workflow update applied."
+                } else {
+                    reply.trim()
+                };
+                if let Err(err) = local_store::create_chat_message(
+                    &workspace_for_worker,
+                    &thread_id_for_worker,
+                    "assistant",
+                    reply_text,
+                    "done",
+                    "workflow-modifier",
+                    Some(&user_id_for_worker),
+                    None,
+                ) {
+                    tracing::warn!("Failed to persist workflow-modifier reply: {err}");
+                }
+                if let Err(err) = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "done",
+                    None,
+                ) {
+                    tracing::warn!("Failed to mark feed-comment as done: {err}");
+                }
+            }
+            Err(err) => {
+                let err_text = crate::util::truncate_with_ellipsis(&format!("{err:#}"), 2000);
+                let _ = local_store::create_chat_message(
+                    &workspace_for_worker,
+                    &thread_id_for_worker,
+                    "assistant",
+                    "",
+                    "error",
+                    "workflow-modifier",
+                    Some(&user_id_for_worker),
+                    Some(&err_text),
+                );
+                if let Err(update_err) = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "error",
+                    Some(&err_text),
+                ) {
+                    tracing::warn!(
+                        "Failed to mark feed-comment as error after workflow-modifier failure: {update_err}"
+                    );
+                }
+            }
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "queued": true,
+            "threadId": thread_id,
+            "workflowKey": workflow.key,
+            "workflowBot": workflow.bot_name,
+            "editableFiles": workflow.editable_files,
+            "messageId": user_id,
+            "message": format!("Queued update for {}", workflow.bot_name),
+        })),
+    )
+}
+
+async fn handle_drafts_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DraftListQuery>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Drafts API") {
+        return err;
+    }
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let limit = query.limit.unwrap_or(20).clamp(1, 200);
+    match local_store::list_drafts(&workspace_dir, limit) {
+        Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))),
+        Err(err) => {
+            tracing::warn!("Drafts list failed: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+        }
+    }
+}
+
+async fn handle_drafts_upsert(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DraftUpsertBody>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Drafts API") {
+        return err;
+    }
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let payload = local_store::DraftUpsert {
+        id: body.id,
+        text: body.text.unwrap_or_default(),
+        video_name: body.video_name.unwrap_or_default(),
+        created_at_client: body.created_at_client,
+        updated_at_client: body.updated_at_client,
+    };
+    match local_store::upsert_draft(&workspace_dir, &payload) {
+        Ok(record) => (StatusCode::OK, Json(record)),
+        Err(err) => {
+            tracing::warn!("Draft upsert failed: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+        }
+    }
+}
+
+async fn handle_post_history_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PostHistoryListQuery>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Post history API") {
+        return err;
+    }
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    match local_store::list_post_history(&workspace_dir, limit) {
+        Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))),
+        Err(err) => {
+            tracing::warn!("Post history list failed: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+        }
+    }
+}
+
+async fn handle_post_history_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PostHistoryCreateBody>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Post history API") {
+        return err;
+    }
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let payload = local_store::PostHistoryInput {
+        provider: body.provider.unwrap_or_else(|| "bluesky".to_string()),
+        text: body.text.unwrap_or_default(),
+        video_name: body.video_name.unwrap_or_default(),
+        source_path: body.source_path.unwrap_or_default(),
+        uri: body.uri.unwrap_or_default(),
+        cid: body.cid.unwrap_or_default(),
+        status: body.status.unwrap_or_else(|| "success".to_string()),
+        error: body.error.unwrap_or_default(),
+        created_at_client: body.created_at_client,
+    };
+    match local_store::create_post_history(&workspace_dir, &payload) {
+        Ok(record) => (StatusCode::OK, Json(record)),
+        Err(err) => {
+            tracing::warn!("Post history create failed: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
         }
     }
 }
@@ -970,114 +3546,6 @@ fn pairing_auth_error(
         "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
     });
     Some((StatusCode::UNAUTHORIZED, Json(err)))
-}
-
-#[derive(serde::Deserialize)]
-struct PocketBaseListRecords {
-    items: Vec<serde_json::Value>,
-}
-
-async fn fetch_chat_thread_messages(
-    base_url: &str,
-    collection: &str,
-    token: Option<&str>,
-    thread_id: &str,
-    limit: usize,
-) -> Result<Vec<serde_json::Value>> {
-    const PAGE_SIZE: usize = 100;
-    let mut out: Vec<serde_json::Value> = Vec::new();
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/collections/{}/records",
-        base_url.trim_end_matches('/'),
-        collection.trim()
-    );
-
-    for page in 1..=5usize {
-        let page_str = page.to_string();
-        let page_size = PAGE_SIZE.to_string();
-        let mut req = client.get(&url).query(&[
-            ("page", page_str.as_str()),
-            ("perPage", page_size.as_str()),
-        ]);
-        if let Some(token) = token {
-            req = req.bearer_auth(token);
-        }
-        let resp = req.send().await.context("PocketBase chat list request failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("PocketBase chat list failed ({status}): {}", body.trim());
-        }
-        let list = resp
-            .json::<PocketBaseListRecords>()
-            .await
-            .context("PocketBase chat list decode failed")?;
-        let page_len = list.items.len();
-        for item in list.items {
-            if item
-                .get("threadId")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|v| v == thread_id)
-            {
-                out.push(item);
-            }
-        }
-        if page_len < PAGE_SIZE || out.len() >= limit {
-            break;
-        }
-    }
-
-    out.sort_by(|a, b| {
-        let a_ts = a
-            .get("createdAtClient")
-            .or_else(|| a.get("created"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let b_ts = b
-            .get("createdAtClient")
-            .or_else(|| b.get("created"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        a_ts.cmp(b_ts)
-    });
-    out.truncate(limit);
-    Ok(out)
-}
-
-async fn create_chat_user_message(
-    base_url: &str,
-    collection: &str,
-    token: Option<&str>,
-    thread_id: &str,
-    content: &str,
-) -> Result<serde_json::Value> {
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/collections/{}/records",
-        base_url.trim_end_matches('/'),
-        collection.trim()
-    );
-    let payload = serde_json::json!({
-        "threadId": thread_id,
-        "role": "user",
-        "content": content,
-        "status": "pending",
-        "source": "gateway-ui",
-        "createdAtClient": chrono::Utc::now().to_rfc3339(),
-    });
-    let mut req = client.post(url).json(&payload);
-    if let Some(token) = token {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().await.context("PocketBase chat create request failed")?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        anyhow::bail!("PocketBase chat create failed ({status}): {}", text.trim());
-    }
-    let value = serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text }));
-    Ok(value)
 }
 
 #[derive(serde::Deserialize)]
@@ -1112,6 +3580,145 @@ struct LibraryTextQuery {
 struct SaveTextBody {
     path: String,
     content: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteLibraryBody {
+    path: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalTranscribeBody {
+    media_path: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeConfigUpdateBody {
+    default_provider: String,
+    default_model: String,
+    transcription_enabled: bool,
+    transcription_model: Option<String>,
+}
+
+fn available_local_transcription_models() -> Vec<String> {
+    let (cache_key, models) = compute_available_transcription_models();
+    let cache = TRANSCRIPTION_MODEL_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock();
+    if let Some(entry) = guard.as_ref() {
+        let fresh = entry.cached_at.elapsed() < Duration::from_secs(TRANSCRIPTION_MODEL_CACHE_TTL_SECS);
+        if fresh && entry.cache_key == cache_key {
+            return entry.models.clone();
+        }
+    }
+    let models_vec: Vec<String> = models.into_iter().collect();
+    *guard = Some(TranscriptionModelCacheEntry {
+        cache_key,
+        models: models_vec.clone(),
+        cached_at: Instant::now(),
+    });
+    models_vec
+}
+
+fn compute_available_transcription_models() -> (String, BTreeSet<String>) {
+    let roots = transcription_cache_roots();
+    let mut signature_parts: Vec<String> = Vec::new();
+    let mut models = BTreeSet::new();
+
+    for root in roots {
+        let root_display = root.display().to_string();
+        if !root.exists() || !root.is_dir() {
+            signature_parts.push(format!("{root_display}:missing"));
+            continue;
+        }
+        let read = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(_) => {
+                signature_parts.push(format!("{root_display}:unreadable"));
+                continue;
+            }
+        };
+
+        for entry in read.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            let lower = dir_name.to_ascii_lowercase();
+            if !(lower.starts_with("models--") && lower.contains("faster-whisper")) {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |dur| dur.as_secs());
+            signature_parts.push(format!("{root_display}:{dir_name}:{modified}"));
+
+            if lower.contains("faster-whisper-large-v3-turbo") {
+                models.insert("whisper-large-v3-turbo".to_string());
+                models.insert("large-v3".to_string());
+            }
+            if lower.contains("faster-whisper-large-v3") {
+                models.insert("large-v3".to_string());
+            }
+            if lower.contains("faster-whisper-large-v2") {
+                models.insert("large-v2".to_string());
+            }
+            if lower.contains("faster-whisper-large-v1") {
+                models.insert("large-v1".to_string());
+            }
+            if lower.contains("faster-whisper-large") {
+                models.insert("large".to_string());
+            }
+            if lower.contains("faster-whisper-medium") {
+                models.insert("medium".to_string());
+            }
+            if lower.contains("faster-whisper-small") {
+                models.insert("small".to_string());
+            }
+            if lower.contains("faster-whisper-base") {
+                models.insert("base".to_string());
+            }
+            if lower.contains("faster-whisper-tiny") {
+                models.insert("tiny".to_string());
+            }
+        }
+    }
+
+    signature_parts.sort();
+    let cache_key = signature_parts.join("|");
+    (cache_key, models)
+}
+
+fn transcription_cache_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var("HOME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        roots.push(PathBuf::from(home).join(".cache/huggingface/hub"));
+    }
+    if let Some(hf_home) = std::env::var("HF_HOME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        roots.push(PathBuf::from(hf_home).join("hub"));
+    }
+    roots
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalTranscribeStatusQuery {
+    media_path: String,
 }
 
 async fn handle_media_upload(
@@ -1218,6 +3825,12 @@ async fn handle_media_upload(
         }
     };
 
+    let transcription = if kind.eq_ignore_ascii_case("audio") {
+        enqueue_journal_transcription(&state, rel_path.clone()).await
+    } else {
+        None
+    };
+
     let body = serde_json::json!({
         "ok": true,
         "kind": kind,
@@ -1226,6 +3839,7 @@ async fn handle_media_upload(
         "path": rel_path,
         "title": title,
         "metadata": pb_record,
+        "transcription": transcription,
     });
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -1405,6 +4019,425 @@ async fn handle_library_save_text(
     (StatusCode::OK, Json(serde_json::json!({"ok": true, "path": rel}))).into_response()
 }
 
+async fn handle_library_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DeleteLibraryBody>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Library delete") {
+        return err.into_response();
+    }
+    let requested = body.path.trim().trim_start_matches('/').to_string();
+    if requested.is_empty() {
+        let err = serde_json::json!({"error": "path is required"});
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let lower = requested.to_ascii_lowercase();
+    let target_path = if lower.starts_with("journals/media/") {
+        resolve_workspace_media_path(&workspace_dir, &requested)
+    } else {
+        resolve_workspace_text_path(&workspace_dir, &requested)
+    };
+    let Some(abs_path) = target_path else {
+        let err = serde_json::json!({"error": "Invalid path"});
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    };
+    if !abs_path.exists() || !abs_path.is_file() {
+        let err = serde_json::json!({"error": "File not found"});
+        return (StatusCode::NOT_FOUND, Json(err)).into_response();
+    }
+
+    if let Err(e) = tokio::fs::remove_file(&abs_path).await {
+        let err = serde_json::json!({"error": format!("Failed to delete file: {e}")});
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+    }
+
+    let mut removed_related: Vec<String> = Vec::new();
+    if lower.starts_with("journals/media/") {
+        let transcript_candidates = [
+            transcript_rel_path_for_media(&requested),
+            legacy_transcript_rel_path_for_media(&requested),
+        ];
+        for transcript_rel in transcript_candidates.into_iter().flatten() {
+            if let Some(transcript_abs) =
+                resolve_workspace_text_path(&workspace_dir, &transcript_rel)
+            {
+                if transcript_abs.exists()
+                    && transcript_abs.is_file()
+                    && tokio::fs::remove_file(&transcript_abs).await.is_ok()
+                {
+                    removed_related.push(transcript_rel);
+                }
+            }
+        }
+        let legacy_caption_rel = format!("{requested}.caption.txt");
+        if let Some(legacy_caption_abs) =
+            resolve_workspace_text_path(&workspace_dir, &legacy_caption_rel)
+        {
+            if legacy_caption_abs.exists() && legacy_caption_abs.is_file() {
+                if tokio::fs::remove_file(&legacy_caption_abs).await.is_ok() {
+                    removed_related.push(legacy_caption_rel);
+                }
+            }
+        }
+    }
+
+    let body = serde_json::json!({
+        "ok": true,
+        "path": requested,
+        "removedRelated": removed_related,
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+async fn handle_journal_transcribe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<JournalTranscribeBody>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Journal transcribe") {
+        return err.into_response();
+    }
+
+    let requested = body.media_path.trim().trim_start_matches('/').to_string();
+    if requested.is_empty() {
+        let err = serde_json::json!({"error": "mediaPath is required"});
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
+
+    let config_snapshot = state.config.lock().clone();
+    if !config_snapshot.transcription.enabled {
+        let err = serde_json::json!({
+            "error": "Transcription is disabled. Enable [transcription] enabled = true in config."
+        });
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
+
+    let workspace_dir = config_snapshot.workspace_dir.clone();
+    let Some(abs_media_path) = resolve_workspace_media_path(&workspace_dir, &requested) else {
+        let err = serde_json::json!({"error": "Invalid media path"});
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    };
+    if !abs_media_path.exists() || !abs_media_path.is_file() {
+        let err = serde_json::json!({"error": "Media file not found"});
+        return (StatusCode::NOT_FOUND, Json(err)).into_response();
+    }
+
+    let Some(transcript_rel_path) = transcript_rel_path_for_media(&requested) else {
+        let err = serde_json::json!({"error": "Could not derive transcript path"});
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    };
+    let transcript_abs_path = workspace_dir.join(&transcript_rel_path);
+
+    if transcript_abs_path.exists() && transcript_abs_path.is_file() {
+        let transcript_text = tokio::fs::read_to_string(&transcript_abs_path)
+            .await
+            .unwrap_or_default();
+        if !transcript_text.trim().is_empty() {
+            let body = serde_json::json!({
+                "ok": true,
+                "mediaPath": requested,
+                "path": transcript_rel_path,
+                "text": transcript_text,
+                "status": "done",
+            });
+            return (StatusCode::OK, Json(body)).into_response();
+        }
+    }
+
+    let enqueue_result = enqueue_transcription_job(
+        state.clone(),
+        requested.clone(),
+        abs_media_path,
+        transcript_rel_path.clone(),
+        transcript_abs_path,
+        config_snapshot.transcription.clone(),
+    );
+
+    let body = serde_json::json!({
+        "ok": true,
+        "mediaPath": requested,
+        "path": transcript_rel_path,
+        "status": enqueue_result.status,
+        "error": enqueue_result.error,
+        "updatedAt": enqueue_result.updated_at,
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+async fn handle_journal_transcribe_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<JournalTranscribeStatusQuery>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Journal transcribe status") {
+        return err.into_response();
+    }
+
+    let requested = query.media_path.trim().trim_start_matches('/').to_string();
+    if requested.is_empty() {
+        let err = serde_json::json!({"error": "mediaPath is required"});
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let Some(transcript_rel_path) = transcript_rel_path_for_media(&requested) else {
+        let err = serde_json::json!({"error": "Could not derive transcript path"});
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    };
+    let transcript_abs_path = workspace_dir.join(&transcript_rel_path);
+
+    if transcript_abs_path.exists() && transcript_abs_path.is_file() {
+        let transcript_text = tokio::fs::read_to_string(&transcript_abs_path)
+            .await
+            .unwrap_or_default();
+        if !transcript_text.trim().is_empty() {
+            let body = serde_json::json!({
+                "ok": true,
+                "mediaPath": requested,
+                "path": transcript_rel_path,
+                "text": transcript_text,
+                "status": "done",
+            });
+            return (StatusCode::OK, Json(body)).into_response();
+        }
+    }
+
+    let jobs = state.journal_transcription_jobs.lock();
+    if let Some(job) = jobs.get(&requested) {
+        let body = serde_json::json!({
+            "ok": true,
+            "mediaPath": requested,
+            "path": transcript_rel_path,
+            "status": job.status,
+            "error": job.error,
+            "updatedAt": job.updated_at,
+        });
+        return (StatusCode::OK, Json(body)).into_response();
+    }
+
+    let body = serde_json::json!({
+        "ok": true,
+        "mediaPath": requested,
+        "path": transcript_rel_path,
+        "status": "idle",
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+fn transcript_rel_path_for_media(media_rel_path: &str) -> Option<String> {
+    let normalized = media_rel_path.trim_start_matches('/');
+    let relative = normalized.strip_prefix("journals/media/")?;
+    let media_rel = StdPath::new(relative);
+    let stem = media_rel.file_stem()?.to_str()?.trim();
+    if stem.is_empty() {
+        return None;
+    }
+
+    let mut out = PathBuf::from("journals/text/transcriptions");
+    if let Some(parent) = media_rel.parent() {
+        if !parent.as_os_str().is_empty() {
+            out.push(parent);
+        }
+    }
+    out.push(format!("{stem}.txt"));
+    Some(out.to_string_lossy().replace('\\', "/"))
+}
+
+fn legacy_transcript_rel_path_for_media(media_rel_path: &str) -> Option<String> {
+    let stem = StdPath::new(media_rel_path).file_stem()?.to_str()?.trim();
+    if stem.is_empty() {
+        return None;
+    }
+    Some(format!("journals/text/transcript/{stem}.txt"))
+}
+
+fn enqueue_transcription_job(
+    state: AppState,
+    media_rel_path: String,
+    media_abs_path: PathBuf,
+    transcript_rel_path: String,
+    transcript_abs_path: PathBuf,
+    transcription_config: TranscriptionConfig,
+) -> JournalTranscriptionJob {
+    {
+        let mut jobs = state.journal_transcription_jobs.lock();
+        if let Some(existing) = jobs.get(&media_rel_path).cloned() {
+            if existing.status == "queued" || existing.status == "running" {
+                return existing;
+            }
+        }
+        jobs.insert(media_rel_path.clone(), JournalTranscriptionJob::queued());
+    }
+
+    let queued_path = transcript_rel_path.clone();
+    let task_transcript_rel_path = transcript_rel_path.clone();
+    let state_for_task = state.clone();
+    tokio::spawn(async move {
+        {
+            let mut jobs = state_for_task.journal_transcription_jobs.lock();
+            jobs.insert(
+                media_rel_path.clone(),
+                JournalTranscriptionJob {
+                    status: "running".to_string(),
+                    transcript_path: Some(task_transcript_rel_path.clone()),
+                    error: None,
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
+        }
+
+        let final_state = match run_local_faster_whisper(
+            &state_for_task,
+            &media_abs_path,
+            &transcript_abs_path,
+            &transcription_config,
+        )
+        .await
+        {
+            Ok(_) => JournalTranscriptionJob {
+                status: "done".to_string(),
+                transcript_path: Some(task_transcript_rel_path.clone()),
+                error: None,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            },
+            Err(error) => JournalTranscriptionJob {
+                status: "error".to_string(),
+                transcript_path: Some(task_transcript_rel_path.clone()),
+                error: Some(error.to_string()),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            },
+        };
+
+        let mut jobs = state_for_task.journal_transcription_jobs.lock();
+        jobs.insert(media_rel_path, final_state);
+    });
+
+    JournalTranscriptionJob {
+        status: "queued".to_string(),
+        transcript_path: Some(queued_path),
+        error: None,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+async fn enqueue_journal_transcription(
+    state: &AppState,
+    media_rel_path: String,
+) -> Option<serde_json::Value> {
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let Some(abs_media_path) = resolve_workspace_media_path(&workspace_dir, &media_rel_path) else {
+        return None;
+    };
+    let Some(transcript_rel_path) = transcript_rel_path_for_media(&media_rel_path) else {
+        return None;
+    };
+    let transcript_abs_path = workspace_dir.join(&transcript_rel_path);
+    if transcript_abs_path.exists() && transcript_abs_path.is_file() {
+        let existing = tokio::fs::read_to_string(&transcript_abs_path)
+            .await
+            .unwrap_or_default();
+        if !existing.trim().is_empty() {
+            return Some(serde_json::json!({
+                "status": "done",
+                "path": transcript_rel_path,
+            }));
+        }
+    }
+    let cfg = state.config.lock().transcription.clone();
+    if !cfg.enabled {
+        return Some(serde_json::json!({
+            "status": "disabled",
+            "path": transcript_rel_path,
+        }));
+    }
+    let job = enqueue_transcription_job(
+        state.clone(),
+        media_rel_path,
+        abs_media_path,
+        transcript_rel_path.clone(),
+        transcript_abs_path,
+        cfg,
+    );
+    Some(serde_json::json!({
+        "status": job.status,
+        "path": transcript_rel_path,
+        "error": job.error,
+        "updatedAt": job.updated_at,
+    }))
+}
+
+async fn run_local_faster_whisper(
+    state: &AppState,
+    media_abs_path: &StdPath,
+    transcript_abs_path: &StdPath,
+    transcription_config: &TranscriptionConfig,
+) -> Result<()> {
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    ensure_workspace_transcriber_script(&workspace_dir).await?;
+
+    let script_path = workspace_dir.join("scripts/transcribe_audio_journal.py");
+    let mut cmd = Command::new(transcription_config.python_bin.trim());
+    cmd.arg(&script_path)
+        .arg("--input")
+        .arg(media_abs_path)
+        .arg("--output")
+        .arg(transcript_abs_path)
+        .arg("--model")
+        .arg(transcription_config.model.trim())
+        .arg("--device")
+        .arg(transcription_config.device.trim())
+        .arg("--compute-type")
+        .arg(transcription_config.compute_type.trim())
+        .arg("--beam-size")
+        .arg(transcription_config.beam_size.max(1).to_string())
+        .current_dir(&workspace_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    if let Some(language) = transcription_config
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|value: &&str| !value.is_empty())
+    {
+        cmd.arg("--language").arg(language);
+    }
+
+    let output = tokio::time::timeout(Duration::from_secs(3_600), cmd.output())
+        .await
+        .context("local transcription timed out")?
+        .context("failed to execute local transcriber script")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        anyhow::bail!(
+            "transcriber script failed ({}): {}",
+            output.status,
+            truncate_with_ellipsis(
+                &(if stderr.trim().is_empty() { stdout } else { stderr }),
+                300
+            )
+        );
+    }
+
+    Ok(())
+}
+
+async fn ensure_workspace_transcriber_script(workspace_dir: &StdPath) -> Result<()> {
+    let scripts_dir = workspace_dir.join("scripts");
+    tokio::fs::create_dir_all(&scripts_dir).await?;
+    let script_path = scripts_dir.join("transcribe_audio_journal.py");
+    let script = include_str!("../../scripts/transcribe_audio_journal.py");
+    tokio::fs::write(&script_path, script).await?;
+    Ok(())
+}
+
 fn infer_media_kind_from_content_type(content_type: &str) -> &'static str {
     let lower = content_type.to_ascii_lowercase();
     if lower.starts_with("audio/") {
@@ -1530,7 +4563,6 @@ fn list_workspace_library_items(
             LibraryScope::Journal
         }
         "feed" => {
-            roots.push(workspace_dir.join("journals/processed"));
             roots.push(workspace_dir.join("posts"));
             LibraryScope::Feed
         }
@@ -1616,7 +4648,7 @@ fn collect_library_items_recursive(
         };
         let rel_lower = rel.to_ascii_lowercase();
 
-        let scope_value = if rel.starts_with("posts/") || rel.starts_with("journals/processed/") {
+        let scope_value = if rel.starts_with("posts/") {
             "feed"
         } else {
             "journal"
@@ -1687,22 +4719,21 @@ async fn create_journal_entry_metadata(
     tags: Option<&[String]>,
 ) -> Result<serde_json::Value> {
     let preview = truncate_with_ellipsis(content, 240);
-    post_pocketbase_record_via_gateway_state(
-        state,
-        "journal_entries",
-        serde_json::json!({
-            "title": title,
-            "entryType": "text",
-            "source": source,
-            "workspacePath": rel_path,
-            "status": "raw",
-            "previewText": preview,
-            "textBody": content,
-            "tagsCsv": tags.map(|t| t.join(",")),
-            "createdAtClient": chrono::Utc::now().to_rfc3339(),
-        }),
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    local_store::create_journal_entry_metadata(
+        &workspace_dir,
+        &local_store::JournalEntryInput {
+            title: title.to_string(),
+            entry_type: "text".to_string(),
+            source: source.to_string(),
+            status: "raw".to_string(),
+            workspace_path: rel_path.to_string(),
+            preview_text: preview,
+            text_body: content.to_string(),
+            tags_csv: tags.map(|t| t.join(",")).unwrap_or_default(),
+            created_at_client: Some(chrono::Utc::now().to_rfc3339()),
+        },
     )
-    .await
 }
 
 async fn upsert_media_asset_metadata(
@@ -1715,57 +4746,21 @@ async fn upsert_media_asset_metadata(
     bytes: u64,
     entry_id: Option<&str>,
 ) -> Result<serde_json::Value> {
-    post_pocketbase_record_via_gateway_state(
-        state,
-        "media_assets",
-        serde_json::json!({
-            "title": title,
-            "assetType": kind,
-            "mimeType": content_type,
-            "source": source,
-            "workspacePath": rel_path,
-            "status": "uploaded",
-            "sizeBytes": bytes.to_string(),
-            "entryId": entry_id.unwrap_or(""),
-            "createdAtClient": chrono::Utc::now().to_rfc3339(),
-        }),
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    local_store::create_media_asset_metadata(
+        &workspace_dir,
+        &local_store::MediaAssetInput {
+            title: title.unwrap_or("").to_string(),
+            entry_id: entry_id.unwrap_or("").to_string(),
+            asset_type: kind.to_string(),
+            mime_type: content_type.to_string(),
+            source: source.to_string(),
+            status: "uploaded".to_string(),
+            workspace_path: rel_path.to_string(),
+            size_bytes: bytes as i64,
+            created_at_client: Some(chrono::Utc::now().to_rfc3339()),
+        },
     )
-    .await
-}
-
-async fn post_pocketbase_record_via_gateway_state(
-    state: &AppState,
-    collection: &str,
-    payload: serde_json::Value,
-) -> Result<serde_json::Value> {
-    let base_url = state
-        .pb_chat_base_url
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("PocketBase unavailable (chat bridge not active)"))?;
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/collections/{}/records",
-        base_url.trim_end_matches('/'),
-        collection.trim()
-    );
-    let mut req = client.post(url).json(&payload);
-    if let Some(token) = state.pb_chat_token.as_deref() {
-        req = req.bearer_auth(token);
-    }
-    let resp = req
-        .send()
-        .await
-        .context("PocketBase metadata request failed")?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        anyhow::bail!(
-            "PocketBase metadata write failed for collection '{}': ({status}) {}",
-            collection,
-            text.trim()
-        );
-    }
-    Ok(serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text })))
 }
 
 /// POST /webhook — main webhook endpoint
@@ -1954,471 +4949,9 @@ async fn handle_webhook(
     }
 }
 
-/// `WhatsApp` verification query params
-#[derive(serde::Deserialize)]
-pub struct WhatsAppVerifyQuery {
-    #[serde(rename = "hub.mode")]
-    pub mode: Option<String>,
-    #[serde(rename = "hub.verify_token")]
-    pub verify_token: Option<String>,
-    #[serde(rename = "hub.challenge")]
-    pub challenge: Option<String>,
-}
-
-/// GET /whatsapp — Meta webhook verification
-async fn handle_whatsapp_verify(
-    State(state): State<AppState>,
-    Query(params): Query<WhatsAppVerifyQuery>,
-) -> impl IntoResponse {
-    let Some(ref wa) = state.whatsapp else {
-        return (StatusCode::NOT_FOUND, "WhatsApp not configured".to_string());
-    };
-
-    // Verify the token matches (constant-time comparison to prevent timing attacks)
-    let token_matches = params
-        .verify_token
-        .as_deref()
-        .is_some_and(|t| constant_time_eq(t, wa.verify_token()));
-    if params.mode.as_deref() == Some("subscribe") && token_matches {
-        if let Some(ch) = params.challenge {
-            tracing::info!("WhatsApp webhook verified successfully");
-            return (StatusCode::OK, ch);
-        }
-        return (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string());
-    }
-
-    tracing::warn!("WhatsApp webhook verification failed — token mismatch");
-    (StatusCode::FORBIDDEN, "Forbidden".to_string())
-}
-
-/// Verify `WhatsApp` webhook signature (`X-Hub-Signature-256`).
-/// Returns true if the signature is valid, false otherwise.
-/// See: <https://developers.facebook.com/docs/graph-api/webhooks/getting-started#verification-requests>
-pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header: &str) -> bool {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    // Signature format: "sha256=<hex_signature>"
-    let Some(hex_sig) = signature_header.strip_prefix("sha256=") else {
-        return false;
-    };
-
-    // Decode hex signature
-    let Ok(expected) = hex::decode(hex_sig) else {
-        return false;
-    };
-
-    // Compute HMAC-SHA256
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(app_secret.as_bytes()) else {
-        return false;
-    };
-    mac.update(body);
-
-    // Constant-time comparison
-    mac.verify_slice(&expected).is_ok()
-}
-
-/// POST /whatsapp — incoming message webhook
-async fn handle_whatsapp_message(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
-    let Some(ref wa) = state.whatsapp else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "WhatsApp not configured"})),
-        );
-    };
-
-    // ── Security: Verify X-Hub-Signature-256 if app_secret is configured ──
-    if let Some(ref app_secret) = state.whatsapp_app_secret {
-        let signature = headers
-            .get("X-Hub-Signature-256")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !verify_whatsapp_signature(app_secret, &body, signature) {
-            tracing::warn!(
-                "WhatsApp webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
-    }
-
-    // Parse JSON body
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
-    };
-
-    // Parse messages from the webhook payload
-    let messages = wa.parse_webhook_payload(&payload);
-
-    if messages.is_empty() {
-        // Acknowledge the webhook even if no messages (could be status updates)
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
-    }
-
-    // Process each message
-    for msg in &messages {
-        tracing::info!(
-            "WhatsApp message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        // Auto-save to memory
-        if state.auto_save {
-            let key = whatsapp_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
-            Ok(response) => {
-                // Send reply via WhatsApp
-                if let Err(e) = wa
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send WhatsApp reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for WhatsApp message: {e:#}");
-                let _ = wa
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
-            }
-        }
-    }
-
-    // Acknowledge the webhook
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
-}
-
-/// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
-async fn handle_linq_webhook(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
-    let Some(ref linq) = state.linq else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Linq not configured"})),
-        );
-    };
-
-    let body_str = String::from_utf8_lossy(&body);
-
-    // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
-    if let Some(ref signing_secret) = state.linq_signing_secret {
-        let timestamp = headers
-            .get("X-Webhook-Timestamp")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        let signature = headers
-            .get("X-Webhook-Signature")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !crate::channels::linq::verify_linq_signature(
-            signing_secret,
-            &body_str,
-            timestamp,
-            signature,
-        ) {
-            tracing::warn!(
-                "Linq webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
-    }
-
-    // Parse JSON body
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
-    };
-
-    // Parse messages from the webhook payload
-    let messages = linq.parse_webhook_payload(&payload);
-
-    if messages.is_empty() {
-        // Acknowledge the webhook even if no messages (could be status/delivery events)
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
-    }
-
-    // Process each message
-    for msg in &messages {
-        tracing::info!(
-            "Linq message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        // Auto-save to memory
-        if state.auto_save {
-            let key = linq_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
-            Ok(response) => {
-                // Send reply via Linq
-                if let Err(e) = linq
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Linq reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for Linq message: {e:#}");
-                let _ = linq
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
-            }
-        }
-    }
-
-    // Acknowledge the webhook
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
-}
-
-/// GET /wati — WATI webhook verification (echoes hub.challenge)
-async fn handle_wati_verify(
-    State(state): State<AppState>,
-    Query(params): Query<WatiVerifyQuery>,
-) -> impl IntoResponse {
-    if state.wati.is_none() {
-        return (StatusCode::NOT_FOUND, "WATI not configured".to_string());
-    }
-
-    // WATI may use Meta-style webhook verification; echo the challenge
-    if let Some(challenge) = params.challenge {
-        tracing::info!("WATI webhook verified successfully");
-        return (StatusCode::OK, challenge);
-    }
-
-    (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string())
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct WatiVerifyQuery {
-    #[serde(rename = "hub.challenge")]
-    pub challenge: Option<String>,
-}
-
-/// POST /wati — incoming WATI WhatsApp message webhook
-async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
-    let Some(ref wati) = state.wati else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "WATI not configured"})),
-        );
-    };
-
-    // Parse JSON body
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
-    };
-
-    // Parse messages from the webhook payload
-    let messages = wati.parse_webhook_payload(&payload);
-
-    if messages.is_empty() {
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
-    }
-
-    // Process each message
-    for msg in &messages {
-        tracing::info!(
-            "WATI message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        // Auto-save to memory
-        if state.auto_save {
-            let key = wati_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
-            Ok(response) => {
-                // Send reply via WATI
-                if let Err(e) = wati
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send WATI reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for WATI message: {e:#}");
-                let _ = wati
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
-            }
-        }
-    }
-
-    // Acknowledge the webhook
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
-}
-
-/// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
-async fn handle_nextcloud_talk_webhook(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
-    let Some(ref nextcloud_talk) = state.nextcloud_talk else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Nextcloud Talk not configured"})),
-        );
-    };
-
-    let body_str = String::from_utf8_lossy(&body);
-
-    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
-    if let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret {
-        let random = headers
-            .get("X-Nextcloud-Talk-Random")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        let signature = headers
-            .get("X-Nextcloud-Talk-Signature")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
-            webhook_secret,
-            random,
-            &body_str,
-            signature,
-        ) {
-            tracing::warn!(
-                "Nextcloud Talk webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
-    }
-
-    // Parse JSON body
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
-    };
-
-    // Parse messages from webhook payload
-    let messages = nextcloud_talk.parse_webhook_payload(&payload);
-    if messages.is_empty() {
-        // Acknowledge webhook even if payload does not contain actionable user messages.
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
-    }
-
-    for msg in &messages {
-        tracing::info!(
-            "Nextcloud Talk message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        if state.auto_save {
-            let key = nextcloud_talk_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
-            Ok(response) => {
-                if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                let _ = nextcloud_talk
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
-            }
-        }
-    }
-
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::traits::ChannelMessage;
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::providers::Provider;
     use async_trait::async_trait;
@@ -2457,16 +4990,6 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_query_fields_are_optional() {
-        let q = WhatsAppVerifyQuery {
-            mode: None,
-            verify_token: None,
-            challenge: None,
-        };
-        assert!(q.mode.is_none());
-    }
-
-    #[test]
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
@@ -2486,17 +5009,11 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
             pb_chat_base_url: None,
             pb_chat_collection: "chat_messages".into(),
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2535,17 +5052,11 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
             pb_chat_base_url: None,
             pb_chat_collection: "chat_messages".into(),
             pb_chat_token: None,
             observer,
+            journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2734,22 +5245,6 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
-    #[test]
-    fn whatsapp_memory_key_includes_sender_and_message_id() {
-        let msg = ChannelMessage {
-            id: "wamid-123".into(),
-            sender: "+1234567890".into(),
-            reply_target: "+1234567890".into(),
-            content: "hello".into(),
-            channel: "whatsapp".into(),
-            timestamp: 1,
-            thread_ts: None,
-        };
-
-        let key = whatsapp_memory_key(&msg);
-        assert_eq!(key, "whatsapp_+1234567890_wamid-123");
-    }
-
     #[derive(Default)]
     struct MockMemory;
 
@@ -2901,17 +5396,11 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
             pb_chat_base_url: None,
             pb_chat_collection: "chat_messages".into(),
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let mut headers = HeaderMap::new();
@@ -2965,17 +5454,11 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
             pb_chat_base_url: None,
             pb_chat_collection: "chat_messages".into(),
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let headers = HeaderMap::new();
@@ -3041,17 +5524,11 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
             pb_chat_base_url: None,
             pb_chat_collection: "chat_messages".into(),
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let response = handle_webhook(
@@ -3089,17 +5566,11 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
             pb_chat_base_url: None,
             pb_chat_collection: "chat_messages".into(),
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let mut headers = HeaderMap::new();
@@ -3142,17 +5613,11 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
             pb_chat_base_url: None,
             pb_chat_collection: "chat_messages".into(),
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let mut headers = HeaderMap::new();
@@ -3171,311 +5636,6 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
-    }
-
-    fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        let payload = format!("{random}{body}");
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(payload.as_bytes());
-        hex::encode(mac.finalize().into_bytes())
-    }
-
-    #[tokio::test]
-    async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
-        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            pb_chat_base_url: None,
-            pb_chat_collection: "chat_messages".into(),
-            pb_chat_token: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-        };
-
-        let response = handle_nextcloud_talk_webhook(
-            State(state),
-            HeaderMap::new(),
-            Bytes::from_static(br#"{"type":"message"}"#),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn nextcloud_talk_webhook_rejects_invalid_signature() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-
-        let channel = Arc::new(NextcloudTalkChannel::new(
-            "https://cloud.example.com".into(),
-            "app-token".into(),
-            vec!["*".into()],
-        ));
-
-        let secret = "nextcloud-test-secret";
-        let random = "seed-value";
-        let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
-        let _valid_signature = compute_nextcloud_signature_hex(secret, random, body);
-        let invalid_signature = "deadbeef";
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: Some(channel),
-            nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
-            wati: None,
-            pb_chat_base_url: None,
-            pb_chat_collection: "chat_messages".into(),
-            pb_chat_token: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-        };
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Nextcloud-Talk-Random",
-            HeaderValue::from_str(random).unwrap(),
-        );
-        headers.insert(
-            "X-Nextcloud-Talk-Signature",
-            HeaderValue::from_str(invalid_signature).unwrap(),
-        );
-
-        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
-            .await
-            .into_response();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
-    }
-
-    // ══════════════════════════════════════════════════════════
-    // WhatsApp Signature Verification Tests (CWE-345 Prevention)
-    // ══════════════════════════════════════════════════════════
-
-    fn compute_whatsapp_signature_hex(secret: &str, body: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(body);
-        hex::encode(mac.finalize().into_bytes())
-    }
-
-    fn compute_whatsapp_signature_header(secret: &str, body: &[u8]) -> String {
-        format!("sha256={}", compute_whatsapp_signature_hex(secret, body))
-    }
-
-    #[test]
-    fn whatsapp_signature_valid() {
-        let app_secret = generate_test_secret();
-        let body = b"test body content";
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_invalid_wrong_secret() {
-        let app_secret = generate_test_secret();
-        let wrong_secret = generate_test_secret();
-        let body = b"test body content";
-
-        let signature_header = compute_whatsapp_signature_header(&wrong_secret, body);
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_invalid_wrong_body() {
-        let app_secret = generate_test_secret();
-        let original_body = b"original body";
-        let tampered_body = b"tampered body";
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, original_body);
-
-        // Verify with tampered body should fail
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            tampered_body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_missing_prefix() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        // Signature without "sha256=" prefix
-        let signature_header = "abc123def456";
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_empty_header() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        assert!(!verify_whatsapp_signature(&app_secret, body, ""));
-    }
-
-    #[test]
-    fn whatsapp_signature_invalid_hex() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        // Invalid hex characters
-        let signature_header = "sha256=not_valid_hex_zzz";
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_empty_body() {
-        let app_secret = generate_test_secret();
-        let body = b"";
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_unicode_body() {
-        let app_secret = generate_test_secret();
-        let body = "Hello 🦀 World".as_bytes();
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_json_payload() {
-        let app_secret = generate_test_secret();
-        let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_case_sensitive_prefix() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
-
-        // Wrong case prefix should fail
-        let wrong_prefix = format!("SHA256={hex_sig}");
-        assert!(!verify_whatsapp_signature(&app_secret, body, &wrong_prefix));
-
-        // Correct prefix should pass
-        let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &correct_prefix
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_truncated_hex() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
-        let truncated = &hex_sig[..32]; // Only half the signature
-        let signature_header = format!("sha256={truncated}");
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_extra_bytes() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
-        let extended = format!("{hex_sig}deadbeef");
-        let signature_header = format!("sha256={extended}");
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
     }
 
     // ══════════════════════════════════════════════════════════
@@ -3670,5 +5830,293 @@ mod tests {
 
         // Should be allowed again
         assert!(limiter.allow("burst-ip"));
+    }
+
+    #[test]
+    fn list_library_feed_scope_includes_posts_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+
+        let posts_dir = workspace.join("posts");
+        let legacy_feed_dir = workspace.join("journals/processed");
+        std::fs::create_dir_all(&posts_dir).unwrap();
+        std::fs::create_dir_all(&legacy_feed_dir).unwrap();
+
+        std::fs::write(posts_dir.join("workflow_post.md"), "# post\n").unwrap();
+        std::fs::write(legacy_feed_dir.join("legacy_clip.md"), "# old\n").unwrap();
+
+        let items = list_workspace_library_items(workspace, "feed", 20).unwrap();
+        assert!(!items.is_empty());
+
+        let paths: Vec<String> = items
+            .iter()
+            .filter_map(|item| item.get("path").and_then(serde_json::Value::as_str))
+            .map(ToString::to_string)
+            .collect();
+
+        assert!(paths.iter().any(|path| path.starts_with("posts/")));
+        assert!(!paths.iter().any(|path| path.starts_with("journals/processed/")));
+    }
+
+    #[test]
+    fn list_library_all_scope_keeps_journal_and_feed_labels() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+
+        std::fs::create_dir_all(workspace.join("posts")).unwrap();
+        std::fs::create_dir_all(workspace.join("journals/text")).unwrap();
+        std::fs::write(workspace.join("posts/feed_note.md"), "# feed\n").unwrap();
+        std::fs::write(workspace.join("journals/text/note.md"), "# journal\n").unwrap();
+
+        let items = list_workspace_library_items(workspace, "all", 20).unwrap();
+        assert!(items.len() >= 2);
+
+        let mut has_feed = false;
+        let mut has_journal = false;
+
+        for item in items {
+            let path = item
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let scope = item
+                .get("scope")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+
+            if path.starts_with("posts/") && scope == "feed" {
+                has_feed = true;
+            }
+            if path.starts_with("journals/") && scope == "journal" {
+                has_journal = true;
+            }
+        }
+
+        assert!(has_feed);
+        assert!(has_journal);
+    }
+
+    fn sample_workflow_store() -> FeedWorkflowSettingsStore {
+        let mut store = FeedWorkflowSettingsStore::default();
+
+        let daily_key = "daily_summary";
+        let daily_record = FeedWorkflowRecord {
+            workflow_key: daily_key.to_string(),
+            workflow_bot: "DailySummaryBot".to_string(),
+            script_path: "scripts/daily_summary_skill/run_daily_summary.py".to_string(),
+            output_prefix: "posts/daily_summary/".to_string(),
+            editable_files: vec![
+                "scripts/daily_summary_skill/run_daily_summary.py".to_string(),
+                "skills/daily_summary/SKILL.md".to_string(),
+            ],
+            settings: workflow_default_settings(),
+        };
+        store.workflows.insert(
+            daily_key.to_string(),
+            normalize_workflow_record(daily_key, daily_record),
+        );
+
+        let audio_key = "audio_roundup";
+        let audio_record = FeedWorkflowRecord {
+            workflow_key: audio_key.to_string(),
+            workflow_bot: "AudioRoundupBot".to_string(),
+            script_path: "scripts/audio_roundup_skill/run_audio_roundup.py".to_string(),
+            output_prefix: "posts/audio_roundup/".to_string(),
+            editable_files: vec![
+                "scripts/audio_roundup_skill/run_audio_roundup.py".to_string(),
+                "skills/audio_roundup/SKILL.md".to_string(),
+            ],
+            settings: workflow_default_settings(),
+        };
+        store.workflows.insert(
+            audio_key.to_string(),
+            normalize_workflow_record(audio_key, audio_record),
+        );
+
+        store
+    }
+
+    #[test]
+    fn workflow_path_mapping_uses_dynamic_store_output_prefixes() {
+        let store = sample_workflow_store();
+
+        let daily = workflow_for_feed_path(&store, "posts/daily_summary/20260303_summary.md");
+        assert!(daily.is_some());
+        let daily = daily.unwrap();
+        assert_eq!(daily.key, "daily_summary");
+        assert_eq!(daily.bot_name, "DailySummaryBot");
+
+        let audio = workflow_for_feed_path(&store, "posts/audio_roundup/20260303/clip_01.mp4");
+        assert!(audio.is_some());
+        let audio = audio.unwrap();
+        assert_eq!(audio.key, "audio_roundup");
+        assert_eq!(audio.bot_name, "AudioRoundupBot");
+
+        assert!(workflow_for_feed_path(&store, "posts/other/something.md").is_none());
+    }
+
+    #[test]
+    fn workflow_creation_prompt_embeds_script_payload_and_overwrite_instruction() {
+        let prompt = render_workflow_creation_prompt(
+            "Daily Summary",
+            "daily_summary",
+            "DailySummaryBot",
+            "text",
+            "journals/text",
+            "scripts/daily_summary_skill/run_daily_summary.py",
+            "skills/daily_summary/SKILL.md",
+            "posts/daily_summary",
+            "Write in a clear, natural voice.",
+            "# Workflow Bot Creation Skill\n",
+            "#!/usr/bin/env python3\nprint('template')\n",
+        );
+        assert!(prompt.contains("## Script File Payload (authoritative)"));
+        assert!(prompt.contains(
+            "Do not respond with only a file path reference."
+        ));
+        assert!(prompt.contains("### `scripts/daily_summary_skill/run_daily_summary.py` initial content"));
+        assert!(prompt.contains("print('template')"));
+        assert!(prompt.contains("Replace `scripts/daily_summary_skill/run_daily_summary.py` with your full updated script content"));
+    }
+
+    #[test]
+    fn workflow_comment_prompt_mentions_allowed_files_and_guardrails() {
+        let store = sample_workflow_store();
+        let wf = workflow_definition_by_key(&store, "daily_summary").unwrap();
+        let prompt = workflow_comment_prompt(
+            &wf,
+            "posts/daily_summary/item.md",
+            "Make tone more human and less robotic",
+        );
+        assert!(prompt.contains("Workflow: DailySummaryBot (daily_summary)"));
+        assert!(prompt.contains("scripts/daily_summary_skill/run_daily_summary.py"));
+        assert!(prompt.contains("Keep feed output rooted under `posts/daily_summary/`"));
+    }
+
+    #[test]
+    fn workflow_self_heal_prompt_mentions_allowed_files_and_command() {
+        let store = sample_workflow_store();
+        let wf = workflow_definition_by_key(&store, "audio_roundup").unwrap();
+        let prompt = workflow_self_heal_prompt(
+            &wf,
+            &wf.bot_name,
+            "workspace-script scripts/audio_roundup_skill/run_audio_roundup.py --mode random --random-count 1",
+            "python3: can't open file 'scripts/audio_roundup_skill/processor.py'",
+            1,
+            1,
+        );
+        assert!(prompt.contains("workflow supervisor"));
+        assert!(prompt.contains("scripts/audio_roundup_skill/run_audio_roundup.py"));
+        assert!(prompt.contains("can't open file"));
+        assert!(prompt.contains("Target command"));
+    }
+
+    #[test]
+    fn workflow_command_preview_respects_mode_controls() {
+        let store = sample_workflow_store();
+        let wf = workflow_definition_by_key(&store, "daily_summary").unwrap();
+        let mut settings = workflow_default_settings();
+
+        settings.mode = FeedWorkflowMode::DateRange;
+        settings.days = 5;
+        let date_cmd = workflow_command_preview(&wf, &settings);
+        assert!(date_cmd.contains("workspace-script"));
+        assert!(date_cmd.contains("scripts/daily_summary_skill/run_daily_summary.py"));
+        assert!(date_cmd.contains("--mode date_range"));
+        assert!(date_cmd.contains("--days 5"));
+
+        settings.mode = FeedWorkflowMode::Random;
+        settings.random_count = 3;
+        let random_cmd = workflow_command_preview(&wf, &settings);
+        assert!(random_cmd.contains("--mode random"));
+        assert!(random_cmd.contains("--random-count 3"));
+    }
+
+    #[test]
+    fn normalize_workflow_settings_clamps_out_of_range_values() {
+        let settings = FeedWorkflowSettings {
+            mode: FeedWorkflowMode::Random,
+            days: 999,
+            random_count: 0,
+            schedule_enabled: true,
+            schedule_cron: "   ".to_string(),
+            schedule_tz: Some("   ".to_string()),
+            prompt: None,
+        };
+
+        let normalized = normalize_workflow_settings(settings);
+        assert_eq!(normalized.days, 30);
+        assert_eq!(normalized.random_count, 1);
+        assert_eq!(normalized.schedule_cron, default_workflow_schedule_cron());
+        assert!(normalized.schedule_tz.is_none());
+    }
+
+    #[test]
+    fn workflow_comment_quickfix_is_noop() {
+        let store = sample_workflow_store();
+        let wf = workflow_definition_by_key(&store, "audio_roundup").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+
+        let result = maybe_apply_workflow_comment_quickfix(
+            temp.path(),
+            &wf,
+            "posts/audio_roundup/20260303_audio_roundup.md",
+            "please fix this import error",
+        )
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn workflow_run_quickfix_adds_missing_prompt_arg_for_legacy_script() {
+        let store = sample_workflow_store();
+        let wf = workflow_definition_by_key(&store, "daily_summary").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let script_path = temp.path().join(&wf.script_path);
+        std::fs::create_dir_all(script_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &script_path,
+            "#!/usr/bin/env python3\n\
+from __future__ import annotations\n\
+\n\
+import argparse\n\
+\n\
+USER_PROMPT = \"\"\n\
+\n\
+def parse_args() -> argparse.Namespace:\n\
+    parser = argparse.ArgumentParser(description=\"Generated workflow bot script\")\n\
+    parser.add_argument(\"--mode\", choices=[\"date_range\", \"random\"], default=\"date_range\")\n\
+    parser.add_argument(\"--days\", type=int, default=7)\n\
+    parser.add_argument(\"--random-count\", type=int, default=1)\n\
+    return parser.parse_args()\n\
+",
+        )
+        .unwrap();
+
+        let result = maybe_apply_workflow_run_quickfix(
+            temp.path(),
+            &wf,
+            "run_tweeto.py: error: unrecognized arguments: --prompt \"generate insightful tweets\"",
+        )
+        .unwrap();
+        assert!(result.is_some());
+
+        let script = std::fs::read_to_string(&script_path).unwrap();
+        assert!(script.contains("parser.add_argument(\"--prompt\", default=USER_PROMPT)"));
+    }
+
+    #[test]
+    fn workflow_run_quickfix_skips_when_error_is_unrelated() {
+        let store = sample_workflow_store();
+        let wf = workflow_definition_by_key(&store, "daily_summary").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+
+        let result = maybe_apply_workflow_run_quickfix(
+            temp.path(),
+            &wf,
+            "{\"ok\": false, \"error\": \"script missing\"}",
+        )
+        .unwrap();
+        assert!(result.is_none());
     }
 }
