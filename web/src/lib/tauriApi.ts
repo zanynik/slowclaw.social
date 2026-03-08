@@ -56,6 +56,7 @@ export type AppConfig = {
   blueskyHandle: string;
   blueskyServiceUrl: string;
   transcriptionEnabled: boolean;
+  transcriptionModel: string;
 };
 
 export type SchedulerJob = {
@@ -75,6 +76,36 @@ export type OllamaStatus = {
   baseUrl: string;
   model: string;
   models: string[];
+};
+
+export type DesktopGatewayInfo = {
+  gatewayUrl: string;
+  running: boolean;
+  lastError?: string | null;
+  providerApiKeySet: boolean;
+};
+
+export type DesktopHostStatus = {
+  gateway: DesktopGatewayInfo;
+  bootstrapReady: boolean;
+};
+
+export type DesktopWorkspacePaths = {
+  workspaceDir: string;
+  journalsDir: string;
+};
+
+export type TranscriptionSetupStatus = {
+  pythonConfigured: boolean;
+  pythonAvailable: boolean;
+  pythonVersion?: string | null;
+  fasterWhisperAvailable: boolean;
+  availableModels: string[];
+  configuredModel: string;
+  configuredModelReady: boolean;
+  recommendedModel: string;
+  installCommands: string[];
+  lastError?: string | null;
 };
 
 // ─────────────────────────────────────────────
@@ -174,8 +205,32 @@ export async function getConfig(): Promise<AppConfig> {
   return invoke("get_config");
 }
 
-export async function saveConfig(config: AppConfig): Promise<void> {
+export async function saveConfig(config: AppConfig): Promise<AppConfig> {
   return invoke("save_config", { config });
+}
+
+export async function getDesktopHostStatus(): Promise<DesktopHostStatus> {
+  return invoke("get_desktop_host_status");
+}
+
+export async function getWorkspacePaths(): Promise<DesktopWorkspacePaths> {
+  return invoke("get_workspace_paths");
+}
+
+export async function openWorkspaceDir(): Promise<void> {
+  return invoke("open_workspace_dir");
+}
+
+export async function openJournalsDir(): Promise<void> {
+  return invoke("open_journals_dir");
+}
+
+export async function getTranscriptionSetupStatus(): Promise<TranscriptionSetupStatus> {
+  return invoke("get_transcription_setup_status");
+}
+
+export async function runTranscriptionSetup(): Promise<TranscriptionSetupStatus> {
+  return invoke("run_transcription_setup");
 }
 
 // ─────────────────────────────────────────────
