@@ -7,8 +7,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "build:tauri": "SLOWCLAW_WEB_BASE=./ tsc && vite build",
+    "build:tauri": "tsc && SLOWCLAW_WEB_BASE=./ vite build",
+    "prepare:desktop-sidecar": "node ./scripts/prepare-desktop-sidecar.mjs",
+    "build:tauri:desktop": "npm run prepare:desktop-sidecar && npm run build:tauri",
     "preview": "vite preview",
+    "package:macos": "npm run tauri build -- --bundles app,dmg",
     "tauri": "tauri",
     "tauri:ios:init": "tauri ios init",
     "tauri:ios:dev": "tauri ios dev --open --host",

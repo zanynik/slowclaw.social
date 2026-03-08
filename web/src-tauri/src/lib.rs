@@ -46,7 +46,19 @@ struct SecretGetResponse {
     value: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppConfig {
+    ollama_base_url: String,
+    ollama_model: String,
+    bluesky_handle: String,
+    bluesky_service_url: String,
+    transcription_enabled: bool,
+    transcription_model: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct EmbeddedGatewayInfo {
     gateway_url: String,
     running: bool,
@@ -66,6 +78,20 @@ struct GatewayQrPayload {
 struct DesktopGatewayBootstrap {
     gateway_url: String,
     token: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopHostStatus {
+    gateway: EmbeddedGatewayInfo,
+    bootstrap_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopWorkspacePaths {
+    workspace_dir: String,
+    journals_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +160,34 @@ struct OpenAiDeviceCodeState {
     inner: Arc<Mutex<OpenAiDeviceCodeRuntimeState>>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptionSetupStatus {
+    python_configured: bool,
+    python_available: bool,
+    python_version: Option<String>,
+    faster_whisper_available: bool,
+    available_models: Vec<String>,
+    configured_model: String,
+    configured_model_ready: bool,
+    recommended_model: String,
+    install_commands: Vec<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptionSetupProbe {
+    python_available: bool,
+    python_version: Option<String>,
+    faster_whisper_available: bool,
+    available_models: Vec<String>,
+    configured_model: String,
+    configured_model_ready: bool,
+    recommended_model: String,
+    last_error: Option<String>,
+}
+
 fn validate_secret_locator(service: &str, account: &str) -> Result<(), String> {
     if service.trim().is_empty() {
         return Err("service is required".to_string());
@@ -196,6 +250,272 @@ fn read_keyring_secret(service: &str, account: &str) -> Result<Option<String>, S
 
 fn provider_api_key_from_keyring() -> Result<Option<String>, String> {
     read_keyring_secret(PROVIDER_SECRET_SERVICE, PROVIDER_API_KEY_SECRET_ACCOUNT)
+}
+
+fn load_local_app_config_sync() -> Result<AppConfig, String> {
+    let config = tauri::async_runtime::block_on(zeroclaw::Config::load_or_init())
+        .map_err(|e| format!("failed to load local config: {e}"))?;
+    Ok(AppConfig {
+        ollama_base_url: config.api_url.unwrap_or_default(),
+        ollama_model: config.default_model.unwrap_or_default(),
+        bluesky_handle: String::new(),
+        bluesky_service_url: "https://bsky.social".to_string(),
+        transcription_enabled: config.transcription.enabled,
+        transcription_model: config.transcription.model,
+    })
+}
+
+fn load_local_workspace_paths_sync() -> Result<DesktopWorkspacePaths, String> {
+    let config = tauri::async_runtime::block_on(zeroclaw::Config::load_or_init())
+        .map_err(|e| format!("failed to load local config: {e}"))?;
+    let workspace_dir = config.workspace_dir;
+    let journals_dir = workspace_dir.join("journals");
+    Ok(DesktopWorkspacePaths {
+        workspace_dir: workspace_dir.display().to_string(),
+        journals_dir: journals_dir.display().to_string(),
+    })
+}
+
+fn open_path_in_system_file_manager(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("path does not exist: {}", path.display()));
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut cmd = Command::new("open");
+        cmd.arg(path);
+        cmd
+    };
+
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(path);
+        cmd
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut cmd = Command::new("explorer");
+        cmd.arg(path);
+        cmd
+    };
+
+    command
+        .spawn()
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn transcription_setup_script_name() -> &'static str {
+    "transcription_setup.py"
+}
+
+fn transcription_setup_script_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir
+        .join("scripts")
+        .join(transcription_setup_script_name())
+}
+
+fn ensure_workspace_transcription_setup_script(workspace_dir: &Path) -> Result<PathBuf, String> {
+    let scripts_dir = workspace_dir.join("scripts");
+    fs::create_dir_all(&scripts_dir)
+        .map_err(|e| format!("failed to create workspace scripts directory: {e}"))?;
+    let script_path = transcription_setup_script_path(workspace_dir);
+    fs::write(
+        &script_path,
+        include_str!("../../../scripts/transcription_setup.py"),
+    )
+    .map_err(|e| format!("failed to write transcription setup helper: {e}"))?;
+    Ok(script_path)
+}
+
+fn recommended_transcription_model(configured_model: &str) -> String {
+    let trimmed = configured_model.trim();
+    if trimmed.is_empty() {
+        "base".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn build_transcription_install_commands(
+    python_bin: &str,
+    script_path: &Path,
+    configured_model: &str,
+) -> Vec<String> {
+    let interpreter = python_bin.trim();
+    let model = recommended_transcription_model(configured_model);
+    if interpreter.is_empty() {
+        return vec![
+            "brew install python".to_string(),
+            "Update transcription.python_bin to a working Python 3 interpreter.".to_string(),
+        ];
+    }
+
+    vec![
+        format!("{interpreter} -m pip install faster-whisper"),
+        format!(
+            "{interpreter} {} install --model {}",
+            script_path.display(),
+            shell_escape(&model)
+        ),
+    ]
+}
+
+fn shell_escape(value: &str) -> String {
+    if value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/') {
+        value.to_string()
+    } else {
+        format!("{value:?}")
+    }
+}
+
+fn run_transcription_setup_probe_sync() -> Result<TranscriptionSetupStatus, String> {
+    let config = tauri::async_runtime::block_on(zeroclaw::Config::load_or_init())
+        .map_err(|e| format!("failed to load config for transcription setup: {e}"))?;
+    let workspace_dir = config.workspace_dir.clone();
+    let configured_python = config.transcription.python_bin.trim().to_string();
+    let configured_model = recommended_transcription_model(&config.transcription.model);
+    let script_path = transcription_setup_script_path(&workspace_dir);
+    let install_commands = build_transcription_install_commands(
+        &configured_python,
+        &script_path,
+        &configured_model,
+    );
+
+    if configured_python.is_empty() {
+        return Ok(TranscriptionSetupStatus {
+            python_configured: false,
+            python_available: false,
+            python_version: None,
+            faster_whisper_available: false,
+            available_models: Vec::new(),
+            configured_model: configured_model.clone(),
+            configured_model_ready: false,
+            recommended_model: configured_model,
+            install_commands,
+            last_error: Some("No Python interpreter configured for transcription.".to_string()),
+        });
+    }
+
+    let version_output = Command::new(&configured_python)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("failed to run {} --version: {e}", configured_python))?;
+
+    if !version_output.status.success() {
+        let stderr = String::from_utf8_lossy(&version_output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&version_output.stdout).trim().to_string();
+        return Ok(TranscriptionSetupStatus {
+            python_configured: true,
+            python_available: false,
+            python_version: None,
+            faster_whisper_available: false,
+            available_models: Vec::new(),
+            configured_model: configured_model.clone(),
+            configured_model_ready: false,
+            recommended_model: configured_model,
+            install_commands,
+            last_error: Some(if !stderr.is_empty() { stderr } else { stdout }),
+        });
+    }
+
+    let python_version_raw = {
+        let stderr = String::from_utf8_lossy(&version_output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            String::from_utf8_lossy(&version_output.stdout).trim().to_string()
+        } else {
+            stderr
+        }
+    };
+    let python_version = python_version_raw
+        .strip_prefix("Python ")
+        .unwrap_or(&python_version_raw)
+        .trim()
+        .to_string();
+
+    let script_path = ensure_workspace_transcription_setup_script(&workspace_dir)?;
+    let probe_output = Command::new(&configured_python)
+        .arg(&script_path)
+        .arg("probe")
+        .arg("--model")
+        .arg(&configured_model)
+        .current_dir(&workspace_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to execute transcription setup probe: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&probe_output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&probe_output.stderr).trim().to_string();
+    let probe: TranscriptionSetupProbe = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("failed to parse transcription probe output: {e}"))?;
+
+    Ok(TranscriptionSetupStatus {
+        python_configured: true,
+        python_available: probe.python_available,
+        python_version: probe
+            .python_version
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| (!python_version.is_empty()).then_some(python_version)),
+        faster_whisper_available: probe.faster_whisper_available,
+        available_models: probe.available_models,
+        configured_model: probe.configured_model,
+        configured_model_ready: probe.configured_model_ready,
+        recommended_model: probe.recommended_model,
+        install_commands: build_transcription_install_commands(
+            &configured_python,
+            &script_path,
+            &configured_model,
+        ),
+        last_error: probe
+            .last_error
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| (!probe_output.status.success() && !stderr.is_empty()).then_some(stderr)),
+    })
+}
+
+fn run_transcription_setup_install_sync() -> Result<TranscriptionSetupStatus, String> {
+    let config = tauri::async_runtime::block_on(zeroclaw::Config::load_or_init())
+        .map_err(|e| format!("failed to load config for transcription setup: {e}"))?;
+    let workspace_dir = config.workspace_dir.clone();
+    let configured_python = config.transcription.python_bin.trim().to_string();
+    let configured_model = recommended_transcription_model(&config.transcription.model);
+
+    let mut status = run_transcription_setup_probe_sync()?;
+    if !status.python_available {
+        return Ok(status);
+    }
+
+    let script_path = ensure_workspace_transcription_setup_script(&workspace_dir)?;
+    let install_output = Command::new(&configured_python)
+        .arg(&script_path)
+        .arg("install")
+        .arg("--model")
+        .arg(&configured_model)
+        .arg("--device")
+        .arg(config.transcription.device.trim())
+        .arg("--compute-type")
+        .arg(config.transcription.compute_type.trim())
+        .current_dir(&workspace_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to execute transcription setup installer: {e}"))?;
+
+    status = run_transcription_setup_probe_sync()?;
+    if !install_output.status.success() {
+        let stdout = String::from_utf8_lossy(&install_output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&install_output.stderr).trim().to_string();
+        if status.last_error.is_none() {
+            status.last_error = Some(if !stderr.is_empty() { stderr } else { stdout });
+        }
+    }
+    Ok(status)
 }
 
 fn discover_lan_ipv4() -> Option<String> {
@@ -527,6 +847,20 @@ fn get_embedded_gateway_info(state: tauri::State<'_, GatewayState>) -> Result<Em
 }
 
 #[tauri::command]
+fn get_desktop_host_status(
+    state: tauri::State<'_, GatewayState>,
+) -> Result<DesktopHostStatus, String> {
+    let gateway = snapshot_gateway_state(&state.inner)?;
+    let bootstrap_ready = ensure_desktop_gateway_token()
+        .map(|token| !token.trim().is_empty())
+        .unwrap_or(false);
+    Ok(DesktopHostStatus {
+        gateway,
+        bootstrap_ready,
+    })
+}
+
+#[tauri::command]
 fn generate_mobile_pairing_qr(
     state: tauri::State<'_, GatewayState>,
 ) -> Result<GatewayQrPayload, String> {
@@ -564,6 +898,58 @@ async fn restart_gateway_daemon(state: tauri::State<'_, GatewayState>) -> Result
     let _ = ensure_desktop_gateway_token()?;
     let info = restart_embedded_gateway(state.inner.clone()).await?;
     Ok(info.gateway_url)
+}
+
+#[tauri::command]
+fn get_config() -> Result<AppConfig, String> {
+    load_local_app_config_sync()
+}
+
+#[tauri::command]
+fn get_workspace_paths() -> Result<DesktopWorkspacePaths, String> {
+    load_local_workspace_paths_sync()
+}
+
+#[tauri::command]
+fn open_workspace_dir() -> Result<(), String> {
+    let paths = load_local_workspace_paths_sync()?;
+    open_path_in_system_file_manager(Path::new(&paths.workspace_dir))
+}
+
+#[tauri::command]
+fn open_journals_dir() -> Result<(), String> {
+    let paths = load_local_workspace_paths_sync()?;
+    let journals_path = Path::new(&paths.journals_dir);
+    if !journals_path.exists() {
+        fs::create_dir_all(journals_path).map_err(|e| {
+            format!(
+                "failed to create journals directory {}: {e}",
+                journals_path.display()
+            )
+        })?;
+    }
+    open_path_in_system_file_manager(journals_path)
+}
+
+#[tauri::command]
+async fn save_config(
+    state: tauri::State<'_, GatewayState>,
+    config: AppConfig,
+) -> Result<AppConfig, String> {
+    let mut loaded = zeroclaw::Config::load_or_init()
+        .await
+        .map_err(|e| format!("failed to load local config: {e}"))?;
+    loaded.api_url = Some(config.ollama_base_url.trim().to_string()).filter(|value| !value.is_empty());
+    loaded.default_model = Some(config.ollama_model.trim().to_string()).filter(|value| !value.is_empty());
+    loaded.transcription.enabled = config.transcription_enabled;
+    loaded.transcription.model = recommended_transcription_model(&config.transcription_model);
+    loaded
+        .save()
+        .await
+        .map_err(|e| format!("failed to save local config: {e}"))?;
+
+    let _ = restart_embedded_gateway(state.inner.clone()).await?;
+    load_local_app_config_sync()
 }
 
 #[tauri::command]
@@ -671,6 +1057,20 @@ fn start_openai_device_code_login(
 }
 
 #[tauri::command]
+async fn get_transcription_setup_status() -> Result<TranscriptionSetupStatus, String> {
+    tauri::async_runtime::spawn_blocking(run_transcription_setup_probe_sync)
+        .await
+        .map_err(|e| format!("failed to join transcription setup probe: {e}"))?
+}
+
+#[tauri::command]
+async fn run_transcription_setup() -> Result<TranscriptionSetupStatus, String> {
+    tauri::async_runtime::spawn_blocking(run_transcription_setup_install_sync)
+        .await
+        .map_err(|e| format!("failed to join transcription setup installer: {e}"))?
+}
+
+#[tauri::command]
 fn show_main_window(window: tauri::Window) {
     if let Err(e) = window.show() {
         eprintln!("failed to show main window: {e}");
@@ -688,6 +1088,14 @@ pub fn run() {
         .manage(content_job_state)
         .setup(|app| {
             let shared = app.state::<GatewayState>().inner.clone();
+            if let Some(window) = app.get_webview_window("main") {
+                if let Err(err) = window.show() {
+                    eprintln!("failed to show main window during setup: {err}");
+                }
+                if let Err(err) = window.set_focus() {
+                    eprintln!("failed to focus main window during setup: {err}");
+                }
+            }
             tauri::async_runtime::spawn(async move {
                 if let Err(err) = ensure_embedded_gateway_started(shared).await {
                     eprintln!("embedded gateway failed to start: {err}");
@@ -730,14 +1138,37 @@ pub fn run() {
             set_secret,
             delete_secret,
             get_embedded_gateway_info,
+            get_desktop_host_status,
             generate_mobile_pairing_qr,
             get_desktop_gateway_bootstrap,
             restart_gateway_daemon,
+            get_config,
+            get_workspace_paths,
+            open_workspace_dir,
+            open_journals_dir,
+            save_config,
             set_provider_api_key,
             get_openai_device_code_status,
             start_openai_device_code_login,
+            get_transcription_setup_status,
+            run_transcription_setup,
             show_main_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slowclaw_binary_file_names;
+
+    #[test]
+    fn slowclaw_binary_names_start_with_plain_binary_name() {
+        let names = slowclaw_binary_file_names();
+        if cfg!(target_os = "windows") {
+            assert_eq!(names.first().map(String::as_str), Some("slowclaw.exe"));
+        } else {
+            assert_eq!(names.first().map(String::as_str), Some("slowclaw"));
+        }
+    }
 }

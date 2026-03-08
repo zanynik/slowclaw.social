@@ -100,6 +100,36 @@ export type OllamaStatus = {
   models: string[];
 };
 
+export type DesktopGatewayInfo = {
+  gatewayUrl: string;
+  running: boolean;
+  lastError?: string | null;
+  providerApiKeySet: boolean;
+};
+
+export type DesktopHostStatus = {
+  gateway: DesktopGatewayInfo;
+  bootstrapReady: boolean;
+};
+
+export type DesktopWorkspacePaths = {
+  workspaceDir: string;
+  journalsDir: string;
+};
+
+export type TranscriptionSetupStatus = {
+  pythonConfigured: boolean;
+  pythonAvailable: boolean;
+  pythonVersion?: string | null;
+  fasterWhisperAvailable: boolean;
+  availableModels: string[];
+  configuredModel: string;
+  configuredModelReady: boolean;
+  recommendedModel: string;
+  installCommands: string[];
+  lastError?: string | null;
+};
+
 // ─────────────────────────────────────────────
 // Journal commands
 // ─────────────────────────────────────────────
@@ -197,7 +227,7 @@ export async function getConfig(): Promise<AppConfig> {
   return invoke("get_config");
 }
 
-export async function saveConfig(config: AppConfig): Promise<void> {
+export async function saveConfig(config: AppConfig): Promise<AppConfig> {
   return invoke("save_config", { config });
 }
 

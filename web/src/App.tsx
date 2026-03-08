@@ -33,6 +33,9 @@ import {
   createJob,
   toggleJob,
   runJobNow,
+  openJournalsDir,
+  openWorkspaceDir,
+  runTranscriptionSetup,
   checkOllama,
   listOllamaModels,
   startRecording as startNativeAudioRecording,
@@ -49,6 +52,9 @@ import type {
   ContentJob,
   SchedulerJob,
   OllamaStatus,
+  DesktopHostStatus,
+  DesktopWorkspacePaths,
+  TranscriptionSetupStatus,
 } from "./lib/tauriApi";
 // ── Secure storage (keyring wrappers — unchanged) ────────────────────────────
 import {
@@ -421,6 +427,34 @@ function resolveGatewayResourceUrl(resourcePath: string, gatewayBaseUrl: string)
   const base = gatewayBaseUrl.trim().replace(/\/+$/, "");
   const suffix = resourcePath.startsWith("/") ? resourcePath : `/${resourcePath}`;
   return `${base}${suffix}`;
+}
+
+type MobileHostReachability = "idle" | "checking" | "connected" | "offline";
+
+function mobileGatewayBlockedMessage(
+  reachability: MobileHostReachability,
+  action: string
+) {
+  if (reachability === "offline") {
+    return `${action} blocked (paired desktop host unavailable). Reconnect to your desktop host and try again.`;
+  }
+  return `${action} blocked (gateway token missing). Pair mobile with desktop QR.`;
+}
+
+function transcriptionSetupSummary(status: TranscriptionSetupStatus | null) {
+  if (!status) {
+    return "Checking transcription setup...";
+  }
+  if (!status.pythonConfigured || !status.pythonAvailable) {
+    return "Python is not ready for transcription setup.";
+  }
+  if (!status.fasterWhisperAvailable) {
+    return "Python is ready, but faster-whisper is not installed.";
+  }
+  if (!status.configuredModelReady) {
+    return `Model '${status.configuredModel || status.recommendedModel}' is not downloaded yet.`;
+  }
+  return `Transcription is ready with model '${status.configuredModel}'.`;
 }
 
 type WorkflowBotMeta = {
@@ -852,9 +886,17 @@ function App() {
   const [settingsTranscriptionEnabled, setSettingsTranscriptionEnabled] = useState(false);
   const [settingsTranscriptionModel, setSettingsTranscriptionModel] = useState("");
   const [settingsAvailableTranscriptionModels, setSettingsAvailableTranscriptionModels] = useState<string[]>([]);
+  const [settingsTranscriptionSetup, setSettingsTranscriptionSetup] = useState<TranscriptionSetupStatus | null>(null);
+  const [settingsTranscriptionSetupBusy, setSettingsTranscriptionSetupBusy] = useState(false);
   const [settingsConfigBusy, setSettingsConfigBusy] = useState(false);
   const [settingsConfigStatus, setSettingsConfigStatus] = useState("");
   const [settingsConfigLoaded, setSettingsConfigLoaded] = useState(false);
+  const [desktopHostStatus, setDesktopHostStatus] = useState<DesktopHostStatus | null>(null);
+  const [desktopHostStatusMessage, setDesktopHostStatusMessage] = useState("");
+  const [desktopWorkspacePaths, setDesktopWorkspacePaths] = useState<DesktopWorkspacePaths | null>(null);
+  const [mobileHostReachability, setMobileHostReachability] = useState<MobileHostReachability>("idle");
+  const [mobileHostStatusMessage, setMobileHostStatusMessage] = useState("");
+  const [mobileHostRefreshTick, setMobileHostRefreshTick] = useState(0);
   const [mobileScannerActive, setMobileScannerActive] = useState(() => {
     if (typeof window === "undefined") {
       return false;
@@ -952,6 +994,9 @@ function App() {
           setProviderApiKey(apiKeySecret.value);
           setProviderApiKeyStatus("Loaded saved API key");
         }
+        await loadDesktopHostStatus();
+        await loadDesktopWorkspacePaths();
+        await loadDesktopTranscriptionSetupStatus();
       }
       if (!cancelled) {
         setSecureStoreReady(true);
@@ -997,6 +1042,13 @@ function App() {
     }
     window.localStorage.setItem(CHAT_THREAD_STORAGE_KEY, chatThreadId);
   }, [chatThreadId]);
+
+  useEffect(() => {
+    if (isDesktopClient) {
+      return;
+    }
+    void checkMobileDesktopHostReachability();
+  }, [isDesktopClient, chatGatewayToken, gatewayBaseUrl, mobileHostRefreshTick]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -3610,6 +3662,160 @@ function App() {
     await invokeDesktopCommandStrict<string>("restart_gateway_daemon");
   }
 
+  async function loadDesktopHostStatus() {
+    if (!isDesktopClient) {
+      return;
+    }
+    try {
+      const next = await getDesktopHostStatus();
+      setDesktopHostStatus(next);
+      setDesktopHostStatusMessage(
+        next.gateway.running
+          ? `Desktop host is running at ${next.gateway.gatewayUrl}.`
+          : `Desktop host is not running${next.gateway.lastError ? ` (${next.gateway.lastError})` : ""}.`
+      );
+    } catch (error) {
+      setDesktopHostStatus(null);
+      setDesktopHostStatusMessage(
+        `Desktop host status unavailable (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function loadDesktopWorkspacePaths() {
+    if (!isDesktopClient) {
+      return;
+    }
+    try {
+      const next = await getWorkspacePaths();
+      setDesktopWorkspacePaths(next);
+    } catch {
+      setDesktopWorkspacePaths(null);
+    }
+  }
+
+  async function openDesktopFolder(kind: "workspace" | "journals") {
+    if (!isDesktopClient) {
+      return;
+    }
+    try {
+      if (kind === "workspace") {
+        await openWorkspaceDir();
+      } else {
+        await openJournalsDir();
+      }
+    } catch (error) {
+      setJournalSaveStatus(
+        `Failed to open ${kind} folder (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function loadDesktopTranscriptionSetupStatus() {
+    if (!isDesktopClient) {
+      return;
+    }
+    try {
+      const next = await getTranscriptionSetupStatus();
+      setSettingsTranscriptionSetup(next);
+    } catch (error) {
+      setSettingsTranscriptionSetup({
+        pythonConfigured: false,
+        pythonAvailable: false,
+        pythonVersion: null,
+        fasterWhisperAvailable: false,
+        availableModels: [],
+        configuredModel: settingsTranscriptionModel.trim() || "base",
+        configuredModelReady: false,
+        recommendedModel: settingsTranscriptionModel.trim() || "base",
+        installCommands: [],
+        lastError: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  async function copyTranscriptionInstallCommands() {
+    const commands = settingsTranscriptionSetup?.installCommands || [];
+    if (!commands.length) {
+      setSettingsConfigStatus("No setup commands available yet.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(commands.join("\n"));
+      setSettingsConfigStatus("Transcription setup commands copied.");
+    } catch (error) {
+      setSettingsConfigStatus(
+        `Failed to copy setup commands (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function runDesktopTranscriptionSetup() {
+    if (!isDesktopClient) {
+      setSettingsConfigStatus("Transcription setup is desktop-only.");
+      return;
+    }
+    setSettingsTranscriptionSetupBusy(true);
+    setSettingsConfigStatus("Running transcription setup...");
+    try {
+      const next = await runTranscriptionSetup();
+      setSettingsTranscriptionSetup(next);
+      if (next.availableModels.length > 0) {
+        setSettingsAvailableTranscriptionModels((current) => {
+          const merged = new Set([...current, ...next.availableModels]);
+          if (settingsTranscriptionModel.trim()) {
+            merged.add(settingsTranscriptionModel.trim());
+          }
+          return Array.from(merged);
+        });
+      }
+      if (!settingsTranscriptionModel.trim()) {
+        setSettingsTranscriptionModel(next.configuredModel || next.recommendedModel || "base");
+      }
+      setSettingsConfigStatus(
+        next.lastError
+          ? `Transcription setup finished with issues (${next.lastError})`
+          : "Transcription setup completed."
+      );
+      await loadRuntimeConfigForSettings();
+    } catch (error) {
+      setSettingsConfigStatus(
+        `Transcription setup failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setSettingsTranscriptionSetupBusy(false);
+    }
+  }
+
+  async function checkMobileDesktopHostReachability() {
+    if (isDesktopClient || !(chatGatewayToken.trim() && gatewayBaseUrl.trim())) {
+      setMobileHostReachability("idle");
+      setMobileHostStatusMessage("");
+      return;
+    }
+
+    setMobileHostReachability("checking");
+    setMobileHostStatusMessage("Checking paired desktop host...");
+    try {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 4000);
+      const response = await fetch(`${gatewayBaseUrl.trim().replace(/\/+$/, "")}/health`, {
+        signal: controller.signal
+      });
+      window.clearTimeout(timeout);
+      if (!response.ok) {
+        throw new Error(`Health check failed (${response.status})`);
+      }
+      setMobileHostReachability("connected");
+      setMobileHostStatusMessage(`Connected to desktop host at ${gatewayBaseUrl.trim()}.`);
+    } catch (error) {
+      setMobileHostReachability("offline");
+      setMobileHostStatusMessage(
+        `Paired desktop host unavailable (${error instanceof Error ? error.message : String(error)}).`
+      );
+    }
+  }
+
   async function loadOpenAiDeviceCodeStatus() {
     if (!isNativeClient) {
       return;
@@ -3685,6 +3891,7 @@ function App() {
         });
       }
       await restartGatewayDaemonFromDesktop();
+      await loadDesktopHostStatus();
       setProviderApiKeyStatus(
         trimmed
           ? "API key saved. Gateway restarted."
@@ -3707,7 +3914,9 @@ function App() {
       setSettingsConfigLoaded(false);
       setSettingsConfigStatus("Loading local config...");
       try {
+        await loadDesktopHostStatus();
         const cfg = await getConfig();
+        const setupStatus = await getTranscriptionSetupStatus().catch(() => null);
         const savedProvider = window.localStorage.getItem(CHAT_PROVIDER_STORAGE_KEY);
         const savedModel = window.localStorage.getItem(CHAT_MODEL_STORAGE_KEY);
         setSettingsProvider((savedProvider && savedProvider.trim()) || "ollama");
@@ -3736,6 +3945,10 @@ function App() {
         if (cfg.transcriptionModel && !models.includes(cfg.transcriptionModel)) {
           models.unshift(cfg.transcriptionModel);
         }
+        if (cfg.transcriptionModel && !models.includes(cfg.transcriptionModel)) {
+          models.unshift(cfg.transcriptionModel);
+        }
+        setSettingsTranscriptionSetup(setupStatus);
         setSettingsAvailableTranscriptionModels(models);
         setSettingsConfigStatus("Config loaded (local)");
         setSettingsConfigLoaded(true);
@@ -3787,12 +4000,20 @@ function App() {
   async function saveRuntimeConfigFromSettings() {
     const provider = settingsProvider.trim();
     const model = settingsModel.trim();
+    const transcriptionModel = settingsTranscriptionModel.trim();
     if (!provider || !model) {
       setSettingsConfigStatus("Provider and model are required.");
       return;
     }
-    if (settingsTranscriptionEnabled && !settingsTranscriptionModel.trim()) {
+    if (settingsTranscriptionEnabled && !transcriptionModel) {
       setSettingsConfigStatus("Pick a transcription model.");
+      return;
+    }
+    if (
+      settingsTranscriptionEnabled &&
+      !settingsAvailableTranscriptionModels.includes(transcriptionModel)
+    ) {
+      setSettingsConfigStatus("Selected transcription model is not installed yet. Run transcription setup first.");
       return;
     }
     let token = normalizeGatewayToken(chatGatewayToken);
@@ -3840,7 +4061,7 @@ function App() {
           defaultProvider: provider,
           defaultModel: model,
           transcriptionEnabled: settingsTranscriptionEnabled,
-          transcriptionModel: settingsTranscriptionModel.trim(),
+          transcriptionModel,
           availableTranscriptionModels: settingsAvailableTranscriptionModels
         },
         token || undefined,
@@ -4171,6 +4392,32 @@ function App() {
         ) : null}
       </div>
 
+      {isDesktopClient && mode === "desktop" ? (
+        <div
+          className="stack"
+          style={{
+            gap: "0.55rem",
+            marginBottom: "1rem",
+            padding: "0.8rem",
+            borderRadius: "14px",
+            border: "1px solid var(--line)",
+            background: "color-mix(in srgb, var(--surface) 88%, transparent)"
+          }}
+        >
+          <p className="text-sm muted" style={{ margin: 0 }}>
+            Workspace: {desktopWorkspacePaths?.workspaceDir || "~/.zeroclaw/workspace"}
+          </p>
+          <div className="row" style={{ gap: "0.55rem", flexWrap: "wrap" }}>
+            <button type="button" className="ghost" onClick={() => void openDesktopFolder("journals")}>
+              Open Journals Folder
+            </button>
+            <button type="button" className="ghost" onClick={() => void openDesktopFolder("workspace")}>
+              Open Workspace
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {journalItems.length === 0 ? (
         <p className="text-center muted">No journals found.</p>
       ) : (
@@ -4255,6 +4502,35 @@ function App() {
                     {mobileCameraPermissionError}
                   </p>
                 ) : null}
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  if (mobileDesktopHostOffline) {
+    return (
+      <div className="app-shell">
+        <main className="page-content">
+          <div className="stack">
+            <div className="card">
+              <h2>Desktop Host Unavailable</h2>
+              <p className="text-sm muted">
+                This mobile app is a paired companion. Chat, feed, uploads, and transcription depend on
+                your desktop host being online.
+              </p>
+              <div className="stack" style={{ gap: "0.8rem" }}>
+                <p className="text-sm muted">{mobileHostStatusMessage}</p>
+                <p className="text-sm muted">Expected host: {gatewayBaseUrl}</p>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => setMobileHostRefreshTick((current) => current + 1)}
+                >
+                  Retry Connection
+                </button>
               </div>
             </div>
           </div>
@@ -5645,7 +5921,7 @@ function App() {
                   <span className="text-sm">Transcription model</span>
                   {settingsAvailableTranscriptionModels.length === 0 ? (
                     <p className="text-sm muted">
-                      No local transcription models detected yet.
+                      No local transcription models detected yet. Use the setup flow below to install one.
                     </p>
                   ) : null}
                   <select
@@ -5663,9 +5939,67 @@ function App() {
                     ))}
                   </select>
                   <p className="text-sm muted">
-                    Only locally available models are listed to avoid downloads.
+                    Desktop transcription runs locally on this machine. Mobile clients use the desktop host.
                   </p>
                 </label>
+                <div className="card" style={{ padding: "0.9rem", background: "color-mix(in srgb, var(--panel) 92%, white 8%)" }}>
+                  <div className="row-between">
+                    <h3 style={{ margin: 0 }}>Transcription Setup</h3>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void loadDesktopTranscriptionSetupStatus()}
+                      disabled={settingsTranscriptionSetupBusy}
+                    >
+                      Re-check
+                    </button>
+                  </div>
+                  <div className="stack" style={{ gap: "0.5rem", marginTop: "0.8rem" }}>
+                    <p className="text-sm muted">{transcriptionSetupSummary(settingsTranscriptionSetup)}</p>
+                    <p className="text-sm muted">
+                      Python:{" "}
+                      {settingsTranscriptionSetup?.pythonAvailable
+                        ? settingsTranscriptionSetup.pythonVersion || "Available"
+                        : settingsTranscriptionSetup?.pythonConfigured
+                          ? "Configured but unavailable"
+                          : "Not configured"}
+                    </p>
+                    <p className="text-sm muted">
+                      faster-whisper: {settingsTranscriptionSetup?.fasterWhisperAvailable ? "Installed" : "Missing"}
+                    </p>
+                    <p className="text-sm muted">
+                      Recommended model: {settingsTranscriptionSetup?.recommendedModel || "base"}
+                    </p>
+                    {settingsTranscriptionSetup?.lastError ? (
+                      <p className="text-sm" style={{ color: "var(--danger)" }}>
+                        {settingsTranscriptionSetup.lastError}
+                      </p>
+                    ) : null}
+                    {settingsTranscriptionSetup?.installCommands?.length ? (
+                      <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                        {settingsTranscriptionSetup.installCommands.join("\n")}
+                      </pre>
+                    ) : null}
+                    <div className="row">
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => void copyTranscriptionInstallCommands()}
+                        disabled={settingsTranscriptionSetupBusy || !(settingsTranscriptionSetup?.installCommands?.length)}
+                      >
+                        Copy Commands
+                      </button>
+                      <button
+                        type="button"
+                        className="primary"
+                        onClick={() => void runDesktopTranscriptionSetup()}
+                        disabled={settingsTranscriptionSetupBusy}
+                      >
+                        {settingsTranscriptionSetupBusy ? "Running..." : "Run Setup"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
                 <button
                   type="button"
                   className="primary"
@@ -5742,6 +6076,9 @@ function App() {
                   <h2>Gateway & App Settings</h2>
                   <div className="stack">
                     <p className="text-sm muted">
+                      Desktop is the local host. Mobile acts as a paired companion client.
+                    </p>
+                    <p className="text-sm muted">
                       Chat and journal upload use desktop gateway auth automatically.
                     </p>
 
@@ -5750,6 +6087,26 @@ function App() {
                         ? "Gateway auth is ready for chat + journal uploads."
                         : "Waiting for desktop gateway auth bootstrap."}
                     </p>
+                    <div className="stack" style={{ gap: "0.35rem" }}>
+                      <p className="text-sm">
+                        <strong>Host state:</strong>{" "}
+                        {desktopHostStatus?.gateway.running ? "Running" : "Unavailable"}
+                      </p>
+                      <p className="text-sm muted">
+                        Gateway URL: {desktopHostStatus?.gateway.gatewayUrl || gatewayBaseUrl || "Unavailable"}
+                      </p>
+                      <p className="text-sm muted">
+                        Mobile bootstrap: {desktopHostStatus?.bootstrapReady ? "Ready" : "Not ready"}
+                      </p>
+                      {desktopHostStatus?.gateway.lastError ? (
+                        <p className="text-sm" style={{ color: "var(--danger)" }}>
+                          {desktopHostStatus.gateway.lastError}
+                        </p>
+                      ) : null}
+                      {desktopHostStatusMessage ? (
+                        <p className="text-sm muted">{desktopHostStatusMessage}</p>
+                      ) : null}
+                    </div>
 
                     <div className="stack" style={{ gap: "0.8rem" }}>
                       <div className="row-between">
