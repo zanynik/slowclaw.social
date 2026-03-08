@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build:tauri",
+    "beforeBuildCommand": "npm run build:tauri:desktop",
     "frontendDist": "../dist"
   },
   "app": {
@@ -17,7 +17,7 @@
         "width": 1180,
         "height": 900,
         "resizable": true,
-        "visible": false
+        "visible": true
       }
     ],
     "security": {
@@ -30,6 +30,8 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": []
+    "externalBin": [
+      "binaries/slowclaw"
+    ]
   }
 }
