@@ -286,6 +286,30 @@ export async function extractClips(journalId: string): Promise<ContentJob> {
   return invoke("extract_clips", { journalId });
 }
 
+export async function getDesktopHostStatus(): Promise<DesktopHostStatus> {
+  return invoke("get_desktop_host_status");
+}
+
+export async function getWorkspacePaths(): Promise<DesktopWorkspacePaths> {
+  return invoke("get_workspace_paths");
+}
+
+export async function openWorkspaceDir(): Promise<void> {
+  return invoke("open_workspace_dir");
+}
+
+export async function openJournalsDir(): Promise<void> {
+  return invoke("open_journals_dir");
+}
+
+export async function getTranscriptionSetupStatus(): Promise<TranscriptionSetupStatus> {
+  return invoke("get_transcription_setup_status");
+}
+
+export async function runTranscriptionSetup(): Promise<TranscriptionSetupStatus> {
+  return invoke("run_transcription_setup");
+}
+
 // ─────────────────────────────────────────────
 // Scheduler commands
 // ─────────────────────────────────────────────

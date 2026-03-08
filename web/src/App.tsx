@@ -33,8 +33,11 @@ import {
   createJob,
   toggleJob,
   runJobNow,
+  getDesktopHostStatus,
+  getWorkspacePaths,
   openJournalsDir,
   openWorkspaceDir,
+  getTranscriptionSetupStatus,
   runTranscriptionSetup,
   checkOllama,
   listOllamaModels,
@@ -4367,6 +4370,7 @@ function App() {
     showDesktopJournalLayout &&
     !hideChrome &&
     !journalDesktopSidebarCollapsed;
+  const mobileDesktopHostOffline = false;
   const isMediaTranscriptMode =
     !!selectedJournalItem &&
     (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video");

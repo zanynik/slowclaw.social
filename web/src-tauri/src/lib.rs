@@ -2,7 +2,10 @@ mod content_ops;
 mod local_workspace;
 
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::net::{IpAddr, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::async_runtime::JoinHandle;
@@ -901,7 +904,7 @@ async fn restart_gateway_daemon(state: tauri::State<'_, GatewayState>) -> Result
 }
 
 #[tauri::command]
-fn get_config() -> Result<AppConfig, String> {
+fn get_desktop_runtime_config() -> Result<AppConfig, String> {
     load_local_app_config_sync()
 }
 
@@ -932,7 +935,7 @@ fn open_journals_dir() -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn save_config(
+async fn save_desktop_runtime_config(
     state: tauri::State<'_, GatewayState>,
     config: AppConfig,
 ) -> Result<AppConfig, String> {
@@ -1142,11 +1145,9 @@ pub fn run() {
             generate_mobile_pairing_qr,
             get_desktop_gateway_bootstrap,
             restart_gateway_daemon,
-            get_config,
             get_workspace_paths,
             open_workspace_dir,
             open_journals_dir,
-            save_config,
             set_provider_api_key,
             get_openai_device_code_status,
             start_openai_device_code_login,
