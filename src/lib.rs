@@ -69,6 +69,7 @@ pub(crate) mod util;
 pub(crate) mod workflow_assets;
 
 pub use config::Config;
+pub use auth::{openai_oauth, AuthService};
 
 pub async fn run_scheduler(config: Config) -> anyhow::Result<()> {
     cron::scheduler::run(config).await

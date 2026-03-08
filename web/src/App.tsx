@@ -12,13 +12,16 @@ import {
   summarizeJournal,
   listSummaries,
   generateWeeklyDigest,
-  saveDraft,
-  listDrafts,
-  deleteDraft,
-  savePostRecord,
-  listPostHistory,
+  saveDraft as saveLocalDraft,
+  listDrafts as listLocalDrafts,
+  deleteDraft as deleteLocalDraft,
+  savePostRecord as saveLocalPostRecord,
+  listPostHistory as listLocalPostHistory,
   getConfig,
   saveConfig,
+  listBuiltInOperations,
+  getLatestContentJobForTarget,
+  transcribeMedia as transcribeLocalMedia,
   listJobs,
   createJob,
   toggleJob,
@@ -35,6 +38,8 @@ import type {
   Draft,
   PostRecord,
   AppConfig,
+  BuiltInOperation,
+  ContentJob,
   SchedulerJob,
   OllamaStatus,
 } from "./lib/tauriApi";
@@ -104,6 +109,58 @@ type DesktopGatewayBootstrap = {
   token?: string | null;
   gatewayUrl?: string | null;
 };
+
+const BUILT_IN_LOCAL_OPERATIONS: BuiltInOperation[] = [
+  {
+    key: "transcribe_media",
+    title: "Transcribe Media",
+    description: "Runs on-device Whisper transcription for local journal media.",
+    version: 1,
+    implemented: true
+  },
+  {
+    key: "trim_media",
+    title: "Trim Media",
+    description: "Reserved for a later built-in media editing update.",
+    version: 1,
+    implemented: false
+  },
+  {
+    key: "clean_transcript",
+    title: "Clean Transcript",
+    description: "Reserved for a later transcript cleanup update.",
+    version: 1,
+    implemented: false
+  },
+  {
+    key: "rewrite_text",
+    title: "Rewrite Text",
+    description: "Reserved for a later AI-assisted rewrite update.",
+    version: 1,
+    implemented: false
+  },
+  {
+    key: "retitle_entry",
+    title: "Retitle Entry",
+    description: "Reserved for a later retitling update.",
+    version: 1,
+    implemented: false
+  },
+  {
+    key: "summarize_entry",
+    title: "Summarize Entry",
+    description: "Reserved for a later summary update.",
+    version: 1,
+    implemented: false
+  },
+  {
+    key: "post_bluesky",
+    title: "Post to Bluesky",
+    description: "Reserved for a later typed posting update.",
+    version: 1,
+    implemented: false
+  }
+];
 
 async function loadBlueskyModule() {
   if (!blueskyModulePromise) {
@@ -652,6 +709,7 @@ function renderBlueskyEmbed(embed: any) {
 
 function App() {
   const isDesktopClient = isTauriDesktopRuntime();
+  const isNativeClient = isDesktopClient || isTauriMobileRuntime();
   const isLargeScreen = useIsLargeScreen();
   const isDesktopLayout = isDesktopClient || isLargeScreen;
   const [gatewayBaseUrl, setGatewayBaseUrl] = useState(defaultGatewayBaseUrl);
@@ -761,6 +819,7 @@ function App() {
     percent: number;
     label: string;
   } | null>(null);
+  const [builtInOperations, setBuiltInOperations] = useState<BuiltInOperation[]>(BUILT_IN_LOCAL_OPERATIONS);
   const [aiSetupStatus, setAiSetupStatus] = useState<OpenAiDeviceCodeStatus | null>(null);
   const [aiSetupBusy, setAiSetupBusy] = useState(false);
   const [providerApiKey, setProviderApiKey] = useState("");
@@ -855,11 +914,12 @@ function App() {
           }
         }
       }
-      if (!cancelled && isDesktopClient) {
+      if (!cancelled && isNativeClient) {
         const secureGatewayToken = await loadGatewayTokenSecure();
         if (secureGatewayToken) {
           setChatGatewayToken(secureGatewayToken);
-        } else {
+        }
+        if (!cancelled) {
           await syncDesktopGatewayBootstrap();
         }
         const apiKeySecret = await invokeDesktopCommand<{ value: string | null }>("get_secret", {
@@ -883,6 +943,25 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!isNativeClient) {
+      return;
+    }
+    let cancelled = false;
+    void listBuiltInOperations()
+      .then((operations) => {
+        if (!cancelled && operations.length > 0) {
+          setBuiltInOperations(operations);
+        }
+      })
+      .catch(() => {
+        // Static fallback remains available.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isNativeClient]);
+
+  useEffect(() => {
     if (!secureStoreReady) {
       return;
     }
@@ -902,10 +981,10 @@ function App() {
     }
     const normalized = chatGatewayToken.trim();
     window.localStorage.setItem(CHAT_GATEWAY_TOKEN_STORAGE_KEY, normalized);
-    if (isDesktopClient && normalized) {
+    if (isNativeClient && normalized) {
       void saveGatewayTokenSecure(normalized);
     }
-  }, [chatGatewayToken, isDesktopClient]);
+  }, [chatGatewayToken, isNativeClient]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1031,18 +1110,18 @@ function App() {
     };
 
     let token = normalizeGatewayToken(chatGatewayToken);
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
     }
     try {
       if (scope === "journal" || scope === "all") {
-        if (isDesktopClient) {
+        if (isNativeClient) {
           try {
-            await refreshGatewayJournalLibrary(token);
-          } catch (gatewayError) {
+            await refreshLocalJournalLibrary();
+          } catch (localError) {
             try {
-              await refreshLocalJournalLibrary();
-            } catch (localError) {
+              await refreshGatewayJournalLibrary(token);
+            } catch (gatewayError) {
               if (isMissingDesktopCommand(localError, "list_journals")) {
                 throw gatewayError;
               }
@@ -1077,23 +1156,23 @@ function App() {
   async function uploadJournalFile(file: File, kind: "audio" | "video") {
     let token = chatGatewayToken.trim();
     if (!gatewayBaseUrl.trim()) {
-      setRecordingHint("Upload blocked (gateway URL missing). Pair mobile with desktop QR.");
-      return;
-    }
-    if (!token && isDesktopClient) {
-      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
-    }
-    if (!token) {
-      if (isDesktopClient) {
-        token = "desktop-local";
-      } else {
-        setRecordingHint("Upload blocked (gateway token missing). Pair mobile with desktop QR.");
+      if (!isNativeClient) {
+        setRecordingHint("Upload blocked (gateway URL missing).");
         return;
       }
+    }
+    if (!token && isNativeClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && isNativeClient) {
+      token = "desktop-local";
     }
     setRecordingHint(`Uploading ${file.name}...`);
     try {
       try {
+        if (!gatewayBaseUrl.trim()) {
+          throw new Error("gateway unavailable");
+        }
         const result = await uploadMediaViaGateway(
           file,
           {
@@ -1123,7 +1202,7 @@ function App() {
           }
         }
       } catch (gatewayError) {
-        if (!isDesktopClient) {
+        if (!isNativeClient) {
           throw gatewayError;
         }
         try {
@@ -1156,10 +1235,10 @@ function App() {
     }
 
     let token = normalizeGatewayToken(chatGatewayToken);
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       setJournalSaveStatus("Save blocked (gateway token missing).");
       return;
     }
@@ -1193,7 +1272,7 @@ function App() {
             resultPath = selectedJournalItem.path;
             nextSelectedPath = selectedJournalItem.path;
           } catch (gatewayError) {
-            if (!isDesktopClient) {
+            if (!isNativeClient) {
               throw gatewayError;
             }
             try {
@@ -1225,7 +1304,7 @@ function App() {
           resultPath = String(result.path || "");
           nextSelectedPath = resultPath;
         } catch (gatewayError) {
-          if (!isDesktopClient) {
+          if (!isNativeClient) {
             throw gatewayError;
           }
           try {
@@ -1253,8 +1332,31 @@ function App() {
   }
 
   async function deleteJournalItem(item: LibraryItem) {
+    const localId = localJournalIdFromPath(item.path);
+    if (localId) {
+      setJournalSaveStatus(`Deleting ${item.title}...`);
+      try {
+        await deleteJournal(localId);
+        setPendingDeleteJournalItem(null);
+        if (selectedJournalPath === item.path) {
+          setSelectedJournalPath("");
+          setSelectedJournalItem(null);
+          setSelectedJournalText("");
+          setJournalDraftText("");
+          loadedTextPathRef.current = "";
+        }
+        await refreshLibrary("journal");
+        setJournalSaveStatus("Deleted");
+      } catch (error) {
+        setJournalSaveStatus(
+          `Delete failed (${error instanceof Error ? error.message : String(error)})`
+        );
+      }
+      return;
+    }
+
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
     if (!token) {
@@ -1288,7 +1390,7 @@ function App() {
 
   async function deleteFeedItem(item: LibraryItem) {
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
     if (!token) {
@@ -1346,64 +1448,122 @@ function App() {
     }
     activeTranscriptionPollRef.current[normalizedPath] = true;
     const isStillSelected = () => selectedJournalPathRef.current === mediaPath;
+    const localId = isNativeClient ? localJournalIdFromPath(normalizedPath) : null;
     try {
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         try {
-          const statusResult = await getJournalTranscriptionStatus(
-            mediaPath,
-            token,
-            gatewayBaseUrl
-          );
-          const status = String(statusResult.status || "").toLowerCase();
-          if (status === "done") {
-            setJournalTranscriptionStatusByPath((prev) => ({
-              ...prev,
-              [normalizedPath]: "done"
-            }));
-            const transcriptPath = String(statusResult.path || "");
-            const transcriptText = String(statusResult.text || "");
-            if (isStillSelected()) {
-              loadedTextPathRef.current = transcriptPath;
-              setSelectedJournalText(transcriptText);
-              setJournalDraftText(transcriptText);
-              setJournalSaveStatus("Transcription ready");
-              setJournalTranscribing(false);
+          if (localId) {
+            const localJob = await getLatestContentJobForTarget("transcribe_media", localId);
+            const status = String(localJob?.status || "").toLowerCase();
+            if (status === "completed") {
+              const journal = await getJournal(localId);
+              setJournalTranscriptionStatusByPath((prev) => ({
+                ...prev,
+                [normalizedPath]: "done"
+              }));
+              if (isStillSelected()) {
+                loadedTextPathRef.current = normalizedPath;
+                setSelectedJournalText(journal.content || "");
+                setJournalDraftText(journal.content || "");
+                setJournalSaveStatus("Transcription ready");
+                setJournalTranscribing(false);
+              }
+              return;
             }
-            return;
-          }
-          if (status === "error") {
-            setJournalTranscriptionStatusByPath((prev) => ({
-              ...prev,
-              [normalizedPath]: "error"
-            }));
-            if (isStillSelected()) {
-              setJournalTranscribing(false);
-              setJournalSaveStatus(
-                `Transcription failed (${String(statusResult.error || "unknown error")})`
-              );
+            if (status === "failed" || status === "canceled") {
+              setJournalTranscriptionStatusByPath((prev) => ({
+                ...prev,
+                [normalizedPath]: "error"
+              }));
+              if (isStillSelected()) {
+                setJournalTranscribing(false);
+                setJournalSaveStatus(
+                  `Transcription failed (${String(localJob?.error || "unknown error")})`
+                );
+              }
+              return;
             }
-            return;
-          }
-          if (status === "queued" || status === "running") {
-            setJournalTranscriptionStatusByPath((prev) => ({
-              ...prev,
-              [normalizedPath]: status as "queued" | "running"
-            }));
-            if (isStillSelected()) {
-              setJournalTranscribing(true);
-              setJournalSaveStatus(
-                status === "queued" ? "Transcription queued..." : "Transcription in progress..."
-              );
+            if (status === "queued" || status === "running" || status === "retryable") {
+              const normalizedStatus = status === "retryable" ? "queued" : status;
+              setJournalTranscriptionStatusByPath((prev) => ({
+                ...prev,
+                [normalizedPath]: normalizedStatus as "queued" | "running"
+              }));
+              if (isStillSelected()) {
+                setJournalTranscribing(true);
+                setJournalSaveStatus(
+                  normalizedStatus === "queued"
+                    ? "Transcription queued..."
+                    : "Transcription in progress..."
+                );
+              }
+            } else {
+              setJournalTranscriptionStatusByPath((prev) => ({
+                ...prev,
+                [normalizedPath]: "idle"
+              }));
+              if (isStillSelected()) {
+                setJournalTranscribing(false);
+              }
+              return;
             }
           } else {
-            setJournalTranscriptionStatusByPath((prev) => ({
-              ...prev,
-              [normalizedPath]: "idle"
-            }));
-            if (isStillSelected()) {
-              setJournalTranscribing(false);
+            const statusResult = await getJournalTranscriptionStatus(
+              mediaPath,
+              token,
+              gatewayBaseUrl
+            );
+            const status = String(statusResult.status || "").toLowerCase();
+            if (status === "done") {
+              setJournalTranscriptionStatusByPath((prev) => ({
+                ...prev,
+                [normalizedPath]: "done"
+              }));
+              const transcriptPath = String(statusResult.path || "");
+              const transcriptText = String(statusResult.text || "");
+              if (isStillSelected()) {
+                loadedTextPathRef.current = transcriptPath;
+                setSelectedJournalText(transcriptText);
+                setJournalDraftText(transcriptText);
+                setJournalSaveStatus("Transcription ready");
+                setJournalTranscribing(false);
+              }
+              return;
             }
-            return;
+            if (status === "error") {
+              setJournalTranscriptionStatusByPath((prev) => ({
+                ...prev,
+                [normalizedPath]: "error"
+              }));
+              if (isStillSelected()) {
+                setJournalTranscribing(false);
+                setJournalSaveStatus(
+                  `Transcription failed (${String(statusResult.error || "unknown error")})`
+                );
+              }
+              return;
+            }
+            if (status === "queued" || status === "running") {
+              setJournalTranscriptionStatusByPath((prev) => ({
+                ...prev,
+                [normalizedPath]: status as "queued" | "running"
+              }));
+              if (isStillSelected()) {
+                setJournalTranscribing(true);
+                setJournalSaveStatus(
+                  status === "queued" ? "Transcription queued..." : "Transcription in progress..."
+                );
+              }
+            } else {
+              setJournalTranscriptionStatusByPath((prev) => ({
+                ...prev,
+                [normalizedPath]: "idle"
+              }));
+              if (isStillSelected()) {
+                setJournalTranscribing(false);
+              }
+              return;
+            }
           }
         } catch {
           if (isStillSelected()) {
@@ -1422,14 +1582,18 @@ function App() {
   }
 
   async function transcribeSelectedJournalMedia() {
-    if (!selectedJournalItem || selectedJournalItem.kind !== "audio") {
+    if (
+      !selectedJournalItem ||
+      (selectedJournalItem.kind !== "audio" && selectedJournalItem.kind !== "video")
+    ) {
       return;
     }
+    const localId = isNativeClient ? localJournalIdFromPath(selectedJournalItem.path) : null;
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       setJournalSaveStatus("Transcription blocked (gateway token missing).");
       return;
     }
@@ -1441,37 +1605,69 @@ function App() {
     }));
     setJournalSaveStatus("Queueing transcription...");
     try {
-      const result = await transcribeJournalMedia(
-        selectedJournalItem.path,
-        token || undefined,
-        gatewayBaseUrl
-      );
-      const status = String(result.status || "").toLowerCase();
-      if (status === "done") {
-        const transcriptPath = String(result.path || journalTranscriptPathForMedia(selectedJournalItem));
-        const transcriptText = String(result.text || "");
-        setJournalTranscriptionStatusByPath((prev) => ({
-          ...prev,
-          [selectedJournalItem.path]: "done"
-        }));
-        loadedTextPathRef.current = transcriptPath;
-        setSelectedJournalText(transcriptText);
-        setJournalDraftText(transcriptText);
-        setJournalSaveStatus("Transcription ready");
-        setJournalTranscribing(false);
-        return;
+      if (localId) {
+        const job = await transcribeLocalMedia(localId);
+        const status = String(job.status || "").toLowerCase();
+        if (status === "completed") {
+          const journal = await getJournal(localId);
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [selectedJournalItem.path]: "done"
+          }));
+          loadedTextPathRef.current = selectedJournalItem.path;
+          setSelectedJournalText(journal.content || "");
+          setJournalDraftText(journal.content || "");
+          setJournalSaveStatus("Transcription ready");
+          setJournalTranscribing(false);
+          return;
+        }
+        if (status === "failed" || status === "canceled") {
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [selectedJournalItem.path]: "error"
+          }));
+          throw new Error(String(job.error || "unknown transcription error"));
+        }
+      } else {
+        const result = await transcribeJournalMedia(
+          selectedJournalItem.path,
+          token || undefined,
+          gatewayBaseUrl
+        );
+        const status = String(result.status || "").toLowerCase();
+        if (status === "done") {
+          const transcriptPath = String(result.path || journalTranscriptPathForMedia(selectedJournalItem));
+          const transcriptText = String(result.text || "");
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [selectedJournalItem.path]: "done"
+          }));
+          loadedTextPathRef.current = transcriptPath;
+          setSelectedJournalText(transcriptText);
+          setJournalDraftText(transcriptText);
+          setJournalSaveStatus("Transcription ready");
+          setJournalTranscribing(false);
+          return;
+        }
+        if (status === "error") {
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [selectedJournalItem.path]: "error"
+          }));
+          throw new Error(String(result.error || "unknown transcription error"));
+        }
+        if (status === "queued" || status === "running") {
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [selectedJournalItem.path]: status as "queued" | "running"
+          }));
+        }
       }
-      if (status === "error") {
+
+      if (localId) {
         setJournalTranscriptionStatusByPath((prev) => ({
           ...prev,
-          [selectedJournalItem.path]: "error"
-        }));
-        throw new Error(String(result.error || "unknown transcription error"));
-      }
-      if (status === "queued" || status === "running") {
-        setJournalTranscriptionStatusByPath((prev) => ({
-          ...prev,
-          [selectedJournalItem.path]: status as "queued" | "running"
+          [selectedJournalItem.path]: "queued"
         }));
       }
       await waitForTranscriptForMedia(
@@ -1527,6 +1723,44 @@ function App() {
         }
       }
     } else if (item.kind === "video" || item.kind === "audio") {
+      const localId = localJournalIdFromPath(item.path);
+      if (scope === "journal" && localId) {
+        try {
+          const journal = await getJournal(localId);
+          loadedTextPathRef.current = item.path;
+          setSelectedJournalText(journal.content || "");
+          setJournalDraftText(journal.content || "");
+          const localJob = await getLatestContentJobForTarget("transcribe_media", localId).catch(
+            () => null as ContentJob | null
+          );
+          const localStatus = String(localJob?.status || "").toLowerCase();
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [item.path]:
+              journal.content?.trim()
+                ? "done"
+                : localStatus === "running"
+                  ? "running"
+                  : localStatus === "queued" || localStatus === "retryable"
+                    ? "queued"
+                    : localStatus === "failed"
+                      ? "error"
+                      : prev[item.path] || "idle"
+          }));
+          if (localStatus === "running" || localStatus === "queued" || localStatus === "retryable") {
+            setJournalTranscribing(true);
+            setJournalSaveStatus(
+              localStatus === "running" ? "Transcription in progress..." : "Transcription queued..."
+            );
+            void waitForTranscriptForMedia(item.path, token);
+          }
+        } catch {
+          setSelectedJournalText("");
+          setJournalDraftText("");
+        }
+        return;
+      }
+
       const transcriptPath = journalTranscriptPathForMedia(item);
       const legacyTranscriptPath = legacyJournalTranscriptPathForMedia(item);
       const legacyCaptionPath = sidecarCaptionPath(item);
@@ -1814,10 +2048,10 @@ function App() {
 
   async function loadFeedWorkflowSettings() {
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       return;
     }
 
@@ -1856,10 +2090,10 @@ function App() {
 
   async function loadWorkflowRunStatuses(targetBots?: WorkflowBotMeta[]) {
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       return;
     }
 
@@ -1906,10 +2140,10 @@ function App() {
   async function triggerManualWorkflowRun(botKey: string) {
     const bot = workflowBots.find((item) => item.key === botKey) || workflowBotByKey(botKey);
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       setFeedEditStatus("Run blocked (gateway token missing).");
       return;
     }
@@ -1950,10 +2184,10 @@ function App() {
       return;
     }
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       setWorkflowSettingsStatusByKey((prev) => ({
         ...prev,
         [botKey]: "Save blocked (gateway token missing)."
@@ -2022,10 +2256,10 @@ function App() {
     }
 
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       setWorkflowTemplateStatus("Create blocked (gateway token missing).");
       return;
     }
@@ -2109,10 +2343,10 @@ function App() {
     }
 
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       setFeedCommentStatusByPath((prev) => ({
         ...prev,
         [item.path]: "Comment blocked (gateway token missing)."
@@ -2170,10 +2404,10 @@ function App() {
     workflowPollAbortRef.current = controller;
 
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       return;
     }
 
@@ -2412,7 +2646,7 @@ function App() {
         try {
           await saveLibraryText(selectedJournalItem.path, selectedJournalText, token, gatewayBaseUrl);
         } catch (gatewayError) {
-          if (!isDesktopClient) {
+          if (!isNativeClient) {
             throw gatewayError;
           }
           try {
@@ -2436,7 +2670,15 @@ function App() {
 
   async function refreshDrafts() {
     try {
-      const result = await listDraftsViaGateway(chatGatewayToken.trim() || undefined, gatewayBaseUrl);
+      const result = isNativeClient
+        ? (await listLocalDrafts()).map((item) => ({
+            id: item.id,
+            text: item.text,
+            videoName: item.videoName || "",
+            created: item.createdAt,
+            updated: item.updatedAt
+          }))
+        : await listDraftsViaGateway(chatGatewayToken.trim() || undefined, gatewayBaseUrl);
       setDrafts(
         result.map((item) => ({
           id: String(item.id || ""),
@@ -2459,7 +2701,7 @@ function App() {
     }
     try {
       let token = chatGatewayToken.trim();
-      if (!token && isDesktopClient) {
+      if (!token && isNativeClient) {
         token = (await syncDesktopGatewayBootstrap())?.trim() || "";
       }
       let threadId = chatThreadId.trim();
@@ -2489,7 +2731,7 @@ function App() {
       setAgent(nextAgent);
       setSession(nextSession);
       await saveBlueskySessionSecure(nextSession);
-      if (isDesktopClient) {
+      if (isNativeClient) {
         try {
           await restartGatewayDaemonFromDesktop();
           setAuthMessage(`Signed in as ${nextSession.handle}. Gateway restarted with new credentials.`);
@@ -2517,7 +2759,15 @@ function App() {
       created: new Date().toISOString()
     };
     try {
-      await saveDraftViaGateway(draft, chatGatewayToken.trim() || undefined, gatewayBaseUrl);
+      if (isNativeClient) {
+        await saveLocalDraft({
+          id: draft.id,
+          text: draft.text,
+          videoName: draft.videoName
+        });
+      } else {
+        await saveDraftViaGateway(draft, chatGatewayToken.trim() || undefined, gatewayBaseUrl);
+      }
       setStatus("Draft saved");
       await refreshDrafts();
     } catch (error) {
@@ -2530,7 +2780,19 @@ function App() {
   async function persistHistory(item: PostHistoryItem) {
     setHistory((prev) => [item, ...prev].slice(0, 20));
     try {
-      await createPostHistory(item, chatGatewayToken.trim() || undefined, gatewayBaseUrl);
+      if (isNativeClient) {
+        await saveLocalPostRecord({
+          provider: item.provider,
+          text: item.text,
+          sourceJournalId: item.sourcePath,
+          uri: item.uri,
+          cid: item.cid,
+          status: item.status,
+          error: item.error
+        });
+      } else {
+        await createPostHistory(item, chatGatewayToken.trim() || undefined, gatewayBaseUrl);
+      }
     } catch {
       // Local UI history remains available even if history sync fails.
     }
@@ -2538,7 +2800,19 @@ function App() {
 
   async function refreshPostHistory() {
     try {
-      const items = await listPostHistoryViaGateway(chatGatewayToken.trim() || undefined, gatewayBaseUrl);
+      const items = isNativeClient
+        ? (await listLocalPostHistory()).map((item) => ({
+            provider: "bluesky" as const,
+            text: item.text,
+            videoName: "",
+            sourcePath: item.sourceJournalId || "",
+            uri: item.uri || "",
+            cid: item.cid || "",
+            created: item.createdAt,
+            status: item.status as "success" | "error",
+            error: item.error || ""
+          }))
+        : await listPostHistoryViaGateway(chatGatewayToken.trim() || undefined, gatewayBaseUrl);
       setHistory((prev) => {
         if (prev.length === 0) {
           return items.slice(0, 20);
@@ -2613,16 +2887,19 @@ function App() {
     setChatStatus("Sending message...");
     try {
       let token = chatGatewayToken.trim();
-      if (!token && isDesktopClient) {
+      if (!token && isNativeClient) {
         token = (await syncDesktopGatewayBootstrap())?.trim() || "";
       }
-      if (!token) {
-        if (isDesktopClient) {
-          token = "desktop-local";
-        } else {
-          setChatStatus("Chat blocked (gateway token missing). Pair mobile with desktop QR.");
-          return;
-        }
+      if (!token && !isNativeClient) {
+        setChatStatus("Chat blocked (gateway token missing).");
+        return;
+      }
+      if (!token && isNativeClient) {
+        token = "desktop-local";
+      }
+      if (!gatewayBaseUrl.trim()) {
+        setChatStatus("Chat blocked (gateway URL missing).");
+        return;
       }
       let threadId = chatThreadId.trim();
       if (!threadId) {
@@ -3208,7 +3485,7 @@ function App() {
   }
 
   async function syncDesktopGatewayBootstrap(): Promise<string | null> {
-    if (!isDesktopClient) {
+    if (!isNativeClient) {
       return null;
     }
     try {
@@ -3234,14 +3511,14 @@ function App() {
   }
 
   async function restartGatewayDaemonFromDesktop() {
-    if (!isDesktopClient) {
+    if (!isNativeClient) {
       return;
     }
     await invokeDesktopCommandStrict<string>("restart_gateway_daemon");
   }
 
   async function loadOpenAiDeviceCodeStatus() {
-    if (!isDesktopClient) {
+    if (!isNativeClient) {
       return;
     }
     try {
@@ -3261,13 +3538,13 @@ function App() {
   }
 
   async function startOpenAiDeviceCodeLogin() {
-    if (!isDesktopClient) {
+    if (!isNativeClient) {
       setAiSetupStatus({
         state: "error",
         running: false,
         completed: false,
-        message: "AI setup is desktop-only.",
-        error: "desktop-only"
+        message: "AI setup unavailable in this runtime.",
+        error: "unavailable"
       });
       return;
     }
@@ -3291,8 +3568,8 @@ function App() {
   }
 
   async function saveOptionalProviderApiKey() {
-    if (!isDesktopClient) {
-      setProviderApiKeyStatus("API key storage is desktop-only.");
+    if (!isNativeClient) {
+      setProviderApiKeyStatus("API key storage is unavailable in this runtime.");
       return;
     }
     const trimmed = providerApiKey.trim();
@@ -3329,11 +3606,11 @@ function App() {
 
   async function loadRuntimeConfigForSettings() {
     let token = normalizeGatewayToken(chatGatewayToken);
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
     }
 
-    if (isDesktopClient) {
+    if (isNativeClient) {
       setSettingsConfigLoaded(false);
       setSettingsConfigStatus("Loading local config...");
       try {
@@ -3343,8 +3620,11 @@ function App() {
         setSettingsProvider((savedProvider && savedProvider.trim()) || "ollama");
         setSettingsModel((savedModel && savedModel.trim()) || cfg.ollamaModel || "");
         setSettingsTranscriptionEnabled(Boolean(cfg.transcriptionEnabled));
-        setSettingsTranscriptionModel(cfg.ollamaModel || "");
-        let models = await listOllamaModels().catch(() => [] as string[]);
+        setSettingsTranscriptionModel(cfg.transcriptionModel || "");
+        let models =
+          cfg.availableTranscriptionModels && cfg.availableTranscriptionModels.length > 0
+            ? [...cfg.availableTranscriptionModels]
+            : [];
         if (!models.length && gatewayBaseUrl.trim()) {
           try {
             const runtimeCfg = await getRuntimeConfig(token || undefined, gatewayBaseUrl);
@@ -3360,8 +3640,8 @@ function App() {
             // Keep local model-only list when gateway runtime config is unavailable.
           }
         }
-        if (cfg.ollamaModel && !models.includes(cfg.ollamaModel)) {
-          models.unshift(cfg.ollamaModel);
+        if (cfg.transcriptionModel && !models.includes(cfg.transcriptionModel)) {
+          models.unshift(cfg.transcriptionModel);
         }
         setSettingsAvailableTranscriptionModels(models);
         setSettingsConfigStatus("Config loaded (local)");
@@ -3423,26 +3703,28 @@ function App() {
       return;
     }
     let token = normalizeGatewayToken(chatGatewayToken);
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
     }
 
     setSettingsConfigBusy(true);
-    setSettingsConfigStatus(isDesktopClient ? "Saving local config..." : "Saving config...");
+    setSettingsConfigStatus(isNativeClient ? "Saving local config..." : "Saving config...");
     try {
-      if (isDesktopClient) {
+      if (isNativeClient) {
         try {
           const cfg = await getConfig();
           await saveConfig({
             ...cfg,
             ollamaModel: model,
-            transcriptionEnabled: settingsTranscriptionEnabled
+            transcriptionEnabled: settingsTranscriptionEnabled,
+            transcriptionModel: settingsTranscriptionModel.trim(),
+            availableTranscriptionModels: settingsAvailableTranscriptionModels
           });
           window.localStorage.setItem(CHAT_PROVIDER_STORAGE_KEY, provider);
           window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, model);
           setSettingsConfigLoaded(true);
           if (provider !== "ollama") {
-            setSettingsConfigStatus("Saved local config. Note: desktop local chat currently uses Ollama.");
+            setSettingsConfigStatus("Saved local config. Embedded gateway settings were updated.");
           } else {
             setSettingsConfigStatus("Config saved (local).");
           }
@@ -3472,7 +3754,7 @@ function App() {
         gatewayBaseUrl
       );
       setSettingsConfigStatus("Config saved. Restarting/applying...");
-      if (isDesktopClient) {
+      if (isNativeClient) {
         await restartGatewayDaemonFromDesktop();
       }
       window.location.reload();
@@ -3522,7 +3804,7 @@ function App() {
   }
 
   useEffect(() => {
-    if (isDesktopClient) {
+    if (isNativeClient) {
       return;
     }
     const needsQrLogin = !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
@@ -3606,17 +3888,17 @@ function App() {
         mobileScannerVideoRef.current.srcObject = null;
       }
     };
-  }, [isDesktopClient, mobileScannerActive, chatGatewayToken, gatewayBaseUrl]);
+  }, [isNativeClient, mobileScannerActive, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
-    if (!isDesktopClient) {
+    if (!isNativeClient) {
       return;
     }
     void loadOpenAiDeviceCodeStatus();
-  }, [isDesktopClient]);
+  }, [isNativeClient]);
 
   useEffect(() => {
-    if (!isDesktopClient || !aiSetupStatus?.running) {
+    if (!isNativeClient || !aiSetupStatus?.running) {
       return;
     }
     const timer = window.setInterval(() => {
@@ -3625,7 +3907,7 @@ function App() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [isDesktopClient, aiSetupStatus?.running]);
+  }, [isNativeClient, aiSetupStatus?.running]);
 
   useEffect(() => {
     if (mobileTab !== "profile") {
@@ -3763,7 +4045,7 @@ function App() {
   const journalList = journalItems;
   const feedList = feedItems;
   const postedHistory = history.filter((item) => item.status === "success");
-  const needsMobileQrLogin = !isDesktopClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
+  const needsMobileQrLogin = !isNativeClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
   const isCaptureZenMode = mobileTab === "journal" && (isRecording || captureMode !== null);
   const hideChrome = isWritingNote || isCaptureZenMode;
   const showDesktopJournalLayout = isDesktopLayout && mobileTab === "journal";
@@ -5236,7 +5518,27 @@ function App() {
             </div>
 
             <div className="card">
-              <h2>Bluesky Login (Desktop)</h2>
+              <h2>Built-In Operations</h2>
+              <div className="stack">
+                <p className="text-sm muted">
+                  Journals, media, transcripts, and edited outputs stay in the app workspace by default.
+                </p>
+                <div className="stack" style={{ gap: "0.45rem" }}>
+                  {builtInOperations.map((operation) => (
+                    <div key={operation.key} className="badge" style={{ alignSelf: "flex-start" }}>
+                      {operation.key}
+                      {!operation.implemented ? " (planned)" : ""}
+                    </div>
+                  ))}
+                </div>
+                <p className="text-sm muted">
+                  New low-level operations ship through app updates. The app can rearrange built-in operations, but it does not run arbitrary user scripts on iOS.
+                </p>
+              </div>
+            </div>
+
+            <div className="card">
+              <h2>Bluesky Login</h2>
               <form className="stack" onSubmit={handleLogin}>
                 <p className="text-sm muted">Service: {creds.serviceUrl || "https://bsky.social"}</p>
                 <input
@@ -5311,7 +5613,11 @@ function App() {
                     </div>
                   </div>
                 </div>
+              </>
+            )}
 
+            {isNativeClient && (
+              <>
                 <div className="card">
                   <div className="row-between">
                     <h2>AI Setup</h2>
@@ -5329,7 +5635,7 @@ function App() {
                   </div>
                   <div className="stack">
                     <p className="text-sm muted">
-                      Starts `slowclaw auth login --provider openai-codex --device-code` and waits for completion.
+                      Starts OpenAI device-code login and stores the resulting profile in this app workspace.
                     </p>
                     <div className="stack" style={{ gap: "0.4rem" }}>
                       <p className="text-sm"><strong>Provider API Key (Optional)</strong></p>

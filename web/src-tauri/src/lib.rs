@@ -1,14 +1,23 @@
+mod content_ops;
+mod local_workspace;
+
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Read};
 use std::net::{IpAddr, UdpSocket};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::async_runtime::JoinHandle;
 use tauri::Manager;
+use zeroclaw::{openai_oauth, AuthService};
+
+use crate::content_ops::{
+    get_content_job, get_latest_content_job_for_target, list_builtin_operations, list_content_jobs,
+    resume_pending_content_jobs, transcribe_media, ContentJobState,
+};
+use crate::local_workspace::{
+    delete_draft, delete_journal, get_config, get_journal, list_drafts, list_journals,
+    list_post_history, save_config, save_draft, save_journal_media, save_journal_text,
+    save_post_record, update_journal_text,
+};
 
 const EMBEDDED_GATEWAY_URL: &str = "http://127.0.0.1:42617";
 const PROVIDER_SECRET_SERVICE: &str = "social.slowclaw.gateway";
@@ -274,7 +283,11 @@ async fn restart_embedded_gateway(
     let mut config = zeroclaw::Config::load_or_init()
         .await
         .map_err(|e| format!("failed to load config for embedded gateway: {e}"))?;
-    let bind_host = discover_lan_ipv4().unwrap_or_else(|| "127.0.0.1".to_string());
+    let bind_host = if cfg!(any(target_os = "ios", target_os = "android")) {
+        "127.0.0.1".to_string()
+    } else {
+        discover_lan_ipv4().unwrap_or_else(|| "127.0.0.1".to_string())
+    };
     config.gateway.host = bind_host.clone();
     config.gateway.require_pairing = false;
     config.gateway.allow_public_bind = bind_host != "127.0.0.1";
@@ -352,305 +365,120 @@ async fn ensure_embedded_gateway_started(
     restart_embedded_gateway(shared).await
 }
 
-fn parse_openai_prefixed_value(line: &str, prefix: &str) -> Option<String> {
-    line.strip_prefix(prefix)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn is_local_callback_url(value: &str) -> bool {
-    value.contains("://localhost:")
-        || value.contains("://127.0.0.1:")
-        || value.contains("://[::1]:")
-}
-
-fn extract_first_url(line: &str) -> Option<String> {
-    for token in line.split_whitespace() {
-        let token = token.trim_matches(|c: char| {
-            c == '"'
-                || c == '\''
-                || c == '('
-                || c == ')'
-                || c == '['
-                || c == ']'
-                || c == ','
-                || c == ';'
-        });
-        if token.starts_with("http://") || token.starts_with("https://") {
-            return Some(token.to_string());
-        }
-    }
-    None
-}
-
-fn openai_auth_is_configured_from_status_output(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("openai-codex")
-        && lower.contains("active profiles:")
-        && lower.contains("openai-codex:")
-}
-
 fn run_openai_auth_status_probe() -> Result<bool, String> {
-    let mut attempts: Vec<(String, Command)> = Vec::new();
-    if let Some(binary_path) = slowclaw_binary_next_to_current_exe() {
-        let mut command = Command::new(&binary_path);
-        command.args(["auth", "status"]);
-        attempts.push((binary_path.display().to_string(), command));
-    }
-    let mut command = Command::new("slowclaw");
-    command.args(["auth", "status"]);
-    attempts.push(("slowclaw".to_string(), command));
-
-    let workspace_dir = workspace_root_dir();
-    let mut fallback = Command::new("cargo");
-    fallback
-        .args(["run", "--quiet", "--bin", "slowclaw", "--", "auth", "status"])
-        .current_dir(workspace_dir);
-    attempts.push(("cargo run --bin slowclaw".to_string(), fallback));
-
-    let mut errors = Vec::new();
-    for (label, mut cmd) in attempts {
-        match cmd.output() {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if output.status.success() {
-                    return Ok(openai_auth_is_configured_from_status_output(&stdout));
-                }
-                errors.push(format!(
-                    "{label} exited with code {}",
-                    output.status.code().unwrap_or(-1)
-                ));
-            }
-            Err(err) => errors.push(format!("{label}: {err}")),
-        }
-    }
-    Err(format!("failed to check OpenAI auth status ({})", errors.join("; ")))
-}
-
-fn update_openai_status_from_line(
-    state: &Arc<Mutex<OpenAiDeviceCodeRuntimeState>>,
-    line: &str,
-) -> Result<(), String> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-
-    let mut guard = lock_openai_state(state)?;
-    let status = &mut guard.status;
-    status.message = trimmed.to_string();
-
-    if let Some(url) = parse_openai_prefixed_value(trimmed, "Visit:") {
-        if !is_local_callback_url(&url) {
-            status.state = "awaiting_user".to_string();
-            status.verification_url = Some(url);
-            status.error = None;
-        }
-    } else if let Some(code) = parse_openai_prefixed_value(trimmed, "Code:") {
-        status.user_code = Some(code);
-    } else if let Some(link) = parse_openai_prefixed_value(trimmed, "Fast link:") {
-        if !is_local_callback_url(&link) {
-            status.fast_link = Some(link);
-        }
-    } else if trimmed.starts_with("OpenAI device-code login started.") {
-        status.state = "awaiting_user".to_string();
-        status.error = None;
-    } else if status.verification_url.is_none() {
-        if let Some(url) = extract_first_url(trimmed) {
-            if !is_local_callback_url(&url) {
-                status.state = "awaiting_user".to_string();
-                status.verification_url = Some(url);
-                status.error = None;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn workspace_root_dir() -> PathBuf {
-    let tauri_manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    tauri_manifest_dir
-        .parent()
-        .and_then(|path| path.parent())
-        .map(PathBuf::from)
-        .unwrap_or(tauri_manifest_dir)
-}
-
-fn slowclaw_binary_next_to_current_exe() -> Option<PathBuf> {
-    let current_exe = std::env::current_exe().ok()?;
-    let file_name = if cfg!(target_os = "windows") {
-        "slowclaw.exe"
-    } else {
-        "slowclaw"
-    };
-    let candidate = current_exe.with_file_name(file_name);
-    candidate.exists().then_some(candidate)
-}
-
-fn spawn_output_reader<R: Read + Send + 'static>(reader: R, tx: mpsc::Sender<String>) {
-    thread::spawn(move || {
-        for line in BufReader::new(reader).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
+    let runtime = tauri::async_runtime::block_on(async {
+        let config = zeroclaw::Config::load_or_init()
+            .await
+            .map_err(|e| format!("failed to load config: {e}"))?;
+        let auth_service = AuthService::from_config(&config);
+        auth_service
+            .get_profile(OPENAI_DEVICE_LOGIN_PROVIDER, Some(OPENAI_DEVICE_LOGIN_PROFILE))
+            .await
+            .map(|profile| profile.is_some())
+            .map_err(|e| format!("failed to inspect OpenAI auth profile: {e}"))
     });
+    runtime
 }
 
-fn spawn_openai_device_login_process() -> Result<Child, String> {
-    let auth_args = [
-        "auth",
-        "login",
-        "--provider",
-        OPENAI_DEVICE_LOGIN_PROVIDER,
-        "--profile",
-        OPENAI_DEVICE_LOGIN_PROFILE,
-        "--device-code",
-    ];
-
-    let mut errors = Vec::new();
-
-    if let Some(binary_path) = slowclaw_binary_next_to_current_exe() {
-        let mut command = Command::new(&binary_path);
-        command
-            .args(auth_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        match command.spawn() {
-            Ok(child) => return Ok(child),
-            Err(err) => errors.push(format!("{}: {err}", binary_path.display())),
-        }
-    }
-
-    let mut command = Command::new("slowclaw");
-    command
-        .args(auth_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    match command.spawn() {
-        Ok(child) => return Ok(child),
-        Err(err) => errors.push(format!("slowclaw: {err}")),
-    }
-
-    let workspace_dir = workspace_root_dir();
-    let mut fallback = Command::new("cargo");
-    fallback
-        .args([
-            "run",
-            "--quiet",
-            "--bin",
-            "slowclaw",
-            "--",
-            "auth",
-            "login",
-            "--provider",
-            OPENAI_DEVICE_LOGIN_PROVIDER,
-            "--profile",
-            OPENAI_DEVICE_LOGIN_PROFILE,
-            "--device-code",
-        ])
-        .current_dir(workspace_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    match fallback.spawn() {
-        Ok(child) => Ok(child),
-        Err(err) => {
-            errors.push(format!("cargo run --bin slowclaw: {err}"));
-            Err(format!(
-                "failed to start OpenAI setup command ({})",
-                errors.join("; ")
-            ))
-        }
-    }
-}
-
-fn run_openai_device_login_worker(
+async fn run_openai_device_login_worker(
     openai_state: Arc<Mutex<OpenAiDeviceCodeRuntimeState>>,
     gateway_state: Arc<Mutex<GatewayRuntimeState>>,
 ) {
-    let mut child = match spawn_openai_device_login_process() {
-        Ok(child) => child,
+    let config = match zeroclaw::Config::load_or_init().await {
+        Ok(config) => config,
         Err(error) => {
             if let Ok(mut guard) = openai_state.lock() {
                 guard.status = OpenAiDeviceCodeStatus {
                     state: "error".to_string(),
                     running: false,
                     completed: false,
-                    message: "Failed to start OpenAI setup command.".to_string(),
+                    message: "Failed to load runtime config for OpenAI setup.".to_string(),
                     verification_url: None,
                     user_code: None,
                     fast_link: None,
-                    error: Some(error),
+                    error: Some(error.to_string()),
                 };
             }
             return;
         }
     };
 
-    let (tx, rx) = mpsc::channel::<String>();
-    if let Some(stdout) = child.stdout.take() {
-        spawn_output_reader(stdout, tx.clone());
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_output_reader(stderr, tx.clone());
-    }
-    drop(tx);
-
-    loop {
-        while let Ok(line) = rx.try_recv() {
-            let _ = update_openai_status_from_line(&openai_state, &line);
+    let client = reqwest::Client::new();
+    let device = match openai_oauth::start_device_code_flow(&client).await {
+        Ok(device) => device,
+        Err(error) => {
+            if let Ok(mut guard) = openai_state.lock() {
+                guard.status = OpenAiDeviceCodeStatus {
+                    state: "error".to_string(),
+                    running: false,
+                    completed: false,
+                    message: "Failed to start OpenAI device-code login.".to_string(),
+                    verification_url: None,
+                    user_code: None,
+                    fast_link: None,
+                    error: Some(error.to_string()),
+                };
+            }
+            return;
         }
+    };
 
-        match child.try_wait() {
-            Ok(Some(exit_status)) => {
-                for line in rx.try_iter() {
-                    let _ = update_openai_status_from_line(&openai_state, &line);
-                }
+    if let Ok(mut guard) = openai_state.lock() {
+        guard.status = OpenAiDeviceCodeStatus {
+            state: "awaiting_user".to_string(),
+            running: true,
+            completed: false,
+            message: device
+                .message
+                .clone()
+                .unwrap_or_else(|| "Authorize the app in your browser, then return here.".to_string()),
+            verification_url: Some(device.verification_uri.clone()),
+            user_code: Some(device.user_code.clone()),
+            fast_link: device.verification_uri_complete.clone(),
+            error: None,
+        };
+    }
 
-                if exit_status.success() {
-                    if let Ok(mut guard) = openai_state.lock() {
-                        guard.status.running = false;
-                        guard.status.completed = true;
-                        guard.status.state = "completed".to_string();
-                        guard.status.error = None;
-                        guard.status.message = "OpenAI setup completed. Restarting gateway...".to_string();
-                    }
-
-                    let gateway_state_for_restart = gateway_state.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(err) = restart_embedded_gateway(gateway_state_for_restart).await {
-                            eprintln!("failed to restart gateway after OpenAI setup: {err}");
-                        }
-                    });
-                } else if let Ok(mut guard) = openai_state.lock() {
-                    let code = exit_status.code().unwrap_or(-1);
-                    guard.status.running = false;
-                    guard.status.completed = false;
-                    guard.status.state = "error".to_string();
-                    guard.status.message = format!("OpenAI setup exited with code {code}.");
-                    guard.status.error = Some(format!("process exited with code {code}"));
-                }
-                break;
+    let token_set = match openai_oauth::poll_device_code_tokens(&client, &device).await {
+        Ok(token_set) => token_set,
+        Err(error) => {
+            if let Ok(mut guard) = openai_state.lock() {
+                guard.status.running = false;
+                guard.status.completed = false;
+                guard.status.state = "error".to_string();
+                guard.status.message = "OpenAI authorization did not complete.".to_string();
+                guard.status.error = Some(error.to_string());
             }
-            Ok(None) => {
-                thread::sleep(Duration::from_millis(120));
-            }
-            Err(err) => {
-                if let Ok(mut guard) = openai_state.lock() {
-                    guard.status.running = false;
-                    guard.status.completed = false;
-                    guard.status.state = "error".to_string();
-                    guard.status.message = "Failed while waiting for OpenAI setup command.".to_string();
-                    guard.status.error = Some(err.to_string());
-                }
-                break;
-            }
+            return;
         }
+    };
+
+    let auth_service = AuthService::from_config(&config);
+    let account_id = openai_oauth::extract_account_id_from_jwt(&token_set.access_token);
+    if let Err(error) = auth_service
+        .store_openai_tokens(OPENAI_DEVICE_LOGIN_PROFILE, token_set, account_id, true)
+        .await
+    {
+        if let Ok(mut guard) = openai_state.lock() {
+            guard.status.running = false;
+            guard.status.completed = false;
+            guard.status.state = "error".to_string();
+            guard.status.message = "OpenAI authorization succeeded, but saving tokens failed.".to_string();
+            guard.status.error = Some(error.to_string());
+        }
+        return;
+    }
+
+    if let Ok(mut guard) = openai_state.lock() {
+        guard.status.running = false;
+        guard.status.completed = true;
+        guard.status.state = "authenticated".to_string();
+        guard.status.message = "OpenAI setup completed. Restarting gateway...".to_string();
+        guard.status.error = None;
+    }
+
+    if let Err(err) = restart_embedded_gateway(gateway_state).await {
+        eprintln!("failed to restart gateway after OpenAI setup: {err}");
     }
 }
 
@@ -833,8 +661,8 @@ fn start_openai_device_code_login(
 
     let openai_state = state.inner.clone();
     let gateway_state = gateway_state.inner.clone();
-    thread::spawn(move || {
-        run_openai_device_login_worker(openai_state, gateway_state);
+    tauri::async_runtime::spawn(async move {
+        run_openai_device_login_worker(openai_state, gateway_state).await;
     });
 
     snapshot_openai_status(&state.inner)
@@ -851,9 +679,11 @@ fn show_main_window(window: tauri::Window) {
 pub fn run() {
     let gateway_state = GatewayState::default();
     let openai_state = OpenAiDeviceCodeState::default();
+    let content_job_state = ContentJobState::default();
     tauri::Builder::default()
         .manage(gateway_state)
         .manage(openai_state)
+        .manage(content_job_state)
         .setup(|app| {
             let shared = app.state::<GatewayState>().inner.clone();
             tauri::async_runtime::spawn(async move {
@@ -861,9 +691,32 @@ pub fn run() {
                     eprintln!("embedded gateway failed to start: {err}");
                 }
             });
+            let content_jobs = app.state::<ContentJobState>().inner().clone();
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                resume_pending_content_jobs(app_handle, content_jobs).await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            save_journal_text,
+            save_journal_media,
+            list_journals,
+            get_journal,
+            update_journal_text,
+            delete_journal,
+            save_draft,
+            list_drafts,
+            delete_draft,
+            save_post_record,
+            list_post_history,
+            get_config,
+            save_config,
+            list_builtin_operations,
+            list_content_jobs,
+            get_content_job,
+            get_latest_content_job_for_target,
+            transcribe_media,
             get_secret,
             set_secret,
             delete_secret,

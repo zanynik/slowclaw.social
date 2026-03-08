@@ -30,6 +30,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": []
+    "externalBin": [],
+    "resources": [
+      "resources/models/*"
+    ]
   }
 }

@@ -66,6 +66,18 @@ pub struct MediaAssetInput {
     pub created_at_client: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ContentJobInput {
+    pub operation_key: String,
+    pub target_id: String,
+    pub target_path: String,
+    pub input_json: String,
+    pub status: String,
+    pub progress_label: String,
+    pub error: String,
+    pub created_at_client: Option<String>,
+}
+
 pub fn initialize(workspace_dir: &Path) -> Result<BootstrapReport> {
     let db_path = db_path(workspace_dir);
     if let Some(parent) = db_path.parent() {
@@ -353,8 +365,8 @@ pub fn create_journal_entry_metadata(
     conn.execute(
         "INSERT INTO journal_entries (
             id, title, entry_type, source, status, workspace_path, preview_text, text_body,
-            tags_csv, created_at_client, created
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            tags_csv, created_at_client, created, updated
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
         params![
             id,
             item.title,
@@ -381,7 +393,110 @@ pub fn create_journal_entry_metadata(
         "textBody": item.text_body,
         "tagsCsv": item.tags_csv,
         "createdAtClient": created_at_client,
+        "created": created,
+        "updated": created,
     }))
+}
+
+pub fn list_journal_entries(
+    workspace_dir: &Path,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let lim = i64::try_from(limit.max(1)).unwrap_or(200);
+    let off = i64::try_from(offset).unwrap_or(0);
+    let mut stmt = conn.prepare(
+        "SELECT id, title, entry_type, status, workspace_path, preview_text, text_body,
+                created_at_client, created, updated
+         FROM journal_entries
+         ORDER BY COALESCE(NULLIF(created_at_client, ''), updated, created) DESC, id DESC
+         LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt.query_map(params![lim, off], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, String>(0)?,
+            "title": row.get::<_, String>(1)?,
+            "entryType": row.get::<_, String>(2)?,
+            "status": row.get::<_, String>(3)?,
+            "workspacePath": row.get::<_, String>(4)?,
+            "previewText": row.get::<_, String>(5)?,
+            "textBody": row.get::<_, String>(6)?,
+            "createdAtClient": row.get::<_, String>(7)?,
+            "created": row.get::<_, String>(8)?,
+            "updated": row.get::<_, String>(9)?,
+        }))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn get_journal_entry(workspace_dir: &Path, id: &str) -> Result<Option<serde_json::Value>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    conn.query_row(
+        "SELECT id, title, entry_type, status, workspace_path, preview_text, text_body,
+                created_at_client, created, updated
+         FROM journal_entries
+         WHERE id = ?1",
+        params![id.trim()],
+        |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "title": row.get::<_, String>(1)?,
+                "entryType": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "workspacePath": row.get::<_, String>(4)?,
+                "previewText": row.get::<_, String>(5)?,
+                "textBody": row.get::<_, String>(6)?,
+                "createdAtClient": row.get::<_, String>(7)?,
+                "created": row.get::<_, String>(8)?,
+                "updated": row.get::<_, String>(9)?,
+            }))
+        },
+    )
+    .optional()
+    .context("Failed to load journal entry")
+}
+
+pub fn update_journal_entry_text(
+    workspace_dir: &Path,
+    id: &str,
+    text_body: &str,
+    preview_text: &str,
+) -> Result<Option<serde_json::Value>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE journal_entries
+         SET text_body = ?2, preview_text = ?3, updated = ?4
+         WHERE id = ?1",
+        params![id.trim(), text_body, preview_text, now],
+    )
+    .with_context(|| format!("Failed to update journal entry {}", id.trim()))?;
+    get_journal_entry(workspace_dir, id)
+}
+
+pub fn delete_journal_entry(workspace_dir: &Path, id: &str) -> Result<bool> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let changed = conn
+        .execute(
+            "DELETE FROM journal_entries WHERE id = ?1",
+            params![id.trim()],
+        )
+        .with_context(|| format!("Failed to delete journal entry {}", id.trim()))?;
+    Ok(changed > 0)
+}
+
+pub fn delete_draft(workspace_dir: &Path, id: &str) -> Result<bool> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let changed = conn
+        .execute("DELETE FROM drafts WHERE id = ?1", params![id.trim()])
+        .with_context(|| format!("Failed to delete draft {}", id.trim()))?;
+    Ok(changed > 0)
 }
 
 pub fn create_media_asset_metadata(
@@ -430,6 +545,169 @@ pub fn create_media_asset_metadata(
         "sizeBytes": item.size_bytes,  // integer
         "createdAtClient": created_at_client,
     }))
+}
+
+pub fn create_content_job(workspace_dir: &Path, job: &ContentJobInput) -> Result<serde_json::Value> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let id = format!("lc_{}", Uuid::new_v4().simple());
+    let now = Utc::now().to_rfc3339();
+    let created_at_client = job
+        .created_at_client
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| now.clone());
+    conn.execute(
+        "INSERT INTO content_jobs (
+            id, operation_key, target_id, target_path, input_json, output_json, status,
+            progress_label, error, created_at_client, created, updated
+         ) VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?10)",
+        params![
+            id,
+            job.operation_key.trim(),
+            job.target_id.trim(),
+            job.target_path.trim(),
+            job.input_json,
+            job.status.trim(),
+            job.progress_label,
+            job.error,
+            created_at_client,
+            now,
+        ],
+    )
+    .context("Failed to create content job")?;
+    get_content_job(workspace_dir, &id)?
+        .ok_or_else(|| anyhow::anyhow!("content job disappeared after insert"))
+}
+
+pub fn get_content_job(workspace_dir: &Path, id: &str) -> Result<Option<serde_json::Value>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    conn.query_row(
+        "SELECT id, operation_key, target_id, target_path, input_json, output_json, status,
+                progress_label, error, created_at_client, created, updated
+         FROM content_jobs
+         WHERE id = ?1",
+        params![id.trim()],
+        |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "operationKey": row.get::<_, String>(1)?,
+                "targetId": row.get::<_, String>(2)?,
+                "targetPath": row.get::<_, String>(3)?,
+                "inputJson": row.get::<_, String>(4)?,
+                "outputJson": row.get::<_, String>(5)?,
+                "status": row.get::<_, String>(6)?,
+                "progressLabel": row.get::<_, String>(7)?,
+                "error": row.get::<_, String>(8)?,
+                "createdAtClient": row.get::<_, String>(9)?,
+                "created": row.get::<_, String>(10)?,
+                "updated": row.get::<_, String>(11)?,
+            }))
+        },
+    )
+    .optional()
+    .context("Failed to load content job")
+}
+
+pub fn list_content_jobs(workspace_dir: &Path, limit: usize) -> Result<Vec<serde_json::Value>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let lim = i64::try_from(limit.max(1)).unwrap_or(100);
+    let mut stmt = conn.prepare(
+        "SELECT id, operation_key, target_id, target_path, input_json, output_json, status,
+                progress_label, error, created_at_client, created, updated
+         FROM content_jobs
+         ORDER BY COALESCE(NULLIF(created_at_client, ''), updated, created) DESC, id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![lim], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, String>(0)?,
+            "operationKey": row.get::<_, String>(1)?,
+            "targetId": row.get::<_, String>(2)?,
+            "targetPath": row.get::<_, String>(3)?,
+            "inputJson": row.get::<_, String>(4)?,
+            "outputJson": row.get::<_, String>(5)?,
+            "status": row.get::<_, String>(6)?,
+            "progressLabel": row.get::<_, String>(7)?,
+            "error": row.get::<_, String>(8)?,
+            "createdAtClient": row.get::<_, String>(9)?,
+            "created": row.get::<_, String>(10)?,
+            "updated": row.get::<_, String>(11)?,
+        }))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn find_latest_content_job_for_target(
+    workspace_dir: &Path,
+    operation_key: &str,
+    target_id: &str,
+) -> Result<Option<serde_json::Value>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    conn.query_row(
+        "SELECT id, operation_key, target_id, target_path, input_json, output_json, status,
+                progress_label, error, created_at_client, created, updated
+         FROM content_jobs
+         WHERE operation_key = ?1 AND target_id = ?2
+         ORDER BY COALESCE(NULLIF(created_at_client, ''), updated, created) DESC, id DESC
+         LIMIT 1",
+        params![operation_key.trim(), target_id.trim()],
+        |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "operationKey": row.get::<_, String>(1)?,
+                "targetId": row.get::<_, String>(2)?,
+                "targetPath": row.get::<_, String>(3)?,
+                "inputJson": row.get::<_, String>(4)?,
+                "outputJson": row.get::<_, String>(5)?,
+                "status": row.get::<_, String>(6)?,
+                "progressLabel": row.get::<_, String>(7)?,
+                "error": row.get::<_, String>(8)?,
+                "createdAtClient": row.get::<_, String>(9)?,
+                "created": row.get::<_, String>(10)?,
+                "updated": row.get::<_, String>(11)?,
+            }))
+        },
+    )
+    .optional()
+    .context("Failed to load latest content job")
+}
+
+pub fn update_content_job(
+    workspace_dir: &Path,
+    id: &str,
+    status: &str,
+    progress_label: &str,
+    error: Option<&str>,
+    output_json: Option<&str>,
+) -> Result<Option<serde_json::Value>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE content_jobs
+         SET status = ?2,
+             progress_label = ?3,
+             error = ?4,
+             output_json = COALESCE(?5, output_json),
+             updated = ?6
+         WHERE id = ?1",
+        params![
+            id.trim(),
+            status.trim(),
+            progress_label,
+            error.unwrap_or("").trim(),
+            output_json,
+            now
+        ],
+    )
+    .with_context(|| format!("Failed to update content job {}", id.trim()))?;
+    get_content_job(workspace_dir, id)
 }
 
 fn open_conn(path: &Path) -> Result<Connection> {
@@ -504,7 +782,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
             text_body TEXT NOT NULL DEFAULT '',
             tags_csv TEXT NOT NULL DEFAULT '',
             created_at_client TEXT NOT NULL DEFAULT '',
-            created TEXT NOT NULL
+            created TEXT NOT NULL,
+            updated TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_journal_entries_path
             ON journal_entries(workspace_path);
@@ -524,6 +803,25 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_media_assets_path
             ON media_assets(workspace_path);
+
+        CREATE TABLE IF NOT EXISTS content_jobs (
+            id TEXT PRIMARY KEY,
+            operation_key TEXT NOT NULL DEFAULT '',
+            target_id TEXT NOT NULL DEFAULT '',
+            target_path TEXT NOT NULL DEFAULT '',
+            input_json TEXT NOT NULL DEFAULT '',
+            output_json TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            progress_label TEXT NOT NULL DEFAULT '',
+            error TEXT NOT NULL DEFAULT '',
+            created_at_client TEXT NOT NULL DEFAULT '',
+            created TEXT NOT NULL,
+            updated TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_content_jobs_target
+            ON content_jobs(operation_key, target_id, updated);
+        CREATE INDEX IF NOT EXISTS idx_content_jobs_created
+            ON content_jobs(created_at_client, created);
 
         CREATE TABLE IF NOT EXISTS artifacts (
             id TEXT PRIMARY KEY,
@@ -551,6 +849,18 @@ fn init_schema(conn: &Connection) -> Result<()> {
     if !has_source_path {
         let _ = conn.execute_batch(
             "ALTER TABLE post_history ADD COLUMN source_path TEXT NOT NULL DEFAULT ''",
+        );
+    }
+
+    let has_journal_updated: bool = conn
+        .prepare("SELECT updated FROM journal_entries LIMIT 0")
+        .is_ok();
+    if !has_journal_updated {
+        let _ = conn.execute_batch(
+            "ALTER TABLE journal_entries ADD COLUMN updated TEXT NOT NULL DEFAULT ''",
+        );
+        let _ = conn.execute_batch(
+            "UPDATE journal_entries SET updated = created WHERE updated = ''",
         );
     }
 
@@ -608,6 +918,7 @@ mod tests {
         assert!(table_exists(&conn, "post_history").unwrap());
         assert!(table_exists(&conn, "journal_entries").unwrap());
         assert!(table_exists(&conn, "media_assets").unwrap());
+        assert!(table_exists(&conn, "content_jobs").unwrap());
         assert!(table_exists(&conn, "artifacts").unwrap());
     }
 
@@ -711,6 +1022,9 @@ mod tests {
         let drafts = list_drafts(tmp.path(), 100).unwrap();
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0]["text"], "updated draft");
+
+        assert!(delete_draft(tmp.path(), &id).unwrap());
+        assert!(list_drafts(tmp.path(), 100).unwrap().is_empty());
     }
 
     #[test]
@@ -764,6 +1078,33 @@ mod tests {
         .unwrap();
         assert_eq!(entry["title"], "test entry");
         assert_eq!(entry["entryType"], "text");
+
+        let listed = list_journal_entries(tmp.path(), 10, 0).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], entry["id"]);
+
+        let fetched = get_journal_entry(tmp.path(), entry["id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched["workspacePath"], "journals/2026-03-03/entry.md");
+
+        let updated = update_journal_entry_text(
+            tmp.path(),
+            entry["id"].as_str().unwrap(),
+            "updated body",
+            "updated preview",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated["textBody"], "updated body");
+        assert_eq!(updated["previewText"], "updated preview");
+
+        assert!(delete_journal_entry(tmp.path(), entry["id"].as_str().unwrap()).unwrap());
+        assert!(
+            get_journal_entry(tmp.path(), entry["id"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -788,6 +1129,55 @@ mod tests {
         .unwrap();
         assert_eq!(asset["sizeBytes"], 1_048_576);
         assert!(asset["sizeBytes"].is_i64());
+    }
+
+    #[test]
+    fn content_job_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        let job = create_content_job(
+            tmp.path(),
+            &ContentJobInput {
+                operation_key: "transcribe_media".into(),
+                target_id: "journal-1".into(),
+                target_path: "journals/media/audio/sample.m4a".into(),
+                input_json: "{\"model\":\"ggml-base.en.bin\"}".into(),
+                status: "queued".into(),
+                progress_label: "Queued".into(),
+                error: String::new(),
+                created_at_client: None,
+            },
+        )
+        .unwrap();
+
+        let fetched = get_content_job(tmp.path(), job["id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched["operationKey"], "transcribe_media");
+        assert_eq!(fetched["status"], "queued");
+
+        let latest = find_latest_content_job_for_target(tmp.path(), "transcribe_media", "journal-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest["id"], job["id"]);
+
+        let updated = update_content_job(
+            tmp.path(),
+            job["id"].as_str().unwrap(),
+            "completed",
+            "Transcript ready",
+            None,
+            Some("{\"transcriptPath\":\"journals/text/transcriptions/sample.txt\"}"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated["status"], "completed");
+        assert_eq!(updated["progressLabel"], "Transcript ready");
+
+        let listed = list_content_jobs(tmp.path(), 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], job["id"]);
     }
 
     #[test]

@@ -56,6 +56,29 @@ export type AppConfig = {
   blueskyHandle: string;
   blueskyServiceUrl: string;
   transcriptionEnabled: boolean;
+  transcriptionModel: string;
+  availableTranscriptionModels: string[];
+};
+
+export type BuiltInOperation = {
+  key: string;
+  title: string;
+  description: string;
+  version: number;
+  implemented: boolean;
+};
+
+export type ContentJob = {
+  id: string;
+  operationKey: string;
+  targetId: string;
+  targetPath: string;
+  status: "queued" | "running" | "paused" | "retryable" | "completed" | "failed" | "canceled" | string;
+  progressLabel: string;
+  error?: string | null;
+  output?: Record<string, unknown> | null;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type SchedulerJob = {
@@ -176,6 +199,29 @@ export async function getConfig(): Promise<AppConfig> {
 
 export async function saveConfig(config: AppConfig): Promise<void> {
   return invoke("save_config", { config });
+}
+
+export async function listBuiltInOperations(): Promise<BuiltInOperation[]> {
+  return invoke("list_builtin_operations");
+}
+
+export async function listContentJobs(limit?: number): Promise<ContentJob[]> {
+  return invoke("list_content_jobs", { limit });
+}
+
+export async function getContentJob(id: string): Promise<ContentJob | null> {
+  return invoke("get_content_job", { id });
+}
+
+export async function getLatestContentJobForTarget(
+  operationKey: string,
+  targetId: string
+): Promise<ContentJob | null> {
+  return invoke("get_latest_content_job_for_target", { operationKey, targetId });
+}
+
+export async function transcribeMedia(journalId: string): Promise<ContentJob> {
+  return invoke("transcribe_media", { journalId });
 }
 
 // ─────────────────────────────────────────────

@@ -34,6 +34,7 @@ let _mediaRecorder: MediaRecorder | null = null;
 let _chunks: BlobPart[] = [];
 let _resolveStop: ((blob: Blob) => void) | null = null;
 let _state: RecordingState = "idle";
+let _mobilePluginActive = false;
 
 export function getRecordingState(): RecordingState {
   return _state;
@@ -91,20 +92,32 @@ async function stopDesktop(): Promise<Blob> {
 // ─────────────────────────────────────────────
 
 async function startMobile(): Promise<RecordingState> {
-  await invoke("plugin:audio_recorder|start_recording");
-  _state = "recording";
-  return "recording";
+  try {
+    await invoke("plugin:audio_recorder|start_recording");
+    _mobilePluginActive = true;
+    _state = "recording";
+    return "recording";
+  } catch {
+    _mobilePluginActive = false;
+    return startDesktop();
+  }
 }
 
 async function stopMobile(): Promise<Blob> {
-  const result = await invoke<{ path: string; mimeType: string }>(
-    "plugin:audio_recorder|stop_recording"
-  );
-  // Read the file back as bytes via Tauri fs plugin
-  const { readFile } = await import("@tauri-apps/plugin-fs");
-  const bytes = await readFile(result.path);
-  _state = "idle";
-  return new Blob([bytes], { type: result.mimeType || "audio/m4a" });
+  if (!_mobilePluginActive) {
+    return stopDesktop();
+  }
+  try {
+    const result = await invoke<{ path: string; mimeType: string }>(
+      "plugin:audio_recorder|stop_recording"
+    );
+    const { readFile } = await import("@tauri-apps/plugin-fs");
+    const bytes = await readFile(result.path);
+    _state = "idle";
+    return new Blob([bytes], { type: result.mimeType || "audio/m4a" });
+  } finally {
+    _mobilePluginActive = false;
+  }
 }
 
 // ─────────────────────────────────────────────
