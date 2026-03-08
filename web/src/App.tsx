@@ -22,6 +22,13 @@ import {
   listBuiltInOperations,
   getLatestContentJobForTarget,
   transcribeMedia as transcribeLocalMedia,
+  summarizeEntry as summarizeLocalEntry,
+  extractTodos as extractLocalTodos,
+  extractCalendarCandidates as extractLocalCalendarCandidates,
+  rewriteEntryText as rewriteLocalEntryText,
+  retitleEntry as retitleLocalEntry,
+  selectClips as selectLocalClips,
+  extractClips as extractLocalClips,
   listJobs,
   createJob,
   toggleJob,
@@ -119,39 +126,53 @@ const BUILT_IN_LOCAL_OPERATIONS: BuiltInOperation[] = [
     implemented: true
   },
   {
-    key: "trim_media",
-    title: "Trim Media",
-    description: "Reserved for a later built-in media editing update.",
+    key: "summarize_entry",
+    title: "Summarize Entry",
+    description: "Generates a structured summary from local journal or transcript content.",
     version: 1,
-    implemented: false
+    implemented: true
   },
   {
-    key: "clean_transcript",
-    title: "Clean Transcript",
-    description: "Reserved for a later transcript cleanup update.",
+    key: "extract_todos",
+    title: "Extract Todos",
+    description: "Extracts structured todo candidates from local content.",
     version: 1,
-    implemented: false
+    implemented: true
+  },
+  {
+    key: "extract_calendar_candidates",
+    title: "Extract Calendar Candidates",
+    description: "Extracts event candidates from local text without touching the calendar.",
+    version: 1,
+    implemented: true
   },
   {
     key: "rewrite_text",
     title: "Rewrite Text",
-    description: "Reserved for a later AI-assisted rewrite update.",
+    description: "Creates a polished rewrite from local journal or transcript text.",
     version: 1,
-    implemented: false
+    implemented: true
   },
   {
     key: "retitle_entry",
     title: "Retitle Entry",
-    description: "Reserved for a later retitling update.",
+    description: "Suggests a clearer title for the selected entry.",
     version: 1,
-    implemented: false
+    implemented: true
   },
   {
-    key: "summarize_entry",
-    title: "Summarize Entry",
-    description: "Reserved for a later summary update.",
+    key: "select_clips",
+    title: "Select Clips",
+    description: "Chooses transcript cue ranges for reusable highlights.",
     version: 1,
-    implemented: false
+    implemented: true
+  },
+  {
+    key: "extract_clips",
+    title: "Extract Clips",
+    description: "Cuts transcript-derived clips and writes clip-local transcript artifacts.",
+    version: 1,
+    implemented: true
   },
   {
     key: "post_bluesky",
@@ -771,6 +792,8 @@ function App() {
   const [pendingDeleteJournalItem, setPendingDeleteJournalItem] = useState<LibraryItem | null>(null);
   const [pendingDeleteFeedItem, setPendingDeleteFeedItem] = useState<LibraryItem | null>(null);
   const [journalTranscribing, setJournalTranscribing] = useState(false);
+  const [journalOperationStatus, setJournalOperationStatus] = useState("");
+  const [journalOperationResult, setJournalOperationResult] = useState("");
   const [journalTranscriptionStatusByPath, setJournalTranscriptionStatusByPath] = useState<
     Record<string, "idle" | "queued" | "running" | "done" | "error">
   >({});
@@ -1686,9 +1709,79 @@ function App() {
     }
   }
 
+  function formatJournalOperationResult(output: Record<string, unknown> | null | undefined) {
+    if (!output) {
+      return "";
+    }
+    const result = output.result;
+    if (result && typeof result === "object") {
+      if ("text" in result && typeof (result as { text?: unknown }).text === "string") {
+        return String((result as { text: string }).text);
+      }
+      if ("summary" in result && typeof (result as { summary?: unknown }).summary === "string") {
+        return JSON.stringify(result, null, 2);
+      }
+      return JSON.stringify(result, null, 2);
+    }
+    return JSON.stringify(output, null, 2);
+  }
+
+  async function runSelectedJournalOperation(
+    operation:
+      | "summarize_entry"
+      | "extract_todos"
+      | "extract_calendar_candidates"
+      | "rewrite_text"
+      | "retitle_entry"
+      | "select_clips"
+      | "extract_clips"
+  ) {
+    if (!selectedJournalItem) {
+      return;
+    }
+    const localId = localJournalIdFromPath(selectedJournalItem.path);
+    if (!localId) {
+      setJournalOperationStatus("This operation is currently available only in the native local workspace.");
+      return;
+    }
+
+    setJournalOperationStatus(`Running ${operation}...`);
+    try {
+      let job: ContentJob;
+      if (operation === "summarize_entry") {
+        job = await summarizeLocalEntry(localId);
+      } else if (operation === "extract_todos") {
+        job = await extractLocalTodos(localId);
+      } else if (operation === "extract_calendar_candidates") {
+        job = await extractLocalCalendarCandidates(localId);
+      } else if (operation === "rewrite_text") {
+        job = await rewriteLocalEntryText(localId, "clear_and_polished", "clear, concise, publishable");
+      } else if (operation === "retitle_entry") {
+        job = await retitleLocalEntry(localId);
+      } else if (operation === "select_clips") {
+        job = await selectLocalClips(localId);
+      } else {
+        job = await extractLocalClips(localId);
+      }
+
+      const rendered = formatJournalOperationResult(job.output || null);
+      setJournalOperationResult(rendered);
+      if (operation === "rewrite_text" && rendered.trim()) {
+        setJournalDraftText(rendered);
+      }
+      setJournalOperationStatus(String(job.progressLabel || "Operation completed."));
+    } catch (error) {
+      setJournalOperationStatus(
+        `Operation failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
   async function openLibraryItem(item: LibraryItem, scope: "journal" | "feed") {
     if (scope === "journal") {
       setJournalTranscribing(false);
+      setJournalOperationStatus("");
+      setJournalOperationResult("");
       setSelectedJournalItem(item);
       setSelectedJournalPath(item.path);
     } else {
@@ -4515,6 +4608,68 @@ function App() {
                         </button>
                       </div>
                     )}
+                  {isNativeClient && selectedJournalItem ? (
+                    <div className="row" style={{ gap: "0.45rem", flexWrap: "wrap", marginBottom: "0.75rem" }}>
+                      <button
+                        type="button"
+                        className="ghost text-sm"
+                        onClick={() => void runSelectedJournalOperation("summarize_entry")}
+                      >
+                        Summarize
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost text-sm"
+                        onClick={() => void runSelectedJournalOperation("extract_todos")}
+                      >
+                        Todos
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost text-sm"
+                        onClick={() => void runSelectedJournalOperation("extract_calendar_candidates")}
+                      >
+                        Events
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost text-sm"
+                        onClick={() => void runSelectedJournalOperation("rewrite_text")}
+                      >
+                        Rewrite
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost text-sm"
+                        onClick={() => void runSelectedJournalOperation("retitle_entry")}
+                      >
+                        Retitle
+                      </button>
+                      {(selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video") ? (
+                        <>
+                          <button
+                            type="button"
+                            className="ghost text-sm"
+                            onClick={() => void runSelectedJournalOperation("select_clips")}
+                          >
+                            Select Clips
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost text-sm"
+                            onClick={() => void runSelectedJournalOperation("extract_clips")}
+                          >
+                            Extract Clips
+                          </button>
+                        </>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {journalOperationStatus ? (
+                    <p className="text-sm muted" style={{ marginTop: 0, marginBottom: "0.6rem" }}>
+                      {journalOperationStatus}
+                    </p>
+                  ) : null}
                   <textarea
                     rows={isWritingNote || isMediaTranscriptMode || isFreshNoteMode ? 15 : 5}
                     value={journalDraftText}
@@ -4534,6 +4689,14 @@ function App() {
                           : undefined
                     }}
                   />
+                  {journalOperationResult ? (
+                    <div className="stack" style={{ marginTop: "0.75rem", gap: "0.35rem" }}>
+                      <span className="text-sm muted">Latest operation output</span>
+                      <pre className="workflow-run-detail" style={{ margin: 0 }}>
+                        {journalOperationResult}
+                      </pre>
+                    </div>
+                  ) : null}
                 </div>
               )}
 

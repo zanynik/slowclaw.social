@@ -224,6 +224,38 @@ export async function transcribeMedia(journalId: string): Promise<ContentJob> {
   return invoke("transcribe_media", { journalId });
 }
 
+export async function summarizeEntry(journalId: string): Promise<ContentJob> {
+  return invoke("summarize_entry", { journalId });
+}
+
+export async function extractTodos(journalId: string): Promise<ContentJob> {
+  return invoke("extract_todos", { journalId });
+}
+
+export async function extractCalendarCandidates(journalId: string): Promise<ContentJob> {
+  return invoke("extract_calendar_candidates", { journalId });
+}
+
+export async function rewriteEntryText(
+  journalId: string,
+  recipeKey?: string,
+  style?: string
+): Promise<ContentJob> {
+  return invoke("rewrite_text", { journalId, recipeKey, style });
+}
+
+export async function retitleEntry(journalId: string): Promise<ContentJob> {
+  return invoke("retitle_entry", { journalId });
+}
+
+export async function selectClips(journalId: string, objective?: string): Promise<ContentJob> {
+  return invoke("select_clips", { journalId, objective });
+}
+
+export async function extractClips(journalId: string): Promise<ContentJob> {
+  return invoke("extract_clips", { journalId });
+}
+
 // ─────────────────────────────────────────────
 // Scheduler commands
 // ─────────────────────────────────────────────

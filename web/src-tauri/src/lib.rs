@@ -10,8 +10,10 @@ use tauri::Manager;
 use zeroclaw::{openai_oauth, AuthService};
 
 use crate::content_ops::{
-    get_content_job, get_latest_content_job_for_target, list_builtin_operations, list_content_jobs,
-    resume_pending_content_jobs, transcribe_media, ContentJobState,
+    extract_calendar_candidates, extract_clips, extract_todos, get_content_job,
+    get_latest_content_job_for_target, list_builtin_operations, list_content_jobs, retitle_entry,
+    resume_pending_content_jobs, rewrite_text, select_clips, summarize_entry, transcribe_media,
+    ContentJobState,
 };
 use crate::local_workspace::{
     delete_draft, delete_journal, get_config, get_journal, list_drafts, list_journals,
@@ -717,6 +719,13 @@ pub fn run() {
             get_content_job,
             get_latest_content_job_for_target,
             transcribe_media,
+            summarize_entry,
+            extract_todos,
+            extract_calendar_candidates,
+            rewrite_text,
+            retitle_entry,
+            select_clips,
+            extract_clips,
             get_secret,
             set_secret,
             delete_secret,

@@ -78,6 +78,20 @@ pub struct ContentJobInput {
     pub created_at_client: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ArtifactInput {
+    pub parent_asset_id: String,
+    pub parent_entry_id: String,
+    pub artifact_type: String,
+    pub title: String,
+    pub status: String,
+    pub mime_type: String,
+    pub workspace_path: String,
+    pub preview_text: String,
+    pub metadata_json: String,
+    pub created_at_client: Option<String>,
+}
+
 pub fn initialize(workspace_dir: &Path) -> Result<BootstrapReport> {
     let db_path = db_path(workspace_dir);
     if let Some(parent) = db_path.parent() {
@@ -710,6 +724,133 @@ pub fn update_content_job(
     get_content_job(workspace_dir, id)
 }
 
+pub fn create_artifact_metadata(
+    workspace_dir: &Path,
+    item: &ArtifactInput,
+) -> Result<serde_json::Value> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let id = format!("lc_{}", Uuid::new_v4().simple());
+    let now = Utc::now().to_rfc3339();
+    let created_at_client = item
+        .created_at_client
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| now.clone());
+
+    conn.execute(
+        "INSERT INTO artifacts (
+            id, parent_asset_id, parent_entry_id, artifact_type, title, status, mime_type,
+            workspace_path, preview_text, metadata_json, created_at_client, created
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            id,
+            item.parent_asset_id,
+            item.parent_entry_id,
+            item.artifact_type,
+            item.title,
+            item.status,
+            item.mime_type,
+            item.workspace_path,
+            item.preview_text,
+            item.metadata_json,
+            created_at_client,
+            now,
+        ],
+    )
+    .context("Failed to insert artifact metadata")?;
+
+    Ok(serde_json::json!({
+        "id": id,
+        "parentAssetId": item.parent_asset_id,
+        "parentEntryId": item.parent_entry_id,
+        "artifactType": item.artifact_type,
+        "title": item.title,
+        "status": item.status,
+        "mimeType": item.mime_type,
+        "workspacePath": item.workspace_path,
+        "previewText": item.preview_text,
+        "metadataJson": item.metadata_json,
+        "createdAtClient": created_at_client,
+        "created": now,
+    }))
+}
+
+pub fn list_artifacts_for_entry(
+    workspace_dir: &Path,
+    parent_entry_id: &str,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let lim = i64::try_from(limit.max(1)).unwrap_or(100);
+    let mut stmt = conn.prepare(
+        "SELECT id, parent_asset_id, parent_entry_id, artifact_type, title, status, mime_type,
+                workspace_path, preview_text, metadata_json, created_at_client, created
+         FROM artifacts
+         WHERE parent_entry_id = ?1
+         ORDER BY COALESCE(NULLIF(created_at_client, ''), created) DESC, id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![parent_entry_id.trim(), lim], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, String>(0)?,
+            "parentAssetId": row.get::<_, String>(1)?,
+            "parentEntryId": row.get::<_, String>(2)?,
+            "artifactType": row.get::<_, String>(3)?,
+            "title": row.get::<_, String>(4)?,
+            "status": row.get::<_, String>(5)?,
+            "mimeType": row.get::<_, String>(6)?,
+            "workspacePath": row.get::<_, String>(7)?,
+            "previewText": row.get::<_, String>(8)?,
+            "metadataJson": row.get::<_, String>(9)?,
+            "createdAtClient": row.get::<_, String>(10)?,
+            "created": row.get::<_, String>(11)?,
+        }))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn find_latest_artifact_for_entry_and_type(
+    workspace_dir: &Path,
+    parent_entry_id: &str,
+    artifact_type: &str,
+) -> Result<Option<serde_json::Value>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    conn.query_row(
+        "SELECT id, parent_asset_id, parent_entry_id, artifact_type, title, status, mime_type,
+                workspace_path, preview_text, metadata_json, created_at_client, created
+         FROM artifacts
+         WHERE parent_entry_id = ?1 AND artifact_type = ?2
+         ORDER BY COALESCE(NULLIF(created_at_client, ''), created) DESC, id DESC
+         LIMIT 1",
+        params![parent_entry_id.trim(), artifact_type.trim()],
+        |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "parentAssetId": row.get::<_, String>(1)?,
+                "parentEntryId": row.get::<_, String>(2)?,
+                "artifactType": row.get::<_, String>(3)?,
+                "title": row.get::<_, String>(4)?,
+                "status": row.get::<_, String>(5)?,
+                "mimeType": row.get::<_, String>(6)?,
+                "workspacePath": row.get::<_, String>(7)?,
+                "previewText": row.get::<_, String>(8)?,
+                "metadataJson": row.get::<_, String>(9)?,
+                "createdAtClient": row.get::<_, String>(10)?,
+                "created": row.get::<_, String>(11)?,
+            }))
+        },
+    )
+    .optional()
+    .context("Failed to load latest artifact")
+}
+
 fn open_conn(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open local store {}", path.display()))?;
@@ -1178,6 +1319,42 @@ mod tests {
         let listed = list_content_jobs(tmp.path(), 10).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0]["id"], job["id"]);
+    }
+
+    #[test]
+    fn artifact_metadata_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        let artifact = create_artifact_metadata(
+            tmp.path(),
+            &ArtifactInput {
+                parent_asset_id: String::new(),
+                parent_entry_id: "journal-1".into(),
+                artifact_type: "canonical_transcript".into(),
+                title: "Timed transcript".into(),
+                status: "ready".into(),
+                mime_type: "application/json".into(),
+                workspace_path: "artifacts/transcripts/audio/example.timed_transcript.json".into(),
+                preview_text: "hello world".into(),
+                metadata_json: "{\"cueCount\":2}".into(),
+                created_at_client: None,
+            },
+        )
+        .unwrap();
+
+        let listed = list_artifacts_for_entry(tmp.path(), "journal-1", 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], artifact["id"]);
+
+        let latest = find_latest_artifact_for_entry_and_type(
+            tmp.path(),
+            "journal-1",
+            "canonical_transcript",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(latest["workspacePath"], "artifacts/transcripts/audio/example.timed_transcript.json");
     }
 
     #[test]
