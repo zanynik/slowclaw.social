@@ -144,6 +144,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig {
+            max_tool_iterations: 20,
             parallel_tools: true,
             ..crate::config::schema::AgentConfig::default()
         },
@@ -172,7 +173,10 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         hooks: crate::config::HooksConfig::default(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
-        transcription: crate::config::TranscriptionConfig::default(),
+        transcription: crate::config::TranscriptionConfig {
+            enabled: true,
+            ..crate::config::TranscriptionConfig::default()
+        },
     };
 
     println!(
@@ -499,6 +503,7 @@ async fn run_quick_setup_with_home(
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig {
+            max_tool_iterations: 20,
             parallel_tools: true,
             ..crate::config::schema::AgentConfig::default()
         },
@@ -527,7 +532,10 @@ async fn run_quick_setup_with_home(
         hooks: crate::config::HooksConfig::default(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
-        transcription: crate::config::TranscriptionConfig::default(),
+        transcription: crate::config::TranscriptionConfig {
+            enabled: true,
+            ..crate::config::TranscriptionConfig::default()
+        },
     };
 
     config.save().await?;

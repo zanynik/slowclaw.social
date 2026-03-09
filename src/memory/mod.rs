@@ -32,7 +32,7 @@ pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
 
-use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
+use crate::config::{Config, EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
@@ -169,6 +169,28 @@ fn resolve_embedding_config(
     }
 }
 
+pub fn create_memory_embedder(
+    config: &MemoryConfig,
+    embedding_routes: &[EmbeddingRouteConfig],
+    api_key: Option<&str>,
+) -> Arc<dyn embeddings::EmbeddingProvider> {
+    let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key);
+    Arc::from(embeddings::create_embedding_provider(
+        &resolved_embedding.provider,
+        resolved_embedding.api_key.as_deref(),
+        &resolved_embedding.model,
+        resolved_embedding.dimensions,
+    ))
+}
+
+pub fn create_embedder_from_config(config: &Config) -> Arc<dyn embeddings::EmbeddingProvider> {
+    create_memory_embedder(
+        &config.memory,
+        &config.embedding_routes,
+        config.api_key.as_deref(),
+    )
+}
+
 /// Factory: create the right memory backend from config
 pub fn create_memory(
     config: &MemoryConfig,
@@ -245,13 +267,14 @@ pub fn create_memory_with_storage_and_routes(
         workspace_dir: &Path,
         resolved_embedding: &ResolvedEmbeddingConfig,
     ) -> anyhow::Result<SqliteMemory> {
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
-            Arc::from(embeddings::create_embedding_provider(
+        let embedder: Arc<dyn embeddings::EmbeddingProvider> = Arc::from(
+            embeddings::create_embedding_provider(
                 &resolved_embedding.provider,
                 resolved_embedding.api_key.as_deref(),
                 &resolved_embedding.model,
                 resolved_embedding.dimensions,
-            ));
+            ),
+        );
 
         #[allow(clippy::cast_possible_truncation)]
         let mem = SqliteMemory::with_embedder(

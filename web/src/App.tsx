@@ -58,31 +58,37 @@ import type {
   StoredDraft,
 } from "./lib/types";
 import {
+  autoRunEligibleFeedContentAgents,
   archivePostedLibraryItem,
   createClawChatUserMessage as createClawChatUserMessageViaGateway,
-  createFeedWorkflowTemplate,
+  createFeedContentAgent,
   createJournalTextViaGateway,
   createPostHistory,
   deleteLibraryItem,
+  fetchPersonalizedBlueskyFeed,
   fetchMediaAsFile,
   getJournalTranscriptionStatus,
   getRuntimeConfig,
   listClawChatMessages,
   listDrafts as listDraftsViaGateway,
-  listFeedWorkflowSettings,
+  listFeedContentAgents,
   listLibraryItems,
   listPostHistory as listPostHistoryViaGateway,
   readLibraryText,
-  runFeedWorkflowNow,
+  runFeedContentAgentNow,
   saveDraft as saveDraftViaGateway,
   saveLibraryText,
-  submitFeedWorkflowComment,
+  submitFeedContentAgentComment,
   transcribeJournalMedia,
-  updateFeedWorkflowSettings,
+  updateFeedContentAgent,
   updateRuntimeConfig,
   uploadMediaViaGateway,
 } from "./lib/gatewayApi";
-import type { FeedWorkflowMode, FeedWorkflowSettingsItem } from "./lib/gatewayApi";
+import type {
+  FeedContentAgentItem,
+  InterestProfileStats,
+  PersonalizedBlueskyItem,
+} from "./lib/gatewayApi";
 
 const CHAT_THREAD_STORAGE_KEY = "slowclaw.chat.thread_id";
 const CHAT_GATEWAY_BASE_URL_STORAGE_KEY = "slowclaw.chat.gateway_base_url";
@@ -353,13 +359,7 @@ type WorkflowBotMeta = {
 };
 
 type WorkflowSettingsDraft = {
-  mode: FeedWorkflowMode;
-  days: number;
-  randomCount: number;
-  scheduleEnabled: boolean;
-  scheduleCron: string;
-  scheduleTz: string;
-  prompt: string;
+  goal: string;
 };
 
 type WorkflowRunStatus = {
@@ -374,15 +374,7 @@ type WorkflowRunStatus = {
 
 type WorkflowTemplateDraft = {
   name: string;
-  botName: string;
-  sourceKind: "text" | "audio";
-  prompt: string;
-  mode: FeedWorkflowMode;
-  days: number;
-  randomCount: number;
-  scheduleEnabled: boolean;
-  scheduleCron: string;
-  scheduleTz: string;
+  goal: string;
   runNow: boolean;
 };
 
@@ -393,7 +385,7 @@ function workflowBotByKey(key: string): WorkflowBotMeta {
     .filter(Boolean)
     .map((token) => `${token.slice(0, 1).toUpperCase()}${token.slice(1)}`)
     .join(" ");
-  const displayName = name ? `${name}Bot` : "WorkflowBot";
+  const displayName = name || "Content Agent";
   const avatar = displayName.slice(0, 1).toUpperCase() || "W";
   return {
     key: trimmed,
@@ -403,7 +395,7 @@ function workflowBotByKey(key: string): WorkflowBotMeta {
   };
 }
 
-function workflowBotMetaFromSettings(item: FeedWorkflowSettingsItem): WorkflowBotMeta {
+function workflowBotMetaFromSettings(item: FeedContentAgentItem): WorkflowBotMeta {
   const fallback = workflowBotByKey(item.workflowKey);
   const workflowBot = String(item.workflowBot || "").trim();
   const outputPrefix = String(item.outputPrefix || "").trim();
@@ -425,30 +417,14 @@ const WORKFLOW_RUN_SOURCES = new Set([
 function defaultWorkflowTemplateDraft(): WorkflowTemplateDraft {
   return {
     name: "",
-    botName: "",
-    sourceKind: "text",
-    prompt: "Write in a clear, natural voice.",
-    mode: "date_range",
-    days: 7,
-    randomCount: 1,
-    scheduleEnabled: false,
-    scheduleCron: "0 9 * * *",
-    scheduleTz: "",
+    goal: "",
     runNow: true
   };
 }
 
-function workflowSettingsDraftFromItem(item: FeedWorkflowSettingsItem): WorkflowSettingsDraft {
+function workflowSettingsDraftFromItem(item: FeedContentAgentItem): WorkflowSettingsDraft {
   return {
-    mode: item.mode,
-    days: Number.isFinite(item.days) ? Math.max(1, Math.min(30, Math.floor(item.days))) : 7,
-    randomCount: Number.isFinite(item.randomCount)
-      ? Math.max(1, Math.min(10, Math.floor(item.randomCount)))
-      : 1,
-    scheduleEnabled: Boolean(item.scheduleEnabled),
-    scheduleCron: String(item.scheduleCron || "").trim(),
-    scheduleTz: String(item.scheduleTz || "").trim(),
-    prompt: String(item.prompt || "").trim()
+    goal: String(item.goal || "").trim()
   };
 }
 
@@ -732,7 +708,7 @@ function App() {
   const [activeWorkflowBotKey, setActiveWorkflowBotKey] = useState<string>("");
   const [workflowBots, setWorkflowBots] = useState<WorkflowBotMeta[]>([]);
   const [workflowSettingsByKey, setWorkflowSettingsByKey] = useState<
-    Record<string, FeedWorkflowSettingsItem | undefined>
+    Record<string, FeedContentAgentItem | undefined>
   >({});
   const [workflowSettingsDraftByKey, setWorkflowSettingsDraftByKey] = useState<
     Record<string, WorkflowSettingsDraft | undefined>
@@ -750,6 +726,7 @@ function App() {
   );
   const [workflowTemplateSubmitting, setWorkflowTemplateSubmitting] = useState(false);
   const [workflowTemplateStatus, setWorkflowTemplateStatus] = useState("");
+  const [workflowToggleBusyKey, setWorkflowToggleBusyKey] = useState("");
   const [recordingHint, setRecordingHint] = useState("Ready to add a journal note, audio, or video.");
   const [mediaPreviewUrl, setMediaPreviewUrl] = useState<string>("");
   const [mediaPreviewMime, setMediaPreviewMime] = useState<string>("");
@@ -832,8 +809,17 @@ function App() {
 
   // Bluesky Feed State
   const [feedSource, setFeedSource] = useState<"local" | "bluesky">("local");
-  const [blueskyFeedItems, setBlueskyFeedItems] = useState<AppBskyFeedDefs.FeedViewPost[]>([]);
+  const [blueskyFeedItems, setBlueskyFeedItems] = useState<PersonalizedBlueskyItem[]>([]);
   const [blueskyFeedLoading, setBlueskyFeedLoading] = useState(false);
+  const [blueskyFeedStatus, setBlueskyFeedStatus] = useState("");
+  const [blueskyProfileStats, setBlueskyProfileStats] = useState<InterestProfileStats>({
+    interestCount: 0,
+    sourceCount: 0,
+    refreshedSources: 0,
+    mergedCount: 0,
+    spawnedCount: 0,
+    ignoredCount: 0,
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -1245,6 +1231,7 @@ function App() {
       if (nextSelectedPath) {
         setSelectedJournalPath(nextSelectedPath);
       }
+      void triggerEligibleContentAgents("journal-save", { quiet: true });
     } catch (error) {
       setJournalSaveStatus(
         `Save failed (${error instanceof Error ? error.message : String(error)})`
@@ -1812,6 +1799,42 @@ function App() {
     setActiveFeedCommentPath((current) => (current === path ? "" : path));
   }
 
+  async function triggerEligibleContentAgents(
+    reason: "app-open" | "journal-save" | "transcript-ready",
+    options?: { quiet?: boolean }
+  ) {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token) {
+      return;
+    }
+
+    try {
+      const result = await autoRunEligibleFeedContentAgents(
+        reason,
+        token || undefined,
+        gatewayBaseUrl
+      );
+      if (result.queuedCount > 0) {
+        const label =
+          result.queuedCount === 1
+            ? `${result.items[0]?.workflowBot || "Content agent"} run queued`
+            : `${result.queuedCount} content agents queued`;
+        setFeedEditStatus(label);
+        void loadWorkflowRunStatuses();
+        void refreshLibrary("feed");
+      }
+    } catch (error) {
+      if (!options?.quiet) {
+        setFeedEditStatus(
+          `Auto-run failed (${error instanceof Error ? error.message : String(error)})`
+        );
+      }
+    }
+  }
+
   async function loadFeedWorkflowSettings() {
     let token = chatGatewayToken.trim();
     if (!token && isDesktopClient) {
@@ -1823,8 +1846,8 @@ function App() {
 
     setWorkflowSettingsLoading(true);
     try {
-      const items = await listFeedWorkflowSettings(token || undefined, gatewayBaseUrl);
-      const byKey: Record<string, FeedWorkflowSettingsItem | undefined> = {};
+      const items = await listFeedContentAgents(token || undefined, gatewayBaseUrl);
+      const byKey: Record<string, FeedContentAgentItem | undefined> = {};
       const drafts: Record<string, WorkflowSettingsDraft | undefined> = {};
       const bots: WorkflowBotMeta[] = [];
       for (const item of items) {
@@ -1847,7 +1870,7 @@ function App() {
       void loadWorkflowRunStatuses(bots);
     } catch (error) {
       setFeedEditStatus(
-        `Workflow settings unavailable (${error instanceof Error ? error.message : String(error)})`
+        `Content agents unavailable (${error instanceof Error ? error.message : String(error)})`
       );
     } finally {
       setWorkflowSettingsLoading(false);
@@ -1916,7 +1939,7 @@ function App() {
 
     setFeedEditStatus(`Queueing ${bot.name} run...`);
     try {
-      const result = await runFeedWorkflowNow(botKey, token || undefined, gatewayBaseUrl);
+      const result = await runFeedContentAgentNow(botKey, token || undefined, gatewayBaseUrl);
       setFeedEditStatus(`${result.workflowBot || bot.name} run queued`);
       void loadWorkflowRunStatuses();
     } catch (error) {
@@ -1940,7 +1963,66 @@ function App() {
     setFeedSidebarOpen(false);
     setActiveWorkflowBotKey("");
     setFeedCreateWorkflowOpen(true);
+    setWorkflowTemplateDraft(defaultWorkflowTemplateDraft());
     setWorkflowTemplateStatus("");
+  }
+
+  async function toggleContentAgentEnabled(botKey: string) {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      setWorkflowTemplateStatus("Agent toggle blocked (gateway token missing).");
+      return;
+    }
+
+    const existing = workflowSettingsByKey[botKey];
+    if (!existing) {
+      setWorkflowTemplateStatus("Agent settings are not loaded yet.");
+      void loadFeedWorkflowSettings();
+      return;
+    }
+    const nextEnabled = !existing.enabled;
+    const agentName = existing.workflowBot || workflowBotByKey(botKey).name;
+
+    setWorkflowToggleBusyKey(botKey);
+    setWorkflowTemplateStatus(
+      nextEnabled ? `Enabling ${agentName}...` : `Disabling ${agentName}...`
+    );
+    try {
+      const result = await updateFeedContentAgent(
+        {
+          workflowKey: botKey,
+          enabled: nextEnabled,
+          runNow: nextEnabled
+        },
+        token || undefined,
+        gatewayBaseUrl
+      );
+      setWorkflowSettingsByKey((prev) => ({ ...prev, [botKey]: result.item }));
+      setWorkflowSettingsDraftByKey((prev) => ({
+        ...prev,
+        [botKey]: workflowSettingsDraftFromItem(result.item)
+      }));
+      setWorkflowTemplateStatus(
+        nextEnabled ? `${agentName} enabled and queued to run` : `${agentName} disabled`
+      );
+      setFeedEditStatus(nextEnabled ? `${agentName} run queued` : `${agentName} disabled`);
+      void loadWorkflowRunStatuses();
+      void refreshLibrary("feed");
+      window.setTimeout(() => {
+        void refreshLibrary("feed");
+      }, 2000);
+
+      void loadFeedWorkflowSettings();
+    } catch (error) {
+      setWorkflowTemplateStatus(
+        `${nextEnabled ? "Enable" : "Disable"} failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setWorkflowToggleBusyKey("");
+    }
   }
 
   async function saveWorkflowSettings(botKey: string) {
@@ -1964,19 +2046,14 @@ function App() {
     setWorkflowSettingsSavingKey(botKey);
     setWorkflowSettingsStatusByKey((prev) => ({
       ...prev,
-      [botKey]: "Saving workflow settings..."
+      [botKey]: "Saving agent goal..."
     }));
     try {
-      const result = await updateFeedWorkflowSettings(
+      const result = await updateFeedContentAgent(
         {
           workflowKey: botKey,
-          mode: draft.mode,
-          days: draft.days,
-          randomCount: draft.randomCount,
-          scheduleEnabled: draft.scheduleEnabled,
-          scheduleCron: draft.scheduleCron.trim(),
-          scheduleTz: draft.scheduleTz.trim(),
-          prompt: draft.prompt.trim() || undefined
+          goal: draft.goal.trim() || undefined,
+          runNow: true
         },
         token || undefined,
         gatewayBaseUrl
@@ -1990,13 +2067,13 @@ function App() {
       setWorkflowSettingsStatusByKey((prev) => ({
         ...prev,
         [botKey]: result.runQueued
-          ? `Saved ${bot.name} settings and queued a run`
-          : `Saved ${bot.name} settings`
+          ? `Saved ${bot.name} goal and queued a run`
+          : `Saved ${bot.name} goal`
       }));
       setFeedEditStatus(
         result.runQueued
-          ? `${bot.name} run queued with updated settings`
-          : `${bot.name} settings saved`
+          ? `${bot.name} run queued with updated goal`
+          : `${bot.name} goal saved`
       );
       void loadWorkflowRunStatuses();
       void refreshLibrary("feed");
@@ -2017,7 +2094,11 @@ function App() {
     event.preventDefault();
     const draft = workflowTemplateDraft;
     if (!draft.name.trim()) {
-      setWorkflowTemplateStatus("Workflow name is required.");
+      setWorkflowTemplateStatus("Give this agent a name.");
+      return;
+    }
+    if (!draft.goal.trim()) {
+      setWorkflowTemplateStatus("Describe what this agent should make.");
       return;
     }
 
@@ -2031,31 +2112,24 @@ function App() {
     }
 
     setWorkflowTemplateSubmitting(true);
-    setWorkflowTemplateStatus("Creating workflow...");
+    setWorkflowTemplateStatus("Creating content agent...");
     try {
-      const result = await createFeedWorkflowTemplate(
+      const result = await createFeedContentAgent(
         {
           name: draft.name.trim(),
-          botName: draft.botName.trim() || undefined,
-          sourceKind: draft.sourceKind,
-          prompt: draft.prompt.trim() || undefined,
-          mode: draft.mode,
-          days: draft.days,
-          randomCount: draft.randomCount,
-          scheduleEnabled: draft.scheduleEnabled,
-          scheduleCron: draft.scheduleCron.trim() || undefined,
-          scheduleTz: draft.scheduleTz.trim() || undefined,
+          goal: draft.goal.trim(),
+          enabled: true,
           runNow: draft.runNow
         },
         token || undefined,
         gatewayBaseUrl
       );
       if (result.queued && result.threadId && result.messageId) {
-        const botLabel = result.workflowBot || result.workflowKey || draft.name.trim();
+        const botLabel = result.workflowBot || result.workflowKey || "content agent";
         setWorkflowTemplateStatus(
           `Creating ${botLabel}...${result.creationSummary ? ` ${result.creationSummary}` : ""}`
         );
-        setFeedEditStatus(`Workflow ${botLabel} creation queued`);
+        setFeedEditStatus(`${botLabel} creation queued`);
         void pollWorkflowTemplateCreateResult(
           result.workflowKey,
           result.workflowBot,
@@ -2066,7 +2140,7 @@ function App() {
       }
       if (!result.created) {
         setWorkflowTemplateStatus(
-          `Create failed (${result.creationSummary || "workflow was not created"})`
+          `Create failed (${result.creationSummary || "content agent was not created"})`
         );
         return;
       }
@@ -2074,7 +2148,7 @@ function App() {
         `Created ${result.workflowBot || result.workflowKey}${result.runQueued ? " and queued the first run" : ""
         }.${result.creationSummary ? ` ${result.creationSummary}` : ""}`
       );
-      setFeedEditStatus(`Workflow ${result.workflowBot || result.workflowKey} created`);
+      setFeedEditStatus(`${result.workflowBot || result.workflowKey} created`);
       setFeedCreateWorkflowOpen(false);
       setWorkflowTemplateDraft(defaultWorkflowTemplateDraft());
       void loadWorkflowRunStatuses();
@@ -2126,7 +2200,7 @@ function App() {
       [item.path]: `Sending request to ${bot.name}...`
     }));
     try {
-      const result = await submitFeedWorkflowComment(
+      const result = await submitFeedContentAgentComment(
         item.path,
         draft,
         token || undefined,
@@ -2228,7 +2302,7 @@ function App() {
       onDone: (reply) => {
         const successText = (reply.content || `Created ${botLabel}.`).trim();
         setWorkflowTemplateStatus(successText);
-        setFeedEditStatus(`Workflow ${botLabel} created`);
+        setFeedEditStatus(`${botLabel} created`);
         setFeedCreateWorkflowOpen(false);
         setWorkflowTemplateDraft(defaultWorkflowTemplateDraft());
         void loadWorkflowRunStatuses();
@@ -2240,7 +2314,7 @@ function App() {
       },
       onError: (errText) => {
         setWorkflowTemplateStatus(`Create failed (${errText})`);
-        setFeedEditStatus("Workflow creation failed");
+        setFeedEditStatus(`Content agent creation failed: ${errText}`);
       },
       onTimeout: () => {
         setWorkflowTemplateStatus(
@@ -3102,16 +3176,43 @@ function App() {
   }
 
   async function fetchBlueskyFeed() {
-    if (!agent || !session) {
+    if (!session || !creds.serviceUrl.trim()) {
+      setBlueskyFeedItems([]);
+      setBlueskyFeedStatus("");
       setBlueskyFeedLoading(false);
       return;
     }
     setBlueskyFeedLoading(true);
+    setBlueskyFeedStatus("");
     try {
-      const res = await agent.getTimeline({ limit: 30 });
-      setBlueskyFeedItems(res.data.feed);
+      const res = await fetchPersonalizedBlueskyFeed(
+        {
+          serviceUrl: creds.serviceUrl,
+          accessJwt: session.accessJwt,
+          limit: 30
+        },
+        chatGatewayToken,
+        gatewayBaseUrl
+      );
+      setBlueskyFeedItems(res.items);
+      setBlueskyProfileStats(res.profileStats);
+      if (res.profileStatus === "embeddingUnavailable") {
+        setBlueskyFeedStatus("Personalized feed needs embeddings configured. Showing raw timeline.");
+      } else if (res.profileStatus === "noInterests") {
+        setBlueskyFeedStatus("Personalized feed starts after text items exist under posts/. Showing raw timeline.");
+      } else if (res.usedFallback) {
+        setBlueskyFeedStatus(res.message || "Showing raw Bluesky timeline.");
+      } else {
+        setBlueskyFeedStatus(
+          res.profileStats.interestCount > 0
+            ? `Personalized by ${res.profileStats.interestCount} workspace interests.`
+            : ""
+        );
+      }
     } catch (error) {
       console.error("Failed to fetch Bluesky feed", error);
+      setBlueskyFeedStatus(error instanceof Error ? error.message : "Failed to load Bluesky feed.");
+      setBlueskyFeedItems([]);
     } finally {
       setBlueskyFeedLoading(false);
     }
@@ -3121,7 +3222,7 @@ function App() {
     if (feedSource === "bluesky") {
       void fetchBlueskyFeed();
     }
-  }, [feedSource, agent, session]);
+  }, [feedSource, session, creds.serviceUrl, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     if (feedSource !== "local") {
@@ -3134,7 +3235,28 @@ function App() {
       setFeedCreateWorkflowOpen(false);
       return;
     }
+    void triggerEligibleContentAgents("app-open", { quiet: true });
     void loadFeedWorkflowSettings();
+  }, [feedSource, mobileTab, chatGatewayToken, gatewayBaseUrl]);
+
+  useEffect(() => {
+    if (feedSource !== "local" || mobileTab !== "feed") {
+      return;
+    }
+
+    const triggerFromForeground = () => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
+      void triggerEligibleContentAgents("app-open", { quiet: true });
+    };
+
+    window.addEventListener("focus", triggerFromForeground);
+    document.addEventListener("visibilitychange", triggerFromForeground);
+    return () => {
+      window.removeEventListener("focus", triggerFromForeground);
+      document.removeEventListener("visibilitychange", triggerFromForeground);
+    };
   }, [feedSource, mobileTab, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
@@ -4273,7 +4395,7 @@ function App() {
                         setFeedSidebarOpen((prev) => !prev);
                         setFeedCreateWorkflowOpen(false);
                       }}
-                      title="Open workflow drawer"
+                      title="Open content agent drawer"
                     >
                       +
                     </button>
@@ -4316,7 +4438,7 @@ function App() {
               {feedSource === "local" && feedSidebarOpen ? (
                 <div className="feed-workflow-drawer">
                   <div className="row-between">
-                    <h3 style={{ margin: 0 }}>Workflow Bots</h3>
+                    <h3 style={{ margin: 0 }}>Content Agents</h3>
                     <button
                       type="button"
                       className="ghost text-sm"
@@ -4325,29 +4447,40 @@ function App() {
                       Close
                     </button>
                   </div>
+                  <p className="text-sm muted" style={{ margin: 0 }}>
+                    Agents create workspace feed content from journal notes and save results under <code>posts/</code>.
+                  </p>
                   <div className="feed-workflow-bot-list">
                     {workflowBots.map((bot) => {
                       const saved = workflowSettingsByKey[bot.key];
+                      const isBusy = workflowToggleBusyKey === bot.key;
                       return (
-                        <button
-                          key={bot.key}
-                          type="button"
-                          className="feed-workflow-bot-row"
-                          onClick={() => openWorkflowSettingsForBot(bot.key)}
-                        >
-                          <span className="feed-bot-chip">
-                            <span className="feed-bot-avatar">{bot.avatar}</span>
-                            <span>{bot.name}</span>
-                          </span>
-                          <span className="text-sm muted">
-                            {saved?.scheduleEnabled ? "Scheduled" : "Manual"}
-                          </span>
-                        </button>
+                        <div key={bot.key} className="feed-workflow-bot-row">
+                          <button
+                            type="button"
+                            className="feed-workflow-bot-open"
+                            onClick={() => openWorkflowSettingsForBot(bot.key)}
+                          >
+                            <span className="feed-bot-chip">
+                              <span className="feed-bot-avatar">{bot.avatar}</span>
+                              <span>{bot.name}</span>
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            className={saved?.enabled === false ? "ghost text-sm" : "primary text-sm"}
+                            style={{ minWidth: "72px", borderRadius: "999px" }}
+                            onClick={() => void toggleContentAgentEnabled(bot.key)}
+                            disabled={isBusy}
+                          >
+                            {isBusy ? "..." : saved?.enabled === false ? "Off" : "On"}
+                          </button>
+                        </div>
                       );
                     })}
                     {!workflowBots.length ? (
                       <p className="text-sm muted" style={{ margin: 0 }}>
-                        No workflow bots yet. Create one to start generating feed posts.
+                        No content agents yet. Create one to start generating feed posts.
                       </p>
                     ) : null}
                   </div>
@@ -4357,7 +4490,7 @@ function App() {
                     style={{ width: "100%", borderRadius: "10px" }}
                     onClick={openWorkflowTemplateForm}
                   >
-                    Create Workflow
+                    Create Custom Agent
                   </button>
                 </div>
               ) : null}
@@ -4365,7 +4498,7 @@ function App() {
               {feedSource === "local" && feedCreateWorkflowOpen ? (
                 <form className="workflow-settings-panel stack" onSubmit={submitWorkflowTemplateCreate}>
                   <div className="row-between">
-                    <h3 style={{ margin: 0 }}>Create Workflow</h3>
+                    <h3 style={{ margin: 0 }}>Create Content Agent</h3>
                     <button
                       type="button"
                       className="ghost text-sm"
@@ -4375,142 +4508,37 @@ function App() {
                     </button>
                   </div>
                   <label className="stack" style={{ gap: "0.35rem" }}>
-                    <span className="text-sm">Workflow name</span>
+                    <span className="text-sm">Agent name</span>
                     <input
+                      type="text"
                       value={workflowTemplateDraft.name}
                       onChange={(e) =>
                         setWorkflowTemplateDraft((prev) => ({ ...prev, name: e.target.value }))
                       }
-                      placeholder="Weekly tweet digest"
+                      placeholder="Bluesky Scout"
                     />
                   </label>
                   <label className="stack" style={{ gap: "0.35rem" }}>
-                    <span className="text-sm">Bot name (optional)</span>
-                    <input
-                      value={workflowTemplateDraft.botName}
-                      onChange={(e) =>
-                        setWorkflowTemplateDraft((prev) => ({ ...prev, botName: e.target.value }))
-                      }
-                      placeholder="TweetDigestBot"
-                    />
-                  </label>
-                  <label className="stack" style={{ gap: "0.35rem" }}>
-                    <span className="text-sm">Source type</span>
-                    <select
-                      value={workflowTemplateDraft.sourceKind}
-                      onChange={(e) =>
-                        setWorkflowTemplateDraft((prev) => ({
-                          ...prev,
-                          sourceKind: e.target.value === "audio" ? "audio" : "text"
-                        }))
-                      }
-                    >
-                      <option value="text">Journal text notes</option>
-                      <option value="audio">Audio insights</option>
-                    </select>
-                  </label>
-                  <label className="stack" style={{ gap: "0.35rem" }}>
-                    <span className="text-sm">Prompt</span>
+                    <span className="text-sm">What should this agent make?</span>
                     <textarea
-                      rows={3}
-                      value={workflowTemplateDraft.prompt}
+                      rows={5}
+                      value={workflowTemplateDraft.goal}
                       onChange={(e) =>
-                        setWorkflowTemplateDraft((prev) => ({ ...prev, prompt: e.target.value }))
+                        setWorkflowTemplateDraft((prev) => ({ ...prev, goal: e.target.value }))
                       }
-                      placeholder="Write in a clear, natural voice."
+                      placeholder="Create interesting Bluesky post drafts from my recent journal notes. Extract standout insights and save each post as a separate file so it appears in the workspace feed."
                     />
                   </label>
-                  <label className="stack" style={{ gap: "0.35rem" }}>
-                    <span className="text-sm">Selection mode</span>
-                    <select
-                      value={workflowTemplateDraft.mode}
-                      onChange={(e) =>
-                        setWorkflowTemplateDraft((prev) => ({
-                          ...prev,
-                          mode: e.target.value === "random" ? "random" : "date_range"
-                        }))
-                      }
-                    >
-                      <option value="date_range">Recent notes</option>
-                      <option value="random">Random files</option>
-                    </select>
-                  </label>
-                  {workflowTemplateDraft.mode === "date_range" ? (
-                    <label className="stack" style={{ gap: "0.35rem" }}>
-                      <span className="text-sm">Days back</span>
-                      <input
-                        type="number"
-                        min={1}
-                        max={30}
-                        value={workflowTemplateDraft.days}
-                        onChange={(e) =>
-                          setWorkflowTemplateDraft((prev) => ({
-                            ...prev,
-                            days: Math.max(1, Math.min(30, Number(e.target.value || 1)))
-                          }))
-                        }
-                      />
-                    </label>
-                  ) : (
-                    <label className="stack" style={{ gap: "0.35rem" }}>
-                      <span className="text-sm">Random file count</span>
-                      <input
-                        type="number"
-                        min={1}
-                        max={10}
-                        value={workflowTemplateDraft.randomCount}
-                        onChange={(e) =>
-                          setWorkflowTemplateDraft((prev) => ({
-                            ...prev,
-                            randomCount: Math.max(1, Math.min(10, Number(e.target.value || 1)))
-                          }))
-                        }
-                      />
-                    </label>
-                  )}
-                  <label className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
-                    <input
-                      type="checkbox"
-                      checked={workflowTemplateDraft.scheduleEnabled}
-                      onChange={(e) =>
-                        setWorkflowTemplateDraft((prev) => ({
-                          ...prev,
-                          scheduleEnabled: e.target.checked
-                        }))
-                      }
-                    />
-                    <span className="text-sm">Run on schedule</span>
-                  </label>
-                  {workflowTemplateDraft.scheduleEnabled ? (
-                    <div className="stack" style={{ gap: "0.45rem" }}>
-                      <label className="stack" style={{ gap: "0.35rem" }}>
-                        <span className="text-sm">Cron expression</span>
-                        <input
-                          value={workflowTemplateDraft.scheduleCron}
-                          onChange={(e) =>
-                            setWorkflowTemplateDraft((prev) => ({
-                              ...prev,
-                              scheduleCron: e.target.value
-                            }))
-                          }
-                          placeholder="0 9 * * *"
-                        />
-                      </label>
-                      <label className="stack" style={{ gap: "0.35rem" }}>
-                        <span className="text-sm">Timezone (optional)</span>
-                        <input
-                          value={workflowTemplateDraft.scheduleTz}
-                          onChange={(e) =>
-                            setWorkflowTemplateDraft((prev) => ({
-                              ...prev,
-                              scheduleTz: e.target.value
-                            }))
-                          }
-                          placeholder="Europe/Berlin"
-                        />
-                      </label>
+                  <div className="feed-agent-facts">
+                    <div>
+                      <span className="text-sm muted">Source</span>
+                      <strong>Text journal notes and available audio/video transcripts</strong>
                     </div>
-                  ) : null}
+                    <div>
+                      <span className="text-sm muted">Destination</span>
+                      <strong>`posts/&lt;agent&gt;/` in Workspace Feed</strong>
+                    </div>
+                  </div>
                   <label className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
                     <input
                       type="checkbox"
@@ -4528,7 +4556,7 @@ function App() {
                       style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
                       disabled={workflowTemplateSubmitting}
                     >
-                      {workflowTemplateSubmitting ? "Creating..." : "Create Workflow"}
+                      {workflowTemplateSubmitting ? "Creating..." : "Create Agent"}
                     </button>
                     <button
                       type="button"
@@ -4608,7 +4636,7 @@ function App() {
                   return (
                     <div className="workflow-settings-panel">
                       <div className="row-between">
-                        <h3 style={{ margin: 0 }}>{bot.name} Settings</h3>
+                        <h3 style={{ margin: 0 }}>{bot.name}</h3>
                         <button
                           type="button"
                           className="ghost text-sm"
@@ -4621,181 +4649,38 @@ function App() {
                       {!draft ? (
                         <p className="text-sm muted" style={{ marginTop: "0.6rem" }}>
                           {workflowSettingsLoading
-                            ? "Loading workflow settings..."
-                            : "Workflow settings are not available yet."}
+                            ? "Loading content agent..."
+                            : "Content agent details are not available yet."}
                         </p>
                       ) : (
                         <div className="stack" style={{ marginTop: "0.6rem" }}>
                           <label className="stack" style={{ gap: "0.35rem" }}>
-                            <span className="text-sm">Prompt</span>
+                            <span className="text-sm">Agent goal</span>
                             <textarea
-                              rows={3}
-                              value={draft.prompt}
+                              rows={5}
+                              value={draft.goal}
                               onChange={(e) =>
                                 setWorkflowSettingsDraftByKey((prev) => ({
                                   ...prev,
                                   [activeWorkflowBotKey]: {
                                     ...draft,
-                                    prompt: e.target.value
+                                    goal: e.target.value
                                   }
                                 }))
                               }
-                              placeholder="E.g., Write a casual tweet about this."
+                              placeholder="Describe what this agent should create from your journal notes."
                             />
                           </label>
-
-                          <label className="stack" style={{ gap: "0.35rem" }}>
-                            <span className="text-sm">Selection mode</span>
-                            <select
-                              value={draft.mode}
-                              onChange={(e) =>
-                                setWorkflowSettingsDraftByKey((prev) => ({
-                                  ...prev,
-                                  [activeWorkflowBotKey]: {
-                                    ...draft,
-                                    mode: (e.target.value === "random" ? "random" : "date_range") as FeedWorkflowMode
-                                  }
-                                }))
-                              }
-                            >
-                              <option value="date_range">Recent notes (date range)</option>
-                              <option value="random">Random notes</option>
-                            </select>
-                          </label>
-
-                          {draft.mode === "date_range" ? (
-                            <label className="stack" style={{ gap: "0.35rem" }}>
-                              <span className="text-sm">Days back</span>
-                              <input
-                                type="number"
-                                min={1}
-                                max={30}
-                                value={draft.days}
-                                onChange={(e) =>
-                                  setWorkflowSettingsDraftByKey((prev) => ({
-                                    ...prev,
-                                    [activeWorkflowBotKey]: {
-                                      ...draft,
-                                      days: Math.max(1, Math.min(30, Number(e.target.value || 1)))
-                                    }
-                                  }))
-                                }
-                              />
-                            </label>
-                          ) : (
-                            <label className="stack" style={{ gap: "0.35rem" }}>
-                              <span className="text-sm">Random file count</span>
-                              <input
-                                type="number"
-                                min={1}
-                                max={10}
-                                value={draft.randomCount}
-                                onChange={(e) =>
-                                  setWorkflowSettingsDraftByKey((prev) => ({
-                                    ...prev,
-                                    [activeWorkflowBotKey]: {
-                                      ...draft,
-                                      randomCount: Math.max(
-                                        1,
-                                        Math.min(10, Number(e.target.value || 1))
-                                      )
-                                    }
-                                  }))
-                                }
-                              />
-                            </label>
-                          )}
-
-                          <label className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
-                            <input
-                              type="checkbox"
-                              checked={draft.scheduleEnabled}
-                              onChange={(e) =>
-                                setWorkflowSettingsDraftByKey((prev) => ({
-                                  ...prev,
-                                  [activeWorkflowBotKey]: {
-                                    ...draft,
-                                    scheduleEnabled: e.target.checked
-                                  }
-                                }))
-                              }
-                            />
-                            <span className="text-sm">Run on schedule</span>
-                          </label>
-
-                          {draft.scheduleEnabled ? (
-                            <div className="stack" style={{ gap: "0.45rem" }}>
-                              <label className="stack" style={{ gap: "0.35rem" }}>
-                                <span className="text-sm">Frequency</span>
-                                <select
-                                  value={
-                                    ["0 * * * *", "0 9 * * *", "0 9 * * 1"].includes(draft.scheduleCron)
-                                      ? draft.scheduleCron
-                                      : "custom"
-                                  }
-                                  onChange={(e) => {
-                                    if (e.target.value !== "custom") {
-                                      setWorkflowSettingsDraftByKey((prev) => ({
-                                        ...prev,
-                                        [activeWorkflowBotKey]: {
-                                          ...draft,
-                                          scheduleCron: e.target.value
-                                        }
-                                      }))
-                                    }
-                                  }}
-                                >
-                                  <option value="0 * * * *">Every Hour</option>
-                                  <option value="0 9 * * *">Every Day at 9 AM</option>
-                                  <option value="0 9 * * 1">Every Monday at 9 AM</option>
-                                  <option value="custom">Custom...</option>
-                                </select>
-                              </label>
-                              {["0 * * * *", "0 9 * * *", "0 9 * * 1"].includes(draft.scheduleCron) ? null : (
-                                <label className="stack" style={{ gap: "0.35rem" }}>
-                                  <span className="text-sm">Custom Cron Expression</span>
-                                  <input
-                                    value={draft.scheduleCron}
-                                    onChange={(e) =>
-                                      setWorkflowSettingsDraftByKey((prev) => ({
-                                        ...prev,
-                                        [activeWorkflowBotKey]: {
-                                          ...draft,
-                                          scheduleCron: e.target.value
-                                        }
-                                      }))
-                                    }
-                                    placeholder="0 9 * * *"
-                                  />
-                                </label>
-                              )}
-                              <label className="stack" style={{ gap: "0.35rem" }}>
-                                <span className="text-sm">Timezone (optional)</span>
-                                <input
-                                  value={draft.scheduleTz}
-                                  onChange={(e) =>
-                                    setWorkflowSettingsDraftByKey((prev) => ({
-                                      ...prev,
-                                      [activeWorkflowBotKey]: {
-                                        ...draft,
-                                        scheduleTz: e.target.value
-                                      }
-                                    }))
-                                  }
-                                  placeholder="Europe/Berlin"
-                                />
-                              </label>
-                              <p className="text-sm muted">
-                                Cron format: minute hour day month weekday.
-                              </p>
+                          <div className="feed-agent-facts">
+                            <div>
+                              <span className="text-sm muted">Source</span>
+                              <strong>Text journal notes and available transcripts</strong>
                             </div>
-                          ) : null}
-
-                          {saved?.commandPreview ? (
-                            <p className="text-sm muted">
-                              Command: <code>{saved.commandPreview}</code>
-                            </p>
-                          ) : null}
+                            <div>
+                              <span className="text-sm muted">Destination</span>
+                              <strong>{saved?.outputPrefix || `posts/${activeWorkflowBotKey}/`}</strong>
+                            </div>
+                          </div>
 
                           <div className="feed-comment-actions">
                             <button
@@ -4805,7 +4690,7 @@ function App() {
                               onClick={() => void saveWorkflowSettings(activeWorkflowBotKey)}
                               disabled={isSaving}
                             >
-                              {isSaving ? "Saving..." : "Save Settings"}
+                              {isSaving ? "Saving..." : "Save Goal & Run"}
                             </button>
                             <button
                               type="button"
@@ -4833,7 +4718,11 @@ function App() {
                   <p className="text-center muted" style={{ padding: "2rem" }}>No Bluesky posts found, or not logged in. Check Settings.</p>
                 ) : (
                   <div className="stack">
-                    {blueskyFeedItems.map((feedItem, idx) => {
+                    {blueskyFeedStatus ? (
+                      <p className="text-sm muted" style={{ padding: "0 0.25rem" }}>{blueskyFeedStatus}</p>
+                    ) : null}
+                    {blueskyFeedItems.map((item, idx) => {
+                      const feedItem = item.feedItem as AppBskyFeedDefs.FeedViewPost;
                       const post = feedItem.post;
                       const author = post.author;
                       const record = post.record as any;
@@ -4876,6 +4765,15 @@ function App() {
                             {renderLinkedText(text)}
                           </div>
                           {embedNode}
+                          {item.score != null ? (
+                            <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
+                              Matched {item.matchedInterestLabel || "workspace interest"} at{" "}
+                              {(item.score * 100).toFixed(0)}%
+                              {item.matchedInterestScore != null
+                                ? ` (similarity ${(item.matchedInterestScore * 100).toFixed(0)}%)`
+                                : ""}
+                            </div>
+                          ) : null}
                           {!hasExternalEmbed && fallbackLinks.length > 0 ? (
                             <div className="stack" style={{ gap: "0.5rem" }}>
                               {fallbackLinks.map((url) => (

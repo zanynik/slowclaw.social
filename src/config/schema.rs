@@ -436,7 +436,7 @@ pub struct TranscriptionConfig {
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
@@ -454,14 +454,14 @@ pub struct AgentConfig {
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
     #[serde(default)]
     pub compact_context: bool,
-    /// Maximum tool-call loop turns per user message. Default: `10`.
-    /// Setting to `0` falls back to the safe default of `10`.
+    /// Maximum tool-call loop turns per user message. Default: `20`.
+    /// Setting to `0` falls back to the safe default of `20`.
     #[serde(default = "default_agent_max_tool_iterations")]
     pub max_tool_iterations: usize,
     /// Maximum conversation history messages retained per session. Default: `50`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
-    /// Enable parallel tool execution within a single iteration. Default: `false`.
+    /// Enable parallel tool execution within a single iteration. Default: `true`.
     #[serde(default)]
     pub parallel_tools: bool,
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
@@ -470,7 +470,7 @@ pub struct AgentConfig {
 }
 
 fn default_agent_max_tool_iterations() -> usize {
-    10
+    20
 }
 
 fn default_agent_max_history_messages() -> usize {
@@ -487,7 +487,7 @@ impl Default for AgentConfig {
             compact_context: false,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
-            parallel_tools: false,
+            parallel_tools: true,
             tool_dispatcher: default_agent_tool_dispatcher(),
         }
     }
@@ -5394,9 +5394,9 @@ reasoning_enabled = false
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
-        assert_eq!(cfg.max_tool_iterations, 10);
+        assert_eq!(cfg.max_tool_iterations, 20);
         assert_eq!(cfg.max_history_messages, 50);
-        assert!(!cfg.parallel_tools);
+        assert!(cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
     }
 
@@ -7742,7 +7742,7 @@ default_model = "legacy-model"
     #[test]
     async fn transcription_config_defaults() {
         let tc = TranscriptionConfig::default();
-        assert!(!tc.enabled);
+        assert!(tc.enabled);
         assert_eq!(tc.model, "base");
         assert!(tc.language.is_none());
         assert_eq!(tc.max_duration_secs, 120);
@@ -7774,7 +7774,7 @@ default_model = "legacy-model"
             default_temperature = 0.7
         "#;
         let parsed: Config = toml::from_str(toml_str).unwrap();
-        assert!(!parsed.transcription.enabled);
+        assert!(parsed.transcription.enabled);
         assert_eq!(parsed.transcription.max_duration_secs, 120);
     }
 

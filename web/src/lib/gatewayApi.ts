@@ -70,7 +70,7 @@ export type RuntimeConfigSnapshot = {
   availableTranscriptionModels: string[];
 };
 
-export type FeedWorkflowCommentResult = {
+export type FeedContentAgentCommentResult = {
   queued: boolean;
   threadId: string;
   workflowKey: string;
@@ -80,80 +80,98 @@ export type FeedWorkflowCommentResult = {
   message?: string;
 };
 
-export type FeedWorkflowMode = "date_range" | "random";
-
-export type FeedWorkflowSettingsItem = {
+export type FeedContentAgentItem = {
   workflowKey: string;
   workflowBot: string;
-  scriptPath: string;
+  skillPath: string;
   outputPrefix: string;
-  mode: FeedWorkflowMode;
-  days: number;
-  randomCount: number;
-  scheduleEnabled: boolean;
-  scheduleCron: string;
-  scheduleTz?: string;
-  scheduleJobId?: string;
-  scheduleNextRun?: string;
-  prompt?: string;
-  commandPreview: string;
+  enabled: boolean;
+  goal?: string;
   editableFiles?: string[];
 };
 
-export type FeedWorkflowSettingsUpdatePayload = {
+export type FeedContentAgentUpdatePayload = {
   workflowKey: string;
-  mode?: FeedWorkflowMode;
-  days?: number;
-  randomCount?: number;
-  scheduleEnabled?: boolean;
-  scheduleCron?: string;
-  scheduleTz?: string;
-  prompt?: string;
+  goal?: string;
+  enabled?: boolean;
+  runNow?: boolean;
 };
 
-export type FeedWorkflowSettingsUpdateResult = {
-  item: FeedWorkflowSettingsItem;
+export type FeedContentAgentUpdateResult = {
+  item: FeedContentAgentItem;
   runQueued?: boolean;
   runThreadId?: string;
 };
 
-export type FeedWorkflowRunResult = {
+export type FeedContentAgentRunResult = {
   queued: boolean;
   threadId: string;
   workflowKey: string;
   workflowBot: string;
 };
 
-export type FeedWorkflowTemplateCreatePayload = {
+export type FeedContentAgentAutoRunItem = {
+  workflowKey: string;
+  workflowBot: string;
+  threadId: string;
+};
+
+export type FeedContentAgentAutoRunResult = {
+  queuedCount: number;
+  items: FeedContentAgentAutoRunItem[];
+};
+
+export type FeedContentAgentCreatePayload = {
   name: string;
-  botName?: string;
-  sourceKind?: "text" | "audio";
-  prompt?: string;
-  mode?: FeedWorkflowMode;
-  days?: number;
-  randomCount?: number;
-  scheduleEnabled?: boolean;
-  scheduleCron?: string;
-  scheduleTz?: string;
+  goal: string;
+  enabled?: boolean;
   runNow?: boolean;
 };
 
-export type FeedWorkflowTemplateCreateResult = {
+export type FeedContentAgentCreateResult = {
   created: boolean;
   queued?: boolean;
   threadId?: string;
   messageId?: string;
   workflowKey: string;
   workflowBot: string;
-  scriptPath: string;
   skillPath: string;
   outputDir: string;
   outputPrefix: string;
-  commandPreview: string;
-  scheduleJobId?: string;
   runQueued?: boolean;
   runThreadId?: string;
   creationSummary?: string;
+};
+
+export type BlueskyPersonalizedFeedRequest = {
+  serviceUrl: string;
+  accessJwt: string;
+  limit?: number;
+};
+
+export type PersonalizedBlueskyItem = {
+  feedItem: any;
+  score?: number | null;
+  matchedInterestLabel?: string | null;
+  matchedInterestScore?: number | null;
+  passedThreshold: boolean;
+};
+
+export type InterestProfileStats = {
+  interestCount: number;
+  sourceCount: number;
+  refreshedSources: number;
+  mergedCount: number;
+  spawnedCount: number;
+  ignoredCount: number;
+};
+
+export type PersonalizedBlueskyFeedResponse = {
+  items: PersonalizedBlueskyItem[];
+  profileStatus: string;
+  profileStats: InterestProfileStats;
+  usedFallback: boolean;
+  message?: string;
 };
 
 export async function pairGatewayClient(oneTimeCode: string, gatewayBaseUrl?: string) {
@@ -210,6 +228,37 @@ export async function updateRuntimeConfig(
     })
   });
   return parseJsonOrThrow(res);
+}
+
+export async function fetchPersonalizedBlueskyFeed(
+  payload: BlueskyPersonalizedFeedRequest,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<PersonalizedBlueskyFeedResponse> {
+  const res = await fetch(resolveGatewayEndpoint("/api/feed/bluesky/personalized", gatewayBaseUrl), {
+    method: "POST",
+    headers: authHeaders(bearerToken, "application/json"),
+    body: JSON.stringify({
+      serviceUrl: payload.serviceUrl,
+      accessJwt: payload.accessJwt,
+      limit: payload.limit
+    })
+  });
+  const data = await parseJsonOrThrow(res);
+  return {
+    items: Array.isArray(data.items) ? (data.items as PersonalizedBlueskyItem[]) : [],
+    profileStatus: String(data.profileStatus || ""),
+    profileStats: {
+      interestCount: Number(data.profileStats?.interestCount || 0),
+      sourceCount: Number(data.profileStats?.sourceCount || 0),
+      refreshedSources: Number(data.profileStats?.refreshedSources || 0),
+      mergedCount: Number(data.profileStats?.mergedCount || 0),
+      spawnedCount: Number(data.profileStats?.spawnedCount || 0),
+      ignoredCount: Number(data.profileStats?.ignoredCount || 0)
+    },
+    usedFallback: Boolean(data.usedFallback),
+    message: typeof data.message === "string" ? data.message : undefined
+  };
 }
 
 export async function listLibraryItems(
@@ -421,12 +470,12 @@ export async function createClawChatUserMessage(
   return parseJsonOrThrow(res);
 }
 
-export async function submitFeedWorkflowComment(
+export async function submitFeedContentAgentComment(
   path: string,
   comment: string,
   bearerToken?: string,
   gatewayBaseUrl?: string
-): Promise<FeedWorkflowCommentResult> {
+): Promise<FeedContentAgentCommentResult> {
   const trimmedPath = path.trim();
   const trimmedComment = comment.trim();
   if (!trimmedPath || !trimmedComment) {
@@ -451,45 +500,37 @@ export async function submitFeedWorkflowComment(
   };
 }
 
-function mapFeedWorkflowSettingsItem(item: any): FeedWorkflowSettingsItem {
+function mapFeedContentAgentItem(item: any): FeedContentAgentItem {
   return {
     workflowKey: String(item?.workflowKey || ""),
     workflowBot: String(item?.workflowBot || ""),
-    scriptPath: String(item?.scriptPath || ""),
+    skillPath: String(item?.skillPath || ""),
     outputPrefix: String(item?.outputPrefix || ""),
-    mode: item?.mode === "random" ? "random" : "date_range",
-    days: Number.isFinite(Number(item?.days)) ? Number(item.days) : 7,
-    randomCount: Number.isFinite(Number(item?.randomCount)) ? Number(item.randomCount) : 1,
-    scheduleEnabled: Boolean(item?.scheduleEnabled),
-    scheduleCron: String(item?.scheduleCron || ""),
-    scheduleTz: item?.scheduleTz ? String(item.scheduleTz) : undefined,
-    scheduleJobId: item?.scheduleJobId ? String(item.scheduleJobId) : undefined,
-    scheduleNextRun: item?.scheduleNextRun ? String(item.scheduleNextRun) : undefined,
-    prompt: item?.prompt ? String(item.prompt) : undefined,
-    commandPreview: String(item?.commandPreview || ""),
+    enabled: item?.enabled !== false,
+    goal: item?.goal ? String(item.goal) : undefined,
     editableFiles: Array.isArray(item?.editableFiles)
       ? item.editableFiles.map((value: unknown) => String(value))
       : undefined
   };
 }
 
-export async function listFeedWorkflowSettings(
+export async function listFeedContentAgents(
   bearerToken?: string,
   gatewayBaseUrl?: string
-): Promise<FeedWorkflowSettingsItem[]> {
+): Promise<FeedContentAgentItem[]> {
   const res = await fetch(resolveGatewayEndpoint("/api/feed/workflow-settings", gatewayBaseUrl), {
     headers: authHeaders(bearerToken)
   });
   const data = await parseJsonOrThrow(res);
   const items = Array.isArray(data?.items) ? data.items : [];
-  return items.map(mapFeedWorkflowSettingsItem);
+  return items.map(mapFeedContentAgentItem);
 }
 
-export async function updateFeedWorkflowSettings(
-  payload: FeedWorkflowSettingsUpdatePayload,
+export async function updateFeedContentAgent(
+  payload: FeedContentAgentUpdatePayload,
   bearerToken?: string,
   gatewayBaseUrl?: string
-): Promise<FeedWorkflowSettingsUpdateResult> {
+): Promise<FeedContentAgentUpdateResult> {
   const res = await fetch(resolveGatewayEndpoint("/api/feed/workflow-settings", gatewayBaseUrl), {
     method: "POST",
     headers: authHeaders(bearerToken, "application/json"),
@@ -497,17 +538,17 @@ export async function updateFeedWorkflowSettings(
   });
   const data = await parseJsonOrThrow(res);
   return {
-    item: mapFeedWorkflowSettingsItem(data?.item || {}),
+    item: mapFeedContentAgentItem(data?.item || {}),
     runQueued: data?.runQueued ? Boolean(data.runQueued) : undefined,
     runThreadId: data?.runThreadId ? String(data.runThreadId) : undefined
   };
 }
 
-export async function runFeedWorkflowNow(
+export async function runFeedContentAgentNow(
   workflowKey: string,
   bearerToken?: string,
   gatewayBaseUrl?: string
-): Promise<FeedWorkflowRunResult> {
+): Promise<FeedContentAgentRunResult> {
   const key = workflowKey.trim();
   if (!key) {
     throw new Error("workflowKey is required");
@@ -526,19 +567,49 @@ export async function runFeedWorkflowNow(
   };
 }
 
-export async function createFeedWorkflowTemplate(
-  payload: FeedWorkflowTemplateCreatePayload,
+export async function autoRunEligibleFeedContentAgents(
+  reason: "app-open" | "journal-save" | "transcript-ready" = "app-open",
   bearerToken?: string,
   gatewayBaseUrl?: string
-): Promise<FeedWorkflowTemplateCreateResult> {
+): Promise<FeedContentAgentAutoRunResult> {
+  const res = await fetch(resolveGatewayEndpoint("/api/feed/workflow-auto-run", gatewayBaseUrl), {
+    method: "POST",
+    headers: authHeaders(bearerToken, "application/json"),
+    body: JSON.stringify({ reason })
+  });
+  const data = await parseJsonOrThrow(res);
+  const items = Array.isArray(data?.items) ? data.items : [];
+  return {
+    queuedCount: Number(data?.queuedCount || 0),
+    items: items.map((item: any) => ({
+      workflowKey: String(item?.workflowKey || ""),
+      workflowBot: String(item?.workflowBot || ""),
+      threadId: String(item?.threadId || "")
+    }))
+  };
+}
+
+export async function createFeedContentAgent(
+  payload: FeedContentAgentCreatePayload,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<FeedContentAgentCreateResult> {
   const name = String(payload?.name || "").trim();
+  const goal = String(payload?.goal || "").trim();
   if (!name) {
     throw new Error("name is required");
+  }
+  if (!goal) {
+    throw new Error("goal is required");
   }
   const res = await fetch(resolveGatewayEndpoint("/api/feed/workflow-template", gatewayBaseUrl), {
     method: "POST",
     headers: authHeaders(bearerToken, "application/json"),
-    body: JSON.stringify(payload)
+    body: JSON.stringify({
+      ...payload,
+      name,
+      goal
+    })
   });
   const data = await parseJsonOrThrow(res);
   return {
@@ -548,12 +619,9 @@ export async function createFeedWorkflowTemplate(
     messageId: data?.messageId ? String(data.messageId) : undefined,
     workflowKey: String(data?.workflowKey || ""),
     workflowBot: String(data?.workflowBot || ""),
-    scriptPath: String(data?.scriptPath || ""),
     skillPath: String(data?.skillPath || ""),
     outputDir: String(data?.outputDir || ""),
     outputPrefix: String(data?.outputPrefix || ""),
-    commandPreview: String(data?.commandPreview || ""),
-    scheduleJobId: data?.scheduleJobId ? String(data.scheduleJobId) : undefined,
     runQueued: data?.runQueued ? Boolean(data.runQueued) : undefined,
     runThreadId: data?.runThreadId ? String(data.runThreadId) : undefined,
     creationSummary: data?.creationSummary ? String(data.creationSummary) : undefined

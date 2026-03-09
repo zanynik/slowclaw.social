@@ -1,64 +1,62 @@
-# Workflow Bot Creation Skill
+# Content Agent Creation Skill
 
-Use this skill to create or modify a workflow bot implemented as a cron-run script.
+Use this skill to create or modify a content agent for the workspace feed.
 
-## Goal
+## Product Model
 
-- Build a script that reads context from the journal tree (`journals/...`).
-- Produce feed outputs under the posts tree (`posts/...`).
-- Keep selection behavior deterministic and configurable.
+- The user describes a goal, not tools or implementation details.
+- The runtime executes the content agent from its `SKILL.md` using the tools available in the workspace runtime.
+- The generated `SKILL.md` is the canonical agent definition.
 
-## Required Script Arguments
+## Fixed Inputs And Outputs
 
-The script must accept:
+- Source scope is fixed:
+  - `journals/text/**`
+  - transcript files under `journals/text/transcriptions/**` when present
+- Output scope is fixed:
+  - `posts/<agent_key>/**`
+- Do not read outside the workspace journal tree.
+- Do not write outside `posts/`.
 
-- `--mode` with values `date_range` or `random`
-- `--days` (used when `--mode date_range`)
-- `--random-count` (used when `--mode random`)
+## What To Generate
 
-Optional arguments can be added, but these core arguments must remain supported.
+You must generate and maintain the agent `SKILL.md`.
+
+The `SKILL.md` should describe:
+
+- the user goal in plain language
+- the fixed source locations
+- the fixed output destination under `posts/`
+- quality rules for outputs
+- one-file-per-post behavior when multiple items are produced
+- safety constraints such as avoiding unrelated file edits
+
+Do not turn the `SKILL.md` into generic documentation. Keep it specific to the agent.
 
 ## Runtime Contract
 
-- Script must run from the workspace root.
-- Script should emit structured output (JSON or concise text) for observability.
-- Script should avoid network-only assumptions unless explicitly requested.
+- The content agent runs inside the workspace runtime with its normal tool access.
+- Do not assume shell-script execution.
+- Keep instructions dependency-light and reversible.
+- The skill must be concrete enough that the runtime agent can execute it directly.
 
-## Safety Rules
+## Tooling Guidance
 
-- Keep all reads under the workspace journal paths.
-- Keep all writes under `posts/` for feed-visible artifacts.
-- Avoid command chaining and avoid introducing heavy dependencies.
-- Keep changes focused and reversible.
+- Prefer the runtime's existing workspace-local tools for reading, searching, and writing files.
+- Do not hardcode a separate tool catalog into generated agent files; rely on the runtime's actual available tools.
+- If the goal can be satisfied with file reads, file writes, search, and existing journal content, keep it that simple.
 
 ## Output Types
 
-A workflow bot may publish one or more of:
+A content agent may publish one or more of:
 
 - Markdown/text
 - Audio
 - Video
 
-## Structured Output Schema
-
-Scripts must emit a single JSON object to stdout on completion:
-
-```json
-{
-  "status": "ok",
-  "files_written": ["posts/my_bot/2026-03-03-digest.md"],
-  "message": "Generated 1 post from 5 journal entries"
-}
-```
-
-Fields:
-
-- `status` (required): `"ok"` on success, `"error"` on failure.
-- `files_written` (required): Array of workspace-relative paths produced by this run. May be empty on error.
-- `message` (required): Human-readable summary for observability logs.
-- `error` (optional): Error detail string when `status` is `"error"`.
+If multiple distinct post candidates are generated, save each as a separate file.
 
 ## Scheduling
 
-Bot scheduling is managed by cron settings in the gateway/UI.
+Scheduling is managed by the application, not by the generated files.
 Do not hardcode schedule timing in script logic.

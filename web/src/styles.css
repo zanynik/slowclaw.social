@@ -892,6 +892,67 @@ textarea {
   gap: 0.4rem;
 }
 
+.feed-template-grid {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.feed-template-card {
+  border-radius: var(--r-sm);
+  border: 1.5px solid var(--line);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  gap: 0.25rem;
+  padding: 0.6rem 0.7rem;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+
+.feed-template-card:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+  background: color-mix(in oklab, var(--surface) 75%, var(--accent-dim));
+}
+
+.feed-template-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.9rem;
+}
+
+.feed-template-title {
+  color: var(--ink);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.feed-template-desc {
+  color: var(--ink-2);
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
+.feed-agent-facts {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.75rem;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.feed-agent-facts strong {
+  display: block;
+  margin-top: 0.12rem;
+  color: var(--ink);
+  font-size: 0.84rem;
+  line-height: 1.35;
+}
+
 .feed-workflow-bot-row {
   border-radius: var(--r-sm);
   border: 1.5px solid var(--line);
@@ -907,6 +968,20 @@ textarea {
 .feed-workflow-bot-row:hover {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+.feed-workflow-bot-open {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
 }
 
 .feed-bot-chip {

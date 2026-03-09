@@ -67,6 +67,13 @@ default_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4-20250514"
 default_temperature = 0.7
 
+[agent]
+max_tool_iterations = 20
+parallel_tools = true
+
+[transcription]
+enabled = true
+
 [gateway]
 port = 42617
 host = "[::]"

@@ -12,11 +12,12 @@ pub mod local_store;
 
 use crate::config::{Config, TranscriptionConfig};
 use crate::memory::{self, Memory, MemoryCategory};
+use crate::memory::vector::{bytes_to_vec, cosine_similarity, vec_to_bytes};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
-use chrono::Datelike;
+use chrono::{Datelike, Utc};
 use axum::{
     extract::{ConnectInfo, Path as AxumPath, Query, Request, State},
     http::{header, HeaderMap, Method, StatusCode},
@@ -46,7 +47,7 @@ pub const MAX_BODY_SIZE: usize = 65_536;
 pub const MAX_MEDIA_UPLOAD_BODY_SIZE: usize = 1_073_741_824;
 /// Request timeout (30s) — prevents slow-loris attacks
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
-/// Workflow template creation timeout (5 min) to allow agent script generation.
+/// Workflow template creation timeout (5 min) to allow agent skill authoring.
 pub const WORKFLOW_TEMPLATE_TIMEOUT_SECS: u64 = 300;
 /// Media upload timeout (30 min) to tolerate large uploads over Wi-Fi/VPN.
 pub const MEDIA_UPLOAD_TIMEOUT_SECS: u64 = 1_800;
@@ -58,6 +59,7 @@ pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
 const JOURNAL_TEXT_DIR: &str = "journals/text";
 const JOURNAL_MEDIA_DIR: &str = "journals/media";
+const CONTENT_AGENT_APP_OPEN_STALE_SECS: i64 = 15 * 60;
 
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
@@ -536,11 +538,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/feed/workflow-comment",
             post(handle_feed_workflow_comment),
         )
+        .route("/api/feed/workflow-settings", get(handle_feed_workflow_settings))
         .route(
-            "/api/feed/workflow-settings",
-            get(handle_feed_workflow_settings).post(handle_feed_workflow_settings_update),
+            "/api/feed/bluesky/personalized",
+            post(handle_feed_bluesky_personalized),
         )
         .route("/api/feed/workflow-run", post(handle_feed_workflow_run))
+        .route("/api/feed/workflow-auto-run", post(handle_feed_workflow_auto_run))
         .route("/api/drafts", get(handle_drafts_list).post(handle_drafts_upsert))
         .route(
             "/api/post-history",
@@ -553,8 +557,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ));
 
-    // Workflow template creation can take longer because it invokes the agent to generate scripts.
+    // Content-agent creation can take longer because it invokes the agent to author skills.
     let workflow_template_router = Router::new()
+        .route(
+            "/api/feed/workflow-settings",
+            post(handle_feed_workflow_settings_update),
+        )
         .route(
             "/api/feed/workflow-template",
             post(handle_feed_workflow_template_create),
@@ -913,7 +921,7 @@ struct PostHistoryCreateBody {
 }
 
 #[derive(serde::Deserialize)]
-struct FeedWorkflowCommentBody {
+struct FeedContentAgentCommentBody {
     path: String,
     comment: String,
 }
@@ -943,7 +951,7 @@ impl FeedWorkflowMode {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct FeedWorkflowSettings {
     #[serde(default)]
     mode: FeedWorkflowMode,
@@ -958,90 +966,99 @@ struct FeedWorkflowSettings {
     #[serde(default)]
     schedule_tz: Option<String>,
     #[serde(default)]
+    goal: Option<String>,
+    #[serde(default)]
     prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FeedWorkflowSettingsUpdateBody {
+struct FeedContentAgentUpdateBody {
     workflow_key: String,
-    mode: Option<String>,
-    days: Option<u32>,
-    random_count: Option<u32>,
-    schedule_enabled: Option<bool>,
-    schedule_cron: Option<String>,
-    schedule_tz: Option<String>,
+    goal: Option<String>,
     prompt: Option<String>,
+    enabled: Option<bool>,
+    run_now: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FeedWorkflowRunBody {
+struct FeedContentAgentRunBody {
     workflow_key: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FeedWorkflowTemplateCreateBody {
-    name: String,
+struct FeedContentAgentAutoRunBody {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedContentAgentAutoRunItem {
+    workflow_key: String,
+    workflow_bot: String,
+    thread_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedContentAgentCreateBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    goal: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
     #[serde(default)]
     bot_name: Option<String>,
     #[serde(default)]
-    source_kind: Option<String>,
-    #[serde(default)]
     prompt: Option<String>,
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    days: Option<u32>,
-    #[serde(default)]
-    random_count: Option<u32>,
-    #[serde(default)]
-    schedule_enabled: Option<bool>,
-    #[serde(default)]
-    schedule_cron: Option<String>,
-    #[serde(default)]
-    schedule_tz: Option<String>,
     #[serde(default)]
     run_now: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct FeedWorkflowSettingsResponseItem {
+struct FeedContentAgentResponseItem {
     workflow_key: String,
     workflow_bot: String,
-    script_path: String,
+    skill_path: String,
     output_prefix: String,
-    mode: FeedWorkflowMode,
-    days: u32,
-    random_count: u32,
-    schedule_enabled: bool,
-    schedule_cron: String,
-    schedule_tz: Option<String>,
-    schedule_job_id: Option<String>,
-    schedule_next_run: Option<String>,
-    prompt: Option<String>,
-    command_preview: String,
+    enabled: bool,
+    goal: Option<String>,
     editable_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct FeedWorkflowRecord {
+struct FeedContentAgentRecord {
     workflow_key: String,
     workflow_bot: String,
-    script_path: String,
+    #[serde(default)]
+    skill_path: String,
     output_prefix: String,
+    #[serde(default = "default_content_agent_enabled")]
+    enabled: bool,
     #[serde(default)]
     editable_files: Vec<String>,
+    #[serde(default)]
+    goal: Option<String>,
+    #[serde(default)]
+    last_triggered_at: Option<String>,
+    #[serde(default)]
+    last_run_at: Option<String>,
+    #[serde(default)]
+    last_triggered_source_updated_at: Option<i64>,
     #[serde(default = "workflow_default_settings")]
+    #[serde(skip_serializing_if = "is_default_workflow_settings")]
     settings: FeedWorkflowSettings,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct FeedWorkflowSettingsStore {
+struct FeedContentAgentStore {
     #[serde(default)]
-    workflows: HashMap<String, FeedWorkflowRecord>,
+    workflows: HashMap<String, FeedContentAgentRecord>,
 }
 
 fn default_feed_workflow_days() -> u32 {
@@ -1052,19 +1069,42 @@ fn default_feed_workflow_random_count() -> u32 {
     1
 }
 
+fn default_content_agent_enabled() -> bool {
+    true
+}
+
+fn default_built_in_content_agent_enabled() -> bool {
+    false
+}
+
 #[derive(Debug, Clone)]
-struct FeedWorkflowDefinition {
+struct FeedContentAgentDefinition {
     key: String,
     bot_name: String,
     editable_files: Vec<String>,
     output_prefix: String,
-    script_path: String,
+    skill_path: String,
+    goal: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct LegacyFeedWorkflowSettingsStore {
+struct LegacyFeedContentAgentSettingsStore {
     #[serde(default)]
     workflows: HashMap<String, FeedWorkflowSettings>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BuiltInContentAgentSpec {
+    key: &'static str,
+    name: &'static str,
+    goal: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ContentAgentAutoRunTrigger {
+    JournalSave,
+    TranscriptReady,
+    AppOpen,
 }
 
 fn default_workflow_schedule_cron() -> String {
@@ -1079,7 +1119,46 @@ fn workflow_default_settings() -> FeedWorkflowSettings {
         schedule_enabled: false,
         schedule_cron: default_workflow_schedule_cron(),
         schedule_tz: None,
+        goal: None,
         prompt: None,
+    }
+}
+
+fn is_default_workflow_settings(settings: &FeedWorkflowSettings) -> bool {
+    settings == &workflow_default_settings()
+}
+
+fn built_in_content_agent_specs() -> &'static [BuiltInContentAgentSpec] {
+    &[
+        BuiltInContentAgentSpec {
+            key: "bluesky_insight_posts",
+            name: "Bluesky Insight Posts",
+            goal: "Create interesting Bluesky post drafts from my recent journal notes. Extract standout insights and save each post as a separate file in posts/ so it appears in the workspace feed.",
+        },
+        BuiltInContentAgentSpec {
+            key: "weekly_highlights",
+            name: "Weekly Highlights",
+            goal: "Turn my recent journal notes into polished weekly highlight posts for the workspace feed. Save each highlight as a separate file in posts/.",
+        },
+        BuiltInContentAgentSpec {
+            key: "audio_insight_clips",
+            name: "Audio Insight Clips",
+            goal: "Use my journal notes and available audio/video transcripts to identify practical insights and turn them into concise feed-ready posts, with each post saved as a separate file in posts/.",
+        },
+    ]
+}
+
+impl ContentAgentAutoRunTrigger {
+    fn queue_source(self) -> &'static str {
+        match self {
+            ContentAgentAutoRunTrigger::JournalSave => "journal-save",
+            ContentAgentAutoRunTrigger::TranscriptReady => "transcript-ready",
+            ContentAgentAutoRunTrigger::AppOpen => "app-open",
+        }
+    }
+
+    fn requires_staleness_gate(self) -> bool {
+        matches!(self, ContentAgentAutoRunTrigger::AppOpen)
     }
 }
 
@@ -1118,50 +1197,37 @@ fn normalize_workflow_output_prefix(prefix: &str, workflow_key: &str) -> String 
     normalized
 }
 
-fn normalize_workflow_script_path(script_path: &str, workflow_key: &str) -> String {
-    let fallback = format!("scripts/{workflow_key}_skill/run_{workflow_key}.py");
-    let trimmed = script_path.trim().trim_start_matches('/').replace('\\', "/");
-    if trimmed.is_empty() {
-        return fallback;
-    }
-    if trimmed.contains("..") {
-        return fallback;
-    }
-    if !trimmed.starts_with("scripts/") {
-        return fallback;
-    }
-    trimmed
-}
-
-fn normalize_workflow_record(workflow_key: &str, mut record: FeedWorkflowRecord) -> FeedWorkflowRecord {
+fn normalize_workflow_record(workflow_key: &str, mut record: FeedContentAgentRecord) -> FeedContentAgentRecord {
     record.workflow_key = workflow_key.to_string();
     record.workflow_bot = record
         .workflow_bot
         .trim()
         .to_string()
         .if_empty_then(|| default_workflow_bot_name(workflow_key));
-    record.script_path = normalize_workflow_script_path(&record.script_path, workflow_key);
     record.output_prefix = normalize_workflow_output_prefix(&record.output_prefix, workflow_key);
     record.settings = normalize_workflow_settings(record.settings);
+    record.skill_path = {
+        let trimmed = record
+            .skill_path
+            .trim()
+            .trim_start_matches('/')
+            .replace('\\', "/");
+        if trimmed.is_empty() || trimmed.contains("..") || !trimmed.starts_with("skills/") {
+            format!("skills/{workflow_key}/SKILL.md")
+        } else {
+            trimmed
+        }
+    };
+    record.goal = normalize_goal_text(record.goal)
+        .or(record.settings.goal.clone())
+        .or(record.settings.prompt.clone());
+    record.last_triggered_at = normalize_goal_text(record.last_triggered_at);
+    record.last_run_at = normalize_goal_text(record.last_run_at);
+    record.last_triggered_source_updated_at = record
+        .last_triggered_source_updated_at
+        .filter(|value| *value > 0);
 
-    let mut editable = Vec::new();
-    for path in &record.editable_files {
-        let cleaned = path.trim().trim_start_matches('/').replace('\\', "/");
-        if cleaned.is_empty() || cleaned.contains("..") {
-            continue;
-        }
-        if !editable.contains(&cleaned) {
-            editable.push(cleaned);
-        }
-    }
-    if !editable.iter().any(|path| path == &record.script_path) {
-        editable.push(record.script_path.clone());
-    }
-    let skill_default = format!("skills/{workflow_key}/SKILL.md");
-    if !editable.iter().any(|path| path == &skill_default) {
-        editable.push(skill_default);
-    }
-    record.editable_files = editable;
+    record.editable_files = vec![record.skill_path.clone()];
     record
 }
 
@@ -1179,18 +1245,24 @@ impl StringExt for String {
     }
 }
 
-fn feed_workflow_definition_from_record(record: &FeedWorkflowRecord) -> FeedWorkflowDefinition {
-    FeedWorkflowDefinition {
+fn feed_workflow_definition_from_record(record: &FeedContentAgentRecord) -> FeedContentAgentDefinition {
+    FeedContentAgentDefinition {
         key: record.workflow_key.clone(),
         bot_name: record.workflow_bot.clone(),
         editable_files: record.editable_files.clone(),
         output_prefix: record.output_prefix.clone(),
-        script_path: record.script_path.clone(),
+        skill_path: record.skill_path.clone(),
+        goal: record
+            .goal
+            .clone()
+            .or(record.settings.goal.clone())
+            .or(record.settings.prompt.clone())
+            .unwrap_or_default(),
     }
 }
 
-fn workflow_definitions(store: &FeedWorkflowSettingsStore) -> Vec<FeedWorkflowDefinition> {
-    let mut defs: Vec<FeedWorkflowDefinition> = store
+fn workflow_definitions(store: &FeedContentAgentStore) -> Vec<FeedContentAgentDefinition> {
+    let mut defs: Vec<FeedContentAgentDefinition> = store
         .workflows
         .values()
         .map(feed_workflow_definition_from_record)
@@ -1200,9 +1272,9 @@ fn workflow_definitions(store: &FeedWorkflowSettingsStore) -> Vec<FeedWorkflowDe
 }
 
 fn workflow_definition_by_key(
-    store: &FeedWorkflowSettingsStore,
+    store: &FeedContentAgentStore,
     key: &str,
-) -> Option<FeedWorkflowDefinition> {
+) -> Option<FeedContentAgentDefinition> {
     let normalized = key.trim().to_ascii_lowercase();
     store
         .workflows
@@ -1211,9 +1283,9 @@ fn workflow_definition_by_key(
 }
 
 fn workflow_for_feed_path(
-    store: &FeedWorkflowSettingsStore,
+    store: &FeedContentAgentStore,
     path: &str,
-) -> Option<FeedWorkflowDefinition> {
+) -> Option<FeedContentAgentDefinition> {
     let normalized_path = path.trim_start_matches('/').to_ascii_lowercase();
     workflow_definitions(store)
         .into_iter()
@@ -1233,7 +1305,84 @@ fn normalize_workflow_settings(mut settings: FeedWorkflowSettings) -> FeedWorkfl
             let trimmed = value.trim().to_string();
             (!trimmed.is_empty()).then_some(trimmed)
         });
+    settings.goal = normalize_goal_text(settings.goal);
+    settings.prompt = normalize_goal_text(settings.prompt);
+    if settings.goal.is_none() {
+        settings.goal = settings.prompt.clone();
+    }
+    if settings.prompt.is_none() {
+        settings.prompt = settings.goal.clone();
+    }
     settings
+}
+
+fn built_in_content_agent_settings(goal: &str) -> FeedWorkflowSettings {
+    let mut settings = workflow_default_settings();
+    settings.goal = Some(goal.to_string());
+    settings.prompt = Some(goal.to_string());
+    normalize_workflow_settings(settings)
+}
+
+fn built_in_content_agent_record(spec: BuiltInContentAgentSpec) -> FeedContentAgentRecord {
+    let key = sanitize_workflow_key(spec.key);
+    FeedContentAgentRecord {
+        workflow_key: key.clone(),
+        workflow_bot: spec.name.to_string(),
+        skill_path: format!("skills/{key}/SKILL.md"),
+        output_prefix: format!("posts/{key}/"),
+        enabled: default_built_in_content_agent_enabled(),
+        editable_files: vec![format!("skills/{key}/SKILL.md")],
+        goal: Some(spec.goal.to_string()),
+        last_triggered_at: None,
+        last_run_at: None,
+        last_triggered_source_updated_at: None,
+        settings: built_in_content_agent_settings(spec.goal),
+    }
+}
+
+fn ensure_content_agent_skill_file(
+    workspace_dir: &StdPath,
+    record: &FeedContentAgentRecord,
+) -> Result<()> {
+    let skill_abs = workspace_dir.join(&record.skill_path);
+    if skill_abs.exists() && skill_abs.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = skill_abs.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create skill directory {}", parent.display()))?;
+    }
+    let goal = record
+        .goal
+        .clone()
+        .or(record.settings.goal.clone())
+        .or(record.settings.prompt.clone())
+        .unwrap_or_else(|| "Create workspace feed posts from journal notes.".to_string());
+    let output_dir = record.output_prefix.trim_end_matches('/');
+    std::fs::write(
+        &skill_abs,
+        render_template_skill_markdown(&record.workflow_bot, &goal, output_dir),
+    )
+    .with_context(|| format!("failed to write starter skill {}", skill_abs.display()))
+}
+
+fn ensure_built_in_content_agents(
+    workspace_dir: &StdPath,
+    store: &mut FeedContentAgentStore,
+) -> Result<bool> {
+    let mut changed = false;
+    for spec in built_in_content_agent_specs() {
+        let key = sanitize_workflow_key(spec.key);
+        if !store.workflows.contains_key(&key) {
+            let record = normalize_workflow_record(&key, built_in_content_agent_record(*spec));
+            store.workflows.insert(key.clone(), record);
+            changed = true;
+        }
+        if let Some(record) = store.workflows.get(&key) {
+            ensure_content_agent_skill_file(workspace_dir, record)?;
+        }
+    }
+    Ok(changed)
 }
 
 fn workflow_settings_store_path(workspace_dir: &StdPath) -> PathBuf {
@@ -1242,14 +1391,14 @@ fn workflow_settings_store_path(workspace_dir: &StdPath) -> PathBuf {
         .join("feed_workflow_settings.json")
 }
 
-fn load_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedWorkflowSettingsStore> {
+fn load_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedContentAgentStore> {
     let path = workflow_settings_store_path(workspace_dir);
     if !path.exists() {
-        return Ok(FeedWorkflowSettingsStore::default());
+        return Ok(FeedContentAgentStore::default());
     }
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read workflow settings store {}", path.display()))?;
-    if let Ok(mut parsed) = serde_json::from_str::<FeedWorkflowSettingsStore>(&raw) {
+    if let Ok(mut parsed) = serde_json::from_str::<FeedContentAgentStore>(&raw) {
         parsed.workflows = parsed
             .workflows
             .into_iter()
@@ -1261,20 +1410,22 @@ fn load_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedWork
         return Ok(parsed);
     }
 
-    let legacy: LegacyFeedWorkflowSettingsStore = serde_json::from_str(&raw)
+    let legacy: LegacyFeedContentAgentSettingsStore = serde_json::from_str(&raw)
         .with_context(|| format!("Invalid workflow settings JSON {}", path.display()))?;
-    let mut migrated = FeedWorkflowSettingsStore::default();
+    let mut migrated = FeedContentAgentStore::default();
     for (legacy_key, legacy_settings) in legacy.workflows {
         let key = sanitize_workflow_key(&legacy_key);
-        let record = FeedWorkflowRecord {
+        let record = FeedContentAgentRecord {
             workflow_key: key.clone(),
             workflow_bot: default_workflow_bot_name(&key),
-            script_path: format!("scripts/{key}_skill/run_{key}.py"),
+            skill_path: format!("skills/{key}/SKILL.md"),
             output_prefix: format!("posts/{key}/"),
-            editable_files: vec![
-                format!("scripts/{key}_skill/run_{key}.py"),
-                format!("skills/{key}/SKILL.md"),
-            ],
+            enabled: default_content_agent_enabled(),
+            editable_files: vec![format!("skills/{key}/SKILL.md")],
+            goal: legacy_settings.goal.clone().or(legacy_settings.prompt.clone()),
+            last_triggered_at: None,
+            last_run_at: None,
+            last_triggered_source_updated_at: None,
             settings: normalize_workflow_settings(legacy_settings),
         };
         migrated
@@ -1286,7 +1437,7 @@ fn load_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedWork
 
 fn save_feed_workflow_settings_store(
     workspace_dir: &StdPath,
-    store: &FeedWorkflowSettingsStore,
+    store: &FeedContentAgentStore,
 ) -> Result<()> {
     let path = workflow_settings_store_path(workspace_dir);
     if let Some(parent) = path.parent() {
@@ -1302,152 +1453,25 @@ fn save_feed_workflow_settings_store(
         .with_context(|| format!("Failed to write workflow settings store {}", path.display()))
 }
 
-fn workflow_cron_job_name(workflow_key: &str) -> String {
-    format!("workflow:{workflow_key}")
-}
-
-fn workflow_command_preview(workflow: &FeedWorkflowDefinition, settings: &FeedWorkflowSettings) -> String {
-    let mut parts = vec![
-        "workspace-script".to_string(),
-        workflow.script_path.trim_start_matches('/').to_string(),
-        "--mode".to_string(),
-        settings.mode.as_cli_value().to_string(),
-    ];
-
-    match settings.mode {
-        FeedWorkflowMode::DateRange => {
-            parts.push("--days".to_string());
-            parts.push(settings.days.to_string());
-        }
-        FeedWorkflowMode::Random => {
-            parts.push("--random-count".to_string());
-            parts.push(settings.random_count.to_string());
-        }
+fn load_or_seed_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedContentAgentStore> {
+    let mut store = load_feed_workflow_settings_store(workspace_dir)?;
+    if ensure_built_in_content_agents(workspace_dir, &mut store)? {
+        save_feed_workflow_settings_store(workspace_dir, &store)?;
     }
-
-    if let Some(prompt) = &settings.prompt {
-        parts.push("--prompt".to_string());
-        parts.push(format!("\"{prompt}\""));
-    }
-
-    parts.join(" ")
-}
-
-fn select_primary_workflow_job(
-    config: &Config,
-    workflow_key: &str,
-) -> Result<Option<crate::cron::CronJob>> {
-    let target_name = workflow_cron_job_name(workflow_key);
-    let mut jobs: Vec<crate::cron::CronJob> = crate::cron::list_jobs(config)?
-        .into_iter()
-        .filter(|job| job.name.as_deref() == Some(target_name.as_str()))
-        .collect();
-    jobs.sort_by_key(|job| job.created_at);
-
-    if jobs.len() > 1 {
-        let keep_id = jobs
-            .first()
-            .map(|job| job.id.clone())
-            .unwrap_or_default();
-        for dup in jobs.iter().skip(1) {
-            if let Err(err) = crate::cron::remove_job(config, &dup.id) {
-                tracing::warn!(
-                    "Failed to remove duplicate workflow cron job {} ({}): {err}",
-                    dup.id,
-                    workflow_key
-                );
-            }
-        }
-        jobs.retain(|job| job.id == keep_id);
-    }
-
-    Ok(jobs.into_iter().next())
-}
-
-fn upsert_workflow_schedule_with_command(
-    config: &Config,
-    workflow_key: &str,
-    settings: &FeedWorkflowSettings,
-    command: String,
-) -> Result<Option<crate::cron::CronJob>> {
-    let existing = select_primary_workflow_job(config, workflow_key)?;
-    if !settings.schedule_enabled {
-        if let Some(job) = existing {
-            crate::cron::remove_job(config, &job.id)?;
-        }
-        return Ok(None);
-    }
-
-    if !config.cron.enabled {
-        anyhow::bail!("cron scheduling is disabled in config (cron.enabled=false)");
-    }
-
-    let expr = settings.schedule_cron.trim();
-    if expr.is_empty() {
-        anyhow::bail!("schedule cron expression is required when schedule is enabled");
-    }
-
-    let schedule = crate::cron::Schedule::Cron {
-        expr: expr.to_string(),
-        tz: settings.schedule_tz.clone(),
-    };
-    let name = workflow_cron_job_name(workflow_key);
-
-    if let Some(job) = existing {
-        let patch = crate::cron::CronJobPatch {
-            schedule: Some(schedule),
-            command: Some(command),
-            name: Some(name),
-            enabled: Some(true),
-            ..crate::cron::CronJobPatch::default()
-        };
-        let updated = crate::cron::update_job(config, &job.id, patch)?;
-        Ok(Some(updated))
-    } else {
-        let created = crate::cron::add_shell_job(config, Some(name), schedule, &command)?;
-        Ok(Some(created))
-    }
-}
-
-fn upsert_workflow_schedule(
-    config: &Config,
-    workflow: &FeedWorkflowDefinition,
-    settings: &FeedWorkflowSettings,
-) -> Result<Option<crate::cron::CronJob>> {
-    let command = workflow_command_preview(workflow, settings);
-    upsert_workflow_schedule_with_command(config, &workflow.key, settings, command)
+    Ok(store)
 }
 
 fn workflow_settings_response_item(
-    workflow: &FeedWorkflowDefinition,
-    settings: FeedWorkflowSettings,
-    schedule_job: Option<&crate::cron::CronJob>,
-) -> FeedWorkflowSettingsResponseItem {
-    FeedWorkflowSettingsResponseItem {
+    workflow: &FeedContentAgentDefinition,
+    enabled: bool,
+) -> FeedContentAgentResponseItem {
+    FeedContentAgentResponseItem {
         workflow_key: workflow.key.to_string(),
         workflow_bot: workflow.bot_name.to_string(),
-        script_path: workflow.script_path.to_string(),
+        skill_path: workflow.skill_path.to_string(),
         output_prefix: workflow.output_prefix.to_string(),
-        mode: settings.mode,
-        days: settings.days,
-        random_count: settings.random_count,
-        schedule_enabled: schedule_job.is_some(),
-        schedule_cron: schedule_job
-            .and_then(|job| match &job.schedule {
-                crate::cron::Schedule::Cron { expr, .. } => Some(expr.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| settings.schedule_cron.clone()),
-        schedule_tz: schedule_job
-            .and_then(|job| match &job.schedule {
-                crate::cron::Schedule::Cron { tz, .. } => tz.clone(),
-                _ => None,
-            })
-            .or(settings.schedule_tz.clone()),
-        schedule_job_id: schedule_job.map(|job| job.id.clone()),
-        schedule_next_run: schedule_job.map(|job| job.next_run.to_rfc3339()),
-        prompt: settings.prompt.clone(),
-        command_preview: workflow_command_preview(workflow, &settings),
+        enabled,
+        goal: Some(workflow.goal.clone()).filter(|value| !value.trim().is_empty()),
         editable_files: workflow
             .editable_files
             .iter()
@@ -1456,396 +1480,152 @@ fn workflow_settings_response_item(
     }
 }
 
-fn build_manual_workflow_job(workflow_key: &str, bot_name: &str, command: String) -> crate::cron::CronJob {
-    let now = chrono::Utc::now();
-    crate::cron::CronJob {
-        id: format!("workflow_manual_{}", Uuid::new_v4().simple()),
-        expression: "manual".to_string(),
-        schedule: crate::cron::Schedule::At { at: now },
-        command,
-        prompt: None,
-        name: Some(format!("{} ({workflow_key})", bot_name)),
-        job_type: crate::cron::JobType::Shell,
-        session_target: crate::cron::SessionTarget::Isolated,
-        model: None,
-        enabled: true,
-        delivery: crate::cron::DeliveryConfig::default(),
-        delete_after_run: false,
-        created_at: now,
-        next_run: now,
-        last_run: None,
-        last_status: None,
-        last_output: None,
-    }
+const CONTENT_AGENT_MIN_TOOL_ITERATIONS: usize = 32;
+const CONTENT_AGENT_MIN_ACTIONS_PER_HOUR: u32 = 200;
+const CONTENT_AGENT_TIMEOUT_SECS: u64 = 420;
+
+fn content_agent_config_with_headroom(base: &Config) -> Config {
+    let mut config = base.clone();
+    config.agent.max_tool_iterations = config
+        .agent
+        .max_tool_iterations
+        .max(CONTENT_AGENT_MIN_TOOL_ITERATIONS);
+    config.autonomy.max_actions_per_hour = config
+        .autonomy
+        .max_actions_per_hour
+        .max(CONTENT_AGENT_MIN_ACTIONS_PER_HOUR);
+    config
 }
 
-const WORKFLOW_SELF_HEAL_MAX_ATTEMPTS: usize = 1;
-const WORKFLOW_TEMPLATE_AGENT_TIMEOUT_SECS: u64 = 180;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WorkflowEditableFileStamp {
-    size: u64,
-    modified_secs: u64,
+fn parse_rfc3339_timestamp_secs(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|parsed| parsed.timestamp())
 }
 
-fn workflow_editable_file_stamp(path: &StdPath) -> Option<WorkflowEditableFileStamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    let modified = meta
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some(WorkflowEditableFileStamp {
-        size: meta.len(),
-        modified_secs: modified,
-    })
+fn source_file_modified_at_secs(path: &StdPath) -> i64 {
+    path.metadata()
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
+        .and_then(|dur| i64::try_from(dur.as_secs()).ok())
+        .unwrap_or(0)
 }
 
-fn capture_workflow_editable_file_stamps(
-    workspace_dir: &StdPath,
-    workflow: &FeedWorkflowDefinition,
-) -> HashMap<String, Option<WorkflowEditableFileStamp>> {
-    let mut out = HashMap::with_capacity(workflow.editable_files.len());
-    for rel in &workflow.editable_files {
-        let abs = workspace_dir.join(rel);
-        out.insert(rel.to_string(), workflow_editable_file_stamp(&abs));
-    }
-    out
+fn is_content_agent_source_file(path: &StdPath) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "md" | "txt" | "srt")
 }
 
-fn changed_workflow_editable_files(
-    before: &HashMap<String, Option<WorkflowEditableFileStamp>>,
-    after: &HashMap<String, Option<WorkflowEditableFileStamp>>,
-) -> Vec<String> {
-    let mut changed = Vec::new();
-    for (path, before_stamp) in before {
-        let after_stamp = after.get(path).copied().flatten();
-        if *before_stamp != after_stamp {
-            changed.push(path.clone());
-        }
-    }
-    changed
-}
-
-fn maybe_apply_workflow_run_quickfix(
-    workspace_dir: &StdPath,
-    workflow: &FeedWorkflowDefinition,
-    error_text: &str,
-) -> Result<Option<String>> {
-    let lowered = error_text.to_ascii_lowercase();
-    let is_prompt_arg_failure =
-        lowered.contains("unrecognized arguments") && lowered.contains("--prompt");
-    if !is_prompt_arg_failure {
-        return Ok(None);
+fn latest_content_agent_source_updated_at(workspace_dir: &StdPath) -> i64 {
+    let root = workspace_dir.join(JOURNAL_TEXT_DIR);
+    if !root.exists() || !root.is_dir() {
+        return 0;
     }
 
-    let script_rel = workflow.script_path.trim_start_matches('/');
-    if script_rel.is_empty() || !script_rel.ends_with(".py") {
-        return Ok(None);
-    }
-    if !workflow
-        .editable_files
-        .iter()
-        .any(|path| path.trim_start_matches('/') == script_rel)
-    {
-        return Ok(None);
-    }
-
-    let script_abs = workspace_dir.join(script_rel);
-    if !script_abs.exists() {
-        return Ok(None);
-    }
-
-    let script_content = std::fs::read_to_string(&script_abs).with_context(|| {
-        format!(
-            "failed to read workflow script for deterministic quick fix {}",
-            script_abs.display()
-        )
-    })?;
-    if script_content.contains("\"--prompt\"") || script_content.contains("'--prompt'") {
-        return Ok(None);
-    }
-
-    let prompt_default = if script_content.contains("USER_PROMPT") {
-        "USER_PROMPT"
-    } else {
-        "\"\""
-    };
-    let prompt_arg_line = format!("    parser.add_argument(\"--prompt\", default={prompt_default})\n");
-    let insertion_anchors = [
-        "    parser.add_argument(\"--random-count\", type=int, default=1)\n",
-        "    parser.add_argument(\"--days\", type=int, default=7)\n",
-        "    parser = argparse.ArgumentParser(description=\"Generated workflow bot script\")\n",
-    ];
-
-    let mut patched_content = None;
-    for anchor in insertion_anchors {
-        if let Some(pos) = script_content.find(anchor) {
-            let insert_at = pos + anchor.len();
-            let mut next = String::with_capacity(script_content.len() + prompt_arg_line.len());
-            next.push_str(&script_content[..insert_at]);
-            next.push_str(&prompt_arg_line);
-            next.push_str(&script_content[insert_at..]);
-            patched_content = Some(next);
-            break;
-        }
-    }
-
-    let Some(next_content) = patched_content else {
-        return Ok(None);
-    };
-
-    std::fs::write(&script_abs, next_content).with_context(|| {
-        format!(
-            "failed to write workflow script quick fix for {}",
-            script_abs.display()
-        )
-    })?;
-
-    Ok(Some(format!(
-        "Applied deterministic quick fix: added `--prompt` CLI argument support to `{script_rel}`."
-    )))
-}
-
-fn workflow_self_heal_prompt(
-    workflow: &FeedWorkflowDefinition,
-    bot_name: &str,
-    command: &str,
-    error_text: &str,
-    attempt: usize,
-    max_attempts: usize,
-) -> String {
-    let mut prompt = String::new();
-    prompt.push_str(
-        "You are the workflow supervisor. A workflow execution failed and must be self-healed.\n\n",
-    );
-    prompt.push_str("## Workflow\n");
-    prompt.push_str(&format!("- Bot: {bot_name}\n"));
-    prompt.push_str(&format!("- Key: {}\n", workflow.key));
-    prompt.push_str(&format!("- Target command: `{command}`\n"));
-    prompt.push_str(&format!(
-        "- Attempt: {attempt}/{max_attempts}\n\n"
-    ));
-
-    prompt.push_str("## Failure Output\n");
-    prompt.push_str("```text\n");
-    prompt.push_str(error_text.trim());
-    prompt.push_str("\n```\n\n");
-
-    prompt.push_str("## Allowed Files (strict)\n");
-    for file in &workflow.editable_files {
-        prompt.push_str(&format!("- `{file}`\n"));
-    }
-    prompt.push('\n');
-
-    prompt.push_str("## Constraints\n");
-    prompt.push_str("- Edit only allowed files.\n");
-    prompt.push_str("- Keep behavior deterministic and production-safe.\n");
-    prompt.push_str(&format!(
-        "- Keep feed output rooted under `{}`.\n",
-        workflow.output_prefix
-    ));
-    prompt.push_str("- Make minimal focused edits that fix the observed failure.\n");
-    prompt.push_str("- You must apply direct file edits to at least one allowed file.\n");
-    prompt.push_str("- Do not introduce new dependencies.\n\n");
-
-    prompt.push_str("After edits, reply with a concise summary of changed files and why.\n");
-    prompt
-}
-
-async fn try_self_heal_workflow_run(
-    state: &AppState,
-    workflow: &FeedWorkflowDefinition,
-    workflow_key: &str,
-    bot_name: &str,
-    command: &str,
-    thread_id: &str,
-    user_id: &str,
-    initial_error: &str,
-    workspace_dir: &StdPath,
-) -> Option<String> {
-    let mut last_error = initial_error.to_string();
-    let config = state.config.lock().clone();
-
-    for attempt in 1..=WORKFLOW_SELF_HEAL_MAX_ATTEMPTS {
-        match maybe_apply_workflow_run_quickfix(workspace_dir, workflow, &last_error) {
-            Ok(Some(message)) => {
-                let _ = local_store::create_chat_message(
-                    workspace_dir,
-                    thread_id,
-                    "assistant",
-                    &message,
-                    "done",
-                    "workflow-quickfix",
-                    Some(user_id),
-                    None,
-                );
-
-                let retry_job = build_manual_workflow_job(workflow_key, bot_name, command.to_string());
-                let (retry_success, retry_output) =
-                    crate::cron::scheduler::execute_job_now(&config, &retry_job).await;
-                let retry_trimmed = truncate_with_ellipsis(retry_output.trim(), 4000);
-                if retry_success {
-                    let detail = if retry_trimmed.is_empty() {
-                        "Workflow run completed after quick fix.".to_string()
-                    } else {
-                        format!("Workflow run completed after quick fix.\n\n{retry_trimmed}")
-                    };
-                    return Some(detail);
-                }
-
-                last_error = if retry_trimmed.is_empty() {
-                    "Workflow run failed after deterministic quick fix.".to_string()
-                } else {
-                    retry_trimmed
-                };
-            }
-            Ok(None) => {}
-            Err(err) => {
-                let err_text = truncate_with_ellipsis(
-                    &format!("quick fix failed before self-heal: {err:#}"),
-                    2000,
-                );
-                let _ = local_store::create_chat_message(
-                    workspace_dir,
-                    thread_id,
-                    "assistant",
-                    "",
-                    "error",
-                    "workflow-quickfix",
-                    Some(user_id),
-                    Some(&err_text),
-                );
-                last_error = err_text;
-            }
-        }
-
-        let start_msg = format!(
-            "Run failed. Starting self-heal attempt {attempt}/{WORKFLOW_SELF_HEAL_MAX_ATTEMPTS}..."
-        );
-        let _ = local_store::create_chat_message(
-            workspace_dir,
-            thread_id,
-            "assistant",
-            &start_msg,
-            "processing",
-            "workflow-supervisor",
-            Some(user_id),
-            None,
-        );
-
-        let prompt = workflow_self_heal_prompt(
-            workflow,
-            bot_name,
-            command,
-            &last_error,
-            attempt,
-            WORKFLOW_SELF_HEAL_MAX_ATTEMPTS,
-        );
-        let before_stamps = capture_workflow_editable_file_stamps(workspace_dir, workflow);
-
-        let channel_ctx = crate::channels::ChannelExecutionContext::new(
-            "local",
-            thread_id.to_string(),
-            Some(thread_id.to_string()),
-        );
-        let heal_result = crate::channels::with_channel_execution_context(
-            channel_ctx,
-            crate::agent::process_message(config.clone(), &prompt),
-        )
-        .await;
-
-        match heal_result {
-            Ok(reply) => {
-                let after_stamps = capture_workflow_editable_file_stamps(workspace_dir, workflow);
-                let changed_files = changed_workflow_editable_files(&before_stamps, &after_stamps);
-                if changed_files.is_empty() {
-                    let reply_preview = truncate_with_ellipsis(reply.trim(), 600);
-                    let no_edit_error = if reply_preview.is_empty() {
-                        "Self-heal attempt completed but did not modify any allowed files."
-                            .to_string()
-                    } else {
-                        format!(
-                            "Self-heal attempt completed but did not modify any allowed files. \
-Agent reply preview: {reply_preview}"
-                        )
-                    };
-                    let _ = local_store::create_chat_message(
-                        workspace_dir,
-                        thread_id,
-                        "assistant",
-                        "",
-                        "error",
-                        "workflow-supervisor",
-                        Some(user_id),
-                        Some(&no_edit_error),
-                    );
-                    last_error = no_edit_error;
-                    continue;
-                }
-
-                let reply_text = if reply.trim().is_empty() {
-                    format!(
-                        "Self-heal attempt {attempt} applied file changes.\n\nEdited files:\n- {}",
-                        changed_files.join("\n- ")
-                    )
-                } else {
-                    format!(
-                        "{}\n\nEdited files:\n- {}",
-                        reply.trim(),
-                        changed_files.join("\n- ")
-                    )
-                };
-                let _ = local_store::create_chat_message(
-                    workspace_dir,
-                    thread_id,
-                    "assistant",
-                    &reply_text,
-                    "done",
-                    "workflow-supervisor",
-                    Some(user_id),
-                    None,
-                );
-            }
-            Err(err) => {
-                let err_text = truncate_with_ellipsis(&format!("{err:#}"), 2000);
-                let _ = local_store::create_chat_message(
-                    workspace_dir,
-                    thread_id,
-                    "assistant",
-                    "",
-                    "error",
-                    "workflow-supervisor",
-                    Some(user_id),
-                    Some(&err_text),
-                );
-                last_error = err_text;
+    let mut latest = 0_i64;
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
                 continue;
             }
+            if !file_type.is_file() || !is_content_agent_source_file(&path) {
+                continue;
+            }
+            latest = latest.max(source_file_modified_at_secs(&path));
         }
+    }
+    latest
+}
 
-        let retry_job = build_manual_workflow_job(workflow_key, bot_name, command.to_string());
-        let (retry_success, retry_output) =
-            crate::cron::scheduler::execute_job_now(&config, &retry_job).await;
-        let retry_trimmed = truncate_with_ellipsis(retry_output.trim(), 4000);
-        if retry_success {
-            let detail = if retry_trimmed.is_empty() {
-                "Workflow run completed after self-heal.".to_string()
-            } else {
-                format!("Workflow run completed after self-heal.\n\n{retry_trimmed}")
-            };
-            return Some(detail);
+fn should_auto_run_content_agent(
+    record: &FeedContentAgentRecord,
+    latest_source_updated_at: i64,
+    trigger: ContentAgentAutoRunTrigger,
+) -> bool {
+    if !record.enabled || latest_source_updated_at <= 0 {
+        return false;
+    }
+    if record.last_triggered_source_updated_at.unwrap_or(0) >= latest_source_updated_at {
+        return false;
+    }
+    if trigger.requires_staleness_gate() {
+        let last_triggered_secs = record
+            .last_triggered_at
+            .as_deref()
+            .and_then(parse_rfc3339_timestamp_secs)
+            .unwrap_or(0);
+        if last_triggered_secs > 0
+            && Utc::now().timestamp() - last_triggered_secs < CONTENT_AGENT_APP_OPEN_STALE_SECS
+        {
+            return false;
         }
+    }
+    true
+}
 
-        last_error = if retry_trimmed.is_empty() {
-            "Workflow run failed after self-heal retry.".to_string()
-        } else {
-            retry_trimmed
-        };
+fn queue_eligible_content_agents_for_trigger(
+    state: &AppState,
+    trigger: ContentAgentAutoRunTrigger,
+) -> Result<Vec<FeedContentAgentAutoRunItem>> {
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let mut store = load_or_seed_feed_workflow_settings_store(&workspace_dir)?;
+    let latest_source_updated_at = latest_content_agent_source_updated_at(&workspace_dir);
+    if latest_source_updated_at <= 0 {
+        return Ok(Vec::new());
     }
 
-    None
+    let now = Utc::now().to_rfc3339();
+    let mut queued = Vec::new();
+    let defs = workflow_definitions(&store);
+    let mut changed = false;
+    for workflow in defs {
+        let Some(record) = store.workflows.get_mut(&workflow.key) else {
+            continue;
+        };
+        if !should_auto_run_content_agent(record, latest_source_updated_at, trigger) {
+            continue;
+        }
+        match queue_workflow_run(state.clone(), workflow.clone(), trigger.queue_source()) {
+            Ok(thread_id) => {
+                record.last_triggered_at = Some(now.clone());
+                record.last_triggered_source_updated_at = Some(latest_source_updated_at);
+                queued.push(FeedContentAgentAutoRunItem {
+                    workflow_key: workflow.key.clone(),
+                    workflow_bot: workflow.bot_name.clone(),
+                    thread_id,
+                });
+                changed = true;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to queue content agent `{}` for {}: {err}",
+                    workflow.key,
+                    trigger.queue_source()
+                );
+            }
+        }
+    }
+
+    if changed {
+        save_feed_workflow_settings_store(&workspace_dir, &store)?;
+    }
+
+    Ok(queued)
 }
 
 async fn run_local_agent_prompt_in_thread(
@@ -1858,7 +1638,7 @@ async fn run_local_agent_prompt_in_thread(
         thread_id.to_string(),
         Some(thread_id.to_string()),
     );
-    let config = state.config.lock().clone();
+    let config = content_agent_config_with_headroom(&state.config.lock().clone());
     crate::channels::with_channel_execution_context(
         channel_ctx,
         crate::agent::process_message(config, prompt),
@@ -1868,17 +1648,12 @@ async fn run_local_agent_prompt_in_thread(
 
 fn queue_workflow_run(
     state: AppState,
-    workflow_key: String,
-    bot_name: String,
-    command: String,
+    workflow: FeedContentAgentDefinition,
     source: &'static str,
 ) -> Result<String> {
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let thread_id = format!("workflow:{workflow_key}");
-    let user_content = format!(
-        "[run] Triggered {} for {} using command: {}",
-        source, bot_name, command
-    );
+    let thread_id = format!("workflow:{}", workflow.key);
+    let user_content = format!("[run] Triggered {} for {}", source, workflow.bot_name);
 
     let user_record = local_store::create_chat_message(
         &workspace_dir,
@@ -1900,9 +1675,7 @@ fn queue_workflow_run(
     let workspace_for_worker = workspace_dir.clone();
     let thread_id_for_worker = thread_id.clone();
     let user_id_for_worker = user_id.clone();
-    let workflow_key_for_worker = workflow_key.clone();
-    let bot_name_for_worker = bot_name.clone();
-    let command_for_worker = command.clone();
+    let workflow_for_worker = workflow.clone();
     tokio::spawn(async move {
         if let Err(err) =
             local_store::patch_chat_status(
@@ -1915,100 +1688,14 @@ fn queue_workflow_run(
             tracing::warn!("Failed to update workflow-run status to processing: {err}");
         }
 
-        let config = state_for_worker.config.lock().clone();
-        let job = build_manual_workflow_job(
-            &workflow_key_for_worker,
-            &bot_name_for_worker,
-            command_for_worker.clone(),
-        );
-        let (success, output) = crate::cron::scheduler::execute_job_now(&config, &job).await;
-        let output_trimmed = crate::util::truncate_with_ellipsis(output.trim(), 4000);
-
-        if success {
-            let reply = if output_trimmed.is_empty() {
-                "Workflow run completed.".to_string()
-            } else {
-                output_trimmed
-            };
-            if let Err(err) = local_store::create_chat_message(
-                &workspace_for_worker,
-                &thread_id_for_worker,
-                "assistant",
-                &reply,
-                "done",
-                "workflow-runner",
-                Some(&user_id_for_worker),
-                None,
-            ) {
-                tracing::warn!("Failed to persist workflow-run success reply: {err}");
-            }
-            if let Err(err) = local_store::patch_chat_status(
-                &workspace_for_worker,
-                &user_id_for_worker,
-                "done",
-                None,
-            ) {
-                tracing::warn!("Failed to mark workflow-run as done: {err}");
-            }
-        } else {
-            let error_text = if output_trimmed.is_empty() {
-                "Workflow run failed.".to_string()
-            } else {
-                output_trimmed
-            };
-            let workflow_store =
-                load_feed_workflow_settings_store(&workspace_for_worker).unwrap_or_default();
-            let healed_output = if let Some(workflow) =
-                workflow_definition_by_key(&workflow_store, &workflow_key_for_worker)
-            {
-                if let Err(err) = local_store::patch_chat_status(
-                    &workspace_for_worker,
-                    &user_id_for_worker,
-                    "processing",
-                    None,
-                ) {
-                    tracing::warn!(
-                        "Failed to mark workflow-run as processing before self-heal: {err}"
-                    );
-                }
-
-                try_self_heal_workflow_run(
-                    &state_for_worker,
-                    &workflow,
-                    &workflow_key_for_worker,
-                    &bot_name_for_worker,
-                    &command_for_worker,
-                    &thread_id_for_worker,
-                    &user_id_for_worker,
-                    &error_text,
-                    &workspace_for_worker,
-                )
-                .await
-            } else {
-                None
-            };
-
-            if let Some(detail) = healed_output {
-                let _ = local_store::create_chat_message(
-                    &workspace_for_worker,
-                    &thread_id_for_worker,
-                    "assistant",
-                    &detail,
-                    "done",
-                    "workflow-runner",
-                    Some(&user_id_for_worker),
-                    None,
+        let skill_abs = workspace_for_worker.join(&workflow_for_worker.skill_path);
+        let skill_markdown = match std::fs::read_to_string(&skill_abs) {
+            Ok(raw) => raw,
+            Err(err) => {
+                let final_error = format!(
+                    "Content agent run failed.\n\nUnable to read skill `{}`: {err}",
+                    workflow_for_worker.skill_path
                 );
-                if let Err(err) = local_store::patch_chat_status(
-                    &workspace_for_worker,
-                    &user_id_for_worker,
-                    "done",
-                    None,
-                ) {
-                    tracing::warn!("Failed to mark workflow-run as done after self-heal: {err}");
-                }
-            } else {
-                let final_error = format!("Workflow run failed.\n\n{error_text}");
                 let _ = local_store::create_chat_message(
                     &workspace_for_worker,
                     &thread_id_for_worker,
@@ -2019,14 +1706,113 @@ fn queue_workflow_run(
                     Some(&user_id_for_worker),
                     Some(&final_error),
                 );
-                if let Err(err) = local_store::patch_chat_status(
+                let _ = local_store::patch_chat_status(
                     &workspace_for_worker,
                     &user_id_for_worker,
                     "error",
                     Some(&final_error),
-                ) {
-                    tracing::warn!("Failed to mark workflow-run as error: {err}");
+                );
+                return;
+            }
+        };
+
+        let run_prompt = render_content_agent_run_prompt(&workflow_for_worker, &skill_markdown);
+        let run_result = tokio::time::timeout(
+            Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
+            run_local_agent_prompt_in_thread(
+                &state_for_worker,
+                &thread_id_for_worker,
+                &run_prompt,
+            ),
+        )
+        .await;
+
+        match run_result {
+            Ok(Ok(reply)) => {
+                let final_reply = if reply.trim().is_empty() {
+                    "Content agent run completed.".to_string()
+                } else {
+                    truncate_with_ellipsis(reply.trim(), 4000)
+                };
+                let _ = local_store::create_chat_message(
+                    &workspace_for_worker,
+                    &thread_id_for_worker,
+                    "assistant",
+                    &final_reply,
+                    "done",
+                    "workflow-runner",
+                    Some(&user_id_for_worker),
+                    None,
+                );
+                let _ = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "done",
+                    None,
+                );
+                match load_feed_workflow_settings_store(&workspace_for_worker) {
+                    Ok(mut store) => {
+                        if let Some(record) = store.workflows.get_mut(&workflow_for_worker.key) {
+                            record.last_run_at = Some(Utc::now().to_rfc3339());
+                            if let Err(err) =
+                                save_feed_workflow_settings_store(&workspace_for_worker, &store)
+                            {
+                                tracing::warn!(
+                                    "Failed to persist content agent last_run_at for `{}`: {err}",
+                                    workflow_for_worker.key
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to load workflow settings store after run success for `{}`: {err}",
+                            workflow_for_worker.key
+                        );
+                    }
                 }
+            }
+            Ok(Err(err)) => {
+                let final_error =
+                    truncate_with_ellipsis(&format!("Content agent run failed.\n\n{err:#}"), 4000);
+                let _ = local_store::create_chat_message(
+                    &workspace_for_worker,
+                    &thread_id_for_worker,
+                    "assistant",
+                    "",
+                    "error",
+                    "workflow-runner",
+                    Some(&user_id_for_worker),
+                    Some(&final_error),
+                );
+                let _ = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "error",
+                    Some(&final_error),
+                );
+            }
+            Err(_) => {
+                let final_error = format!(
+                    "Content agent run timed out after {}s",
+                    CONTENT_AGENT_TIMEOUT_SECS
+                );
+                let _ = local_store::create_chat_message(
+                    &workspace_for_worker,
+                    &thread_id_for_worker,
+                    "assistant",
+                    "",
+                    "error",
+                    "workflow-runner",
+                    Some(&user_id_for_worker),
+                    Some(&final_error),
+                );
+                let _ = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "error",
+                    Some(&final_error),
+                );
             }
         }
     });
@@ -2056,6 +1842,39 @@ fn sanitize_workflow_key(raw: &str) -> String {
     }
 }
 
+fn normalize_goal_text(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
+}
+
+fn derive_workflow_name_from_goal(goal: &str) -> String {
+    let tokens: Vec<String> = goal
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .take(6)
+        .map(|token| {
+            let mut chars = token.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut out = String::new();
+                    out.push(first.to_ascii_uppercase());
+                    out.push_str(chars.as_str());
+                    out
+                }
+                None => String::new(),
+            }
+        })
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        "Content Agent".to_string()
+    } else {
+        tokens.join(" ")
+    }
+}
+
 const WORKFLOW_BOT_CREATION_SKILL_REL_PATH: &str = "skills/workflow_bot_creation/SKILL.md";
 
 fn ensure_workflow_bot_creation_skill(workspace_dir: &StdPath) -> Result<String> {
@@ -2079,225 +1898,114 @@ fn ensure_workflow_bot_creation_skill(workspace_dir: &StdPath) -> Result<String>
         .with_context(|| format!("failed to read workflow bot creation skill {}", abs.display()))
 }
 
-fn render_workflow_script_stub(source_kind: &str, output_dir: &str, user_prompt: &str) -> String {
-    let output_literal =
-        serde_json::to_string(output_dir.trim()).unwrap_or_else(|_| "\"posts/workflow\"".to_string());
-    let user_prompt_literal =
-        serde_json::to_string(user_prompt.trim()).unwrap_or_else(|_| "\"\"".to_string());
-    let default_source_root = if source_kind == "audio" {
-        "journals/media/audio"
-    } else {
-        "journals/text"
-    };
-    let source_root_literal = serde_json::to_string(default_source_root).unwrap_or_else(|_| "\"journals/text\"".to_string());
-
+fn render_template_skill_markdown(
+    skill_name: &str,
+    goal: &str,
+    output_dir: &str,
+) -> String {
     format!(
-        "#!/usr/bin/env python3\n\
-from __future__ import annotations\n\
-\n\
-import argparse\n\
-import datetime as dt\n\
-import json\n\
-import random\n\
-from pathlib import Path\n\
-\n\
-DEFAULT_SOURCE_ROOT = {source_root_literal}\n\
-DEFAULT_OUTPUT_DIR = {output_literal}\n\
-USER_PROMPT = {user_prompt_literal}\n\
-\n\
-def parse_args() -> argparse.Namespace:\n\
-    parser = argparse.ArgumentParser(description=\"Generated workflow bot script\")\n\
-    parser.add_argument(\"--mode\", choices=[\"date_range\", \"random\"], default=\"date_range\")\n\
-    parser.add_argument(\"--days\", type=int, default=7)\n\
-    parser.add_argument(\"--random-count\", type=int, default=1)\n\
-    parser.add_argument(\"--prompt\", default=USER_PROMPT)\n\
-    parser.add_argument(\"--workspace\", default=\".\")\n\
-    parser.add_argument(\"--source-root\", default=DEFAULT_SOURCE_ROOT)\n\
-    parser.add_argument(\"--output-dir\", default=DEFAULT_OUTPUT_DIR)\n\
-    parser.add_argument(\"--seed\", type=int, default=None)\n\
-    return parser.parse_args()\n\
-\n\
-def collect_files(root: Path) -> list[Path]:\n\
-    if not root.exists():\n\
-        return []\n\
-    files = [path for path in root.rglob(\"*\") if path.is_file()]\n\
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)\n\
-    return files\n\
-\n\
-def select_files(files: list[Path], args: argparse.Namespace) -> list[Path]:\n\
-    if not files:\n\
-        return []\n\
-    if args.mode == \"random\":\n\
-        target = max(1, min(args.random_count, len(files)))\n\
-        rng = random.Random(args.seed)\n\
-        picked = rng.sample(files, target)\n\
-        picked.sort(key=lambda p: p.stat().st_mtime, reverse=True)\n\
-        return picked\n\
-\n\
-    now = dt.datetime.now(dt.timezone.utc)\n\
-    start = now - dt.timedelta(days=max(0, args.days))\n\
-    selected = []\n\
-    for path in files:\n\
-        modified = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)\n\
-        if modified >= start:\n\
-            selected.append(path)\n\
-    return selected\n\
-\n\
-def rel(path: Path, workspace: Path) -> str:\n\
-    return str(path.resolve().relative_to(workspace.resolve())).replace('\\\\', '/')\n\
-\n\
-def main() -> int:\n\
-    args = parse_args()\n\
-    workspace = Path(args.workspace).resolve()\n\
-    source_root = (workspace / args.source_root).resolve()\n\
-    output_dir = (workspace / args.output_dir).resolve()\n\
-    posts_root = (workspace / \"posts\").resolve()\n\
-    if not str(output_dir).startswith(str(posts_root)):\n\
-        print(json.dumps({{\"ok\": False, \"error\": \"output-dir must be under posts/\"}}))\n\
-        return 2\n\
-\n\
-    files = collect_files(source_root)\n\
-    selected = select_files(files, args)\n\
-    output_dir.mkdir(parents=True, exist_ok=True)\n\
-    stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d_%H%M%S')\n\
-    out_path = output_dir / f\"{{stamp}}_summary.md\"\n\
-\n\
-    lines = [\n\
-        f\"{{args.prompt}}\",\n\
-        \"\",\n\
-        \"## Selected Journal Files\",\n\
-        \"\",\n\
-    ]\n\
-    if not selected:\n\
-        lines.append(\"- none\")\n\
-    for path in selected:\n\
-        lines.append(f\"- `{{rel(path, workspace)}}`\")\n\
-\n\
-    lines.append(\"\")\n\
-    lines.append(\"## Notes\")\n\
-    lines.append(\"\")\n\
-    lines.append(\"Edit this script to implement specialized behavior for this workflow bot.\")\n\
-    out_path.write_text(\"\\n\".join(lines) + \"\\n\", encoding=\"utf-8\")\n\
-\n\
-    print(json.dumps({{\"ok\": True, \"output\": rel(out_path, workspace), \"selected\": [rel(p, workspace) for p in selected]}}))\n\
-    return 0\n\
-\n\
-if __name__ == \"__main__\":\n\
-    raise SystemExit(main())\n"
+        "# {skill_name}\n\n\
+Use this content agent to fulfill the following goal:\n\n\
+> {goal}\n\n\
+## Sources\n\n\
+- `journals/text/**`\n\
+- transcript files under `journals/text/transcriptions/**` when present\n\n\
+## Output\n\n\
+- `{output_dir}`\n\n\
+## Output Rules\n\n\
+- Write feed-visible artifacts only under `{output_dir}`.\n\
+- If generating multiple distinct post candidates, save each as a separate file.\n\
+- Keep unrelated workspace files untouched.\n"
     )
 }
 
-fn render_workflow_creation_prompt(
-    workflow_name: &str,
-    workflow_key: &str,
-    workflow_bot: &str,
-    source_kind: &str,
-    source_root: &str,
-    script_rel: &str,
-    skill_rel: &str,
-    output_dir_rel: &str,
-    user_prompt: &str,
-    creation_skill_markdown: &str,
-    script_body: &str,
-) -> String {
-    let mut prompt = String::new();
-    prompt.push_str("Use the workflow bot creation skill below to implement a new workflow bot.\n\n");
-    prompt.push_str(&format!(
-        "Skill file: `{WORKFLOW_BOT_CREATION_SKILL_REL_PATH}`\n\n"
-    ));
-    prompt.push_str("## Bot Creation Skill (verbatim)\n");
-    prompt.push_str("```markdown\n");
-    prompt.push_str(creation_skill_markdown.trim());
-    prompt.push_str("\n```\n\n");
-
-    prompt.push_str("## Workflow Request\n");
-    prompt.push_str(&format!("- Name: {workflow_name}\n"));
-    prompt.push_str(&format!("- Key: {workflow_key}\n"));
-    prompt.push_str(&format!("- Bot: {workflow_bot}\n"));
-    prompt.push_str(&format!("- Source kind: {source_kind}\n"));
-    prompt.push_str(&format!("- Source root: `{source_root}`\n"));
-    prompt.push_str(&format!("- User intent: \"{}\"\n\n", user_prompt.trim()));
-
-    prompt.push_str("## Required Files\n");
-    prompt.push_str(&format!("- Script (must exist): `{script_rel}`\n"));
-    prompt.push_str(&format!("- Skill (must exist): `{skill_rel}`\n"));
-    prompt.push_str(&format!("- Output directory root: `{output_dir_rel}`\n\n"));
-
-    prompt.push_str("## Script File Payload (authoritative)\n");
-    prompt.push_str("Use this full script content as the source template, then overwrite the script file with your updated implementation.\n");
-    prompt.push_str("Do not respond with only a file path reference.\n\n");
-    prompt.push_str(&format!("### `{script_rel}` initial content\n"));
-    prompt.push_str("```python\n");
-    prompt.push_str(script_body.trim());
-    prompt.push_str("\n```\n\n");
-
-    prompt.push_str("## Hard Requirements\n");
-    prompt.push_str("- The script must support: `--mode`, `--days`, `--random-count`.\n");
-    prompt.push_str("- `--mode` values: `date_range` and `random`.\n");
-    prompt.push_str("- Script must read journal context from the journal folder (`journals/...`).\n");
-    prompt.push_str("- Script must publish outputs under the posts folder (`posts/...`).\n");
-    prompt.push_str("- Keep execution deterministic for file selection behavior.\n");
-    prompt.push_str("- Keep edits minimal, production-safe, and dependency-light.\n");
-    prompt.push_str("- Do not include metadata headers in the output file. Only output the generated content. If generating multiple distinct items, save each as a separate file.\n");
-    prompt.push_str(&format!("- Replace `{script_rel}` with your full updated script content (not a patch description).\n"));
-    prompt.push_str("- Use the `file_write` tool to save your changes directly to the file.\n");
-    prompt.push_str("- Do direct file edits. Do not just describe code.\n\n");
-    prompt.push_str("- You must modify the script implementation from the initial template stub.\n\n");
-
-    prompt.push_str("After editing, reply with a concise summary of modified files and behavior.\n");
-    prompt
-}
-
-fn validate_workflow_script_contract(script_abs: &StdPath) -> Result<()> {
-    let raw = std::fs::read_to_string(script_abs)
-        .with_context(|| format!("failed to read generated script {}", script_abs.display()))?;
-    let required_fragments = [
-        "--mode",
-        "date_range",
-        "random",
-        "--days",
-        "--random-count",
-        "journals/",
-        "posts/",
-    ];
+fn validate_content_agent_skill_contract(skill_abs: &StdPath) -> Result<()> {
+    let raw = std::fs::read_to_string(skill_abs)
+        .with_context(|| format!("failed to read generated skill {}", skill_abs.display()))?;
+    let required_fragments = ["journals/text", "posts/", "Output Rules"];
     for fragment in required_fragments {
         if !raw.contains(fragment) {
             anyhow::bail!(
-                "generated workflow script is missing required fragment `{fragment}` (file: {})",
-                script_abs.display()
+                "generated content agent skill is missing required fragment `{fragment}` (file: {})",
+                skill_abs.display()
             );
         }
     }
     Ok(())
 }
 
-fn render_template_skill_markdown(
-    skill_name: &str,
-    source_kind: &str,
-    script_rel_path: &str,
-    output_dir: &str,
+fn render_content_agent_authoring_prompt(
+    workflow_name: &str,
+    workflow_key: &str,
+    workflow_bot: &str,
+    skill_rel: &str,
+    output_dir_rel: &str,
+    goal: &str,
+    creation_skill_markdown: &str,
+    current_skill_body: &str,
 ) -> String {
-    let source_hint = if source_kind == "audio" {
-        "`journals/media/audio` (with transcriptions in `journals/text/transcriptions`)"
-    } else {
-        "`journals/text`"
-    };
-    format!(
-        "# {skill_name} Workflow\n\n\
-Use this skill to generate feed-ready posts from {source_hint}.\n\n\
-## Script\n\n\
-- `{script_rel_path}`\n\n\
-## Default Command\n\n\
-```bash\n\
-workspace-script {script_rel_path} --mode date_range --days 7\n\
-```\n\n\
-## Output\n\n\
-- `{output_dir}`\n"
-    )
+    let mut prompt = String::new();
+    prompt.push_str("Use the content agent creation skill below to author or update a workspace feed content agent.\n\n");
+    prompt.push_str("## Creation Skill\n");
+    prompt.push_str("```markdown\n");
+    prompt.push_str(creation_skill_markdown.trim());
+    prompt.push_str("\n```\n\n");
+    prompt.push_str("## Agent Request\n");
+    prompt.push_str(&format!("- Name: {workflow_name}\n"));
+    prompt.push_str(&format!("- Key: {workflow_key}\n"));
+    prompt.push_str(&format!("- Bot: {workflow_bot}\n"));
+    prompt.push_str(&format!("- Goal: \"{}\"\n", goal.trim()));
+    prompt.push_str("- Fixed sources: `journals/text/**` and transcript files under `journals/text/transcriptions/**` when present\n");
+    prompt.push_str(&format!("- Fixed output root: `{output_dir_rel}`\n\n"));
+
+    prompt.push_str("## Required File\n");
+    prompt.push_str(&format!("- Content agent skill: `{skill_rel}`\n\n"));
+
+    prompt.push_str("## Current Skill Content\n");
+    prompt.push_str("Replace this file with improved content aligned to the goal.\n\n");
+    prompt.push_str("```markdown\n");
+    prompt.push_str(current_skill_body.trim());
+    prompt.push_str("\n```\n\n");
+
+    prompt.push_str("## Hard Requirements\n");
+    prompt.push_str("- Update only the content agent skill file.\n");
+    prompt.push_str("- Keep the sources fixed to journal notes and available transcripts.\n");
+    prompt.push_str("- Keep the output fixed under the posts folder.\n");
+    prompt.push_str("- Tell the agent to create multiple files when multiple distinct post candidates are useful.\n");
+    prompt.push_str("- Keep instructions concrete and operational, not generic.\n");
+    prompt.push_str("- Use the file_write tool to overwrite the skill file directly.\n");
+    prompt.push_str("- Do not respond with a patch description only.\n\n");
+    prompt.push_str("After editing, reply with a concise summary of what changed in the skill.\n");
+    prompt
+}
+
+fn render_content_agent_run_prompt(
+    workflow: &FeedContentAgentDefinition,
+    skill_markdown: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Run the following content agent and create feed artifacts in the workspace.\n\n");
+    prompt.push_str("## Agent\n");
+    prompt.push_str(&format!("- Name: {}\n", workflow.bot_name));
+    prompt.push_str(&format!("- Key: {}\n", workflow.key));
+    prompt.push_str(&format!("- Goal: {}\n", workflow.goal.trim()));
+    prompt.push_str(&format!("- Skill file: `{}`\n", workflow.skill_path));
+    prompt.push_str(&format!("- Output root: `{}`\n\n", workflow.output_prefix));
+    prompt.push_str("## Skill\n");
+    prompt.push_str("```markdown\n");
+    prompt.push_str(skill_markdown.trim());
+    prompt.push_str("\n```\n\n");
+    prompt.push_str("## Execution Rules\n");
+    prompt.push_str("- Read from `journals/text/**` and available transcript files when relevant.\n");
+    prompt.push_str(&format!("- Write feed-visible artifacts only under `{}`.\n", workflow.output_prefix));
+    prompt.push_str("- If multiple distinct post candidates are useful, save each as a separate file.\n");
+    prompt.push_str("- Use direct file edits in the workspace, not code blocks in chat.\n");
+    prompt.push_str("- Reply with a concise summary of files written.\n");
+    prompt
 }
 
 fn workflow_comment_prompt(
-    workflow: &FeedWorkflowDefinition,
+    workflow: &FeedContentAgentDefinition,
     feed_item_path: &str,
     comment: &str,
 ) -> String {
@@ -2310,14 +2018,13 @@ fn workflow_comment_prompt(
     prompt.push_str(&format!("- User comment: \"{}\"\n\n", comment.trim()));
 
     prompt.push_str("## Allowed Files\n");
-    for file in &workflow.editable_files {
-        prompt.push_str(&format!("- `{file}`\n"));
-    }
-    prompt.push('\n');
+    prompt.push_str(&format!("- Agent skill: `{}`\n", workflow.skill_path));
+    prompt.push_str(&format!("- Feed item: `{feed_item_path}`\n\n"));
 
     prompt.push_str("## Guardrails\n");
-    prompt.push_str("- Edit only files from the allowed list.\n");
-    prompt.push_str("- Keep behavior deterministic and production-safe.\n");
+    prompt.push_str("- Edit only the listed files.\n");
+    prompt.push_str("- Update the target feed item directly when the request is about that one item.\n");
+    prompt.push_str("- Update the skill only if the request should change future generated posts too.\n");
     prompt.push_str(&format!(
         "- Keep feed output rooted under `{}`.\n",
         workflow.output_prefix
@@ -2331,7 +2038,7 @@ fn workflow_comment_prompt(
 
 fn maybe_apply_workflow_comment_quickfix(
     _workspace_dir: &StdPath,
-    _workflow: &FeedWorkflowDefinition,
+    _workflow: &FeedContentAgentDefinition,
     _feed_item_path: &str,
     _comment: &str,
 ) -> Result<Option<String>> {
@@ -2509,9 +2216,8 @@ async fn handle_feed_workflow_settings(
     }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let config_snapshot = state.config.lock().clone();
 
-    let store = match load_feed_workflow_settings_store(&workspace_dir) {
+    let store = match load_or_seed_feed_workflow_settings_store(&workspace_dir) {
         Ok(store) => store,
         Err(err) => {
             tracing::warn!("Failed to load workflow settings store: {err}");
@@ -2524,26 +2230,12 @@ async fn handle_feed_workflow_settings(
 
     let mut items = Vec::new();
     for workflow in workflow_definitions(&store) {
-        let configured = store
+        let enabled = store
             .workflows
             .get(&workflow.key)
-            .map(|record| record.settings.clone())
-            .unwrap_or_else(workflow_default_settings);
-        let settings = normalize_workflow_settings(configured);
-
-        let schedule_job = match select_primary_workflow_job(&config_snapshot, &workflow.key) {
-            Ok(job) => job,
-            Err(err) => {
-                tracing::warn!("Failed to load cron state for {}: {err}", workflow.key);
-                None
-            }
-        };
-
-        items.push(workflow_settings_response_item(
-            &workflow,
-            settings,
-            schedule_job.as_ref(),
-        ));
+            .map(|record| record.enabled)
+            .unwrap_or_else(default_content_agent_enabled);
+        items.push(workflow_settings_response_item(&workflow, enabled));
     }
 
     (
@@ -2557,7 +2249,7 @@ async fn handle_feed_workflow_settings(
 async fn handle_feed_workflow_settings_update(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<FeedWorkflowSettingsUpdateBody>,
+    Json(body): Json<FeedContentAgentUpdateBody>,
 ) -> impl IntoResponse {
     if let Some(err) = pairing_auth_error(&state, &headers, "Feed workflow settings update") {
         return err;
@@ -2565,7 +2257,7 @@ async fn handle_feed_workflow_settings_update(
 
     let workflow_key = body.workflow_key.trim().to_ascii_lowercase();
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let mut store = match load_feed_workflow_settings_store(&workspace_dir) {
+    let mut store = match load_or_seed_feed_workflow_settings_store(&workspace_dir) {
         Ok(store) => store,
         Err(err) => {
             tracing::warn!("Failed to load workflow settings store for update: {err}");
@@ -2588,54 +2280,100 @@ async fn handle_feed_workflow_settings_update(
         let err = serde_json::json!({"error": "workflow record missing"});
         return (StatusCode::BAD_REQUEST, Json(err));
     };
-    let mut next = workflow_record.settings.clone();
-
-    if let Some(raw_mode) = body.mode.as_deref() {
-        let Some(parsed_mode) = FeedWorkflowMode::parse(raw_mode) else {
-            let err = serde_json::json!({"error": "mode must be one of: date_range, random"});
-            return (StatusCode::BAD_REQUEST, Json(err));
-        };
-        next.mode = parsed_mode;
-    }
-    if let Some(days) = body.days {
-        next.days = days;
-    }
-    if let Some(random_count) = body.random_count {
-        next.random_count = random_count;
-    }
-    if let Some(schedule_enabled) = body.schedule_enabled {
-        next.schedule_enabled = schedule_enabled;
-    }
-    if let Some(schedule_cron) = body.schedule_cron {
-        next.schedule_cron = schedule_cron;
-    }
-    if let Some(schedule_tz) = body.schedule_tz {
-        next.schedule_tz = Some(schedule_tz);
-    }
-    if let Some(prompt) = body.prompt {
-        next.prompt = Some(prompt);
-    }
-
-    next = normalize_workflow_settings(next);
-    if next.schedule_enabled && next.schedule_cron.is_empty() {
-        let err = serde_json::json!({"error": "scheduleCron is required when scheduleEnabled=true"});
+    let updated_goal = normalize_goal_text(body.goal.or(body.prompt));
+    let previous_goal = normalize_goal_text(workflow_record.goal.clone())
+        .or_else(|| normalize_goal_text(workflow_record.settings.goal.clone()))
+        .or_else(|| normalize_goal_text(workflow_record.settings.prompt.clone()));
+    let Some(goal) = updated_goal
+        .clone()
+        .or_else(|| previous_goal.clone())
+    else {
+        let err = serde_json::json!({"error": "goal is required"});
         return (StatusCode::BAD_REQUEST, Json(err));
+    };
+    let goal_changed = updated_goal
+        .as_ref()
+        .map(|value| previous_goal.as_deref() != Some(value.as_str()))
+        .unwrap_or(false);
+    if updated_goal.is_some() {
+        workflow_record.goal = Some(goal.clone());
+        workflow_record.settings.goal = Some(goal.clone());
+        workflow_record.settings.prompt = Some(goal.clone());
+    }
+    workflow_record.enabled = body.enabled.unwrap_or(workflow_record.enabled);
+    workflow_record = normalize_workflow_record(&workflow.key, workflow_record);
+
+    let skill_abs = workspace_dir.join(&workflow_record.skill_path);
+    if goal_changed {
+        let replacement_skill = render_template_skill_markdown(
+            &workflow_record.workflow_bot,
+            &goal,
+            workflow_record.output_prefix.trim_end_matches('/'),
+        );
+        if let Err(err) = std::fs::write(&skill_abs, replacement_skill) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("failed to update skill: {err}")})),
+            );
+        }
+
+        let creation_skill_markdown = match ensure_workflow_bot_creation_skill(&workspace_dir) {
+            Ok(markdown) => markdown,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("{err:#}")})),
+                )
+            }
+        };
+        let authoring_prompt = render_content_agent_authoring_prompt(
+            &workflow_record.workflow_bot,
+            &workflow.key,
+            &workflow_record.workflow_bot,
+            &workflow_record.skill_path,
+            workflow_record.output_prefix.trim_end_matches('/'),
+            &goal,
+            &creation_skill_markdown,
+            &std::fs::read_to_string(&skill_abs).unwrap_or_default(),
+        );
+        let authoring_thread_id = format!("workflow:update:{}", workflow.key);
+        let authoring_result = tokio::time::timeout(
+            Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
+            run_local_agent_prompt_in_thread(&state, &authoring_thread_id, &authoring_prompt),
+        )
+        .await;
+        match authoring_result {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("content agent update failed: {err:#}")})),
+                );
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("content agent update timed out after {}s", CONTENT_AGENT_TIMEOUT_SECS)})),
+                );
+            }
+        }
+
+        if let Err(err) = validate_content_agent_skill_contract(&skill_abs) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("updated skill failed validation: {err:#}")})),
+            );
+        }
+    } else if let Err(err) = ensure_content_agent_skill_file(&workspace_dir, &workflow_record) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to ensure skill: {err:#}")})),
+        );
     }
 
-    let config_snapshot = state.config.lock().clone();
-    let schedule_job = match upsert_workflow_schedule(&config_snapshot, &workflow, &next) {
-        Ok(job) => job,
-        Err(err) => {
-            tracing::warn!("Workflow schedule update failed for {}: {err}", workflow.key);
-            let payload = serde_json::json!({
-                "error": format!("{err:#}"),
-            });
-            return (StatusCode::BAD_REQUEST, Json(payload));
-        }
-    };
-
-    workflow_record.settings = next.clone();
-    store.workflows.insert(workflow.key.to_string(), workflow_record);
+    store
+        .workflows
+        .insert(workflow.key.to_string(), workflow_record.clone());
     if let Err(err) = save_feed_workflow_settings_store(&workspace_dir, &store) {
         tracing::warn!("Failed to persist workflow settings: {err}");
         return (
@@ -2644,22 +2382,20 @@ async fn handle_feed_workflow_settings_update(
         );
     }
 
-    let run_command = workflow_command_preview(&workflow, &next);
-    let run_thread_id = match queue_workflow_run(
-        state.clone(),
-        workflow.key.to_string(),
-        workflow.bot_name.to_string(),
-        run_command,
-        "workflow-settings-save",
-    ) {
-        Ok(thread_id) => Some(thread_id),
-        Err(err) => {
-            tracing::warn!("Failed to queue workflow run after settings save: {err}");
-            None
+    let workflow_def = feed_workflow_definition_from_record(&workflow_record);
+    let run_thread_id = if workflow_record.enabled && body.run_now.unwrap_or(false) {
+        match queue_workflow_run(state.clone(), workflow_def.clone(), "workflow-settings-save") {
+            Ok(thread_id) => Some(thread_id),
+            Err(err) => {
+                tracing::warn!("Failed to queue workflow run after settings save: {err}");
+                None
+            }
         }
+    } else {
+        None
     };
 
-    let item = workflow_settings_response_item(&workflow, next, schedule_job.as_ref());
+    let item = workflow_settings_response_item(&workflow_def, workflow_record.enabled);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2674,7 +2410,7 @@ async fn handle_feed_workflow_settings_update(
 async fn handle_feed_workflow_run(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<FeedWorkflowRunBody>,
+    Json(body): Json<FeedContentAgentRunBody>,
 ) -> impl IntoResponse {
     if let Some(err) = pairing_auth_error(&state, &headers, "Feed workflow run") {
         return err;
@@ -2682,7 +2418,7 @@ async fn handle_feed_workflow_run(
 
     let workflow_key = body.workflow_key.trim().to_ascii_lowercase();
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let store = load_feed_workflow_settings_store(&workspace_dir).unwrap_or_default();
+    let store = load_or_seed_feed_workflow_settings_store(&workspace_dir).unwrap_or_default();
     let Some(workflow) = workflow_definition_by_key(&store, &workflow_key) else {
         let err = serde_json::json!({
             "error": "unknown workflowKey",
@@ -2691,28 +2427,15 @@ async fn handle_feed_workflow_run(
         return (StatusCode::BAD_REQUEST, Json(err));
     };
 
-    let configured = store
-        .workflows
-        .get(&workflow.key)
-        .map(|record| record.settings.clone())
-        .unwrap_or_else(workflow_default_settings);
-    let settings = normalize_workflow_settings(configured);
-    let command = workflow_command_preview(&workflow, &settings);
-
-    match queue_workflow_run(
-        state.clone(),
-        workflow.key.to_string(),
-        workflow.bot_name.to_string(),
-        command,
-        "workflow-run-manual",
-    ) {
+    let workflow_bot = workflow.bot_name.clone();
+    match queue_workflow_run(state.clone(), workflow, "workflow-run-manual") {
         Ok(thread_id) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "queued": true,
                 "threadId": thread_id,
-                "workflowKey": workflow.key,
-                "workflowBot": workflow.bot_name,
+                "workflowKey": workflow_key,
+                "workflowBot": workflow_bot,
             })),
         ),
         Err(err) => {
@@ -2725,31 +2448,161 @@ async fn handle_feed_workflow_run(
     }
 }
 
+async fn handle_feed_workflow_auto_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FeedContentAgentAutoRunBody>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Feed workflow auto run") {
+        return err;
+    }
+
+    let trigger = match body.reason.as_deref().map(str::trim) {
+        Some(reason) if reason.eq_ignore_ascii_case("journal-save") => {
+            ContentAgentAutoRunTrigger::JournalSave
+        }
+        Some(reason) if reason.eq_ignore_ascii_case("transcript-ready") => {
+            ContentAgentAutoRunTrigger::TranscriptReady
+        }
+        _ => ContentAgentAutoRunTrigger::AppOpen,
+    };
+
+    match queue_eligible_content_agents_for_trigger(&state, trigger) {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "queuedCount": items.len(),
+                "items": items,
+            })),
+        ),
+        Err(err) => {
+            tracing::warn!("Failed to auto-run eligible content agents: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+        }
+    }
+}
+
+async fn handle_feed_bluesky_personalized(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BlueskyPersonalizedFeedRequest>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Bluesky personalized feed") {
+        return err;
+    }
+
+    let limit = body.limit.unwrap_or(30).clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
+    let config_snapshot = state.config.lock().clone();
+
+    let candidates =
+        match fetch_bluesky_timeline_candidates(&body.service_url, &body.access_jwt, limit).await {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": format!("Failed to fetch Bluesky timeline: {err}")
+                    })),
+                );
+            }
+        };
+
+    let raw_items: Vec<PersonalizedBlueskyItem> = candidates
+        .iter()
+        .map(|candidate| PersonalizedBlueskyItem {
+            feed_item: candidate.feed_item.clone(),
+            score: None,
+            matched_interest_label: None,
+            matched_interest_score: None,
+            passed_threshold: false,
+        })
+        .collect();
+
+    let profile = match rebuild_interest_profile(&config_snapshot).await {
+        Ok(profile) => profile,
+        Err(err) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "items": raw_items,
+                    "profileStatus": "fallbackRaw",
+                    "profileStats": InterestProfileStats::default(),
+                    "usedFallback": true,
+                    "message": format!("Failed to rebuild interest profile: {err}"),
+                })),
+            );
+        }
+    };
+
+    if profile.status != "ready" || profile.interests.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": raw_items,
+                "profileStatus": profile.status,
+                "profileStats": profile.stats,
+                "usedFallback": true,
+            })),
+        );
+    }
+
+    let embedder = memory::create_embedder_from_config(&config_snapshot);
+    let ranked_items = match rank_bluesky_candidates(embedder, &profile.interests, candidates).await
+    {
+        Ok(items) if !items.is_empty() => items,
+        Ok(_) => raw_items,
+        Err(err) => {
+            tracing::warn!("Failed to rank personalized Bluesky feed: {err}");
+            raw_items
+        }
+    };
+
+    let used_fallback = ranked_items.iter().all(|item| item.score.is_none());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "items": ranked_items,
+            "profileStatus": if used_fallback { "fallbackRaw" } else { profile.status },
+            "profileStats": profile.stats,
+            "usedFallback": used_fallback,
+        })),
+    )
+}
+
 async fn handle_feed_workflow_template_create(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<FeedWorkflowTemplateCreateBody>,
+    Json(body): Json<FeedContentAgentCreateBody>,
 ) -> impl IntoResponse {
     if let Some(err) = pairing_auth_error(&state, &headers, "Feed workflow template create") {
         return err;
     }
 
-    let name = body.name.trim();
-    if name.is_empty() {
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let Some(name) = name else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "name is required"})),
         );
-    }
+    };
 
-    let workflow_key = sanitize_workflow_key(name);
-    let source_kind = body
-        .source_kind
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or("text")
-        .to_ascii_lowercase();
-    let source_kind = if source_kind == "audio" { "audio" } else { "text" };
+    let goal = normalize_goal_text(body.goal.clone().or(body.prompt.clone()));
+    let Some(goal) = goal else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "goal is required"})),
+        );
+    };
+    let workflow_name = name.clone();
+    let workflow_key = sanitize_workflow_key(&workflow_name);
 
     let workflow_bot = body
         .bot_name
@@ -2757,32 +2610,22 @@ async fn handle_feed_workflow_template_create(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| default_workflow_bot_name(&workflow_key));
-    let prompt = body
-        .prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Write in a clear, natural voice.");
+        .unwrap_or_else(|| name.clone());
 
-    let default_mode = body
-        .mode
-        .as_deref()
-        .and_then(FeedWorkflowMode::parse)
-        .unwrap_or(FeedWorkflowMode::DateRange);
     let mut settings = FeedWorkflowSettings {
-        mode: default_mode,
-        days: body.days.unwrap_or(default_feed_workflow_days()),
-        random_count: body.random_count.unwrap_or(default_feed_workflow_random_count()),
-        schedule_enabled: body.schedule_enabled.unwrap_or(false),
-        schedule_cron: body.schedule_cron.unwrap_or_else(default_workflow_schedule_cron),
-        schedule_tz: body.schedule_tz,
-        prompt: Some(prompt.to_string()),
+        mode: FeedWorkflowMode::DateRange,
+        days: default_feed_workflow_days(),
+        random_count: default_feed_workflow_random_count(),
+        schedule_enabled: false,
+        schedule_cron: default_workflow_schedule_cron(),
+        schedule_tz: None,
+        goal: Some(goal.clone()),
+        prompt: Some(goal.clone()),
     };
     settings = normalize_workflow_settings(settings);
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let store = match load_feed_workflow_settings_store(&workspace_dir) {
+    let store = match load_or_seed_feed_workflow_settings_store(&workspace_dir) {
         Ok(store) => store,
         Err(err) => {
             tracing::warn!("Failed to load workflow settings store for create: {err}");
@@ -2800,22 +2643,11 @@ async fn handle_feed_workflow_template_create(
     }
 
     let output_dir_rel = format!("posts/{workflow_key}");
-    let script_rel = format!("scripts/{}_skill/run_{}.py", workflow_key, workflow_key);
     let skill_rel = format!("skills/{workflow_key}/SKILL.md");
-    let script_abs = workspace_dir.join(&script_rel);
     let skill_abs = workspace_dir.join(&skill_rel);
 
-    let script_body = render_workflow_script_stub(source_kind, &output_dir_rel, prompt);
-    let skill_body = render_template_skill_markdown(name, source_kind, &script_rel, &output_dir_rel);
+    let skill_body = render_template_skill_markdown(&workflow_name, &goal, &output_dir_rel);
 
-    if let Some(parent) = script_abs.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("failed to create script directory: {err}")})),
-            );
-        }
-    }
     if let Some(parent) = skill_abs.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
             return (
@@ -2830,24 +2662,11 @@ async fn handle_feed_workflow_template_create(
             Json(serde_json::json!({"error": format!("failed to create output directory: {err}")})),
         );
     }
-
-    if let Err(err) = std::fs::write(&script_abs, &script_body) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("failed to write script: {err}")})),
-        );
-    }
     if let Err(err) = std::fs::write(&skill_abs, skill_body) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("failed to write skill: {err}")})),
         );
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&script_abs, std::fs::Permissions::from_mode(0o755));
     }
 
     let creation_skill_markdown = match ensure_workflow_bot_creation_skill(&workspace_dir) {
@@ -2859,29 +2678,20 @@ async fn handle_feed_workflow_template_create(
             )
         }
     };
-    let source_root = if source_kind == "audio" {
-        "journals/media/audio"
-    } else {
-        "journals/text"
-    };
-    let creation_prompt = render_workflow_creation_prompt(
-        name,
+    let creation_prompt = render_content_agent_authoring_prompt(
+        &workflow_name,
         &workflow_key,
         &workflow_bot,
-        source_kind,
-        source_root,
-        &script_rel,
         &skill_rel,
         &output_dir_rel,
-        prompt,
+        &goal,
         &creation_skill_markdown,
-        &script_body,
+        &std::fs::read_to_string(&skill_abs).unwrap_or_default(),
     );
 
     let creation_thread_id = format!("workflow:create:{workflow_key}");
-    let creation_user_content = format!(
-        "[create] name={name}; key={workflow_key}; script={script_rel}; output={output_dir_rel}; source={source_kind}"
-    );
+    let creation_user_content =
+        format!("[create] goal={goal}; key={workflow_key}; skill={skill_rel}; output={output_dir_rel}");
     let creation_user_record = match local_store::create_chat_message(
         &workspace_dir,
         &creation_thread_id,
@@ -2907,20 +2717,9 @@ async fn handle_feed_workflow_template_create(
         .unwrap_or("")
         .to_string();
 
-    let run_now = body.run_now.unwrap_or(true);
+    let enabled = body.enabled.unwrap_or(true);
+    let run_now = enabled && body.run_now.unwrap_or(true);
     let output_prefix = format!("{output_dir_rel}/");
-    let preview_def = FeedWorkflowDefinition {
-        key: workflow_key.clone(),
-        bot_name: workflow_bot.clone(),
-        editable_files: vec![
-            script_rel.clone(),
-            skill_rel.clone(),
-            WORKFLOW_BOT_CREATION_SKILL_REL_PATH.to_string(),
-        ],
-        output_prefix: output_prefix.clone(),
-        script_path: script_rel.clone(),
-    };
-    let command_preview = workflow_command_preview(&preview_def, &settings);
 
     let state_for_worker = state.clone();
     let workspace_for_worker = workspace_dir.clone();
@@ -2928,14 +2727,12 @@ async fn handle_feed_workflow_template_create(
     let user_id_for_worker = creation_user_id.clone();
     let workflow_key_for_worker = workflow_key.clone();
     let workflow_bot_for_worker = workflow_bot.clone();
-    let script_rel_for_worker = script_rel.clone();
     let skill_rel_for_worker = skill_rel.clone();
     let output_dir_for_worker = output_dir_rel.clone();
     let output_prefix_for_worker = output_prefix.clone();
     let settings_for_worker = settings.clone();
-    let script_abs_for_worker = script_abs.clone();
-    let script_body_for_worker = script_body.clone();
     let creation_prompt_for_worker = creation_prompt.clone();
+    let goal_for_worker = goal.clone();
 
     tokio::spawn(async move {
         let persist_error = |message: &str| {
@@ -2971,7 +2768,7 @@ async fn handle_feed_workflow_template_create(
         }
 
         let creation_result = tokio::time::timeout(
-            Duration::from_secs(WORKFLOW_TEMPLATE_AGENT_TIMEOUT_SECS),
+            Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
             run_local_agent_prompt_in_thread(
                 &state_for_worker,
                 &thread_id_for_worker,
@@ -2992,38 +2789,37 @@ async fn handle_feed_workflow_template_create(
             Err(_) => {
                 let err_text = format!(
                     "workflow bot creation agent timed out after {}s",
-                    WORKFLOW_TEMPLATE_AGENT_TIMEOUT_SECS
+                    CONTENT_AGENT_TIMEOUT_SECS
                 );
                 persist_error(&err_text);
                 return;
             }
         };
 
-        if let Err(err) = validate_workflow_script_contract(&script_abs_for_worker) {
+        let skill_abs_for_worker = workspace_for_worker.join(&skill_rel_for_worker);
+        if let Err(err) = validate_content_agent_skill_contract(&skill_abs_for_worker) {
             let err_text = truncate_with_ellipsis(
-                &format!("generated script failed workflow contract validation: {err:#}"),
+                &format!("generated content agent skill failed validation: {err:#}"),
                 2000,
             );
             persist_error(&err_text);
             return;
         }
-        let final_script = match std::fs::read_to_string(&script_abs_for_worker) {
+        let final_skill = match std::fs::read_to_string(&skill_abs_for_worker) {
             Ok(raw) => raw,
             Err(err) => {
                 let err_text =
-                    truncate_with_ellipsis(&format!("failed to read generated script: {err}"), 2000);
+                    truncate_with_ellipsis(&format!("failed to read generated skill: {err}"), 2000);
                 persist_error(&err_text);
                 return;
             }
         };
-        if final_script.trim() == script_body_for_worker.trim() {
-            persist_error(
-                "workflow bot creation agent left the template script unchanged; creation aborted",
-            );
+        if final_skill.trim().is_empty() {
+            persist_error("content agent creation produced an empty skill file");
             return;
         }
 
-        let mut worker_store = match load_feed_workflow_settings_store(&workspace_for_worker) {
+        let mut worker_store = match load_or_seed_feed_workflow_settings_store(&workspace_for_worker) {
             Ok(store) => store,
             Err(err) => {
                 let err_text = truncate_with_ellipsis(
@@ -3039,36 +2835,21 @@ async fn handle_feed_workflow_template_create(
             return;
         }
 
-        let mut workflow_record = FeedWorkflowRecord {
+        let mut workflow_record = FeedContentAgentRecord {
             workflow_key: workflow_key_for_worker.clone(),
             workflow_bot: workflow_bot_for_worker.clone(),
-            script_path: script_rel_for_worker.clone(),
+            skill_path: skill_rel_for_worker.clone(),
             output_prefix: output_prefix_for_worker.clone(),
-            editable_files: vec![
-                script_rel_for_worker.clone(),
-                skill_rel_for_worker.clone(),
-                WORKFLOW_BOT_CREATION_SKILL_REL_PATH.to_string(),
-            ],
+            enabled,
+            editable_files: vec![skill_rel_for_worker.clone()],
+            goal: Some(goal_for_worker.clone()),
+            last_triggered_at: None,
+            last_run_at: None,
+            last_triggered_source_updated_at: None,
             settings: settings_for_worker.clone(),
         };
         workflow_record = normalize_workflow_record(&workflow_key_for_worker, workflow_record);
         let workflow_def = feed_workflow_definition_from_record(&workflow_record);
-        let command = workflow_command_preview(&workflow_def, &settings_for_worker);
-
-        let config_snapshot = state_for_worker.config.lock().clone();
-        if let Err(err) = upsert_workflow_schedule_with_command(
-            &config_snapshot,
-            &workflow_key_for_worker,
-            &settings_for_worker,
-            command.clone(),
-        ) {
-            let err_text = truncate_with_ellipsis(
-                &format!("failed to upsert workflow schedule: {err:#}"),
-                2000,
-            );
-            persist_error(&err_text);
-            return;
-        }
 
         worker_store
             .workflows
@@ -3085,9 +2866,7 @@ async fn handle_feed_workflow_template_create(
         let run_thread_id = if run_now {
             match queue_workflow_run(
                 state_for_worker.clone(),
-                workflow_key_for_worker.clone(),
-                workflow_bot_for_worker.clone(),
-                command.clone(),
+                workflow_def,
                 "workflow-template-create",
             ) {
                 Ok(thread_id) => Some(thread_id),
@@ -3101,10 +2880,10 @@ async fn handle_feed_workflow_template_create(
         };
 
         let mut summary = format!(
-            "Workflow `{}` ({}) created.\n\nScript: `{}`\nOutput: `{}`\n",
+            "Content agent `{}` ({}) created.\n\nSkill: `{}`\nOutput: `{}`\n",
             workflow_bot_for_worker,
             workflow_key_for_worker,
-            script_rel_for_worker,
+            skill_rel_for_worker,
             output_dir_for_worker
         );
         if let Some(thread_id) = &run_thread_id {
@@ -3148,15 +2927,12 @@ async fn handle_feed_workflow_template_create(
             "messageId": creation_user_id,
             "workflowKey": workflow_key,
             "workflowBot": workflow_bot,
-            "scriptPath": script_rel,
             "skillPath": skill_rel,
             "outputDir": output_dir_rel,
             "outputPrefix": output_prefix,
-            "commandPreview": command_preview,
-            "scheduleJobId": serde_json::Value::Null,
             "runQueued": false,
             "runThreadId": serde_json::Value::Null,
-            "creationSummary": "Workflow creation queued.",
+            "creationSummary": "Content agent creation queued.",
         })),
     )
 }
@@ -3164,7 +2940,7 @@ async fn handle_feed_workflow_template_create(
 async fn handle_feed_workflow_comment(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<FeedWorkflowCommentBody>,
+    Json(body): Json<FeedContentAgentCommentBody>,
 ) -> impl IntoResponse {
     if let Some(err) = pairing_auth_error(&state, &headers, "Feed workflow comment") {
         return err;
@@ -3186,7 +2962,7 @@ async fn handle_feed_workflow_comment(
     }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let store = load_feed_workflow_settings_store(&workspace_dir).unwrap_or_default();
+    let store = load_or_seed_feed_workflow_settings_store(&workspace_dir).unwrap_or_default();
     let Some(workflow) = workflow_for_feed_path(&store, &requested_path) else {
         let supported_prefixes: Vec<String> = workflow_definitions(&store)
             .into_iter()
@@ -3249,41 +3025,16 @@ async fn handle_feed_workflow_comment(
                 tracing::warn!("Failed to persist workflow quickfix assistant message: {err}");
             }
 
-            let configured = load_feed_workflow_settings_store(&workspace_dir)
-                .ok()
-                .and_then(|loaded| {
-                    loaded
-                        .workflows
-                        .get(&workflow.key)
-                        .map(|record| record.settings.clone())
-                })
-                .unwrap_or_else(workflow_default_settings);
-            let settings = normalize_workflow_settings(configured);
-            let command = workflow_command_preview(&workflow, &settings);
-            let run_thread_id = queue_workflow_run(
-                state.clone(),
-                workflow.key.to_string(),
-                workflow.bot_name.to_string(),
-                command,
-                "workflow-quickfix",
-            )
-            .ok();
-
-            let response_message = if run_thread_id.is_some() {
-                format!("{quickfix_message} Rerun queued.")
-            } else {
-                quickfix_message.clone()
-            };
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
-                    "queued": run_thread_id.is_some(),
-                    "threadId": run_thread_id.unwrap_or(thread_id),
+                    "queued": false,
+                    "threadId": thread_id,
                     "workflowKey": workflow.key,
                     "workflowBot": workflow.bot_name,
                     "editableFiles": workflow.editable_files,
                     "messageId": user_id,
-                    "message": response_message,
+                    "message": quickfix_message,
                     "quickfixApplied": true,
                 })),
             );
@@ -3902,6 +3653,10 @@ async fn handle_journal_text(
         }
     };
 
+    if let Err(err) = queue_eligible_content_agents_for_trigger(&state, ContentAgentAutoRunTrigger::JournalSave) {
+        tracing::warn!("Failed to queue content agents after journal save: {err}");
+    }
+
     let resp = serde_json::json!({
         "ok": true,
         "path": rel_path,
@@ -4311,6 +4066,15 @@ fn enqueue_transcription_job(
             },
         };
 
+        if final_state.status == "done" {
+            if let Err(err) = queue_eligible_content_agents_for_trigger(
+                &state_for_task,
+                ContentAgentAutoRunTrigger::TranscriptReady,
+            ) {
+                tracing::warn!("Failed to queue content agents after transcription: {err}");
+            }
+        }
+
         let mut jobs = state_for_task.journal_transcription_jobs.lock();
         jobs.insert(media_rel_path, final_state);
     });
@@ -4708,6 +4472,421 @@ fn collect_library_items_recursive(
         }));
     }
     Ok(())
+}
+
+const INTEREST_MERGE_THRESHOLD: f32 = 0.75;
+const INTEREST_SPAWN_THRESHOLD: f32 = 0.55;
+const FEED_MATCH_THRESHOLD: f32 = 0.65;
+const INTEREST_DECAY_RATE: f64 = 0.95;
+const INTEREST_EMA_NEW_WEIGHT: f32 = 0.2;
+const BLUESKY_TIMELINE_LIMIT_MAX: usize = 100;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlueskyPersonalizedFeedRequest {
+    service_url: String,
+    access_jwt: String,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct InterestProfileStats {
+    interest_count: usize,
+    source_count: usize,
+    refreshed_sources: usize,
+    merged_count: usize,
+    spawned_count: usize,
+    ignored_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonalizedBlueskyItem {
+    feed_item: serde_json::Value,
+    score: Option<f32>,
+    matched_interest_label: Option<String>,
+    matched_interest_score: Option<f32>,
+    passed_threshold: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveInterest {
+    record: local_store::FeedInterestRecord,
+    embedding: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateFeedPost {
+    feed_item: serde_json::Value,
+    text: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RebuildInterestProfileResult {
+    status: &'static str,
+    stats: InterestProfileStats,
+    interests: Vec<ActiveInterest>,
+}
+
+fn content_hash_16(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let hash = Sha256::digest(text.as_bytes());
+    format!(
+        "{:016x}",
+        u64::from_be_bytes(
+            hash[..8]
+                .try_into()
+                .expect("SHA-256 always produces at least 8 bytes")
+        )
+    )
+}
+
+fn derive_interest_label(default_title: &str, content: &str) -> String {
+    let normalized_title = default_title.trim();
+    if !normalized_title.is_empty() && !normalized_title.eq_ignore_ascii_case("untitled") {
+        return truncate_with_ellipsis(normalized_title, 80);
+    }
+
+    for line in content.lines() {
+        let trimmed = line.trim().trim_start_matches('#').trim();
+        if !trimmed.is_empty() {
+            return truncate_with_ellipsis(trimmed, 80);
+        }
+    }
+
+    "Workspace interest".to_string()
+}
+
+fn ema_merge_vectors(current: &[f32], previous: &[f32]) -> Vec<f32> {
+    current
+        .iter()
+        .zip(previous.iter())
+        .map(|(new_value, previous_value)| {
+            INTEREST_EMA_NEW_WEIGHT * *new_value + (1.0 - INTEREST_EMA_NEW_WEIGHT) * *previous_value
+        })
+        .collect()
+}
+
+fn sort_personalized_items(items: &mut [PersonalizedBlueskyItem]) {
+    items.sort_by(|left, right| {
+        let score_order = right
+            .score
+            .unwrap_or(0.0)
+            .partial_cmp(&left.score.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal);
+        if score_order != std::cmp::Ordering::Equal {
+            return score_order;
+        }
+        let right_ts = right
+            .feed_item
+            .get("post")
+            .and_then(|post| post.get("indexedAt"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let left_ts = left
+            .feed_item
+            .get("post")
+            .and_then(|post| post.get("indexedAt"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        right_ts.cmp(left_ts)
+    });
+}
+
+fn extract_bluesky_post_text(feed_item: &serde_json::Value) -> String {
+    let post = feed_item.get("post").unwrap_or(feed_item);
+    let text = post
+        .get("record")
+        .and_then(|record| record.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !text.is_empty() {
+        return text.to_string();
+    }
+
+    post.get("embed")
+        .and_then(|embed| embed.get("external"))
+        .and_then(|external| external.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+async fn fetch_bluesky_timeline_candidates(
+    service_url: &str,
+    access_jwt: &str,
+    limit: usize,
+) -> Result<Vec<CandidateFeedPost>> {
+    let trimmed_service = service_url.trim().trim_end_matches('/');
+    let normalized_limit = limit.clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
+    let url = format!(
+        "{trimmed_service}/xrpc/app.bsky.feed.getTimeline?limit={normalized_limit}"
+    );
+
+    let response = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(access_jwt.trim())
+        .send()
+        .await
+        .context("Failed to fetch Bluesky timeline")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Bluesky timeline request failed ({status}): {body}");
+    }
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .context("Failed to decode Bluesky timeline response")?;
+    let feed = json
+        .get("feed")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(feed
+        .into_iter()
+        .map(|feed_item| {
+            CandidateFeedPost {
+                text: extract_bluesky_post_text(&feed_item),
+                feed_item,
+            }
+        })
+        .collect())
+}
+
+async fn rebuild_interest_profile(
+    config: &Config,
+) -> Result<RebuildInterestProfileResult> {
+    let embedder = memory::create_embedder_from_config(config);
+    if embedder.dimensions() == 0 {
+        return Ok(RebuildInterestProfileResult {
+            status: "embeddingUnavailable",
+            ..RebuildInterestProfileResult::default()
+        });
+    }
+
+    let workspace_dir = &config.workspace_dir;
+    let _ = local_store::decay_feed_interests(workspace_dir, INTEREST_DECAY_RATE)?;
+    let mut active_interests: Vec<ActiveInterest> = local_store::list_feed_interests(workspace_dir)?
+        .into_iter()
+        .map(|record| ActiveInterest {
+            embedding: bytes_to_vec(&record.embedding),
+            record,
+        })
+        .filter(|interest| !interest.embedding.is_empty())
+        .collect();
+
+    let items = list_workspace_library_items(workspace_dir, "feed", 2_000)?;
+    let text_items: Vec<serde_json::Value> = items
+        .into_iter()
+        .filter(|item| item.get("kind").and_then(serde_json::Value::as_str) == Some("text"))
+        .collect();
+
+    let mut stats = InterestProfileStats {
+        source_count: text_items.len(),
+        ..InterestProfileStats::default()
+    };
+
+    for item in text_items {
+        let Some(path) = item.get("path").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let abs_path = workspace_dir.join(path);
+        let content = match tokio::fs::read_to_string(&abs_path).await {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let content_hash = content_hash_16(trimmed);
+        if let Some(previous) = local_store::get_feed_interest_source(workspace_dir, path)? {
+            if previous.content_hash == content_hash {
+                continue;
+            }
+        }
+
+        let label = derive_interest_label(
+            item.get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Workspace interest"),
+            trimmed,
+        );
+        let embedding = embedder
+            .embed_one(trimmed)
+            .await
+            .with_context(|| format!("Failed to embed feed source {path}"))?;
+
+        let mut best_match: Option<(usize, f32)> = None;
+        for (index, interest) in active_interests.iter().enumerate() {
+            let similarity = cosine_similarity(&embedding, &interest.embedding);
+            if best_match
+                .as_ref()
+                .map(|(_, current_best)| similarity > *current_best)
+                .unwrap_or(true)
+            {
+                best_match = Some((index, similarity));
+            }
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mapped_interest_id = if let Some((index, similarity)) = best_match {
+            if similarity >= INTEREST_MERGE_THRESHOLD {
+                let current = active_interests[index].clone();
+                let merged_embedding = ema_merge_vectors(&embedding, &current.embedding);
+                let next_label = if current.record.label.trim().is_empty() {
+                    label.clone()
+                } else {
+                    current.record.label.clone()
+                };
+                let updated = local_store::upsert_feed_interest(
+                    workspace_dir,
+                    &local_store::FeedInterestUpsert {
+                        id: Some(current.record.id.clone()),
+                        label: next_label,
+                        source_path: path.to_string(),
+                        embedding: vec_to_bytes(&merged_embedding),
+                        health_score: 1.0,
+                        last_seen_at: now.clone(),
+                    },
+                )?;
+                active_interests[index] = ActiveInterest {
+                    embedding: merged_embedding,
+                    record: updated.clone(),
+                };
+                stats.refreshed_sources += 1;
+                stats.merged_count += 1;
+                Some(updated.id)
+            } else if similarity >= INTEREST_SPAWN_THRESHOLD {
+                let created = local_store::upsert_feed_interest(
+                    workspace_dir,
+                    &local_store::FeedInterestUpsert {
+                        id: None,
+                        label: label.clone(),
+                        source_path: path.to_string(),
+                        embedding: vec_to_bytes(&embedding),
+                        health_score: 1.0,
+                        last_seen_at: now.clone(),
+                    },
+                )?;
+                active_interests.push(ActiveInterest {
+                    embedding,
+                    record: created.clone(),
+                });
+                stats.refreshed_sources += 1;
+                stats.spawned_count += 1;
+                Some(created.id)
+            } else {
+                stats.ignored_count += 1;
+                None
+            }
+        } else {
+            let created = local_store::upsert_feed_interest(
+                workspace_dir,
+                &local_store::FeedInterestUpsert {
+                    id: None,
+                    label: label.clone(),
+                    source_path: path.to_string(),
+                    embedding: vec_to_bytes(&embedding),
+                    health_score: 1.0,
+                    last_seen_at: now.clone(),
+                },
+            )?;
+            active_interests.push(ActiveInterest {
+                embedding,
+                record: created.clone(),
+            });
+            stats.refreshed_sources += 1;
+            stats.spawned_count += 1;
+            Some(created.id)
+        };
+
+        local_store::upsert_feed_interest_source(
+            workspace_dir,
+            &local_store::FeedInterestSourceRecord {
+                source_path: path.to_string(),
+                content_hash,
+                interest_id: mapped_interest_id,
+                title: label,
+                updated_at: now,
+            },
+        )?;
+    }
+
+    stats.interest_count = active_interests.len();
+    Ok(RebuildInterestProfileResult {
+        status: if active_interests.is_empty() {
+            "noInterests"
+        } else {
+            "ready"
+        },
+        stats,
+        interests: active_interests,
+    })
+}
+
+async fn rank_bluesky_candidates(
+    embedder: Arc<dyn memory::embeddings::EmbeddingProvider>,
+    interests: &[ActiveInterest],
+    candidates: Vec<CandidateFeedPost>,
+) -> Result<Vec<PersonalizedBlueskyItem>> {
+    let mut ranked = Vec::new();
+    for candidate in candidates {
+        let trimmed = candidate.text.trim();
+        if trimmed.is_empty() {
+            ranked.push(PersonalizedBlueskyItem {
+                feed_item: candidate.feed_item,
+                score: None,
+                matched_interest_label: None,
+                matched_interest_score: None,
+                passed_threshold: false,
+            });
+            continue;
+        }
+
+        let embedding = embedder
+            .embed_one(trimmed)
+            .await
+            .context("Failed to embed Bluesky candidate post")?;
+
+        let mut best_weighted = 0.0_f32;
+        let mut best_similarity = 0.0_f32;
+        let mut best_label: Option<String> = None;
+        for interest in interests {
+            let similarity = cosine_similarity(&embedding, &interest.embedding);
+            let weighted = similarity * interest.record.health_score as f32;
+            if weighted > best_weighted {
+                best_weighted = weighted;
+                best_similarity = similarity;
+                best_label = Some(interest.record.label.clone());
+            }
+        }
+
+        ranked.push(PersonalizedBlueskyItem {
+            feed_item: candidate.feed_item,
+            score: Some(best_weighted),
+            matched_interest_label: best_label,
+            matched_interest_score: if best_similarity > 0.0 {
+                Some(best_similarity)
+            } else {
+                None
+            },
+            passed_threshold: best_weighted >= FEED_MATCH_THRESHOLD,
+        });
+    }
+
+    let mut filtered: Vec<PersonalizedBlueskyItem> =
+        ranked.into_iter().filter(|item| item.passed_threshold).collect();
+    sort_personalized_items(&mut filtered);
+    Ok(filtered)
 }
 
 async fn create_journal_entry_metadata(
@@ -5115,6 +5294,64 @@ mod tests {
         for _ in 0..100 {
             assert!(limiter.allow("any-key"));
         }
+    }
+
+    #[test]
+    fn derive_interest_label_prefers_title_then_content() {
+        assert_eq!(derive_interest_label("Machine Learning", "ignored"), "Machine Learning");
+        assert_eq!(
+            derive_interest_label("untitled", "# Systems Thinking\nBody"),
+            "Systems Thinking"
+        );
+    }
+
+    #[test]
+    fn extract_bluesky_post_text_reads_record_text() {
+        let feed_item = serde_json::json!({
+            "post": {
+                "record": {
+                    "text": "hello from bluesky"
+                }
+            }
+        });
+        assert_eq!(extract_bluesky_post_text(&feed_item), "hello from bluesky");
+    }
+
+    #[test]
+    fn sort_personalized_items_orders_by_score_then_recency() {
+        let mut items = vec![
+            PersonalizedBlueskyItem {
+                feed_item: serde_json::json!({"post": {"indexedAt": "2026-03-09T09:00:00Z"}}),
+                score: Some(0.8),
+                matched_interest_label: None,
+                matched_interest_score: None,
+                passed_threshold: true,
+            },
+            PersonalizedBlueskyItem {
+                feed_item: serde_json::json!({"post": {"indexedAt": "2026-03-09T10:00:00Z"}}),
+                score: Some(0.8),
+                matched_interest_label: None,
+                matched_interest_score: None,
+                passed_threshold: true,
+            },
+            PersonalizedBlueskyItem {
+                feed_item: serde_json::json!({"post": {"indexedAt": "2026-03-09T11:00:00Z"}}),
+                score: Some(0.6),
+                matched_interest_label: None,
+                matched_interest_score: None,
+                passed_threshold: false,
+            },
+        ];
+
+        sort_personalized_items(&mut items);
+        assert_eq!(
+            items[0]
+                .feed_item
+                .get("post")
+                .and_then(|post| post.get("indexedAt"))
+                .and_then(serde_json::Value::as_str),
+            Some("2026-03-09T10:00:00Z")
+        );
     }
 
     #[test]
@@ -5896,19 +6133,183 @@ mod tests {
         assert!(has_journal);
     }
 
-    fn sample_workflow_store() -> FeedWorkflowSettingsStore {
-        let mut store = FeedWorkflowSettingsStore::default();
+    #[tokio::test]
+    async fn content_agent_create_requires_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            pb_chat_base_url: None,
+            pb_chat_collection: "chat_messages".into(),
+            pb_chat_token: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let response = handle_feed_workflow_template_create(
+            State(state),
+            HeaderMap::new(),
+            Json(FeedContentAgentCreateBody {
+                name: None,
+                goal: Some("Create concise feed posts from recent notes.".to_string()),
+                bot_name: None,
+                prompt: None,
+                enabled: Some(true),
+                run_now: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["error"], "name is required");
+    }
+
+    #[tokio::test]
+    async fn content_agent_create_requires_goal() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            pb_chat_base_url: None,
+            pb_chat_collection: "chat_messages".into(),
+            pb_chat_token: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let response = handle_feed_workflow_template_create(
+            State(state),
+            HeaderMap::new(),
+            Json(FeedContentAgentCreateBody {
+                name: Some("Bluesky Scout".to_string()),
+                goal: None,
+                bot_name: None,
+                prompt: Some("   ".to_string()),
+                enabled: Some(true),
+                run_now: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["error"], "goal is required");
+    }
+
+    #[test]
+    fn load_or_seed_feed_workflow_settings_store_preseeds_builtin_agents() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+
+        let store = load_or_seed_feed_workflow_settings_store(workspace).unwrap();
+
+        assert_eq!(store.workflows.len(), built_in_content_agent_specs().len());
+        for spec in built_in_content_agent_specs() {
+            let key = sanitize_workflow_key(spec.key);
+            let record = store.workflows.get(&key).expect("missing built-in content agent");
+            assert_eq!(record.workflow_bot, spec.name);
+            assert_eq!(record.goal.as_deref(), Some(spec.goal));
+            assert!(!record.enabled);
+            assert!(workspace.join(&record.skill_path).exists());
+        }
+    }
+
+    #[test]
+    fn content_agent_auto_run_requires_new_source_and_staleness_gate() {
+        let mut record = built_in_content_agent_record(built_in_content_agent_specs()[0]);
+        record.enabled = true;
+
+        assert!(should_auto_run_content_agent(
+            &record,
+            100,
+            ContentAgentAutoRunTrigger::JournalSave
+        ));
+
+        record.last_triggered_source_updated_at = Some(100);
+        assert!(!should_auto_run_content_agent(
+            &record,
+            100,
+            ContentAgentAutoRunTrigger::JournalSave
+        ));
+
+        record.last_triggered_source_updated_at = Some(50);
+        record.last_triggered_at = Some(Utc::now().to_rfc3339());
+        assert!(!should_auto_run_content_agent(
+            &record,
+            100,
+            ContentAgentAutoRunTrigger::AppOpen
+        ));
+
+        record.last_triggered_at = Some(
+            (Utc::now() - chrono::Duration::seconds(CONTENT_AGENT_APP_OPEN_STALE_SECS + 5))
+                .to_rfc3339(),
+        );
+        assert!(should_auto_run_content_agent(
+            &record,
+            100,
+            ContentAgentAutoRunTrigger::AppOpen
+        ));
+    }
+
+    #[test]
+    fn latest_content_agent_source_updated_at_reads_nested_transcripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let journal_dir = workspace.join("journals/text");
+        let transcript_dir = workspace.join("journals/text/transcriptions/session");
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        std::fs::write(journal_dir.join("entry.md"), "# entry\n").unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(transcript_dir.join("clip.txt"), "transcript\n").unwrap();
+
+        assert!(latest_content_agent_source_updated_at(workspace) > 0);
+    }
+
+    fn sample_workflow_store() -> FeedContentAgentStore {
+        let mut store = FeedContentAgentStore::default();
 
         let daily_key = "daily_summary";
-        let daily_record = FeedWorkflowRecord {
+        let daily_record = FeedContentAgentRecord {
             workflow_key: daily_key.to_string(),
             workflow_bot: "DailySummaryBot".to_string(),
-            script_path: "scripts/daily_summary_skill/run_daily_summary.py".to_string(),
+            skill_path: "skills/daily_summary/SKILL.md".to_string(),
             output_prefix: "posts/daily_summary/".to_string(),
-            editable_files: vec![
-                "scripts/daily_summary_skill/run_daily_summary.py".to_string(),
-                "skills/daily_summary/SKILL.md".to_string(),
-            ],
+            enabled: true,
+            editable_files: vec!["skills/daily_summary/SKILL.md".to_string()],
+            goal: Some("Create daily summary posts from recent journal notes".to_string()),
+            last_triggered_at: None,
+            last_run_at: None,
+            last_triggered_source_updated_at: None,
             settings: workflow_default_settings(),
         };
         store.workflows.insert(
@@ -5917,15 +6318,17 @@ mod tests {
         );
 
         let audio_key = "audio_roundup";
-        let audio_record = FeedWorkflowRecord {
+        let audio_record = FeedContentAgentRecord {
             workflow_key: audio_key.to_string(),
             workflow_bot: "AudioRoundupBot".to_string(),
-            script_path: "scripts/audio_roundup_skill/run_audio_roundup.py".to_string(),
+            skill_path: "skills/audio_roundup/SKILL.md".to_string(),
             output_prefix: "posts/audio_roundup/".to_string(),
-            editable_files: vec![
-                "scripts/audio_roundup_skill/run_audio_roundup.py".to_string(),
-                "skills/audio_roundup/SKILL.md".to_string(),
-            ],
+            enabled: true,
+            editable_files: vec!["skills/audio_roundup/SKILL.md".to_string()],
+            goal: Some("Create roundup posts from audio transcripts".to_string()),
+            last_triggered_at: None,
+            last_run_at: None,
+            last_triggered_source_updated_at: None,
             settings: workflow_default_settings(),
         };
         store.workflows.insert(
@@ -5956,30 +6359,6 @@ mod tests {
     }
 
     #[test]
-    fn workflow_creation_prompt_embeds_script_payload_and_overwrite_instruction() {
-        let prompt = render_workflow_creation_prompt(
-            "Daily Summary",
-            "daily_summary",
-            "DailySummaryBot",
-            "text",
-            "journals/text",
-            "scripts/daily_summary_skill/run_daily_summary.py",
-            "skills/daily_summary/SKILL.md",
-            "posts/daily_summary",
-            "Write in a clear, natural voice.",
-            "# Workflow Bot Creation Skill\n",
-            "#!/usr/bin/env python3\nprint('template')\n",
-        );
-        assert!(prompt.contains("## Script File Payload (authoritative)"));
-        assert!(prompt.contains(
-            "Do not respond with only a file path reference."
-        ));
-        assert!(prompt.contains("### `scripts/daily_summary_skill/run_daily_summary.py` initial content"));
-        assert!(prompt.contains("print('template')"));
-        assert!(prompt.contains("Replace `scripts/daily_summary_skill/run_daily_summary.py` with your full updated script content"));
-    }
-
-    #[test]
     fn workflow_comment_prompt_mentions_allowed_files_and_guardrails() {
         let store = sample_workflow_store();
         let wf = workflow_definition_by_key(&store, "daily_summary").unwrap();
@@ -5989,47 +6368,8 @@ mod tests {
             "Make tone more human and less robotic",
         );
         assert!(prompt.contains("Workflow: DailySummaryBot (daily_summary)"));
-        assert!(prompt.contains("scripts/daily_summary_skill/run_daily_summary.py"));
+        assert!(prompt.contains("skills/daily_summary/SKILL.md"));
         assert!(prompt.contains("Keep feed output rooted under `posts/daily_summary/`"));
-    }
-
-    #[test]
-    fn workflow_self_heal_prompt_mentions_allowed_files_and_command() {
-        let store = sample_workflow_store();
-        let wf = workflow_definition_by_key(&store, "audio_roundup").unwrap();
-        let prompt = workflow_self_heal_prompt(
-            &wf,
-            &wf.bot_name,
-            "workspace-script scripts/audio_roundup_skill/run_audio_roundup.py --mode random --random-count 1",
-            "python3: can't open file 'scripts/audio_roundup_skill/processor.py'",
-            1,
-            1,
-        );
-        assert!(prompt.contains("workflow supervisor"));
-        assert!(prompt.contains("scripts/audio_roundup_skill/run_audio_roundup.py"));
-        assert!(prompt.contains("can't open file"));
-        assert!(prompt.contains("Target command"));
-    }
-
-    #[test]
-    fn workflow_command_preview_respects_mode_controls() {
-        let store = sample_workflow_store();
-        let wf = workflow_definition_by_key(&store, "daily_summary").unwrap();
-        let mut settings = workflow_default_settings();
-
-        settings.mode = FeedWorkflowMode::DateRange;
-        settings.days = 5;
-        let date_cmd = workflow_command_preview(&wf, &settings);
-        assert!(date_cmd.contains("workspace-script"));
-        assert!(date_cmd.contains("scripts/daily_summary_skill/run_daily_summary.py"));
-        assert!(date_cmd.contains("--mode date_range"));
-        assert!(date_cmd.contains("--days 5"));
-
-        settings.mode = FeedWorkflowMode::Random;
-        settings.random_count = 3;
-        let random_cmd = workflow_command_preview(&wf, &settings);
-        assert!(random_cmd.contains("--mode random"));
-        assert!(random_cmd.contains("--random-count 3"));
     }
 
     #[test]
@@ -6041,6 +6381,7 @@ mod tests {
             schedule_enabled: true,
             schedule_cron: "   ".to_string(),
             schedule_tz: Some("   ".to_string()),
+            goal: None,
             prompt: None,
         };
 
@@ -6062,59 +6403,6 @@ mod tests {
             &wf,
             "posts/audio_roundup/20260303_audio_roundup.md",
             "please fix this import error",
-        )
-        .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn workflow_run_quickfix_adds_missing_prompt_arg_for_legacy_script() {
-        let store = sample_workflow_store();
-        let wf = workflow_definition_by_key(&store, "daily_summary").unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let script_path = temp.path().join(&wf.script_path);
-        std::fs::create_dir_all(script_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &script_path,
-            "#!/usr/bin/env python3\n\
-from __future__ import annotations\n\
-\n\
-import argparse\n\
-\n\
-USER_PROMPT = \"\"\n\
-\n\
-def parse_args() -> argparse.Namespace:\n\
-    parser = argparse.ArgumentParser(description=\"Generated workflow bot script\")\n\
-    parser.add_argument(\"--mode\", choices=[\"date_range\", \"random\"], default=\"date_range\")\n\
-    parser.add_argument(\"--days\", type=int, default=7)\n\
-    parser.add_argument(\"--random-count\", type=int, default=1)\n\
-    return parser.parse_args()\n\
-",
-        )
-        .unwrap();
-
-        let result = maybe_apply_workflow_run_quickfix(
-            temp.path(),
-            &wf,
-            "run_tweeto.py: error: unrecognized arguments: --prompt \"generate insightful tweets\"",
-        )
-        .unwrap();
-        assert!(result.is_some());
-
-        let script = std::fs::read_to_string(&script_path).unwrap();
-        assert!(script.contains("parser.add_argument(\"--prompt\", default=USER_PROMPT)"));
-    }
-
-    #[test]
-    fn workflow_run_quickfix_skips_when_error_is_unrelated() {
-        let store = sample_workflow_store();
-        let wf = workflow_definition_by_key(&store, "daily_summary").unwrap();
-        let temp = tempfile::tempdir().unwrap();
-
-        let result = maybe_apply_workflow_run_quickfix(
-            temp.path(),
-            &wf,
-            "{\"ok\": false, \"error\": \"script missing\"}",
         )
         .unwrap();
         assert!(result.is_none());

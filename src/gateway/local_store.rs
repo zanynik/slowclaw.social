@@ -66,6 +66,37 @@ pub struct MediaAssetInput {
     pub created_at_client: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FeedInterestRecord {
+    pub id: String,
+    pub label: String,
+    pub source_path: String,
+    pub embedding: Vec<u8>,
+    pub health_score: f64,
+    pub last_seen_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedInterestUpsert {
+    pub id: Option<String>,
+    pub label: String,
+    pub source_path: String,
+    pub embedding: Vec<u8>,
+    pub health_score: f64,
+    pub last_seen_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedInterestSourceRecord {
+    pub source_path: String,
+    pub content_hash: String,
+    pub interest_id: Option<String>,
+    pub title: String,
+    pub updated_at: String,
+}
+
 pub fn initialize(workspace_dir: &Path) -> Result<BootstrapReport> {
     let db_path = db_path(workspace_dir);
     if let Some(parent) = db_path.parent() {
@@ -432,6 +463,145 @@ pub fn create_media_asset_metadata(
     }))
 }
 
+pub fn list_feed_interests(workspace_dir: &Path) -> Result<Vec<FeedInterestRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, label, source_path, embedding, health_score, last_seen_at, created_at, updated_at
+         FROM feed_interests
+         ORDER BY updated_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(FeedInterestRecord {
+            id: row.get(0)?,
+            label: row.get(1)?,
+            source_path: row.get(2)?,
+            embedding: row.get(3)?,
+            health_score: row.get(4)?,
+            last_seen_at: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn upsert_feed_interest(
+    workspace_dir: &Path,
+    interest: &FeedInterestUpsert,
+) -> Result<FeedInterestRecord> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    let id = interest
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("lc_{}", Uuid::new_v4().simple()));
+    conn.execute(
+        "INSERT INTO feed_interests (
+            id, label, source_path, embedding, health_score, last_seen_at, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+            label = excluded.label,
+            source_path = excluded.source_path,
+            embedding = excluded.embedding,
+            health_score = excluded.health_score,
+            last_seen_at = excluded.last_seen_at,
+            updated_at = excluded.updated_at",
+        params![
+            id,
+            interest.label,
+            interest.source_path,
+            interest.embedding,
+            interest.health_score,
+            interest.last_seen_at,
+            now
+        ],
+    )
+    .context("Failed to upsert feed interest")?;
+
+    Ok(FeedInterestRecord {
+        id,
+        label: interest.label.clone(),
+        source_path: interest.source_path.clone(),
+        embedding: interest.embedding.clone(),
+        health_score: interest.health_score,
+        last_seen_at: interest.last_seen_at.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+pub fn decay_feed_interests(workspace_dir: &Path, decay_rate: f64) -> Result<usize> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    let updated = conn.execute(
+        "UPDATE feed_interests
+         SET health_score = MAX(0.0, MIN(1.0, health_score * ?1)),
+             updated_at = ?2",
+        params![decay_rate, now],
+    )?;
+    Ok(updated)
+}
+
+pub fn get_feed_interest_source(
+    workspace_dir: &Path,
+    source_path: &str,
+) -> Result<Option<FeedInterestSourceRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT source_path, content_hash, interest_id, title, updated_at
+         FROM feed_interest_sources
+         WHERE source_path = ?1
+         LIMIT 1",
+    )?;
+    let row = stmt
+        .query_row(params![source_path], |row| {
+            let interest_id: String = row.get(2)?;
+            Ok(FeedInterestSourceRecord {
+                source_path: row.get(0)?,
+                content_hash: row.get(1)?,
+                interest_id: non_empty_opt(interest_id),
+                title: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+pub fn upsert_feed_interest_source(
+    workspace_dir: &Path,
+    source: &FeedInterestSourceRecord,
+) -> Result<()> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    conn.execute(
+        "INSERT INTO feed_interest_sources (
+            source_path, content_hash, interest_id, title, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(source_path) DO UPDATE SET
+            content_hash = excluded.content_hash,
+            interest_id = excluded.interest_id,
+            title = excluded.title,
+            updated_at = excluded.updated_at",
+        params![
+            source.source_path,
+            source.content_hash,
+            source.interest_id.clone().unwrap_or_default(),
+            source.title,
+            source.updated_at
+        ],
+    )
+    .context("Failed to upsert feed interest source")?;
+    Ok(())
+}
+
 fn open_conn(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open local store {}", path.display()))?;
@@ -540,7 +710,30 @@ fn init_schema(conn: &Connection) -> Result<()> {
             created TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_artifacts_path
-            ON artifacts(workspace_path);",
+            ON artifacts(workspace_path);
+
+        CREATE TABLE IF NOT EXISTS feed_interests (
+            id TEXT PRIMARY KEY,
+            label TEXT NOT NULL DEFAULT '',
+            source_path TEXT NOT NULL DEFAULT '',
+            embedding BLOB NOT NULL,
+            health_score REAL NOT NULL DEFAULT 1.0,
+            last_seen_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_feed_interests_updated
+            ON feed_interests(updated_at);
+
+        CREATE TABLE IF NOT EXISTS feed_interest_sources (
+            source_path TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL DEFAULT '',
+            interest_id TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_feed_interest_sources_interest_id
+            ON feed_interest_sources(interest_id);",
     )
     .context("Failed to initialize local store schema")?;
 
@@ -609,6 +802,8 @@ mod tests {
         assert!(table_exists(&conn, "journal_entries").unwrap());
         assert!(table_exists(&conn, "media_assets").unwrap());
         assert!(table_exists(&conn, "artifacts").unwrap());
+        assert!(table_exists(&conn, "feed_interests").unwrap());
+        assert!(table_exists(&conn, "feed_interest_sources").unwrap());
     }
 
     #[test]
@@ -807,6 +1002,58 @@ mod tests {
         assert_eq!(non_empty_opt("  spaced  ".into()), Some("spaced".into()));
         assert_eq!(non_empty_opt("".into()), None);
         assert_eq!(non_empty_opt("   ".into()), None);
+    }
+
+    #[test]
+    fn feed_interest_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        let interest = upsert_feed_interest(
+            tmp.path(),
+            &FeedInterestUpsert {
+                id: None,
+                label: "Machine Learning".into(),
+                source_path: "posts/ml/one.md".into(),
+                embedding: vec![1, 2, 3, 4],
+                health_score: 0.8,
+                last_seen_at: "2026-03-09T12:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(interest.label, "Machine Learning");
+
+        let interests = list_feed_interests(tmp.path()).unwrap();
+        assert_eq!(interests.len(), 1);
+        assert_eq!(interests[0].source_path, "posts/ml/one.md");
+
+        let decayed = decay_feed_interests(tmp.path(), 0.95).unwrap();
+        assert_eq!(decayed, 1);
+        let interests = list_feed_interests(tmp.path()).unwrap();
+        assert!(interests[0].health_score < 0.8);
+    }
+
+    #[test]
+    fn feed_interest_source_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        upsert_feed_interest_source(
+            tmp.path(),
+            &FeedInterestSourceRecord {
+                source_path: "posts/ml/one.md".into(),
+                content_hash: "abc123".into(),
+                interest_id: Some("interest-1".into()),
+                title: "Machine Learning".into(),
+                updated_at: "2026-03-09T12:00:00Z".into(),
+            },
+        )
+        .unwrap();
+
+        let source = get_feed_interest_source(tmp.path(), "posts/ml/one.md").unwrap();
+        let source = source.expect("source record should exist");
+        assert_eq!(source.content_hash, "abc123");
+        assert_eq!(source.interest_id.as_deref(), Some("interest-1"));
     }
 
 }
