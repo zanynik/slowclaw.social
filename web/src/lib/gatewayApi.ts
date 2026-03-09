@@ -174,6 +174,23 @@ export type PersonalizedBlueskyFeedResponse = {
   message?: string;
 };
 
+export type WorkspaceSyncFile = {
+  path: string;
+  modifiedAt: number;
+  contentBase64: string;
+};
+
+export type LocalStoreSyncBlob = {
+  modifiedAt: number;
+  contentBase64: string;
+};
+
+export type WorkspaceSyncSnapshot = {
+  exportedAt: number;
+  files: WorkspaceSyncFile[];
+  localStore?: LocalStoreSyncBlob | null;
+};
+
 export async function pairGatewayClient(oneTimeCode: string, gatewayBaseUrl?: string) {
   const code = oneTimeCode.trim();
   if (!code) {
@@ -259,6 +276,45 @@ export async function fetchPersonalizedBlueskyFeed(
     usedFallback: Boolean(data.usedFallback),
     message: typeof data.message === "string" ? data.message : undefined
   };
+}
+
+export async function exportWorkspaceSyncSnapshot(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<WorkspaceSyncSnapshot> {
+  const res = await fetch(resolveGatewayEndpoint("/api/sync/export", gatewayBaseUrl), {
+    headers: authHeaders(bearerToken)
+  });
+  const data = await parseJsonOrThrow(res);
+  return {
+    exportedAt: Number(data.exportedAt || 0),
+    files: Array.isArray(data.files)
+      ? data.files.map((item: any) => ({
+          path: String(item?.path || ""),
+          modifiedAt: Number(item?.modifiedAt || 0),
+          contentBase64: String(item?.contentBase64 || "")
+        }))
+      : [],
+    localStore: data.localStore
+      ? {
+          modifiedAt: Number(data.localStore.modifiedAt || 0),
+          contentBase64: String(data.localStore.contentBase64 || "")
+        }
+      : null
+  };
+}
+
+export async function importWorkspaceSyncSnapshot(
+  snapshot: WorkspaceSyncSnapshot,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+) {
+  const res = await fetch(resolveGatewayEndpoint("/api/sync/import", gatewayBaseUrl), {
+    method: "POST",
+    headers: authHeaders(bearerToken, "application/json"),
+    body: JSON.stringify(snapshot)
+  });
+  return parseJsonOrThrow(res);
 }
 
 export async function listLibraryItems(

@@ -40,12 +40,17 @@ import type {
 } from "./lib/tauriApi";
 // ── Secure storage (keyring wrappers — unchanged) ────────────────────────────
 import {
+  clearSyncPeerSecure,
   deleteCredentialsSecure,
   loadGatewayTokenSecure,
   loadCredentialsFallback,
   loadCredentialsSecure,
+  loadSyncPeerTokenSecure,
+  loadSyncPeerUrlSecure,
   saveGatewayTokenSecure,
   saveBlueskySessionSecure,
+  saveSyncPeerTokenSecure,
+  saveSyncPeerUrlSecure,
   saveCredentialsSecure,
 } from "./lib/secureStorage";
 import type {
@@ -65,9 +70,11 @@ import {
   createJournalTextViaGateway,
   createPostHistory,
   deleteLibraryItem,
+  exportWorkspaceSyncSnapshot,
   fetchPersonalizedBlueskyFeed,
   fetchMediaAsFile,
   getJournalTranscriptionStatus,
+  importWorkspaceSyncSnapshot,
   getRuntimeConfig,
   listClawChatMessages,
   listDrafts as listDraftsViaGateway,
@@ -93,6 +100,8 @@ import type {
 const CHAT_THREAD_STORAGE_KEY = "slowclaw.chat.thread_id";
 const CHAT_GATEWAY_BASE_URL_STORAGE_KEY = "slowclaw.chat.gateway_base_url";
 const CHAT_GATEWAY_TOKEN_STORAGE_KEY = "slowclaw.chat.gateway_token";
+const SYNC_PEER_GATEWAY_BASE_URL_STORAGE_KEY = "slowclaw.sync.peer.gateway_base_url";
+const SYNC_PEER_GATEWAY_TOKEN_STORAGE_KEY = "slowclaw.sync.peer.gateway_token";
 const CHAT_PROVIDER_STORAGE_KEY = "slowclaw.settings.provider";
 const CHAT_MODEL_STORAGE_KEY = "slowclaw.settings.model";
 const LOCAL_JOURNAL_PATH_PREFIX = "journal://";
@@ -666,6 +675,21 @@ function App() {
     }
     return window.localStorage.getItem(CHAT_GATEWAY_TOKEN_STORAGE_KEY) || "";
   });
+  const [syncPeerGatewayUrl, setSyncPeerGatewayUrl] = useState<string>(() => {
+    if (typeof window === "undefined") {
+      return "";
+    }
+    return window.localStorage.getItem(SYNC_PEER_GATEWAY_BASE_URL_STORAGE_KEY) || "";
+  });
+  const [syncPeerToken, setSyncPeerToken] = useState<string>(() => {
+    if (typeof window === "undefined") {
+      return "";
+    }
+    return window.localStorage.getItem(SYNC_PEER_GATEWAY_TOKEN_STORAGE_KEY) || "";
+  });
+  const [syncStatus, setSyncStatus] = useState("");
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncScannerActive, setSyncScannerActive] = useState(false);
   const [desktopQrLoading, setDesktopQrLoading] = useState(false);
   const [desktopQrPayload, setDesktopQrPayload] = useState<GatewayQrPayload | null>(null);
   const [desktopQrStatus, setDesktopQrStatus] = useState("");
@@ -848,6 +872,14 @@ function App() {
         } else {
           await syncDesktopGatewayBootstrap();
         }
+        const secureSyncPeerUrl = await loadSyncPeerUrlSecure();
+        const secureSyncPeerToken = await loadSyncPeerTokenSecure();
+        if (secureSyncPeerUrl) {
+          setSyncPeerGatewayUrl(secureSyncPeerUrl);
+        }
+        if (secureSyncPeerToken) {
+          setSyncPeerToken(secureSyncPeerToken);
+        }
         const apiKeySecret = await invokeDesktopCommand<{ value: string | null }>("get_secret", {
           req: { service: DESKTOP_SECRET_SERVICE, account: PROVIDER_API_KEY_SECRET_ACCOUNT }
         });
@@ -892,6 +924,28 @@ function App() {
       void saveGatewayTokenSecure(normalized);
     }
   }, [chatGatewayToken, isDesktopClient]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const normalized = syncPeerGatewayUrl.trim().replace(/\/+$/, "");
+    window.localStorage.setItem(SYNC_PEER_GATEWAY_BASE_URL_STORAGE_KEY, normalized);
+    if (isDesktopClient && normalized) {
+      void saveSyncPeerUrlSecure(normalized);
+    }
+  }, [syncPeerGatewayUrl, isDesktopClient]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const normalized = syncPeerToken.trim();
+    window.localStorage.setItem(SYNC_PEER_GATEWAY_TOKEN_STORAGE_KEY, normalized);
+    if (isDesktopClient && normalized) {
+      void saveSyncPeerTokenSecure(normalized);
+    }
+  }, [syncPeerToken, isDesktopClient]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -3297,6 +3351,17 @@ function App() {
     void refreshClawChat();
   }
 
+  function applySyncPeerConnection(gatewayUrl: string, token: string) {
+    const normalizedUrl = gatewayUrl.trim().replace(/\/+$/, "");
+    const normalizedToken = token.trim();
+    if (!normalizedUrl || !normalizedToken) {
+      return;
+    }
+    setSyncPeerGatewayUrl(normalizedUrl);
+    setSyncPeerToken(normalizedToken);
+    setSyncStatus(`Sync peer saved: ${normalizedUrl}`);
+  }
+
   function parseGatewayQrPayload(rawValue: string): { gatewayUrl: string; token: string } | null {
     const raw = rawValue.trim();
     if (!raw) {
@@ -3312,6 +3377,46 @@ function App() {
       return { gatewayUrl, token };
     } catch {
       return null;
+    }
+  }
+
+  async function syncWithPeerNow() {
+    const peerUrl = syncPeerGatewayUrl.trim().replace(/\/+$/, "");
+    const peerToken = syncPeerToken.trim();
+    if (!peerUrl || !peerToken) {
+      setSyncStatus("Sync peer is not configured.");
+      return;
+    }
+    let localToken = normalizeGatewayToken(chatGatewayToken);
+    if (!localToken && isDesktopClient) {
+      localToken = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
+    }
+    setSyncBusy(true);
+    setSyncStatus("Syncing workspace...");
+    try {
+      const snapshot = await exportWorkspaceSyncSnapshot(peerToken, peerUrl);
+      const result = await importWorkspaceSyncSnapshot(snapshot, localToken || undefined, gatewayBaseUrl);
+      setSyncStatus(
+        `Sync complete (${Number(result?.importedFiles || 0)} files${result?.importedDb ? ", local DB updated" : ""}).`
+      );
+      await Promise.all([refreshLibrary("all"), refreshPostHistory(), refreshDrafts()]);
+      void loadFeedWorkflowSettings();
+      if (feedSource === "bluesky") {
+        void fetchBlueskyFeed();
+      }
+    } catch (error) {
+      setSyncStatus(`Sync failed (${error instanceof Error ? error.message : String(error)})`);
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  async function clearSyncPeerConnection() {
+    setSyncPeerGatewayUrl("");
+    setSyncPeerToken("");
+    setSyncStatus("Sync peer cleared.");
+    if (isDesktopClient) {
+      await clearSyncPeerSecure().catch(() => {});
     }
   }
 
@@ -3641,14 +3746,13 @@ function App() {
       mobileScannerVideoRef.current.srcObject = null;
     }
     setMobileScannerActive(false);
+    setSyncScannerActive(false);
   }
 
   useEffect(() => {
-    if (isDesktopClient) {
-      return;
-    }
-    const needsQrLogin = !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
-    if (!needsQrLogin || !mobileScannerActive) {
+    const needsQrLogin = !isDesktopClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
+    const shouldScan = syncScannerActive || (needsQrLogin && mobileScannerActive);
+    if (!shouldScan) {
       return;
     }
     let cancelled = false;
@@ -3686,10 +3790,14 @@ function App() {
             if (video.readyState >= 2) {
               const codes = await detector.detect(video);
               if (codes && codes.length > 0) {
-                const value = String(codes[0].rawValue || "");
-                const parsed = parseGatewayQrPayload(value);
-                if (parsed) {
-                  applyGatewayConnection(parsed.gatewayUrl, parsed.token);
+              const value = String(codes[0].rawValue || "");
+              const parsed = parseGatewayQrPayload(value);
+              if (parsed) {
+                  if (syncScannerActive && isTauriMobileRuntime()) {
+                    applySyncPeerConnection(parsed.gatewayUrl, parsed.token);
+                  } else {
+                    applyGatewayConnection(parsed.gatewayUrl, parsed.token);
+                  }
                   stopMobileScanner();
                   return;
                 }
@@ -3728,7 +3836,7 @@ function App() {
         mobileScannerVideoRef.current.srcObject = null;
       }
     };
-  }, [isDesktopClient, mobileScannerActive, chatGatewayToken, gatewayBaseUrl]);
+  }, [isDesktopClient, mobileScannerActive, syncScannerActive, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     if (!isDesktopClient) {
@@ -5134,7 +5242,7 @@ function App() {
             </div>
 
             <div className="card">
-              <h2>Bluesky Login (Desktop)</h2>
+              <h2>Bluesky Login</h2>
               <form className="stack" onSubmit={handleLogin}>
                 <p className="text-sm muted">Service: {creds.serviceUrl || "https://bsky.social"}</p>
                 <input
@@ -5172,21 +5280,21 @@ function App() {
             {isDesktopClient && (
               <>
                 <div className="card">
-                  <h2>Gateway & App Settings</h2>
+                  <h2>Local Runtime & Pairing</h2>
                   <div className="stack">
                     <p className="text-sm muted">
-                      Chat and journal upload use desktop gateway auth automatically.
+                      This app uses its embedded local gateway automatically. Pairing is used for device sync.
                     </p>
 
                     <p className="text-sm muted">
                       {chatGatewayToken
-                        ? "Gateway auth is ready for chat + journal uploads."
-                        : "Waiting for desktop gateway auth bootstrap."}
+                        ? "Local runtime is ready."
+                        : "Waiting for local runtime bootstrap."}
                     </p>
 
                     <div className="stack" style={{ gap: "0.8rem" }}>
                       <div className="row-between">
-                        <p><strong>Pair Mobile With QR</strong></p>
+                        <p><strong>Generate Sync QR</strong></p>
                         <button
                           type="button"
                           onClick={() => void generateDesktopPairingQr()}
@@ -5201,12 +5309,69 @@ function App() {
                             <QRCodeCanvas value={desktopQrPayload.qr_value} size={220} includeMargin />
                           </Suspense>
                           <p className="text-sm muted text-center">
-                            Mobile gateway: {desktopQrPayload.gateway_url}
+                            Sync peer gateway: {desktopQrPayload.gateway_url}
                           </p>
                         </div>
                       )}
                       {desktopQrStatus ? <p className="text-sm muted">{desktopQrStatus}</p> : null}
                     </div>
+                  </div>
+                </div>
+
+                <div className="card">
+                  <h2>Sync Peer</h2>
+                  <div className="stack">
+                    <p className="text-sm muted">
+                      Optional remote peer used only for workspace sync. Local journal, feed, and content-agent runtime stay local.
+                    </p>
+                    <input
+                      value={syncPeerGatewayUrl}
+                      onChange={(e) => setSyncPeerGatewayUrl(e.target.value)}
+                      placeholder="Peer gateway URL"
+                    />
+                    <input
+                      type="password"
+                      value={syncPeerToken}
+                      onChange={(e) => setSyncPeerToken(e.target.value)}
+                      placeholder="Peer sync token"
+                    />
+                    <div className="row">
+                      <button type="button" className="primary" onClick={() => void syncWithPeerNow()} disabled={syncBusy}>
+                        {syncBusy ? "Syncing..." : "Sync Now"}
+                      </button>
+                      {isTauriMobileRuntime() ? (
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() => {
+                            setSyncScannerActive(true);
+                            setMobileScannerActive(true);
+                            setSyncStatus("Scanning sync QR...");
+                          }}
+                          disabled={syncScannerActive}
+                        >
+                          {syncScannerActive ? "Scanner Active" : "Scan Sync QR"}
+                        </button>
+                      ) : null}
+                      <button type="button" className="ghost" onClick={() => void clearSyncPeerConnection()}>
+                        Clear Peer
+                      </button>
+                    </div>
+                    {syncScannerActive ? (
+                      <video
+                        ref={mobileScannerVideoRef}
+                        style={{
+                          width: "100%",
+                          maxWidth: "360px",
+                          borderRadius: "14px",
+                          background: "#000",
+                          minHeight: "240px"
+                        }}
+                        playsInline
+                        muted
+                      />
+                    ) : null}
+                    {syncStatus ? <p className="text-sm muted">{syncStatus}</p> : null}
                   </div>
                 </div>
 

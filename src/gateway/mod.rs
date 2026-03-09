@@ -17,6 +17,7 @@ use crate::providers::{self, ChatMessage, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{Datelike, Utc};
 use axum::{
     extract::{ConnectInfo, Path as AxumPath, Query, Request, State},
@@ -59,6 +60,7 @@ pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
 const JOURNAL_TEXT_DIR: &str = "journals/text";
 const JOURNAL_MEDIA_DIR: &str = "journals/media";
+const SYNC_ALLOWED_ROOTS: &[&str] = &["journals", "posts", "skills"];
 const CONTENT_AGENT_APP_OPEN_STALE_SECS: i64 = 15 * 60;
 
 fn webhook_memory_key() -> String {
@@ -543,6 +545,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/feed/bluesky/personalized",
             post(handle_feed_bluesky_personalized),
         )
+        .route("/api/sync/export", get(handle_sync_export))
+        .route("/api/sync/import", post(handle_sync_import))
         .route("/api/feed/workflow-run", post(handle_feed_workflow_run))
         .route("/api/feed/workflow-auto-run", post(handle_feed_workflow_auto_run))
         .route("/api/drafts", get(handle_drafts_list).post(handle_drafts_upsert))
@@ -806,6 +810,50 @@ async fn handle_pair_new_code(
         "message": "New one-time pairing code generated"
     });
     (StatusCode::OK, Json(body))
+}
+
+async fn handle_sync_export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Sync export") {
+        return err;
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    match export_workspace_sync_snapshot(&workspace_dir) {
+        Ok(snapshot) => (StatusCode::OK, Json(serde_json::json!(snapshot))),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to export sync snapshot: {err}")})),
+        ),
+    }
+}
+
+async fn handle_sync_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(snapshot): Json<WorkspaceSyncSnapshot>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Sync import") {
+        return err;
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    match import_workspace_sync_snapshot(&workspace_dir, &snapshot) {
+        Ok((imported_files, imported_db)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "importedFiles": imported_files,
+                "importedDb": imported_db,
+                "imported": true,
+            })),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to import sync snapshot: {err}")})),
+        ),
+    }
 }
 
 async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
@@ -4529,6 +4577,29 @@ struct RebuildInterestProfileResult {
     interests: Vec<ActiveInterest>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSyncFile {
+    path: String,
+    modified_at: i64,
+    content_base64: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalStoreSyncBlob {
+    modified_at: i64,
+    content_base64: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSyncSnapshot {
+    exported_at: i64,
+    files: Vec<WorkspaceSyncFile>,
+    local_store: Option<LocalStoreSyncBlob>,
+}
+
 fn content_hash_16(text: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -4887,6 +4958,176 @@ async fn rank_bluesky_candidates(
         ranked.into_iter().filter(|item| item.passed_threshold).collect();
     sort_personalized_items(&mut filtered);
     Ok(filtered)
+}
+
+fn modified_unix_secs(path: &StdPath) -> i64 {
+    path.metadata()
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+fn sync_file_allowed(path: &str) -> bool {
+    let normalized = path.trim().trim_start_matches('/').replace('\\', "/");
+    if normalized.is_empty() || normalized.contains("..") {
+        return false;
+    }
+    if normalized == "feed_workflow_settings.json" {
+        return true;
+    }
+    SYNC_ALLOWED_ROOTS
+        .iter()
+        .any(|root| normalized == *root || normalized.starts_with(&format!("{root}/")))
+}
+
+fn collect_sync_files_recursive(
+    workspace_dir: &StdPath,
+    dir: &StdPath,
+    out: &mut Vec<WorkspaceSyncFile>,
+) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            collect_sync_files_recursive(workspace_dir, &path, out)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let rel = match path.strip_prefix(workspace_dir) {
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        if !sync_file_allowed(&rel) {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        out.push(WorkspaceSyncFile {
+            path: rel,
+            modified_at: modified_unix_secs(&path),
+            content_base64: BASE64_STANDARD.encode(bytes),
+        });
+    }
+    Ok(())
+}
+
+fn export_local_store_blob(workspace_dir: &StdPath) -> Result<Option<LocalStoreSyncBlob>> {
+    let db_path = local_store::db_path(workspace_dir);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    {
+        let conn = rusqlite::Connection::open(&db_path)
+            .with_context(|| format!("Failed to open sync export DB {}", db_path.display()))?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+
+    let bytes = std::fs::read(&db_path)
+        .with_context(|| format!("Failed to read local store DB {}", db_path.display()))?;
+    Ok(Some(LocalStoreSyncBlob {
+        modified_at: modified_unix_secs(&db_path),
+        content_base64: BASE64_STANDARD.encode(bytes),
+    }))
+}
+
+fn export_workspace_sync_snapshot(workspace_dir: &StdPath) -> Result<WorkspaceSyncSnapshot> {
+    let mut files = Vec::new();
+    for root in SYNC_ALLOWED_ROOTS {
+        collect_sync_files_recursive(workspace_dir, &workspace_dir.join(root), &mut files)?;
+    }
+    let workflow_settings = workspace_dir.join("feed_workflow_settings.json");
+    if workflow_settings.exists() && workflow_settings.is_file() {
+        let bytes = std::fs::read(&workflow_settings)
+            .with_context(|| format!("Failed to read {}", workflow_settings.display()))?;
+        files.push(WorkspaceSyncFile {
+            path: "feed_workflow_settings.json".to_string(),
+            modified_at: modified_unix_secs(&workflow_settings),
+            content_base64: BASE64_STANDARD.encode(bytes),
+        });
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(WorkspaceSyncSnapshot {
+        exported_at: Utc::now().timestamp(),
+        files,
+        local_store: export_local_store_blob(workspace_dir)?,
+    })
+}
+
+fn import_workspace_sync_snapshot(
+    workspace_dir: &StdPath,
+    snapshot: &WorkspaceSyncSnapshot,
+) -> Result<(usize, bool)> {
+    let mut imported_files = 0_usize;
+    for file in &snapshot.files {
+        if !sync_file_allowed(&file.path) {
+            continue;
+        }
+        let abs_path = workspace_dir.join(&file.path);
+        let current_modified = modified_unix_secs(&abs_path);
+        if abs_path.exists() && current_modified > file.modified_at {
+            continue;
+        }
+        let bytes = BASE64_STANDARD
+            .decode(file.content_base64.as_bytes())
+            .with_context(|| format!("Failed to decode sync file {}", file.path))?;
+        if let Some(parent) = abs_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        std::fs::write(&abs_path, bytes)
+            .with_context(|| format!("Failed to write synced file {}", abs_path.display()))?;
+        imported_files += 1;
+    }
+
+    let mut imported_db = false;
+    if let Some(local_store_blob) = &snapshot.local_store {
+        let db_path = local_store::db_path(workspace_dir);
+        let local_modified = modified_unix_secs(&db_path);
+        if !db_path.exists() || local_modified <= local_store_blob.modified_at {
+            let bytes = BASE64_STANDARD
+                .decode(local_store_blob.content_base64.as_bytes())
+                .context("Failed to decode synced local store")?;
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create {}", parent.display()))?;
+            }
+            let temp_path = db_path.with_extension("db.sync.tmp");
+            std::fs::write(&temp_path, bytes)
+                .with_context(|| format!("Failed to write temp DB {}", temp_path.display()))?;
+            std::fs::rename(&temp_path, &db_path)
+                .with_context(|| format!("Failed to replace DB {}", db_path.display()))?;
+            let wal_path = db_path.with_extension("db-wal");
+            if wal_path.exists() {
+                let _ = std::fs::remove_file(&wal_path);
+            }
+            let shm_path = db_path.with_extension("db-shm");
+            if shm_path.exists() {
+                let _ = std::fs::remove_file(&shm_path);
+            }
+            imported_db = true;
+        }
+    }
+
+    Ok((imported_files, imported_db))
 }
 
 async fn create_journal_entry_metadata(

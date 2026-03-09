@@ -7,6 +7,8 @@ const SECRET_ACCOUNT = "bluesky.credentials";
 const SESSION_ACCOUNT = "bluesky.session";
 const GATEWAY_SECRET_SERVICE = "social.slowclaw.gateway";
 const GATEWAY_SECRET_ACCOUNT = "desktop.gateway.token";
+const SYNC_PEER_URL_ACCOUNT = "sync.peer.gateway_url";
+const SYNC_PEER_TOKEN_ACCOUNT = "sync.peer.gateway_token";
 
 type SecretGetResponse = { value: string | null };
 
@@ -144,5 +146,62 @@ export async function saveGatewayTokenSecure(token: string): Promise<void> {
       account: GATEWAY_SECRET_ACCOUNT,
       value: normalized
     }
+  });
+}
+
+export async function loadSyncPeerUrlSecure(): Promise<string | null> {
+  const res = await invokeTauri<SecretGetResponse>("get_secret", {
+    req: { service: GATEWAY_SECRET_SERVICE, account: SYNC_PEER_URL_ACCOUNT }
+  });
+  if (!res?.value || !res.value.trim()) {
+    return null;
+  }
+  return res.value.trim();
+}
+
+export async function saveSyncPeerUrlSecure(url: string): Promise<void> {
+  const normalized = url.trim();
+  if (!normalized) {
+    return;
+  }
+  await invokeTauri<void>("set_secret", {
+    req: {
+      service: GATEWAY_SECRET_SERVICE,
+      account: SYNC_PEER_URL_ACCOUNT,
+      value: normalized
+    }
+  });
+}
+
+export async function loadSyncPeerTokenSecure(): Promise<string | null> {
+  const res = await invokeTauri<SecretGetResponse>("get_secret", {
+    req: { service: GATEWAY_SECRET_SERVICE, account: SYNC_PEER_TOKEN_ACCOUNT }
+  });
+  if (!res?.value || !res.value.trim()) {
+    return null;
+  }
+  return res.value.trim();
+}
+
+export async function saveSyncPeerTokenSecure(token: string): Promise<void> {
+  const normalized = token.trim();
+  if (!normalized) {
+    return;
+  }
+  await invokeTauri<void>("set_secret", {
+    req: {
+      service: GATEWAY_SECRET_SERVICE,
+      account: SYNC_PEER_TOKEN_ACCOUNT,
+      value: normalized
+    }
+  });
+}
+
+export async function clearSyncPeerSecure(): Promise<void> {
+  await invokeTauri<void>("delete_secret", {
+    req: { service: GATEWAY_SECRET_SERVICE, account: SYNC_PEER_URL_ACCOUNT }
+  });
+  await invokeTauri<void>("delete_secret", {
+    req: { service: GATEWAY_SECRET_SERVICE, account: SYNC_PEER_TOKEN_ACCOUNT }
   });
 }
