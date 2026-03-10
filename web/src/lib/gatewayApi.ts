@@ -97,6 +97,8 @@ export type FeedContentAgentItem = {
   skillPath: string;
   outputPrefix: string;
   enabled: boolean;
+  supported?: boolean;
+  unsupportedReason?: string;
   goal?: string;
   editableFiles?: string[];
 };
@@ -618,6 +620,10 @@ function mapFeedContentAgentItem(item: any): FeedContentAgentItem {
     skillPath: String(item?.skillPath || ""),
     outputPrefix: String(item?.outputPrefix || ""),
     enabled: item?.enabled !== false,
+    supported: item?.supported !== false,
+    unsupportedReason: item?.unsupportedReason
+      ? String(item.unsupportedReason)
+      : undefined,
     goal: item?.goal ? String(item.goal) : undefined,
     editableFiles: Array.isArray(item?.editableFiles)
       ? item.editableFiles.map((value: unknown) => String(value))

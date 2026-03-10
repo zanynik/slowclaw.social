@@ -1994,6 +1994,13 @@ function App() {
 
   async function triggerManualWorkflowRun(botKey: string) {
     const bot = workflowBots.find((item) => item.key === botKey) || workflowBotByKey(botKey);
+    const existing = workflowSettingsByKey[botKey];
+    if (existing?.supported === false) {
+      setFeedEditStatus(
+        existing.unsupportedReason || `${bot.name} cannot run on this device.`
+      );
+      return;
+    }
     let token = chatGatewayToken.trim();
     if (!token && isDesktopClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
@@ -2051,6 +2058,12 @@ function App() {
     }
     const nextEnabled = !existing.enabled;
     const agentName = existing.workflowBot || workflowBotByKey(botKey).name;
+    if (nextEnabled && existing.supported === false) {
+      setWorkflowTemplateStatus(
+        existing.unsupportedReason || `${agentName} cannot run on this device.`
+      );
+      return;
+    }
 
     setWorkflowToggleBusyKey(botKey);
     setWorkflowTemplateStatus(
@@ -4615,6 +4628,7 @@ function App() {
                     {workflowBots.map((bot) => {
                       const saved = workflowSettingsByKey[bot.key];
                       const isBusy = workflowToggleBusyKey === bot.key;
+                      const enableBlocked = saved?.enabled === false && saved?.supported === false;
                       return (
                         <div key={bot.key} className="feed-workflow-bot-row">
                           <button
@@ -4630,6 +4644,11 @@ function App() {
                               {bot.goal ? (
                                 <span className="feed-bot-goal text-sm muted">{bot.goal}</span>
                               ) : null}
+                              {saved?.unsupportedReason ? (
+                                <span className="feed-bot-goal text-sm muted">
+                                  {saved.unsupportedReason}
+                                </span>
+                              ) : null}
                             </span>
                           </button>
                           <button
@@ -4637,7 +4656,8 @@ function App() {
                             className={saved?.enabled === false ? "ghost text-sm" : "primary text-sm"}
                             style={{ minWidth: "72px", borderRadius: "999px" }}
                             onClick={() => void toggleContentAgentEnabled(bot.key)}
-                            disabled={isBusy}
+                            disabled={isBusy || enableBlocked}
+                            title={enableBlocked ? saved?.unsupportedReason : undefined}
                           >
                             {isBusy ? "..." : saved?.enabled === false ? "Off" : "On"}
                           </button>
@@ -4753,6 +4773,7 @@ function App() {
                 <div className="stack">
                   {workflowBots.map((bot) => {
                     const run = workflowRunStatusByKey[bot.key];
+                    const saved = workflowSettingsByKey[bot.key];
                     if (!run) {
                       return null;
                     }
@@ -4777,6 +4798,8 @@ function App() {
                               type="button"
                               className="ghost text-sm"
                               onClick={() => void triggerManualWorkflowRun(bot.key)}
+                              disabled={saved?.supported === false}
+                              title={saved?.unsupportedReason}
                             >
                               Retry
                             </button>
@@ -4803,6 +4826,7 @@ function App() {
                     (saved ? workflowSettingsDraftFromItem(saved) : undefined);
                   const status = workflowSettingsStatusByKey[activeWorkflowBotKey] || "";
                   const isSaving = workflowSettingsSavingKey === activeWorkflowBotKey;
+                  const unsupportedReason = saved?.unsupportedReason || "";
 
                   return (
                     <div className="workflow-settings-panel">
@@ -4852,6 +4876,9 @@ function App() {
                               <strong>{saved?.outputPrefix || `posts/${activeWorkflowBotKey}/`}</strong>
                             </div>
                           </div>
+                          {unsupportedReason ? (
+                            <div className="feed-comment-status">{unsupportedReason}</div>
+                          ) : null}
 
                           <div className="feed-comment-actions">
                             <button

@@ -1106,6 +1106,8 @@ struct FeedContentAgentResponseItem {
     skill_path: String,
     output_prefix: String,
     enabled: bool,
+    supported: bool,
+    unsupported_reason: Option<String>,
     goal: Option<String>,
     editable_files: Vec<String>,
 }
@@ -1566,13 +1568,17 @@ fn load_or_seed_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<
 fn workflow_settings_response_item(
     workflow: &FeedContentAgentDefinition,
     enabled: bool,
+    media_capabilities: MediaToolCapabilities,
 ) -> FeedContentAgentResponseItem {
+    let unsupported_reason = workflow_unsupported_reason(workflow, media_capabilities);
     FeedContentAgentResponseItem {
         workflow_key: workflow.key.to_string(),
         workflow_bot: workflow.bot_name.to_string(),
         skill_path: workflow.skill_path.to_string(),
         output_prefix: workflow.output_prefix.to_string(),
         enabled,
+        supported: unsupported_reason.is_none(),
+        unsupported_reason,
         goal: Some(workflow.goal.clone()).filter(|value| !value.trim().is_empty()),
         editable_files: workflow
             .editable_files
@@ -1580,6 +1586,64 @@ fn workflow_settings_response_item(
             .map(std::string::ToString::to_string)
             .collect(),
     }
+}
+
+fn goal_requests_media_output(goal: &str) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    [
+        " audio ",
+        " video ",
+        " clip",
+        " clips",
+        " mp4",
+        " slideshow",
+        " image ",
+        " images",
+        " transcript",
+        " narration",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle.trim()))
+}
+
+fn workflow_requires_media_capabilities(workflow: &FeedContentAgentDefinition) -> bool {
+    workflow.key == "audio_insight_clips" || goal_requests_media_output(&workflow.goal)
+}
+
+fn required_media_capability_reason(media_capabilities: MediaToolCapabilities) -> String {
+    let mut missing = Vec::new();
+    if !media_capabilities.transcribe_media {
+        missing.push("transcribe_media");
+    }
+    if !media_capabilities.compose_simple_clip {
+        missing.push("compose_simple_clip");
+    }
+    let available = media_capabilities.available_tool_names();
+    if available.is_empty() {
+        format!(
+            "This workflow requires local media tools: {}. No local media tools are currently available on this device.",
+            missing.join(", ")
+        )
+    } else {
+        format!(
+            "This workflow requires local media tools: {}. Available on this device: {}.",
+            missing.join(", "),
+            available.join(", ")
+        )
+    }
+}
+
+fn workflow_unsupported_reason(
+    workflow: &FeedContentAgentDefinition,
+    media_capabilities: MediaToolCapabilities,
+) -> Option<String> {
+    if !workflow_requires_media_capabilities(workflow) {
+        return None;
+    }
+    if media_capabilities.transcribe_media && media_capabilities.compose_simple_clip {
+        return None;
+    }
+    Some(required_media_capability_reason(media_capabilities))
 }
 
 const CONTENT_AGENT_MIN_TOOL_ITERATIONS: usize = 32;
@@ -1684,7 +1748,9 @@ fn queue_eligible_content_agents_for_trigger(
     state: &AppState,
     trigger: ContentAgentAutoRunTrigger,
 ) -> Result<Vec<FeedContentAgentAutoRunItem>> {
-    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let config_snapshot = state.config.lock().clone();
+    let workspace_dir = config_snapshot.workspace_dir.clone();
+    let media_capabilities = local_media_capabilities(&config_snapshot);
     let mut store = load_or_seed_feed_workflow_settings_store(&workspace_dir)?;
     let latest_source_updated_at = latest_content_agent_source_updated_at(&workspace_dir);
     if latest_source_updated_at <= 0 {
@@ -1699,6 +1765,9 @@ fn queue_eligible_content_agents_for_trigger(
         let Some(record) = store.workflows.get_mut(&workflow.key) else {
             continue;
         };
+        if workflow_unsupported_reason(&workflow, media_capabilities).is_some() {
+            continue;
+        }
         if !should_auto_run_content_agent(record, latest_source_updated_at, trigger) {
             continue;
         }
@@ -2385,6 +2454,7 @@ async fn handle_feed_workflow_settings(
         }
     };
 
+    let media_capabilities = local_media_capabilities(&state.config.lock().clone());
     let mut items = Vec::new();
     for workflow in workflow_definitions(&store) {
         let enabled = store
@@ -2392,7 +2462,11 @@ async fn handle_feed_workflow_settings(
             .get(&workflow.key)
             .map(|record| record.enabled)
             .unwrap_or_else(default_content_agent_enabled);
-        items.push(workflow_settings_response_item(&workflow, enabled));
+        items.push(workflow_settings_response_item(
+            &workflow,
+            enabled,
+            media_capabilities,
+        ));
     }
 
     (
@@ -2448,6 +2522,15 @@ async fn handle_feed_workflow_settings_update(
         let err = serde_json::json!({"error": "goal is required"});
         return (StatusCode::BAD_REQUEST, Json(err));
     };
+    let media_capabilities = local_media_capabilities(&state.config.lock().clone());
+    if goal_requests_media_output(&goal)
+        && !(media_capabilities.transcribe_media && media_capabilities.compose_simple_clip)
+    {
+        let err = serde_json::json!({
+            "error": required_media_capability_reason(media_capabilities),
+        });
+        return (StatusCode::BAD_REQUEST, Json(err));
+    }
     let goal_changed = updated_goal
         .as_ref()
         .map(|value| previous_goal.as_deref() != Some(value.as_str()))
@@ -2553,7 +2636,11 @@ async fn handle_feed_workflow_settings_update(
         None
     };
 
-    let item = workflow_settings_response_item(&workflow_def, workflow_record.enabled);
+    let item = workflow_settings_response_item(
+        &workflow_def,
+        workflow_record.enabled,
+        local_media_capabilities(&state.config.lock().clone()),
+    );
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2584,6 +2671,15 @@ async fn handle_feed_workflow_run(
         });
         return (StatusCode::BAD_REQUEST, Json(err));
     };
+    let media_capabilities = local_media_capabilities(&state.config.lock().clone());
+    if let Some(reason) = workflow_unsupported_reason(&workflow, media_capabilities) {
+        let err = serde_json::json!({
+            "error": reason,
+            "workflowKey": workflow_key,
+            "workflowBot": workflow.bot_name,
+        });
+        return (StatusCode::BAD_REQUEST, Json(err));
+    }
 
     let workflow_bot = workflow.bot_name.clone();
     match queue_workflow_run(state.clone(), workflow, "workflow-run-manual") {
@@ -2881,6 +2977,17 @@ async fn handle_feed_workflow_template_create(
             Json(serde_json::json!({"error": "goal is required"})),
         );
     };
+    let media_capabilities = local_media_capabilities(&state.config.lock().clone());
+    if goal_requests_media_output(&goal)
+        && !(media_capabilities.transcribe_media && media_capabilities.compose_simple_clip)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": required_media_capability_reason(media_capabilities),
+            })),
+        );
+    }
     let workflow_name = name.clone();
     let workflow_key = sanitize_workflow_key(&workflow_name);
 
@@ -6484,6 +6591,27 @@ mod tests {
         hex::encode(bytes)
     }
 
+    fn test_app_state_with_config(config: Config) -> AppState {
+        AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            pb_chat_base_url: None,
+            pb_chat_collection: "chat_messages".into(),
+            pb_chat_token: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     #[test]
     fn security_body_limit_is_64kb() {
         assert_eq!(MAX_BODY_SIZE, 65_536);
@@ -7607,6 +7735,43 @@ mod tests {
         assert_eq!(parsed["error"], "goal is required");
     }
 
+    #[tokio::test]
+    async fn content_agent_create_rejects_media_goal_without_local_media_capabilities() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.transcription.enabled = false;
+
+        let response = handle_feed_workflow_template_create(
+            State(test_app_state_with_config(config)),
+            HeaderMap::new(),
+            Json(FeedContentAgentCreateBody {
+                name: Some("Clip Maker".to_string()),
+                goal: Some(
+                    "Create simple vertical video clips from my journal audio recordings.".to_string(),
+                ),
+                bot_name: None,
+                prompt: None,
+                enabled: Some(true),
+                run_now: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("requires local media tools"),
+            "unexpected error payload: {parsed:?}"
+        );
+    }
+
     #[test]
     fn load_or_seed_feed_workflow_settings_store_preseeds_builtin_agents() {
         let temp = tempfile::tempdir().unwrap();
@@ -7701,6 +7866,38 @@ mod tests {
                 "unexpected command {command}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn content_agent_run_rejects_unsupported_media_workflow() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.transcription.enabled = false;
+
+        let response = handle_feed_workflow_run(
+            State(test_app_state_with_config(config)),
+            HeaderMap::new(),
+            Json(FeedContentAgentRunBody {
+                workflow_key: "audio_insight_clips".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["workflowKey"], "audio_insight_clips");
+        assert_eq!(parsed["workflowBot"], "Audio Insight Clips");
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("requires local media tools"),
+            "unexpected error payload: {parsed:?}"
+        );
     }
 
     fn sample_workflow_store() -> FeedContentAgentStore {
