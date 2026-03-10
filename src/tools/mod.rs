@@ -31,6 +31,7 @@ pub mod glob_search;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod media_tools;
 pub mod model_routing_config;
 pub mod schedule;
 pub mod schema;
@@ -54,6 +55,10 @@ pub use glob_search::GlobSearchTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use media_tools::{
+    CleanAudioTool, ComposeSimpleClipTool, ExtractAudioSegmentTool, RenderTextCardVideoTool,
+    StitchImagesWithAudioTool, TranscribeMediaTool,
+};
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
@@ -66,6 +71,7 @@ pub use web_search_tool::WebSearchTool;
 pub use task_plan::TaskPlanTool;
 
 use crate::config::Config;
+use crate::media::command_media_backend;
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
@@ -177,6 +183,11 @@ pub fn all_tools_with_runtime(
     _fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let media_backend = command_media_backend(
+        config.workspace_dir.clone(),
+        config.transcription.clone(),
+    );
+    let media_capabilities = media_backend.capabilities();
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
@@ -204,6 +215,43 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
     ];
+
+    if media_capabilities.transcribe_media {
+        tool_arcs.push(Arc::new(TranscribeMediaTool::new(
+            media_backend.clone(),
+            security.clone(),
+        )));
+    }
+    if media_capabilities.clean_audio {
+        tool_arcs.push(Arc::new(CleanAudioTool::new(
+            media_backend.clone(),
+            security.clone(),
+        )));
+    }
+    if media_capabilities.extract_audio_segment {
+        tool_arcs.push(Arc::new(ExtractAudioSegmentTool::new(
+            media_backend.clone(),
+            security.clone(),
+        )));
+    }
+    if media_capabilities.render_text_card_video {
+        tool_arcs.push(Arc::new(RenderTextCardVideoTool::new(
+            media_backend.clone(),
+            security.clone(),
+        )));
+    }
+    if media_capabilities.stitch_images_with_audio {
+        tool_arcs.push(Arc::new(StitchImagesWithAudioTool::new(
+            media_backend.clone(),
+            security.clone(),
+        )));
+    }
+    if media_capabilities.compose_simple_clip {
+        tool_arcs.push(Arc::new(ComposeSimpleClipTool::new(
+            media_backend,
+            security.clone(),
+        )));
+    }
 
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {

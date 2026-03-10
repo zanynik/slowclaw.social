@@ -94,6 +94,7 @@ import {
 import type {
   FeedContentAgentItem,
   InterestProfileStats,
+  MediaCapabilities,
   PersonalizedBlueskyItem,
 } from "./lib/gatewayApi";
 
@@ -365,6 +366,7 @@ type WorkflowBotMeta = {
   name: string;
   avatar: string;
   outputPrefix: string;
+  goal: string;
 };
 
 type WorkflowSettingsDraft = {
@@ -400,7 +402,8 @@ function workflowBotByKey(key: string): WorkflowBotMeta {
     key: trimmed,
     name: displayName,
     avatar,
-    outputPrefix: `posts/${trimmed}/`
+    outputPrefix: `posts/${trimmed}/`,
+    goal: ""
   };
 }
 
@@ -412,7 +415,8 @@ function workflowBotMetaFromSettings(item: FeedContentAgentItem): WorkflowBotMet
     key: item.workflowKey,
     name: workflowBot || fallback.name,
     avatar: (workflowBot || fallback.name).slice(0, 1).toUpperCase() || fallback.avatar,
-    outputPrefix: outputPrefix || fallback.outputPrefix
+    outputPrefix: outputPrefix || fallback.outputPrefix,
+    goal: String(item.goal || "").trim()
   };
 }
 
@@ -771,6 +775,8 @@ function App() {
   const [settingsTranscriptionEnabled, setSettingsTranscriptionEnabled] = useState(false);
   const [settingsTranscriptionModel, setSettingsTranscriptionModel] = useState("");
   const [settingsAvailableTranscriptionModels, setSettingsAvailableTranscriptionModels] = useState<string[]>([]);
+  const [runtimeMediaCapabilities, setRuntimeMediaCapabilities] = useState<MediaCapabilities | null>(null);
+  const [runtimeMediaSummary, setRuntimeMediaSummary] = useState("");
   const [settingsConfigBusy, setSettingsConfigBusy] = useState(false);
   const [settingsConfigStatus, setSettingsConfigStatus] = useState("");
   const [settingsConfigLoaded, setSettingsConfigLoaded] = useState(false);
@@ -1464,6 +1470,12 @@ function App() {
 
   async function transcribeSelectedJournalMedia() {
     if (!selectedJournalItem || selectedJournalItem.kind !== "audio") {
+      return;
+    }
+    if (runtimeMediaCapabilities && !runtimeMediaCapabilities.transcribeMedia) {
+      setJournalSaveStatus(
+        runtimeMediaSummary || "Local transcription is unavailable on this device."
+      );
       return;
     }
     let token = chatGatewayToken.trim();
@@ -3251,7 +3263,10 @@ function App() {
       setBlueskyFeedItems(res.items);
       setBlueskyProfileStats(res.profileStats);
       if (res.profileStatus === "embeddingUnavailable") {
-        setBlueskyFeedStatus("Personalized feed needs embeddings configured. Showing raw timeline.");
+        setBlueskyFeedStatus(
+          res.message ||
+            "Personalized feed needs local all-MiniLM embeddings available. Showing raw Bluesky feed."
+        );
       } else if (res.profileStatus === "noInterests") {
         setBlueskyFeedStatus("Personalized feed starts after text items exist under posts/. Showing raw timeline.");
       } else if (res.usedFallback) {
@@ -3554,6 +3569,26 @@ function App() {
     }
   }
 
+  async function loadRuntimeMediaCapabilities() {
+    let token = normalizeGatewayToken(chatGatewayToken);
+    if (!token && isDesktopClient) {
+      token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
+    }
+    if (!gatewayBaseUrl.trim()) {
+      setRuntimeMediaCapabilities(null);
+      setRuntimeMediaSummary("");
+      return;
+    }
+    try {
+      const cfg = await getRuntimeConfig(token || undefined, gatewayBaseUrl);
+      setRuntimeMediaCapabilities(cfg.mediaCapabilities || null);
+      setRuntimeMediaSummary(cfg.mediaSummary || "");
+    } catch {
+      setRuntimeMediaCapabilities(null);
+      setRuntimeMediaSummary("");
+    }
+  }
+
   async function loadRuntimeConfigForSettings() {
     let token = normalizeGatewayToken(chatGatewayToken);
     if (!token && isDesktopClient) {
@@ -3575,6 +3610,8 @@ function App() {
         if (!models.length && gatewayBaseUrl.trim()) {
           try {
             const runtimeCfg = await getRuntimeConfig(token || undefined, gatewayBaseUrl);
+            setRuntimeMediaCapabilities(runtimeCfg.mediaCapabilities || null);
+            setRuntimeMediaSummary(runtimeCfg.mediaSummary || "");
             models =
               runtimeCfg.availableTranscriptionModels && runtimeCfg.availableTranscriptionModels.length > 0
                 ? [...runtimeCfg.availableTranscriptionModels]
@@ -3615,6 +3652,8 @@ function App() {
     setSettingsConfigStatus("Loading current config...");
     try {
       const cfg = await getRuntimeConfig(token || undefined, gatewayBaseUrl);
+      setRuntimeMediaCapabilities(cfg.mediaCapabilities || null);
+      setRuntimeMediaSummary(cfg.mediaSummary || "");
       setSettingsProvider(cfg.defaultProvider || "");
       setSettingsModel(cfg.defaultModel || "");
       setSettingsTranscriptionEnabled(Boolean(cfg.transcriptionEnabled));
@@ -3631,6 +3670,8 @@ function App() {
       setSettingsConfigStatus("Config loaded");
       setSettingsConfigLoaded(true);
     } catch (error) {
+      setRuntimeMediaCapabilities(null);
+      setRuntimeMediaSummary("");
       setSettingsConfigStatus(
         `Config unavailable (${error instanceof Error ? error.message : String(error)}). You can still edit and save manually.`
       );
@@ -3863,6 +3904,13 @@ function App() {
     }
     void loadRuntimeConfigForSettings();
   }, [mobileTab, chatGatewayToken, gatewayBaseUrl]);
+
+  useEffect(() => {
+    if (mobileTab !== "feed" && mobileTab !== "profile" && mobileTab !== "journal") {
+      return;
+    }
+    void loadRuntimeMediaCapabilities();
+  }, [mobileTab, feedSource, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     void refreshClawChat();
@@ -4558,6 +4606,11 @@ function App() {
                   <p className="text-sm muted" style={{ margin: 0 }}>
                     Agents create workspace feed content from journal notes and save results under <code>posts/</code>.
                   </p>
+                  {runtimeMediaSummary ? (
+                    <p className="text-sm muted" style={{ margin: 0 }}>
+                      {runtimeMediaSummary}
+                    </p>
+                  ) : null}
                   <div className="feed-workflow-bot-list">
                     {workflowBots.map((bot) => {
                       const saved = workflowSettingsByKey[bot.key];
@@ -4569,9 +4622,14 @@ function App() {
                             className="feed-workflow-bot-open"
                             onClick={() => openWorkflowSettingsForBot(bot.key)}
                           >
-                            <span className="feed-bot-chip">
-                              <span className="feed-bot-avatar">{bot.avatar}</span>
-                              <span>{bot.name}</span>
+                            <span className="stack" style={{ gap: "0.2rem", width: "100%" }}>
+                              <span className="feed-bot-chip">
+                                <span className="feed-bot-avatar">{bot.avatar}</span>
+                                <span>{bot.name}</span>
+                              </span>
+                              {bot.goal ? (
+                                <span className="feed-bot-goal text-sm muted">{bot.goal}</span>
+                              ) : null}
                             </span>
                           </button>
                           <button
@@ -4647,6 +4705,11 @@ function App() {
                       <strong>`posts/&lt;agent&gt;/` in Workspace Feed</strong>
                     </div>
                   </div>
+                  {runtimeMediaSummary ? (
+                    <p className="text-sm muted" style={{ margin: 0 }}>
+                      {runtimeMediaSummary}
+                    </p>
+                  ) : null}
                   <label className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
                     <input
                       type="checkbox"
@@ -4823,13 +4886,69 @@ function App() {
                 blueskyFeedLoading ? (
                   <p className="text-center muted" style={{ padding: "2rem" }}>Loading Bluesky timeline...</p>
                 ) : blueskyFeedItems.length === 0 ? (
-                  <p className="text-center muted" style={{ padding: "2rem" }}>No Bluesky posts found, or not logged in. Check Settings.</p>
+                  <p className="text-center muted" style={{ padding: "2rem" }}>No personalized items found, or not logged in. Check Settings.</p>
                 ) : (
                   <div className="stack">
                     {blueskyFeedStatus ? (
                       <p className="text-sm muted" style={{ padding: "0 0.25rem" }}>{blueskyFeedStatus}</p>
                     ) : null}
                     {blueskyFeedItems.map((item, idx) => {
+                      if (item.sourceType === "web" && item.webPreview) {
+                        const preview = item.webPreview;
+                        return (
+                          <div key={`${preview.url}-${idx}`} className="feed-item">
+                            <div className="feed-header">
+                              <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                                <div className="stack-sm" style={{ gap: "0.05rem" }}>
+                                  <strong>{preview.title || preview.domain}</strong>
+                                  <span className="muted text-sm" style={{ fontWeight: "normal" }}>
+                                    Web source via {preview.provider}
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="feed-time">
+                                {preview.discoveredAt ? formatTimestamp(preview.discoveredAt) : "now"}
+                              </div>
+                            </div>
+                            <a
+                              href={preview.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="bluesky-external-card"
+                              style={{ marginTop: "0.75rem" }}
+                            >
+                              {preview.imageUrl ? (
+                                <img
+                                  src={preview.imageUrl}
+                                  alt={preview.title || "Web preview"}
+                                  className="bluesky-external-thumb"
+                                />
+                              ) : null}
+                              <div className="bluesky-external-body">
+                                <div className="bluesky-external-title">{preview.title || preview.url}</div>
+                                {preview.description ? (
+                                  <div className="bluesky-external-desc">{preview.description}</div>
+                                ) : null}
+                                <div className="bluesky-external-domain">{preview.domain || preview.url}</div>
+                              </div>
+                            </a>
+                            {preview.providerSnippet ? (
+                              <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
+                                Search snippet: {preview.providerSnippet}
+                              </div>
+                            ) : null}
+                            {item.score != null ? (
+                              <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
+                                Matched {item.matchedInterestLabel || "workspace interest"} at{" "}
+                                {(item.score * 100).toFixed(0)}%
+                                {item.matchedInterestScore != null
+                                  ? ` (similarity ${(item.matchedInterestScore * 100).toFixed(0)}%)`
+                                  : ""}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      }
                       const feedItem = item.feedItem as AppBskyFeedDefs.FeedViewPost;
                       const post = feedItem.post;
                       const author = post.author;
@@ -5237,6 +5356,9 @@ function App() {
                 </button>
                 {settingsConfigStatus ? (
                   <p className="text-sm muted">{settingsConfigStatus}</p>
+                ) : null}
+                {runtimeMediaSummary ? (
+                  <p className="text-sm muted">{runtimeMediaSummary}</p>
                 ) : null}
               </div>
             </div>

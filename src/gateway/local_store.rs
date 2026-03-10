@@ -97,6 +97,55 @@ pub struct FeedInterestSourceRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct FeedWebSourceRecord {
+    pub domain: String,
+    pub title: String,
+    pub html_url: String,
+    pub xml_url: String,
+    pub enabled: bool,
+    pub source_kind: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedWebSourceUpsert {
+    pub domain: String,
+    pub title: String,
+    pub html_url: String,
+    pub xml_url: String,
+    pub enabled: bool,
+    pub source_kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedWebCacheRecord {
+    pub url: String,
+    pub domain: String,
+    pub title: String,
+    pub description: String,
+    pub image_url: String,
+    pub provider: String,
+    pub snippet: String,
+    pub search_query: String,
+    pub fetched_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedWebCacheUpsert {
+    pub url: String,
+    pub domain: String,
+    pub title: String,
+    pub description: String,
+    pub image_url: String,
+    pub provider: String,
+    pub snippet: String,
+    pub search_query: String,
+    pub fetched_at: String,
+}
+
 pub fn initialize(workspace_dir: &Path) -> Result<BootstrapReport> {
     let db_path = db_path(workspace_dir);
     if let Some(parent) = db_path.parent() {
@@ -602,6 +651,151 @@ pub fn upsert_feed_interest_source(
     Ok(())
 }
 
+pub fn list_feed_web_sources(workspace_dir: &Path) -> Result<Vec<FeedWebSourceRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT domain, title, html_url, xml_url, enabled, source_kind, created_at, updated_at
+         FROM feed_web_sources
+         WHERE enabled = 1
+         ORDER BY title ASC, domain ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(FeedWebSourceRecord {
+            domain: row.get(0)?,
+            title: row.get(1)?,
+            html_url: row.get(2)?,
+            xml_url: row.get(3)?,
+            enabled: row.get::<_, i64>(4)? != 0,
+            source_kind: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn upsert_feed_web_source(
+    workspace_dir: &Path,
+    source: &FeedWebSourceUpsert,
+) -> Result<FeedWebSourceRecord> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO feed_web_sources (
+            domain, title, html_url, xml_url, enabled, source_kind, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+         ON CONFLICT(domain) DO UPDATE SET
+            title = excluded.title,
+            html_url = excluded.html_url,
+            xml_url = excluded.xml_url,
+            enabled = excluded.enabled,
+            source_kind = excluded.source_kind,
+            updated_at = excluded.updated_at",
+        params![
+            source.domain.trim().to_ascii_lowercase(),
+            source.title,
+            source.html_url,
+            source.xml_url,
+            if source.enabled { 1 } else { 0 },
+            source.source_kind,
+            now
+        ],
+    )
+    .context("Failed to upsert feed web source")?;
+
+    Ok(FeedWebSourceRecord {
+        domain: source.domain.trim().to_ascii_lowercase(),
+        title: source.title.clone(),
+        html_url: source.html_url.clone(),
+        xml_url: source.xml_url.clone(),
+        enabled: source.enabled,
+        source_kind: source.source_kind.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+pub fn get_feed_web_cache(workspace_dir: &Path, url: &str) -> Result<Option<FeedWebCacheRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT url, domain, title, description, image_url, provider, snippet, search_query, fetched_at, updated_at
+         FROM feed_web_cache
+         WHERE url = ?1
+         LIMIT 1",
+    )?;
+    let row = stmt
+        .query_row(params![url], |row| {
+            Ok(FeedWebCacheRecord {
+                url: row.get(0)?,
+                domain: row.get(1)?,
+                title: row.get(2)?,
+                description: row.get(3)?,
+                image_url: row.get(4)?,
+                provider: row.get(5)?,
+                snippet: row.get(6)?,
+                search_query: row.get(7)?,
+                fetched_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+pub fn upsert_feed_web_cache(
+    workspace_dir: &Path,
+    item: &FeedWebCacheUpsert,
+) -> Result<FeedWebCacheRecord> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO feed_web_cache (
+            url, domain, title, description, image_url, provider, snippet, search_query, fetched_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(url) DO UPDATE SET
+            domain = excluded.domain,
+            title = excluded.title,
+            description = excluded.description,
+            image_url = excluded.image_url,
+            provider = excluded.provider,
+            snippet = excluded.snippet,
+            search_query = excluded.search_query,
+            fetched_at = excluded.fetched_at,
+            updated_at = excluded.updated_at",
+        params![
+            item.url,
+            item.domain,
+            item.title,
+            item.description,
+            item.image_url,
+            item.provider,
+            item.snippet,
+            item.search_query,
+            item.fetched_at,
+            now
+        ],
+    )
+    .context("Failed to upsert feed web cache")?;
+
+    Ok(FeedWebCacheRecord {
+        url: item.url.clone(),
+        domain: item.domain.clone(),
+        title: item.title.clone(),
+        description: item.description.clone(),
+        image_url: item.image_url.clone(),
+        provider: item.provider.clone(),
+        snippet: item.snippet.clone(),
+        search_query: item.search_query.clone(),
+        fetched_at: item.fetched_at.clone(),
+        updated_at: now,
+    })
+}
+
 fn open_conn(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open local store {}", path.display()))?;
@@ -733,7 +927,35 @@ fn init_schema(conn: &Connection) -> Result<()> {
             updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_feed_interest_sources_interest_id
-            ON feed_interest_sources(interest_id);",
+            ON feed_interest_sources(interest_id);
+
+        CREATE TABLE IF NOT EXISTS feed_web_sources (
+            domain TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            html_url TEXT NOT NULL DEFAULT '',
+            xml_url TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            source_kind TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_feed_web_sources_enabled
+            ON feed_web_sources(enabled, title);
+
+        CREATE TABLE IF NOT EXISTS feed_web_cache (
+            url TEXT PRIMARY KEY,
+            domain TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            image_url TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL DEFAULT '',
+            snippet TEXT NOT NULL DEFAULT '',
+            search_query TEXT NOT NULL DEFAULT '',
+            fetched_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_feed_web_cache_updated
+            ON feed_web_cache(updated_at);",
     )
     .context("Failed to initialize local store schema")?;
 
@@ -804,6 +1026,8 @@ mod tests {
         assert!(table_exists(&conn, "artifacts").unwrap());
         assert!(table_exists(&conn, "feed_interests").unwrap());
         assert!(table_exists(&conn, "feed_interest_sources").unwrap());
+        assert!(table_exists(&conn, "feed_web_sources").unwrap());
+        assert!(table_exists(&conn, "feed_web_cache").unwrap());
     }
 
     #[test]
@@ -1054,6 +1278,56 @@ mod tests {
         let source = source.expect("source record should exist");
         assert_eq!(source.content_hash, "abc123");
         assert_eq!(source.interest_id.as_deref(), Some("interest-1"));
+    }
+
+    #[test]
+    fn feed_web_source_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        upsert_feed_web_source(
+            tmp.path(),
+            &FeedWebSourceUpsert {
+                domain: "example.com".into(),
+                title: "Example".into(),
+                html_url: "https://example.com".into(),
+                xml_url: "https://example.com/feed.xml".into(),
+                enabled: true,
+                source_kind: "seed".into(),
+            },
+        )
+        .unwrap();
+
+        let sources = list_feed_web_sources(tmp.path()).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].domain, "example.com");
+    }
+
+    #[test]
+    fn feed_web_cache_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        upsert_feed_web_cache(
+            tmp.path(),
+            &FeedWebCacheUpsert {
+                url: "https://example.com/post".into(),
+                domain: "example.com".into(),
+                title: "Example".into(),
+                description: "Desc".into(),
+                image_url: "https://example.com/image.png".into(),
+                provider: "duckduckgo".into(),
+                snippet: "Snippet".into(),
+                search_query: "test query".into(),
+                fetched_at: "2026-03-10T10:00:00Z".into(),
+            },
+        )
+        .unwrap();
+
+        let cached = get_feed_web_cache(tmp.path(), "https://example.com/post").unwrap();
+        let cached = cached.expect("cache should exist");
+        assert_eq!(cached.domain, "example.com");
+        assert_eq!(cached.title, "Example");
     }
 
 }

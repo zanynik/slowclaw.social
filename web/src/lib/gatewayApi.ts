@@ -68,6 +68,17 @@ export type RuntimeConfigSnapshot = {
   transcriptionEnabled: boolean;
   transcriptionModel: string;
   availableTranscriptionModels: string[];
+  mediaCapabilities?: MediaCapabilities;
+  mediaSummary?: string;
+};
+
+export type MediaCapabilities = {
+  transcribeMedia: boolean;
+  cleanAudio: boolean;
+  extractAudioSegment: boolean;
+  renderTextCardVideo: boolean;
+  stitchImagesWithAudio: boolean;
+  composeSimpleClip: boolean;
 };
 
 export type FeedContentAgentCommentResult = {
@@ -150,7 +161,18 @@ export type BlueskyPersonalizedFeedRequest = {
 };
 
 export type PersonalizedBlueskyItem = {
+  sourceType?: "bluesky" | "web";
   feedItem: any;
+  webPreview?: {
+    url: string;
+    title: string;
+    description: string;
+    imageUrl?: string | null;
+    domain: string;
+    provider: string;
+    providerSnippet?: string | null;
+    discoveredAt: string;
+  } | null;
   score?: number | null;
   matchedInterestLabel?: string | null;
   matchedInterestScore?: number | null;
@@ -225,7 +247,16 @@ export async function getRuntimeConfig(
     transcriptionModel: String(data?.transcriptionModel || ""),
     availableTranscriptionModels: Array.isArray(data?.availableTranscriptionModels)
       ? data.availableTranscriptionModels.map((value: unknown) => String(value))
-      : []
+      : [],
+    mediaCapabilities: {
+      transcribeMedia: Boolean(data?.mediaCapabilities?.transcribeMedia),
+      cleanAudio: Boolean(data?.mediaCapabilities?.cleanAudio),
+      extractAudioSegment: Boolean(data?.mediaCapabilities?.extractAudioSegment),
+      renderTextCardVideo: Boolean(data?.mediaCapabilities?.renderTextCardVideo),
+      stitchImagesWithAudio: Boolean(data?.mediaCapabilities?.stitchImagesWithAudio),
+      composeSimpleClip: Boolean(data?.mediaCapabilities?.composeSimpleClip)
+    },
+    mediaSummary: String(data?.mediaSummary || "")
   };
 }
 
@@ -263,7 +294,31 @@ export async function fetchPersonalizedBlueskyFeed(
   });
   const data = await parseJsonOrThrow(res);
   return {
-    items: Array.isArray(data.items) ? (data.items as PersonalizedBlueskyItem[]) : [],
+    items: Array.isArray(data.items)
+      ? data.items.map((item: any) => ({
+          sourceType: item?.sourceType === "web" ? "web" : "bluesky",
+          feedItem: item?.feedItem || {},
+          webPreview: item?.webPreview
+            ? {
+                url: String(item.webPreview.url || ""),
+                title: String(item.webPreview.title || ""),
+                description: String(item.webPreview.description || ""),
+                imageUrl: item.webPreview.imageUrl ? String(item.webPreview.imageUrl) : null,
+                domain: String(item.webPreview.domain || ""),
+                provider: String(item.webPreview.provider || ""),
+                providerSnippet: item.webPreview.providerSnippet
+                  ? String(item.webPreview.providerSnippet)
+                  : null,
+                discoveredAt: String(item.webPreview.discoveredAt || "")
+              }
+            : null,
+          score: item?.score == null ? null : Number(item.score),
+          matchedInterestLabel: item?.matchedInterestLabel ? String(item.matchedInterestLabel) : null,
+          matchedInterestScore:
+            item?.matchedInterestScore == null ? null : Number(item.matchedInterestScore),
+          passedThreshold: Boolean(item?.passedThreshold)
+        }))
+      : [],
     profileStatus: String(data.profileStatus || ""),
     profileStats: {
       interestCount: Number(data.profileStats?.interestCount || 0),

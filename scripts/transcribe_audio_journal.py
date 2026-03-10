@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -159,6 +159,40 @@ def available_local_model_labels() -> list[str]:
     return sorted(labels)
 
 
+def sidecar_path(output_path: Path, suffix: str) -> Path:
+    return output_path.with_suffix(suffix)
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    total_ms = max(0, int(round(seconds * 1000)))
+    delta = timedelta(milliseconds=total_ms)
+    total_seconds = int(delta.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    millis = total_ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def write_srt(path: Path, segments: list[dict]) -> None:
+    lines: list[str] = []
+    for segment in segments:
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        index = int(segment.get("index", 0))
+        start = float(segment.get("start", 0.0))
+        end = float(segment.get("end", start))
+        lines.extend(
+            [
+                str(index),
+                f"{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}",
+                text,
+                "",
+            ]
+        )
+    path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
 def main() -> int:
     args = parse_args()
     resolved_model = resolve_local_model(args.model)
@@ -197,10 +231,19 @@ def main() -> int:
             vad_filter=True,
         )
         lines: list[str] = []
-        for segment in segments:
+        segment_items: list[dict] = []
+        for index, segment in enumerate(segments, start=1):
             text = str(getattr(segment, "text", "")).strip()
             if text:
                 lines.append(text)
+                segment_items.append(
+                    {
+                        "index": index,
+                        "start": float(getattr(segment, "start", 0.0) or 0.0),
+                        "end": float(getattr(segment, "end", 0.0) or 0.0),
+                        "text": text,
+                    }
+                )
 
         transcript = "\n".join(lines).strip()
         if not transcript:
@@ -209,12 +252,30 @@ def main() -> int:
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(f"{transcript}\n", encoding="utf-8")
+        json_path = sidecar_path(output_path, ".json")
+        srt_path = sidecar_path(output_path, ".srt")
+        json_payload = {
+            "ok": True,
+            "source": str(input_path),
+            "transcriptPath": str(output_path),
+            "segments": segment_items,
+            "model": resolved_model,
+            "device": args.device,
+            "computeType": args.compute_type,
+        }
+        json_path.write_text(
+            json.dumps(json_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        write_srt(srt_path, segment_items)
 
         print(
             json.dumps(
                 {
                     "ok": True,
                     "path": str(output_path),
+                    "jsonPath": str(json_path),
+                    "srtPath": str(srt_path),
                     "text": transcript,
                     "model": resolved_model,
                     "device": args.device,

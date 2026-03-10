@@ -959,10 +959,11 @@ textarea {
   background: var(--surface);
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   gap: 0.7rem;
   padding: 0.55rem 0.7rem;
   transition: border-color 0.15s, box-shadow 0.15s;
+  min-width: 0;
 }
 
 .feed-workflow-bot-row:hover {
@@ -973,6 +974,7 @@ textarea {
 .feed-workflow-bot-open {
   flex: 1;
   min-width: 0;
+  max-width: 100%;
   border: 0;
   background: transparent;
   color: inherit;
@@ -982,6 +984,17 @@ textarea {
   padding: 0;
   text-align: left;
   cursor: pointer;
+}
+
+.feed-workflow-bot-open .stack {
+  min-width: 0;
+}
+
+.feed-bot-goal {
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .feed-bot-chip {
@@ -998,12 +1011,20 @@ textarea {
   cursor: pointer;
   box-shadow: var(--shadow-xs);
   transition: border-color 0.15s, background 0.15s;
+  white-space: normal;
+  max-width: 100%;
 }
 
 .feed-bot-chip:hover {
   border-color: var(--accent);
   background: var(--accent-dim);
   color: var(--accent);
+}
+
+@media (max-width: 640px) {
+  .feed-workflow-bot-row {
+    flex-wrap: wrap;
+  }
 }
 
 .feed-bot-avatar {

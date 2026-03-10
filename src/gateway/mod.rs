@@ -9,12 +9,16 @@
 
 pub mod static_files;
 pub mod local_store;
+pub mod feed_web_sources;
 
 use crate::config::{Config, TranscriptionConfig};
+use crate::gateway::feed_web_sources::DEFAULT_FEED_WEB_SOURCES;
+use crate::media::{command_media_backend, MediaToolCapabilities};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::memory::vector::{bytes_to_vec, cosine_similarity, vec_to_bytes};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
+use crate::tools::web_search_tool::WebSearchTool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -28,6 +32,7 @@ use axum::{
 };
 use http_body_util::BodyExt as _;
 use parking_lot::Mutex;
+use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path as StdPath, PathBuf};
@@ -62,6 +67,8 @@ const JOURNAL_TEXT_DIR: &str = "journals/text";
 const JOURNAL_MEDIA_DIR: &str = "journals/media";
 const SYNC_ALLOWED_ROOTS: &[&str] = &["journals", "posts", "skills"];
 const CONTENT_AGENT_APP_OPEN_STALE_SECS: i64 = 15 * 60;
+const LEGACY_AUDIO_INSIGHT_CLIPS_GOAL: &str =
+    "Use my journal notes and available audio/video transcripts to identify practical insights and turn them into concise feed-ready posts, with each post saved as a separate file in posts/.";
 
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
@@ -534,6 +541,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/config/runtime",
             get(handle_runtime_config).post(handle_runtime_config_update),
         )
+        .route("/api/media/capabilities", get(handle_media_capabilities))
         .route("/webhook", post(handle_webhook))
         .route("/api/chat/messages", get(handle_chat_list).post(handle_chat_send))
         .route(
@@ -664,12 +672,35 @@ async fn handle_runtime_config(
     }
     let config = state.config.lock().clone();
     let transcription_models = available_local_transcription_models();
+    let media_capabilities = local_media_capabilities(&config);
     let body = serde_json::json!({
         "defaultProvider": config.default_provider.unwrap_or_default(),
         "defaultModel": config.default_model.unwrap_or_default(),
         "transcriptionEnabled": config.transcription.enabled,
         "transcriptionModel": config.transcription.model,
         "availableTranscriptionModels": transcription_models,
+        "mediaCapabilities": media_capabilities,
+        "mediaSummary": media_capabilities.summary(),
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+fn local_media_capabilities(config: &Config) -> MediaToolCapabilities {
+    command_media_backend(config.workspace_dir.clone(), config.transcription.clone()).capabilities()
+}
+
+async fn handle_media_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Media capabilities") {
+        return err.into_response();
+    }
+    let config = state.config.lock().clone();
+    let capabilities = local_media_capabilities(&config);
+    let body = serde_json::json!({
+        "capabilities": capabilities,
+        "summary": capabilities.summary(),
     });
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -1191,7 +1222,7 @@ fn built_in_content_agent_specs() -> &'static [BuiltInContentAgentSpec] {
         BuiltInContentAgentSpec {
             key: "audio_insight_clips",
             name: "Audio Insight Clips",
-            goal: "Use my journal notes and available audio/video transcripts to identify practical insights and turn them into concise feed-ready posts, with each post saved as a separate file in posts/.",
+            goal: "Create simple vertical video clips from my journal audio recordings. If a transcript is missing, generate it first, extract exact insightful lines, build black-background text cards, and render a feed-ready mp4 into posts/.",
         },
     ]
 }
@@ -1407,10 +1438,11 @@ fn ensure_content_agent_skill_file(
         .or(record.settings.prompt.clone())
         .unwrap_or_else(|| "Create workspace feed posts from journal notes.".to_string());
     let output_dir = record.output_prefix.trim_end_matches('/');
-    std::fs::write(
-        &skill_abs,
-        render_template_skill_markdown(&record.workflow_bot, &goal, output_dir),
-    )
+    let skill_body = match record.workflow_key.as_str() {
+        "audio_insight_clips" => render_audio_insight_clip_skill_markdown(output_dir),
+        _ => render_template_skill_markdown(&record.workflow_bot, &goal, output_dir),
+    };
+    std::fs::write(&skill_abs, skill_body)
     .with_context(|| format!("failed to write starter skill {}", skill_abs.display()))
 }
 
@@ -1426,7 +1458,29 @@ fn ensure_built_in_content_agents(
             store.workflows.insert(key.clone(), record);
             changed = true;
         }
-        if let Some(record) = store.workflows.get(&key) {
+        if let Some(record) = store.workflows.get_mut(&key) {
+            if key == "audio_insight_clips"
+                && record.goal.as_deref() == Some(LEGACY_AUDIO_INSIGHT_CLIPS_GOAL)
+            {
+                record.goal = Some(spec.goal.to_string());
+                record.settings = built_in_content_agent_settings(spec.goal);
+                *record = normalize_workflow_record(&key, record.clone());
+                changed = true;
+                let skill_abs = workspace_dir.join(&record.skill_path);
+                let should_refresh_skill = skill_abs.exists()
+                    && std::fs::read_to_string(&skill_abs)
+                        .map(|raw| raw.contains(LEGACY_AUDIO_INSIGHT_CLIPS_GOAL))
+                        .unwrap_or(false);
+                if should_refresh_skill {
+                    std::fs::write(
+                        &skill_abs,
+                        render_audio_insight_clip_skill_markdown(
+                            record.output_prefix.trim_end_matches('/'),
+                        ),
+                    )
+                    .with_context(|| format!("failed to refresh built-in skill {}", skill_abs.display()))?;
+                }
+            }
             ensure_content_agent_skill_file(workspace_dir, record)?;
         }
     }
@@ -1566,7 +1620,7 @@ fn is_content_agent_source_file(path: &StdPath) -> bool {
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(extension.as_str(), "md" | "txt" | "srt")
+    matches!(extension.as_str(), "md" | "txt" | "json" | "srt")
 }
 
 fn latest_content_agent_source_updated_at(workspace_dir: &StdPath) -> i64 {
@@ -1763,8 +1817,10 @@ fn queue_workflow_run(
                 return;
             }
         };
-
-        let run_prompt = render_content_agent_run_prompt(&workflow_for_worker, &skill_markdown);
+        let config_snapshot = state.config.lock().clone();
+        let media_tool_summary = local_media_capabilities(&config_snapshot).summary();
+        let run_prompt =
+            render_content_agent_run_prompt(&workflow_for_worker, &skill_markdown, &media_tool_summary);
         let run_result = tokio::time::timeout(
             Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
             run_local_agent_prompt_in_thread(
@@ -1958,12 +2014,46 @@ Use this content agent to fulfill the following goal:\n\n\
 ## Sources\n\n\
 - `journals/text/**`\n\
 - transcript files under `journals/text/transcriptions/**` when present\n\n\
+ - `journals/media/audio/**` and `journals/media/video/**` when the goal depends on journal media\n\n\
 ## Output\n\n\
 - `{output_dir}`\n\n\
 ## Output Rules\n\n\
 - Write feed-visible artifacts only under `{output_dir}`.\n\
+- Hidden intermediates may go under `{output_dir}/pipeline/` or `{output_dir}/artifacts/`.\n\
 - If generating multiple distinct post candidates, save each as a separate file.\n\
+- Prefer built-in runtime tools for media and transcription tasks; do not hardcode scripts or shell pipelines when a built-in tool exists.\n\
 - Keep unrelated workspace files untouched.\n"
+    )
+}
+
+fn render_audio_insight_clip_skill_markdown(output_dir: &str) -> String {
+    format!(
+        "# Audio Insight Clips\n\n\
+Create simple vertical video clips from journal audio recordings.\n\n\
+## Sources\n\n\
+- `journals/media/audio/**`\n\
+- `journals/text/transcriptions/audio/**` when present\n\
+- `journals/text/transcriptions/**` for existing transcript sidecars\n\
+- `journals/text/**` for context if useful\n\n\
+## Output\n\n\
+- Final feed-visible clips: `{output_dir}`\n\
+- Hidden intermediates: `{output_dir}/pipeline/`\n\n\
+## Workflow\n\n\
+1. Find one or more strong source recordings under `journals/media/audio/**`.\n\
+2. For each chosen recording, look for a transcript text file under `journals/text/transcriptions/**` using the same stem and relative media path.\n\
+3. If the transcript is missing, call the built-in `transcribe_media` tool for that recording.\n\
+4. Read the transcript and extract exact insightful lines. Do not rewrite the quoted line if it will appear inside the video card.\n\
+5. Optionally call `clean_audio` when the source recording is noisy.\n\
+6. If you need a precise quote segment, call `extract_audio_segment` with the exact start/end range.\n\
+7. Render the final clip with `compose_simple_clip` or `render_text_card_video` using white text on a black background.\n\
+8. Save the final `.mp4` directly under `{output_dir}` so it appears in the workspace feed.\n\n\
+## Output Rules\n\n\
+- Use a black background with white text cards.\n\
+- Prefer 1 to 3 exact lines per clip.\n\
+- Keep final clips concise and feed-ready.\n\
+- Put JSON manifests, transcripts, and other machine files only under `{output_dir}/pipeline/`.\n\
+- Prefer built-in runtime tools over shell commands or scripts.\n\
+- Do not overwrite unrelated posts.\n"
     )
 }
 
@@ -1975,6 +2065,14 @@ fn validate_content_agent_skill_contract(skill_abs: &StdPath) -> Result<()> {
         if !raw.contains(fragment) {
             anyhow::bail!(
                 "generated content agent skill is missing required fragment `{fragment}` (file: {})",
+                skill_abs.display()
+            );
+        }
+    }
+    for banned in ["python3 ", "ffmpeg ", "ffprobe ", "scripts/"] {
+        if raw.contains(banned) {
+            anyhow::bail!(
+                "generated content agent skill must use built-in media tools instead of `{banned}` (file: {})",
                 skill_abs.display()
             );
         }
@@ -1991,6 +2089,7 @@ fn render_content_agent_authoring_prompt(
     goal: &str,
     creation_skill_markdown: &str,
     current_skill_body: &str,
+    media_tool_summary: &str,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str("Use the content agent creation skill below to author or update a workspace feed content agent.\n\n");
@@ -2003,7 +2102,7 @@ fn render_content_agent_authoring_prompt(
     prompt.push_str(&format!("- Key: {workflow_key}\n"));
     prompt.push_str(&format!("- Bot: {workflow_bot}\n"));
     prompt.push_str(&format!("- Goal: \"{}\"\n", goal.trim()));
-    prompt.push_str("- Fixed sources: `journals/text/**` and transcript files under `journals/text/transcriptions/**` when present\n");
+    prompt.push_str("- Fixed journal sources: `journals/text/**`, transcript files under `journals/text/transcriptions/**`, and journal media under `journals/media/audio/**` or `journals/media/video/**` when the goal requires media-derived output\n");
     prompt.push_str(&format!("- Fixed output root: `{output_dir_rel}`\n\n"));
 
     prompt.push_str("## Required File\n");
@@ -2017,10 +2116,14 @@ fn render_content_agent_authoring_prompt(
 
     prompt.push_str("## Hard Requirements\n");
     prompt.push_str("- Update only the content agent skill file.\n");
-    prompt.push_str("- Keep the sources fixed to journal notes and available transcripts.\n");
+    prompt.push_str("- Keep the sources fixed to journal notes, available transcripts, and journal media only when the goal requires media-derived output.\n");
     prompt.push_str("- Keep the output fixed under the posts folder.\n");
+    prompt.push_str("- Hidden intermediate files may live under the output root in `pipeline/` or `artifacts/`.\n");
     prompt.push_str("- Tell the agent to create multiple files when multiple distinct post candidates are useful.\n");
     prompt.push_str("- Keep instructions concrete and operational, not generic.\n");
+    prompt.push_str(&format!("- {media_tool_summary}\n"));
+    prompt.push_str("- Prefer built-in runtime media tools such as `transcribe_media`, `clean_audio`, `extract_audio_segment`, `render_text_card_video`, `stitch_images_with_audio`, and `compose_simple_clip` when they are available on this device.\n");
+    prompt.push_str("- Do not hardcode `python3`, `ffmpeg`, `ffprobe`, or `scripts/...` into the generated skill.\n");
     prompt.push_str("- Use the file_write tool to overwrite the skill file directly.\n");
     prompt.push_str("- Do not respond with a patch description only.\n\n");
     prompt.push_str("After editing, reply with a concise summary of what changed in the skill.\n");
@@ -2030,6 +2133,7 @@ fn render_content_agent_authoring_prompt(
 fn render_content_agent_run_prompt(
     workflow: &FeedContentAgentDefinition,
     skill_markdown: &str,
+    media_tool_summary: &str,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str("Run the following content agent and create feed artifacts in the workspace.\n\n");
@@ -2044,8 +2148,13 @@ fn render_content_agent_run_prompt(
     prompt.push_str(skill_markdown.trim());
     prompt.push_str("\n```\n\n");
     prompt.push_str("## Execution Rules\n");
-    prompt.push_str("- Read from `journals/text/**` and available transcript files when relevant.\n");
+    prompt.push_str("- Read from `journals/text/**`, available transcript files, and journal media files when relevant to the goal.\n");
+    prompt.push_str("- If a needed transcript for journal media is missing, use `transcribe_media` and save outputs under `journals/text/transcriptions/**`.\n");
+    prompt.push_str(&format!("- {media_tool_summary}\n"));
+    prompt.push_str("- For deterministic media transforms, use only the built-in media tools that are available on this device.\n");
+    prompt.push_str("- Do not invent script paths or raw ffmpeg commands inside the skill execution.\n");
     prompt.push_str(&format!("- Write feed-visible artifacts only under `{}`.\n", workflow.output_prefix));
+    prompt.push_str(&format!("- Hidden intermediate artifacts may go under `{}/pipeline/` or `{}/artifacts/`.\n", workflow.output_prefix.trim_end_matches('/'), workflow.output_prefix.trim_end_matches('/')));
     prompt.push_str("- If multiple distinct post candidates are useful, save each as a separate file.\n");
     prompt.push_str("- Use direct file edits in the workspace, not code blocks in chat.\n");
     prompt.push_str("- Reply with a concise summary of files written.\n");
@@ -2383,6 +2492,7 @@ async fn handle_feed_workflow_settings_update(
             &goal,
             &creation_skill_markdown,
             &std::fs::read_to_string(&skill_abs).unwrap_or_default(),
+            &local_media_capabilities(&state.config.lock().clone()).summary(),
         );
         let authoring_thread_id = format!("workflow:update:{}", workflow.key);
         let authoring_result = tokio::time::timeout(
@@ -2545,33 +2655,67 @@ async fn handle_feed_bluesky_personalized(
     let limit = body.limit.unwrap_or(30).clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
     let config_snapshot = state.config.lock().clone();
 
-    let candidates =
-        match fetch_bluesky_timeline_candidates(&body.service_url, &body.access_jwt, limit).await {
-            Ok(candidates) => candidates,
-            Err(err) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": format!("Failed to fetch Bluesky timeline: {err}")
-                    })),
-                );
-            }
-        };
+    let fallback_candidates = || async {
+        fetch_bluesky_fallback_candidates(&body.service_url, &body.access_jwt, limit).await
+    };
 
-    let raw_items: Vec<PersonalizedBlueskyItem> = candidates
-        .iter()
-        .map(|candidate| PersonalizedBlueskyItem {
-            feed_item: candidate.feed_item.clone(),
-            score: None,
-            matched_interest_label: None,
-            matched_interest_score: None,
-            passed_threshold: false,
-        })
-        .collect();
+    let (embedder, _embedder_message) = match resolve_feed_embedder(&config_snapshot).await {
+        Ok((Some(embedder), message)) => (embedder, message),
+        Ok((None, message)) => {
+            let unavailable_message = message.unwrap_or_else(|| {
+                "Local all-MiniLM embeddings are unavailable. Showing raw Bluesky feed."
+                    .to_string()
+            });
+            let raw_items = match fallback_candidates().await {
+                Ok(candidates) => build_raw_personalized_items(candidates, limit),
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": format!("Failed to fetch Bluesky candidates: {err}")
+                        })),
+                    );
+                }
+            };
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "items": raw_items,
+                    "profileStatus": "embeddingUnavailable",
+                    "profileStats": InterestProfileStats::default(),
+                    "usedFallback": true,
+                    "message": unavailable_message,
+                })),
+            );
+        }
+        Err(err) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "items": Vec::<PersonalizedBlueskyItem>::new(),
+                    "profileStatus": "embeddingUnavailable",
+                    "profileStats": InterestProfileStats::default(),
+                    "usedFallback": true,
+                    "message": format!("Failed to initialize local feed embeddings: {err}"),
+                })),
+            );
+        }
+    };
 
-    let profile = match rebuild_interest_profile(&config_snapshot).await {
+    let profile = match rebuild_interest_profile(&config_snapshot, embedder.clone()).await {
         Ok(profile) => profile,
         Err(err) => {
+            let raw_items = match fallback_candidates().await {
+                Ok(candidates) => build_raw_personalized_items(candidates, limit),
+                Err(fetch_err) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": format!("Failed to fetch Bluesky candidates: {fetch_err}")
+                        })),
+                    );
+                }
+            };
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -2586,6 +2730,17 @@ async fn handle_feed_bluesky_personalized(
     };
 
     if profile.status != "ready" || profile.interests.is_empty() {
+        let raw_items = match fallback_candidates().await {
+            Ok(candidates) => build_raw_personalized_items(candidates, limit),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": format!("Failed to fetch Bluesky candidates: {err}")
+                    })),
+                );
+            }
+        };
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -2597,25 +2752,102 @@ async fn handle_feed_bluesky_personalized(
         );
     }
 
-    let embedder = memory::create_embedder_from_config(&config_snapshot);
-    let ranked_items = match rank_bluesky_candidates(embedder, &profile.interests, candidates).await
+    let (ranked_bluesky_items, raw_bluesky_candidates, mut fallback_message): (
+        Vec<PersonalizedBlueskyItem>,
+        Vec<CandidateFeedPost>,
+        Option<String>,
+    ) = match collect_ranked_bluesky_matches(
+        &body.service_url,
+        &body.access_jwt,
+        embedder.clone(),
+        &profile.interests,
+        limit,
+    )
+    .await
     {
-        Ok(items) if !items.is_empty() => items,
-        Ok(_) => raw_items,
+        Ok((items, raw_candidates)) => (items, raw_candidates, None),
         Err(err) => {
             tracing::warn!("Failed to rank personalized Bluesky feed: {err}");
-            raw_items
+            let raw_candidates = match fallback_candidates().await {
+                Ok(candidates) => candidates,
+                Err(fetch_err) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": format!("Failed to fetch Bluesky candidates: {fetch_err}")
+                        })),
+                    );
+                }
+            };
+            (
+                Vec::new(),
+                raw_candidates,
+                Some("Personalized Bluesky ranking failed. Raw Bluesky results are available.".to_string()),
+            )
         }
     };
 
-    let used_fallback = ranked_items.iter().all(|item| item.score.is_none());
+    let mut ranked_items = ranked_bluesky_items;
+    match collect_web_search_candidates(&config_snapshot, &profile.interests).await {
+        Ok(web_candidates) if !web_candidates.is_empty() => {
+            match rank_web_candidates(
+                &config_snapshot.workspace_dir,
+                embedder,
+                &profile.interests,
+                web_candidates,
+                limit,
+            )
+            .await
+            {
+                Ok(mut web_items) => ranked_items.append(&mut web_items),
+                Err(err) => {
+                    tracing::warn!("Failed to rank web feed candidates: {err}");
+                    if fallback_message.is_none() {
+                        fallback_message =
+                            Some("Web link discovery failed; showing personalized Bluesky results only.".to_string());
+                    }
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!("Failed to collect web feed candidates: {err}");
+            if fallback_message.is_none() {
+                fallback_message =
+                    Some("Web link discovery failed; showing personalized Bluesky results only.".to_string());
+            }
+        }
+    }
+
+    sort_personalized_items(&mut ranked_items);
+    ranked_items.truncate(limit);
+    if ranked_items.is_empty() {
+        let raw_items = build_raw_personalized_items(raw_bluesky_candidates, limit);
+        let message = fallback_message.unwrap_or_else(|| {
+            "No web or Bluesky matches passed the similarity threshold. Showing raw Bluesky feed."
+                .to_string()
+        });
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": raw_items,
+                "profileStatus": "fallbackRaw",
+                "profileStats": profile.stats,
+                "usedFallback": true,
+                "message": message,
+            })),
+        );
+    }
+
+    let used_fallback = false;
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "items": ranked_items,
-            "profileStatus": if used_fallback { "fallbackRaw" } else { profile.status },
+            "profileStatus": profile.status,
             "profileStats": profile.stats,
             "usedFallback": used_fallback,
+            "message": fallback_message,
         })),
     )
 }
@@ -2735,6 +2967,7 @@ async fn handle_feed_workflow_template_create(
         &goal,
         &creation_skill_markdown,
         &std::fs::read_to_string(&skill_abs).unwrap_or_default(),
+        &local_media_capabilities(&state.config.lock().clone()).summary(),
     );
 
     let creation_thread_id = format!("workflow:create:{workflow_key}");
@@ -3917,6 +4150,13 @@ async fn handle_journal_transcribe(
         });
         return (StatusCode::BAD_REQUEST, Json(err)).into_response();
     }
+    let media_capabilities = local_media_capabilities(&config_snapshot);
+    if !media_capabilities.transcribe_media {
+        let err = serde_json::json!({
+            "error": "Local transcription is unavailable on this device. Check local media capabilities in settings."
+        });
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
 
     let workspace_dir = config_snapshot.workspace_dir.clone();
     let Some(abs_media_path) = resolve_workspace_media_path(&workspace_dir, &requested) else {
@@ -3933,6 +4173,8 @@ async fn handle_journal_transcribe(
         return (StatusCode::BAD_REQUEST, Json(err)).into_response();
     };
     let transcript_abs_path = workspace_dir.join(&transcript_rel_path);
+    let transcript_json_path = transcript_json_rel_path(&transcript_rel_path);
+    let transcript_srt_path = transcript_srt_rel_path(&transcript_rel_path);
 
     if transcript_abs_path.exists() && transcript_abs_path.is_file() {
         let transcript_text = tokio::fs::read_to_string(&transcript_abs_path)
@@ -3943,6 +4185,8 @@ async fn handle_journal_transcribe(
                 "ok": true,
                 "mediaPath": requested,
                 "path": transcript_rel_path,
+                "jsonPath": transcript_json_path,
+                "srtPath": transcript_srt_path,
                 "text": transcript_text,
                 "status": "done",
             });
@@ -3963,6 +4207,8 @@ async fn handle_journal_transcribe(
         "ok": true,
         "mediaPath": requested,
         "path": transcript_rel_path,
+        "jsonPath": transcript_json_path,
+        "srtPath": transcript_srt_path,
         "status": enqueue_result.status,
         "error": enqueue_result.error,
         "updatedAt": enqueue_result.updated_at,
@@ -3991,6 +4237,8 @@ async fn handle_journal_transcribe_status(
         return (StatusCode::BAD_REQUEST, Json(err)).into_response();
     };
     let transcript_abs_path = workspace_dir.join(&transcript_rel_path);
+    let transcript_json_path = transcript_json_rel_path(&transcript_rel_path);
+    let transcript_srt_path = transcript_srt_rel_path(&transcript_rel_path);
 
     if transcript_abs_path.exists() && transcript_abs_path.is_file() {
         let transcript_text = tokio::fs::read_to_string(&transcript_abs_path)
@@ -4001,6 +4249,8 @@ async fn handle_journal_transcribe_status(
                 "ok": true,
                 "mediaPath": requested,
                 "path": transcript_rel_path,
+                "jsonPath": transcript_json_path,
+                "srtPath": transcript_srt_path,
                 "text": transcript_text,
                 "status": "done",
             });
@@ -4014,6 +4264,8 @@ async fn handle_journal_transcribe_status(
             "ok": true,
             "mediaPath": requested,
             "path": transcript_rel_path,
+            "jsonPath": transcript_json_path,
+            "srtPath": transcript_srt_path,
             "status": job.status,
             "error": job.error,
             "updatedAt": job.updated_at,
@@ -4025,6 +4277,8 @@ async fn handle_journal_transcribe_status(
         "ok": true,
         "mediaPath": requested,
         "path": transcript_rel_path,
+        "jsonPath": transcript_json_path,
+        "srtPath": transcript_srt_path,
         "status": "idle",
     });
     (StatusCode::OK, Json(body)).into_response()
@@ -4047,6 +4301,20 @@ fn transcript_rel_path_for_media(media_rel_path: &str) -> Option<String> {
     }
     out.push(format!("{stem}.txt"));
     Some(out.to_string_lossy().replace('\\', "/"))
+}
+
+fn transcript_json_rel_path(transcript_rel_path: &str) -> String {
+    match transcript_rel_path.rsplit_once('.') {
+        Some((base, _)) => format!("{base}.json"),
+        None => format!("{transcript_rel_path}.json"),
+    }
+}
+
+fn transcript_srt_rel_path(transcript_rel_path: &str) -> String {
+    match transcript_rel_path.rsplit_once('.') {
+        Some((base, _)) => format!("{base}.srt"),
+        None => format!("{transcript_rel_path}.srt"),
+    }
 }
 
 fn legacy_transcript_rel_path_for_media(media_rel_path: &str) -> Option<String> {
@@ -4146,6 +4414,8 @@ async fn enqueue_journal_transcription(
     let Some(transcript_rel_path) = transcript_rel_path_for_media(&media_rel_path) else {
         return None;
     };
+    let transcript_json_path = transcript_json_rel_path(&transcript_rel_path);
+    let transcript_srt_path = transcript_srt_rel_path(&transcript_rel_path);
     let transcript_abs_path = workspace_dir.join(&transcript_rel_path);
     if transcript_abs_path.exists() && transcript_abs_path.is_file() {
         let existing = tokio::fs::read_to_string(&transcript_abs_path)
@@ -4155,6 +4425,8 @@ async fn enqueue_journal_transcription(
             return Some(serde_json::json!({
                 "status": "done",
                 "path": transcript_rel_path,
+                "jsonPath": transcript_json_path,
+                "srtPath": transcript_srt_path,
             }));
         }
     }
@@ -4163,6 +4435,18 @@ async fn enqueue_journal_transcription(
         return Some(serde_json::json!({
             "status": "disabled",
             "path": transcript_rel_path,
+            "jsonPath": transcript_json_path,
+            "srtPath": transcript_srt_path,
+        }));
+    }
+    let media_capabilities = local_media_capabilities(&state.config.lock().clone());
+    if !media_capabilities.transcribe_media {
+        return Some(serde_json::json!({
+            "status": "unsupported",
+            "path": transcript_rel_path,
+            "jsonPath": transcript_json_path,
+            "srtPath": transcript_srt_path,
+            "error": "Local transcription is unavailable on this device.",
         }));
     }
     let job = enqueue_transcription_job(
@@ -4176,6 +4460,8 @@ async fn enqueue_journal_transcription(
     Some(serde_json::json!({
         "status": job.status,
         "path": transcript_rel_path,
+        "jsonPath": transcript_json_path,
+        "srtPath": transcript_srt_path,
         "error": job.error,
         "updatedAt": job.updated_at,
     }))
@@ -4188,7 +4474,7 @@ async fn run_local_faster_whisper(
     transcription_config: &TranscriptionConfig,
 ) -> Result<()> {
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    ensure_workspace_transcriber_script(&workspace_dir).await?;
+    ensure_workspace_content_agent_helper_scripts(&workspace_dir).await?;
 
     let script_path = workspace_dir.join("scripts/transcribe_audio_journal.py");
     let mut cmd = Command::new(transcription_config.python_bin.trim());
@@ -4241,12 +4527,44 @@ async fn run_local_faster_whisper(
     Ok(())
 }
 
-async fn ensure_workspace_transcriber_script(workspace_dir: &StdPath) -> Result<()> {
+fn write_workspace_helper_script(
+    workspace_dir: &StdPath,
+    filename: &str,
+    body: &str,
+) -> Result<()> {
+    let scripts_dir = workspace_dir.join("scripts");
+    std::fs::create_dir_all(&scripts_dir)?;
+    std::fs::write(scripts_dir.join(filename), body)?;
+    Ok(())
+}
+
+fn ensure_workspace_content_agent_helper_scripts_sync(workspace_dir: &StdPath) -> Result<()> {
+    write_workspace_helper_script(
+        workspace_dir,
+        "transcribe_audio_journal.py",
+        include_str!("../../scripts/transcribe_audio_journal.py"),
+    )?;
+    write_workspace_helper_script(
+        workspace_dir,
+        "render_audio_insight_clip.py",
+        include_str!("../../scripts/render_audio_insight_clip.py"),
+    )?;
+    Ok(())
+}
+
+async fn ensure_workspace_content_agent_helper_scripts(workspace_dir: &StdPath) -> Result<()> {
     let scripts_dir = workspace_dir.join("scripts");
     tokio::fs::create_dir_all(&scripts_dir).await?;
-    let script_path = scripts_dir.join("transcribe_audio_journal.py");
-    let script = include_str!("../../scripts/transcribe_audio_journal.py");
-    tokio::fs::write(&script_path, script).await?;
+    tokio::fs::write(
+        scripts_dir.join("transcribe_audio_journal.py"),
+        include_str!("../../scripts/transcribe_audio_journal.py"),
+    )
+    .await?;
+    tokio::fs::write(
+        scripts_dir.join("render_audio_insight_clip.py"),
+        include_str!("../../scripts/render_audio_insight_clip.py"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -4528,6 +4846,34 @@ const FEED_MATCH_THRESHOLD: f32 = 0.65;
 const INTEREST_DECAY_RATE: f64 = 0.95;
 const INTEREST_EMA_NEW_WEIGHT: f32 = 0.2;
 const BLUESKY_TIMELINE_LIMIT_MAX: usize = 100;
+const BLUESKY_DISCOVER_FEED_URI: &str =
+    "at://did:plc:qh3lfd7q24h3fn3pejqr25ct/app.bsky.feed.generator/whats-hot";
+const BLUESKY_PERSONALIZED_PAGE_LIMIT_PER_SOURCE: usize = 10;
+const BLUESKY_PERSONALIZED_MATCH_LIMIT: usize = 10;
+const BLUESKY_PERSONALIZED_PAGE_SIZE: usize = 30;
+const FEED_LOCAL_EMBEDDING_MODEL_PRIMARY: &str = "all-minilm";
+const FEED_LOCAL_EMBEDDING_MODEL_FALLBACK: &str = "all-minilm:latest";
+const FEED_LOCAL_EMBEDDING_DIMENSIONS: usize = 384;
+const FEED_LOCAL_EMBEDDING_PULL_TIMEOUT_SECS: u64 = 25;
+const FEED_WEB_SOURCE_KIND: &str = "hn-popular-blogs-2025";
+const FEED_WEB_PREVIEW_CACHE_TTL_SECS: i64 = 24 * 60 * 60;
+const FEED_WEB_INTEREST_QUERY_COUNT: usize = 3;
+const FEED_WEB_DOMAIN_BATCH_SIZE: usize = 5;
+const FEED_WEB_DOMAIN_BATCHES_PER_INTEREST: usize = 2;
+const FEED_WEB_RESULT_LIMIT_PER_QUERY: usize = 5;
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebFeedPreview {
+    url: String,
+    title: String,
+    description: String,
+    image_url: Option<String>,
+    domain: String,
+    provider: String,
+    provider_snippet: Option<String>,
+    discovered_at: String,
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4551,7 +4897,9 @@ struct InterestProfileStats {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PersonalizedBlueskyItem {
+    source_type: String,
     feed_item: serde_json::Value,
+    web_preview: Option<WebFeedPreview>,
     score: Option<f32>,
     matched_interest_label: Option<String>,
     matched_interest_score: Option<f32>,
@@ -4568,6 +4916,31 @@ struct ActiveInterest {
 struct CandidateFeedPost {
     feed_item: serde_json::Value,
     text: String,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateWebResult {
+    url: String,
+    title: String,
+    description: String,
+    domain: String,
+    provider: String,
+    search_query: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlueskyCandidateSource {
+    HomeTimeline,
+    Discover,
+}
+
+impl BlueskyCandidateSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::HomeTimeline => "home",
+            Self::Discover => "discover",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4630,6 +5003,15 @@ fn derive_interest_label(default_title: &str, content: &str) -> String {
     "Workspace interest".to_string()
 }
 
+fn non_empty_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn ema_merge_vectors(current: &[f32], previous: &[f32]) -> Vec<f32> {
     current
         .iter()
@@ -4650,20 +5032,27 @@ fn sort_personalized_items(items: &mut [PersonalizedBlueskyItem]) {
         if score_order != std::cmp::Ordering::Equal {
             return score_order;
         }
-        let right_ts = right
-            .feed_item
-            .get("post")
-            .and_then(|post| post.get("indexedAt"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let left_ts = left
-            .feed_item
-            .get("post")
-            .and_then(|post| post.get("indexedAt"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
+        let right_ts = item_sort_timestamp(right);
+        let left_ts = item_sort_timestamp(left);
         right_ts.cmp(left_ts)
     });
+}
+
+fn item_sort_timestamp(item: &PersonalizedBlueskyItem) -> &str {
+    if let Some(discovered_at) = item
+        .web_preview
+        .as_ref()
+        .map(|preview| preview.discovered_at.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        return discovered_at;
+    }
+
+    item.feed_item
+        .get("post")
+        .and_then(|post| post.get("indexedAt"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
 }
 
 fn extract_bluesky_post_text(feed_item: &serde_json::Value) -> String {
@@ -4687,55 +5076,647 @@ fn extract_bluesky_post_text(feed_item: &serde_json::Value) -> String {
         .to_string()
 }
 
-async fn fetch_bluesky_timeline_candidates(
+fn bluesky_candidate_sources() -> [BlueskyCandidateSource; 2] {
+    [BlueskyCandidateSource::HomeTimeline, BlueskyCandidateSource::Discover]
+}
+
+fn build_bluesky_feed_endpoint(
     service_url: &str,
-    access_jwt: &str,
+    source: BlueskyCandidateSource,
+    cursor: Option<&str>,
     limit: usize,
-) -> Result<Vec<CandidateFeedPost>> {
+) -> String {
     let trimmed_service = service_url.trim().trim_end_matches('/');
     let normalized_limit = limit.clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
-    let url = format!(
-        "{trimmed_service}/xrpc/app.bsky.feed.getTimeline?limit={normalized_limit}"
-    );
+    let mut url = match source {
+        BlueskyCandidateSource::HomeTimeline => format!(
+            "{trimmed_service}/xrpc/app.bsky.feed.getTimeline?limit={normalized_limit}"
+        ),
+        BlueskyCandidateSource::Discover => format!(
+            "{trimmed_service}/xrpc/app.bsky.feed.getFeed?feed={}&limit={normalized_limit}",
+            urlencoding::encode(BLUESKY_DISCOVER_FEED_URI)
+        ),
+    };
 
+    if let Some(next_cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) {
+        url.push_str("&cursor=");
+        url.push_str(urlencoding::encode(next_cursor).as_ref());
+    }
+
+    url
+}
+
+fn bluesky_candidate_dedup_key(feed_item: &serde_json::Value) -> Option<String> {
+    let post = feed_item.get("post").unwrap_or(feed_item);
+    post.get("uri")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            post.get("cid")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn dedupe_candidate_posts(
+    candidates: Vec<CandidateFeedPost>,
+    seen: &mut BTreeSet<String>,
+) -> Vec<CandidateFeedPost> {
+    let mut out = Vec::new();
+    for candidate in candidates {
+        if let Some(key) = bluesky_candidate_dedup_key(&candidate.feed_item) {
+            if !seen.insert(key) {
+                continue;
+            }
+        }
+        out.push(candidate);
+    }
+    out
+}
+
+fn build_raw_personalized_items(
+    candidates: Vec<CandidateFeedPost>,
+    limit: usize,
+) -> Vec<PersonalizedBlueskyItem> {
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(|candidate| PersonalizedBlueskyItem {
+            source_type: "bluesky".to_string(),
+            feed_item: candidate.feed_item,
+            web_preview: None,
+            score: None,
+            matched_interest_label: None,
+            matched_interest_score: None,
+            passed_threshold: false,
+        })
+        .collect()
+}
+
+async fn fetch_bluesky_candidate_page(
+    service_url: &str,
+    access_jwt: &str,
+    source: BlueskyCandidateSource,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<CandidateFeedPost>, Option<String>)> {
+    let url = build_bluesky_feed_endpoint(service_url, source, cursor, limit);
     let response = reqwest::Client::new()
         .get(url)
         .bearer_auth(access_jwt.trim())
         .send()
         .await
-        .context("Failed to fetch Bluesky timeline")?;
+        .with_context(|| format!("Failed to fetch Bluesky {} feed", source.label()))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Bluesky timeline request failed ({status}): {body}");
+        anyhow::bail!(
+            "Bluesky {} feed request failed ({status}): {body}",
+            source.label()
+        );
     }
 
     let json: serde_json::Value = response
         .json()
         .await
-        .context("Failed to decode Bluesky timeline response")?;
+        .with_context(|| format!("Failed to decode Bluesky {} feed response", source.label()))?;
     let feed = json
         .get("feed")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let next_cursor = json
+        .get("cursor")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
 
-    Ok(feed
-        .into_iter()
-        .map(|feed_item| {
-            CandidateFeedPost {
+    Ok((
+        feed.into_iter()
+            .map(|feed_item| CandidateFeedPost {
                 text: extract_bluesky_post_text(&feed_item),
                 feed_item,
+            })
+            .collect(),
+        next_cursor,
+    ))
+}
+
+async fn fetch_bluesky_fallback_candidates(
+    service_url: &str,
+    access_jwt: &str,
+    limit: usize,
+) -> Result<Vec<CandidateFeedPost>> {
+    let mut seen = BTreeSet::new();
+    let mut all_candidates = Vec::new();
+    for source in bluesky_candidate_sources() {
+        let (page, _) = fetch_bluesky_candidate_page(
+            service_url,
+            access_jwt,
+            source,
+            None,
+            limit.min(BLUESKY_PERSONALIZED_PAGE_SIZE),
+        )
+        .await?;
+        let unique_page = dedupe_candidate_posts(page, &mut seen);
+        all_candidates.extend(unique_page);
+        if all_candidates.len() >= limit {
+            break;
+        }
+    }
+    Ok(all_candidates)
+}
+
+fn normalize_feed_web_domain(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches("www.")
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn resolve_feed_web_domain(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(normalize_feed_web_domain(host))
+}
+
+fn is_allowed_feed_web_domain(host: &str, allowed: &BTreeSet<String>) -> bool {
+    let normalized = normalize_feed_web_domain(host);
+    allowed.iter().any(|domain| {
+        normalized == *domain || normalized.ends_with(&format!(".{domain}"))
+    })
+}
+
+fn seed_default_feed_web_sources(workspace_dir: &StdPath) -> Result<()> {
+    for source in DEFAULT_FEED_WEB_SOURCES {
+        let _ = local_store::upsert_feed_web_source(
+            workspace_dir,
+            &local_store::FeedWebSourceUpsert {
+                domain: source.domain.to_string(),
+                title: source.title.to_string(),
+                html_url: source.html_url.to_string(),
+                xml_url: source.xml_url.to_string(),
+                enabled: true,
+                source_kind: FEED_WEB_SOURCE_KIND.to_string(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn build_feed_web_queries(
+    interests: &[ActiveInterest],
+    sources: &[local_store::FeedWebSourceRecord],
+) -> Vec<String> {
+    let top_interests: Vec<&ActiveInterest> = interests
+        .iter()
+        .filter(|interest| !interest.record.label.trim().is_empty())
+        .collect();
+    let mut top_interests = top_interests;
+    top_interests.sort_by(|left, right| {
+        right
+            .record
+            .health_score
+            .partial_cmp(&left.record.health_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    top_interests.truncate(FEED_WEB_INTEREST_QUERY_COUNT);
+
+    let domains: Vec<String> = sources
+        .iter()
+        .map(|source| normalize_feed_web_domain(&source.domain))
+        .filter(|domain| !domain.is_empty())
+        .collect();
+    if domains.is_empty() {
+        return Vec::new();
+    }
+
+    let batches: Vec<&[String]> = domains.chunks(FEED_WEB_DOMAIN_BATCH_SIZE).collect();
+    let mut queries = Vec::new();
+    for (interest_index, interest) in top_interests.iter().enumerate() {
+        for batch_offset in 0..FEED_WEB_DOMAIN_BATCHES_PER_INTEREST {
+            let batch_index = (interest_index * FEED_WEB_DOMAIN_BATCHES_PER_INTEREST + batch_offset)
+                % batches.len();
+            let batch = batches[batch_index];
+            let site_filters = batch
+                .iter()
+                .map(|domain| format!("site:{domain}"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            queries.push(format!("{} ({site_filters})", interest.record.label));
+        }
+    }
+    queries
+}
+
+fn build_feed_web_search_tool(config: &Config) -> Option<WebSearchTool> {
+    if !config.web_search.enabled {
+        return None;
+    }
+
+    Some(WebSearchTool::new(
+        config.web_search.provider.clone(),
+        config.web_search.brave_api_key.clone(),
+        FEED_WEB_RESULT_LIMIT_PER_QUERY.min(config.web_search.max_results),
+        config.web_search.timeout_secs,
+    ))
+}
+
+async fn collect_web_search_candidates(
+    config: &Config,
+    interests: &[ActiveInterest],
+) -> Result<Vec<CandidateWebResult>> {
+    let Some(tool) = build_feed_web_search_tool(config) else {
+        return Ok(Vec::new());
+    };
+
+    let workspace_dir = &config.workspace_dir;
+    seed_default_feed_web_sources(workspace_dir)?;
+    let sources = local_store::list_feed_web_sources(workspace_dir)?;
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let allowed_domains: BTreeSet<String> = sources
+        .iter()
+        .map(|source| normalize_feed_web_domain(&source.domain))
+        .collect();
+    let mut candidates = Vec::new();
+    let mut seen_urls = BTreeSet::new();
+
+    for query in build_feed_web_queries(interests, &sources) {
+        let results = match tool.search_structured(&query).await {
+            Ok(results) => results,
+            Err(err) => {
+                tracing::debug!(query, error = %err, "Feed web search query failed");
+                continue;
             }
-        })
-        .collect())
+        };
+        for result in results {
+            let Some(domain) = resolve_feed_web_domain(&result.url) else {
+                continue;
+            };
+            if !is_allowed_feed_web_domain(&domain, &allowed_domains) {
+                continue;
+            }
+            if !seen_urls.insert(result.url.clone()) {
+                continue;
+            }
+            candidates.push(CandidateWebResult {
+                url: result.url,
+                title: result.title,
+                description: result.description,
+                domain,
+                provider: result.provider,
+                search_query: query.clone(),
+            });
+        }
+    }
+
+    Ok(candidates)
+}
+
+fn web_preview_cache_is_fresh(updated_at: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(updated_at)
+        .ok()
+        .map(|value| Utc::now().signed_duration_since(value.with_timezone(&Utc)).num_seconds())
+        .map(|age| age >= 0 && age <= FEED_WEB_PREVIEW_CACHE_TTL_SECS)
+        .unwrap_or(false)
+}
+
+fn first_meta_capture(html: &str, patterns: &[&str]) -> Option<String> {
+    for pattern in patterns {
+        let regex = Regex::new(pattern).ok()?;
+        if let Some(capture) = regex.captures(html) {
+            if let Some(value) = capture.get(1) {
+                let trimmed = html_unescape_basic(value.as_str().trim());
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn html_unescape_basic(raw: &str) -> String {
+    raw.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+}
+
+async fn fetch_web_preview_html(url: &str) -> Result<String> {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent("SlowClawFeedPreview/1.0")
+        .build()?
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch preview URL {url}"))?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Preview fetch failed for {url} ({})", response.status());
+    }
+
+    response
+        .text()
+        .await
+        .with_context(|| format!("Failed to read preview body {url}"))
+}
+
+fn preview_from_html(candidate: &CandidateWebResult, html: &str) -> WebFeedPreview {
+    let title = first_meta_capture(
+        html,
+        &[
+            r#"(?is)<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']"#,
+            r#"(?is)<meta[^>]+name=["']twitter:title["'][^>]+content=["']([^"']+)["']"#,
+            r#"(?is)<title[^>]*>\s*([^<]+?)\s*</title>"#,
+        ],
+    )
+    .unwrap_or_else(|| candidate.title.clone());
+    let description = first_meta_capture(
+        html,
+        &[
+            r#"(?is)<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']"#,
+            r#"(?is)<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']"#,
+            r#"(?is)<meta[^>]+name=["']twitter:description["'][^>]+content=["']([^"']+)["']"#,
+        ],
+    )
+    .unwrap_or_else(|| candidate.description.clone());
+    let image_url = first_meta_capture(
+        html,
+        &[
+            r#"(?is)<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']"#,
+            r#"(?is)<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']"#,
+        ],
+    );
+
+    WebFeedPreview {
+        url: candidate.url.clone(),
+        title,
+        description,
+        image_url,
+        domain: candidate.domain.clone(),
+        provider: candidate.provider.clone(),
+        provider_snippet: (!candidate.description.trim().is_empty())
+            .then(|| candidate.description.clone()),
+        discovered_at: Utc::now().to_rfc3339(),
+    }
+}
+
+async fn resolve_web_preview(
+    workspace_dir: &StdPath,
+    candidate: &CandidateWebResult,
+) -> WebFeedPreview {
+    if let Ok(Some(cached)) = local_store::get_feed_web_cache(workspace_dir, &candidate.url) {
+        if web_preview_cache_is_fresh(&cached.updated_at) {
+            return WebFeedPreview {
+                url: cached.url,
+                title: if cached.title.trim().is_empty() {
+                    candidate.title.clone()
+                } else {
+                    cached.title
+                },
+                description: if cached.description.trim().is_empty() {
+                    candidate.description.clone()
+                } else {
+                    cached.description
+                },
+                image_url: non_empty_string(cached.image_url),
+                domain: if cached.domain.trim().is_empty() {
+                    candidate.domain.clone()
+                } else {
+                    cached.domain
+                },
+                provider: if cached.provider.trim().is_empty() {
+                    candidate.provider.clone()
+                } else {
+                    cached.provider
+                },
+                provider_snippet: non_empty_string(cached.snippet),
+                discovered_at: if cached.fetched_at.trim().is_empty() {
+                    Utc::now().to_rfc3339()
+                } else {
+                    cached.fetched_at
+                },
+            };
+        }
+    }
+
+    let preview = match fetch_web_preview_html(&candidate.url).await {
+        Ok(html) => preview_from_html(candidate, &html),
+        Err(err) => {
+            tracing::debug!(url = %candidate.url, error = %err, "Feed preview fetch failed");
+            WebFeedPreview {
+                url: candidate.url.clone(),
+                title: candidate.title.clone(),
+                description: candidate.description.clone(),
+                image_url: None,
+                domain: candidate.domain.clone(),
+                provider: candidate.provider.clone(),
+                provider_snippet: (!candidate.description.trim().is_empty())
+                    .then(|| candidate.description.clone()),
+                discovered_at: Utc::now().to_rfc3339(),
+            }
+        }
+    };
+
+    let _ = local_store::upsert_feed_web_cache(
+        workspace_dir,
+        &local_store::FeedWebCacheUpsert {
+            url: preview.url.clone(),
+            domain: preview.domain.clone(),
+            title: preview.title.clone(),
+            description: preview.description.clone(),
+            image_url: preview.image_url.clone().unwrap_or_default(),
+            provider: preview.provider.clone(),
+            snippet: preview.provider_snippet.clone().unwrap_or_default(),
+            search_query: candidate.search_query.clone(),
+            fetched_at: preview.discovered_at.clone(),
+        },
+    );
+
+    preview
+}
+
+fn local_feed_embedding_base_urls(config: &Config) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Some(api_url) = config
+        .api_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let trimmed = api_url.trim_end_matches('/');
+        if trimmed.ends_with("/api") {
+            urls.push(format!("custom:{trimmed}"));
+        } else if !trimmed.ends_with("/api/embeddings") && !trimmed.ends_with("/embeddings") {
+            urls.push(format!("custom:{trimmed}/api"));
+        } else {
+            urls.push(format!("custom:{trimmed}"));
+        }
+    }
+    urls.push("custom:http://127.0.0.1:11434/api".to_string());
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
+fn normalize_ollama_endpoint_root(raw_url: &str) -> String {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    trimmed
+        .trim_end_matches("/embeddings")
+        .trim_end_matches("/v1")
+        .trim_end_matches("/api")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn ollama_endpoint_is_local(endpoint_url: &str) -> bool {
+    reqwest::Url::parse(endpoint_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"))
+}
+
+fn local_ollama_pull_endpoints(config: &Config) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    if let Some(api_url) = config
+        .api_url
+        .as_deref()
+        .map(normalize_ollama_endpoint_root)
+        .filter(|value| !value.is_empty() && ollama_endpoint_is_local(value))
+    {
+        endpoints.push(api_url);
+    }
+    endpoints.push("http://127.0.0.1:11434".to_string());
+    endpoints.push("http://localhost:11434".to_string());
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints
+}
+
+async fn pull_local_feed_embedding_model(endpoint: &str, model: &str) -> Result<()> {
+    let url = format!("{}/api/pull", endpoint.trim_end_matches('/'));
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(FEED_LOCAL_EMBEDDING_PULL_TIMEOUT_SECS))
+        .build()?
+        .post(url)
+        .json(&serde_json::json!({
+            "model": model,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("Failed to reach local Ollama at {endpoint}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Ollama pull failed at {endpoint} ({status}): {body}");
+    }
+
+    Ok(())
+}
+
+async fn bootstrap_local_feed_embeddings(config: &Config) -> Result<Option<String>> {
+    let mut failures = Vec::new();
+
+    for endpoint in local_ollama_pull_endpoints(config) {
+        for model in [
+            FEED_LOCAL_EMBEDDING_MODEL_PRIMARY,
+            FEED_LOCAL_EMBEDDING_MODEL_FALLBACK,
+        ] {
+            match pull_local_feed_embedding_model(&endpoint, model).await {
+                Ok(()) => {
+                    return Ok(Some(format!(
+                        "Bootstrapped local all-MiniLM embeddings via Ollama at {endpoint}."
+                    )));
+                }
+                Err(err) => failures.push(format!("{endpoint} [{model}]: {err}")),
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "Tried to bootstrap local all-MiniLM embeddings via Ollama, but it did not succeed: {}",
+            failures.join(" | ")
+        )))
+    }
+}
+
+async fn select_feed_embedder(config: &Config) -> Result<Option<Arc<dyn memory::embeddings::EmbeddingProvider>>> {
+    let mut providers: Vec<Arc<dyn memory::embeddings::EmbeddingProvider>> = Vec::new();
+    for base_url in local_feed_embedding_base_urls(config) {
+        for model in [
+            FEED_LOCAL_EMBEDDING_MODEL_PRIMARY,
+            FEED_LOCAL_EMBEDDING_MODEL_FALLBACK,
+        ] {
+            providers.push(Arc::from(memory::embeddings::create_embedding_provider(
+                &base_url,
+                None,
+                model,
+                FEED_LOCAL_EMBEDDING_DIMENSIONS,
+            )));
+        }
+    }
+
+    let configured = memory::create_embedder_from_config(config);
+    if configured.dimensions() > 0 {
+        providers.push(configured);
+    }
+
+    for provider in providers {
+        if provider.dimensions() == 0 {
+            continue;
+        }
+        match provider.embed_one("feed profile probe").await {
+            Ok(embedding) if !embedding.is_empty() => return Ok(Some(provider)),
+            Ok(_) => continue,
+            Err(err) => {
+                tracing::debug!(
+                    provider = provider.name(),
+                    dimensions = provider.dimensions(),
+                    error = %err,
+                    "Feed embedder probe failed"
+                );
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn resolve_feed_embedder(
+    config: &Config,
+) -> Result<(
+    Option<Arc<dyn memory::embeddings::EmbeddingProvider>>,
+    Option<String>,
+)> {
+    if let Some(embedder) = select_feed_embedder(config).await? {
+        return Ok((Some(embedder), None));
+    }
+
+    let bootstrap_message = bootstrap_local_feed_embeddings(config).await?;
+    let embedder = select_feed_embedder(config).await?;
+    Ok((embedder, bootstrap_message))
 }
 
 async fn rebuild_interest_profile(
     config: &Config,
+    embedder: Arc<dyn memory::embeddings::EmbeddingProvider>,
 ) -> Result<RebuildInterestProfileResult> {
-    let embedder = memory::create_embedder_from_config(config);
     if embedder.dimensions() == 0 {
         return Ok(RebuildInterestProfileResult {
             status: "embeddingUnavailable",
@@ -4904,6 +5885,25 @@ async fn rebuild_interest_profile(
     })
 }
 
+fn best_interest_match(
+    embedding: &[f32],
+    interests: &[ActiveInterest],
+) -> (f32, f32, Option<String>) {
+    let mut best_weighted = 0.0_f32;
+    let mut best_similarity = 0.0_f32;
+    let mut best_label: Option<String> = None;
+    for interest in interests {
+        let similarity = cosine_similarity(embedding, &interest.embedding);
+        let weighted = similarity * interest.record.health_score as f32;
+        if weighted > best_weighted {
+            best_weighted = weighted;
+            best_similarity = similarity;
+            best_label = Some(interest.record.label.clone());
+        }
+    }
+    (best_weighted, best_similarity, best_label)
+}
+
 async fn rank_bluesky_candidates(
     embedder: Arc<dyn memory::embeddings::EmbeddingProvider>,
     interests: &[ActiveInterest],
@@ -4914,7 +5914,9 @@ async fn rank_bluesky_candidates(
         let trimmed = candidate.text.trim();
         if trimmed.is_empty() {
             ranked.push(PersonalizedBlueskyItem {
+                source_type: "bluesky".to_string(),
                 feed_item: candidate.feed_item,
+                web_preview: None,
                 score: None,
                 matched_interest_label: None,
                 matched_interest_score: None,
@@ -4928,21 +5930,13 @@ async fn rank_bluesky_candidates(
             .await
             .context("Failed to embed Bluesky candidate post")?;
 
-        let mut best_weighted = 0.0_f32;
-        let mut best_similarity = 0.0_f32;
-        let mut best_label: Option<String> = None;
-        for interest in interests {
-            let similarity = cosine_similarity(&embedding, &interest.embedding);
-            let weighted = similarity * interest.record.health_score as f32;
-            if weighted > best_weighted {
-                best_weighted = weighted;
-                best_similarity = similarity;
-                best_label = Some(interest.record.label.clone());
-            }
-        }
+        let (best_weighted, best_similarity, best_label) =
+            best_interest_match(&embedding, interests);
 
         ranked.push(PersonalizedBlueskyItem {
+            source_type: "bluesky".to_string(),
             feed_item: candidate.feed_item,
+            web_preview: None,
             score: Some(best_weighted),
             matched_interest_label: best_label,
             matched_interest_score: if best_similarity > 0.0 {
@@ -4958,6 +5952,109 @@ async fn rank_bluesky_candidates(
         ranked.into_iter().filter(|item| item.passed_threshold).collect();
     sort_personalized_items(&mut filtered);
     Ok(filtered)
+}
+
+async fn rank_web_candidates(
+    workspace_dir: &StdPath,
+    embedder: Arc<dyn memory::embeddings::EmbeddingProvider>,
+    interests: &[ActiveInterest],
+    candidates: Vec<CandidateWebResult>,
+    limit: usize,
+) -> Result<Vec<PersonalizedBlueskyItem>> {
+    let mut ranked = Vec::new();
+    for candidate in candidates {
+        let combined = format!("{}\n{}", candidate.title.trim(), candidate.description.trim());
+        let trimmed = combined.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let embedding = embedder
+            .embed_one(trimmed)
+            .await
+            .with_context(|| format!("Failed to embed web candidate {}", candidate.url))?;
+        let (best_weighted, best_similarity, best_label) =
+            best_interest_match(&embedding, interests);
+        if best_weighted < FEED_MATCH_THRESHOLD {
+            continue;
+        }
+
+        let preview = resolve_web_preview(workspace_dir, &candidate).await;
+        ranked.push(PersonalizedBlueskyItem {
+            source_type: "web".to_string(),
+            feed_item: serde_json::json!({
+                "url": candidate.url,
+                "title": candidate.title,
+                "description": candidate.description,
+                "domain": candidate.domain,
+            }),
+            web_preview: Some(preview),
+            score: Some(best_weighted),
+            matched_interest_label: best_label,
+            matched_interest_score: if best_similarity > 0.0 {
+                Some(best_similarity)
+            } else {
+                None
+            },
+            passed_threshold: true,
+        });
+    }
+
+    sort_personalized_items(&mut ranked);
+    ranked.truncate(limit);
+    Ok(ranked)
+}
+
+async fn collect_ranked_bluesky_matches(
+    service_url: &str,
+    access_jwt: &str,
+    embedder: Arc<dyn memory::embeddings::EmbeddingProvider>,
+    interests: &[ActiveInterest],
+    limit: usize,
+) -> Result<(Vec<PersonalizedBlueskyItem>, Vec<CandidateFeedPost>)> {
+    let mut matched = Vec::new();
+    let mut raw_candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    let target_matches = limit.min(BLUESKY_PERSONALIZED_MATCH_LIMIT);
+
+    for source in bluesky_candidate_sources() {
+        let mut cursor: Option<String> = None;
+        for _ in 0..BLUESKY_PERSONALIZED_PAGE_LIMIT_PER_SOURCE {
+            let (page, next_cursor) = fetch_bluesky_candidate_page(
+                service_url,
+                access_jwt,
+                source,
+                cursor.as_deref(),
+                BLUESKY_PERSONALIZED_PAGE_SIZE,
+            )
+            .await?;
+            if page.is_empty() {
+                break;
+            }
+
+            let unique_page = dedupe_candidate_posts(page, &mut seen);
+            if !unique_page.is_empty() {
+                raw_candidates.extend(unique_page.clone());
+                let mut ranked_page =
+                    rank_bluesky_candidates(embedder.clone(), interests, unique_page).await?;
+                matched.append(&mut ranked_page);
+                if matched.len() >= target_matches {
+                    sort_personalized_items(&mut matched);
+                    matched.truncate(target_matches);
+                    return Ok((matched, raw_candidates));
+                }
+            }
+
+            let Some(next_cursor) = next_cursor.filter(|value| !value.trim().is_empty()) else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+
+    sort_personalized_items(&mut matched);
+    matched.truncate(target_matches);
+    Ok((matched, raw_candidates))
 }
 
 fn modified_unix_secs(path: &StdPath) -> i64 {
@@ -5559,24 +6656,68 @@ mod tests {
     }
 
     #[test]
+    fn build_bluesky_feed_endpoint_uses_discover_feed_generator() {
+        let url = build_bluesky_feed_endpoint(
+            "https://bsky.social/",
+            BlueskyCandidateSource::Discover,
+            Some("cursor-1"),
+            30,
+        );
+        assert!(url.contains("/xrpc/app.bsky.feed.getFeed?feed="));
+        assert!(url.contains("app.bsky.feed.generator%2Fwhats-hot"));
+        assert!(url.contains("cursor=cursor-1"));
+    }
+
+    #[test]
+    fn dedupe_candidate_posts_drops_duplicate_post_uri() {
+        let mut seen = BTreeSet::new();
+        let deduped = dedupe_candidate_posts(
+            vec![
+                CandidateFeedPost {
+                    text: "first".to_string(),
+                    feed_item: serde_json::json!({"post": {"uri": "at://post/1"}}),
+                },
+                CandidateFeedPost {
+                    text: "second".to_string(),
+                    feed_item: serde_json::json!({"post": {"uri": "at://post/1"}}),
+                },
+                CandidateFeedPost {
+                    text: "third".to_string(),
+                    feed_item: serde_json::json!({"post": {"uri": "at://post/2"}}),
+                },
+            ],
+            &mut seen,
+        );
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].text, "first");
+        assert_eq!(deduped[1].text, "third");
+    }
+
+    #[test]
     fn sort_personalized_items_orders_by_score_then_recency() {
         let mut items = vec![
             PersonalizedBlueskyItem {
+                source_type: "bluesky".to_string(),
                 feed_item: serde_json::json!({"post": {"indexedAt": "2026-03-09T09:00:00Z"}}),
+                web_preview: None,
                 score: Some(0.8),
                 matched_interest_label: None,
                 matched_interest_score: None,
                 passed_threshold: true,
             },
             PersonalizedBlueskyItem {
+                source_type: "bluesky".to_string(),
                 feed_item: serde_json::json!({"post": {"indexedAt": "2026-03-09T10:00:00Z"}}),
+                web_preview: None,
                 score: Some(0.8),
                 matched_interest_label: None,
                 matched_interest_score: None,
                 passed_threshold: true,
             },
             PersonalizedBlueskyItem {
+                source_type: "bluesky".to_string(),
                 feed_item: serde_json::json!({"post": {"indexedAt": "2026-03-09T11:00:00Z"}}),
+                web_preview: None,
                 score: Some(0.6),
                 matched_interest_label: None,
                 matched_interest_score: None,
@@ -6534,6 +7675,32 @@ mod tests {
         std::fs::write(transcript_dir.join("clip.txt"), "transcript\n").unwrap();
 
         assert!(latest_content_agent_source_updated_at(workspace) > 0);
+    }
+
+    #[test]
+    fn transcript_sidecar_paths_follow_transcript_txt_path() {
+        let transcript = "journals/text/transcriptions/audio/clip.txt";
+        assert_eq!(
+            transcript_json_rel_path(transcript),
+            "journals/text/transcriptions/audio/clip.json"
+        );
+        assert_eq!(
+            transcript_srt_rel_path(transcript),
+            "journals/text/transcriptions/audio/clip.srt"
+        );
+    }
+
+    #[test]
+    fn content_agent_config_with_headroom_keeps_existing_command_allowlist() {
+        let base = Config::default();
+        let config = content_agent_config_with_headroom(&base);
+        assert_eq!(config.autonomy.allowed_commands, base.autonomy.allowed_commands);
+        for command in ["python", "python3", "ffmpeg", "ffprobe"] {
+            assert!(
+                !config.autonomy.allowed_commands.iter().any(|value| value == command),
+                "unexpected command {command}"
+            );
+        }
     }
 
     fn sample_workflow_store() -> FeedContentAgentStore {

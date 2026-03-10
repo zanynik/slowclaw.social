@@ -4,6 +4,14 @@ use regex::Regex;
 use serde_json::json;
 use std::time::Duration;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSearchResultItem {
+    pub title: String,
+    pub url: String,
+    pub description: String,
+    pub provider: String,
+}
+
 /// Web search tool for searching the internet.
 /// Supports multiple providers: DuckDuckGo (free), Brave (requires API key).
 pub struct WebSearchTool {
@@ -28,7 +36,27 @@ impl WebSearchTool {
         }
     }
 
+    pub async fn search_structured(&self, query: &str) -> anyhow::Result<Vec<WebSearchResultItem>> {
+        if query.trim().is_empty() {
+            anyhow::bail!("Search query cannot be empty");
+        }
+
+        match self.provider.as_str() {
+            "duckduckgo" | "ddg" => self.search_duckduckgo_structured(query).await,
+            "brave" => self.search_brave_structured(query).await,
+            _ => anyhow::bail!(
+                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
+                self.provider
+            ),
+        }
+    }
+
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
+        let results = self.search_duckduckgo_structured(query).await?;
+        Ok(format_search_results(query, "DuckDuckGo", &results))
+    }
+
+    async fn search_duckduckgo_structured(&self, query: &str) -> anyhow::Result<Vec<WebSearchResultItem>> {
         let encoded_query = urlencoding::encode(query);
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
 
@@ -47,10 +75,10 @@ impl WebSearchTool {
         }
 
         let html = response.text().await?;
-        self.parse_duckduckgo_results(&html, query)
+        self.parse_duckduckgo_results(&html)
     }
 
-    fn parse_duckduckgo_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
+    fn parse_duckduckgo_results(&self, html: &str) -> anyhow::Result<Vec<WebSearchResultItem>> {
         // Extract result links: <a class="result__a" href="...">Title</a>
         let link_regex = Regex::new(
             r#"<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#,
@@ -70,35 +98,39 @@ impl WebSearchTool {
             .collect();
 
         if link_matches.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(Vec::new());
         }
 
-        let mut lines = vec![format!("Search results for: {} (via DuckDuckGo)", query)];
-
         let count = link_matches.len().min(self.max_results);
+        let mut results = Vec::with_capacity(count);
 
         for i in 0..count {
             let caps = &link_matches[i];
             let url_str = decode_ddg_redirect_url(&caps[1]);
             let title = strip_tags(&caps[2]);
+            let description = if i < snippet_matches.len() {
+                strip_tags(&snippet_matches[i][1]).trim().to_string()
+            } else {
+                String::new()
+            };
 
-            lines.push(format!("{}. {}", i + 1, title.trim()));
-            lines.push(format!("   {}", url_str.trim()));
-
-            // Add snippet if available
-            if i < snippet_matches.len() {
-                let snippet = strip_tags(&snippet_matches[i][1]);
-                let snippet = snippet.trim();
-                if !snippet.is_empty() {
-                    lines.push(format!("   {}", snippet));
-                }
-            }
+            results.push(WebSearchResultItem {
+                title: title.trim().to_string(),
+                url: url_str.trim().to_string(),
+                description,
+                provider: "duckduckgo".to_string(),
+            });
         }
 
-        Ok(lines.join("\n"))
+        Ok(results)
     }
 
     async fn search_brave(&self, query: &str) -> anyhow::Result<String> {
+        let results = self.search_brave_structured(query).await?;
+        Ok(format_search_results(query, "Brave", &results))
+    }
+
+    async fn search_brave_structured(&self, query: &str) -> anyhow::Result<Vec<WebSearchResultItem>> {
         let api_key = self
             .brave_api_key
             .as_ref()
@@ -126,10 +158,10 @@ impl WebSearchTool {
         }
 
         let json: serde_json::Value = response.json().await?;
-        self.parse_brave_results(&json, query)
+        self.parse_brave_results(&json)
     }
 
-    fn parse_brave_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
+    fn parse_brave_results(&self, json: &serde_json::Value) -> anyhow::Result<Vec<WebSearchResultItem>> {
         let results = json
             .get("web")
             .and_then(|w| w.get("results"))
@@ -137,12 +169,12 @@ impl WebSearchTool {
             .ok_or_else(|| anyhow::anyhow!("Invalid Brave API response"))?;
 
         if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(Vec::new());
         }
 
-        let mut lines = vec![format!("Search results for: {} (via Brave)", query)];
+        let mut items = Vec::with_capacity(results.len().min(self.max_results));
 
-        for (i, result) in results.iter().take(self.max_results).enumerate() {
+        for result in results.iter().take(self.max_results) {
             let title = result
                 .get("title")
                 .and_then(|t| t.as_str())
@@ -153,15 +185,32 @@ impl WebSearchTool {
                 .and_then(|d| d.as_str())
                 .unwrap_or("");
 
-            lines.push(format!("{}. {}", i + 1, title));
-            lines.push(format!("   {}", url));
-            if !description.is_empty() {
-                lines.push(format!("   {}", description));
-            }
+            items.push(WebSearchResultItem {
+                title: title.to_string(),
+                url: url.to_string(),
+                description: description.to_string(),
+                provider: "brave".to_string(),
+            });
         }
 
-        Ok(lines.join("\n"))
+        Ok(items)
     }
+}
+
+fn format_search_results(query: &str, provider_label: &str, items: &[WebSearchResultItem]) -> String {
+    if items.is_empty() {
+        return format!("No results found for: {}", query);
+    }
+
+    let mut lines = vec![format!("Search results for: {} (via {})", query, provider_label)];
+    for (index, item) in items.iter().enumerate() {
+        lines.push(format!("{}. {}", index + 1, item.title));
+        lines.push(format!("   {}", item.url));
+        if !item.description.trim().is_empty() {
+            lines.push(format!("   {}", item.description.trim()));
+        }
+    }
+    lines.join("\n")
 }
 
 fn decode_ddg_redirect_url(raw_url: &str) -> String {
@@ -266,10 +315,8 @@ mod tests {
     #[test]
     fn test_parse_duckduckgo_results_empty() {
         let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
-        let result = tool
-            .parse_duckduckgo_results("<html>No results here</html>", "test")
-            .unwrap();
-        assert!(result.contains("No results found"));
+        let result = tool.parse_duckduckgo_results("<html>No results here</html>").unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -279,9 +326,10 @@ mod tests {
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
         "#;
-        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
-        assert!(result.contains("Example Title"));
-        assert!(result.contains("https://example.com"));
+        let result = tool.parse_duckduckgo_results(html).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "Example Title");
+        assert_eq!(result[0].url, "https://example.com");
     }
 
     #[test]
@@ -291,9 +339,8 @@ mod tests {
             <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1&amp;rut=test">Example Title</a>
             <a class="result__snippet">This is a description</a>
         "#;
-        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
-        assert!(result.contains("https://example.com/path?a=1"));
-        assert!(!result.contains("rut=test"));
+        let result = tool.parse_duckduckgo_results(html).unwrap();
+        assert_eq!(result[0].url, "https://example.com/path?a=1");
     }
 
     #[test]
@@ -303,8 +350,8 @@ mod tests {
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
         "#;
-        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
-        assert!(result.contains("Example Title"));
+        let result = tool.parse_duckduckgo_results(html).unwrap();
+        assert_eq!(result[0].title, "Example Title");
     }
 
     #[tokio::test]
