@@ -130,6 +130,20 @@ Required:
 - For risky changes, define rollback path before merge.
 - Avoid mixed mega-patches that block safe rollback.
 
+### 3.9 Product Vision Alignment (Required)
+
+**Why here:** The repository must converge on a clean, minimal, AI-native personal content and curation engine rather than drifting into generic agent sprawl.
+
+Required:
+
+- Treat [`docs/vision-contract.md`](docs/vision-contract.md) as a merge gate, not optional product commentary.
+- Reject changes that add cognitive load, fragmented UX, or avoidable configuration without a documented user-value reason.
+- Prefer open protocols (`BlueSky`, `Nostr`, `RSS`, `Atom`) over closed-platform lock-in for core product surfaces.
+- Prefer traits, tools, skills, and plugin-style extension points over hardcoded one-off workflow branches.
+- Preserve the path to cross-platform operation (`macOS`, `iOS`, `Windows`, `Android`) when introducing runtime or UI assumptions.
+- Keep vectorization local-first or explicitly tied to secure, user-owned credentials; do not broaden remote processing silently.
+- Preserve the product pipeline direction: multimodal capture (`text`, `audio`, `video`), transform workflows, personalized curation, draft review, and open publishing/ingestion contracts.
+
 ## 4) Repository Map (High-Level)
 
 - `src/main.rs` — CLI entrypoint and command routing
@@ -215,6 +229,7 @@ When uncertain, classify as higher risk.
     - Code/risky changes: full relevant checks and focused scenarios.
 5. **Document impact**
     - Update docs/PR notes for behavior, risk, side effects, and rollback.
+    - Include vision-alignment notes whenever planning, user-facing behavior, architecture shape, publishing flow, ingestion flow, or vectorization behavior changes.
     - If CLI/config/provider/channel behavior changed, update corresponding runtime-contract references.
     - If docs entry points changed, keep all supported locale README/docs-hub navigation aligned (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`).
 6. **Respect queue hygiene**
@@ -437,6 +452,7 @@ Co-authored-by: <Name B> <login_b@users.noreply.github.com>
 Reference docs:
 
 - `CONTRIBUTING.md`
+- `docs/vision-contract.md`
 - `docs/README.md`
 - `docs/SUMMARY.md`
 - `docs/docs-inventory.md`
@@ -470,8 +486,9 @@ When handing off work, include:
 1. What changed
 2. What did not change
 3. Validation run and results
-4. Remaining risks / unknowns
-5. Next recommended action
+4. Vision requirements affected or intentionally unchanged
+5. Remaining risks / unknowns
+6. Next recommended action
 
 ## 12) Vibe Coding Guardrails
 

@@ -12,6 +12,7 @@ This document defines how ZeroClaw handles high PR volume while maintaining:
 Related references:
 
 - [`docs/README.md`](./README.md) for documentation taxonomy and navigation.
+- [`docs/vision-contract.md`](./vision-contract.md) for product-direction invariants and vision-alignment gates.
 - [`docs/ci-map.md`](./ci-map.md) for per-workflow ownership, triggers, and triage flow.
 - [`docs/reviewer-playbook.md`](./reviewer-playbook.md) for day-to-day reviewer execution.
 
@@ -77,6 +78,7 @@ Go to:
 3. Keep security review explicit for risky surfaces.
 4. Keep changes easy to reason about and easy to revert.
 5. Keep repository artifacts free of personal/sensitive data leakage.
+6. Keep planning and implementation aligned with the product vision contract.
 
 ### 2.2 Governance design logic (control loop)
 
@@ -113,6 +115,7 @@ Maintain these branch protection rules on `dev` and `main`:
 ### 4.1 Step A: Intake
 
 - Contributor opens PR with full `.github/pull_request_template.md`.
+- Contributor maps the change against `docs/vision-contract.md` in the `Vision Alignment` section when the work touches planning, behavior, architecture, or user-facing flows.
 - `PR Labeler` applies scope/path labels + size labels + risk labels + module labels (for example `channel:telegram`, `provider:kimi`, `tool:shell`) and contributor tiers by merged PR count (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50), while de-duplicating less-specific scope labels when a more specific module label is present.
 - For all module prefixes, module labels are compacted to reduce noise: one specific module keeps `prefix:component`, but multiple specifics collapse to the base scope label `prefix`.
 - Label ordering is priority-first: `risk:*` -> `size:*` -> contributor tier -> module/path labels.
@@ -147,9 +150,11 @@ Maintain these branch protection rules on `dev` and `main`:
 ### 5.1 Definition of Ready (DoR) before requesting review
 
 - PR template fully completed.
+- Vision-alignment fields completed when the change affects behavior, product direction, architecture shape, or user-facing workflows.
 - Scope boundary is explicit (what changed / what did not).
 - Validation evidence attached (not just "CI will check").
 - Security and rollback fields completed for risky paths.
+- The change is consistent with `docs/vision-contract.md`, or any exception is explicit and reviewable.
 - Privacy/data-hygiene checks are completed and test language is neutral/project-scoped.
 - If identity-like wording appears in tests/examples, it is normalized to ZeroClaw/project-native labels.
 
@@ -158,6 +163,7 @@ Maintain these branch protection rules on `dev` and `main`:
 - `CI Required Gate` is green.
 - Required reviewers approved (including CODEOWNERS paths).
 - Risk class labels match touched paths.
+- Vision contract conflicts are resolved or explicitly rejected before merge.
 - Migration/compatibility impact is documented.
 - Rollback path is concrete and fast.
 
@@ -195,6 +201,7 @@ AI-assisted PRs are welcome, and review can also be agent-assisted.
 1. Clear PR summary with scope boundary.
 2. Explicit test/validation evidence.
 3. Security impact and rollback notes for risky changes.
+4. Vision-alignment notes tied to `docs/vision-contract.md` for product, UX, ingestion, publishing, curation, or vectorization changes.
 
 ### 7.2 Recommended
 
@@ -206,6 +213,7 @@ We do **not** require contributors to quantify AI-vs-human line ownership.
 ### 7.3 Review emphasis for AI-heavy PRs
 
 - Contract compatibility.
+- Vision-contract compatibility.
 - Security boundaries.
 - Error handling and fallback behavior.
 - Performance and memory regressions.

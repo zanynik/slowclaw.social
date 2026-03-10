@@ -22,6 +22,18 @@ Describe this PR in 2-5 bullets:
 - Change type (`bug|feature|refactor|docs|security|chore`):
 - Primary scope (`runtime|provider|channel|memory|security|ci|docs|multi`):
 
+## Vision Alignment (required)
+
+- Vision requirement(s) supported:
+- Simplicity / cognitive-load impact:
+- Open ecosystem / protocol alignment preserved? (`Yes/No/N.A.`):
+- Extensible via traits/tools/skills instead of hardcoded branching? (`Yes/No/N.A.`):
+- Cross-platform path preserved for macOS/iOS/Windows/Android? (`Yes/No/N.A.`):
+- Local/secure vectorization contract preserved? (`Yes/No/N.A.`):
+- Publishing or ingestion contract changed? (`Yes/No`):
+- If `Yes`, exact behavior change:
+- If any answer is `No`, explain why this is still acceptable:
+
 ## Linked Issue
 
 - Closes #

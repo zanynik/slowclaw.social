@@ -219,6 +219,7 @@ To keep docs useful under high PR volume, we use these rules:
 | `docs/README.md` | canonical docs index and taxonomy | add/remove docs or change documentation ownership/navigation |
 | `docs/doc-template.md` | standard skeleton for new operational documentation | when required sections or documentation quality bar changes |
 | `CONTRIBUTING.md` | contributor contract and readiness baseline | contributor expectations or policy changes |
+| `docs/vision-contract.md` | product-direction contract and vision gate | planning/user-facing behavior/architecture direction changes |
 | `docs/pr-workflow.md` | governance logic and merge contract | workflow/risk/merge gate changes |
 | `docs/reviewer-playbook.md` | reviewer operating checklist | review depth or triage behavior changes |
 | `docs/ci-map.md` | CI ownership and triage entry points | workflow trigger/job ownership changes |
@@ -231,8 +232,10 @@ Before requesting review, ensure all of the following are true:
 
 - Scope is focused to a single concern.
 - `.github/pull_request_template.md` is fully completed.
+- The `Vision Alignment` section is fully completed for behavior, planning, architecture, or user-facing changes.
 - Relevant local validation has been run (`fmt`, `clippy`, `test`, scenario checks).
 - Security impact and rollback path are explicitly described.
+- The change is consistent with [`docs/vision-contract.md`](docs/vision-contract.md), or any intentional exception is explicitly justified.
 - No personal/sensitive data is introduced in code/docs/tests/fixtures/logs/examples/commit messages.
 - Tests/fixtures/examples use neutral project-scoped wording (no identity-specific or first-person phrasing).
 - If identity-like wording is required, use ZeroClaw-centric labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`).
@@ -247,6 +250,7 @@ A PR is merge-ready when:
 - `CI Required Gate` is green.
 - Required reviewers approved (including CODEOWNERS paths).
 - Risk level matches changed paths (`risk: low/medium/high`).
+- Vision alignment is documented and no unresolved vision-contract conflict remains.
 - User-visible behavior, migration, and rollback notes are complete.
 - Follow-up TODOs are explicit and tracked in issues.
 - For documentation changes, links and ownership mapping in `CONTRIBUTING.md` and `docs/README.md` are consistent.
@@ -258,6 +262,7 @@ When PR traffic is high (especially with AI-assisted contributions), these rules
 - **One concern per PR**: avoid mixing refactor + feature + infra in one change.
 - **Small PRs first**: prefer PR size `XS/S/M`; split large work into stacked PRs.
 - **Template is mandatory**: complete every section in `.github/pull_request_template.md`.
+- **Vision-first planning**: feature proposals and PRs must map work back to [`docs/vision-contract.md`](docs/vision-contract.md).
 - **Explicit rollback**: every PR must include a fast rollback path.
 - **Security-first review**: changes in `src/security/`, runtime, gateway, and CI need stricter validation.
 - **Risk-first triage**: use labels (`risk: high`, `risk: medium`, `risk: low`) to route review depth.
@@ -276,6 +281,7 @@ Agent-assisted contributions are welcome and treated as first-class contribution
 For smoother agent-to-agent and human-to-agent review:
 
 - Keep PR summaries concrete (problem, change, non-goals).
+- Include explicit vision-alignment notes when the work changes product behavior, UX, publishing, ingestion, curation, or vectorization.
 - Include reproducible validation evidence (`fmt`, `clippy`, `test`, scenario checks).
 - Add brief workflow notes when automation materially influenced design/code.
 - Agent-assisted PRs are welcome, but contributors remain accountable for understanding what the code does and what it could affect.
@@ -484,6 +490,7 @@ impl Tool for YourTool {
 ## Pull Request Checklist
 
 - [ ] PR template sections are completed (including security + rollback)
+- [ ] `Vision Alignment` section is complete and matches [`docs/vision-contract.md`](docs/vision-contract.md)
 - [ ] `./scripts/ci/rust_quality_gate.sh` — merge gate formatter/lint baseline passes
 - [ ] `cargo test --locked` — all tests pass locally or skipped tests are explained
 - [ ] Optional strict audit: `./scripts/ci/rust_quality_gate.sh --strict` (full repo, run when doing lint cleanup or release-hardening work)

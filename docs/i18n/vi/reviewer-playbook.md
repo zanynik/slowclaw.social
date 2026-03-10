@@ -76,6 +76,7 @@ Nếu việc gán nhãn rủi ro tự động không đúng ngữ cảnh, mainta
 Cho mỗi PR mới:
 
 1. Xác nhận độ đầy đủ template (`summary`, `validation`, `security`, `rollback`).
+   - Khi hành vi, kiến trúc hoặc kế hoạch bị ảnh hưởng, xác nhận mục `Vision Alignment` đã đầy đủ và nhất quán với [`docs/vision-contract.md`](vision-contract.md).
 2. Xác nhận nhãn hiện diện và hợp lý:
    - `size:*`, `risk:*`
    - nhãn phạm vi (ví dụ `provider`, `channel`, `security`)
@@ -91,6 +92,7 @@ Nếu bất kỳ yêu cầu intake nào thất bại, để lại một comment 
 
 - Ranh giới phạm vi rõ ràng và đáng tin cậy.
 - Các lệnh validation hiện diện và kết quả nhất quán.
+- Căn chỉnh với hợp đồng tầm nhìn là rõ ràng, đáng tin và không che giấu việc lệch phạm vi sản phẩm.
 - Các thay đổi hành vi hướng người dùng đã được ghi lại.
 - Tác giả thể hiện hiểu biết về hành vi và blast radius (đặc biệt với PR có hỗ trợ agent).
 - Đường dẫn rollback cụ thể (không chỉ là "revert").
@@ -106,6 +108,7 @@ Với PR rủi ro cao, xác minh ít nhất một ví dụ cụ thể trong mỗ
 - **Ranh giới bảo mật:** hành vi deny-by-default được bảo tồn, không mở rộng phạm vi ngẫu nhiên.
 - **Failure mode:** xử lý lỗi rõ ràng và suy giảm an toàn.
 - **Ổn định hợp đồng:** tương thích CLI/config/API được bảo tồn hoặc migration được ghi lại.
+- **Ổn định định hướng sản phẩm:** các mặc định về tính đơn giản, tính mở, khả năng mở rộng và quyền riêng tư vẫn phù hợp với `docs/vision-contract.md`.
 - **Observability:** lỗi có thể chẩn đoán mà không rò rỉ secret.
 - **An toàn rollback:** đường dẫn revert và blast radius rõ ràng.
 

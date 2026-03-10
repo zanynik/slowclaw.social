@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Product vision contract
+    url: https://github.com/zeroclaw-labs/zeroclaw/blob/main/docs/vision-contract.md
+    about: Read the product-direction and vision-alignment rules before filing features or planning work.
   - name: Security vulnerability report
     url: https://github.com/zeroclaw-labs/zeroclaw/security/policy
     about: Please report security vulnerabilities privately via SECURITY.md policy.

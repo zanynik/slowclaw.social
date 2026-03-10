@@ -13,6 +13,7 @@ module.exports = async ({ github, context, core }) => {
   const legacyMarker = "<!-- pr-intake-sanity -->";
   const requiredSections = [
     "## Summary",
+    "## Vision Alignment (required)",
     "## Validation Evidence (required)",
     "## Security Impact (required)",
     "## Privacy and Data Hygiene (required)",
@@ -26,6 +27,9 @@ module.exports = async ({ github, context, core }) => {
     ["summary problem", /- Problem:\s*\S+/m],
     ["summary why it matters", /- Why it matters:\s*\S+/m],
     ["summary what changed", /- What changed:\s*\S+/m],
+    ["vision requirement mapping", /- Vision requirement\(s\) supported:\s*\S+/m],
+    ["vision simplicity impact", /- Simplicity \/ cognitive-load impact:\s*\S+/m],
+    ["vision open ecosystem status", /- Open ecosystem \/ protocol alignment preserved\?\s*\(`Yes\/No\/N\.A\.`\):\s*\S+/m],
     ["validation commands", /Commands and result summary:\s*[\s\S]*```/m],
     ["security risk/mitigation", /- New permissions\/capabilities\?\s*\(`Yes\/No`\):\s*\S+/m],
     ["privacy status", /- Data-hygiene status\s*\(`pass\|needs-follow-up`\):\s*\S+/m],

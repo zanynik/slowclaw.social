@@ -39,6 +39,18 @@ body:
       required: true
 
   - type: textarea
+    id: vision_alignment
+    attributes:
+      label: Vision alignment
+      description: Explain how this request aligns with the product vision contract and what must not regress.
+      placeholder: |
+        - Supports vision requirement(s): ...
+        - Must not weaken: simplicity / open protocols / extensibility / local vectorization / draft-publish flow
+        - Why this is the simplest acceptable first step: ...
+    validations:
+      required: true
+
+  - type: textarea
     id: non_goals
     attributes:
       label: Non-goals / out of scope
@@ -104,4 +116,16 @@ body:
         - label: I removed personal/sensitive data from examples, payloads, and logs.
           required: true
         - label: I used neutral, project-focused wording and placeholders.
+          required: true
+
+  - type: checkboxes
+    id: vision_guardrails
+    attributes:
+      label: Vision guardrails
+      options:
+        - label: I checked this request against docs/vision-contract.md.
+          required: true
+        - label: This request does not make a closed platform or remote vector processing mandatory by default.
+          required: true
+        - label: This request preserves a path to extensibility through traits, tools, or skills where applicable.
           required: true

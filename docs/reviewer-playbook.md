@@ -76,6 +76,7 @@ If automated risk labeling is contextually wrong, maintainers can apply `risk: m
 For every new PR:
 
 1. Confirm template completeness (`summary`, `validation`, `security`, `rollback`).
+   - When behavior, architecture, or planning is affected, confirm the `Vision Alignment` section is complete and coherent with [`docs/vision-contract.md`](./vision-contract.md).
 2. Confirm labels are present and plausible:
    - `size:*`, `risk:*`
    - scope labels (for example `provider`, `channel`, `security`)
@@ -91,6 +92,7 @@ If any intake requirement fails, leave one actionable checklist comment instead 
 
 - Scope boundary is explicit and believable.
 - Validation commands are present and results are coherent.
+- Vision-contract alignment is explicit, believable, and does not hide product-scope drift.
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for agent-assisted PRs).
 - Rollback path is concrete (not just “revert”).
@@ -106,6 +108,7 @@ For high-risk PRs, verify at least one concrete example in each category:
 - **Security boundaries:** deny-by-default behavior preserved, no accidental scope broadening.
 - **Failure modes:** error handling is explicit and degrades safely.
 - **Contract stability:** CLI/config/API compatibility preserved or migration documented.
+- **Product-direction stability:** simplicity, openness, extensibility, and privacy defaults remain aligned with `docs/vision-contract.md`.
 - **Observability:** failures are diagnosable without leaking secrets.
 - **Rollback safety:** revert path and blast radius are clear.
 
