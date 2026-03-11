@@ -102,6 +102,7 @@ import type {
   MediaCapabilities,
   PersonalizedBlueskyItem,
   WorkspaceEventItem,
+  WorkspaceSynthArtifactState,
   WorkspaceSynthesizerStatus,
   WorkspaceTodoItem,
 } from "./lib/gatewayApi";
@@ -122,8 +123,7 @@ const PROVIDER_API_KEY_SECRET_ACCOUNT = "provider.api_key";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
-type MobileTab = "journal" | "feed" | "chat" | "profile";
-type WorkspaceLocalTab = "feed" | "todos" | "events";
+type MobileTab = "journal" | "feed" | "todos" | "events" | "chat" | "profile";
 type ThemeMode = "light" | "dark";
 type DesktopGatewayBootstrap = {
   token?: string | null;
@@ -156,7 +156,13 @@ function defaultMobileTab(): MobileTab {
     return "journal";
   }
   const saved = window.localStorage.getItem(UI_TAB_STORAGE_KEY);
-  return saved === "feed" || saved === "chat" || saved === "profile" ? saved : "journal";
+  return saved === "feed" ||
+    saved === "todos" ||
+    saved === "events" ||
+    saved === "chat" ||
+    saved === "profile"
+    ? saved
+    : "journal";
 }
 
 function useIsLargeScreen() {
@@ -193,6 +199,118 @@ function formatTimestamp(value?: number | string) {
     return String(value);
   }
   return date.toLocaleString();
+}
+
+function parseDateValue(value?: string | null) {
+  if (!value) {
+    return null;
+  }
+  const parsed = new Date(String(value));
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function startOfLocalDay(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function isSameLocalDay(a: Date, b: Date) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+function todoPriorityRank(priority: string) {
+  if (priority === "high") {
+    return 0;
+  }
+  if (priority === "medium") {
+    return 1;
+  }
+  return 2;
+}
+
+function formatTodoDueLabel(value?: string | null) {
+  const due = parseDateValue(value);
+  if (!due) {
+    return "No due date";
+  }
+  const now = new Date();
+  const today = startOfLocalDay(now);
+  const tomorrow = new Date(today);
+  tomorrow.setDate(today.getDate() + 1);
+  const dueDay = startOfLocalDay(due);
+  if (dueDay.getTime() < today.getTime()) {
+    return `Overdue · ${due.toLocaleDateString()}`;
+  }
+  if (dueDay.getTime() === today.getTime()) {
+    return `Due today · ${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+  }
+  if (dueDay.getTime() === tomorrow.getTime()) {
+    return `Due tomorrow · ${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+  }
+  return `Due ${due.toLocaleDateString()}${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) !== "Invalid Date" ? ` · ${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}`;
+}
+
+function formatEventTiming(
+  startAt: string,
+  endAt?: string | null,
+  allDay?: boolean
+) {
+  const start = parseDateValue(startAt);
+  const end = parseDateValue(endAt);
+  if (!start) {
+    return "Time unavailable";
+  }
+  if (allDay) {
+    if (end && !isSameLocalDay(start, end)) {
+      return `${start.toLocaleDateString()} -> ${end.toLocaleDateString()} · All day`;
+    }
+    return `${start.toLocaleDateString()} · All day`;
+  }
+  const startLabel = `${start.toLocaleDateString()} · ${start.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit"
+  })}`;
+  if (!end) {
+    return startLabel;
+  }
+  if (isSameLocalDay(start, end)) {
+    return `${startLabel} -> ${end.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+  }
+  return `${startLabel} -> ${end.toLocaleDateString()} · ${end.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit"
+  })}`;
+}
+
+function formatDayKey(date: Date) {
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function workspaceSynthArtifactTone(state?: WorkspaceSynthArtifactState) {
+  if (state?.status === "error") {
+    return "danger";
+  }
+  if (state?.status === "applied") {
+    return "success";
+  }
+  return "muted";
+}
+
+function workspaceSynthArtifactLabel(name: string, state?: WorkspaceSynthArtifactState) {
+  const status = state?.status || "skipped";
+  if (status === "applied") {
+    return `${name} ${state?.itemCount ?? 0}`;
+  }
+  if (status === "error") {
+    return `${name} error`;
+  }
+  return `${name} skipped`;
 }
 
 function sidecarCaptionPath(item: LibraryItem) {
@@ -848,9 +966,9 @@ function App() {
 
   // Bluesky Feed State
   const [feedSource, setFeedSource] = useState<"local" | "bluesky">("local");
-  const [workspaceLocalTab, setWorkspaceLocalTab] = useState<WorkspaceLocalTab>("feed");
   const [workspaceTodos, setWorkspaceTodos] = useState<WorkspaceTodoItem[]>([]);
   const [workspaceEvents, setWorkspaceEvents] = useState<WorkspaceEventItem[]>([]);
+  const [selectedEventDay, setSelectedEventDay] = useState(() => formatDayKey(new Date()));
   const [workspaceSynthStatus, setWorkspaceSynthStatus] = useState<WorkspaceSynthesizerStatus>({
     status: "idle"
   });
@@ -866,6 +984,16 @@ function App() {
     spawnedCount: 0,
     ignoredCount: 0,
   });
+  const workspaceTabActive =
+    mobileTab === "todos" ||
+    mobileTab === "events" ||
+    (mobileTab === "feed" && feedSource === "local");
+  const workspaceSynthArtifacts = [
+    { key: "posts", label: "Posts", state: workspaceSynthStatus.artifactStates?.insightPosts },
+    { key: "todos", label: "Todos", state: workspaceSynthStatus.artifactStates?.todos },
+    { key: "events", label: "Events", state: workspaceSynthStatus.artifactStates?.events },
+    { key: "clips", label: "Clips", state: workspaceSynthStatus.artifactStates?.clipPlans }
+  ];
 
   useEffect(() => {
     let cancelled = false;
@@ -3421,12 +3549,7 @@ function App() {
   }, [feedSource, session, creds.serviceUrl, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
-    if (feedSource !== "local") {
-      setFeedSidebarOpen(false);
-      setFeedCreateWorkflowOpen(false);
-      return;
-    }
-    if (mobileTab !== "feed") {
+    if (mobileTab !== "feed" || feedSource !== "local") {
       setFeedSidebarOpen(false);
       setFeedCreateWorkflowOpen(false);
       return;
@@ -3439,7 +3562,7 @@ function App() {
   }, [feedSource, mobileTab, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
-    if (feedSource !== "local" || mobileTab !== "feed") {
+    if (!workspaceTabActive) {
       return;
     }
 
@@ -3458,10 +3581,10 @@ function App() {
       window.removeEventListener("focus", triggerFromForeground);
       document.removeEventListener("visibilitychange", triggerFromForeground);
     };
-  }, [feedSource, mobileTab, chatGatewayToken, gatewayBaseUrl]);
+  }, [workspaceTabActive, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
-    if (feedSource !== "local" || mobileTab !== "feed") {
+    if (!workspaceTabActive) {
       return;
     }
     if (
@@ -3495,8 +3618,7 @@ function App() {
       window.clearInterval(timer);
     };
   }, [
-    feedSource,
-    mobileTab,
+    workspaceTabActive,
     chatGatewayToken,
     gatewayBaseUrl,
     workflowBots,
@@ -3504,7 +3626,7 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (feedSource !== "local" || mobileTab !== "feed") {
+    if (!workspaceTabActive) {
       return;
     }
     if (
@@ -3518,7 +3640,7 @@ function App() {
       loadWorkspaceTodos(),
       loadWorkspaceEvents()
     ]);
-  }, [feedSource, mobileTab, workspaceSynthStatus.status, workspaceSynthStatus.lastRunAt]);
+  }, [workspaceTabActive, workspaceSynthStatus.status, workspaceSynthStatus.lastRunAt]);
 
   function applyGatewayConnection(gatewayUrl: string, token: string) {
     const normalizedUrl = gatewayUrl.trim().replace(/\/+$/, "");
@@ -4125,7 +4247,7 @@ function App() {
   }, [feedItems, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
-    const item = mobileTab === "feed" ? null : selectedJournalItem;
+    const item = mobileTab === "journal" ? selectedJournalItem : null;
     if (item && (item.kind === "audio" || item.kind === "video" || item.kind === "image")) {
       void loadMediaPreview(item);
       return;
@@ -4220,6 +4342,114 @@ function App() {
   const isMediaTranscriptMode =
     !!selectedJournalItem &&
     (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video");
+  const now = new Date();
+  const todayStart = startOfLocalDay(now);
+  const tomorrowStart = new Date(todayStart);
+  tomorrowStart.setDate(todayStart.getDate() + 1);
+  const openTodos = workspaceTodos
+    .filter((item) => item.status !== "done")
+    .slice()
+    .sort((a, b) => {
+      const aDue = parseDateValue(a.dueAt);
+      const bDue = parseDateValue(b.dueAt);
+      const dueScore =
+        (aDue ? aDue.getTime() : Number.MAX_SAFE_INTEGER) -
+        (bDue ? bDue.getTime() : Number.MAX_SAFE_INTEGER);
+      if (dueScore !== 0) {
+        return dueScore;
+      }
+      const priorityScore = todoPriorityRank(a.priority) - todoPriorityRank(b.priority);
+      if (priorityScore !== 0) {
+        return priorityScore;
+      }
+      return (parseDateValue(b.updated)?.getTime() || 0) - (parseDateValue(a.updated)?.getTime() || 0);
+    });
+  const doneTodos = workspaceTodos
+    .filter((item) => item.status === "done")
+    .slice()
+    .sort(
+      (a, b) =>
+        (parseDateValue(b.updated)?.getTime() || 0) - (parseDateValue(a.updated)?.getTime() || 0)
+    );
+  const overdueTodoCount = openTodos.filter((item) => {
+    const due = parseDateValue(item.dueAt);
+    return due ? due.getTime() < now.getTime() : false;
+  }).length;
+  const todayEventItems = workspaceEvents
+    .filter((item) => {
+      const start = parseDateValue(item.startAt);
+      return start ? isSameLocalDay(start, now) : false;
+    })
+    .slice()
+    .sort(
+      (a, b) =>
+        (parseDateValue(a.startAt)?.getTime() || 0) - (parseDateValue(b.startAt)?.getTime() || 0)
+    );
+  const upcomingEventItems = workspaceEvents
+    .filter((item) => {
+      const start = parseDateValue(item.startAt);
+      return start ? start.getTime() >= tomorrowStart.getTime() : false;
+    })
+    .slice()
+    .sort(
+      (a, b) =>
+        (parseDateValue(a.startAt)?.getTime() || 0) - (parseDateValue(b.startAt)?.getTime() || 0)
+    );
+  const pastEventItems = workspaceEvents
+    .filter((item) => {
+      const start = parseDateValue(item.startAt);
+      return start ? start.getTime() < todayStart.getTime() : false;
+    })
+    .slice()
+    .sort(
+      (a, b) =>
+        (parseDateValue(b.startAt)?.getTime() || 0) - (parseDateValue(a.startAt)?.getTime() || 0)
+    );
+  const eventDates = workspaceEvents
+    .map((item) => parseDateValue(item.startAt))
+    .filter((value): value is Date => value !== null)
+    .sort((a, b) => a.getTime() - b.getTime());
+  const selectedDayDate = parseDateValue(`${selectedEventDay}T00:00:00`);
+  const calendarAnchor = eventDates.find((date) => isSameLocalDay(date, now)) ||
+    eventDates.find((date) => selectedDayDate ? isSameLocalDay(date, selectedDayDate) : false) ||
+    eventDates[0] ||
+    now;
+  const monthStripLabel = calendarAnchor.toLocaleDateString([], {
+    month: "long",
+    year: "numeric"
+  });
+  const stripMonthStart = new Date(calendarAnchor.getFullYear(), calendarAnchor.getMonth(), 1);
+  const stripMonthEnd = new Date(calendarAnchor.getFullYear(), calendarAnchor.getMonth() + 1, 0);
+  const monthStripDays: Date[] = [];
+  for (let day = 1; day <= stripMonthEnd.getDate(); day += 1) {
+    monthStripDays.push(new Date(stripMonthStart.getFullYear(), stripMonthStart.getMonth(), day));
+  }
+  const eventCountByDay = workspaceEvents.reduce<Record<string, number>>((acc, item) => {
+    const start = parseDateValue(item.startAt);
+    if (!start) {
+      return acc;
+    }
+    const key = formatDayKey(start);
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const filteredEventItems = workspaceEvents
+    .filter((item) => {
+      const start = parseDateValue(item.startAt);
+      return start ? formatDayKey(start) === selectedEventDay : false;
+    })
+    .slice()
+    .sort(
+      (a, b) =>
+        (parseDateValue(a.startAt)?.getTime() || 0) - (parseDateValue(b.startAt)?.getTime() || 0)
+    );
+  const selectedDayHeading = selectedDayDate
+    ? selectedDayDate.toLocaleDateString([], {
+        weekday: "long",
+        month: "short",
+        day: "numeric"
+      })
+    : selectedEventDay;
   const isFreshNoteMode = !selectedJournalItem;
   const selectedJournalTranscriptionStatus =
     selectedJournalItem?.kind === "audio"
@@ -4925,71 +5155,6 @@ function App() {
               ) : null}
 
               {feedSource === "local" ? (
-                <div className="workspace-synth-card">
-                  <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
-                    <div className="stack-sm" style={{ gap: "0.3rem" }}>
-                      <strong>Workspace Synthesizer</strong>
-                      <span className="text-sm muted">
-                        One manifest-driven pass extracts feed posts, todos, events, and clip plans from journals and transcripts.
-                      </span>
-                      <span className="text-sm muted">
-                        Status: {workspaceSynthStatus.status}
-                        {workspaceSynthStatus.lastRunAt
-                          ? ` • ${formatTimestamp(workspaceSynthStatus.lastRunAt)}`
-                          : ""}
-                      </span>
-                      {workspaceSynthStatus.lastSummary ? (
-                        <span className="text-sm muted">{workspaceSynthStatus.lastSummary}</span>
-                      ) : null}
-                      {workspaceSynthStatus.lastError ? (
-                        <span className="text-sm muted">{workspaceSynthStatus.lastError}</span>
-                      ) : null}
-                    </div>
-                    <button
-                      type="button"
-                      className="primary text-sm"
-                      style={{ padding: "0.45rem 0.8rem", borderRadius: "999px" }}
-                      onClick={() => void runWorkspaceSynthesizerManual()}
-                      disabled={
-                        workspaceSynthBusy ||
-                        workspaceSynthStatus.status === "pending" ||
-                        workspaceSynthStatus.status === "processing"
-                      }
-                    >
-                      {workspaceSynthBusy ||
-                      workspaceSynthStatus.status === "pending" ||
-                      workspaceSynthStatus.status === "processing"
-                        ? "Running..."
-                        : "Synthesize"}
-                    </button>
-                  </div>
-                  <div className="segmented-control mt-2">
-                    <button
-                      type="button"
-                      className={workspaceLocalTab === "feed" ? "active" : ""}
-                      onClick={() => setWorkspaceLocalTab("feed")}
-                    >
-                      Feed
-                    </button>
-                    <button
-                      type="button"
-                      className={workspaceLocalTab === "todos" ? "active" : ""}
-                      onClick={() => setWorkspaceLocalTab("todos")}
-                    >
-                      Todos
-                    </button>
-                    <button
-                      type="button"
-                      className={workspaceLocalTab === "events" ? "active" : ""}
-                      onClick={() => setWorkspaceLocalTab("events")}
-                    >
-                      Events
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-
-              {feedSource === "local" && workspaceLocalTab === "feed" ? (
                 <div className="stack">
                   {workflowBots.map((bot) => {
                     const run = workflowRunStatusByKey[bot.key];
@@ -5037,7 +5202,7 @@ function App() {
                 </div>
               ) : null}
 
-              {feedSource === "local" && workspaceLocalTab === "feed" && activeWorkflowBotKey
+              {feedSource === "local" && activeWorkflowBotKey
                 ? (() => {
                   const bot = workflowBotByKey(activeWorkflowBotKey);
                   const saved = workflowSettingsByKey[activeWorkflowBotKey];
@@ -5300,72 +5465,6 @@ function App() {
                     })}
                   </div>
                 )
-              ) : workspaceLocalTab === "todos" ? (
-                workspaceTodos.length === 0 ? (
-                  <p className="text-center muted">No active todos extracted from your workspace yet.</p>
-                ) : (
-                  <div className="stack">
-                    {workspaceTodos.map((item) => (
-                      <div key={item.id} className="planner-item-card">
-                        <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
-                          <div className="stack-sm" style={{ gap: "0.25rem" }}>
-                            <strong>{item.title}</strong>
-                            <span className="text-sm muted">
-                              {item.priority.toUpperCase()} priority • {item.status}
-                              {item.dueAt ? ` • due ${formatTimestamp(item.dueAt)}` : ""}
-                            </span>
-                          </div>
-                          <button
-                            type="button"
-                            className={item.status === "done" ? "ghost text-sm" : "primary text-sm"}
-                            style={{ padding: "0.35rem 0.75rem", borderRadius: "999px" }}
-                            onClick={() => void toggleWorkspaceTodo(item)}
-                          >
-                            {item.status === "done" ? "Reopen" : "Done"}
-                          </button>
-                        </div>
-                        {item.details ? <div className="planner-item-body">{item.details}</div> : null}
-                        {(item.sourcePath || item.sourceExcerpt) ? (
-                          <div className="planner-item-meta text-sm muted">
-                            {item.sourcePath ? <code>{item.sourcePath}</code> : null}
-                            {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
-                          </div>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                )
-              ) : workspaceLocalTab === "events" ? (
-                workspaceEvents.length === 0 ? (
-                  <p className="text-center muted">No upcoming events extracted from your workspace yet.</p>
-                ) : (
-                  <div className="stack">
-                    {workspaceEvents.map((item) => (
-                      <div key={item.id} className="planner-item-card">
-                        <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
-                          <div className="stack-sm" style={{ gap: "0.25rem" }}>
-                            <strong>{item.title}</strong>
-                            <span className="text-sm muted">
-                              {item.status}
-                              {" • "}
-                              {item.allDay
-                                ? formatTimestamp(item.startAt)
-                                : `${formatTimestamp(item.startAt)}${item.endAt ? ` → ${formatTimestamp(item.endAt)}` : ""}`}
-                            </span>
-                          </div>
-                        </div>
-                        {item.details ? <div className="planner-item-body">{item.details}</div> : null}
-                        {(item.location || item.sourcePath || item.sourceExcerpt) ? (
-                          <div className="planner-item-meta text-sm muted">
-                            {item.location ? <span>{item.location}</span> : null}
-                            {item.sourcePath ? <code>{item.sourcePath}</code> : null}
-                            {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
-                          </div>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                )
               ) : feedItems.length === 0 ? (
                 <p className="text-center muted">No items in your workspace feed yet.</p>
               ) : (
@@ -5547,6 +5646,397 @@ function App() {
                       )}
                     </div>
                   )}
+                </div>
+              )}
+            </div>
+          </div>
+        ) : null}
+
+        {mobileTab === "todos" ? (
+          <div className="stack">
+            <div className="card">
+              <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
+                <div className="stack-sm">
+                  <h2 style={{ margin: 0 }}>Todos</h2>
+                  <p className="text-sm muted" style={{ margin: 0 }}>
+                    Action items extracted from journals and transcripts. Marking one done keeps the model suggestion but preserves your override locally.
+                  </p>
+                </div>
+                <div className="row" style={{ gap: "0.45rem", alignItems: "center" }}>
+                  <button type="button" className="ghost text-sm" onClick={() => void loadWorkspaceTodos()}>
+                    Refresh
+                  </button>
+                  <button
+                    type="button"
+                    className="primary text-sm"
+                    onClick={() => void runWorkspaceSynthesizerManual()}
+                    disabled={
+                      workspaceSynthBusy ||
+                      workspaceSynthStatus.status === "pending" ||
+                      workspaceSynthStatus.status === "processing"
+                    }
+                  >
+                    {workspaceSynthBusy ||
+                    workspaceSynthStatus.status === "pending" ||
+                    workspaceSynthStatus.status === "processing"
+                      ? "Running..."
+                      : "Synthesize"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="workspace-synth-card">
+                <div className="planner-overview-row">
+                  <span className="status-pill">Open {openTodos.length}</span>
+                  <span className="status-pill">Done {doneTodos.length}</span>
+                  <span className="status-pill">Overdue {overdueTodoCount}</span>
+                </div>
+                <span className="text-sm muted">
+                  Synthesizer: {workspaceSynthStatus.status}
+                  {workspaceSynthStatus.lastRunAt
+                    ? ` • ${formatTimestamp(workspaceSynthStatus.lastRunAt)}`
+                    : ""}
+                </span>
+                <div className="workspace-synth-artifacts">
+                  {workspaceSynthArtifacts.map((artifact) => (
+                    <span
+                      key={artifact.key}
+                      className={`status-pill workspace-synth-pill ${workspaceSynthArtifactTone(artifact.state)}`}
+                      title={artifact.state?.error || artifact.state?.path || ""}
+                    >
+                      {workspaceSynthArtifactLabel(artifact.label, artifact.state)}
+                    </span>
+                  ))}
+                </div>
+                {workspaceSynthStatus.lastSummary ? (
+                  <span className="text-sm muted">{workspaceSynthStatus.lastSummary}</span>
+                ) : null}
+              </div>
+
+              {openTodos.length === 0 && doneTodos.length === 0 ? (
+                <div className="planner-empty-state">
+                  <p className="text-center muted" style={{ margin: 0 }}>
+                    No todos extracted from your workspace yet.
+                  </p>
+                </div>
+              ) : (
+                <div className="stack">
+                  {openTodos.length > 0 ? (
+                    <div className="stack">
+                      <div className="planner-section-header">
+                        <h3 style={{ margin: 0 }}>Open</h3>
+                        <span className="text-sm muted">{openTodos.length}</span>
+                      </div>
+                      {openTodos.map((item) => (
+                        <div key={item.id} className="planner-item-card">
+                          <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
+                            <div className="stack-sm" style={{ gap: "0.35rem" }}>
+                              <strong>{item.title}</strong>
+                              <div className="planner-chip-row">
+                                <span className={`planner-chip planner-chip-priority-${item.priority || "medium"}`}>
+                                  {(item.priority || "medium").toUpperCase()}
+                                </span>
+                                <span className="planner-chip">
+                                  {formatTodoDueLabel(item.dueAt)}
+                                </span>
+                                <span className="planner-chip">
+                                  {item.modelStatus || item.status}
+                                </span>
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              className="primary text-sm"
+                              style={{ padding: "0.35rem 0.75rem", borderRadius: "999px" }}
+                              onClick={() => void toggleWorkspaceTodo(item)}
+                            >
+                              Done
+                            </button>
+                          </div>
+                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
+                          {(item.sourcePath || item.sourceExcerpt) ? (
+                            <div className="planner-item-meta text-sm muted">
+                              {item.sourcePath ? <code>{item.sourcePath}</code> : null}
+                              {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {doneTodos.length > 0 ? (
+                    <div className="stack">
+                      <div className="planner-section-header">
+                        <h3 style={{ margin: 0 }}>Completed</h3>
+                        <span className="text-sm muted">{doneTodos.length}</span>
+                      </div>
+                      {doneTodos.map((item) => (
+                        <div key={item.id} className="planner-item-card planner-item-card-done">
+                          <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
+                            <div className="stack-sm" style={{ gap: "0.35rem" }}>
+                              <strong>{item.title}</strong>
+                              <div className="planner-chip-row">
+                                <span className="planner-chip">Completed</span>
+                                <span className="planner-chip">
+                                  Updated {formatTimestamp(item.updated)}
+                                </span>
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              className="ghost text-sm"
+                              style={{ padding: "0.35rem 0.75rem", borderRadius: "999px" }}
+                              onClick={() => void toggleWorkspaceTodo(item)}
+                            >
+                              Reopen
+                            </button>
+                          </div>
+                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              )}
+            </div>
+          </div>
+        ) : null}
+
+        {mobileTab === "events" ? (
+          <div className="stack">
+            <div className="card">
+              <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
+                <div className="stack-sm">
+                  <h2 style={{ margin: 0 }}>Events</h2>
+                  <p className="text-sm muted" style={{ margin: 0 }}>
+                    Calendar-style commitments extracted from the workspace. Upcoming sections are ordered chronologically so mobile and desktop show the same timeline.
+                  </p>
+                </div>
+                <div className="row" style={{ gap: "0.45rem", alignItems: "center" }}>
+                  <button type="button" className="ghost text-sm" onClick={() => void loadWorkspaceEvents()}>
+                    Refresh
+                  </button>
+                  <button
+                    type="button"
+                    className="primary text-sm"
+                    onClick={() => void runWorkspaceSynthesizerManual()}
+                    disabled={
+                      workspaceSynthBusy ||
+                      workspaceSynthStatus.status === "pending" ||
+                      workspaceSynthStatus.status === "processing"
+                    }
+                  >
+                    {workspaceSynthBusy ||
+                    workspaceSynthStatus.status === "pending" ||
+                    workspaceSynthStatus.status === "processing"
+                      ? "Running..."
+                      : "Synthesize"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="workspace-synth-card">
+                <div className="planner-overview-row">
+                  <span className="status-pill">Today {todayEventItems.length}</span>
+                  <span className="status-pill">Upcoming {upcomingEventItems.length}</span>
+                  <span className="status-pill">Past {pastEventItems.length}</span>
+                </div>
+                <span className="text-sm muted">
+                  Synthesizer: {workspaceSynthStatus.status}
+                  {workspaceSynthStatus.lastRunAt
+                    ? ` • ${formatTimestamp(workspaceSynthStatus.lastRunAt)}`
+                    : ""}
+                </span>
+                <div className="workspace-synth-artifacts">
+                  {workspaceSynthArtifacts.map((artifact) => (
+                    <span
+                      key={artifact.key}
+                      className={`status-pill workspace-synth-pill ${workspaceSynthArtifactTone(artifact.state)}`}
+                      title={artifact.state?.error || artifact.state?.path || ""}
+                    >
+                      {workspaceSynthArtifactLabel(artifact.label, artifact.state)}
+                    </span>
+                  ))}
+                </div>
+                {workspaceEvents.length > 0 ? (
+                  <div className="events-calendar-strip">
+                    <div className="planner-section-header" style={{ marginTop: 0 }}>
+                      <strong>{monthStripLabel}</strong>
+                      <button
+                        type="button"
+                        className="ghost text-sm"
+                        onClick={() => setSelectedEventDay(formatDayKey(new Date()))}
+                      >
+                        Today
+                      </button>
+                    </div>
+                    <div className="events-calendar-days" role="tablist" aria-label="Event day filter">
+                      {monthStripDays.map((day) => {
+                        const dayKey = formatDayKey(day);
+                        const isSelected = dayKey === selectedEventDay;
+                        const hasEvents = (eventCountByDay[dayKey] || 0) > 0;
+                        return (
+                          <button
+                            key={dayKey}
+                            type="button"
+                            role="tab"
+                            aria-selected={isSelected}
+                            className={`events-calendar-day${isSelected ? " selected" : ""}${hasEvents ? " has-events" : ""}`}
+                            onClick={() => setSelectedEventDay(dayKey)}
+                          >
+                            <span className="events-calendar-dow">
+                              {day.toLocaleDateString([], { weekday: "short" })}
+                            </span>
+                            <span className="events-calendar-date">{day.getDate()}</span>
+                            <span className="events-calendar-count">
+                              {hasEvents ? eventCountByDay[dayKey] : ""}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+
+              {workspaceEvents.length === 0 ? (
+                <div className="planner-empty-state">
+                  <p className="text-center muted" style={{ margin: 0 }}>
+                    No events extracted from your workspace yet.
+                  </p>
+                </div>
+              ) : (
+                <div className="stack">
+                  <div className="stack">
+                    <div className="planner-section-header">
+                      <h3 style={{ margin: 0 }}>Agenda</h3>
+                      <span className="text-sm muted">
+                        {selectedDayHeading} · {filteredEventItems.length}
+                      </span>
+                    </div>
+                    {filteredEventItems.length === 0 ? (
+                      <div className="planner-empty-state">
+                        <p className="text-center muted" style={{ margin: 0 }}>
+                          No events on {selectedDayHeading}.
+                        </p>
+                      </div>
+                    ) : (
+                      filteredEventItems.map((item) => (
+                        <div key={`agenda-${item.id}`} className="planner-item-card">
+                          <div className="stack-sm" style={{ gap: "0.35rem" }}>
+                            <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
+                              <strong>{item.title}</strong>
+                              <span className="planner-chip">{item.status}</span>
+                            </div>
+                            <div className="planner-chip-row">
+                              <span className="planner-chip">
+                                {formatEventTiming(item.startAt, item.endAt, item.allDay)}
+                              </span>
+                              {item.location ? <span className="planner-chip">{item.location}</span> : null}
+                            </div>
+                          </div>
+                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
+                          {(item.sourcePath || item.sourceExcerpt) ? (
+                            <div className="planner-item-meta text-sm muted">
+                              {item.sourcePath ? <code>{item.sourcePath}</code> : null}
+                              {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
+                            </div>
+                          ) : null}
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  {todayEventItems.length > 0 ? (
+                    <div className="stack">
+                      <div className="planner-section-header">
+                        <h3 style={{ margin: 0 }}>Today</h3>
+                        <span className="text-sm muted">{todayEventItems.length}</span>
+                      </div>
+                      {todayEventItems.map((item) => (
+                        <div key={item.id} className="planner-item-card">
+                          <div className="stack-sm" style={{ gap: "0.35rem" }}>
+                            <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
+                              <strong>{item.title}</strong>
+                              <span className="planner-chip">{item.status}</span>
+                            </div>
+                            <div className="planner-chip-row">
+                              <span className="planner-chip">
+                                {formatEventTiming(item.startAt, item.endAt, item.allDay)}
+                              </span>
+                              {item.location ? <span className="planner-chip">{item.location}</span> : null}
+                            </div>
+                          </div>
+                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
+                          {(item.sourcePath || item.sourceExcerpt) ? (
+                            <div className="planner-item-meta text-sm muted">
+                              {item.sourcePath ? <code>{item.sourcePath}</code> : null}
+                              {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {upcomingEventItems.length > 0 ? (
+                    <div className="stack">
+                      <div className="planner-section-header">
+                        <h3 style={{ margin: 0 }}>Upcoming</h3>
+                        <span className="text-sm muted">{upcomingEventItems.length}</span>
+                      </div>
+                      {upcomingEventItems.map((item) => (
+                        <div key={item.id} className="planner-item-card">
+                          <div className="stack-sm" style={{ gap: "0.35rem" }}>
+                            <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
+                              <strong>{item.title}</strong>
+                              <span className="planner-chip">{item.status}</span>
+                            </div>
+                            <div className="planner-chip-row">
+                              <span className="planner-chip">
+                                {formatEventTiming(item.startAt, item.endAt, item.allDay)}
+                              </span>
+                              {item.location ? <span className="planner-chip">{item.location}</span> : null}
+                            </div>
+                          </div>
+                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
+                          {(item.sourcePath || item.sourceExcerpt) ? (
+                            <div className="planner-item-meta text-sm muted">
+                              {item.sourcePath ? <code>{item.sourcePath}</code> : null}
+                              {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {pastEventItems.length > 0 ? (
+                    <div className="stack">
+                      <div className="planner-section-header">
+                        <h3 style={{ margin: 0 }}>Recent Past</h3>
+                        <span className="text-sm muted">{pastEventItems.length}</span>
+                      </div>
+                      {pastEventItems.map((item) => (
+                        <div key={item.id} className="planner-item-card planner-item-card-past">
+                          <div className="stack-sm" style={{ gap: "0.35rem" }}>
+                            <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
+                              <strong>{item.title}</strong>
+                              <span className="planner-chip">{item.status}</span>
+                            </div>
+                            <div className="planner-chip-row">
+                              <span className="planner-chip">
+                                {formatEventTiming(item.startAt, item.endAt, item.allDay)}
+                              </span>
+                              {item.location ? <span className="planner-chip">{item.location}</span> : null}
+                            </div>
+                          </div>
+                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
               )}
             </div>
@@ -5922,6 +6412,30 @@ function App() {
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
             Feed
+          </button>
+          <button
+            type="button"
+            className={mobileTab === "todos" ? "active" : ""}
+            onClick={() => setMobileTab("todos")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
+            <span className="bottom-nav-label">
+              Todos
+              {openTodos.length > 0 ? <span className="bottom-nav-badge">{openTodos.length}</span> : null}
+            </span>
+          </button>
+          <button
+            type="button"
+            className={mobileTab === "events" ? "active" : ""}
+            onClick={() => setMobileTab("events")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
+            <span className="bottom-nav-label">
+              Events
+              {todayEventItems.length + upcomingEventItems.length > 0 ? (
+                <span className="bottom-nav-badge">{todayEventItems.length + upcomingEventItems.length}</span>
+              ) : null}
+            </span>
           </button>
           <button
             type="button"

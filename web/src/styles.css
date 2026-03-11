@@ -335,7 +335,9 @@ textarea {
   flex-direction: column;
   align-items: center;
   gap: 5px;
-  padding: 8px 18px;
+  flex: 1;
+  min-width: 0;
+  padding: 8px 6px;
   border-radius: var(--r-lg);
   transition: color 0.15s, background 0.15s;
 }
@@ -359,6 +361,28 @@ textarea {
 
 .bottom-nav button.active svg {
   transform: scale(1.1);
+}
+
+.bottom-nav-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  min-width: 0;
+}
+
+.bottom-nav-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.05rem;
+  height: 1.05rem;
+  padding: 0 0.3rem;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--ink-2);
+  font-size: 0.55rem;
+  line-height: 1;
 }
 
 /* ── Page content ── */
@@ -1441,6 +1465,24 @@ textarea {
     linear-gradient(160deg, color-mix(in srgb, var(--surface) 92%, transparent), color-mix(in srgb, var(--surface-2) 90%, transparent));
 }
 
+.workspace-synth-artifacts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.workspace-synth-pill.success {
+  color: color-mix(in srgb, var(--accent) 82%, black);
+  border-color: color-mix(in srgb, var(--accent) 25%, var(--line));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface-2));
+}
+
+.workspace-synth-pill.danger {
+  color: #8f2f2f;
+  border-color: rgba(180, 74, 74, 0.28);
+  background: rgba(180, 74, 74, 0.09);
+}
+
 .planner-item-card {
   display: flex;
   flex-direction: column;
@@ -1469,6 +1511,134 @@ textarea {
   border-radius: 999px;
   background: var(--surface-2);
   border: 1px solid var(--line);
+}
+
+.planner-overview-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.planner-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 0.2rem;
+}
+
+.planner-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.planner-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.24rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: 0.78rem;
+  line-height: 1.2;
+}
+
+.planner-chip-priority-high {
+  border-color: color-mix(in srgb, var(--error) 40%, var(--line));
+  background: color-mix(in srgb, var(--error) 10%, var(--surface));
+  color: color-mix(in srgb, var(--error) 78%, var(--ink));
+}
+
+.planner-chip-priority-medium {
+  border-color: color-mix(in srgb, #f59e0b 40%, var(--line));
+  background: color-mix(in srgb, #f59e0b 12%, var(--surface));
+  color: color-mix(in srgb, #b45309 80%, var(--ink));
+}
+
+.planner-chip-priority-low {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--line));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  color: color-mix(in srgb, var(--accent) 74%, var(--ink));
+}
+
+.planner-empty-state {
+  display: grid;
+  place-items: center;
+  min-height: 180px;
+  padding: 1rem;
+  border-radius: 18px;
+  border: 1px dashed var(--line);
+  background: color-mix(in srgb, var(--surface-2) 72%, transparent);
+}
+
+.planner-item-card-done {
+  opacity: 0.86;
+}
+
+.planner-item-card-past {
+  opacity: 0.88;
+}
+
+.events-calendar-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.events-calendar-days {
+  display: flex;
+  gap: 0.5rem;
+  overflow-x: auto;
+  padding-bottom: 0.15rem;
+  margin: 0 -0.1rem;
+}
+
+.events-calendar-day {
+  min-width: 3.35rem;
+  padding: 0.55rem 0.5rem;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-2);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.18rem;
+  box-shadow: none;
+}
+
+.events-calendar-day.selected {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.events-calendar-day.has-events:not(.selected) {
+  background: color-mix(in srgb, var(--surface) 82%, var(--accent-dim));
+}
+
+.events-calendar-dow {
+  font-size: 0.67rem;
+  color: var(--muted);
+}
+
+.events-calendar-day.selected .events-calendar-dow {
+  color: color-mix(in srgb, var(--accent) 72%, var(--muted));
+}
+
+.events-calendar-date {
+  font-size: 1rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.events-calendar-count {
+  min-height: 0.8rem;
+  font-size: 0.65rem;
+  color: var(--muted);
 }
 
 /* ─────────────────────────────────────────────

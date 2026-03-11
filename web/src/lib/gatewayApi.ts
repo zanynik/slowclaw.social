@@ -171,6 +171,19 @@ export type WorkspaceSynthesizerStatus = {
     events?: number;
     clipPlans?: number;
   };
+  artifactStates?: {
+    insightPosts?: WorkspaceSynthArtifactState;
+    todos?: WorkspaceSynthArtifactState;
+    events?: WorkspaceSynthArtifactState;
+    clipPlans?: WorkspaceSynthArtifactState;
+  };
+};
+
+export type WorkspaceSynthArtifactState = {
+  status?: "applied" | "skipped" | "error" | string;
+  path?: string;
+  itemCount?: number;
+  error?: string;
 };
 
 export type WorkspaceTodoItem = {
@@ -782,6 +795,58 @@ export async function getWorkspaceSynthesizerStatus(
           todos: Number(data.artifactCounts.todos || 0),
           events: Number(data.artifactCounts.events || 0),
           clipPlans: Number(data.artifactCounts.clipPlans || 0)
+        }
+      : undefined,
+    artifactStates: data?.artifactStates
+      ? {
+          insightPosts: data.artifactStates.insightPosts
+            ? {
+                status: String(data.artifactStates.insightPosts.status || ""),
+                path: data.artifactStates.insightPosts.path
+                  ? String(data.artifactStates.insightPosts.path)
+                  : undefined,
+                itemCount: Number(data.artifactStates.insightPosts.itemCount || 0),
+                error: data.artifactStates.insightPosts.error
+                  ? String(data.artifactStates.insightPosts.error)
+                  : undefined
+              }
+            : undefined,
+          todos: data.artifactStates.todos
+            ? {
+                status: String(data.artifactStates.todos.status || ""),
+                path: data.artifactStates.todos.path
+                  ? String(data.artifactStates.todos.path)
+                  : undefined,
+                itemCount: Number(data.artifactStates.todos.itemCount || 0),
+                error: data.artifactStates.todos.error
+                  ? String(data.artifactStates.todos.error)
+                  : undefined
+              }
+            : undefined,
+          events: data.artifactStates.events
+            ? {
+                status: String(data.artifactStates.events.status || ""),
+                path: data.artifactStates.events.path
+                  ? String(data.artifactStates.events.path)
+                  : undefined,
+                itemCount: Number(data.artifactStates.events.itemCount || 0),
+                error: data.artifactStates.events.error
+                  ? String(data.artifactStates.events.error)
+                  : undefined
+              }
+            : undefined,
+          clipPlans: data.artifactStates.clipPlans
+            ? {
+                status: String(data.artifactStates.clipPlans.status || ""),
+                path: data.artifactStates.clipPlans.path
+                  ? String(data.artifactStates.clipPlans.path)
+                  : undefined,
+                itemCount: Number(data.artifactStates.clipPlans.itemCount || 0),
+                error: data.artifactStates.clipPlans.error
+                  ? String(data.artifactStates.clipPlans.error)
+                  : undefined
+              }
+            : undefined
         }
       : undefined
   };

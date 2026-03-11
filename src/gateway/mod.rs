@@ -68,6 +68,7 @@ const JOURNAL_TEXT_DIR: &str = "journals/text";
 const JOURNAL_MEDIA_DIR: &str = "journals/media";
 const SYNC_ALLOWED_ROOTS: &[&str] = &["journals", "posts", "skills"];
 const CONTENT_AGENT_APP_OPEN_STALE_SECS: i64 = 15 * 60;
+const WORKSPACE_SYNTHESIZER_WORKFLOW_KEY: &str = "workspace_synthesizer";
 const LEGACY_AUDIO_INSIGHT_CLIPS_GOAL: &str =
     "Use my journal notes and available audio/video transcripts to identify practical insights and turn them into concise feed-ready posts, with each post saved as a separate file in posts/.";
 
@@ -588,7 +589,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .route("/api/workspace/todos", get(handle_workspace_todos_list))
         .route(
-            "/api/workspace/todos/:todo_id",
+            "/api/workspace/todos/{todo_id}",
             patch(handle_workspace_todo_update),
         )
         .route("/api/workspace/events", get(handle_workspace_events_list))
@@ -1265,6 +1266,11 @@ fn is_default_workflow_settings(settings: &FeedWorkflowSettings) -> bool {
 fn built_in_content_agent_specs() -> &'static [BuiltInContentAgentSpec] {
     &[
         BuiltInContentAgentSpec {
+            key: WORKSPACE_SYNTHESIZER_WORKFLOW_KEY,
+            name: "Workspace Synthesizer",
+            goal: "Create one strict workspace synthesis manifest from recent journals and transcripts. The runtime will turn that manifest into feed posts, todos, events, and clip plans.",
+        },
+        BuiltInContentAgentSpec {
             key: "bluesky_insight_posts",
             name: "Bluesky Insight Posts",
             goal: "Create interesting Bluesky post drafts from my recent journal notes. Extract standout insights and save each post as a separate file in posts/ so it appears in the workspace feed.",
@@ -1494,6 +1500,8 @@ fn ensure_content_agent_skill_file(
         .unwrap_or_else(|| "Create workspace feed posts from journal notes.".to_string());
     let output_dir = record.output_prefix.trim_end_matches('/');
     let skill_body = match record.workflow_key.as_str() {
+        WORKSPACE_SYNTHESIZER_WORKFLOW_KEY =>
+            workspace_synthesizer::render_skill_markdown()?,
         "audio_insight_clips" => render_audio_insight_clip_skill_markdown(output_dir),
         _ => render_template_skill_markdown(&record.workflow_bot, &goal, output_dir),
     };
@@ -1660,6 +1668,9 @@ fn goal_requests_media_output(goal: &str) -> bool {
 }
 
 fn workflow_requires_media_capabilities(workflow: &FeedContentAgentDefinition) -> bool {
+    if workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY {
+        return false;
+    }
     workflow.key == "audio_insight_clips" || goal_requests_media_output(&workflow.goal)
 }
 
@@ -1797,6 +1808,52 @@ fn should_auto_run_content_agent(
     true
 }
 
+fn save_workspace_synthesizer_status(
+    workspace_dir: &StdPath,
+    status: &str,
+    trigger_reason: &str,
+    thread_id: &str,
+    latest_source_updated_at: i64,
+    last_run_at: Option<String>,
+    last_summary: Option<String>,
+    last_error: Option<String>,
+    artifact_counts: Option<workspace_synthesizer::WorkspaceSynthArtifactCounts>,
+    artifact_states: Option<workspace_synthesizer::WorkspaceSynthArtifactStates>,
+) {
+    let mut next = workspace_synthesizer::load_status(workspace_dir);
+    next.status = status.to_string();
+    next.trigger_reason = trigger_reason.trim().to_string();
+    next.thread_id = thread_id.trim().to_string();
+    next.last_source_updated_at = latest_source_updated_at;
+    next.last_manifest_path =
+        workspace_synthesizer::WORKSPACE_SYNTHESIZER_PIPELINE_DIR.to_string();
+    if let Some(last_run_at) = last_run_at {
+        next.last_run_at = last_run_at;
+    }
+    match last_summary {
+        Some(summary) => next.last_summary = summary,
+        None if status != "done" => next.last_summary.clear(),
+        None => {}
+    }
+    match last_error {
+        Some(error) => next.last_error = error,
+        None => next.last_error.clear(),
+    }
+    if let Some(artifact_counts) = artifact_counts {
+        next.artifact_counts = artifact_counts;
+    } else if status != "done" {
+        next.artifact_counts = workspace_synthesizer::WorkspaceSynthArtifactCounts::default();
+    }
+    if let Some(artifact_states) = artifact_states {
+        next.artifact_states = artifact_states;
+    } else if status != "done" {
+        next.artifact_states = workspace_synthesizer::WorkspaceSynthArtifactStates::default();
+    }
+    if let Err(err) = workspace_synthesizer::save_status(workspace_dir, &next) {
+        tracing::warn!("Failed to persist workspace synthesizer status `{status}`: {err}");
+    }
+}
+
 fn queue_eligible_content_agents_for_trigger(
     state: &AppState,
     trigger: ContentAgentAutoRunTrigger,
@@ -1862,6 +1919,14 @@ fn queue_workspace_synthesizer_for_trigger(
         return Ok(None);
     }
 
+    let store = load_or_seed_feed_workflow_settings_store(&workspace_dir)?;
+    let Some(record) = store.workflows.get(WORKSPACE_SYNTHESIZER_WORKFLOW_KEY) else {
+        return Ok(None);
+    };
+    if !record.enabled {
+        return Ok(None);
+    }
+
     let status = workspace_synthesizer::load_status(&workspace_dir);
     if reason.eq_ignore_ascii_case("app-open")
         && status.last_source_updated_at > 0
@@ -1889,319 +1954,29 @@ fn queue_workspace_synthesizer_run(
     {
         return Ok(existing_status.thread_id);
     }
-    let thread_id = workspace_synthesizer::WORKSPACE_SYNTHESIZER_THREAD_ID.to_string();
-    let user_content = format!("[run] Triggered {} for Workspace Synthesizer", source.trim());
-
-    let user_record = local_store::create_chat_message(
-        &workspace_dir,
-        &thread_id,
-        "user",
-        &user_content,
-        "pending",
-        source,
-        None,
-        None,
-    )?;
-    let user_id = user_record
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    let pending_status = workspace_synthesizer::WorkspaceSynthesizerStatus {
-        status: "pending".to_string(),
-        trigger_reason: source.trim().to_string(),
-        thread_id: thread_id.clone(),
-        last_source_updated_at: latest_source_updated_at,
-        last_error: String::new(),
-        last_manifest_path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH.to_string(),
-        ..workspace_synthesizer::load_status(&workspace_dir)
+    let store = load_or_seed_feed_workflow_settings_store(&workspace_dir)?;
+    let workflow = workflow_definition_by_key(&store, WORKSPACE_SYNTHESIZER_WORKFLOW_KEY)
+        .context("workspace synthesizer workflow is missing")?;
+    let source_label = match source.trim() {
+        "app-open" => "app-open",
+        "journal-save" => "journal-save",
+        "transcript-ready" => "transcript-ready",
+        "workspace-run-manual" => "workspace-run-manual",
+        _ => "workspace-synthesizer",
     };
-    let _ = workspace_synthesizer::save_status(&workspace_dir, &pending_status);
-
-    let state_for_worker = state.clone();
-    let workspace_for_worker = workspace_dir.clone();
-    let thread_id_for_worker = thread_id.clone();
-    let user_id_for_worker = user_id.clone();
-    let source_owned = source.trim().to_string();
-    tokio::spawn(async move {
-        if let Err(err) = local_store::patch_chat_status(
-            &workspace_for_worker,
-            &user_id_for_worker,
-            "processing",
-            None,
-        ) {
-            tracing::warn!("Failed to update workspace synthesizer status to processing: {err}");
-        }
-
-        let processing_status = workspace_synthesizer::WorkspaceSynthesizerStatus {
-            status: "processing".to_string(),
-            trigger_reason: source_owned.clone(),
-            thread_id: thread_id_for_worker.clone(),
-            last_source_updated_at: latest_source_updated_at,
-            last_error: String::new(),
-            last_manifest_path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH.to_string(),
-            ..workspace_synthesizer::load_status(&workspace_for_worker)
-        };
-        let _ = workspace_synthesizer::save_status(&workspace_for_worker, &processing_status);
-
-        let media_summary = local_media_capabilities(&state_for_worker.config.lock().clone()).summary();
-        let prompt = match workspace_synthesizer::render_prompt(&media_summary) {
-            Ok(prompt) => prompt,
-            Err(err) => {
-                let final_error = truncate_with_ellipsis(
-                    &format!("Workspace synthesizer prompt build failed.\n\n{err:#}"),
-                    4000,
-                );
-                let _ = workspace_synthesizer::save_status(
-                    &workspace_for_worker,
-                    &workspace_synthesizer::WorkspaceSynthesizerStatus {
-                        status: "error".to_string(),
-                        trigger_reason: source_owned.clone(),
-                        thread_id: thread_id_for_worker.clone(),
-                        last_source_updated_at: latest_source_updated_at,
-                        last_error: final_error.clone(),
-                        last_manifest_path:
-                            workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH.to_string(),
-                        ..workspace_synthesizer::load_status(&workspace_for_worker)
-                    },
-                );
-                let _ = local_store::create_chat_message(
-                    &workspace_for_worker,
-                    &thread_id_for_worker,
-                    "assistant",
-                    "",
-                    "error",
-                    "workspace-synthesizer",
-                    Some(&user_id_for_worker),
-                    Some(&final_error),
-                );
-                let _ = local_store::patch_chat_status(
-                    &workspace_for_worker,
-                    &user_id_for_worker,
-                    "error",
-                    Some(&final_error),
-                );
-                return;
-            }
-        };
-
-        let run_result = tokio::time::timeout(
-            Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
-            run_local_agent_prompt_in_thread(
-                &state_for_worker,
-                &thread_id_for_worker,
-                &prompt,
-            ),
-        )
-        .await;
-
-        match run_result {
-            Ok(Ok(reply)) => {
-                let workspace_for_apply = workspace_for_worker.clone();
-                let apply_result = tokio::task::spawn_blocking(move || {
-                    let manifest = workspace_synthesizer::load_manifest(&workspace_for_apply)?;
-                    workspace_synthesizer::apply_manifest(
-                        &workspace_for_apply,
-                        &manifest,
-                        &Utc::now().to_rfc3339(),
-                    )
-                })
-                .await;
-
-                match apply_result {
-                    Ok(Ok(applied)) => {
-                        let combined_reply = if reply.trim().is_empty() {
-                            applied.summary.clone()
-                        } else {
-                            format!("{}\n\nAgent reply:\n{}", applied.summary, reply.trim())
-                        };
-                        let final_reply = truncate_with_ellipsis(combined_reply.trim(), 4000);
-                        let _ = local_store::create_chat_message(
-                            &workspace_for_worker,
-                            &thread_id_for_worker,
-                            "assistant",
-                            &final_reply,
-                            "done",
-                            "workspace-synthesizer",
-                            Some(&user_id_for_worker),
-                            None,
-                        );
-                        let _ = local_store::patch_chat_status(
-                            &workspace_for_worker,
-                            &user_id_for_worker,
-                            "done",
-                            None,
-                        );
-                        let _ = workspace_synthesizer::save_status(
-                            &workspace_for_worker,
-                            &workspace_synthesizer::WorkspaceSynthesizerStatus {
-                                status: "done".to_string(),
-                                trigger_reason: source_owned.clone(),
-                                thread_id: thread_id_for_worker.clone(),
-                                last_run_at: Utc::now().to_rfc3339(),
-                                last_source_updated_at: latest_source_updated_at,
-                                last_summary: applied.summary.clone(),
-                                last_error: String::new(),
-                                last_manifest_path:
-                                    workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH
-                                        .to_string(),
-                                artifact_counts: applied.counts,
-                                ..workspace_synthesizer::load_status(&workspace_for_worker)
-                            },
-                        );
-                    }
-                    Ok(Err(err)) => {
-                        let final_error = truncate_with_ellipsis(
-                            &format!("Workspace synthesis apply failed.\n\n{err:#}"),
-                            4000,
-                        );
-                        let _ = local_store::create_chat_message(
-                            &workspace_for_worker,
-                            &thread_id_for_worker,
-                            "assistant",
-                            "",
-                            "error",
-                            "workspace-synthesizer",
-                            Some(&user_id_for_worker),
-                            Some(&final_error),
-                        );
-                        let _ = local_store::patch_chat_status(
-                            &workspace_for_worker,
-                            &user_id_for_worker,
-                            "error",
-                            Some(&final_error),
-                        );
-                        let _ = workspace_synthesizer::save_status(
-                            &workspace_for_worker,
-                            &workspace_synthesizer::WorkspaceSynthesizerStatus {
-                                status: "error".to_string(),
-                                trigger_reason: source_owned.clone(),
-                                thread_id: thread_id_for_worker.clone(),
-                                last_source_updated_at: latest_source_updated_at,
-                                last_summary: String::new(),
-                                last_error: final_error,
-                                last_manifest_path:
-                                    workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH
-                                        .to_string(),
-                                ..workspace_synthesizer::load_status(&workspace_for_worker)
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        let final_error = truncate_with_ellipsis(
-                            &format!("Workspace synthesis apply task failed.\n\n{err:#}"),
-                            4000,
-                        );
-                        let _ = local_store::create_chat_message(
-                            &workspace_for_worker,
-                            &thread_id_for_worker,
-                            "assistant",
-                            "",
-                            "error",
-                            "workspace-synthesizer",
-                            Some(&user_id_for_worker),
-                            Some(&final_error),
-                        );
-                        let _ = local_store::patch_chat_status(
-                            &workspace_for_worker,
-                            &user_id_for_worker,
-                            "error",
-                            Some(&final_error),
-                        );
-                        let _ = workspace_synthesizer::save_status(
-                            &workspace_for_worker,
-                            &workspace_synthesizer::WorkspaceSynthesizerStatus {
-                                status: "error".to_string(),
-                                trigger_reason: source_owned.clone(),
-                                thread_id: thread_id_for_worker.clone(),
-                                last_source_updated_at: latest_source_updated_at,
-                                last_summary: String::new(),
-                                last_error: final_error,
-                                last_manifest_path:
-                                    workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH
-                                        .to_string(),
-                                ..workspace_synthesizer::load_status(&workspace_for_worker)
-                            },
-                        );
-                    }
-                }
-            }
-            Ok(Err(err)) => {
-                let final_error = truncate_with_ellipsis(
-                    &format!("Workspace synthesizer run failed.\n\n{err:#}"),
-                    4000,
-                );
-                let _ = local_store::create_chat_message(
-                    &workspace_for_worker,
-                    &thread_id_for_worker,
-                    "assistant",
-                    "",
-                    "error",
-                    "workspace-synthesizer",
-                    Some(&user_id_for_worker),
-                    Some(&final_error),
-                );
-                let _ = local_store::patch_chat_status(
-                    &workspace_for_worker,
-                    &user_id_for_worker,
-                    "error",
-                    Some(&final_error),
-                );
-                let _ = workspace_synthesizer::save_status(
-                    &workspace_for_worker,
-                    &workspace_synthesizer::WorkspaceSynthesizerStatus {
-                        status: "error".to_string(),
-                        trigger_reason: source_owned,
-                        thread_id: thread_id_for_worker,
-                        last_source_updated_at: latest_source_updated_at,
-                        last_summary: String::new(),
-                        last_error: final_error,
-                        last_manifest_path:
-                            workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH.to_string(),
-                        ..workspace_synthesizer::load_status(&workspace_for_worker)
-                    },
-                );
-            }
-            Err(_) => {
-                let final_error = format!(
-                    "Workspace synthesizer timed out after {}s",
-                    CONTENT_AGENT_TIMEOUT_SECS
-                );
-                let _ = local_store::create_chat_message(
-                    &workspace_for_worker,
-                    &thread_id_for_worker,
-                    "assistant",
-                    "",
-                    "error",
-                    "workspace-synthesizer",
-                    Some(&user_id_for_worker),
-                    Some(&final_error),
-                );
-                let _ = local_store::patch_chat_status(
-                    &workspace_for_worker,
-                    &user_id_for_worker,
-                    "error",
-                    Some(&final_error),
-                );
-                let _ = workspace_synthesizer::save_status(
-                    &workspace_for_worker,
-                    &workspace_synthesizer::WorkspaceSynthesizerStatus {
-                        status: "error".to_string(),
-                        trigger_reason: source_owned,
-                        thread_id: thread_id_for_worker,
-                        last_source_updated_at: latest_source_updated_at,
-                        last_summary: String::new(),
-                        last_error: final_error,
-                        last_manifest_path:
-                            workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH.to_string(),
-                        ..workspace_synthesizer::load_status(&workspace_for_worker)
-                    },
-                );
-            }
-        }
-    });
-
+    let thread_id = queue_workflow_run(state.clone(), workflow, source_label)?;
+    save_workspace_synthesizer_status(
+        &workspace_dir,
+        "pending",
+        source_label,
+        &thread_id,
+        latest_source_updated_at,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     Ok(thread_id)
 }
 
@@ -2247,12 +2022,27 @@ fn queue_workflow_run(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
+    if workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY {
+        save_workspace_synthesizer_status(
+            &workspace_dir,
+            "pending",
+            source,
+            &thread_id,
+            latest_content_agent_source_updated_at(&workspace_dir),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
 
     let state_for_worker = state.clone();
     let workspace_for_worker = workspace_dir.clone();
     let thread_id_for_worker = thread_id.clone();
     let user_id_for_worker = user_id.clone();
     let workflow_for_worker = workflow.clone();
+    let is_workspace_synth = workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY;
     tokio::spawn(async move {
         if let Err(err) =
             local_store::patch_chat_status(
@@ -2263,6 +2053,20 @@ fn queue_workflow_run(
             )
         {
             tracing::warn!("Failed to update workflow-run status to processing: {err}");
+        }
+        if is_workspace_synth {
+            save_workspace_synthesizer_status(
+                &workspace_for_worker,
+                "processing",
+                source,
+                &thread_id_for_worker,
+                latest_content_agent_source_updated_at(&workspace_for_worker),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         }
 
         let skill_abs = workspace_for_worker.join(&workflow_for_worker.skill_path);
@@ -2289,6 +2093,20 @@ fn queue_workflow_run(
                     "error",
                     Some(&final_error),
                 );
+                if is_workspace_synth {
+                    save_workspace_synthesizer_status(
+                        &workspace_for_worker,
+                        "error",
+                        source,
+                        &thread_id_for_worker,
+                        latest_content_agent_source_updated_at(&workspace_for_worker),
+                        None,
+                        None,
+                        Some(final_error),
+                        None,
+                        None,
+                    );
+                }
                 return;
             }
         };
@@ -2308,6 +2126,159 @@ fn queue_workflow_run(
 
         match run_result {
             Ok(Ok(reply)) => {
+                if is_workspace_synth {
+                    let workspace_for_apply = workspace_for_worker.clone();
+                    let apply_result = tokio::task::spawn_blocking(move || {
+                        workspace_synthesizer::apply_handoff_files(
+                            &workspace_for_apply,
+                            &Utc::now().to_rfc3339(),
+                        )
+                    })
+                    .await;
+
+                    match apply_result {
+                        Ok(Ok(applied)) => {
+                            let run_finished_at = Utc::now().to_rfc3339();
+                            if applied.had_errors && !applied.applied_any {
+                                let final_error = truncate_with_ellipsis(&applied.summary, 4000);
+                                let _ = local_store::create_chat_message(
+                                    &workspace_for_worker,
+                                    &thread_id_for_worker,
+                                    "assistant",
+                                    "",
+                                    "error",
+                                    "workflow-runner",
+                                    Some(&user_id_for_worker),
+                                    Some(&final_error),
+                                );
+                                let _ = local_store::patch_chat_status(
+                                    &workspace_for_worker,
+                                    &user_id_for_worker,
+                                    "error",
+                                    Some(&final_error),
+                                );
+                                save_workspace_synthesizer_status(
+                                    &workspace_for_worker,
+                                    "error",
+                                    source,
+                                    &thread_id_for_worker,
+                                    latest_content_agent_source_updated_at(&workspace_for_worker),
+                                    Some(run_finished_at),
+                                    Some(applied.summary.clone()),
+                                    Some(final_error),
+                                    Some(applied.counts.clone()),
+                                    Some(applied.artifact_states.clone()),
+                                );
+                            } else {
+                                let combined_reply = if reply.trim().is_empty() {
+                                    applied.summary.clone()
+                                } else {
+                                    format!("{}\n\nAgent reply:\n{}", applied.summary, reply.trim())
+                                };
+                                let final_reply =
+                                    truncate_with_ellipsis(combined_reply.trim(), 4000);
+                                let _ = local_store::create_chat_message(
+                                    &workspace_for_worker,
+                                    &thread_id_for_worker,
+                                    "assistant",
+                                    &final_reply,
+                                    "done",
+                                    "workflow-runner",
+                                    Some(&user_id_for_worker),
+                                    None,
+                                );
+                                let _ = local_store::patch_chat_status(
+                                    &workspace_for_worker,
+                                    &user_id_for_worker,
+                                    "done",
+                                    None,
+                                );
+                                save_workspace_synthesizer_status(
+                                    &workspace_for_worker,
+                                    "done",
+                                    source,
+                                    &thread_id_for_worker,
+                                    latest_content_agent_source_updated_at(&workspace_for_worker),
+                                    Some(run_finished_at),
+                                    Some(applied.summary.clone()),
+                                    None,
+                                    Some(applied.counts.clone()),
+                                    Some(applied.artifact_states.clone()),
+                                );
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            let final_error = truncate_with_ellipsis(
+                                &format!("Workspace synthesis apply failed.\n\n{err:#}"),
+                                4000,
+                            );
+                            let _ = local_store::create_chat_message(
+                                &workspace_for_worker,
+                                &thread_id_for_worker,
+                                "assistant",
+                                "",
+                                "error",
+                                "workflow-runner",
+                                Some(&user_id_for_worker),
+                                Some(&final_error),
+                            );
+                            let _ = local_store::patch_chat_status(
+                                &workspace_for_worker,
+                                &user_id_for_worker,
+                                "error",
+                                Some(&final_error),
+                            );
+                            save_workspace_synthesizer_status(
+                                &workspace_for_worker,
+                                "error",
+                                source,
+                                &thread_id_for_worker,
+                                latest_content_agent_source_updated_at(&workspace_for_worker),
+                                None,
+                                None,
+                                Some(final_error),
+                                None,
+                                None,
+                            );
+                        }
+                        Err(err) => {
+                            let final_error = truncate_with_ellipsis(
+                                &format!("Workspace synthesis apply task failed.\n\n{err:#}"),
+                                4000,
+                            );
+                            let _ = local_store::create_chat_message(
+                                &workspace_for_worker,
+                                &thread_id_for_worker,
+                                "assistant",
+                                "",
+                                "error",
+                                "workflow-runner",
+                                Some(&user_id_for_worker),
+                                Some(&final_error),
+                            );
+                            let _ = local_store::patch_chat_status(
+                                &workspace_for_worker,
+                                &user_id_for_worker,
+                                "error",
+                                Some(&final_error),
+                            );
+                            save_workspace_synthesizer_status(
+                                &workspace_for_worker,
+                                "error",
+                                source,
+                                &thread_id_for_worker,
+                                latest_content_agent_source_updated_at(&workspace_for_worker),
+                                None,
+                                None,
+                                Some(final_error),
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                    return;
+                }
+
                 let final_reply = if reply.trim().is_empty() {
                     "Content agent run completed.".to_string()
                 } else {
@@ -2370,6 +2341,20 @@ fn queue_workflow_run(
                     "error",
                     Some(&final_error),
                 );
+                if is_workspace_synth {
+                    save_workspace_synthesizer_status(
+                        &workspace_for_worker,
+                        "error",
+                        source,
+                        &thread_id_for_worker,
+                        latest_content_agent_source_updated_at(&workspace_for_worker),
+                        None,
+                        None,
+                        Some(final_error),
+                        None,
+                        None,
+                    );
+                }
             }
             Err(_) => {
                 let final_error = format!(
@@ -2392,6 +2377,20 @@ fn queue_workflow_run(
                     "error",
                     Some(&final_error),
                 );
+                if is_workspace_synth {
+                    save_workspace_synthesizer_status(
+                        &workspace_for_worker,
+                        "error",
+                        source,
+                        &thread_id_for_worker,
+                        latest_content_agent_source_updated_at(&workspace_for_worker),
+                        None,
+                        None,
+                        Some(final_error),
+                        None,
+                        None,
+                    );
+                }
             }
         }
     });
@@ -2628,9 +2627,26 @@ fn render_content_agent_run_prompt(
     prompt.push_str(&format!("- {media_tool_summary}\n"));
     prompt.push_str("- For deterministic media transforms, use only the built-in media tools that are available on this device.\n");
     prompt.push_str("- Do not invent script paths or raw ffmpeg commands inside the skill execution.\n");
-    prompt.push_str(&format!("- Write feed-visible artifacts only under `{}`.\n", workflow.output_prefix));
-    prompt.push_str(&format!("- Hidden intermediate artifacts may go under `{}/pipeline/` or `{}/artifacts/`.\n", workflow.output_prefix.trim_end_matches('/'), workflow.output_prefix.trim_end_matches('/')));
-    prompt.push_str("- If multiple distinct post candidates are useful, save each as a separate file.\n");
+    if workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY {
+        prompt.push_str(&format!(
+            "- Write only small JSON handoff files under `{}`.\n",
+            workspace_synthesizer::WORKSPACE_SYNTHESIZER_PIPELINE_DIR
+        ));
+        prompt.push_str(&format!(
+            "- Allowed handoff files: `{}`, `{}`, `{}`, `{}`.\n",
+            workspace_synthesizer::WORKSPACE_SYNTHESIZER_INSIGHT_POSTS_PATH,
+            workspace_synthesizer::WORKSPACE_SYNTHESIZER_TODOS_PATH,
+            workspace_synthesizer::WORKSPACE_SYNTHESIZER_EVENTS_PATH,
+            workspace_synthesizer::WORKSPACE_SYNTHESIZER_CLIP_PLANS_PATH
+        ));
+        prompt.push_str("- Omit any handoff file that has no strong candidates, or write an empty `items` array.\n");
+        prompt.push_str("- Do not directly write feed posts, todos, events, or clip plan outputs.\n");
+        prompt.push_str("- Use direct file edits in the workspace so the runtime can validate and apply each handoff independently.\n");
+    } else {
+        prompt.push_str(&format!("- Write feed-visible artifacts only under `{}`.\n", workflow.output_prefix));
+        prompt.push_str(&format!("- Hidden intermediate artifacts may go under `{}/pipeline/` or `{}/artifacts/`.\n", workflow.output_prefix.trim_end_matches('/'), workflow.output_prefix.trim_end_matches('/')));
+        prompt.push_str("- If multiple distinct post candidates are useful, save each as a separate file.\n");
+    }
     prompt.push_str("- Use direct file edits in the workspace, not code blocks in chat.\n");
     prompt.push_str("- Reply with a concise summary of files written.\n");
     prompt
