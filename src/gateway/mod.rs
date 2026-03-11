@@ -34,7 +34,7 @@ use axum::{
 use http_body_util::BodyExt as _;
 use parking_lot::Mutex;
 use regex::Regex;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -3831,11 +3831,7 @@ async fn handle_feed_personalized(
     }
 
     if let Some(embedder) = embedder.as_ref() {
-        if let Err(err) =
-            backfill_cached_content_item_embeddings(&workspace_dir, embedder.clone()).await
-        {
-            tracing::warn!("Failed to backfill cached content item embeddings: {err}");
-        }
+        spawn_cached_content_item_embedding_backfill(workspace_dir.clone(), embedder.clone());
     }
 
     let recent_content_items = build_recent_content_items(&workspace_dir, limit).unwrap_or_default();
@@ -6079,7 +6075,7 @@ const FEED_WEB_DOMAIN_BATCHES_PER_INTEREST: usize = 2;
 const FEED_WEB_RESULT_LIMIT_PER_QUERY: usize = 5;
 const CONTENT_SOURCE_REFRESH_TTL_SECS: i64 = 30 * 60;
 const CONTENT_SOURCE_REFRESH_BATCH_SIZE: usize = 6;
-const CONTENT_ITEM_EMBEDDING_BACKFILL_BATCH_SIZE: usize = 64;
+const CONTENT_ITEM_EMBEDDING_BACKFILL_BATCH_SIZE: usize = 16;
 const CONTENT_SOURCE_ITEM_LIMIT: usize = 12;
 const CONTENT_RANK_CANDIDATE_LIMIT: usize = 160;
 const CONTENT_TEXT_MAX_CHARS: usize = 2400;
@@ -7120,6 +7116,33 @@ async fn backfill_cached_content_item_embeddings(
     }
 
     Ok(updated_count)
+}
+
+fn cached_content_backfill_inflight() -> &'static Mutex<HashSet<PathBuf>> {
+    static INFLIGHT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    INFLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn spawn_cached_content_item_embedding_backfill(
+    workspace_dir: PathBuf,
+    embedder: Arc<dyn memory::embeddings::EmbeddingProvider>,
+) {
+    {
+        let mut inflight = cached_content_backfill_inflight().lock();
+        if !inflight.insert(workspace_dir.clone()) {
+            return;
+        }
+    }
+
+    tokio::spawn(async move {
+        let result = backfill_cached_content_item_embeddings(&workspace_dir, embedder).await;
+        if let Err(err) = result {
+            tracing::warn!("Failed to backfill cached content item embeddings: {err}");
+        }
+        cached_content_backfill_inflight()
+            .lock()
+            .remove(&workspace_dir);
+    });
 }
 
 fn content_preview_timestamp(item: &local_store::ContentItemRecord) -> String {

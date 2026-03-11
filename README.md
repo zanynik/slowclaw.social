@@ -42,39 +42,122 @@ Minimum recommendation:
 
 ## Quick Start
 
+### Fastest developer path
+
+If you are working on the app locally, the main entry point is:
+
+```bash
+cd web
+npm install
+npm run tauri dev
+```
+
+That starts the React frontend, launches the embedded Rust gateway, and opens the desktop app shell.
+
 ### 1. Prerequisites
 
-Required:
+Required for all local development:
 
-- Rust toolchain (`rustc`, `cargo`)
+- Rust stable toolchain (`rustc`, `cargo`)
+- Node.js 18+ and npm
 
-Optional (for rebuilding the web UI):
+Required on macOS for the Tauri desktop app:
 
-- Node.js 18+
+- Xcode Command Line Tools
 
-### 2. Build
+  ```bash
+  xcode-select --install
+  ```
+
+Recommended on macOS for packaging and native Apple builds:
+
+- Full Xcode app from the App Store
+- Homebrew
+
+Required for iPhone/iOS development:
+
+- Full Xcode app
+- CocoaPods
+
+  ```bash
+  brew install cocoapods
+  ```
+
+- Rust iOS targets
+
+  ```bash
+  rustup target add aarch64-apple-ios x86_64-apple-ios aarch64-apple-ios-sim
+  ```
+
+### 2. Clone and install dependencies
+
+```bash
+git clone https://github.com/zanynik/slowclaw.social.git
+cd slowclaw.social
+cd web
+npm install
+cd ..
+```
+
+### 3. Run the macOS desktop app in dev mode
+
+```bash
+cd web
+npm run tauri dev
+```
+
+What this does:
+
+- runs the Vite frontend dev server
+- builds the Rust Tauri host
+- starts the embedded gateway automatically
+- opens the desktop app window
+
+The frontend dev server is configured at `http://localhost:1420`, but in normal use you just launch the Tauri app window.
+
+### 4. Build distributable desktop artifacts
+
+To build the production desktop app and bundle outputs such as `.app` and `.dmg` on macOS:
+
+```bash
+cd web
+npm run tauri -- build
+```
+
+Bundle outputs are written under:
+
+- `web/src-tauri/target/release/bundle/`
+
+### 5. Run the iPhone app in dev mode
+
+First-time setup:
+
+```bash
+cd web
+npm run tauri:ios:init
+```
+
+Then run on simulator or device:
+
+```bash
+cd web
+npm run tauri:ios:dev
+```
+
+Notes:
+
+- You will likely need to choose a signing team in Xcode for device builds.
+- The generated iOS project lives under `web/src-tauri/gen/apple/`.
+- The iOS app uses the same Rust/Tauri codebase and web frontend as the desktop app.
+
+### 6. CLI / gateway-only development
+
+If you only want the Rust binary and gateway without the Tauri shell:
 
 ```bash
 cargo build --release
-```
-
-Binary path:
-
-```bash
-./target/release/slowclaw
-```
-
-### 3. Run the gateway (serves UI + starts local store)
-
-```bash
 ./target/release/slowclaw gateway
 ```
-
-Open:
-
-- `http://127.0.0.1:8080/` (or your configured gateway port)
-
-The gateway startup log prints the actual UI URL and local store path.
 
 Recommended for full scheduling + chat worker runtime:
 
@@ -82,18 +165,22 @@ Recommended for full scheduling + chat worker runtime:
 ./target/release/slowclaw daemon
 ```
 
-### 4. Pair and send a webhook prompt (optional)
+The default gateway bind is:
+
+- `http://127.0.0.1:42617/`
+
+### 7. Pair and send a webhook prompt (optional)
 
 If pairing is enabled, use the startup pairing code:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/pair -H 'X-Pairing-Code: <code>'
+curl -X POST http://127.0.0.1:42617/pair -H 'X-Pairing-Code: <code>'
 ```
 
 Then send prompts:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/webhook \
+curl -X POST http://127.0.0.1:42617/webhook \
   -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: application/json' \
   -d '{"message":"hello"}'
@@ -114,7 +201,7 @@ By default, temp workspace overrides are ignored unless you explicitly opt in wi
 export ZEROCLAW_ALLOW_TEMP_WORKSPACE=1
 ```
 
-### 5. Generate a new pairing code without logging out existing clients
+### 8. Generate a new pairing code without logging out existing clients
 
 Use this when Mac is already paired and you want to pair phone too.
 
