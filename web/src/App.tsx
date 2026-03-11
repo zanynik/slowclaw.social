@@ -63,7 +63,7 @@ import type {
   StoredDraft,
 } from "./lib/types";
 import {
-  autoRunEligibleFeedContentAgents,
+  autoRunWorkspaceSynthesizer,
   archivePostedLibraryItem,
   createClawChatUserMessage as createClawChatUserMessageViaGateway,
   createFeedContentAgent,
@@ -71,22 +71,27 @@ import {
   createPostHistory,
   deleteLibraryItem,
   exportWorkspaceSyncSnapshot,
-  fetchPersonalizedBlueskyFeed,
+  fetchPersonalizedFeed,
   fetchMediaAsFile,
   getJournalTranscriptionStatus,
   importWorkspaceSyncSnapshot,
   getRuntimeConfig,
+  getWorkspaceSynthesizerStatus,
   listClawChatMessages,
   listDrafts as listDraftsViaGateway,
   listFeedContentAgents,
+  listWorkspaceEvents,
+  listWorkspaceTodos,
   listLibraryItems,
   listPostHistory as listPostHistoryViaGateway,
   readLibraryText,
+  runWorkspaceSynthesizerNow,
   runFeedContentAgentNow,
   saveDraft as saveDraftViaGateway,
   saveLibraryText,
   submitFeedContentAgentComment,
   transcribeJournalMedia,
+  updateWorkspaceTodoStatus,
   updateFeedContentAgent,
   updateRuntimeConfig,
   uploadMediaViaGateway,
@@ -96,6 +101,9 @@ import type {
   InterestProfileStats,
   MediaCapabilities,
   PersonalizedBlueskyItem,
+  WorkspaceEventItem,
+  WorkspaceSynthesizerStatus,
+  WorkspaceTodoItem,
 } from "./lib/gatewayApi";
 
 const CHAT_THREAD_STORAGE_KEY = "slowclaw.chat.thread_id";
@@ -115,6 +123,7 @@ let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
 type MobileTab = "journal" | "feed" | "chat" | "profile";
+type WorkspaceLocalTab = "feed" | "todos" | "events";
 type ThemeMode = "light" | "dark";
 type DesktopGatewayBootstrap = {
   token?: string | null;
@@ -839,6 +848,13 @@ function App() {
 
   // Bluesky Feed State
   const [feedSource, setFeedSource] = useState<"local" | "bluesky">("local");
+  const [workspaceLocalTab, setWorkspaceLocalTab] = useState<WorkspaceLocalTab>("feed");
+  const [workspaceTodos, setWorkspaceTodos] = useState<WorkspaceTodoItem[]>([]);
+  const [workspaceEvents, setWorkspaceEvents] = useState<WorkspaceEventItem[]>([]);
+  const [workspaceSynthStatus, setWorkspaceSynthStatus] = useState<WorkspaceSynthesizerStatus>({
+    status: "idle"
+  });
+  const [workspaceSynthBusy, setWorkspaceSynthBusy] = useState(false);
   const [blueskyFeedItems, setBlueskyFeedItems] = useState<PersonalizedBlueskyItem[]>([]);
   const [blueskyFeedLoading, setBlueskyFeedLoading] = useState(false);
   const [blueskyFeedStatus, setBlueskyFeedStatus] = useState("");
@@ -1291,7 +1307,7 @@ function App() {
       if (nextSelectedPath) {
         setSelectedJournalPath(nextSelectedPath);
       }
-      void triggerEligibleContentAgents("journal-save", { quiet: true });
+      void triggerWorkspaceSynthesizer("journal-save", { quiet: true });
     } catch (error) {
       setJournalSaveStatus(
         `Save failed (${error instanceof Error ? error.message : String(error)})`
@@ -1865,7 +1881,61 @@ function App() {
     setActiveFeedCommentPath((current) => (current === path ? "" : path));
   }
 
-  async function triggerEligibleContentAgents(
+  async function loadWorkspaceSynthStatus() {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      return;
+    }
+    try {
+      const status = await getWorkspaceSynthesizerStatus(token || undefined, gatewayBaseUrl);
+      setWorkspaceSynthStatus(status);
+    } catch (error) {
+      setFeedEditStatus(
+        `Workspace status unavailable (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function loadWorkspaceTodos() {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      return;
+    }
+    try {
+      const items = await listWorkspaceTodos(token || undefined, gatewayBaseUrl);
+      setWorkspaceTodos(items);
+    } catch (error) {
+      setFeedEditStatus(
+        `Workspace todos unavailable (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function loadWorkspaceEvents() {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      return;
+    }
+    try {
+      const items = await listWorkspaceEvents(token || undefined, gatewayBaseUrl);
+      setWorkspaceEvents(items);
+    } catch (error) {
+      setFeedEditStatus(
+        `Workspace events unavailable (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function triggerWorkspaceSynthesizer(
     reason: "app-open" | "journal-save" | "transcript-ready",
     options?: { quiet?: boolean }
   ) {
@@ -1878,19 +1948,14 @@ function App() {
     }
 
     try {
-      const result = await autoRunEligibleFeedContentAgents(
+      const result = await autoRunWorkspaceSynthesizer(
         reason,
         token || undefined,
         gatewayBaseUrl
       );
-      if (result.queuedCount > 0) {
-        const label =
-          result.queuedCount === 1
-            ? `${result.items[0]?.workflowBot || "Content agent"} run queued`
-            : `${result.queuedCount} content agents queued`;
-        setFeedEditStatus(label);
-        void loadWorkflowRunStatuses();
-        void refreshLibrary("feed");
+      if (result.queued) {
+        setFeedEditStatus("Workspace synthesizer queued");
+        void loadWorkspaceSynthStatus();
       }
     } catch (error) {
       if (!options?.quiet) {
@@ -1898,6 +1963,59 @@ function App() {
           `Auto-run failed (${error instanceof Error ? error.message : String(error)})`
         );
       }
+    }
+  }
+
+  async function runWorkspaceSynthesizerManual() {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      setFeedEditStatus("Run blocked (gateway token missing).");
+      return;
+    }
+
+    setWorkspaceSynthBusy(true);
+    try {
+      const result = await runWorkspaceSynthesizerNow(token || undefined, gatewayBaseUrl);
+      if (result.queued) {
+        setFeedEditStatus("Workspace synthesizer queued");
+        await loadWorkspaceSynthStatus();
+      }
+    } catch (error) {
+      setFeedEditStatus(
+        `Workspace synth run failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setWorkspaceSynthBusy(false);
+    }
+  }
+
+  async function toggleWorkspaceTodo(item: WorkspaceTodoItem) {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      setFeedEditStatus("Todo update blocked (gateway token missing).");
+      return;
+    }
+    const nextStatus = item.status === "done" ? "open" : "done";
+    try {
+      const updated = await updateWorkspaceTodoStatus(
+        item.id,
+        nextStatus,
+        token || undefined,
+        gatewayBaseUrl
+      );
+      setWorkspaceTodos((prev) =>
+        prev.map((entry) => (entry.id === updated.id ? updated : entry))
+      );
+    } catch (error) {
+      setFeedEditStatus(
+        `Todo update failed (${error instanceof Error ? error.message : String(error)})`
+      );
     }
   }
 
@@ -3255,19 +3373,13 @@ function App() {
   }
 
   async function fetchBlueskyFeed() {
-    if (!session || !creds.serviceUrl.trim()) {
-      setBlueskyFeedItems([]);
-      setBlueskyFeedStatus("");
-      setBlueskyFeedLoading(false);
-      return;
-    }
     setBlueskyFeedLoading(true);
     setBlueskyFeedStatus("");
     try {
-      const res = await fetchPersonalizedBlueskyFeed(
+      const res = await fetchPersonalizedFeed(
         {
-          serviceUrl: creds.serviceUrl,
-          accessJwt: session.accessJwt,
+          serviceUrl: creds.serviceUrl.trim() || undefined,
+          accessJwt: session?.accessJwt,
           limit: 30
         },
         chatGatewayToken,
@@ -3278,12 +3390,14 @@ function App() {
       if (res.profileStatus === "embeddingUnavailable") {
         setBlueskyFeedStatus(
           res.message ||
-            "Personalized feed needs local all-MiniLM embeddings available. Showing raw Bluesky feed."
+            "Personalized feed needs a configured embedding provider. Showing recent cached content and raw Bluesky items when possible."
         );
       } else if (res.profileStatus === "noInterests") {
-        setBlueskyFeedStatus("Personalized feed starts after text items exist under posts/. Showing raw timeline.");
+        setBlueskyFeedStatus(
+          res.message || "Personalized feed starts after text items exist under posts/."
+        );
       } else if (res.usedFallback) {
-        setBlueskyFeedStatus(res.message || "Showing raw Bluesky timeline.");
+        setBlueskyFeedStatus(res.message || "Showing recent cached content and fallback items.");
       } else {
         setBlueskyFeedStatus(
           res.profileStats.interestCount > 0
@@ -3317,8 +3431,11 @@ function App() {
       setFeedCreateWorkflowOpen(false);
       return;
     }
-    void triggerEligibleContentAgents("app-open", { quiet: true });
+    void triggerWorkspaceSynthesizer("app-open", { quiet: true });
     void loadFeedWorkflowSettings();
+    void loadWorkspaceSynthStatus();
+    void loadWorkspaceTodos();
+    void loadWorkspaceEvents();
   }, [feedSource, mobileTab, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
@@ -3326,11 +3443,13 @@ function App() {
       return;
     }
 
+    void loadWorkspaceSynthStatus();
+
     const triggerFromForeground = () => {
       if (document.visibilityState === "hidden") {
         return;
       }
-      void triggerEligibleContentAgents("app-open", { quiet: true });
+      void triggerWorkspaceSynthesizer("app-open", { quiet: true });
     };
 
     window.addEventListener("focus", triggerFromForeground);
@@ -3345,13 +3464,25 @@ function App() {
     if (feedSource !== "local" || mobileTab !== "feed") {
       return;
     }
+    if (
+      workspaceSynthStatus.status !== "pending" &&
+      workspaceSynthStatus.status !== "processing"
+    ) {
+      return;
+    }
 
     let cancelled = false;
     const poll = async () => {
       if (cancelled) {
         return;
       }
-      await Promise.all([loadWorkflowRunStatuses(), refreshLibrary("feed")]);
+      await Promise.all([
+        loadWorkspaceSynthStatus(),
+        loadWorkflowRunStatuses(),
+        refreshLibrary("feed"),
+        loadWorkspaceTodos(),
+        loadWorkspaceEvents()
+      ]);
     };
 
     void poll();
@@ -3363,7 +3494,31 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [feedSource, mobileTab, chatGatewayToken, gatewayBaseUrl, workflowBots]);
+  }, [
+    feedSource,
+    mobileTab,
+    chatGatewayToken,
+    gatewayBaseUrl,
+    workflowBots,
+    workspaceSynthStatus.status
+  ]);
+
+  useEffect(() => {
+    if (feedSource !== "local" || mobileTab !== "feed") {
+      return;
+    }
+    if (
+      workspaceSynthStatus.status !== "done" &&
+      workspaceSynthStatus.status !== "error"
+    ) {
+      return;
+    }
+    void Promise.all([
+      refreshLibrary("feed"),
+      loadWorkspaceTodos(),
+      loadWorkspaceEvents()
+    ]);
+  }, [feedSource, mobileTab, workspaceSynthStatus.status, workspaceSynthStatus.lastRunAt]);
 
   function applyGatewayConnection(gatewayUrl: string, token: string) {
     const normalizedUrl = gatewayUrl.trim().replace(/\/+$/, "");
@@ -4770,6 +4925,71 @@ function App() {
               ) : null}
 
               {feedSource === "local" ? (
+                <div className="workspace-synth-card">
+                  <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
+                    <div className="stack-sm" style={{ gap: "0.3rem" }}>
+                      <strong>Workspace Synthesizer</strong>
+                      <span className="text-sm muted">
+                        One manifest-driven pass extracts feed posts, todos, events, and clip plans from journals and transcripts.
+                      </span>
+                      <span className="text-sm muted">
+                        Status: {workspaceSynthStatus.status}
+                        {workspaceSynthStatus.lastRunAt
+                          ? ` • ${formatTimestamp(workspaceSynthStatus.lastRunAt)}`
+                          : ""}
+                      </span>
+                      {workspaceSynthStatus.lastSummary ? (
+                        <span className="text-sm muted">{workspaceSynthStatus.lastSummary}</span>
+                      ) : null}
+                      {workspaceSynthStatus.lastError ? (
+                        <span className="text-sm muted">{workspaceSynthStatus.lastError}</span>
+                      ) : null}
+                    </div>
+                    <button
+                      type="button"
+                      className="primary text-sm"
+                      style={{ padding: "0.45rem 0.8rem", borderRadius: "999px" }}
+                      onClick={() => void runWorkspaceSynthesizerManual()}
+                      disabled={
+                        workspaceSynthBusy ||
+                        workspaceSynthStatus.status === "pending" ||
+                        workspaceSynthStatus.status === "processing"
+                      }
+                    >
+                      {workspaceSynthBusy ||
+                      workspaceSynthStatus.status === "pending" ||
+                      workspaceSynthStatus.status === "processing"
+                        ? "Running..."
+                        : "Synthesize"}
+                    </button>
+                  </div>
+                  <div className="segmented-control mt-2">
+                    <button
+                      type="button"
+                      className={workspaceLocalTab === "feed" ? "active" : ""}
+                      onClick={() => setWorkspaceLocalTab("feed")}
+                    >
+                      Feed
+                    </button>
+                    <button
+                      type="button"
+                      className={workspaceLocalTab === "todos" ? "active" : ""}
+                      onClick={() => setWorkspaceLocalTab("todos")}
+                    >
+                      Todos
+                    </button>
+                    <button
+                      type="button"
+                      className={workspaceLocalTab === "events" ? "active" : ""}
+                      onClick={() => setWorkspaceLocalTab("events")}
+                    >
+                      Events
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
+              {feedSource === "local" && workspaceLocalTab === "feed" ? (
                 <div className="stack">
                   {workflowBots.map((bot) => {
                     const run = workflowRunStatusByKey[bot.key];
@@ -4817,7 +5037,7 @@ function App() {
                 </div>
               ) : null}
 
-              {feedSource === "local" && activeWorkflowBotKey
+              {feedSource === "local" && workspaceLocalTab === "feed" && activeWorkflowBotKey
                 ? (() => {
                   const bot = workflowBotByKey(activeWorkflowBotKey);
                   const saved = workflowSettingsByKey[activeWorkflowBotKey];
@@ -4911,9 +5131,16 @@ function App() {
 
               {feedSource === "bluesky" ? (
                 blueskyFeedLoading ? (
-                  <p className="text-center muted" style={{ padding: "2rem" }}>Loading Bluesky timeline...</p>
+                  <p className="text-center muted" style={{ padding: "2rem" }}>Loading personalized feed...</p>
                 ) : blueskyFeedItems.length === 0 ? (
-                  <p className="text-center muted" style={{ padding: "2rem" }}>No personalized items found, or not logged in. Check Settings.</p>
+                  <div className="stack-sm" style={{ padding: "2rem" }}>
+                    {blueskyFeedStatus ? (
+                      <p className="text-center muted">{blueskyFeedStatus}</p>
+                    ) : null}
+                    <p className="text-center muted">
+                      No personalized items found yet. Add workspace posts, cached sources, or connect Bluesky.
+                    </p>
+                  </div>
                 ) : (
                   <div className="stack">
                     {blueskyFeedStatus ? (
@@ -5071,6 +5298,72 @@ function App() {
                         </div>
                       );
                     })}
+                  </div>
+                )
+              ) : workspaceLocalTab === "todos" ? (
+                workspaceTodos.length === 0 ? (
+                  <p className="text-center muted">No active todos extracted from your workspace yet.</p>
+                ) : (
+                  <div className="stack">
+                    {workspaceTodos.map((item) => (
+                      <div key={item.id} className="planner-item-card">
+                        <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
+                          <div className="stack-sm" style={{ gap: "0.25rem" }}>
+                            <strong>{item.title}</strong>
+                            <span className="text-sm muted">
+                              {item.priority.toUpperCase()} priority • {item.status}
+                              {item.dueAt ? ` • due ${formatTimestamp(item.dueAt)}` : ""}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            className={item.status === "done" ? "ghost text-sm" : "primary text-sm"}
+                            style={{ padding: "0.35rem 0.75rem", borderRadius: "999px" }}
+                            onClick={() => void toggleWorkspaceTodo(item)}
+                          >
+                            {item.status === "done" ? "Reopen" : "Done"}
+                          </button>
+                        </div>
+                        {item.details ? <div className="planner-item-body">{item.details}</div> : null}
+                        {(item.sourcePath || item.sourceExcerpt) ? (
+                          <div className="planner-item-meta text-sm muted">
+                            {item.sourcePath ? <code>{item.sourcePath}</code> : null}
+                            {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                )
+              ) : workspaceLocalTab === "events" ? (
+                workspaceEvents.length === 0 ? (
+                  <p className="text-center muted">No upcoming events extracted from your workspace yet.</p>
+                ) : (
+                  <div className="stack">
+                    {workspaceEvents.map((item) => (
+                      <div key={item.id} className="planner-item-card">
+                        <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
+                          <div className="stack-sm" style={{ gap: "0.25rem" }}>
+                            <strong>{item.title}</strong>
+                            <span className="text-sm muted">
+                              {item.status}
+                              {" • "}
+                              {item.allDay
+                                ? formatTimestamp(item.startAt)
+                                : `${formatTimestamp(item.startAt)}${item.endAt ? ` → ${formatTimestamp(item.endAt)}` : ""}`}
+                            </span>
+                          </div>
+                        </div>
+                        {item.details ? <div className="planner-item-body">{item.details}</div> : null}
+                        {(item.location || item.sourcePath || item.sourceExcerpt) ? (
+                          <div className="planner-item-meta text-sm muted">
+                            {item.location ? <span>{item.location}</span> : null}
+                            {item.sourcePath ? <code>{item.sourcePath}</code> : null}
+                            {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
                   </div>
                 )
               ) : feedItems.length === 0 ? (

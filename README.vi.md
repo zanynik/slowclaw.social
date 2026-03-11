@@ -417,7 +417,7 @@ Tự phát triển hoàn toàn, không phụ thuộc bên ngoài — không Pine
 | **Vector DB** | Embeddings lưu dưới dạng BLOB trong SQLite, tìm kiếm cosine similarity |
 | **Keyword Search** | Bảng ảo FTS5 với BM25 scoring |
 | **Hybrid Merge** | Hàm merge có trọng số tùy chỉnh (`vector.rs`) |
-| **Embeddings** | Trait `EmbeddingProvider` — OpenAI, URL tùy chỉnh, hoặc noop |
+| **Embeddings** | Trait `EmbeddingProvider` — embeddings cục bộ tích hợp sẵn, OpenAI, URL tùy chỉnh, hoặc noop |
 | **Chunking** | Bộ chia đoạn markdown theo dòng, giữ nguyên heading |
 | **Caching** | Bảng SQLite `embedding_cache` với LRU eviction |
 | **Safe Reindex** | Rebuild FTS5 + re-embed các vector bị thiếu theo cách nguyên tử |
@@ -428,7 +428,7 @@ Agent tự động ghi nhớ, lưu trữ và quản lý memory qua các tool.
 [memory]
 backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
 auto_save = true
-embedding_provider = "none"    # "none", "openai", "custom:https://..."
+embedding_provider = "builtin" # "builtin", "none", "openai", "openrouter", "custom:https://..."
 vector_weight = 0.7
 keyword_weight = 0.3
 
@@ -623,7 +623,7 @@ default_temperature = 0.7
 [memory]
 backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
 auto_save = true
-embedding_provider = "none"    # "none", "openai", "custom:https://..."
+embedding_provider = "builtin" # "builtin", "none", "openai", "openrouter", "custom:https://..."
 vector_weight = 0.7
 keyword_weight = 0.3
 

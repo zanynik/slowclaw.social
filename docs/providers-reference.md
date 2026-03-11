@@ -267,9 +267,9 @@ embedding_model = "hint:semantic"
 
 [[embedding_routes]]
 hint = "semantic"
-provider = "openai"
-model = "text-embedding-3-small"
-dimensions = 1536
+provider = "builtin"
+model = "builtin-384-v1"
+dimensions = 384
 
 [[embedding_routes]]
 hint = "archive"
@@ -280,8 +280,10 @@ dimensions = 1024
 
 Supported embedding providers:
 
+- `builtin` (app-managed local all-MiniLM embeddings, auto-downloaded and cached for desktop/mobile)
 - `none`
 - `openai`
+- `openrouter`
 - `custom:<url>` (OpenAI-compatible embeddings endpoint)
 
 Optional per-route key override:

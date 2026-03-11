@@ -236,15 +236,16 @@ Lưu ý:
 |---|---|---|
 | `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `none` |
 | `auto_save` | `true` | Chỉ lưu đầu vào người dùng (đầu ra assistant bị loại) |
-| `embedding_provider` | `none` | `none`, `openai` hoặc endpoint tùy chỉnh |
-| `embedding_model` | `text-embedding-3-small` | ID model embedding, hoặc tuyến `hint:<name>` |
-| `embedding_dimensions` | `1536` | Kích thước vector mong đợi cho model embedding đã chọn |
+| `embedding_provider` | `builtin` | `builtin`, `none`, `openai`, `openrouter` hoặc endpoint tùy chỉnh |
+| `embedding_model` | `builtin-384-v1` | ID model embedding, hoặc tuyến `hint:<name>` |
+| `embedding_dimensions` | `384` | Kích thước vector mong đợi cho model embedding đã chọn |
 | `vector_weight` | `0.7` | Trọng số vector trong xếp hạng kết hợp |
 | `keyword_weight` | `0.3` | Trọng số từ khóa trong xếp hạng kết hợp |
 
 Lưu ý:
 
 - Chèn ngữ cảnh memory bỏ qua khóa auto-save `assistant_resp*` kiểu cũ để tránh tóm tắt do model tạo bị coi là sự thật.
+- `embedding_provider = "builtin"` là mặc định cục bộ do ứng dụng tự quản lý. Ứng dụng sẽ tự tải asset all-MiniLM ở lần dùng đầu tiên, lưu vào cache cục bộ, rồi chạy mà không cần daemon riêng hay API key.
 
 ## `[[model_routes]]` và `[[embedding_routes]]`
 
@@ -264,7 +265,7 @@ Route hint giúp tên tích hợp ổn định khi model ID thay đổi.
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
 | `hint` | _bắt buộc_ | Tên route hint (ví dụ `"semantic"`, `"archive"`, `"faq"`) |
-| `provider` | _bắt buộc_ | Embedding provider (`"none"`, `"openai"` hoặc `"custom:<url>"`) |
+| `provider` | _bắt buộc_ | Embedding provider (`"builtin"`, `"none"`, `"openai"`, `"openrouter"` hoặc `"custom:<url>"`) |
 | `model` | _bắt buộc_ | Model embedding sử dụng với provider đó |
 | `dimensions` | chưa đặt | Ghi đè kích thước embedding cho route này (tùy chọn) |
 | `api_key` | chưa đặt | API key tùy chỉnh cho provider của route này (tùy chọn) |
@@ -280,9 +281,9 @@ model = "provider/model-id"
 
 [[embedding_routes]]
 hint = "semantic"
-provider = "openai"
-model = "text-embedding-3-small"
-dimensions = 1536
+provider = "builtin"
+model = "builtin-384-v1"
+dimensions = 384
 ```
 
 Chiến lược nâng cấp:

@@ -209,9 +209,9 @@ embedding_model = "hint:semantic"
 
 [[embedding_routes]]
 hint = "semantic"
-provider = "openai"
-model = "text-embedding-3-small"
-dimensions = 1536
+provider = "builtin"
+model = "builtin-384-v1"
+dimensions = 384
 
 [[embedding_routes]]
 hint = "archive"
@@ -222,8 +222,10 @@ dimensions = 1024
 
 Các embedding provider được hỗ trợ:
 
+- `builtin` (embedding all-MiniLM cục bộ do ứng dụng tự tải và cache trên desktop/mobile)
 - `none`
 - `openai`
+- `openrouter`
 - `custom:<url>` (endpoint embeddings tương thích OpenAI)
 
 Tùy chọn ghi đè key theo từng route:

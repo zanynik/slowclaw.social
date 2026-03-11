@@ -57,6 +57,8 @@ base64 = "0.22"
 
 # URL encoding for web search
 urlencoding = "2.1"
+tokenizers = "0.20"
+tract-onnx = "0.22"
 
 
 # Error handling

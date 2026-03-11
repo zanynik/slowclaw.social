@@ -1430,6 +1430,47 @@ textarea {
   border: 1px solid var(--line);
 }
 
+.workspace-synth-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  padding: 1rem;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(160deg, color-mix(in srgb, var(--surface) 92%, transparent), color-mix(in srgb, var(--surface-2) 90%, transparent));
+}
+
+.planner-item-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  animation: fadeIn 0.18s var(--ease-out) both;
+}
+
+.planner-item-body {
+  white-space: pre-wrap;
+  line-height: 1.55;
+  color: var(--ink);
+}
+
+.planner-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+}
+
+.planner-item-meta code {
+  padding: 0.18rem 0.4rem;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+
 /* ─────────────────────────────────────────────
    SCROLLBAR
    ───────────────────────────────────────────── */
