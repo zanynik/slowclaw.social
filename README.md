@@ -1,24 +1,28 @@
-# slowclaw.social (minimal workspace-only fork)
+# slowclaw.social
 
-A stripped-down fork of SlowClaw focused on one job:
+SlowClaw Social is a local-first personal capture and curation app.
 
-- run in a single workspace
-- execute/schedule workspace scripts
-- persist app data locally in SQLite
-- serve a simple bundled web UI
+It is built around one workspace where you can:
+
+- write journals and notes
+- record audio or video into the workspace
+- generate a workspace feed, todos, events, and clip plans from your own material
+- curate personalized Bluesky and web feeds from local interests and cached sources
+- keep the core runtime, storage, and AI workflows on your own machine
 
 The binary name is `slowclaw`.
 
 ## What This Fork Keeps
 
 - Workspace-only file access policy (hard-enforced in app config/policy)
+- Local-first desktop/mobile app flow built on the bundled web UI and Tauri shell
+- Journals, workspace feed generation, todos, events, transcript/clip planning, and personalized feed surfaces
 - CLI + gateway (`/pair`, `/pair/new-code`, `/webhook`, `/health`, `/metrics`)
 - Cron scheduling
 - `workspace-script <relative/path>` scheduled command support
 - PocketBase delivery for cron/heartbeat output
-- Gateway-managed local SQLite store for chat/drafts/history metadata
+- Gateway-managed local SQLite store for chat, drafts, history, todos, events, and feed metadata
 - `memory/` folder structure (unchanged)
-- Bundled web UI (local-first gateway API frontend)
 
 ## What This Fork Removes
 
@@ -29,7 +33,7 @@ The binary name is `slowclaw`.
 
 ## Before You Install (Security)
 
-Scheduled scripts are still real process execution. App-level workspace checks are useful, but not a kernel sandbox.
+SlowClaw Social is local-first, but scheduled scripts and agent actions are still real process execution. App-level workspace checks are useful, but not a kernel sandbox.
 
 Read `SECURITY.md` and follow the **Workspace-Only Fork Hardening (Before Install)** section.
 
