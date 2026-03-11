@@ -1428,6 +1428,71 @@ pub fn list_recent_content_items(
     Ok(out)
 }
 
+pub fn list_content_items_missing_embeddings(
+    workspace_dir: &Path,
+    limit: usize,
+) -> Result<Vec<ContentItemRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let lim = i64::try_from(limit.max(1)).unwrap_or(100);
+    let mut stmt = conn.prepare(
+        "SELECT id, source_key, source_title, source_kind, domain, canonical_url, external_id,
+                title, author, summary, content_text, content_hash, embedding, published_at,
+                discovered_at, created_at, updated_at
+         FROM content_items
+         WHERE length(embedding) = 0
+           AND length(trim(content_text)) > 0
+         ORDER BY
+            COALESCE(NULLIF(published_at, ''), NULLIF(discovered_at, ''), updated_at) DESC,
+            id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![lim], |row| {
+        Ok(ContentItemRecord {
+            id: row.get(0)?,
+            source_key: row.get(1)?,
+            source_title: row.get(2)?,
+            source_kind: row.get(3)?,
+            domain: row.get(4)?,
+            canonical_url: row.get(5)?,
+            external_id: row.get(6)?,
+            title: row.get(7)?,
+            author: row.get(8)?,
+            summary: row.get(9)?,
+            content_text: row.get(10)?,
+            content_hash: row.get(11)?,
+            embedding: row.get(12)?,
+            published_at: row.get(13)?,
+            discovered_at: row.get(14)?,
+            created_at: row.get(15)?,
+            updated_at: row.get(16)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn update_content_item_embedding(
+    workspace_dir: &Path,
+    item_id: &str,
+    embedding: &[u8],
+) -> Result<()> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE content_items
+         SET embedding = ?2,
+             updated_at = ?3
+         WHERE id = ?1",
+        params![item_id.trim(), embedding, now],
+    )
+    .with_context(|| format!("Failed to update content item embedding for {}", item_id))?;
+    Ok(())
+}
+
 fn open_conn(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open local store {}", path.display()))?;
@@ -2194,6 +2259,63 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].canonical_url, "https://example.com/posts/1");
         assert_eq!(items[0].source_title, "Example Feed");
+    }
+
+    #[test]
+    fn content_item_embedding_backfill_queries_only_missing_rows() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        upsert_content_item(
+            tmp.path(),
+            &ContentItemUpsert {
+                id: "item-missing".into(),
+                source_key: "https://example.com/feed.xml".into(),
+                source_title: "Example Feed".into(),
+                source_kind: "rss".into(),
+                domain: "example.com".into(),
+                canonical_url: "https://example.com/posts/missing".into(),
+                external_id: "guid-missing".into(),
+                title: "Missing vector".into(),
+                author: "Example Author".into(),
+                summary: "Summary".into(),
+                content_text: "Needs embedding".into(),
+                content_hash: "hash-missing".into(),
+                embedding: Vec::new(),
+                published_at: "2026-03-10T10:00:00Z".into(),
+                discovered_at: "2026-03-10T10:05:00Z".into(),
+            },
+        )
+        .unwrap();
+        upsert_content_item(
+            tmp.path(),
+            &ContentItemUpsert {
+                id: "item-complete".into(),
+                source_key: "https://example.com/feed.xml".into(),
+                source_title: "Example Feed".into(),
+                source_kind: "rss".into(),
+                domain: "example.com".into(),
+                canonical_url: "https://example.com/posts/complete".into(),
+                external_id: "guid-complete".into(),
+                title: "Has vector".into(),
+                author: "Example Author".into(),
+                summary: "Summary".into(),
+                content_text: "Already embedded".into(),
+                content_hash: "hash-complete".into(),
+                embedding: vec![1, 2, 3, 4],
+                published_at: "2026-03-09T10:00:00Z".into(),
+                discovered_at: "2026-03-09T10:05:00Z".into(),
+            },
+        )
+        .unwrap();
+
+        let missing = list_content_items_missing_embeddings(tmp.path(), 10).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].id, "item-missing");
+
+        update_content_item_embedding(tmp.path(), "item-missing", &[9, 8, 7, 6]).unwrap();
+        let missing_after = list_content_items_missing_embeddings(tmp.path(), 10).unwrap();
+        assert!(missing_after.is_empty());
     }
 
 }

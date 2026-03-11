@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 pub const WORKSPACE_SYNTHESIZER_THREAD_ID: &str = "workspace:synthesizer";
 pub const WORKSPACE_SYNTHESIZER_OUTPUT_ROOT: &str = "posts/workspace_synthesizer";
 pub const WORKSPACE_SYNTHESIZER_PIPELINE_DIR: &str = "posts/workspace_synthesizer/pipeline";
+pub const WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY: &str = "workspace_insight_extractor";
+pub const WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY: &str = "workspace_todo_extractor";
+pub const WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY: &str = "workspace_event_extractor";
+pub const WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY: &str = "workspace_clip_extractor";
 pub const WORKSPACE_SYNTHESIZER_INSIGHT_POSTS_PATH: &str =
     "posts/workspace_synthesizer/pipeline/insight_posts.json";
 pub const WORKSPACE_SYNTHESIZER_TODOS_PATH: &str =
@@ -27,6 +31,46 @@ const MAX_INSIGHT_POSTS: usize = 18;
 const MAX_TODOS: usize = 30;
 const MAX_EVENTS: usize = 20;
 const MAX_CLIP_PLANS: usize = 12;
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceSynthExtractorSpec {
+    pub workflow_key: &'static str,
+    pub name: &'static str,
+    pub goal: &'static str,
+    pub handoff_path: &'static str,
+    pub max_items: usize,
+}
+
+const WORKSPACE_SYNTH_EXTRACTOR_SPECS: [WorkspaceSynthExtractorSpec; 4] = [
+    WorkspaceSynthExtractorSpec {
+        workflow_key: WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Insight Extractor",
+        goal: "Extract concise workspace feed posts from recent journals and transcripts. Write only the insight_posts handoff JSON for Rust to materialize into feed posts.",
+        handoff_path: WORKSPACE_SYNTHESIZER_INSIGHT_POSTS_PATH,
+        max_items: MAX_INSIGHT_POSTS,
+    },
+    WorkspaceSynthExtractorSpec {
+        workflow_key: WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Todo Extractor",
+        goal: "Extract concrete action items and commitments from recent journals and transcripts. Write only the todos handoff JSON for Rust to store in the planner.",
+        handoff_path: WORKSPACE_SYNTHESIZER_TODOS_PATH,
+        max_items: MAX_TODOS,
+    },
+    WorkspaceSynthExtractorSpec {
+        workflow_key: WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Event Extractor",
+        goal: "Extract scheduled events with clear timing from recent journals and transcripts. Write only the events handoff JSON for Rust to store in the planner.",
+        handoff_path: WORKSPACE_SYNTHESIZER_EVENTS_PATH,
+        max_items: MAX_EVENTS,
+    },
+    WorkspaceSynthExtractorSpec {
+        workflow_key: WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Clip Extractor",
+        goal: "Extract transcript-backed clip plans from recent journals and transcript text. Write only the clip_plans handoff JSON for Rust to keep as pipeline artifacts.",
+        handoff_path: WORKSPACE_SYNTHESIZER_CLIP_PLANS_PATH,
+        max_items: MAX_CLIP_PLANS,
+    },
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
@@ -285,68 +329,129 @@ fn clip_plans_schema_json() -> Result<String> {
     serde_json::to_string_pretty(&schema).context("failed to serialize clip plans schema")
 }
 
+pub fn extractor_specs() -> &'static [WorkspaceSynthExtractorSpec] {
+    &WORKSPACE_SYNTH_EXTRACTOR_SPECS
+}
+
+pub fn is_extractor_workflow_key(workflow_key: &str) -> bool {
+    extractor_spec_by_key(workflow_key).is_some()
+}
+
+pub fn extractor_handoff_path(workflow_key: &str) -> Option<&'static str> {
+    extractor_spec_by_key(workflow_key).map(|spec| spec.handoff_path)
+}
+
+pub fn extractor_spec_by_key(workflow_key: &str) -> Option<WorkspaceSynthExtractorSpec> {
+    extractor_specs()
+        .iter()
+        .copied()
+        .find(|spec| spec.workflow_key == workflow_key.trim())
+}
+
 pub fn render_skill_markdown() -> Result<String> {
-    let insight_posts_schema = insight_posts_schema_json()?;
-    let todos_schema = todos_schema_json()?;
-    let events_schema = events_schema_json()?;
-    let clip_plans_schema = clip_plans_schema_json()?;
     Ok(format!(
         "# Workspace Synthesizer\n\n\
-Create small typed JSON handoff files for the workspace synthesis pipeline.\n\n\
-## Output Contract\n\n\
+This is the index skill for workspace synthesis.\n\n\
+The runtime uses this skill as the shared guidance layer, then runs specialized extractor skills for each artifact family:\n\
+- `{insight_key}` -> `{insight_posts_path}`\n\
+- `{todo_key}` -> `{todos_path}`\n\
+- `{event_key}` -> `{events_path}`\n\
+- `{clip_key}` -> `{clip_plans_path}`\n\n\
+## Role\n\n\
 - Read from `journals/text/**` and available transcript text under `journals/text/transcriptions/**`.\n\
-- Write zero or more of these files under the pipeline directory:\n\
-  - `{insight_posts_path}`\n\
-  - `{todos_path}`\n\
-  - `{events_path}`\n\
-  - `{clip_plans_path}`\n\
-- Overwrite each file completely with valid JSON when you choose to emit that artifact type.\n\
-- If a category has no strong candidates, either omit that file entirely or write an empty `items` array.\n\
-- Do not create feed posts, todos, events, or clip plan output files directly.\n\
-- Do not emit markdown fences or prose outside the JSON files.\n\n\
-## Extraction Targets\n\n\
-- `insightPosts`: short feed-ready insights only.\n\
-- `todos`: concrete commitments or next actions only.\n\
-- `events`: only when a date/time or clearly scheduled plan is present.\n\
-- `clipPlans`: transcript-backed segments only when the source contains a quotable moment.\n\n\
-## Guardrails\n\n\
+- Act as the global policy layer for all workspace extraction.\n\
+- The Rust runtime decides which extractor skills to run and validates each handoff file independently.\n\
+- Extractor skills, not this index skill alone, own the small typed JSON outputs.\n\n\
+## Shared Guardrails\n\n\
 - Prefer fewer, higher-signal artifacts over exhaustive extraction.\n\
 - Every emitted item must include `sourcePath` and `sourceExcerpt`.\n\
 - Use workspace-relative journal paths only.\n\
-- Prefer independent small files over one giant response.\n\
+- Do not create final feed posts, todos, events, or clip plan output files directly.\n\
+- Desktop and mobile must both be supported. Clip rendering may be unavailable, but clip planning is still allowed.\n\n\
+## Artifact Policy\n\n\
+- `insightPosts`: concise feed-ready text only.\n\
+- `todos`: only explicit actions or commitments.\n\
+- `events`: only when timing or scheduling is actually supported by the source.\n\
+- `clipPlans`: only when transcript text contains a quotable segment with clear start/end timing context.\n\
 \n\
-## Schemas\n\n\
-### `{insight_posts_path}`\n\
-```json\n\
-{insight_posts_schema}\n\
-```\n\
-\n\
-### `{todos_path}`\n\
-```json\n\
-{todos_schema}\n\
-```\n\
-\n\
-### `{events_path}`\n\
-```json\n\
-{events_schema}\n\
-```\n\
-\n\
-### `{clip_plans_path}`\n\
-```json\n\
-{clip_plans_schema}\n\
-```\n\
-\n\
-## Notes\n\n\
-- The Rust runtime will validate and apply each file independently.\n\
-- Partial success is allowed: one file can fail validation without discarding the others.\n",
+## Runtime Notes\n\n\
+- Each extractor writes one small typed JSON handoff file.\n\
+- Rust materializes final outputs and keeps planner data out of the feed.\n\
+- Partial success is allowed: one extractor can fail without discarding the others.\n",
+        insight_key = WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY,
+        todo_key = WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY,
+        event_key = WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY,
+        clip_key = WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY,
         insight_posts_path = WORKSPACE_SYNTHESIZER_INSIGHT_POSTS_PATH,
         todos_path = WORKSPACE_SYNTHESIZER_TODOS_PATH,
         events_path = WORKSPACE_SYNTHESIZER_EVENTS_PATH,
         clip_plans_path = WORKSPACE_SYNTHESIZER_CLIP_PLANS_PATH,
-        insight_posts_schema = insight_posts_schema.trim(),
-        todos_schema = todos_schema.trim(),
-        events_schema = events_schema.trim(),
-        clip_plans_schema = clip_plans_schema.trim(),
+    ))
+}
+
+pub fn render_extractor_skill_markdown(workflow_key: &str) -> Result<String> {
+    let Some(spec) = extractor_spec_by_key(workflow_key) else {
+        anyhow::bail!("unknown workspace synthesizer extractor `{workflow_key}`");
+    };
+    let (artifact_name, schema_json, artifact_rules) = match spec.workflow_key {
+        WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY => (
+            "insightPosts",
+            insight_posts_schema_json()?,
+            "- Emit concise, feed-ready text only.\n\
+- No titles, no markdown bullets, no surrounding quotes.\n\
+- Only include items strong enough to stand alone in the workspace feed.\n",
+        ),
+        WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY => (
+            "todos",
+            todos_schema_json()?,
+            "- Emit only explicit next actions, tasks, or commitments.\n\
+- Avoid vague aspirations unless the source clearly implies an actionable todo.\n\
+- Prefer stable titles and put nuance in `details`.\n",
+        ),
+        WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY => (
+            "events",
+            events_schema_json()?,
+            "- Emit only items with a clear date, time, or scheduled plan.\n\
+- Use `allDay` only when timing is date-level rather than time-specific.\n\
+- Do not invent timing or location details.\n",
+        ),
+        WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => (
+            "clipPlans",
+            clip_plans_schema_json()?,
+            "- Emit only transcript-backed segments with enough context to plan an edit later.\n\
+- `transcriptQuote` must be a real quote from the source excerpt.\n\
+- Use precise `startAt` and `endAt` values from the transcript context when available.\n",
+        ),
+        _ => unreachable!(),
+    };
+    Ok(format!(
+        "# {name}\n\n\
+Create one small typed JSON handoff file for the workspace synthesis pipeline.\n\n\
+## Output Contract\n\n\
+- Read from `journals/text/**` and available transcript text under `journals/text/transcriptions/**`.\n\
+- Write exactly one file: `{handoff_path}`.\n\
+- Overwrite that file completely with valid JSON.\n\
+- If there are no strong candidates, write an empty `items` array.\n\
+- Do not create final feed posts, todos, events, clip plan output files, or other handoff files.\n\
+- Do not emit markdown fences or prose outside the JSON file.\n\n\
+## Artifact Scope\n\n\
+- This extractor owns only `{artifact_name}`.\n\
+- Maximum items: {max_items}\n\
+- Every item must include `sourcePath` and `sourceExcerpt`.\n\
+- Use workspace-relative journal paths only.\n\n\
+## Artifact Rules\n\n\
+{artifact_rules}\n\
+## Schema\n\n\
+### `{handoff_path}`\n\
+```json\n\
+{schema_json}\n\
+```\n",
+        name = spec.name,
+        handoff_path = spec.handoff_path,
+        artifact_name = artifact_name,
+        max_items = spec.max_items,
+        artifact_rules = artifact_rules,
+        schema_json = schema_json.trim(),
     ))
 }
 
@@ -455,6 +560,27 @@ pub fn clip_plans_path(workspace_dir: &Path) -> PathBuf {
 
 pub fn status_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join(WORKSPACE_SYNTHESIZER_STATUS_PATH)
+}
+
+pub fn reset_handoff_files(workspace_dir: &Path) -> Result<()> {
+    let handoff_paths = [
+        manifest_path(workspace_dir),
+        insight_posts_path(workspace_dir),
+        todos_path(workspace_dir),
+        events_path(workspace_dir),
+        clip_plans_path(workspace_dir),
+    ];
+    for path in handoff_paths {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to clear {}", path.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn load_status(workspace_dir: &Path) -> WorkspaceSynthesizerStatus {

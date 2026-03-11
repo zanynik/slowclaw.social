@@ -1919,6 +1919,29 @@ impl Default for MemoryConfig {
     }
 }
 
+impl MemoryConfig {
+    fn normalize_embedding_defaults(&mut self) {
+        let provider = self.embedding_provider.trim();
+        if provider.is_empty() {
+            self.embedding_provider = default_embedding_provider();
+        } else {
+            self.embedding_provider = provider.to_string();
+        }
+
+        let provider_is_none = self.embedding_provider.eq_ignore_ascii_case("none");
+        let model = self.embedding_model.trim();
+        if model.is_empty() && !provider_is_none {
+            self.embedding_model = default_embedding_model();
+        } else {
+            self.embedding_model = model.to_string();
+        }
+
+        if self.embedding_dimensions == 0 && !provider_is_none {
+            self.embedding_dimensions = default_embedding_dims();
+        }
+    }
+}
+
 // ── Observability ─────────────────────────────────────────────────
 
 /// Observability backend configuration (`[observability]` section).
@@ -4146,6 +4169,7 @@ impl Config {
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
+            config.memory.normalize_embedding_defaults();
             let store = crate::security::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
             decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
             decrypt_optional_secret(
@@ -4198,6 +4222,7 @@ impl Config {
             let mut config = Config::default();
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
+            config.memory.normalize_embedding_defaults();
             config.save().await?;
 
             // Restrict permissions on newly created config file (may contain API keys)
@@ -4816,6 +4841,7 @@ impl Config {
     pub async fn save(&self) -> Result<()> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
+        config_to_save.memory.normalize_embedding_defaults();
         let zeroclaw_dir = self
             .config_path
             .parent()
@@ -5179,6 +5205,29 @@ default_temperature = 0.7
         assert_eq!(m.purge_after_days, 30);
         assert_eq!(m.conversation_retention_days, 30);
         assert!(m.sqlite_open_timeout_secs.is_none());
+    }
+
+    #[test]
+    async fn memory_config_normalizes_blank_embedding_defaults() {
+        let mut m = MemoryConfig::default();
+        m.embedding_provider = "   ".to_string();
+        m.embedding_model = "   ".to_string();
+        m.embedding_dimensions = 0;
+        m.normalize_embedding_defaults();
+
+        assert_eq!(m.embedding_provider, "builtin");
+        assert_eq!(m.embedding_model, "builtin-384-v1");
+        assert_eq!(m.embedding_dimensions, 384);
+
+        let mut disabled = MemoryConfig::default();
+        disabled.embedding_provider = "none".to_string();
+        disabled.embedding_model = "   ".to_string();
+        disabled.embedding_dimensions = 0;
+        disabled.normalize_embedding_defaults();
+
+        assert_eq!(disabled.embedding_provider, "none");
+        assert_eq!(disabled.embedding_model, "");
+        assert_eq!(disabled.embedding_dimensions, 0);
     }
 
     #[test]

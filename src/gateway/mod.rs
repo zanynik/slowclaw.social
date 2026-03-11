@@ -1187,6 +1187,8 @@ struct FeedContentAgentRecord {
     last_triggered_source_updated_at: Option<i64>,
     #[serde(default)]
     built_in_skill_fingerprint: Option<String>,
+    #[serde(default = "default_workflow_visible_in_ui")]
+    visible_in_ui: bool,
     #[serde(default = "workflow_default_settings")]
     #[serde(skip_serializing_if = "is_default_workflow_settings")]
     settings: FeedWorkflowSettings,
@@ -1210,8 +1212,8 @@ fn default_content_agent_enabled() -> bool {
     true
 }
 
-fn default_built_in_content_agent_enabled() -> bool {
-    false
+fn default_workflow_visible_in_ui() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -1222,6 +1224,7 @@ struct FeedContentAgentDefinition {
     output_prefix: String,
     skill_path: String,
     goal: String,
+    visible_in_ui: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1235,6 +1238,9 @@ struct BuiltInContentAgentSpec {
     key: &'static str,
     name: &'static str,
     goal: &'static str,
+    output_prefix: &'static str,
+    visible_in_ui: bool,
+    enabled_by_default: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1270,22 +1276,66 @@ fn built_in_content_agent_specs() -> &'static [BuiltInContentAgentSpec] {
         BuiltInContentAgentSpec {
             key: WORKSPACE_SYNTHESIZER_WORKFLOW_KEY,
             name: "Workspace Synthesizer",
-            goal: "Create one strict workspace synthesis manifest from recent journals and transcripts. The runtime will turn that manifest into feed posts, todos, events, and clip plans.",
+            goal: "Use the workspace synthesizer index skill as shared guidance for specialized extractor skills. The runtime will run those extractors, validate their typed JSON handoffs, and turn them into feed posts, todos, events, and clip plans.",
+            output_prefix: "posts/workspace_synthesizer/",
+            visible_in_ui: true,
+            enabled_by_default: false,
+        },
+        BuiltInContentAgentSpec {
+            key: workspace_synthesizer::WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY,
+            name: "Workspace Insight Extractor",
+            goal: "Extract concise workspace feed posts from recent journals and transcripts. Write only the insight_posts handoff JSON for Rust to materialize into feed posts.",
+            output_prefix: "posts/workspace_synthesizer/",
+            visible_in_ui: false,
+            enabled_by_default: true,
+        },
+        BuiltInContentAgentSpec {
+            key: workspace_synthesizer::WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY,
+            name: "Workspace Todo Extractor",
+            goal: "Extract concrete action items and commitments from recent journals and transcripts. Write only the todos handoff JSON for Rust to store in the planner.",
+            output_prefix: "posts/workspace_synthesizer/",
+            visible_in_ui: false,
+            enabled_by_default: true,
+        },
+        BuiltInContentAgentSpec {
+            key: workspace_synthesizer::WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY,
+            name: "Workspace Event Extractor",
+            goal: "Extract scheduled events with clear timing from recent journals and transcripts. Write only the events handoff JSON for Rust to store in the planner.",
+            output_prefix: "posts/workspace_synthesizer/",
+            visible_in_ui: false,
+            enabled_by_default: true,
+        },
+        BuiltInContentAgentSpec {
+            key: workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY,
+            name: "Workspace Clip Extractor",
+            goal: "Extract transcript-backed clip plans from recent journals and transcript text. Write only the clip_plans handoff JSON for Rust to keep as pipeline artifacts.",
+            output_prefix: "posts/workspace_synthesizer/",
+            visible_in_ui: false,
+            enabled_by_default: true,
         },
         BuiltInContentAgentSpec {
             key: "bluesky_insight_posts",
             name: "Bluesky Insight Posts",
             goal: "Create interesting Bluesky post drafts from my recent journal notes. Extract standout insights and save each post as a separate file in posts/ so it appears in the workspace feed.",
+            output_prefix: "posts/bluesky_insight_posts/",
+            visible_in_ui: true,
+            enabled_by_default: false,
         },
         BuiltInContentAgentSpec {
             key: "weekly_highlights",
             name: "Weekly Highlights",
             goal: "Turn my recent journal notes into polished weekly highlight posts for the workspace feed. Save each highlight as a separate file in posts/.",
+            output_prefix: "posts/weekly_highlights/",
+            visible_in_ui: true,
+            enabled_by_default: false,
         },
         BuiltInContentAgentSpec {
             key: "audio_insight_clips",
             name: "Audio Insight Clips",
             goal: "Create simple vertical video clips from my journal audio recordings. If a transcript is missing, generate it first, extract exact insightful lines, build black-background text cards, and render a feed-ready mp4 into posts/.",
+            output_prefix: "posts/audio_insight_clips/",
+            visible_in_ui: true,
+            enabled_by_default: false,
         },
     ]
 }
@@ -1401,6 +1451,7 @@ fn feed_workflow_definition_from_record(record: &FeedContentAgentRecord) -> Feed
             .or(record.settings.goal.clone())
             .or(record.settings.prompt.clone())
             .unwrap_or_default(),
+        visible_in_ui: record.visible_in_ui,
     }
 }
 
@@ -1409,6 +1460,7 @@ fn workflow_definitions(store: &FeedContentAgentStore) -> Vec<FeedContentAgentDe
         .workflows
         .values()
         .map(feed_workflow_definition_from_record)
+        .filter(|workflow| workflow.visible_in_ui)
         .collect();
     defs.sort_by(|a, b| a.key.cmp(&b.key));
     defs
@@ -1486,6 +1538,12 @@ fn canonical_content_agent_skill_body(record: &FeedContentAgentRecord) -> Result
     let output_dir = record.output_prefix.trim_end_matches('/');
     let body = match record.workflow_key.as_str() {
         WORKSPACE_SYNTHESIZER_WORKFLOW_KEY => workspace_synthesizer::render_skill_markdown()?,
+        workspace_synthesizer::WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY
+        | workspace_synthesizer::WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY
+        | workspace_synthesizer::WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY
+        | workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => {
+            workspace_synthesizer::render_extractor_skill_markdown(&record.workflow_key)?
+        }
         "audio_insight_clips" => render_audio_insight_clip_skill_markdown(output_dir),
         _ => render_template_skill_markdown(&record.workflow_bot, &goal, output_dir),
     };
@@ -1505,14 +1563,15 @@ fn built_in_content_agent_record(spec: BuiltInContentAgentSpec) -> FeedContentAg
         workflow_key: key.clone(),
         workflow_bot: spec.name.to_string(),
         skill_path: format!("skills/{key}/SKILL.md"),
-        output_prefix: format!("posts/{key}/"),
-        enabled: default_built_in_content_agent_enabled(),
+        output_prefix: spec.output_prefix.to_string(),
+        enabled: spec.enabled_by_default,
         editable_files: vec![format!("skills/{key}/SKILL.md")],
         goal: Some(spec.goal.to_string()),
         last_triggered_at: None,
         last_run_at: None,
         last_triggered_source_updated_at: None,
         built_in_skill_fingerprint: None,
+        visible_in_ui: spec.visible_in_ui,
         settings: built_in_content_agent_settings(spec.goal),
     };
     record = normalize_workflow_record(&key, record);
@@ -1639,6 +1698,7 @@ fn load_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedCont
             last_run_at: None,
             last_triggered_source_updated_at: None,
             built_in_skill_fingerprint: None,
+            visible_in_ui: true,
             settings: normalize_workflow_settings(legacy_settings),
         };
         migrated
@@ -2046,6 +2106,242 @@ async fn run_local_agent_prompt_in_thread(
     .await
 }
 
+fn workspace_synth_default_artifact_states() -> workspace_synthesizer::WorkspaceSynthArtifactStates {
+    workspace_synthesizer::WorkspaceSynthArtifactStates {
+        insight_posts: workspace_synthesizer::WorkspaceSynthArtifactState {
+            status: "skipped".to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_INSIGHT_POSTS_PATH.to_string(),
+            item_count: 0,
+            error: String::new(),
+        },
+        todos: workspace_synthesizer::WorkspaceSynthArtifactState {
+            status: "skipped".to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_TODOS_PATH.to_string(),
+            item_count: 0,
+            error: String::new(),
+        },
+        events: workspace_synthesizer::WorkspaceSynthArtifactState {
+            status: "skipped".to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_EVENTS_PATH.to_string(),
+            item_count: 0,
+            error: String::new(),
+        },
+        clip_plans: workspace_synthesizer::WorkspaceSynthArtifactState {
+            status: "skipped".to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_CLIP_PLANS_PATH.to_string(),
+            item_count: 0,
+            error: String::new(),
+        },
+    }
+}
+
+fn workspace_synth_artifact_state_mut<'a>(
+    states: &'a mut workspace_synthesizer::WorkspaceSynthArtifactStates,
+    workflow_key: &str,
+) -> Option<&'a mut workspace_synthesizer::WorkspaceSynthArtifactState> {
+    match workflow_key {
+        workspace_synthesizer::WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY => {
+            Some(&mut states.insight_posts)
+        }
+        workspace_synthesizer::WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY => Some(&mut states.todos),
+        workspace_synthesizer::WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY => Some(&mut states.events),
+        workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => {
+            Some(&mut states.clip_plans)
+        }
+        _ => None,
+    }
+}
+
+fn render_workspace_synth_extractor_run_prompt(
+    orchestrator: &FeedContentAgentDefinition,
+    orchestrator_skill_markdown: &str,
+    extractor: &FeedContentAgentDefinition,
+    extractor_skill_markdown: &str,
+    media_tool_summary: &str,
+    handoff_path: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Run the following workspace extractor skill and write only its typed handoff file.\n\n");
+    prompt.push_str("## Workspace Synthesizer Index Skill\n");
+    prompt.push_str(&format!("- Name: {}\n", orchestrator.bot_name));
+    prompt.push_str(&format!("- Key: {}\n", orchestrator.key));
+    prompt.push_str(&format!("- Goal: {}\n", orchestrator.goal.trim()));
+    prompt.push_str("```markdown\n");
+    prompt.push_str(orchestrator_skill_markdown.trim());
+    prompt.push_str("\n```\n\n");
+    prompt.push_str("## Extractor Skill\n");
+    prompt.push_str(&format!("- Name: {}\n", extractor.bot_name));
+    prompt.push_str(&format!("- Key: {}\n", extractor.key));
+    prompt.push_str(&format!("- Goal: {}\n", extractor.goal.trim()));
+    prompt.push_str(&format!("- Skill file: `{}`\n", extractor.skill_path));
+    prompt.push_str(&format!("- Allowed output file: `{}`\n\n", handoff_path));
+    prompt.push_str("```markdown\n");
+    prompt.push_str(extractor_skill_markdown.trim());
+    prompt.push_str("\n```\n\n");
+    prompt.push_str("## Execution Rules\n");
+    prompt.push_str("- Read from `journals/text/**`, available transcript files, and journal media files when relevant to the goal.\n");
+    prompt.push_str("- If a needed transcript for journal media is missing, use `transcribe_media` and save outputs under `journals/text/transcriptions/**`.\n");
+    prompt.push_str(&format!("- {media_tool_summary}\n"));
+    prompt.push_str("- For deterministic media transforms, use only the built-in media tools that are available on this device.\n");
+    prompt.push_str("- Write exactly one handoff file at the allowed path, even if the `items` array is empty.\n");
+    prompt.push_str("- Do not write any other handoff file, final feed post, todo, event, or clip artifact.\n");
+    prompt.push_str("- Use direct file edits in the workspace, not code blocks in chat.\n");
+    prompt.push_str("- Reply with a concise summary of what you wrote to the handoff file.\n");
+    prompt
+}
+
+async fn run_workspace_synthesizer_orchestrator(
+    state: &AppState,
+    workspace_dir: &StdPath,
+    orchestrator_workflow: &FeedContentAgentDefinition,
+    orchestrator_skill_markdown: &str,
+    media_tool_summary: &str,
+) -> Result<(String, workspace_synthesizer::WorkspaceSynthesisApplyResult)> {
+    let store = load_or_seed_feed_workflow_settings_store(workspace_dir)?;
+    workspace_synthesizer::reset_handoff_files(workspace_dir)?;
+
+    let mut extractor_replies = Vec::new();
+    let mut extractor_errors = Vec::new();
+    let mut artifact_states = workspace_synth_default_artifact_states();
+
+    for extractor_spec in workspace_synthesizer::extractor_specs() {
+        let Some(extractor_workflow) = workflow_definition_by_key(&store, extractor_spec.workflow_key) else {
+            let error = format!("missing extractor workflow `{}`", extractor_spec.workflow_key);
+            if let Some(state) =
+                workspace_synth_artifact_state_mut(&mut artifact_states, extractor_spec.workflow_key)
+            {
+                state.status = "error".to_string();
+                state.error = error.clone();
+            }
+            extractor_errors.push(error);
+            continue;
+        };
+        let enabled = store
+            .workflows
+            .get(extractor_spec.workflow_key)
+            .map(|record| record.enabled)
+            .unwrap_or(false);
+        if !enabled {
+            continue;
+        }
+
+        let extractor_skill_abs = workspace_dir.join(&extractor_workflow.skill_path);
+        let extractor_skill_markdown = match std::fs::read_to_string(&extractor_skill_abs) {
+            Ok(raw) => raw,
+            Err(err) => {
+                let message = truncate_with_ellipsis(
+                    &format!(
+                        "{} failed: unable to read skill `{}`: {}",
+                        extractor_workflow.bot_name, extractor_workflow.skill_path, err
+                    ),
+                    800,
+                );
+                if let Some(state) =
+                    workspace_synth_artifact_state_mut(&mut artifact_states, extractor_spec.workflow_key)
+                {
+                    state.status = "error".to_string();
+                    state.error = message.clone();
+                }
+                extractor_errors.push(message);
+                continue;
+            }
+        };
+        let prompt = render_workspace_synth_extractor_run_prompt(
+            orchestrator_workflow,
+            orchestrator_skill_markdown,
+            &extractor_workflow,
+            &extractor_skill_markdown,
+            media_tool_summary,
+            extractor_spec.handoff_path,
+        );
+        let subthread_id = format!(
+            "workflow:{}:{}",
+            orchestrator_workflow.key, extractor_workflow.key
+        );
+        match tokio::time::timeout(
+            Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
+            run_local_agent_prompt_in_thread(state, &subthread_id, &prompt),
+        )
+        .await
+        {
+            Ok(Ok(reply)) => {
+                let trimmed = reply.trim();
+                if !trimmed.is_empty() {
+                    extractor_replies.push(format!("{}: {}", extractor_workflow.bot_name, trimmed));
+                }
+            }
+            Ok(Err(err)) => {
+                let message = truncate_with_ellipsis(
+                    &format!("{} failed: {err:#}", extractor_workflow.bot_name),
+                    800,
+                );
+                if let Some(state) =
+                    workspace_synth_artifact_state_mut(&mut artifact_states, extractor_spec.workflow_key)
+                {
+                    state.status = "error".to_string();
+                    state.error = message.clone();
+                }
+                extractor_errors.push(message);
+            }
+            Err(_) => {
+                let message = format!(
+                    "{} timed out after {}s",
+                    extractor_workflow.bot_name, CONTENT_AGENT_TIMEOUT_SECS
+                );
+                if let Some(state) =
+                    workspace_synth_artifact_state_mut(&mut artifact_states, extractor_spec.workflow_key)
+                {
+                    state.status = "error".to_string();
+                    state.error = message.clone();
+                }
+                extractor_errors.push(message);
+            }
+        }
+    }
+
+    let workspace_for_apply = workspace_dir.to_path_buf();
+    let mut applied = tokio::task::spawn_blocking(move || {
+        workspace_synthesizer::apply_handoff_files(&workspace_for_apply, &Utc::now().to_rfc3339())
+    })
+    .await
+    .context("workspace synthesis apply task failed")??;
+
+    if !artifact_states.insight_posts.error.trim().is_empty() {
+        applied.artifact_states.insight_posts = artifact_states.insight_posts.clone();
+    }
+    if !artifact_states.todos.error.trim().is_empty() {
+        applied.artifact_states.todos = artifact_states.todos.clone();
+    }
+    if !artifact_states.events.error.trim().is_empty() {
+        applied.artifact_states.events = artifact_states.events.clone();
+    }
+    if !artifact_states.clip_plans.error.trim().is_empty() {
+        applied.artifact_states.clip_plans = artifact_states.clip_plans.clone();
+    }
+
+    if !extractor_errors.is_empty() {
+        applied.had_errors = true;
+        let joined = extractor_errors.join(" | ");
+        if applied.summary.trim().is_empty() {
+            applied.summary = format!("Workspace synthesis extractor issues: {joined}");
+        } else {
+            applied.summary = format!("{} Extractor issues: {}", applied.summary.trim(), joined);
+        }
+    }
+
+    let reply = if extractor_replies.is_empty() {
+        applied.summary.clone()
+    } else {
+        format!(
+            "{}\n\nExtractor summaries:\n- {}",
+            applied.summary.trim(),
+            extractor_replies.join("\n- ")
+        )
+    };
+
+    Ok((reply, applied))
+}
+
 fn queue_workflow_run(
     state: AppState,
     workflow: FeedContentAgentDefinition,
@@ -2160,6 +2456,117 @@ fn queue_workflow_run(
         };
         let config_snapshot = state.config.lock().clone();
         let media_tool_summary = local_media_capabilities(&config_snapshot).summary();
+        if is_workspace_synth {
+            match run_workspace_synthesizer_orchestrator(
+                &state_for_worker,
+                &workspace_for_worker,
+                &workflow_for_worker,
+                &skill_markdown,
+                &media_tool_summary,
+            )
+            .await
+            {
+                Ok((reply, applied)) => {
+                    let run_finished_at = Utc::now().to_rfc3339();
+                    if applied.had_errors && !applied.applied_any {
+                        let final_error = truncate_with_ellipsis(&applied.summary, 4000);
+                        let _ = local_store::create_chat_message(
+                            &workspace_for_worker,
+                            &thread_id_for_worker,
+                            "assistant",
+                            "",
+                            "error",
+                            "workflow-runner",
+                            Some(&user_id_for_worker),
+                            Some(&final_error),
+                        );
+                        let _ = local_store::patch_chat_status(
+                            &workspace_for_worker,
+                            &user_id_for_worker,
+                            "error",
+                            Some(&final_error),
+                        );
+                        save_workspace_synthesizer_status(
+                            &workspace_for_worker,
+                            "error",
+                            source,
+                            &thread_id_for_worker,
+                            latest_content_agent_source_updated_at(&workspace_for_worker),
+                            Some(run_finished_at),
+                            Some(applied.summary.clone()),
+                            Some(final_error),
+                            Some(applied.counts.clone()),
+                            Some(applied.artifact_states.clone()),
+                        );
+                    } else {
+                        let final_reply = truncate_with_ellipsis(reply.trim(), 4000);
+                        let _ = local_store::create_chat_message(
+                            &workspace_for_worker,
+                            &thread_id_for_worker,
+                            "assistant",
+                            &final_reply,
+                            "done",
+                            "workflow-runner",
+                            Some(&user_id_for_worker),
+                            None,
+                        );
+                        let _ = local_store::patch_chat_status(
+                            &workspace_for_worker,
+                            &user_id_for_worker,
+                            "done",
+                            None,
+                        );
+                        save_workspace_synthesizer_status(
+                            &workspace_for_worker,
+                            "done",
+                            source,
+                            &thread_id_for_worker,
+                            latest_content_agent_source_updated_at(&workspace_for_worker),
+                            Some(run_finished_at),
+                            Some(applied.summary.clone()),
+                            None,
+                            Some(applied.counts.clone()),
+                            Some(applied.artifact_states.clone()),
+                        );
+                    }
+                }
+                Err(err) => {
+                    let final_error = truncate_with_ellipsis(
+                        &format!("Workspace synthesis orchestration failed.\n\n{err:#}"),
+                        4000,
+                    );
+                    let _ = local_store::create_chat_message(
+                        &workspace_for_worker,
+                        &thread_id_for_worker,
+                        "assistant",
+                        "",
+                        "error",
+                        "workflow-runner",
+                        Some(&user_id_for_worker),
+                        Some(&final_error),
+                    );
+                    let _ = local_store::patch_chat_status(
+                        &workspace_for_worker,
+                        &user_id_for_worker,
+                        "error",
+                        Some(&final_error),
+                    );
+                    save_workspace_synthesizer_status(
+                        &workspace_for_worker,
+                        "error",
+                        source,
+                        &thread_id_for_worker,
+                        latest_content_agent_source_updated_at(&workspace_for_worker),
+                        None,
+                        None,
+                        Some(final_error),
+                        None,
+                        Some(workspace_synth_default_artifact_states()),
+                    );
+                }
+            }
+            return;
+        }
         let run_prompt =
             render_content_agent_run_prompt(&workflow_for_worker, &skill_markdown, &media_tool_summary);
         let run_result = tokio::time::timeout(
@@ -3423,6 +3830,14 @@ async fn handle_feed_personalized(
         tracing::warn!("Failed to refresh cached content sources: {err}");
     }
 
+    if let Some(embedder) = embedder.as_ref() {
+        if let Err(err) =
+            backfill_cached_content_item_embeddings(&workspace_dir, embedder.clone()).await
+        {
+            tracing::warn!("Failed to backfill cached content item embeddings: {err}");
+        }
+    }
+
     let recent_content_items = build_recent_content_items(&workspace_dir, limit).unwrap_or_default();
 
     let Some(embedder) = embedder else {
@@ -3932,6 +4347,7 @@ async fn handle_feed_workflow_template_create(
             last_run_at: None,
             last_triggered_source_updated_at: None,
             built_in_skill_fingerprint: None,
+            visible_in_ui: true,
             settings: settings_for_worker.clone(),
         };
         workflow_record = normalize_workflow_record(&workflow_key_for_worker, workflow_record);
@@ -5645,7 +6061,7 @@ fn collect_library_items_recursive(
 }
 
 const INTEREST_MERGE_THRESHOLD: f32 = 0.75;
-const INTEREST_SPAWN_THRESHOLD: f32 = 0.55;
+const INTEREST_SPAWN_THRESHOLD: f32 = 0.35;
 const FEED_MATCH_THRESHOLD: f32 = 0.65;
 const INTEREST_DECAY_RATE: f64 = 0.95;
 const INTEREST_EMA_NEW_WEIGHT: f32 = 0.2;
@@ -5663,6 +6079,7 @@ const FEED_WEB_DOMAIN_BATCHES_PER_INTEREST: usize = 2;
 const FEED_WEB_RESULT_LIMIT_PER_QUERY: usize = 5;
 const CONTENT_SOURCE_REFRESH_TTL_SECS: i64 = 30 * 60;
 const CONTENT_SOURCE_REFRESH_BATCH_SIZE: usize = 6;
+const CONTENT_ITEM_EMBEDDING_BACKFILL_BATCH_SIZE: usize = 64;
 const CONTENT_SOURCE_ITEM_LIMIT: usize = 12;
 const CONTENT_RANK_CANDIDATE_LIMIT: usize = 160;
 const CONTENT_TEXT_MAX_CHARS: usize = 2400;
@@ -6655,6 +7072,54 @@ async fn refresh_cached_content_sources(
     }
 
     Ok(())
+}
+
+async fn backfill_cached_content_item_embeddings(
+    workspace_dir: &StdPath,
+    embedder: Arc<dyn memory::embeddings::EmbeddingProvider>,
+) -> Result<usize> {
+    let missing_items = local_store::list_content_items_missing_embeddings(
+        workspace_dir,
+        CONTENT_ITEM_EMBEDDING_BACKFILL_BATCH_SIZE,
+    )?;
+    if missing_items.is_empty() {
+        return Ok(0);
+    }
+
+    let mut updated_count = 0usize;
+    for item in missing_items {
+        let content = item.content_text.trim();
+        if content.is_empty() {
+            continue;
+        }
+        match embedder.embed_one(content).await {
+            Ok(embedding) if !embedding.is_empty() => {
+                local_store::update_content_item_embedding(
+                    workspace_dir,
+                    &item.id,
+                    &vec_to_bytes(&embedding),
+                )?;
+                updated_count += 1;
+            }
+            Ok(_) => {
+                tracing::debug!(
+                    item_id = %item.id,
+                    url = %item.canonical_url,
+                    "Feed embedder returned an empty vector for cached content item"
+                );
+            }
+            Err(err) => {
+                tracing::debug!(
+                    item_id = %item.id,
+                    url = %item.canonical_url,
+                    error = %err,
+                    "Failed to backfill cached content item embedding"
+                );
+            }
+        }
+    }
+
+    Ok(updated_count)
 }
 
 fn content_preview_timestamp(item: &local_store::ContentItemRecord) -> String {
@@ -8933,9 +9398,33 @@ mod tests {
             let record = store.workflows.get(&key).expect("missing built-in content agent");
             assert_eq!(record.workflow_bot, spec.name);
             assert_eq!(record.goal.as_deref(), Some(spec.goal));
-            assert!(!record.enabled);
+            assert_eq!(record.enabled, spec.enabled_by_default);
+            assert_eq!(record.visible_in_ui, spec.visible_in_ui);
             assert!(workspace.join(&record.skill_path).exists());
         }
+    }
+
+    #[test]
+    fn workflow_definitions_hide_internal_workspace_extractors() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let store = load_or_seed_feed_workflow_settings_store(workspace).unwrap();
+
+        let defs = workflow_definitions(&store);
+
+        assert!(defs.iter().any(|workflow| workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY));
+        assert!(!defs.iter().any(|workflow| {
+            workflow.key == workspace_synthesizer::WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY
+        }));
+        assert!(!defs.iter().any(|workflow| {
+            workflow.key == workspace_synthesizer::WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY
+        }));
+        assert!(!defs.iter().any(|workflow| {
+            workflow.key == workspace_synthesizer::WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY
+        }));
+        assert!(!defs.iter().any(|workflow| {
+            workflow.key == workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY
+        }));
     }
 
     #[test]
@@ -8965,7 +9454,7 @@ mod tests {
         let refreshed_skill = std::fs::read_to_string(&skill_abs).unwrap();
         let expected_fingerprint = content_agent_skill_fingerprint(&refreshed_skill);
 
-        assert!(refreshed_skill.contains("Create small typed JSON handoff files"));
+        assert!(refreshed_skill.contains("This is the index skill for workspace synthesis."));
         assert_eq!(
             refreshed_record.built_in_skill_fingerprint.as_deref(),
             Some(expected_fingerprint.as_str())
@@ -9098,6 +9587,7 @@ mod tests {
             last_run_at: None,
             last_triggered_source_updated_at: None,
             built_in_skill_fingerprint: None,
+            visible_in_ui: true,
             settings: workflow_default_settings(),
         };
         store.workflows.insert(
@@ -9118,6 +9608,7 @@ mod tests {
             last_run_at: None,
             last_triggered_source_updated_at: None,
             built_in_skill_fingerprint: None,
+            visible_in_ui: true,
             settings: workflow_default_settings(),
         };
         store.workflows.insert(
