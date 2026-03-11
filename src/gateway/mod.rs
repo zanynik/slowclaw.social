@@ -1185,6 +1185,8 @@ struct FeedContentAgentRecord {
     last_run_at: Option<String>,
     #[serde(default)]
     last_triggered_source_updated_at: Option<i64>,
+    #[serde(default)]
+    built_in_skill_fingerprint: Option<String>,
     #[serde(default = "workflow_default_settings")]
     #[serde(skip_serializing_if = "is_default_workflow_settings")]
     settings: FeedWorkflowSettings,
@@ -1366,6 +1368,7 @@ fn normalize_workflow_record(workflow_key: &str, mut record: FeedContentAgentRec
     record.last_triggered_source_updated_at = record
         .last_triggered_source_updated_at
         .filter(|value| *value > 0);
+    record.built_in_skill_fingerprint = normalize_goal_text(record.built_in_skill_fingerprint);
 
     record.editable_files = vec![record.skill_path.clone()];
     record
@@ -1463,9 +1466,42 @@ fn built_in_content_agent_settings(goal: &str) -> FeedWorkflowSettings {
     normalize_workflow_settings(settings)
 }
 
+fn is_built_in_content_agent_key(workflow_key: &str) -> bool {
+    let normalized = sanitize_workflow_key(workflow_key);
+    built_in_content_agent_specs()
+        .iter()
+        .any(|spec| sanitize_workflow_key(spec.key) == normalized)
+}
+
+fn canonical_content_agent_skill_body(record: &FeedContentAgentRecord) -> Result<Option<String>> {
+    if !is_built_in_content_agent_key(&record.workflow_key) {
+        return Ok(None);
+    }
+    let goal = record
+        .goal
+        .clone()
+        .or(record.settings.goal.clone())
+        .or(record.settings.prompt.clone())
+        .unwrap_or_else(|| "Create workspace feed posts from journal notes.".to_string());
+    let output_dir = record.output_prefix.trim_end_matches('/');
+    let body = match record.workflow_key.as_str() {
+        WORKSPACE_SYNTHESIZER_WORKFLOW_KEY => workspace_synthesizer::render_skill_markdown()?,
+        "audio_insight_clips" => render_audio_insight_clip_skill_markdown(output_dir),
+        _ => render_template_skill_markdown(&record.workflow_bot, &goal, output_dir),
+    };
+    Ok(Some(body))
+}
+
+fn content_agent_skill_fingerprint(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(body.as_bytes());
+    hex::encode(digest)
+}
+
 fn built_in_content_agent_record(spec: BuiltInContentAgentSpec) -> FeedContentAgentRecord {
     let key = sanitize_workflow_key(spec.key);
-    FeedContentAgentRecord {
+    let mut record = FeedContentAgentRecord {
         workflow_key: key.clone(),
         workflow_bot: spec.name.to_string(),
         skill_path: format!("skills/{key}/SKILL.md"),
@@ -1476,8 +1512,14 @@ fn built_in_content_agent_record(spec: BuiltInContentAgentSpec) -> FeedContentAg
         last_triggered_at: None,
         last_run_at: None,
         last_triggered_source_updated_at: None,
+        built_in_skill_fingerprint: None,
         settings: built_in_content_agent_settings(spec.goal),
+    };
+    record = normalize_workflow_record(&key, record);
+    if let Ok(Some(body)) = canonical_content_agent_skill_body(&record) {
+        record.built_in_skill_fingerprint = Some(content_agent_skill_fingerprint(&body));
     }
+    record
 }
 
 fn ensure_content_agent_skill_file(
@@ -1492,19 +1534,16 @@ fn ensure_content_agent_skill_file(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create skill directory {}", parent.display()))?;
     }
-    let goal = record
-        .goal
-        .clone()
-        .or(record.settings.goal.clone())
-        .or(record.settings.prompt.clone())
-        .unwrap_or_else(|| "Create workspace feed posts from journal notes.".to_string());
-    let output_dir = record.output_prefix.trim_end_matches('/');
-    let skill_body = match record.workflow_key.as_str() {
-        WORKSPACE_SYNTHESIZER_WORKFLOW_KEY =>
-            workspace_synthesizer::render_skill_markdown()?,
-        "audio_insight_clips" => render_audio_insight_clip_skill_markdown(output_dir),
-        _ => render_template_skill_markdown(&record.workflow_bot, &goal, output_dir),
-    };
+    let skill_body = canonical_content_agent_skill_body(record)?.unwrap_or_else(|| {
+        let goal = record
+            .goal
+            .clone()
+            .or(record.settings.goal.clone())
+            .or(record.settings.prompt.clone())
+            .unwrap_or_else(|| "Create workspace feed posts from journal notes.".to_string());
+        let output_dir = record.output_prefix.trim_end_matches('/');
+        render_template_skill_markdown(&record.workflow_bot, &goal, output_dir)
+    });
     std::fs::write(&skill_abs, skill_body)
     .with_context(|| format!("failed to write starter skill {}", skill_abs.display()))
 }
@@ -1529,19 +1568,27 @@ fn ensure_built_in_content_agents(
                 record.settings = built_in_content_agent_settings(spec.goal);
                 *record = normalize_workflow_record(&key, record.clone());
                 changed = true;
+            }
+
+            if let Some(canonical_body) = canonical_content_agent_skill_body(record)? {
+                let canonical_fingerprint = content_agent_skill_fingerprint(&canonical_body);
                 let skill_abs = workspace_dir.join(&record.skill_path);
-                let should_refresh_skill = skill_abs.exists()
-                    && std::fs::read_to_string(&skill_abs)
-                        .map(|raw| raw.contains(LEGACY_AUDIO_INSIGHT_CLIPS_GOAL))
-                        .unwrap_or(false);
+                let should_refresh_skill = record
+                    .built_in_skill_fingerprint
+                    .as_deref()
+                    != Some(canonical_fingerprint.as_str())
+                    || !skill_abs.exists();
                 if should_refresh_skill {
-                    std::fs::write(
-                        &skill_abs,
-                        render_audio_insight_clip_skill_markdown(
-                            record.output_prefix.trim_end_matches('/'),
-                        ),
-                    )
-                    .with_context(|| format!("failed to refresh built-in skill {}", skill_abs.display()))?;
+                    if let Some(parent) = skill_abs.parent() {
+                        std::fs::create_dir_all(parent).with_context(|| {
+                            format!("failed to create skill directory {}", parent.display())
+                        })?;
+                    }
+                    std::fs::write(&skill_abs, canonical_body).with_context(|| {
+                        format!("failed to refresh built-in skill {}", skill_abs.display())
+                    })?;
+                    record.built_in_skill_fingerprint = Some(canonical_fingerprint);
+                    changed = true;
                 }
             }
             ensure_content_agent_skill_file(workspace_dir, record)?;
@@ -1591,6 +1638,7 @@ fn load_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedCont
             last_triggered_at: None,
             last_run_at: None,
             last_triggered_source_updated_at: None,
+            built_in_skill_fingerprint: None,
             settings: normalize_workflow_settings(legacy_settings),
         };
         migrated
@@ -3883,6 +3931,7 @@ async fn handle_feed_workflow_template_create(
             last_triggered_at: None,
             last_run_at: None,
             last_triggered_source_updated_at: None,
+            built_in_skill_fingerprint: None,
             settings: settings_for_worker.clone(),
         };
         workflow_record = normalize_workflow_record(&workflow_key_for_worker, workflow_record);
@@ -8890,6 +8939,40 @@ mod tests {
     }
 
     #[test]
+    fn load_or_seed_feed_workflow_settings_store_refreshes_stale_builtin_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let key = sanitize_workflow_key(WORKSPACE_SYNTHESIZER_WORKFLOW_KEY);
+        let mut record = built_in_content_agent_record(built_in_content_agent_specs()[0]);
+        record.built_in_skill_fingerprint = None;
+
+        let skill_abs = workspace.join(&record.skill_path);
+        if let Some(parent) = skill_abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &skill_abs,
+            "# Workspace Synthesizer\n\nCreate a single strict JSON manifest.\n",
+        )
+        .unwrap();
+
+        let mut store = FeedContentAgentStore::default();
+        store.workflows.insert(key.clone(), record);
+        save_feed_workflow_settings_store(workspace, &store).unwrap();
+
+        let refreshed = load_or_seed_feed_workflow_settings_store(workspace).unwrap();
+        let refreshed_record = refreshed.workflows.get(&key).unwrap();
+        let refreshed_skill = std::fs::read_to_string(&skill_abs).unwrap();
+        let expected_fingerprint = content_agent_skill_fingerprint(&refreshed_skill);
+
+        assert!(refreshed_skill.contains("Create small typed JSON handoff files"));
+        assert_eq!(
+            refreshed_record.built_in_skill_fingerprint.as_deref(),
+            Some(expected_fingerprint.as_str())
+        );
+    }
+
+    #[test]
     fn content_agent_auto_run_requires_new_source_and_staleness_gate() {
         let mut record = built_in_content_agent_record(built_in_content_agent_specs()[0]);
         record.enabled = true;
@@ -9014,6 +9097,7 @@ mod tests {
             last_triggered_at: None,
             last_run_at: None,
             last_triggered_source_updated_at: None,
+            built_in_skill_fingerprint: None,
             settings: workflow_default_settings(),
         };
         store.workflows.insert(
@@ -9033,6 +9117,7 @@ mod tests {
             last_triggered_at: None,
             last_run_at: None,
             last_triggered_source_updated_at: None,
+            built_in_skill_fingerprint: None,
             settings: workflow_default_settings(),
         };
         store.workflows.insert(
