@@ -1031,6 +1031,15 @@ struct WorkspaceSynthesizerAutoRunBody {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSynthesizerRunBody {
+    #[serde(default)]
+    source_path: Option<String>,
+    #[serde(default)]
+    force: Option<bool>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceTodoUpdateBody {
@@ -1314,6 +1323,14 @@ fn built_in_content_agent_specs() -> &'static [BuiltInContentAgentSpec] {
             enabled_by_default: true,
         },
         BuiltInContentAgentSpec {
+            key: workspace_synthesizer::WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY,
+            name: "Workspace Journal Title Extractor",
+            goal: "Propose concise durable titles for the current journal note batch. Write only the journal_titles handoff JSON for Rust to rename journal note files.",
+            output_prefix: "posts/workspace_synthesizer/",
+            visible_in_ui: false,
+            enabled_by_default: true,
+        },
+        BuiltInContentAgentSpec {
             key: "bluesky_insight_posts",
             name: "Bluesky Insight Posts",
             goal: "Create interesting Bluesky post drafts from my recent journal notes. Extract standout insights and save each post as a separate file in posts/ so it appears in the workspace feed.",
@@ -1541,7 +1558,8 @@ fn canonical_content_agent_skill_body(record: &FeedContentAgentRecord) -> Result
         workspace_synthesizer::WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY
         | workspace_synthesizer::WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY
         | workspace_synthesizer::WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY
-        | workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => {
+        | workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY
+        | workspace_synthesizer::WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => {
             workspace_synthesizer::render_extractor_skill_markdown(&record.workflow_key)?
         }
         "audio_insight_clips" => render_audio_insight_clip_skill_markdown(output_dir),
@@ -1922,6 +1940,9 @@ fn save_workspace_synthesizer_status(
     trigger_reason: &str,
     thread_id: &str,
     latest_source_updated_at: i64,
+    pending_source_count: usize,
+    pending_word_count: usize,
+    selected_source_paths: Option<Vec<String>>,
     last_run_at: Option<String>,
     last_summary: Option<String>,
     last_error: Option<String>,
@@ -1935,6 +1956,13 @@ fn save_workspace_synthesizer_status(
     next.last_source_updated_at = latest_source_updated_at;
     next.last_manifest_path =
         workspace_synthesizer::WORKSPACE_SYNTHESIZER_PIPELINE_DIR.to_string();
+    next.pending_source_count = pending_source_count;
+    next.pending_word_count = pending_word_count;
+    if let Some(selected_source_paths) = selected_source_paths {
+        next.selected_source_paths = selected_source_paths;
+    } else if status != "pending" && status != "processing" {
+        next.selected_source_paths.clear();
+    }
     if let Some(last_run_at) = last_run_at {
         next.last_run_at = last_run_at;
     }
@@ -2022,8 +2050,14 @@ fn queue_workspace_synthesizer_for_trigger(
     reason: &str,
 ) -> Result<Option<String>> {
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let latest_source_updated_at = latest_content_agent_source_updated_at(&workspace_dir);
-    if latest_source_updated_at <= 0 {
+    let selection = select_workspace_synth_sources(&workspace_dir, &[], false)?;
+    let latest_source_updated_at = selection
+        .pending
+        .iter()
+        .map(|item| item.modified_at)
+        .max()
+        .unwrap_or(0);
+    if latest_source_updated_at <= 0 || selection.selected.is_empty() {
         return Ok(None);
     }
 
@@ -2047,13 +2081,24 @@ fn queue_workspace_synthesizer_for_trigger(
         return Ok(Some(status.thread_id));
     }
 
-    queue_workspace_synthesizer_run(state.clone(), reason, latest_source_updated_at).map(Some)
+    queue_workspace_synthesizer_run(
+        state.clone(),
+        reason,
+        latest_source_updated_at,
+        selection.pending.len(),
+        selection.selected_word_count,
+        selection.selected,
+    )
+    .map(Some)
 }
 
 fn queue_workspace_synthesizer_run(
     state: AppState,
     source: &str,
     latest_source_updated_at: i64,
+    pending_source_count: usize,
+    pending_word_count: usize,
+    selected_sources: Vec<WorkspaceSynthSourceCandidate>,
 ) -> Result<String> {
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let existing_status = workspace_synthesizer::load_status(&workspace_dir);
@@ -2073,12 +2118,19 @@ fn queue_workspace_synthesizer_run(
         _ => "workspace-synthesizer",
     };
     let thread_id = queue_workflow_run(state.clone(), workflow, source_label)?;
+    let selected_source_paths = selected_sources
+        .into_iter()
+        .map(|item| item.source_path)
+        .collect::<Vec<_>>();
     save_workspace_synthesizer_status(
         &workspace_dir,
         "pending",
         source_label,
         &thread_id,
         latest_source_updated_at,
+        pending_source_count,
+        pending_word_count,
+        Some(selected_source_paths),
         None,
         None,
         None,
@@ -2086,6 +2138,46 @@ fn queue_workspace_synthesizer_run(
         None,
     );
     Ok(thread_id)
+}
+
+fn mark_workspace_synth_sources_processed(
+    workspace_dir: &StdPath,
+    sources: &[WorkspaceSynthSourceCandidate],
+    renamed_sources: &[workspace_synthesizer::WorkspaceSynthRenamedSource],
+    processed_at: &str,
+) -> Result<Vec<String>> {
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rename_map: HashMap<String, String> = renamed_sources
+        .iter()
+        .map(|item| (item.from_path.clone(), item.to_path.clone()))
+        .collect();
+    let mut deduped = HashMap::new();
+    for item in sources {
+        let source_path = rename_map
+            .get(&item.source_path)
+            .cloned()
+            .unwrap_or_else(|| item.source_path.clone());
+        deduped.insert(
+            source_path.clone(),
+            local_store::WorkspaceSynthSourceUpsert {
+                source_path,
+                content_hash: item.content_hash.clone(),
+                word_count: i64::try_from(item.word_count).unwrap_or(0),
+                last_processed_hash: item.content_hash.clone(),
+                last_processed_at: processed_at.to_string(),
+                last_batch_id: processed_at.to_string(),
+            },
+        );
+    }
+    let mut paths: Vec<String> = deduped.keys().cloned().collect();
+    paths.sort();
+    local_store::upsert_workspace_synth_sources(
+        workspace_dir,
+        &deduped.into_values().collect::<Vec<_>>(),
+    )?;
+    Ok(paths)
 }
 
 async fn run_local_agent_prompt_in_thread(
@@ -2159,6 +2251,7 @@ fn render_workspace_synth_extractor_run_prompt(
     extractor_skill_markdown: &str,
     media_tool_summary: &str,
     handoff_path: &str,
+    target_sources: &[WorkspaceSynthSourceCandidate],
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str("Run the following workspace extractor skill and write only its typed handoff file.\n\n");
@@ -2179,6 +2272,18 @@ fn render_workspace_synth_extractor_run_prompt(
     prompt.push_str(extractor_skill_markdown.trim());
     prompt.push_str("\n```\n\n");
     prompt.push_str("## Execution Rules\n");
+    if !target_sources.is_empty() {
+        prompt.push_str("## Target Sources For This Run\n");
+        prompt.push_str("- Only process these source files in this run:\n");
+        for item in target_sources {
+            prompt.push_str(&format!(
+                "  - `{}` ({} words)\n",
+                item.source_path, item.word_count
+            ));
+        }
+        prompt.push_str("- If multiple target notes are present, synthesize them together as one batch.\n");
+        prompt.push_str("- Ignore older journal files that are outside this target list unless one of the targets explicitly depends on them.\n\n");
+    }
     prompt.push_str("- Read from `journals/text/**`, available transcript files, and journal media files when relevant to the goal.\n");
     prompt.push_str("- If a needed transcript for journal media is missing, use `transcribe_media` and save outputs under `journals/text/transcriptions/**`.\n");
     prompt.push_str(&format!("- {media_tool_summary}\n"));
@@ -2196,6 +2301,7 @@ async fn run_workspace_synthesizer_orchestrator(
     orchestrator_workflow: &FeedContentAgentDefinition,
     orchestrator_skill_markdown: &str,
     media_tool_summary: &str,
+    target_sources: &[WorkspaceSynthSourceCandidate],
 ) -> Result<(String, workspace_synthesizer::WorkspaceSynthesisApplyResult)> {
     let store = load_or_seed_feed_workflow_settings_store(workspace_dir)?;
     workspace_synthesizer::reset_handoff_files(workspace_dir)?;
@@ -2253,6 +2359,7 @@ async fn run_workspace_synthesizer_orchestrator(
             &extractor_skill_markdown,
             media_tool_summary,
             extractor_spec.handoff_path,
+            target_sources,
         );
         let subthread_id = format!(
             "workflow:{}:{}",
@@ -2367,12 +2474,16 @@ fn queue_workflow_run(
         .unwrap_or("")
         .to_string();
     if workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY {
+        let existing = workspace_synthesizer::load_status(&workspace_dir);
         save_workspace_synthesizer_status(
             &workspace_dir,
             "pending",
             source,
             &thread_id,
-            latest_content_agent_source_updated_at(&workspace_dir),
+            existing.last_source_updated_at,
+            existing.pending_source_count,
+            existing.pending_word_count,
+            Some(existing.selected_source_paths.clone()),
             None,
             None,
             None,
@@ -2388,6 +2499,22 @@ fn queue_workflow_run(
     let workflow_for_worker = workflow.clone();
     let is_workspace_synth = workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY;
     tokio::spawn(async move {
+        let synth_status_snapshot = if is_workspace_synth {
+            workspace_synthesizer::load_status(&workspace_for_worker)
+        } else {
+            workspace_synthesizer::WorkspaceSynthesizerStatus::default()
+        };
+        let workspace_synth_targets = if is_workspace_synth {
+            select_workspace_synth_sources(
+                &workspace_for_worker,
+                &synth_status_snapshot.selected_source_paths,
+                true,
+            )
+            .map(|selection| selection.selected)
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if let Err(err) =
             local_store::patch_chat_status(
                 &workspace_for_worker,
@@ -2404,7 +2531,10 @@ fn queue_workflow_run(
                 "processing",
                 source,
                 &thread_id_for_worker,
-                latest_content_agent_source_updated_at(&workspace_for_worker),
+                synth_status_snapshot.last_source_updated_at,
+                synth_status_snapshot.pending_source_count,
+                synth_status_snapshot.pending_word_count,
+                Some(synth_status_snapshot.selected_source_paths.clone()),
                 None,
                 None,
                 None,
@@ -2443,7 +2573,10 @@ fn queue_workflow_run(
                         "error",
                         source,
                         &thread_id_for_worker,
-                        latest_content_agent_source_updated_at(&workspace_for_worker),
+                        synth_status_snapshot.last_source_updated_at,
+                        synth_status_snapshot.pending_source_count,
+                        synth_status_snapshot.pending_word_count,
+                        Some(synth_status_snapshot.selected_source_paths.clone()),
                         None,
                         None,
                         Some(final_error),
@@ -2463,6 +2596,7 @@ fn queue_workflow_run(
                 &workflow_for_worker,
                 &skill_markdown,
                 &media_tool_summary,
+                &workspace_synth_targets,
             )
             .await
             {
@@ -2486,12 +2620,24 @@ fn queue_workflow_run(
                             "error",
                             Some(&final_error),
                         );
+                        let next_selection =
+                            select_workspace_synth_sources(&workspace_for_worker, &[], false)
+                                .unwrap_or_default();
                         save_workspace_synthesizer_status(
                             &workspace_for_worker,
                             "error",
                             source,
                             &thread_id_for_worker,
-                            latest_content_agent_source_updated_at(&workspace_for_worker),
+                            synth_status_snapshot.last_source_updated_at,
+                            next_selection.pending.len(),
+                            next_selection.selected_word_count,
+                            Some(
+                                next_selection
+                                    .selected
+                                    .iter()
+                                    .map(|item| item.source_path.clone())
+                                    .collect(),
+                            ),
                             Some(run_finished_at),
                             Some(applied.summary.clone()),
                             Some(final_error),
@@ -2499,6 +2645,16 @@ fn queue_workflow_run(
                             Some(applied.artifact_states.clone()),
                         );
                     } else {
+                        let processed_paths = mark_workspace_synth_sources_processed(
+                            &workspace_for_worker,
+                            &workspace_synth_targets,
+                            &applied.renamed_sources,
+                            &run_finished_at,
+                        )
+                        .unwrap_or_default();
+                        let next_selection =
+                            select_workspace_synth_sources(&workspace_for_worker, &[], false)
+                                .unwrap_or_default();
                         let final_reply = truncate_with_ellipsis(reply.trim(), 4000);
                         let _ = local_store::create_chat_message(
                             &workspace_for_worker,
@@ -2521,7 +2677,31 @@ fn queue_workflow_run(
                             "done",
                             source,
                             &thread_id_for_worker,
-                            latest_content_agent_source_updated_at(&workspace_for_worker),
+                            processed_paths
+                                .iter()
+                                .filter_map(|path| {
+                                    workspace_synth_targets
+                                        .iter()
+                                        .find(|item| {
+                                            item.source_path == *path
+                                                || applied
+                                                    .renamed_sources
+                                                    .iter()
+                                                    .any(|rename| rename.to_path == *path && rename.from_path == item.source_path)
+                                        })
+                                        .map(|item| item.modified_at)
+                                })
+                                .max()
+                                .unwrap_or(synth_status_snapshot.last_source_updated_at),
+                            next_selection.pending.len(),
+                            next_selection.selected_word_count,
+                            Some(
+                                next_selection
+                                    .selected
+                                    .iter()
+                                    .map(|item| item.source_path.clone())
+                                    .collect(),
+                            ),
                             Some(run_finished_at),
                             Some(applied.summary.clone()),
                             None,
@@ -2551,12 +2731,24 @@ fn queue_workflow_run(
                         "error",
                         Some(&final_error),
                     );
+                    let next_selection =
+                        select_workspace_synth_sources(&workspace_for_worker, &[], false)
+                            .unwrap_or_default();
                     save_workspace_synthesizer_status(
                         &workspace_for_worker,
                         "error",
                         source,
                         &thread_id_for_worker,
-                        latest_content_agent_source_updated_at(&workspace_for_worker),
+                        synth_status_snapshot.last_source_updated_at,
+                        next_selection.pending.len(),
+                        next_selection.selected_word_count,
+                        Some(
+                            next_selection
+                                .selected
+                                .iter()
+                                .map(|item| item.source_path.clone())
+                                .collect(),
+                        ),
                         None,
                         None,
                         Some(final_error),
@@ -2617,7 +2809,10 @@ fn queue_workflow_run(
                                     "error",
                                     source,
                                     &thread_id_for_worker,
-                                    latest_content_agent_source_updated_at(&workspace_for_worker),
+                                    synth_status_snapshot.last_source_updated_at,
+                                    synth_status_snapshot.pending_source_count,
+                                    synth_status_snapshot.pending_word_count,
+                                    Some(synth_status_snapshot.selected_source_paths.clone()),
                                     Some(run_finished_at),
                                     Some(applied.summary.clone()),
                                     Some(final_error),
@@ -2653,7 +2848,10 @@ fn queue_workflow_run(
                                     "done",
                                     source,
                                     &thread_id_for_worker,
-                                    latest_content_agent_source_updated_at(&workspace_for_worker),
+                                    synth_status_snapshot.last_source_updated_at,
+                                    synth_status_snapshot.pending_source_count,
+                                    synth_status_snapshot.pending_word_count,
+                                    Some(synth_status_snapshot.selected_source_paths.clone()),
                                     Some(run_finished_at),
                                     Some(applied.summary.clone()),
                                     None,
@@ -2688,7 +2886,10 @@ fn queue_workflow_run(
                                 "error",
                                 source,
                                 &thread_id_for_worker,
-                                latest_content_agent_source_updated_at(&workspace_for_worker),
+                                synth_status_snapshot.last_source_updated_at,
+                                synth_status_snapshot.pending_source_count,
+                                synth_status_snapshot.pending_word_count,
+                                Some(synth_status_snapshot.selected_source_paths.clone()),
                                 None,
                                 None,
                                 Some(final_error),
@@ -2722,7 +2923,10 @@ fn queue_workflow_run(
                                 "error",
                                 source,
                                 &thread_id_for_worker,
-                                latest_content_agent_source_updated_at(&workspace_for_worker),
+                                synth_status_snapshot.last_source_updated_at,
+                                synth_status_snapshot.pending_source_count,
+                                synth_status_snapshot.pending_word_count,
+                                Some(synth_status_snapshot.selected_source_paths.clone()),
                                 None,
                                 None,
                                 Some(final_error),
@@ -2802,7 +3006,10 @@ fn queue_workflow_run(
                         "error",
                         source,
                         &thread_id_for_worker,
-                        latest_content_agent_source_updated_at(&workspace_for_worker),
+                        synth_status_snapshot.last_source_updated_at,
+                        synth_status_snapshot.pending_source_count,
+                        synth_status_snapshot.pending_word_count,
+                        Some(synth_status_snapshot.selected_source_paths.clone()),
                         None,
                         None,
                         Some(final_error),
@@ -2838,7 +3045,10 @@ fn queue_workflow_run(
                         "error",
                         source,
                         &thread_id_for_worker,
-                        latest_content_agent_source_updated_at(&workspace_for_worker),
+                        synth_status_snapshot.last_source_updated_at,
+                        synth_status_snapshot.pending_source_count,
+                        synth_status_snapshot.pending_word_count,
+                        Some(synth_status_snapshot.selected_source_paths.clone()),
                         None,
                         None,
                         Some(final_error),
@@ -3625,7 +3835,18 @@ async fn handle_workspace_synthesizer_status(
     }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let status = workspace_synthesizer::load_status(&workspace_dir);
+    let mut status = workspace_synthesizer::load_status(&workspace_dir);
+    if let Ok(selection) = select_workspace_synth_sources(&workspace_dir, &[], false) {
+        status.pending_source_count = selection.pending.len();
+        status.pending_word_count = selection.selected_word_count;
+        if !matches!(status.status.as_str(), "pending" | "processing") {
+            status.selected_source_paths = selection
+                .selected
+                .into_iter()
+                .map(|item| item.source_path)
+                .collect();
+        }
+    }
     (
         StatusCode::OK,
         Json(serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({}))),
@@ -3635,17 +3856,59 @@ async fn handle_workspace_synthesizer_status(
 async fn handle_workspace_synthesizer_run(
     State(state): State<AppState>,
     headers: HeaderMap,
+    maybe_body: Option<Json<WorkspaceSynthesizerRunBody>>,
 ) -> impl IntoResponse {
     if let Some(err) = pairing_auth_error(&state, &headers, "Workspace synthesizer run") {
         return err;
     }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let latest_source_updated_at = latest_content_agent_source_updated_at(&workspace_dir);
-    if latest_source_updated_at <= 0 {
+    let body = maybe_body.map(|Json(body)| body).unwrap_or_default();
+    let requested_path = body
+        .source_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_start_matches('/').replace('\\', "/"));
+    let selection = match requested_path.clone() {
+        Some(path) => match select_workspace_synth_sources(
+            &workspace_dir,
+            &[path.clone()],
+            body.force.unwrap_or(false),
+        ) {
+            Ok(selection) => selection,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": err.to_string()})),
+                );
+            }
+        },
+        None => match select_workspace_synth_sources(&workspace_dir, &[], false) {
+            Ok(selection) => selection,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": err.to_string()})),
+                );
+            }
+        },
+    };
+    let latest_source_updated_at = selection
+        .selected
+        .iter()
+        .map(|item| item.modified_at)
+        .max()
+        .unwrap_or(0);
+    if latest_source_updated_at <= 0 || selection.selected.is_empty() {
         return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "No journal text sources are available yet"})),
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "queued": false,
+                "message": requested_path
+                    .map(|_| "That journal entry is already up to date or unavailable.")
+                    .unwrap_or("No unprocessed journal entries are waiting for synthesis.")
+            })),
         );
     }
 
@@ -3653,6 +3916,9 @@ async fn handle_workspace_synthesizer_run(
         state.clone(),
         "manual",
         latest_source_updated_at,
+        selection.pending.len(),
+        selection.selected_word_count,
+        selection.selected,
     ) {
         Ok(thread_id) => (
             StatusCode::OK,
@@ -5128,7 +5394,7 @@ async fn handle_journal_text(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
         }
     }
-    let file_body = format!("# {}\n\n{}\n", title, content);
+    let file_body = format!("{content}\n");
     if let Err(e) = tokio::fs::write(&abs_path, file_body).await {
         let err = serde_json::json!({"error": format!("Failed to save journal note: {e}")});
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
@@ -5150,10 +5416,6 @@ async fn handle_journal_text(
             None
         }
     };
-
-    if let Err(err) = queue_workspace_synthesizer_for_trigger(&state, "journal-save") {
-        tracing::warn!("Failed to queue workspace synthesizer after journal save: {err}");
-    }
 
     let resp = serde_json::json!({
         "ok": true,
@@ -5599,14 +5861,6 @@ fn enqueue_transcription_job(
             },
         };
 
-        if final_state.status == "done" {
-            if let Err(err) =
-                queue_workspace_synthesizer_for_trigger(&state_for_task, "transcript-ready")
-            {
-                tracing::warn!("Failed to queue workspace synthesizer after transcription: {err}");
-            }
-        }
-
         let mut jobs = state_for_task.journal_transcription_jobs.lock();
         jobs.insert(media_rel_path, final_state);
     });
@@ -5920,11 +6174,24 @@ fn list_workspace_library_items(
     };
 
     let mut items: Vec<serde_json::Value> = Vec::new();
+    let synth_state_map: HashMap<String, local_store::WorkspaceSynthSourceRecord> =
+        local_store::list_workspace_synth_sources(workspace_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| (item.source_path.clone(), item))
+            .collect();
     for root in roots {
         if !root.exists() {
             continue;
         }
-        collect_library_items_recursive(workspace_dir, &root, &mut items, limit, requested_scope)?;
+        collect_library_items_recursive(
+            workspace_dir,
+            &root,
+            &mut items,
+            limit,
+            requested_scope,
+            &synth_state_map,
+        )?;
         if items.len() >= limit {
             break;
         }
@@ -5945,6 +6212,7 @@ fn collect_library_items_recursive(
     out: &mut Vec<serde_json::Value>,
     limit: usize,
     requested_scope: LibraryScope,
+    synth_state_map: &HashMap<String, local_store::WorkspaceSynthSourceRecord>,
 ) -> Result<()> {
     if out.len() >= limit {
         return Ok(());
@@ -5967,7 +6235,14 @@ fn collect_library_items_recursive(
             Err(_) => continue,
         };
         if meta.is_dir() {
-            collect_library_items_recursive(workspace_dir, &path, out, limit, requested_scope)?;
+            collect_library_items_recursive(
+                workspace_dir,
+                &path,
+                out,
+                limit,
+                requested_scope,
+                synth_state_map,
+            )?;
             continue;
         }
         if !meta.is_file() {
@@ -6027,15 +6302,34 @@ fn collect_library_items_recursive(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("untitled")
-            .replace('_', " ");
-        let preview = if kind == "text" {
-            std::fs::read_to_string(&path)
-                .ok()
-                .map(|s| truncate_with_ellipsis(&s, 240))
-                .unwrap_or_default()
+            .replace(['_', '-'], " ");
+        let text_content = if kind == "text" {
+            std::fs::read_to_string(&path).ok()
         } else {
-            String::new()
+            None
         };
+        let preview = text_content
+            .as_deref()
+            .map(|s| truncate_with_ellipsis(s, 240))
+            .unwrap_or_default();
+        let (workspace_synth_processed, workspace_synth_pending, workspace_synth_last_processed_at) =
+            if kind == "text" && rel.starts_with("journals/text/") {
+                let current_hash = text_content
+                    .as_deref()
+                    .map(|content| content_hash_16(content.trim()))
+                    .unwrap_or_default();
+                let state = synth_state_map.get(&rel);
+                let processed = state
+                    .map(|item| !current_hash.is_empty() && item.last_processed_hash == current_hash)
+                    .unwrap_or(false);
+                (
+                    processed,
+                    !processed,
+                    state.and_then(|item| non_empty_string(item.last_processed_at.clone())),
+                )
+            } else {
+                (false, false, None)
+            };
         out.push(serde_json::json!({
             "id": rel.clone(),
             "path": rel.clone(),
@@ -6051,6 +6345,9 @@ fn collect_library_items_recursive(
             },
             "editableText": kind == "text",
             "scope": scope_value,
+            "workspaceSynthProcessed": workspace_synth_processed,
+            "workspaceSynthPending": workspace_synth_pending,
+            "workspaceSynthLastProcessedAt": workspace_synth_last_processed_at,
         }));
     }
     Ok(())
@@ -6066,6 +6363,7 @@ const BLUESKY_DISCOVER_FEED_URI: &str =
     "at://did:plc:qh3lfd7q24h3fn3pejqr25ct/app.bsky.feed.generator/whats-hot";
 const BLUESKY_PERSONALIZED_PAGE_LIMIT_PER_SOURCE: usize = 10;
 const BLUESKY_PERSONALIZED_MATCH_LIMIT: usize = 10;
+const WORKSPACE_SYNTH_BATCH_WORD_LIMIT: usize = 500;
 const BLUESKY_PERSONALIZED_PAGE_SIZE: usize = 30;
 const FEED_WEB_SOURCE_KIND: &str = "hn-popular-blogs-2025";
 const FEED_WEB_PREVIEW_CACHE_TTL_SECS: i64 = 24 * 60 * 60;
@@ -6215,6 +6513,155 @@ fn content_hash_16(text: &str) -> String {
                 .expect("SHA-256 always produces at least 8 bytes")
         )
     )
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkspaceSynthSourceCandidate {
+    source_path: String,
+    content_hash: String,
+    word_count: usize,
+    modified_at: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkspaceSynthPendingSelection {
+    pending: Vec<WorkspaceSynthSourceCandidate>,
+    selected: Vec<WorkspaceSynthSourceCandidate>,
+    selected_word_count: usize,
+}
+
+fn count_words(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
+fn collect_workspace_synth_source_candidates(
+    workspace_dir: &StdPath,
+) -> Vec<WorkspaceSynthSourceCandidate> {
+    let root = workspace_dir.join(JOURNAL_TEXT_DIR);
+    if !root.exists() || !root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() || !is_content_agent_source_file(&path) {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(workspace_dir) else {
+                continue;
+            };
+            items.push(WorkspaceSynthSourceCandidate {
+                source_path: rel.to_string_lossy().replace('\\', "/"),
+                content_hash: content_hash_16(trimmed),
+                word_count: count_words(trimmed),
+                modified_at: source_file_modified_at_secs(&path),
+            });
+        }
+    }
+    items.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    items
+}
+
+fn select_workspace_synth_sources(
+    workspace_dir: &StdPath,
+    forced_paths: &[String],
+    force_reprocess: bool,
+) -> Result<WorkspaceSynthPendingSelection> {
+    let candidates = collect_workspace_synth_source_candidates(workspace_dir);
+    if candidates.is_empty() {
+        return Ok(WorkspaceSynthPendingSelection::default());
+    }
+
+    let state_map: HashMap<String, local_store::WorkspaceSynthSourceRecord> =
+        local_store::list_workspace_synth_sources(workspace_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| (item.source_path.clone(), item))
+            .collect();
+    let forced: HashSet<String> = forced_paths
+        .iter()
+        .map(|value| value.trim().trim_start_matches('/').replace('\\', "/"))
+        .filter(|value| !value.is_empty())
+        .collect();
+
+    let pending: Vec<WorkspaceSynthSourceCandidate> = candidates
+        .iter()
+        .filter(|item| {
+            if forced.contains(&item.source_path) {
+                return true;
+            }
+            state_map
+                .get(&item.source_path)
+                .map(|state| state.last_processed_hash != item.content_hash)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+
+    if pending.is_empty() {
+        return Ok(WorkspaceSynthPendingSelection::default());
+    }
+
+    if !forced.is_empty() {
+        let selected: Vec<WorkspaceSynthSourceCandidate> = candidates
+            .into_iter()
+            .filter(|item| {
+                forced.contains(&item.source_path)
+                    && (force_reprocess
+                        || state_map
+                            .get(&item.source_path)
+                            .map(|state| state.last_processed_hash != item.content_hash)
+                            .unwrap_or(true))
+            })
+            .collect();
+        let selected_word_count = selected.iter().map(|item| item.word_count).sum();
+        return Ok(WorkspaceSynthPendingSelection {
+            pending,
+            selected,
+            selected_word_count,
+        });
+    }
+
+    let mut selected = Vec::new();
+    let mut selected_word_count = 0usize;
+    for item in &pending {
+        if !selected.is_empty() && selected_word_count + item.word_count > WORKSPACE_SYNTH_BATCH_WORD_LIMIT {
+            break;
+        }
+        selected_word_count += item.word_count;
+        selected.push(item.clone());
+    }
+    if selected.is_empty() && !pending.is_empty() {
+        selected.push(pending[0].clone());
+        selected_word_count = pending[0].word_count;
+    }
+
+    Ok(WorkspaceSynthPendingSelection {
+        pending,
+        selected,
+        selected_word_count,
+    })
 }
 
 fn derive_interest_label(default_title: &str, content: &str) -> String {
@@ -9448,6 +9895,9 @@ mod tests {
         assert!(!defs.iter().any(|workflow| {
             workflow.key == workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY
         }));
+        assert!(!defs.iter().any(|workflow| {
+            workflow.key == workspace_synthesizer::WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY
+        }));
     }
 
     #[test]
@@ -9534,6 +9984,54 @@ mod tests {
         std::fs::write(transcript_dir.join("clip.txt"), "transcript\n").unwrap();
 
         assert!(latest_content_agent_source_updated_at(workspace) > 0);
+    }
+
+    #[test]
+    fn select_workspace_synth_sources_batches_recent_pending_entries_under_word_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let journal_dir = workspace.join("journals/text");
+        std::fs::create_dir_all(workspace.join("state")).unwrap();
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        local_store::initialize(workspace).unwrap();
+
+        let recent_body = "recent ".repeat(220);
+        let older_body = "older ".repeat(200);
+        let stale_body = "done ".repeat(190);
+        let stale_hash = content_hash_16(stale_body.trim());
+
+        std::fs::write(journal_dir.join("stale.md"), &stale_body).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(journal_dir.join("older.md"), &older_body).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(journal_dir.join("recent.md"), &recent_body).unwrap();
+
+        local_store::upsert_workspace_synth_sources(
+            workspace,
+            &[local_store::WorkspaceSynthSourceUpsert {
+                source_path: "journals/text/stale.md".to_string(),
+                content_hash: stale_hash.clone(),
+                word_count: 190,
+                last_processed_hash: stale_hash,
+                last_processed_at: Utc::now().to_rfc3339(),
+                last_batch_id: "test-batch".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let selection = select_workspace_synth_sources(workspace, &[], false).unwrap();
+        let selected_paths: Vec<&str> = selection
+            .selected
+            .iter()
+            .map(|item| item.source_path.as_str())
+            .collect();
+
+        assert_eq!(selection.pending.len(), 2);
+        assert_eq!(selection.selected_word_count, 420);
+        assert_eq!(
+            selected_paths,
+            vec!["journals/text/recent.md", "journals/text/older.md"]
+        );
     }
 
     #[test]

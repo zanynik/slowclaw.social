@@ -101,6 +101,27 @@ pub struct WorkspaceEventUpsert {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkspaceSynthSourceRecord {
+    pub source_path: String,
+    pub content_hash: String,
+    pub word_count: i64,
+    pub last_processed_hash: String,
+    pub last_processed_at: String,
+    pub last_batch_id: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceSynthSourceUpsert {
+    pub source_path: String,
+    pub content_hash: String,
+    pub word_count: i64,
+    pub last_processed_hash: String,
+    pub last_processed_at: String,
+    pub last_batch_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct FeedInterestRecord {
     pub id: String,
     pub label: String,
@@ -785,6 +806,122 @@ pub fn list_workspace_events(workspace_dir: &Path, limit: usize) -> Result<Vec<s
         out.push(row?);
     }
     Ok(out)
+}
+
+pub fn list_workspace_synth_sources(
+    workspace_dir: &Path,
+) -> Result<Vec<WorkspaceSynthSourceRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT
+            source_path, content_hash, word_count, last_processed_hash,
+            last_processed_at, last_batch_id, updated_at
+         FROM workspace_synth_sources
+         ORDER BY updated_at DESC, source_path ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(WorkspaceSynthSourceRecord {
+            source_path: row.get(0)?,
+            content_hash: row.get(1)?,
+            word_count: row.get(2)?,
+            last_processed_hash: row.get(3)?,
+            last_processed_at: row.get(4)?,
+            last_batch_id: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn upsert_workspace_synth_sources(
+    workspace_dir: &Path,
+    items: &[WorkspaceSynthSourceUpsert],
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let mut conn = open_conn(&db_path(workspace_dir))?;
+    let tx = conn.transaction()?;
+    let now = Utc::now().to_rfc3339();
+
+    for item in items {
+        tx.execute(
+            "INSERT INTO workspace_synth_sources (
+                source_path, content_hash, word_count, last_processed_hash,
+                last_processed_at, last_batch_id, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(source_path) DO UPDATE SET
+                content_hash = excluded.content_hash,
+                word_count = excluded.word_count,
+                last_processed_hash = excluded.last_processed_hash,
+                last_processed_at = excluded.last_processed_at,
+                last_batch_id = excluded.last_batch_id,
+                updated_at = excluded.updated_at",
+            params![
+                item.source_path,
+                item.content_hash,
+                item.word_count,
+                item.last_processed_hash,
+                item.last_processed_at,
+                item.last_batch_id,
+                now,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "Failed to upsert workspace synth source {}",
+                item.source_path
+            )
+        })?;
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn rename_workspace_synth_source_path(
+    workspace_dir: &Path,
+    old_path: &str,
+    new_path: &str,
+) -> Result<()> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE workspace_synth_sources
+         SET source_path = ?2, updated_at = ?3
+         WHERE source_path = ?1",
+        params![old_path.trim(), new_path.trim(), now],
+    )
+    .with_context(|| {
+        format!(
+            "Failed to rename workspace synth source path {} -> {}",
+            old_path, new_path
+        )
+    })?;
+    Ok(())
+}
+
+pub fn rename_journal_entry_path(
+    workspace_dir: &Path,
+    old_path: &str,
+    new_path: &str,
+    title: &str,
+) -> Result<()> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    conn.execute(
+        "UPDATE journal_entries
+         SET workspace_path = ?2, title = ?3
+         WHERE workspace_path = ?1",
+        params![old_path.trim(), new_path.trim(), title.trim()],
+    )
+    .with_context(|| format!("Failed to rename journal entry {} -> {}", old_path, new_path))?;
+    Ok(())
 }
 
 pub fn create_journal_entry_metadata(
@@ -1641,6 +1778,18 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_workspace_events_active
             ON workspace_events(archived, start_at);
+
+        CREATE TABLE IF NOT EXISTS workspace_synth_sources (
+            source_path TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL DEFAULT '',
+            word_count INTEGER NOT NULL DEFAULT 0,
+            last_processed_hash TEXT NOT NULL DEFAULT '',
+            last_processed_at TEXT NOT NULL DEFAULT '',
+            last_batch_id TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_synth_sources_updated
+            ON workspace_synth_sources(updated_at);
 
         CREATE TABLE IF NOT EXISTS feed_interests (
             id TEXT PRIMARY KEY,

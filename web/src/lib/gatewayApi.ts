@@ -162,6 +162,9 @@ export type WorkspaceSynthesizerStatus = {
   threadId?: string;
   lastRunAt?: string;
   lastSourceUpdatedAt?: number;
+  pendingSourceCount?: number;
+  pendingWordCount?: number;
+  selectedSourcePaths?: string[];
   lastSummary?: string;
   lastError?: string;
   lastManifestPath?: string;
@@ -786,6 +789,13 @@ export async function getWorkspaceSynthesizerStatus(
     lastRunAt: data?.lastRunAt ? String(data.lastRunAt) : undefined,
     lastSourceUpdatedAt:
       typeof data?.lastSourceUpdatedAt === "number" ? data.lastSourceUpdatedAt : undefined,
+    pendingSourceCount:
+      typeof data?.pendingSourceCount === "number" ? data.pendingSourceCount : undefined,
+    pendingWordCount:
+      typeof data?.pendingWordCount === "number" ? data.pendingWordCount : undefined,
+    selectedSourcePaths: Array.isArray(data?.selectedSourcePaths)
+      ? data.selectedSourcePaths.map((value: unknown) => String(value))
+      : undefined,
     lastSummary: data?.lastSummary ? String(data.lastSummary) : undefined,
     lastError: data?.lastError ? String(data.lastError) : undefined,
     lastManifestPath: data?.lastManifestPath ? String(data.lastManifestPath) : undefined,
@@ -853,17 +863,23 @@ export async function getWorkspaceSynthesizerStatus(
 }
 
 export async function runWorkspaceSynthesizerNow(
+  payload?: { sourcePath?: string; force?: boolean },
   bearerToken?: string,
   gatewayBaseUrl?: string
-): Promise<{ queued: boolean; threadId?: string }> {
+) : Promise<{ queued: boolean; threadId?: string; message?: string }> {
   const res = await fetch(resolveGatewayEndpoint("/api/workspace/synthesizer/run", gatewayBaseUrl), {
     method: "POST",
-    headers: authHeaders(bearerToken)
+    headers: authHeaders(bearerToken, "application/json"),
+    body: JSON.stringify({
+      sourcePath: payload?.sourcePath,
+      force: payload?.force
+    })
   });
   const data = await parseJsonOrThrow(res);
   return {
     queued: Boolean(data?.queued),
-    threadId: data?.threadId ? String(data.threadId) : undefined
+    threadId: data?.threadId ? String(data.threadId) : undefined,
+    message: data?.message ? String(data.message) : undefined
   };
 }
 

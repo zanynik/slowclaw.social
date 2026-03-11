@@ -63,7 +63,6 @@ import type {
   StoredDraft,
 } from "./lib/types";
 import {
-  autoRunWorkspaceSynthesizer,
   archivePostedLibraryItem,
   createClawChatUserMessage as createClawChatUserMessageViaGateway,
   createFeedContentAgent,
@@ -120,10 +119,11 @@ const UI_TAB_STORAGE_KEY = "slowclaw.ui.tab";
 
 const DESKTOP_SECRET_SERVICE = "social.slowclaw.gateway";
 const PROVIDER_API_KEY_SECRET_ACCOUNT = "provider.api_key";
+const DEFAULT_RECORDING_HINT = "Ready to add a journal note, audio, or video.";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
-type MobileTab = "journal" | "feed" | "todos" | "events" | "chat" | "profile";
+type MobileTab = "journal" | "feed" | "todos" | "events" | "profile";
 type ThemeMode = "light" | "dark";
 type DesktopGatewayBootstrap = {
   token?: string | null;
@@ -159,7 +159,6 @@ function defaultMobileTab(): MobileTab {
   return saved === "feed" ||
     saved === "todos" ||
     saved === "events" ||
-    saved === "chat" ||
     saved === "profile"
     ? saved
     : "journal";
@@ -882,7 +881,7 @@ function App() {
   const [workflowTemplateSubmitting, setWorkflowTemplateSubmitting] = useState(false);
   const [workflowTemplateStatus, setWorkflowTemplateStatus] = useState("");
   const [workflowToggleBusyKey, setWorkflowToggleBusyKey] = useState("");
-  const [recordingHint, setRecordingHint] = useState("Ready to add a journal note, audio, or video.");
+  const [recordingHint, setRecordingHint] = useState(DEFAULT_RECORDING_HINT);
   const [mediaPreviewUrl, setMediaPreviewUrl] = useState<string>("");
   const [mediaPreviewMime, setMediaPreviewMime] = useState<string>("");
   const [mediaPreviewLoading, setMediaPreviewLoading] = useState(false);
@@ -994,6 +993,10 @@ function App() {
     { key: "events", label: "Events", state: workspaceSynthStatus.artifactStates?.events },
     { key: "clips", label: "Clips", state: workspaceSynthStatus.artifactStates?.clipPlans }
   ];
+  const workspaceSynthRunning =
+    workspaceSynthStatus.status === "pending" || workspaceSynthStatus.status === "processing";
+  const workspaceSynthPendingCount = Number(workspaceSynthStatus.pendingSourceCount || 0);
+  const workspaceSynthSelectedCount = workspaceSynthStatus.selectedSourcePaths?.length || 0;
 
   useEffect(() => {
     let cancelled = false;
@@ -1435,7 +1438,7 @@ function App() {
       if (nextSelectedPath) {
         setSelectedJournalPath(nextSelectedPath);
       }
-      void triggerWorkspaceSynthesizer("journal-save", { quiet: true });
+      void loadWorkspaceSynthStatus();
     } catch (error) {
       setJournalSaveStatus(
         `Save failed (${error instanceof Error ? error.message : String(error)})`
@@ -1692,6 +1695,9 @@ function App() {
       setJournalTranscribing(false);
       setSelectedJournalItem(item);
       setSelectedJournalPath(item.path);
+      if (item.kind === "text" || item.kind === "image") {
+        setRecordingHint(DEFAULT_RECORDING_HINT);
+      }
     } else {
       setSelectedFeedItem(item);
       setSelectedFeedPath(item.path);
@@ -1824,6 +1830,7 @@ function App() {
     setSelectedJournalText("");
     setSelectedJournalItem(null);
     setSelectedJournalPath("");
+    setRecordingHint(DEFAULT_RECORDING_HINT);
     loadedTextPathRef.current = "";
     setJournalTranscribing(false);
     setJournalSaveStatus("Journal idle");
@@ -2015,15 +2022,17 @@ function App() {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
     if (!token && !isDesktopClient) {
-      return;
+      return null;
     }
     try {
       const status = await getWorkspaceSynthesizerStatus(token || undefined, gatewayBaseUrl);
       setWorkspaceSynthStatus(status);
+      return status;
     } catch (error) {
       setFeedEditStatus(
         `Workspace status unavailable (${error instanceof Error ? error.message : String(error)})`
       );
+      return null;
     }
   }
 
@@ -2063,38 +2072,39 @@ function App() {
     }
   }
 
-  async function triggerWorkspaceSynthesizer(
-    reason: "app-open" | "journal-save" | "transcript-ready",
-    options?: { quiet?: boolean }
-  ) {
+  async function refreshWorkspaceViews(options?: { runSynthIfPending?: boolean }) {
     let token = chatGatewayToken.trim();
     if (!token && isDesktopClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
-    if (!token) {
+    if (!token && !isDesktopClient) {
       return;
     }
-
-    try {
-      const result = await autoRunWorkspaceSynthesizer(
-        reason,
-        token || undefined,
-        gatewayBaseUrl
-      );
-      if (result.queued) {
-        setFeedEditStatus("Workspace synthesizer queued");
-        void loadWorkspaceSynthStatus();
-      }
-    } catch (error) {
-      if (!options?.quiet) {
-        setFeedEditStatus(
-          `Auto-run failed (${error instanceof Error ? error.message : String(error)})`
-        );
-      }
+    const status = await loadWorkspaceSynthStatus();
+    await Promise.all([
+      refreshLibrary("feed"),
+      loadFeedWorkflowSettings(),
+      loadWorkflowRunStatuses(),
+      loadWorkspaceTodos(),
+      loadWorkspaceEvents()
+    ]);
+    if (
+      options?.runSynthIfPending &&
+      status &&
+      status.status !== "pending" &&
+      status.status !== "processing" &&
+      Number(status.pendingSourceCount || 0) > 0
+    ) {
+      await runWorkspaceSynthesizerManual({ statusSnapshot: status, quietWhenIdle: true });
     }
   }
 
-  async function runWorkspaceSynthesizerManual() {
+  async function runWorkspaceSynthesizerManual(options?: {
+    sourcePath?: string;
+    force?: boolean;
+    statusSnapshot?: WorkspaceSynthesizerStatus | null;
+    quietWhenIdle?: boolean;
+  }) {
     let token = chatGatewayToken.trim();
     if (!token && isDesktopClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
@@ -2106,10 +2116,24 @@ function App() {
 
     setWorkspaceSynthBusy(true);
     try {
-      const result = await runWorkspaceSynthesizerNow(token || undefined, gatewayBaseUrl);
+      const status = options?.statusSnapshot ?? (await loadWorkspaceSynthStatus());
+      const result = await runWorkspaceSynthesizerNow(
+        {
+          sourcePath: options?.sourcePath,
+          force: options?.force
+        },
+        token || undefined,
+        gatewayBaseUrl
+      );
       if (result.queued) {
-        setFeedEditStatus("Workspace synthesizer queued");
+        const selectedCount =
+          options?.sourcePath ? 1 : status?.selectedSourcePaths?.length || 0;
+        setFeedEditStatus(
+          `Processing ${Math.max(1, selectedCount)} journal entr${Math.max(1, selectedCount) === 1 ? "y" : "ies"}...`
+        );
         await loadWorkspaceSynthStatus();
+      } else if (result.message && !options?.quietWhenIdle) {
+        setFeedEditStatus(result.message);
       }
     } catch (error) {
       setFeedEditStatus(
@@ -3554,7 +3578,6 @@ function App() {
       setFeedCreateWorkflowOpen(false);
       return;
     }
-    void triggerWorkspaceSynthesizer("app-open", { quiet: true });
     void loadFeedWorkflowSettings();
     void loadWorkspaceSynthStatus();
     void loadWorkspaceTodos();
@@ -3568,18 +3591,18 @@ function App() {
 
     void loadWorkspaceSynthStatus();
 
-    const triggerFromForeground = () => {
+    const refreshFromForeground = () => {
       if (document.visibilityState === "hidden") {
         return;
       }
-      void triggerWorkspaceSynthesizer("app-open", { quiet: true });
+      void loadWorkspaceSynthStatus();
     };
 
-    window.addEventListener("focus", triggerFromForeground);
-    document.addEventListener("visibilitychange", triggerFromForeground);
+    window.addEventListener("focus", refreshFromForeground);
+    document.addEventListener("visibilitychange", refreshFromForeground);
     return () => {
-      window.removeEventListener("focus", triggerFromForeground);
-      document.removeEventListener("visibilitychange", triggerFromForeground);
+      window.removeEventListener("focus", refreshFromForeground);
+      document.removeEventListener("visibilitychange", refreshFromForeground);
     };
   }, [workspaceTabActive, chatGatewayToken, gatewayBaseUrl]);
 
@@ -4342,6 +4365,9 @@ function App() {
   const isMediaTranscriptMode =
     !!selectedJournalItem &&
     (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video");
+  const selectedJournalSynthSourcePath =
+    selectedJournalItem?.kind === "text" ? selectedJournalItem.path : "";
+  const selectedJournalWasProcessed = Boolean(selectedJournalItem?.workspaceSynthProcessed);
   const now = new Date();
   const todayStart = startOfLocalDay(now);
   const tomorrowStart = new Date(todayStart);
@@ -4876,6 +4902,26 @@ function App() {
                   <div className="row-between">
                     <h2 style={{ margin: 0 }}>Session</h2>
                     <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+                      {selectedJournalSynthSourcePath ? (
+                        <button
+                          type="button"
+                          className="ghost text-sm"
+                          onClick={() =>
+                            void runWorkspaceSynthesizerManual({
+                              sourcePath: selectedJournalSynthSourcePath,
+                              force: selectedJournalWasProcessed
+                            })
+                          }
+                          disabled={workspaceSynthBusy || workspaceSynthRunning}
+                          title={
+                            selectedJournalWasProcessed
+                              ? "Run the synthesizer again for this journal entry"
+                              : "Process this journal entry now"
+                          }
+                        >
+                          {selectedJournalWasProcessed ? "Re-process" : "Process"}
+                        </button>
+                      ) : null}
                       <span className="text-sm muted">{journalSaveStatus !== "Journal idle" ? journalSaveStatus : ""}</span>
                       {isWritingNote && <button type="button" className="ghost" onClick={() => setIsWritingNote(false)}>Done</button>}
                     </div>
@@ -4961,9 +5007,7 @@ function App() {
                       if (feedSource === "bluesky") {
                         void fetchBlueskyFeed();
                       } else {
-                        void refreshLibrary("feed");
-                        void loadFeedWorkflowSettings();
-                        void loadWorkflowRunStatuses();
+                        void refreshWorkspaceViews({ runSynthIfPending: true });
                       }
                     }}
                   >
@@ -4978,14 +5022,14 @@ function App() {
                   className={feedSource === "local" ? "active" : ""}
                   onClick={() => setFeedSource("local")}
                 >
-                  Workspace
+                  Me
                 </button>
                 <button
                   type="button"
                   className={feedSource === "bluesky" ? "active" : ""}
                   onClick={() => setFeedSource("bluesky")}
                 >
-                  Bluesky
+                  World
                 </button>
               </div>
 
@@ -5663,7 +5707,11 @@ function App() {
                   </p>
                 </div>
                 <div className="row" style={{ gap: "0.45rem", alignItems: "center" }}>
-                  <button type="button" className="ghost text-sm" onClick={() => void loadWorkspaceTodos()}>
+                  <button
+                    type="button"
+                    className="ghost text-sm"
+                    onClick={() => void refreshWorkspaceViews({ runSynthIfPending: true })}
+                  >
                     Refresh
                   </button>
                   <button
@@ -5671,16 +5719,14 @@ function App() {
                     className="primary text-sm"
                     onClick={() => void runWorkspaceSynthesizerManual()}
                     disabled={
-                      workspaceSynthBusy ||
-                      workspaceSynthStatus.status === "pending" ||
-                      workspaceSynthStatus.status === "processing"
+                      workspaceSynthBusy || workspaceSynthRunning || workspaceSynthPendingCount === 0
                     }
                   >
-                    {workspaceSynthBusy ||
-                    workspaceSynthStatus.status === "pending" ||
-                    workspaceSynthStatus.status === "processing"
-                      ? "Running..."
-                      : "Synthesize"}
+                    {workspaceSynthBusy || workspaceSynthRunning
+                      ? "Processing..."
+                      : workspaceSynthPendingCount > 0
+                        ? `Process ${workspaceSynthPendingCount}`
+                        : "Up to date"}
                   </button>
                 </div>
               </div>
@@ -5692,7 +5738,11 @@ function App() {
                   <span className="status-pill">Overdue {overdueTodoCount}</span>
                 </div>
                 <span className="text-sm muted">
-                  Synthesizer: {workspaceSynthStatus.status}
+                  Synthesizer: {workspaceSynthRunning
+                    ? `processing ${Math.max(1, workspaceSynthSelectedCount)} entr${Math.max(1, workspaceSynthSelectedCount) === 1 ? "y" : "ies"}`
+                    : workspaceSynthPendingCount > 0
+                      ? `${workspaceSynthPendingCount} pending`
+                      : "up to date"}
                   {workspaceSynthStatus.lastRunAt
                     ? ` • ${formatTimestamp(workspaceSynthStatus.lastRunAt)}`
                     : ""}
@@ -5814,7 +5864,11 @@ function App() {
                   </p>
                 </div>
                 <div className="row" style={{ gap: "0.45rem", alignItems: "center" }}>
-                  <button type="button" className="ghost text-sm" onClick={() => void loadWorkspaceEvents()}>
+                  <button
+                    type="button"
+                    className="ghost text-sm"
+                    onClick={() => void refreshWorkspaceViews({ runSynthIfPending: true })}
+                  >
                     Refresh
                   </button>
                   <button
@@ -5822,16 +5876,14 @@ function App() {
                     className="primary text-sm"
                     onClick={() => void runWorkspaceSynthesizerManual()}
                     disabled={
-                      workspaceSynthBusy ||
-                      workspaceSynthStatus.status === "pending" ||
-                      workspaceSynthStatus.status === "processing"
+                      workspaceSynthBusy || workspaceSynthRunning || workspaceSynthPendingCount === 0
                     }
                   >
-                    {workspaceSynthBusy ||
-                    workspaceSynthStatus.status === "pending" ||
-                    workspaceSynthStatus.status === "processing"
-                      ? "Running..."
-                      : "Synthesize"}
+                    {workspaceSynthBusy || workspaceSynthRunning
+                      ? "Processing..."
+                      : workspaceSynthPendingCount > 0
+                        ? `Process ${workspaceSynthPendingCount}`
+                        : "Up to date"}
                   </button>
                 </div>
               </div>
@@ -5843,7 +5895,11 @@ function App() {
                   <span className="status-pill">Past {pastEventItems.length}</span>
                 </div>
                 <span className="text-sm muted">
-                  Synthesizer: {workspaceSynthStatus.status}
+                  Synthesizer: {workspaceSynthRunning
+                    ? `processing ${Math.max(1, workspaceSynthSelectedCount)} entr${Math.max(1, workspaceSynthSelectedCount) === 1 ? "y" : "ies"}`
+                    : workspaceSynthPendingCount > 0
+                      ? `${workspaceSynthPendingCount} pending`
+                      : "up to date"}
                   {workspaceSynthStatus.lastRunAt
                     ? ` • ${formatTimestamp(workspaceSynthStatus.lastRunAt)}`
                     : ""}
@@ -6039,58 +6095,6 @@ function App() {
                   ) : null}
                 </div>
               )}
-            </div>
-          </div>
-        ) : null}
-
-        {mobileTab === "chat" ? (
-          <div className="stack" style={{ paddingBottom: '20px' }}>
-            <div className="card" style={{ flex: 1, marginBottom: '60px' }}>
-              <div className="row-between">
-                <h2>Assistant</h2>
-                <button type="button" className="ghost" onClick={refreshClawChat}>
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-                </button>
-              </div>
-
-              <div className="stack" style={{ minHeight: '300px', overflowY: 'auto', flex: 1 }}>
-                {chatMessages.length === 0 ? (
-                  <p className="text-center muted">Send a message to start chatting with SlowClaw.</p>
-                ) : (
-                  chatMessages.map(msg => (
-                    <div key={msg.id} className={`stack`} style={{ alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
-                      <div className={`chat-bubble ${msg.role}`}>
-                        {msg.content || (msg.error ? `(error) ${msg.error}` : "(empty)")}
-                      </div>
-                      <small className="muted text-sm">{msg.status}</small>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-
-            <div style={{ position: 'fixed', bottom: '85px', left: 0, right: 0, padding: '1rem 1.5rem', background: 'var(--bg)', zIndex: 45, display: 'flex', gap: '0.5rem', maxWidth: '680px', margin: '0 auto' }}>
-              <input
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                placeholder="Message SlowClaw..."
-                style={{ borderRadius: '24px', flex: 1 }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    void sendClawChatMessage();
-                  }
-                }}
-              />
-              <button
-                type="button"
-                className="primary"
-                style={{ borderRadius: '50%', width: '48px', height: '48px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                onClick={sendClawChatMessage}
-                disabled={chatSending || !chatInput.trim()}
-              >
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
-              </button>
             </div>
           </div>
         ) : null}
@@ -6436,14 +6440,6 @@ function App() {
                 <span className="bottom-nav-badge">{todayEventItems.length + upcomingEventItems.length}</span>
               ) : null}
             </span>
-          </button>
-          <button
-            type="button"
-            className={mobileTab === "chat" ? "active" : ""}
-            onClick={() => setMobileTab("chat")}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
-            Chat
           </button>
         </nav>
       )}

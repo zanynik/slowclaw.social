@@ -57,6 +57,9 @@ export type LibraryItem = {
   mediaUrl?: string | null;
   editableText?: boolean;
   scope?: "journal" | "feed" | string;
+  workspaceSynthProcessed?: boolean;
+  workspaceSynthPending?: boolean;
+  workspaceSynthLastProcessedAt?: string | null;
 };
 
 export type GatewayQrPayload = {
