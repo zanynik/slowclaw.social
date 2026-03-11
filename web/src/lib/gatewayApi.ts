@@ -156,9 +156,58 @@ export type FeedContentAgentCreateResult = {
   creationSummary?: string;
 };
 
-export type BlueskyPersonalizedFeedRequest = {
-  serviceUrl: string;
-  accessJwt: string;
+export type WorkspaceSynthesizerStatus = {
+  status: "idle" | "pending" | "processing" | "done" | "error" | string;
+  triggerReason?: string;
+  threadId?: string;
+  lastRunAt?: string;
+  lastSourceUpdatedAt?: number;
+  lastSummary?: string;
+  lastError?: string;
+  lastManifestPath?: string;
+  artifactCounts?: {
+    insightPosts?: number;
+    todos?: number;
+    events?: number;
+    clipPlans?: number;
+  };
+};
+
+export type WorkspaceTodoItem = {
+  id: string;
+  title: string;
+  details?: string | null;
+  priority: "low" | "medium" | "high" | string;
+  modelStatus?: "open" | "done" | string;
+  statusOverride?: "open" | "done" | string | null;
+  status: "open" | "done" | string;
+  dueAt?: string | null;
+  sourcePath?: string | null;
+  sourceExcerpt?: string | null;
+  metadataJson?: string | null;
+  created: string;
+  updated: string;
+};
+
+export type WorkspaceEventItem = {
+  id: string;
+  title: string;
+  details?: string | null;
+  location?: string | null;
+  status: "confirmed" | "tentative" | "cancelled" | string;
+  startAt: string;
+  endAt?: string | null;
+  allDay: boolean;
+  sourcePath?: string | null;
+  sourceExcerpt?: string | null;
+  metadataJson?: string | null;
+  created: string;
+  updated: string;
+};
+
+export type PersonalizedFeedRequest = {
+  serviceUrl?: string;
+  accessJwt?: string;
   limit?: number;
 };
 
@@ -280,12 +329,12 @@ export async function updateRuntimeConfig(
   return parseJsonOrThrow(res);
 }
 
-export async function fetchPersonalizedBlueskyFeed(
-  payload: BlueskyPersonalizedFeedRequest,
+export async function fetchPersonalizedFeed(
+  payload: PersonalizedFeedRequest,
   bearerToken?: string,
   gatewayBaseUrl?: string
 ): Promise<PersonalizedBlueskyFeedResponse> {
-  const res = await fetch(resolveGatewayEndpoint("/api/feed/bluesky/personalized", gatewayBaseUrl), {
+  const res = await fetch(resolveGatewayEndpoint("/api/feed/personalized", gatewayBaseUrl), {
     method: "POST",
     headers: authHeaders(bearerToken, "application/json"),
     body: JSON.stringify({
@@ -298,7 +347,7 @@ export async function fetchPersonalizedBlueskyFeed(
   return {
     items: Array.isArray(data.items)
       ? data.items.map((item: any) => ({
-          sourceType: item?.sourceType === "web" ? "web" : "bluesky",
+          sourceType: item?.sourceType === "bluesky" ? "bluesky" : "web",
           feedItem: item?.feedItem || {},
           webPreview: item?.webPreview
             ? {
@@ -704,6 +753,162 @@ export async function autoRunEligibleFeedContentAgents(
       threadId: String(item?.threadId || "")
     }))
   };
+}
+
+export async function getWorkspaceSynthesizerStatus(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<WorkspaceSynthesizerStatus> {
+  const res = await fetch(
+    resolveGatewayEndpoint("/api/workspace/synthesizer/status", gatewayBaseUrl),
+    {
+      headers: authHeaders(bearerToken)
+    }
+  );
+  const data = await parseJsonOrThrow(res);
+  return {
+    status: String(data?.status || "idle"),
+    triggerReason: data?.triggerReason ? String(data.triggerReason) : undefined,
+    threadId: data?.threadId ? String(data.threadId) : undefined,
+    lastRunAt: data?.lastRunAt ? String(data.lastRunAt) : undefined,
+    lastSourceUpdatedAt:
+      typeof data?.lastSourceUpdatedAt === "number" ? data.lastSourceUpdatedAt : undefined,
+    lastSummary: data?.lastSummary ? String(data.lastSummary) : undefined,
+    lastError: data?.lastError ? String(data.lastError) : undefined,
+    lastManifestPath: data?.lastManifestPath ? String(data.lastManifestPath) : undefined,
+    artifactCounts: data?.artifactCounts
+      ? {
+          insightPosts: Number(data.artifactCounts.insightPosts || 0),
+          todos: Number(data.artifactCounts.todos || 0),
+          events: Number(data.artifactCounts.events || 0),
+          clipPlans: Number(data.artifactCounts.clipPlans || 0)
+        }
+      : undefined
+  };
+}
+
+export async function runWorkspaceSynthesizerNow(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<{ queued: boolean; threadId?: string }> {
+  const res = await fetch(resolveGatewayEndpoint("/api/workspace/synthesizer/run", gatewayBaseUrl), {
+    method: "POST",
+    headers: authHeaders(bearerToken)
+  });
+  const data = await parseJsonOrThrow(res);
+  return {
+    queued: Boolean(data?.queued),
+    threadId: data?.threadId ? String(data.threadId) : undefined
+  };
+}
+
+export async function autoRunWorkspaceSynthesizer(
+  reason: "app-open" | "journal-save" | "transcript-ready" = "app-open",
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<{ queued: boolean; threadId?: string }> {
+  const res = await fetch(
+    resolveGatewayEndpoint("/api/workspace/synthesizer/auto-run", gatewayBaseUrl),
+    {
+      method: "POST",
+      headers: authHeaders(bearerToken, "application/json"),
+      body: JSON.stringify({ reason })
+    }
+  );
+  const data = await parseJsonOrThrow(res);
+  return {
+    queued: Boolean(data?.queued),
+    threadId: data?.threadId ? String(data.threadId) : undefined
+  };
+}
+
+export async function listWorkspaceTodos(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<WorkspaceTodoItem[]> {
+  const res = await fetch(resolveGatewayEndpoint("/api/workspace/todos?limit=100", gatewayBaseUrl), {
+    headers: authHeaders(bearerToken)
+  });
+  const data = await parseJsonOrThrow(res);
+  const items = Array.isArray(data?.items) ? data.items : [];
+  return items.map((item: any) => ({
+    id: String(item?.id || ""),
+    title: String(item?.title || ""),
+    details: item?.details ? String(item.details) : undefined,
+    priority: String(item?.priority || "medium"),
+    modelStatus: item?.modelStatus ? String(item.modelStatus) : undefined,
+    statusOverride: item?.statusOverride ? String(item.statusOverride) : undefined,
+    status: String(item?.status || "open"),
+    dueAt: item?.dueAt ? String(item.dueAt) : undefined,
+    sourcePath: item?.sourcePath ? String(item.sourcePath) : undefined,
+    sourceExcerpt: item?.sourceExcerpt ? String(item.sourceExcerpt) : undefined,
+    metadataJson: item?.metadataJson ? String(item.metadataJson) : undefined,
+    created: String(item?.created || ""),
+    updated: String(item?.updated || "")
+  }));
+}
+
+export async function updateWorkspaceTodoStatus(
+  todoId: string,
+  status: "open" | "done",
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<WorkspaceTodoItem> {
+  const id = todoId.trim();
+  if (!id) {
+    throw new Error("todoId is required");
+  }
+  const res = await fetch(
+    resolveGatewayEndpoint(`/api/workspace/todos/${encodeURIComponent(id)}`, gatewayBaseUrl),
+    {
+      method: "PATCH",
+      headers: authHeaders(bearerToken, "application/json"),
+      body: JSON.stringify({ status })
+    }
+  );
+  const data = await parseJsonOrThrow(res);
+  const item = data?.item || {};
+  return {
+    id: String(item?.id || ""),
+    title: String(item?.title || ""),
+    details: item?.details ? String(item.details) : undefined,
+    priority: String(item?.priority || "medium"),
+    modelStatus: item?.modelStatus ? String(item.modelStatus) : undefined,
+    statusOverride: item?.statusOverride ? String(item.statusOverride) : undefined,
+    status: String(item?.status || "open"),
+    dueAt: item?.dueAt ? String(item.dueAt) : undefined,
+    sourcePath: item?.sourcePath ? String(item.sourcePath) : undefined,
+    sourceExcerpt: item?.sourceExcerpt ? String(item.sourceExcerpt) : undefined,
+    metadataJson: item?.metadataJson ? String(item.metadataJson) : undefined,
+    created: String(item?.created || ""),
+    updated: String(item?.updated || "")
+  };
+}
+
+export async function listWorkspaceEvents(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<WorkspaceEventItem[]> {
+  const res = await fetch(resolveGatewayEndpoint("/api/workspace/events?limit=100", gatewayBaseUrl), {
+    headers: authHeaders(bearerToken)
+  });
+  const data = await parseJsonOrThrow(res);
+  const items = Array.isArray(data?.items) ? data.items : [];
+  return items.map((item: any) => ({
+    id: String(item?.id || ""),
+    title: String(item?.title || ""),
+    details: item?.details ? String(item.details) : undefined,
+    location: item?.location ? String(item.location) : undefined,
+    status: String(item?.status || "confirmed"),
+    startAt: String(item?.startAt || ""),
+    endAt: item?.endAt ? String(item.endAt) : undefined,
+    allDay: Boolean(item?.allDay),
+    sourcePath: item?.sourcePath ? String(item.sourcePath) : undefined,
+    sourceExcerpt: item?.sourceExcerpt ? String(item.sourceExcerpt) : undefined,
+    metadataJson: item?.metadataJson ? String(item.metadataJson) : undefined,
+    created: String(item?.created || ""),
+    updated: String(item?.updated || "")
+  }));
 }
 
 export async function createFeedContentAgent(

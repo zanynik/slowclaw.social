@@ -630,12 +630,16 @@ fn provider_validation_error(name: &str) -> Option<String> {
 
 fn embedding_provider_validation_error(name: &str) -> Option<String> {
     let normalized = name.trim();
-    if normalized.eq_ignore_ascii_case("none") || normalized.eq_ignore_ascii_case("openai") {
+    if normalized.eq_ignore_ascii_case("builtin")
+        || normalized.eq_ignore_ascii_case("none")
+        || normalized.eq_ignore_ascii_case("openai")
+        || normalized.eq_ignore_ascii_case("openrouter")
+    {
         return None;
     }
 
     let Some(url) = normalized.strip_prefix("custom:") else {
-        return Some("supported values: none, openai, custom:<url>".into());
+        return Some("supported values: builtin, none, openai, openrouter, custom:<url>".into());
     };
 
     let url = url.trim();

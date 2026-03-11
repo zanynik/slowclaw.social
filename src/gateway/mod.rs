@@ -10,6 +10,7 @@
 pub mod static_files;
 pub mod local_store;
 pub mod feed_web_sources;
+pub mod workspace_synthesizer;
 
 use crate::config::{Config, TranscriptionConfig};
 use crate::gateway::feed_web_sources::DEFAULT_FEED_WEB_SOURCES;
@@ -27,7 +28,7 @@ use axum::{
     extract::{ConnectInfo, Path as AxumPath, Query, Request, State},
     http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use http_body_util::BodyExt as _;
@@ -360,6 +361,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
 
+    if config.memory.embedding_provider.trim().eq_ignore_ascii_case("builtin") {
+        let provider = config.memory.embedding_provider.clone();
+        let model = config.memory.embedding_model.clone();
+        tokio::spawn(async move {
+            if let Err(err) =
+                memory::embeddings::prewarm_builtin_embedding_assets(&provider, &model).await
+            {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to prewarm local builtin embedding assets"
+                );
+            }
+        });
+    }
+
     if let Err(err) = ensure_workflow_bot_creation_skill(&config.workspace_dir) {
         tracing::warn!("Failed to ensure workflow bot creation skill: {err}");
     }
@@ -551,12 +567,31 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/feed/workflow-settings", get(handle_feed_workflow_settings))
         .route(
             "/api/feed/bluesky/personalized",
-            post(handle_feed_bluesky_personalized),
+            post(handle_feed_personalized),
         )
+        .route("/api/feed/personalized", post(handle_feed_personalized))
         .route("/api/sync/export", get(handle_sync_export))
         .route("/api/sync/import", post(handle_sync_import))
         .route("/api/feed/workflow-run", post(handle_feed_workflow_run))
         .route("/api/feed/workflow-auto-run", post(handle_feed_workflow_auto_run))
+        .route(
+            "/api/workspace/synthesizer/status",
+            get(handle_workspace_synthesizer_status),
+        )
+        .route(
+            "/api/workspace/synthesizer/run",
+            post(handle_workspace_synthesizer_run),
+        )
+        .route(
+            "/api/workspace/synthesizer/auto-run",
+            post(handle_workspace_synthesizer_auto_run),
+        )
+        .route("/api/workspace/todos", get(handle_workspace_todos_list))
+        .route(
+            "/api/workspace/todos/:todo_id",
+            patch(handle_workspace_todo_update),
+        )
+        .route("/api/workspace/events", get(handle_workspace_events_list))
         .route("/api/drafts", get(handle_drafts_list).post(handle_drafts_upsert))
         .route(
             "/api/post-history",
@@ -981,6 +1016,24 @@ struct DraftUpsertBody {
 #[derive(serde::Deserialize)]
 struct PostHistoryListQuery {
     limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkspaceListQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSynthesizerAutoRunBody {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceTodoUpdateBody {
+    status: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1797,6 +1850,359 @@ fn queue_eligible_content_agents_for_trigger(
     }
 
     Ok(queued)
+}
+
+fn queue_workspace_synthesizer_for_trigger(
+    state: &AppState,
+    reason: &str,
+) -> Result<Option<String>> {
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let latest_source_updated_at = latest_content_agent_source_updated_at(&workspace_dir);
+    if latest_source_updated_at <= 0 {
+        return Ok(None);
+    }
+
+    let status = workspace_synthesizer::load_status(&workspace_dir);
+    if reason.eq_ignore_ascii_case("app-open")
+        && status.last_source_updated_at > 0
+        && status.last_source_updated_at >= latest_source_updated_at
+    {
+        return Ok(None);
+    }
+    if matches!(status.status.as_str(), "pending" | "processing") && !status.thread_id.trim().is_empty()
+    {
+        return Ok(Some(status.thread_id));
+    }
+
+    queue_workspace_synthesizer_run(state.clone(), reason, latest_source_updated_at).map(Some)
+}
+
+fn queue_workspace_synthesizer_run(
+    state: AppState,
+    source: &str,
+    latest_source_updated_at: i64,
+) -> Result<String> {
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let existing_status = workspace_synthesizer::load_status(&workspace_dir);
+    if matches!(existing_status.status.as_str(), "pending" | "processing")
+        && !existing_status.thread_id.trim().is_empty()
+    {
+        return Ok(existing_status.thread_id);
+    }
+    let thread_id = workspace_synthesizer::WORKSPACE_SYNTHESIZER_THREAD_ID.to_string();
+    let user_content = format!("[run] Triggered {} for Workspace Synthesizer", source.trim());
+
+    let user_record = local_store::create_chat_message(
+        &workspace_dir,
+        &thread_id,
+        "user",
+        &user_content,
+        "pending",
+        source,
+        None,
+        None,
+    )?;
+    let user_id = user_record
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let pending_status = workspace_synthesizer::WorkspaceSynthesizerStatus {
+        status: "pending".to_string(),
+        trigger_reason: source.trim().to_string(),
+        thread_id: thread_id.clone(),
+        last_source_updated_at: latest_source_updated_at,
+        last_error: String::new(),
+        last_manifest_path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH.to_string(),
+        ..workspace_synthesizer::load_status(&workspace_dir)
+    };
+    let _ = workspace_synthesizer::save_status(&workspace_dir, &pending_status);
+
+    let state_for_worker = state.clone();
+    let workspace_for_worker = workspace_dir.clone();
+    let thread_id_for_worker = thread_id.clone();
+    let user_id_for_worker = user_id.clone();
+    let source_owned = source.trim().to_string();
+    tokio::spawn(async move {
+        if let Err(err) = local_store::patch_chat_status(
+            &workspace_for_worker,
+            &user_id_for_worker,
+            "processing",
+            None,
+        ) {
+            tracing::warn!("Failed to update workspace synthesizer status to processing: {err}");
+        }
+
+        let processing_status = workspace_synthesizer::WorkspaceSynthesizerStatus {
+            status: "processing".to_string(),
+            trigger_reason: source_owned.clone(),
+            thread_id: thread_id_for_worker.clone(),
+            last_source_updated_at: latest_source_updated_at,
+            last_error: String::new(),
+            last_manifest_path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH.to_string(),
+            ..workspace_synthesizer::load_status(&workspace_for_worker)
+        };
+        let _ = workspace_synthesizer::save_status(&workspace_for_worker, &processing_status);
+
+        let media_summary = local_media_capabilities(&state_for_worker.config.lock().clone()).summary();
+        let prompt = match workspace_synthesizer::render_prompt(&media_summary) {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                let final_error = truncate_with_ellipsis(
+                    &format!("Workspace synthesizer prompt build failed.\n\n{err:#}"),
+                    4000,
+                );
+                let _ = workspace_synthesizer::save_status(
+                    &workspace_for_worker,
+                    &workspace_synthesizer::WorkspaceSynthesizerStatus {
+                        status: "error".to_string(),
+                        trigger_reason: source_owned.clone(),
+                        thread_id: thread_id_for_worker.clone(),
+                        last_source_updated_at: latest_source_updated_at,
+                        last_error: final_error.clone(),
+                        last_manifest_path:
+                            workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH.to_string(),
+                        ..workspace_synthesizer::load_status(&workspace_for_worker)
+                    },
+                );
+                let _ = local_store::create_chat_message(
+                    &workspace_for_worker,
+                    &thread_id_for_worker,
+                    "assistant",
+                    "",
+                    "error",
+                    "workspace-synthesizer",
+                    Some(&user_id_for_worker),
+                    Some(&final_error),
+                );
+                let _ = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "error",
+                    Some(&final_error),
+                );
+                return;
+            }
+        };
+
+        let run_result = tokio::time::timeout(
+            Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
+            run_local_agent_prompt_in_thread(
+                &state_for_worker,
+                &thread_id_for_worker,
+                &prompt,
+            ),
+        )
+        .await;
+
+        match run_result {
+            Ok(Ok(reply)) => {
+                let workspace_for_apply = workspace_for_worker.clone();
+                let apply_result = tokio::task::spawn_blocking(move || {
+                    let manifest = workspace_synthesizer::load_manifest(&workspace_for_apply)?;
+                    workspace_synthesizer::apply_manifest(
+                        &workspace_for_apply,
+                        &manifest,
+                        &Utc::now().to_rfc3339(),
+                    )
+                })
+                .await;
+
+                match apply_result {
+                    Ok(Ok(applied)) => {
+                        let combined_reply = if reply.trim().is_empty() {
+                            applied.summary.clone()
+                        } else {
+                            format!("{}\n\nAgent reply:\n{}", applied.summary, reply.trim())
+                        };
+                        let final_reply = truncate_with_ellipsis(combined_reply.trim(), 4000);
+                        let _ = local_store::create_chat_message(
+                            &workspace_for_worker,
+                            &thread_id_for_worker,
+                            "assistant",
+                            &final_reply,
+                            "done",
+                            "workspace-synthesizer",
+                            Some(&user_id_for_worker),
+                            None,
+                        );
+                        let _ = local_store::patch_chat_status(
+                            &workspace_for_worker,
+                            &user_id_for_worker,
+                            "done",
+                            None,
+                        );
+                        let _ = workspace_synthesizer::save_status(
+                            &workspace_for_worker,
+                            &workspace_synthesizer::WorkspaceSynthesizerStatus {
+                                status: "done".to_string(),
+                                trigger_reason: source_owned.clone(),
+                                thread_id: thread_id_for_worker.clone(),
+                                last_run_at: Utc::now().to_rfc3339(),
+                                last_source_updated_at: latest_source_updated_at,
+                                last_summary: applied.summary.clone(),
+                                last_error: String::new(),
+                                last_manifest_path:
+                                    workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH
+                                        .to_string(),
+                                artifact_counts: applied.counts,
+                                ..workspace_synthesizer::load_status(&workspace_for_worker)
+                            },
+                        );
+                    }
+                    Ok(Err(err)) => {
+                        let final_error = truncate_with_ellipsis(
+                            &format!("Workspace synthesis apply failed.\n\n{err:#}"),
+                            4000,
+                        );
+                        let _ = local_store::create_chat_message(
+                            &workspace_for_worker,
+                            &thread_id_for_worker,
+                            "assistant",
+                            "",
+                            "error",
+                            "workspace-synthesizer",
+                            Some(&user_id_for_worker),
+                            Some(&final_error),
+                        );
+                        let _ = local_store::patch_chat_status(
+                            &workspace_for_worker,
+                            &user_id_for_worker,
+                            "error",
+                            Some(&final_error),
+                        );
+                        let _ = workspace_synthesizer::save_status(
+                            &workspace_for_worker,
+                            &workspace_synthesizer::WorkspaceSynthesizerStatus {
+                                status: "error".to_string(),
+                                trigger_reason: source_owned.clone(),
+                                thread_id: thread_id_for_worker.clone(),
+                                last_source_updated_at: latest_source_updated_at,
+                                last_summary: String::new(),
+                                last_error: final_error,
+                                last_manifest_path:
+                                    workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH
+                                        .to_string(),
+                                ..workspace_synthesizer::load_status(&workspace_for_worker)
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        let final_error = truncate_with_ellipsis(
+                            &format!("Workspace synthesis apply task failed.\n\n{err:#}"),
+                            4000,
+                        );
+                        let _ = local_store::create_chat_message(
+                            &workspace_for_worker,
+                            &thread_id_for_worker,
+                            "assistant",
+                            "",
+                            "error",
+                            "workspace-synthesizer",
+                            Some(&user_id_for_worker),
+                            Some(&final_error),
+                        );
+                        let _ = local_store::patch_chat_status(
+                            &workspace_for_worker,
+                            &user_id_for_worker,
+                            "error",
+                            Some(&final_error),
+                        );
+                        let _ = workspace_synthesizer::save_status(
+                            &workspace_for_worker,
+                            &workspace_synthesizer::WorkspaceSynthesizerStatus {
+                                status: "error".to_string(),
+                                trigger_reason: source_owned.clone(),
+                                thread_id: thread_id_for_worker.clone(),
+                                last_source_updated_at: latest_source_updated_at,
+                                last_summary: String::new(),
+                                last_error: final_error,
+                                last_manifest_path:
+                                    workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH
+                                        .to_string(),
+                                ..workspace_synthesizer::load_status(&workspace_for_worker)
+                            },
+                        );
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                let final_error = truncate_with_ellipsis(
+                    &format!("Workspace synthesizer run failed.\n\n{err:#}"),
+                    4000,
+                );
+                let _ = local_store::create_chat_message(
+                    &workspace_for_worker,
+                    &thread_id_for_worker,
+                    "assistant",
+                    "",
+                    "error",
+                    "workspace-synthesizer",
+                    Some(&user_id_for_worker),
+                    Some(&final_error),
+                );
+                let _ = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "error",
+                    Some(&final_error),
+                );
+                let _ = workspace_synthesizer::save_status(
+                    &workspace_for_worker,
+                    &workspace_synthesizer::WorkspaceSynthesizerStatus {
+                        status: "error".to_string(),
+                        trigger_reason: source_owned,
+                        thread_id: thread_id_for_worker,
+                        last_source_updated_at: latest_source_updated_at,
+                        last_summary: String::new(),
+                        last_error: final_error,
+                        last_manifest_path:
+                            workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH.to_string(),
+                        ..workspace_synthesizer::load_status(&workspace_for_worker)
+                    },
+                );
+            }
+            Err(_) => {
+                let final_error = format!(
+                    "Workspace synthesizer timed out after {}s",
+                    CONTENT_AGENT_TIMEOUT_SECS
+                );
+                let _ = local_store::create_chat_message(
+                    &workspace_for_worker,
+                    &thread_id_for_worker,
+                    "assistant",
+                    "",
+                    "error",
+                    "workspace-synthesizer",
+                    Some(&user_id_for_worker),
+                    Some(&final_error),
+                );
+                let _ = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "error",
+                    Some(&final_error),
+                );
+                let _ = workspace_synthesizer::save_status(
+                    &workspace_for_worker,
+                    &workspace_synthesizer::WorkspaceSynthesizerStatus {
+                        status: "error".to_string(),
+                        trigger_reason: source_owned,
+                        thread_id: thread_id_for_worker,
+                        last_source_updated_at: latest_source_updated_at,
+                        last_summary: String::new(),
+                        last_error: final_error,
+                        last_manifest_path:
+                            workspace_synthesizer::WORKSPACE_SYNTHESIZER_MANIFEST_PATH.to_string(),
+                        ..workspace_synthesizer::load_status(&workspace_for_worker)
+                    },
+                );
+            }
+        }
+    });
+
+    Ok(thread_id)
 }
 
 async fn run_local_agent_prompt_in_thread(
@@ -2739,32 +3145,232 @@ async fn handle_feed_workflow_auto_run(
     }
 }
 
-async fn handle_feed_bluesky_personalized(
+async fn handle_workspace_synthesizer_status(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<BlueskyPersonalizedFeedRequest>,
 ) -> impl IntoResponse {
-    if let Some(err) = pairing_auth_error(&state, &headers, "Bluesky personalized feed") {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Workspace synthesizer status") {
+        return err;
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let status = workspace_synthesizer::load_status(&workspace_dir);
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+async fn handle_workspace_synthesizer_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Workspace synthesizer run") {
+        return err;
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let latest_source_updated_at = latest_content_agent_source_updated_at(&workspace_dir);
+    if latest_source_updated_at <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "No journal text sources are available yet"})),
+        );
+    }
+
+    match queue_workspace_synthesizer_run(
+        state.clone(),
+        "manual",
+        latest_source_updated_at,
+    ) {
+        Ok(thread_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "queued": true,
+                "threadId": thread_id,
+            })),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        ),
+    }
+}
+
+async fn handle_workspace_synthesizer_auto_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WorkspaceSynthesizerAutoRunBody>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Workspace synthesizer auto run") {
+        return err;
+    }
+
+    let reason = body
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("app-open");
+
+    match queue_workspace_synthesizer_for_trigger(&state, reason) {
+        Ok(Some(thread_id)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "queued": true,
+                "threadId": thread_id,
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "queued": false,
+            })),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        ),
+    }
+}
+
+async fn handle_workspace_todos_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceListQuery>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Workspace todos") {
+        return err;
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let limit = query.limit.unwrap_or(100);
+    match local_store::list_workspace_todos(&workspace_dir, limit) {
+        Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        ),
+    }
+}
+
+async fn handle_workspace_todo_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(todo_id): AxumPath<String>,
+    Json(body): Json<WorkspaceTodoUpdateBody>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Workspace todo update") {
+        return err;
+    }
+
+    let status = body.status.unwrap_or_default().trim().to_ascii_lowercase();
+    if status != "open" && status != "done" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "status must be `open` or `done`"})),
+        );
+    }
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let update = local_store::WorkspaceTodoStatusUpdate {
+        id: todo_id,
+        status_override: status,
+    };
+    match local_store::update_workspace_todo_status(&workspace_dir, &update) {
+        Ok(item) => (StatusCode::OK, Json(serde_json::json!({ "item": item }))),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        ),
+    }
+}
+
+async fn handle_workspace_events_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceListQuery>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Workspace events") {
+        return err;
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let limit = query.limit.unwrap_or(100);
+    match local_store::list_workspace_events(&workspace_dir, limit) {
+        Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        ),
+    }
+}
+
+async fn handle_feed_personalized(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PersonalizedFeedRequest>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Personalized feed") {
         return err;
     }
 
     let limit = body.limit.unwrap_or(30).clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
     let config_snapshot = state.config.lock().clone();
-
-    let fallback_candidates = || async {
-        fetch_bluesky_fallback_candidates(&body.service_url, &body.access_jwt, limit).await
+    let workspace_dir = config_snapshot.workspace_dir.clone();
+    let bluesky_auth = match (
+        body.service_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        body.access_jwt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (Some(service_url), Some(access_jwt)) => {
+            Some((service_url.to_string(), access_jwt.to_string()))
+        }
+        _ => None,
     };
 
-    let (embedder, _embedder_message) = match resolve_feed_embedder(&config_snapshot).await {
-        Ok((Some(embedder), message)) => (embedder, message),
-        Ok((None, message)) => {
-            let unavailable_message = message.unwrap_or_else(|| {
-                "Local all-MiniLM embeddings are unavailable. Showing raw Bluesky feed."
-                    .to_string()
-            });
-            let raw_items = match fallback_candidates().await {
-                Ok(candidates) => build_raw_personalized_items(candidates, limit),
-                Err(err) => {
+    let fallback_candidates = || {
+        let bluesky_auth = bluesky_auth.clone();
+        async move {
+            match bluesky_auth.as_ref() {
+                Some((service_url, access_jwt)) => {
+                    fetch_bluesky_fallback_candidates(service_url, access_jwt, limit).await
+                }
+                None => Ok(Vec::new()),
+            }
+        }
+    };
+
+    let (embedder, embedder_message) = match resolve_feed_embedder(&config_snapshot).await {
+        Ok((embedder, message)) => (embedder, message),
+        Err(err) => (
+            None,
+            Some(format!(
+                "Failed to initialize the configured embedding provider: {err}"
+            )),
+        ),
+    };
+
+    if let Err(err) = refresh_cached_content_sources(&workspace_dir, embedder.clone()).await {
+        tracing::warn!("Failed to refresh cached content sources: {err}");
+    }
+
+    let recent_content_items = build_recent_content_items(&workspace_dir, limit).unwrap_or_default();
+
+    let Some(embedder) = embedder else {
+        let mut items = recent_content_items.clone();
+        match fallback_candidates().await {
+            Ok(candidates) => append_feed_items_up_to_limit(
+                &mut items,
+                build_raw_personalized_items(candidates, limit),
+                limit,
+            ),
+            Err(err) => {
+                if items.is_empty() {
                     return (
                         StatusCode::BAD_GATEWAY,
                         Json(serde_json::json!({
@@ -2772,50 +3378,47 @@ async fn handle_feed_bluesky_personalized(
                         })),
                     );
                 }
-            };
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "items": raw_items,
-                    "profileStatus": "embeddingUnavailable",
-                    "profileStats": InterestProfileStats::default(),
-                    "usedFallback": true,
-                    "message": unavailable_message,
-                })),
-            );
+            }
         }
-        Err(err) => {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "items": Vec::<PersonalizedBlueskyItem>::new(),
-                    "profileStatus": "embeddingUnavailable",
-                    "profileStats": InterestProfileStats::default(),
-                    "usedFallback": true,
-                    "message": format!("Failed to initialize local feed embeddings: {err}"),
-                })),
-            );
-        }
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": items,
+                "profileStatus": "embeddingUnavailable",
+                "profileStats": InterestProfileStats::default(),
+                "usedFallback": true,
+                "message": embedder_message.unwrap_or_else(|| {
+                    "Configured feed embeddings are unavailable. Showing recent cached content and raw Bluesky items when available.".to_string()
+                }),
+            })),
+        );
     };
 
     let profile = match rebuild_interest_profile(&config_snapshot, embedder.clone()).await {
         Ok(profile) => profile,
         Err(err) => {
-            let raw_items = match fallback_candidates().await {
-                Ok(candidates) => build_raw_personalized_items(candidates, limit),
+            let mut items = recent_content_items.clone();
+            match fallback_candidates().await {
+                Ok(candidates) => append_feed_items_up_to_limit(
+                    &mut items,
+                    build_raw_personalized_items(candidates, limit),
+                    limit,
+                ),
                 Err(fetch_err) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "error": format!("Failed to fetch Bluesky candidates: {fetch_err}")
-                        })),
-                    );
+                    if items.is_empty() {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "error": format!("Failed to fetch Bluesky candidates: {fetch_err}")
+                            })),
+                        );
+                    }
                 }
-            };
+            }
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
-                    "items": raw_items,
+                    "items": items,
                     "profileStatus": "fallbackRaw",
                     "profileStats": InterestProfileStats::default(),
                     "usedFallback": true,
@@ -2826,68 +3429,87 @@ async fn handle_feed_bluesky_personalized(
     };
 
     if profile.status != "ready" || profile.interests.is_empty() {
-        let raw_items = match fallback_candidates().await {
-            Ok(candidates) => build_raw_personalized_items(candidates, limit),
+        let mut items = recent_content_items.clone();
+        match fallback_candidates().await {
+            Ok(candidates) => append_feed_items_up_to_limit(
+                &mut items,
+                build_raw_personalized_items(candidates, limit),
+                limit,
+            ),
             Err(err) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": format!("Failed to fetch Bluesky candidates: {err}")
-                    })),
-                );
+                if items.is_empty() {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": format!("Failed to fetch Bluesky candidates: {err}")
+                        })),
+                    );
+                }
             }
-        };
+        }
         return (
             StatusCode::OK,
             Json(serde_json::json!({
-                "items": raw_items,
+                "items": items,
                 "profileStatus": profile.status,
                 "profileStats": profile.stats,
                 "usedFallback": true,
+                "message": "Personalized feed starts after text items exist under posts/.",
             })),
         );
     }
+
+    let mut ranked_items = match rank_cached_content_items(&workspace_dir, &profile.interests, limit) {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!("Failed to rank cached content items: {err}");
+            Vec::new()
+        }
+    };
 
     let (ranked_bluesky_items, raw_bluesky_candidates, mut fallback_message): (
         Vec<PersonalizedBlueskyItem>,
         Vec<CandidateFeedPost>,
         Option<String>,
-    ) = match collect_ranked_bluesky_matches(
-        &body.service_url,
-        &body.access_jwt,
-        embedder.clone(),
-        &profile.interests,
-        limit,
-    )
-    .await
-    {
-        Ok((items, raw_candidates)) => (items, raw_candidates, None),
-        Err(err) => {
-            tracing::warn!("Failed to rank personalized Bluesky feed: {err}");
-            let raw_candidates = match fallback_candidates().await {
-                Ok(candidates) => candidates,
-                Err(fetch_err) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "error": format!("Failed to fetch Bluesky candidates: {fetch_err}")
-                        })),
-                    );
-                }
-            };
-            (
-                Vec::new(),
-                raw_candidates,
-                Some("Personalized Bluesky ranking failed. Raw Bluesky results are available.".to_string()),
-            )
-        }
+    ) = match bluesky_auth.as_ref() {
+        Some((service_url, access_jwt)) => match collect_ranked_bluesky_matches(
+            service_url,
+            access_jwt,
+            embedder.clone(),
+            &profile.interests,
+            limit,
+        )
+        .await
+        {
+            Ok((items, raw_candidates)) => (items, raw_candidates, None),
+            Err(err) => {
+                tracing::warn!("Failed to rank personalized Bluesky feed: {err}");
+                let raw_candidates = match fallback_candidates().await {
+                    Ok(candidates) => candidates,
+                    Err(fetch_err) => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "error": format!("Failed to fetch Bluesky candidates: {fetch_err}")
+                            })),
+                        );
+                    }
+                };
+                (
+                    Vec::new(),
+                    raw_candidates,
+                    Some("Personalized Bluesky ranking failed. Raw Bluesky results are available.".to_string()),
+                )
+            }
+        },
+        None => (Vec::new(), Vec::new(), None),
     };
+    ranked_items.extend(ranked_bluesky_items);
 
-    let mut ranked_items = ranked_bluesky_items;
     match collect_web_search_candidates(&config_snapshot, &profile.interests).await {
         Ok(web_candidates) if !web_candidates.is_empty() => {
             match rank_web_candidates(
-                &config_snapshot.workspace_dir,
+                &workspace_dir,
                 embedder,
                 &profile.interests,
                 web_candidates,
@@ -2899,8 +3521,10 @@ async fn handle_feed_bluesky_personalized(
                 Err(err) => {
                     tracing::warn!("Failed to rank web feed candidates: {err}");
                     if fallback_message.is_none() {
-                        fallback_message =
-                            Some("Web link discovery failed; showing personalized Bluesky results only.".to_string());
+                        fallback_message = Some(
+                            "Web link discovery failed; showing cached and Bluesky results only."
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -2910,7 +3534,7 @@ async fn handle_feed_bluesky_personalized(
             tracing::warn!("Failed to collect web feed candidates: {err}");
             if fallback_message.is_none() {
                 fallback_message =
-                    Some("Web link discovery failed; showing personalized Bluesky results only.".to_string());
+                    Some("Web link discovery failed; showing cached and Bluesky results only.".to_string());
             }
         }
     }
@@ -2918,15 +3542,24 @@ async fn handle_feed_bluesky_personalized(
     sort_personalized_items(&mut ranked_items);
     ranked_items.truncate(limit);
     if ranked_items.is_empty() {
-        let raw_items = build_raw_personalized_items(raw_bluesky_candidates, limit);
+        let mut fallback_items = recent_content_items;
+        append_feed_items_up_to_limit(
+            &mut fallback_items,
+            build_raw_personalized_items(raw_bluesky_candidates, limit),
+            limit,
+        );
         let message = fallback_message.unwrap_or_else(|| {
-            "No web or Bluesky matches passed the similarity threshold. Showing raw Bluesky feed."
-                .to_string()
+            if fallback_items.is_empty() {
+                "No personalized matches are available yet.".to_string()
+            } else {
+                "No matches passed the similarity threshold. Showing recent cached content and raw Bluesky items."
+                    .to_string()
+            }
         });
         return (
             StatusCode::OK,
             Json(serde_json::json!({
-                "items": raw_items,
+                "items": fallback_items,
                 "profileStatus": "fallbackRaw",
                 "profileStats": profile.stats,
                 "usedFallback": true,
@@ -4041,8 +4674,8 @@ async fn handle_journal_text(
         }
     };
 
-    if let Err(err) = queue_eligible_content_agents_for_trigger(&state, ContentAgentAutoRunTrigger::JournalSave) {
-        tracing::warn!("Failed to queue content agents after journal save: {err}");
+    if let Err(err) = queue_workspace_synthesizer_for_trigger(&state, "journal-save") {
+        tracing::warn!("Failed to queue workspace synthesizer after journal save: {err}");
     }
 
     let resp = serde_json::json!({
@@ -4490,11 +5123,10 @@ fn enqueue_transcription_job(
         };
 
         if final_state.status == "done" {
-            if let Err(err) = queue_eligible_content_agents_for_trigger(
-                &state_for_task,
-                ContentAgentAutoRunTrigger::TranscriptReady,
-            ) {
-                tracing::warn!("Failed to queue content agents after transcription: {err}");
+            if let Err(err) =
+                queue_workspace_synthesizer_for_trigger(&state_for_task, "transcript-ready")
+            {
+                tracing::warn!("Failed to queue workspace synthesizer after transcription: {err}");
             }
         }
 
@@ -4958,16 +5590,18 @@ const BLUESKY_DISCOVER_FEED_URI: &str =
 const BLUESKY_PERSONALIZED_PAGE_LIMIT_PER_SOURCE: usize = 10;
 const BLUESKY_PERSONALIZED_MATCH_LIMIT: usize = 10;
 const BLUESKY_PERSONALIZED_PAGE_SIZE: usize = 30;
-const FEED_LOCAL_EMBEDDING_MODEL_PRIMARY: &str = "all-minilm";
-const FEED_LOCAL_EMBEDDING_MODEL_FALLBACK: &str = "all-minilm:latest";
-const FEED_LOCAL_EMBEDDING_DIMENSIONS: usize = 384;
-const FEED_LOCAL_EMBEDDING_PULL_TIMEOUT_SECS: u64 = 25;
 const FEED_WEB_SOURCE_KIND: &str = "hn-popular-blogs-2025";
 const FEED_WEB_PREVIEW_CACHE_TTL_SECS: i64 = 24 * 60 * 60;
 const FEED_WEB_INTEREST_QUERY_COUNT: usize = 3;
 const FEED_WEB_DOMAIN_BATCH_SIZE: usize = 5;
 const FEED_WEB_DOMAIN_BATCHES_PER_INTEREST: usize = 2;
 const FEED_WEB_RESULT_LIMIT_PER_QUERY: usize = 5;
+const CONTENT_SOURCE_REFRESH_TTL_SECS: i64 = 30 * 60;
+const CONTENT_SOURCE_REFRESH_BATCH_SIZE: usize = 6;
+const CONTENT_SOURCE_ITEM_LIMIT: usize = 12;
+const CONTENT_RANK_CANDIDATE_LIMIT: usize = 160;
+const CONTENT_TEXT_MAX_CHARS: usize = 2400;
+const CONTENT_FETCH_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4984,9 +5618,9 @@ struct WebFeedPreview {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BlueskyPersonalizedFeedRequest {
-    service_url: String,
-    access_jwt: String,
+struct PersonalizedFeedRequest {
+    service_url: Option<String>,
+    access_jwt: Option<String>,
     limit: Option<usize>,
 }
 
@@ -5033,6 +5667,17 @@ struct CandidateWebResult {
     domain: String,
     provider: String,
     search_query: String,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedFeedEntry {
+    external_id: String,
+    canonical_url: String,
+    title: String,
+    author: String,
+    summary: String,
+    content_text: String,
+    published_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5515,6 +6160,555 @@ fn html_unescape_basic(raw: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
+fn xml_block_regex(tag: &str) -> Regex {
+    Regex::new(&format!(r"(?is)<{tag}\b[^>]*>(.*?)</{tag}>", tag = regex::escape(tag)))
+        .expect("valid XML block regex")
+}
+
+fn xml_tag_regex(tag: &str) -> Regex {
+    Regex::new(&format!(r"(?is)<{tag}\b[^>]*>(.*?)</{tag}>", tag = regex::escape(tag)))
+        .expect("valid XML tag regex")
+}
+
+fn xml_link_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r#"(?is)<link\b([^>]*)>"#).expect("valid XML link regex"))
+}
+
+fn xml_href_attr_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r#"(?is)\bhref\s*=\s*["']([^"']+)["']"#).expect("valid href regex")
+    })
+}
+
+fn xml_rel_attr_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r#"(?is)\brel\s*=\s*["']([^"']+)["']"#).expect("valid rel regex")
+    })
+}
+
+fn html_tag_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?is)<[^>]+>").expect("valid HTML tag regex"))
+}
+
+fn html_break_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?is)<br\s*/?>").expect("valid break regex"))
+}
+
+fn html_paragraph_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?is)</p\s*>").expect("valid paragraph regex"))
+}
+
+fn collapse_whitespace(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn sanitize_feed_text(raw: &str) -> String {
+    let without_breaks = html_break_regex().replace_all(raw, "\n");
+    let with_paragraphs = html_paragraph_regex().replace_all(&without_breaks, "\n");
+    let without_tags = html_tag_regex().replace_all(&with_paragraphs, " ");
+    let without_cdata = without_tags
+        .replace("<![CDATA[", "")
+        .replace("]]>", "")
+        .replace("&apos;", "'");
+    collapse_whitespace(&html_unescape_basic(&without_cdata))
+}
+
+fn extract_xml_tag_text(fragment: &str, tags: &[&str]) -> Option<String> {
+    for tag in tags {
+        let regex = xml_tag_regex(tag);
+        if let Some(capture) = regex.captures(fragment) {
+            if let Some(value) = capture.get(1) {
+                let sanitized = sanitize_feed_text(value.as_str());
+                if !sanitized.is_empty() {
+                    return Some(sanitized);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_atom_link(fragment: &str, base_url: &str) -> Option<String> {
+    let mut fallback: Option<String> = None;
+    for capture in xml_link_regex().captures_iter(fragment) {
+        let attrs = capture.get(1).map(|value| value.as_str()).unwrap_or("");
+        let href = xml_href_attr_regex()
+            .captures(attrs)
+            .and_then(|value| value.get(1))
+            .map(|value| value.as_str().trim().to_string());
+        let Some(href) = href.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let rel = xml_rel_attr_regex()
+            .captures(attrs)
+            .and_then(|value| value.get(1))
+            .map(|value| value.as_str().trim().to_ascii_lowercase());
+        if rel.as_deref() != Some("self") {
+            return Some(absolutize_feed_url(base_url, &href));
+        }
+        if fallback.is_none() {
+            fallback = Some(absolutize_feed_url(base_url, &href));
+        }
+    }
+    fallback
+}
+
+fn absolutize_feed_url(base_url: &str, raw_url: &str) -> String {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(parsed) = reqwest::Url::parse(trimmed) {
+        return parsed.to_string();
+    }
+    reqwest::Url::parse(base_url)
+        .and_then(|base| base.join(trimmed))
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| trimmed.to_string())
+}
+
+fn normalize_feed_timestamp(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return parsed.with_timezone(&Utc).to_rfc3339();
+    }
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc2822(trimmed) {
+        return parsed.with_timezone(&Utc).to_rfc3339();
+    }
+    trimmed.to_string()
+}
+
+fn parse_rss_feed_entries(xml: &str, base_url: &str) -> Vec<ParsedFeedEntry> {
+    let mut items = Vec::new();
+    for capture in xml_block_regex("item").captures_iter(xml) {
+        let fragment = capture.get(1).map(|value| value.as_str()).unwrap_or("");
+        let title = extract_xml_tag_text(fragment, &["title"]).unwrap_or_default();
+        let canonical_url = extract_xml_tag_text(fragment, &["link"])
+            .map(|value| absolutize_feed_url(base_url, &value))
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                extract_xml_tag_text(fragment, &["guid"])
+                    .map(|value| absolutize_feed_url(base_url, &value))
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_else(|| base_url.to_string());
+        let summary = extract_xml_tag_text(fragment, &["description"]).unwrap_or_default();
+        let content_text =
+            extract_xml_tag_text(fragment, &["content:encoded", "content", "description"])
+                .unwrap_or_else(|| summary.clone());
+        let author = extract_xml_tag_text(fragment, &["author", "dc:creator"]).unwrap_or_default();
+        let published_at = extract_xml_tag_text(fragment, &["pubDate", "published", "updated"])
+            .map(|value| normalize_feed_timestamp(&value))
+            .unwrap_or_default();
+        let external_id = extract_xml_tag_text(fragment, &["guid"])
+            .or_else(|| non_empty_string(canonical_url.clone()))
+            .unwrap_or_default();
+        if title.is_empty() && content_text.is_empty() {
+            continue;
+        }
+        items.push(ParsedFeedEntry {
+            external_id,
+            canonical_url,
+            title,
+            author,
+            summary,
+            content_text,
+            published_at,
+        });
+    }
+    items
+}
+
+fn parse_atom_feed_entries(xml: &str, base_url: &str) -> Vec<ParsedFeedEntry> {
+    let mut items = Vec::new();
+    for capture in xml_block_regex("entry").captures_iter(xml) {
+        let fragment = capture.get(1).map(|value| value.as_str()).unwrap_or("");
+        let title = extract_xml_tag_text(fragment, &["title"]).unwrap_or_default();
+        let canonical_url = extract_atom_link(fragment, base_url).unwrap_or_else(|| base_url.to_string());
+        let summary = extract_xml_tag_text(fragment, &["summary"]).unwrap_or_default();
+        let content_text = extract_xml_tag_text(fragment, &["content", "summary"])
+            .unwrap_or_else(|| summary.clone());
+        let author = xml_block_regex("author")
+            .captures(fragment)
+            .and_then(|value| value.get(1))
+            .and_then(|value| extract_xml_tag_text(value.as_str(), &["name"]))
+            .or_else(|| extract_xml_tag_text(fragment, &["author", "name"]))
+            .unwrap_or_default();
+        let published_at = extract_xml_tag_text(fragment, &["published", "updated"])
+            .map(|value| normalize_feed_timestamp(&value))
+            .unwrap_or_default();
+        let external_id = extract_xml_tag_text(fragment, &["id"])
+            .or_else(|| non_empty_string(canonical_url.clone()))
+            .unwrap_or_default();
+        if title.is_empty() && content_text.is_empty() {
+            continue;
+        }
+        items.push(ParsedFeedEntry {
+            external_id,
+            canonical_url,
+            title,
+            author,
+            summary,
+            content_text,
+            published_at,
+        });
+    }
+    items
+}
+
+fn parse_feed_entries(xml: &str, base_url: &str) -> Vec<ParsedFeedEntry> {
+    let trimmed = xml.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut items = if trimmed.contains("<feed") {
+        parse_atom_feed_entries(trimmed, base_url)
+    } else {
+        parse_rss_feed_entries(trimmed, base_url)
+    };
+    items.retain(|item| !item.canonical_url.trim().is_empty());
+    items
+}
+
+fn content_source_is_stale(last_fetch_at: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(last_fetch_at.trim())
+        .ok()
+        .map(|value| Utc::now().signed_duration_since(value.with_timezone(&Utc)).num_seconds())
+        .map(|age| age < 0 || age > CONTENT_SOURCE_REFRESH_TTL_SECS)
+        .unwrap_or(true)
+}
+
+fn content_item_embedding_text(entry: &ParsedFeedEntry) -> String {
+    let combined = format!(
+        "{}\n{}\n{}",
+        entry.title.trim(),
+        entry.summary.trim(),
+        entry.content_text.trim()
+    );
+    truncate_with_ellipsis(combined.trim(), CONTENT_TEXT_MAX_CHARS)
+}
+
+fn build_content_item_id(source_key: &str, canonical_url: &str, external_id: &str) -> String {
+    format!(
+        "content_{}",
+        content_hash_16(&format!("{source_key}\n{canonical_url}\n{external_id}"))
+    )
+}
+
+fn sync_content_sources_from_feed_web_sources(workspace_dir: &StdPath) -> Result<()> {
+    seed_default_feed_web_sources(workspace_dir)?;
+    for source in local_store::list_feed_web_sources(workspace_dir)? {
+        let source_key = source.xml_url.trim();
+        if source_key.is_empty() {
+            continue;
+        }
+        let _ = local_store::upsert_content_source(
+            workspace_dir,
+            &local_store::ContentSourceUpsert {
+                source_key: source_key.to_string(),
+                domain: source.domain.clone(),
+                title: source.title.clone(),
+                html_url: source.html_url.clone(),
+                xml_url: source.xml_url.clone(),
+                source_kind: source.source_kind.clone(),
+                enabled: source.enabled,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+struct RemoteFeedFetchResult {
+    entries: Vec<ParsedFeedEntry>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    not_modified: bool,
+}
+
+async fn fetch_remote_feed(source: &local_store::ContentSourceRecord) -> Result<RemoteFeedFetchResult> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(CONTENT_FETCH_TIMEOUT_SECS))
+        .build()?;
+    let mut request = client.get(source.xml_url.trim());
+    if !source.etag.trim().is_empty() {
+        request = request.header(reqwest::header::IF_NONE_MATCH, source.etag.trim());
+    }
+    if !source.last_modified.trim().is_empty() {
+        request = request.header(
+            reqwest::header::IF_MODIFIED_SINCE,
+            source.last_modified.trim(),
+        );
+    }
+
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch content source {}", source.xml_url))?;
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let last_modified = response
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(RemoteFeedFetchResult {
+            entries: Vec::new(),
+            etag,
+            last_modified,
+            not_modified: true,
+        });
+    }
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Feed fetch failed for {} ({status}): {body}", source.xml_url);
+    }
+
+    let body = response.bytes().await?;
+    let xml = String::from_utf8_lossy(&body);
+    Ok(RemoteFeedFetchResult {
+        entries: parse_feed_entries(&xml, &source.html_url),
+        etag,
+        last_modified,
+        not_modified: false,
+    })
+}
+
+async fn refresh_cached_content_sources(
+    workspace_dir: &StdPath,
+    embedder: Option<Arc<dyn memory::embeddings::EmbeddingProvider>>,
+) -> Result<()> {
+    sync_content_sources_from_feed_web_sources(workspace_dir)?;
+    let sources = local_store::list_content_sources(workspace_dir, 128)?;
+    let stale_sources: Vec<local_store::ContentSourceRecord> = sources
+        .into_iter()
+        .filter(|source| content_source_is_stale(&source.last_fetch_at))
+        .take(CONTENT_SOURCE_REFRESH_BATCH_SIZE)
+        .collect();
+
+    for source in stale_sources {
+        let fetched_at = Utc::now().to_rfc3339();
+        match fetch_remote_feed(&source).await {
+            Ok(result) => {
+                if !result.not_modified {
+                    for entry in result.entries.into_iter().take(CONTENT_SOURCE_ITEM_LIMIT) {
+                        let embedding_text = content_item_embedding_text(&entry);
+                        if embedding_text.trim().is_empty() {
+                            continue;
+                        }
+                        let embedding = if let Some(embedder) = embedder.as_ref() {
+                            match embedder.embed_one(&embedding_text).await {
+                                Ok(value) => vec_to_bytes(&value),
+                                Err(err) => {
+                                    tracing::debug!(
+                                        source = %source.xml_url,
+                                        url = %entry.canonical_url,
+                                        error = %err,
+                                        "Failed to embed feed content item"
+                                    );
+                                    Vec::new()
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let canonical_url = if entry.canonical_url.trim().is_empty() {
+                            source.html_url.clone()
+                        } else {
+                            entry.canonical_url.clone()
+                        };
+                        let id = build_content_item_id(
+                            &source.source_key,
+                            &canonical_url,
+                            &entry.external_id,
+                        );
+                        let content_hash = content_hash_16(&embedding_text);
+                        let _ = local_store::upsert_content_item(
+                            workspace_dir,
+                            &local_store::ContentItemUpsert {
+                                id,
+                                source_key: source.source_key.clone(),
+                                source_title: source.title.clone(),
+                                source_kind: source.source_kind.clone(),
+                                domain: source.domain.clone(),
+                                canonical_url,
+                                external_id: entry.external_id.clone(),
+                                title: entry.title.clone(),
+                                author: entry.author.clone(),
+                                summary: truncate_with_ellipsis(entry.summary.trim(), 280),
+                                content_text: embedding_text,
+                                content_hash,
+                                embedding,
+                                published_at: entry.published_at.clone(),
+                                discovered_at: fetched_at.clone(),
+                            },
+                        )?;
+                    }
+                }
+                local_store::update_content_source_fetch(
+                    workspace_dir,
+                    &source.source_key,
+                    &fetched_at,
+                    result.etag.as_deref(),
+                    result.last_modified.as_deref(),
+                    None,
+                    true,
+                )?;
+            }
+            Err(err) => {
+                tracing::debug!(
+                    source = %source.xml_url,
+                    error = %err,
+                    "Failed to refresh content source"
+                );
+                local_store::update_content_source_fetch(
+                    workspace_dir,
+                    &source.source_key,
+                    &fetched_at,
+                    None,
+                    None,
+                    Some(&err.to_string()),
+                    false,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn content_preview_timestamp(item: &local_store::ContentItemRecord) -> String {
+    non_empty_string(item.published_at.clone())
+        .or_else(|| non_empty_string(item.discovered_at.clone()))
+        .or_else(|| non_empty_string(item.updated_at.clone()))
+        .unwrap_or_default()
+}
+
+fn build_content_preview(item: &local_store::ContentItemRecord) -> WebFeedPreview {
+    let description = if !item.summary.trim().is_empty() {
+        item.summary.trim().to_string()
+    } else {
+        truncate_with_ellipsis(item.content_text.trim(), 220)
+    };
+    WebFeedPreview {
+        url: item.canonical_url.clone(),
+        title: if item.title.trim().is_empty() {
+            item.canonical_url.clone()
+        } else {
+            item.title.clone()
+        },
+        description,
+        image_url: None,
+        domain: item.domain.clone(),
+        provider: "RSS/Atom".to_string(),
+        provider_snippet: non_empty_string(item.source_title.clone()),
+        discovered_at: content_preview_timestamp(item),
+    }
+}
+
+fn build_recent_content_items(
+    workspace_dir: &StdPath,
+    limit: usize,
+) -> Result<Vec<PersonalizedBlueskyItem>> {
+    let items = local_store::list_recent_content_items(workspace_dir, limit)?;
+    Ok(items
+        .into_iter()
+        .filter(|item| !item.canonical_url.trim().is_empty())
+        .map(|item| {
+            let preview = build_content_preview(&item);
+            PersonalizedBlueskyItem {
+                source_type: "web".to_string(),
+                feed_item: serde_json::json!({
+                    "url": item.canonical_url,
+                    "title": item.title,
+                    "description": item.summary,
+                    "domain": item.domain,
+                    "author": item.author,
+                    "sourceTitle": item.source_title,
+                    "publishedAt": item.published_at,
+                }),
+                web_preview: Some(preview),
+                score: None,
+                matched_interest_label: None,
+                matched_interest_score: None,
+                passed_threshold: false,
+            }
+        })
+        .collect())
+}
+
+fn rank_cached_content_items(
+    workspace_dir: &StdPath,
+    interests: &[ActiveInterest],
+    limit: usize,
+) -> Result<Vec<PersonalizedBlueskyItem>> {
+    let mut ranked = Vec::new();
+    for item in local_store::list_recent_content_items(workspace_dir, CONTENT_RANK_CANDIDATE_LIMIT)? {
+        let embedding = bytes_to_vec(&item.embedding);
+        if embedding.is_empty() {
+            continue;
+        }
+        let (best_weighted, best_similarity, best_label) =
+            best_interest_match(&embedding, interests);
+        if best_weighted < FEED_MATCH_THRESHOLD {
+            continue;
+        }
+        let preview = build_content_preview(&item);
+        ranked.push(PersonalizedBlueskyItem {
+            source_type: "web".to_string(),
+            feed_item: serde_json::json!({
+                "url": item.canonical_url,
+                "title": item.title,
+                "description": item.summary,
+                "domain": item.domain,
+                "author": item.author,
+                "sourceTitle": item.source_title,
+                "publishedAt": item.published_at,
+            }),
+            web_preview: Some(preview),
+            score: Some(best_weighted),
+            matched_interest_label: best_label,
+            matched_interest_score: if best_similarity > 0.0 {
+                Some(best_similarity)
+            } else {
+                None
+            },
+            passed_threshold: true,
+        });
+    }
+    sort_personalized_items(&mut ranked);
+    ranked.truncate(limit);
+    Ok(ranked)
+}
+
+fn append_feed_items_up_to_limit(
+    target: &mut Vec<PersonalizedBlueskyItem>,
+    mut extra: Vec<PersonalizedBlueskyItem>,
+    limit: usize,
+) {
+    if target.len() >= limit {
+        return;
+    }
+    let remaining = limit - target.len();
+    extra.truncate(remaining);
+    target.extend(extra);
+}
+
 async fn fetch_web_preview_html(url: &str) -> Result<String> {
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
@@ -5650,159 +6844,36 @@ async fn resolve_web_preview(
     preview
 }
 
-fn local_feed_embedding_base_urls(config: &Config) -> Vec<String> {
-    let mut urls = Vec::new();
-    if let Some(api_url) = config
-        .api_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let trimmed = api_url.trim_end_matches('/');
-        if trimmed.ends_with("/api") {
-            urls.push(format!("custom:{trimmed}"));
-        } else if !trimmed.ends_with("/api/embeddings") && !trimmed.ends_with("/embeddings") {
-            urls.push(format!("custom:{trimmed}/api"));
-        } else {
-            urls.push(format!("custom:{trimmed}"));
-        }
-    }
-    urls.push("custom:http://127.0.0.1:11434/api".to_string());
-    urls.sort();
-    urls.dedup();
-    urls
-}
-
-fn normalize_ollama_endpoint_root(raw_url: &str) -> String {
-    let trimmed = raw_url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    trimmed
-        .trim_end_matches("/embeddings")
-        .trim_end_matches("/v1")
-        .trim_end_matches("/api")
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn ollama_endpoint_is_local(endpoint_url: &str) -> bool {
-    reqwest::Url::parse(endpoint_url)
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"))
-}
-
-fn local_ollama_pull_endpoints(config: &Config) -> Vec<String> {
-    let mut endpoints = Vec::new();
-    if let Some(api_url) = config
-        .api_url
-        .as_deref()
-        .map(normalize_ollama_endpoint_root)
-        .filter(|value| !value.is_empty() && ollama_endpoint_is_local(value))
-    {
-        endpoints.push(api_url);
-    }
-    endpoints.push("http://127.0.0.1:11434".to_string());
-    endpoints.push("http://localhost:11434".to_string());
-    endpoints.sort();
-    endpoints.dedup();
-    endpoints
-}
-
-async fn pull_local_feed_embedding_model(endpoint: &str, model: &str) -> Result<()> {
-    let url = format!("{}/api/pull", endpoint.trim_end_matches('/'));
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(FEED_LOCAL_EMBEDDING_PULL_TIMEOUT_SECS))
-        .build()?
-        .post(url)
-        .json(&serde_json::json!({
-            "model": model,
-            "stream": false,
-        }))
-        .send()
-        .await
-        .with_context(|| format!("Failed to reach local Ollama at {endpoint}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Ollama pull failed at {endpoint} ({status}): {body}");
-    }
-
-    Ok(())
-}
-
-async fn bootstrap_local_feed_embeddings(config: &Config) -> Result<Option<String>> {
-    let mut failures = Vec::new();
-
-    for endpoint in local_ollama_pull_endpoints(config) {
-        for model in [
-            FEED_LOCAL_EMBEDDING_MODEL_PRIMARY,
-            FEED_LOCAL_EMBEDDING_MODEL_FALLBACK,
-        ] {
-            match pull_local_feed_embedding_model(&endpoint, model).await {
-                Ok(()) => {
-                    return Ok(Some(format!(
-                        "Bootstrapped local all-MiniLM embeddings via Ollama at {endpoint}."
-                    )));
-                }
-                Err(err) => failures.push(format!("{endpoint} [{model}]: {err}")),
-            }
-        }
-    }
-
-    if failures.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(format!(
-            "Tried to bootstrap local all-MiniLM embeddings via Ollama, but it did not succeed: {}",
-            failures.join(" | ")
-        )))
-    }
-}
-
-async fn select_feed_embedder(config: &Config) -> Result<Option<Arc<dyn memory::embeddings::EmbeddingProvider>>> {
-    let mut providers: Vec<Arc<dyn memory::embeddings::EmbeddingProvider>> = Vec::new();
-    for base_url in local_feed_embedding_base_urls(config) {
-        for model in [
-            FEED_LOCAL_EMBEDDING_MODEL_PRIMARY,
-            FEED_LOCAL_EMBEDDING_MODEL_FALLBACK,
-        ] {
-            providers.push(Arc::from(memory::embeddings::create_embedding_provider(
-                &base_url,
-                None,
-                model,
-                FEED_LOCAL_EMBEDDING_DIMENSIONS,
-            )));
-        }
-    }
-
+async fn select_feed_embedder(
+    config: &Config,
+) -> Result<Option<Arc<dyn memory::embeddings::EmbeddingProvider>>> {
     let configured = memory::create_embedder_from_config(config);
-    if configured.dimensions() > 0 {
-        providers.push(configured);
+    if configured.dimensions() == 0 {
+        return Ok(None);
     }
 
-    for provider in providers {
-        if provider.dimensions() == 0 {
-            continue;
+    match configured.embed_one("feed profile probe").await {
+        Ok(embedding) if !embedding.is_empty() => Ok(Some(configured)),
+        Ok(_) => {
+            tracing::debug!(
+                provider = config.memory.embedding_provider.trim(),
+                model = config.memory.embedding_model.trim(),
+                dimensions = configured.dimensions(),
+                "Configured feed embedder returned an empty probe vector"
+            );
+            Ok(None)
         }
-        match provider.embed_one("feed profile probe").await {
-            Ok(embedding) if !embedding.is_empty() => return Ok(Some(provider)),
-            Ok(_) => continue,
-            Err(err) => {
-                tracing::debug!(
-                    provider = provider.name(),
-                    dimensions = provider.dimensions(),
-                    error = %err,
-                    "Feed embedder probe failed"
-                );
-            }
+        Err(err) => {
+            tracing::debug!(
+                provider = config.memory.embedding_provider.trim(),
+                model = config.memory.embedding_model.trim(),
+                dimensions = configured.dimensions(),
+                error = %err,
+                "Configured feed embedder probe failed"
+            );
+            Ok(None)
         }
     }
-
-    Ok(None)
 }
 
 async fn resolve_feed_embedder(
@@ -5811,13 +6882,25 @@ async fn resolve_feed_embedder(
     Option<Arc<dyn memory::embeddings::EmbeddingProvider>>,
     Option<String>,
 )> {
+    if config.memory.embedding_provider.trim().eq_ignore_ascii_case("none") {
+        return Ok((
+            None,
+            Some(
+                "Personalized feed embeddings are disabled in [memory]. Showing recent cached content and raw Bluesky items when available.".to_string(),
+            ),
+        ));
+    }
+
     if let Some(embedder) = select_feed_embedder(config).await? {
         return Ok((Some(embedder), None));
     }
 
-    let bootstrap_message = bootstrap_local_feed_embeddings(config).await?;
-    let embedder = select_feed_embedder(config).await?;
-    Ok((embedder, bootstrap_message))
+    Ok((
+        None,
+        Some(
+            "Configured embedding provider is unavailable. Showing recent cached content and raw Bluesky items when available.".to_string(),
+        ),
+    ))
 }
 
 async fn rebuild_interest_profile(
@@ -8012,4 +9095,68 @@ mod tests {
         .unwrap();
         assert!(result.is_none());
     }
+
+    #[test]
+    fn parse_feed_entries_reads_rss_items() {
+        let xml = r#"
+            <rss version="2.0">
+              <channel>
+                <title>Example Feed</title>
+                <item>
+                  <title>First item</title>
+                  <link>https://example.com/posts/1</link>
+                  <description><![CDATA[<p>Hello <strong>world</strong></p>]]></description>
+                  <pubDate>Tue, 10 Mar 2026 10:00:00 +0000</pubDate>
+                </item>
+              </channel>
+            </rss>
+        "#;
+
+        let entries = parse_feed_entries(xml, "https://example.com/feed.xml");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "First item");
+        assert_eq!(entries[0].canonical_url, "https://example.com/posts/1");
+        assert_eq!(entries[0].summary, "Hello world");
+        assert_eq!(entries[0].published_at, "2026-03-10T10:00:00+00:00");
+    }
+
+    #[test]
+    fn parse_feed_entries_reads_atom_entries() {
+        let xml = r#"
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <title>Example Atom</title>
+              <entry>
+                <title>Atom item</title>
+                <id>tag:example.com,2026:1</id>
+                <link rel="alternate" href="/posts/atom-1" />
+                <summary type="html">&lt;p&gt;Atom summary&lt;/p&gt;</summary>
+                <updated>2026-03-10T11:00:00Z</updated>
+                <author><name>Example Author</name></author>
+              </entry>
+            </feed>
+        "#;
+
+        let entries = parse_feed_entries(xml, "https://example.com/feed.xml");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Atom item");
+        assert_eq!(entries[0].canonical_url, "https://example.com/posts/atom-1");
+        assert_eq!(entries[0].summary, "Atom summary");
+        assert_eq!(entries[0].author, "Example Author");
+    }
+
+    #[tokio::test]
+    async fn resolve_feed_embedder_returns_disabled_message_when_embeddings_are_off() {
+        let mut config = Config::default();
+        config.memory.embedding_provider = "none".to_string();
+
+        let (embedder, message) = resolve_feed_embedder(&config).await.unwrap();
+        assert!(embedder.is_none());
+        assert_eq!(
+            message.as_deref(),
+            Some(
+                "Personalized feed embeddings are disabled in [memory]. Showing recent cached content and raw Bluesky items when available."
+            )
+        );
+    }
+
 }

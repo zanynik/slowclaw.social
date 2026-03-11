@@ -67,6 +67,40 @@ pub struct MediaAssetInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkspaceTodoUpsert {
+    pub id: String,
+    pub title: String,
+    pub details: String,
+    pub priority: String,
+    pub model_status: String,
+    pub due_at: String,
+    pub source_path: String,
+    pub source_excerpt: String,
+    pub metadata_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceTodoStatusUpdate {
+    pub id: String,
+    pub status_override: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceEventUpsert {
+    pub id: String,
+    pub title: String,
+    pub details: String,
+    pub location: String,
+    pub status: String,
+    pub start_at: String,
+    pub end_at: String,
+    pub all_day: bool,
+    pub source_path: String,
+    pub source_excerpt: String,
+    pub metadata_json: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct FeedInterestRecord {
     pub id: String,
     pub label: String,
@@ -144,6 +178,75 @@ pub struct FeedWebCacheUpsert {
     pub snippet: String,
     pub search_query: String,
     pub fetched_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContentSourceRecord {
+    pub source_key: String,
+    pub domain: String,
+    pub title: String,
+    pub html_url: String,
+    pub xml_url: String,
+    pub source_kind: String,
+    pub enabled: bool,
+    pub etag: String,
+    pub last_modified: String,
+    pub last_fetch_at: String,
+    pub last_success_at: String,
+    pub last_error: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContentSourceUpsert {
+    pub source_key: String,
+    pub domain: String,
+    pub title: String,
+    pub html_url: String,
+    pub xml_url: String,
+    pub source_kind: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContentItemRecord {
+    pub id: String,
+    pub source_key: String,
+    pub source_title: String,
+    pub source_kind: String,
+    pub domain: String,
+    pub canonical_url: String,
+    pub external_id: String,
+    pub title: String,
+    pub author: String,
+    pub summary: String,
+    pub content_text: String,
+    pub content_hash: String,
+    pub embedding: Vec<u8>,
+    pub published_at: String,
+    pub discovered_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContentItemUpsert {
+    pub id: String,
+    pub source_key: String,
+    pub source_title: String,
+    pub source_kind: String,
+    pub domain: String,
+    pub canonical_url: String,
+    pub external_id: String,
+    pub title: String,
+    pub author: String,
+    pub summary: String,
+    pub content_text: String,
+    pub content_hash: String,
+    pub embedding: Vec<u8>,
+    pub published_at: String,
+    pub discovered_at: String,
 }
 
 pub fn initialize(workspace_dir: &Path) -> Result<BootstrapReport> {
@@ -406,6 +509,274 @@ pub fn list_post_history(workspace_dir: &Path, limit: usize) -> Result<Vec<serde
             "error": non_empty_opt(row.get::<_, String>(8)?),
             "createdAtClient": row.get::<_, String>(9)?,
             "created": row.get::<_, String>(10)?,
+        }))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn replace_workspace_todos(
+    workspace_dir: &Path,
+    items: &[WorkspaceTodoUpsert],
+    manifest_id: &str,
+) -> Result<usize> {
+    let mut conn = open_conn(&db_path(workspace_dir))?;
+    let tx = conn.transaction()?;
+    let now = Utc::now().to_rfc3339();
+    let mut written = 0usize;
+
+    for item in items {
+        tx.execute(
+            "INSERT INTO workspace_todos (
+                id, title, details, priority, model_status, status_override, due_at,
+                source_path, source_excerpt, metadata_json, created_at, updated_at,
+                last_manifest_id, archived
+             ) VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?10, ?11, 0)
+             ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                details = excluded.details,
+                priority = excluded.priority,
+                model_status = excluded.model_status,
+                due_at = excluded.due_at,
+                source_path = excluded.source_path,
+                source_excerpt = excluded.source_excerpt,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at,
+                last_manifest_id = excluded.last_manifest_id,
+                archived = 0",
+            params![
+                item.id,
+                item.title,
+                item.details,
+                item.priority,
+                item.model_status,
+                item.due_at,
+                item.source_path,
+                item.source_excerpt,
+                item.metadata_json,
+                now,
+                manifest_id,
+            ],
+        )
+        .with_context(|| format!("Failed to upsert workspace todo {}", item.id))?;
+        written += 1;
+    }
+
+    tx.execute(
+        "UPDATE workspace_todos
+         SET archived = 1, updated_at = ?2
+         WHERE last_manifest_id != ?1",
+        params![manifest_id, now],
+    )
+    .context("Failed to archive stale workspace todos")?;
+
+    tx.commit()?;
+    Ok(written)
+}
+
+pub fn list_workspace_todos(workspace_dir: &Path, limit: usize) -> Result<Vec<serde_json::Value>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let lim = i64::try_from(limit.max(1)).unwrap_or(50);
+    let mut stmt = conn.prepare(
+        "SELECT
+            id, title, details, priority, model_status, status_override, due_at,
+            source_path, source_excerpt, metadata_json, created_at, updated_at
+         FROM workspace_todos
+         WHERE archived = 0
+         ORDER BY
+            CASE
+                WHEN COALESCE(NULLIF(status_override, ''), model_status) = 'done' THEN 1
+                ELSE 0
+            END ASC,
+            CASE priority
+                WHEN 'high' THEN 0
+                WHEN 'medium' THEN 1
+                WHEN 'low' THEN 2
+                ELSE 3
+            END ASC,
+            updated_at DESC,
+            id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![lim], |row| {
+        let model_status: String = row.get(4)?;
+        let status_override: String = row.get(5)?;
+        let effective_status = non_empty_opt(status_override.clone()).unwrap_or(model_status.clone());
+        Ok(serde_json::json!({
+            "id": row.get::<_, String>(0)?,
+            "title": row.get::<_, String>(1)?,
+            "details": non_empty_opt(row.get::<_, String>(2)?),
+            "priority": row.get::<_, String>(3)?,
+            "modelStatus": model_status,
+            "statusOverride": non_empty_opt(status_override),
+            "status": effective_status,
+            "dueAt": non_empty_opt(row.get::<_, String>(6)?),
+            "sourcePath": non_empty_opt(row.get::<_, String>(7)?),
+            "sourceExcerpt": non_empty_opt(row.get::<_, String>(8)?),
+            "metadataJson": non_empty_opt(row.get::<_, String>(9)?),
+            "created": row.get::<_, String>(10)?,
+            "updated": row.get::<_, String>(11)?,
+        }))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn update_workspace_todo_status(
+    workspace_dir: &Path,
+    update: &WorkspaceTodoStatusUpdate,
+) -> Result<serde_json::Value> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE workspace_todos
+         SET status_override = ?2, updated_at = ?3
+         WHERE id = ?1",
+        params![update.id.trim(), update.status_override.trim(), now],
+    )
+    .with_context(|| format!("Failed to update workspace todo {}", update.id))?;
+
+    let mut stmt = conn.prepare(
+        "SELECT
+            id, title, details, priority, model_status, status_override, due_at,
+            source_path, source_excerpt, metadata_json, created_at, updated_at
+         FROM workspace_todos
+         WHERE id = ?1
+         LIMIT 1",
+    )?;
+    let record = stmt
+        .query_row(params![update.id.trim()], |row| {
+            let model_status: String = row.get(4)?;
+            let status_override: String = row.get(5)?;
+            let effective_status =
+                non_empty_opt(status_override.clone()).unwrap_or(model_status.clone());
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "title": row.get::<_, String>(1)?,
+                "details": non_empty_opt(row.get::<_, String>(2)?),
+                "priority": row.get::<_, String>(3)?,
+                "modelStatus": model_status,
+                "statusOverride": non_empty_opt(status_override),
+                "status": effective_status,
+                "dueAt": non_empty_opt(row.get::<_, String>(6)?),
+                "sourcePath": non_empty_opt(row.get::<_, String>(7)?),
+                "sourceExcerpt": non_empty_opt(row.get::<_, String>(8)?),
+                "metadataJson": non_empty_opt(row.get::<_, String>(9)?),
+                "created": row.get::<_, String>(10)?,
+                "updated": row.get::<_, String>(11)?,
+            }))
+        })
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("Workspace todo not found"))?;
+
+    Ok(record)
+}
+
+pub fn replace_workspace_events(
+    workspace_dir: &Path,
+    items: &[WorkspaceEventUpsert],
+    manifest_id: &str,
+) -> Result<usize> {
+    let mut conn = open_conn(&db_path(workspace_dir))?;
+    let tx = conn.transaction()?;
+    let now = Utc::now().to_rfc3339();
+    let mut written = 0usize;
+
+    for item in items {
+        tx.execute(
+            "INSERT INTO workspace_events (
+                id, title, details, location, status, start_at, end_at, all_day,
+                source_path, source_excerpt, metadata_json, created_at, updated_at,
+                last_manifest_id, archived
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, 0)
+             ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                details = excluded.details,
+                location = excluded.location,
+                status = excluded.status,
+                start_at = excluded.start_at,
+                end_at = excluded.end_at,
+                all_day = excluded.all_day,
+                source_path = excluded.source_path,
+                source_excerpt = excluded.source_excerpt,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at,
+                last_manifest_id = excluded.last_manifest_id,
+                archived = 0",
+            params![
+                item.id,
+                item.title,
+                item.details,
+                item.location,
+                item.status,
+                item.start_at,
+                item.end_at,
+                if item.all_day { 1 } else { 0 },
+                item.source_path,
+                item.source_excerpt,
+                item.metadata_json,
+                now,
+                manifest_id,
+            ],
+        )
+        .with_context(|| format!("Failed to upsert workspace event {}", item.id))?;
+        written += 1;
+    }
+
+    tx.execute(
+        "UPDATE workspace_events
+         SET archived = 1, updated_at = ?2
+         WHERE last_manifest_id != ?1",
+        params![manifest_id, now],
+    )
+    .context("Failed to archive stale workspace events")?;
+
+    tx.commit()?;
+    Ok(written)
+}
+
+pub fn list_workspace_events(workspace_dir: &Path, limit: usize) -> Result<Vec<serde_json::Value>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let lim = i64::try_from(limit.max(1)).unwrap_or(50);
+    let mut stmt = conn.prepare(
+        "SELECT
+            id, title, details, location, status, start_at, end_at, all_day,
+            source_path, source_excerpt, metadata_json, created_at, updated_at
+         FROM workspace_events
+         WHERE archived = 0
+         ORDER BY
+            CASE status
+                WHEN 'cancelled' THEN 1
+                ELSE 0
+            END ASC,
+            start_at ASC,
+            updated_at DESC,
+            id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![lim], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, String>(0)?,
+            "title": row.get::<_, String>(1)?,
+            "details": non_empty_opt(row.get::<_, String>(2)?),
+            "location": non_empty_opt(row.get::<_, String>(3)?),
+            "status": row.get::<_, String>(4)?,
+            "startAt": row.get::<_, String>(5)?,
+            "endAt": non_empty_opt(row.get::<_, String>(6)?),
+            "allDay": row.get::<_, i64>(7)? != 0,
+            "sourcePath": non_empty_opt(row.get::<_, String>(8)?),
+            "sourceExcerpt": non_empty_opt(row.get::<_, String>(9)?),
+            "metadataJson": non_empty_opt(row.get::<_, String>(10)?),
+            "created": row.get::<_, String>(11)?,
+            "updated": row.get::<_, String>(12)?,
         }))
     })?;
 
@@ -796,6 +1167,267 @@ pub fn upsert_feed_web_cache(
     })
 }
 
+pub fn list_content_sources(workspace_dir: &Path, limit: usize) -> Result<Vec<ContentSourceRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let lim = i64::try_from(limit.max(1)).unwrap_or(100);
+    let mut stmt = conn.prepare(
+        "SELECT source_key, domain, title, html_url, xml_url, source_kind, enabled,
+                etag, last_modified, last_fetch_at, last_success_at, last_error, created_at, updated_at
+         FROM content_sources
+         WHERE enabled = 1
+         ORDER BY
+            CASE WHEN NULLIF(last_fetch_at, '') IS NULL THEN 0 ELSE 1 END ASC,
+            NULLIF(last_fetch_at, '') ASC,
+            title ASC,
+            domain ASC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![lim], |row| {
+        Ok(ContentSourceRecord {
+            source_key: row.get(0)?,
+            domain: row.get(1)?,
+            title: row.get(2)?,
+            html_url: row.get(3)?,
+            xml_url: row.get(4)?,
+            source_kind: row.get(5)?,
+            enabled: row.get::<_, i64>(6)? != 0,
+            etag: row.get(7)?,
+            last_modified: row.get(8)?,
+            last_fetch_at: row.get(9)?,
+            last_success_at: row.get(10)?,
+            last_error: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn upsert_content_source(
+    workspace_dir: &Path,
+    source: &ContentSourceUpsert,
+) -> Result<ContentSourceRecord> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    let source_key = source.source_key.trim().to_string();
+    conn.execute(
+        "INSERT INTO content_sources (
+            source_key, domain, title, html_url, xml_url, source_kind, enabled,
+            etag, last_modified, last_fetch_at, last_success_at, last_error, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', '', '', '', '', ?8, ?8)
+         ON CONFLICT(source_key) DO UPDATE SET
+            domain = excluded.domain,
+            title = excluded.title,
+            html_url = excluded.html_url,
+            xml_url = excluded.xml_url,
+            source_kind = excluded.source_kind,
+            enabled = excluded.enabled,
+            updated_at = excluded.updated_at",
+        params![
+            source_key,
+            source.domain.trim().to_ascii_lowercase(),
+            source.title,
+            source.html_url,
+            source.xml_url,
+            source.source_kind,
+            if source.enabled { 1 } else { 0 },
+            now
+        ],
+    )
+    .context("Failed to upsert content source")?;
+
+    let existing = get_content_source(workspace_dir, &source.source_key)?;
+    existing.context("Content source missing after upsert")
+}
+
+pub fn get_content_source(
+    workspace_dir: &Path,
+    source_key: &str,
+) -> Result<Option<ContentSourceRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT source_key, domain, title, html_url, xml_url, source_kind, enabled,
+                etag, last_modified, last_fetch_at, last_success_at, last_error, created_at, updated_at
+         FROM content_sources
+         WHERE source_key = ?1
+         LIMIT 1",
+    )?;
+    let row = stmt
+        .query_row(params![source_key.trim()], |row| {
+            Ok(ContentSourceRecord {
+                source_key: row.get(0)?,
+                domain: row.get(1)?,
+                title: row.get(2)?,
+                html_url: row.get(3)?,
+                xml_url: row.get(4)?,
+                source_kind: row.get(5)?,
+                enabled: row.get::<_, i64>(6)? != 0,
+                etag: row.get(7)?,
+                last_modified: row.get(8)?,
+                last_fetch_at: row.get(9)?,
+                last_success_at: row.get(10)?,
+                last_error: row.get(11)?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+pub fn update_content_source_fetch(
+    workspace_dir: &Path,
+    source_key: &str,
+    fetched_at: &str,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    last_error: Option<&str>,
+    success: bool,
+) -> Result<()> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let normalized_error = last_error.unwrap_or("").trim().to_string();
+    conn.execute(
+        "UPDATE content_sources
+         SET etag = COALESCE(NULLIF(?2, ''), etag),
+             last_modified = COALESCE(NULLIF(?3, ''), last_modified),
+             last_fetch_at = ?4,
+             last_success_at = CASE WHEN ?6 = 1 THEN ?4 ELSE last_success_at END,
+             last_error = ?5,
+             updated_at = ?4
+         WHERE source_key = ?1",
+        params![
+            source_key.trim(),
+            etag.unwrap_or("").trim(),
+            last_modified.unwrap_or("").trim(),
+            fetched_at.trim(),
+            if success { "" } else { normalized_error.as_str() },
+            if success { 1 } else { 0 },
+        ],
+    )
+    .with_context(|| format!("Failed to update content source fetch state for {}", source_key))?;
+    Ok(())
+}
+
+pub fn upsert_content_item(
+    workspace_dir: &Path,
+    item: &ContentItemUpsert,
+) -> Result<ContentItemRecord> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO content_items (
+            id, source_key, source_title, source_kind, domain, canonical_url, external_id,
+            title, author, summary, content_text, content_hash, embedding, published_at,
+            discovered_at, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)
+         ON CONFLICT(id) DO UPDATE SET
+            source_key = excluded.source_key,
+            source_title = excluded.source_title,
+            source_kind = excluded.source_kind,
+            domain = excluded.domain,
+            canonical_url = excluded.canonical_url,
+            external_id = excluded.external_id,
+            title = excluded.title,
+            author = excluded.author,
+            summary = excluded.summary,
+            content_text = excluded.content_text,
+            content_hash = excluded.content_hash,
+            embedding = excluded.embedding,
+            published_at = excluded.published_at,
+            discovered_at = excluded.discovered_at,
+            updated_at = excluded.updated_at",
+        params![
+            item.id,
+            item.source_key,
+            item.source_title,
+            item.source_kind,
+            item.domain,
+            item.canonical_url,
+            item.external_id,
+            item.title,
+            item.author,
+            item.summary,
+            item.content_text,
+            item.content_hash,
+            item.embedding,
+            item.published_at,
+            item.discovered_at,
+            now
+        ],
+    )
+    .context("Failed to upsert content item")?;
+
+    Ok(ContentItemRecord {
+        id: item.id.clone(),
+        source_key: item.source_key.clone(),
+        source_title: item.source_title.clone(),
+        source_kind: item.source_kind.clone(),
+        domain: item.domain.clone(),
+        canonical_url: item.canonical_url.clone(),
+        external_id: item.external_id.clone(),
+        title: item.title.clone(),
+        author: item.author.clone(),
+        summary: item.summary.clone(),
+        content_text: item.content_text.clone(),
+        content_hash: item.content_hash.clone(),
+        embedding: item.embedding.clone(),
+        published_at: item.published_at.clone(),
+        discovered_at: item.discovered_at.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+pub fn list_recent_content_items(
+    workspace_dir: &Path,
+    limit: usize,
+) -> Result<Vec<ContentItemRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let lim = i64::try_from(limit.max(1)).unwrap_or(100);
+    let mut stmt = conn.prepare(
+        "SELECT id, source_key, source_title, source_kind, domain, canonical_url, external_id,
+                title, author, summary, content_text, content_hash, embedding, published_at,
+                discovered_at, created_at, updated_at
+         FROM content_items
+         ORDER BY
+            COALESCE(NULLIF(published_at, ''), NULLIF(discovered_at, ''), updated_at) DESC,
+            id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![lim], |row| {
+        Ok(ContentItemRecord {
+            id: row.get(0)?,
+            source_key: row.get(1)?,
+            source_title: row.get(2)?,
+            source_kind: row.get(3)?,
+            domain: row.get(4)?,
+            canonical_url: row.get(5)?,
+            external_id: row.get(6)?,
+            title: row.get(7)?,
+            author: row.get(8)?,
+            summary: row.get(9)?,
+            content_text: row.get(10)?,
+            content_hash: row.get(11)?,
+            embedding: row.get(12)?,
+            published_at: row.get(13)?,
+            discovered_at: row.get(14)?,
+            created_at: row.get(15)?,
+            updated_at: row.get(16)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 fn open_conn(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open local store {}", path.display()))?;
@@ -906,6 +1538,45 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_artifacts_path
             ON artifacts(workspace_path);
 
+        CREATE TABLE IF NOT EXISTS workspace_todos (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            details TEXT NOT NULL DEFAULT '',
+            priority TEXT NOT NULL DEFAULT 'medium',
+            model_status TEXT NOT NULL DEFAULT 'open',
+            status_override TEXT NOT NULL DEFAULT '',
+            due_at TEXT NOT NULL DEFAULT '',
+            source_path TEXT NOT NULL DEFAULT '',
+            source_excerpt TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_manifest_id TEXT NOT NULL DEFAULT '',
+            archived INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_todos_active
+            ON workspace_todos(archived, updated_at);
+
+        CREATE TABLE IF NOT EXISTS workspace_events (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            details TEXT NOT NULL DEFAULT '',
+            location TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'confirmed',
+            start_at TEXT NOT NULL DEFAULT '',
+            end_at TEXT NOT NULL DEFAULT '',
+            all_day INTEGER NOT NULL DEFAULT 0,
+            source_path TEXT NOT NULL DEFAULT '',
+            source_excerpt TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_manifest_id TEXT NOT NULL DEFAULT '',
+            archived INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_events_active
+            ON workspace_events(archived, start_at);
+
         CREATE TABLE IF NOT EXISTS feed_interests (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
@@ -955,7 +1626,50 @@ fn init_schema(conn: &Connection) -> Result<()> {
             updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_feed_web_cache_updated
-            ON feed_web_cache(updated_at);",
+            ON feed_web_cache(updated_at);
+
+        CREATE TABLE IF NOT EXISTS content_sources (
+            source_key TEXT PRIMARY KEY,
+            domain TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            html_url TEXT NOT NULL DEFAULT '',
+            xml_url TEXT NOT NULL DEFAULT '',
+            source_kind TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            etag TEXT NOT NULL DEFAULT '',
+            last_modified TEXT NOT NULL DEFAULT '',
+            last_fetch_at TEXT NOT NULL DEFAULT '',
+            last_success_at TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_content_sources_fetch
+            ON content_sources(enabled, last_fetch_at, updated_at);
+
+        CREATE TABLE IF NOT EXISTS content_items (
+            id TEXT PRIMARY KEY,
+            source_key TEXT NOT NULL DEFAULT '',
+            source_title TEXT NOT NULL DEFAULT '',
+            source_kind TEXT NOT NULL DEFAULT '',
+            domain TEXT NOT NULL DEFAULT '',
+            canonical_url TEXT NOT NULL DEFAULT '',
+            external_id TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            author TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            content_text TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL DEFAULT '',
+            embedding BLOB NOT NULL,
+            published_at TEXT NOT NULL DEFAULT '',
+            discovered_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_content_items_canonical_url
+            ON content_items(canonical_url);
+        CREATE INDEX IF NOT EXISTS idx_content_items_published
+            ON content_items(published_at, discovered_at, updated_at);",
     )
     .context("Failed to initialize local store schema")?;
 
@@ -1028,6 +1742,8 @@ mod tests {
         assert!(table_exists(&conn, "feed_interest_sources").unwrap());
         assert!(table_exists(&conn, "feed_web_sources").unwrap());
         assert!(table_exists(&conn, "feed_web_cache").unwrap());
+        assert!(table_exists(&conn, "content_sources").unwrap());
+        assert!(table_exists(&conn, "content_items").unwrap());
     }
 
     #[test]
@@ -1159,6 +1875,87 @@ mod tests {
         assert_eq!(history[0]["provider"], "bluesky");
         assert_eq!(history[0]["status"], "success");
         assert_eq!(history[0]["sourcePath"], "posts/digest/2026-03-03.md");
+    }
+
+    #[test]
+    fn workspace_todos_roundtrip_and_override() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        let written = replace_workspace_todos(
+            tmp.path(),
+            &[WorkspaceTodoUpsert {
+                id: "todo-follow-up".into(),
+                title: "Send follow-up".into(),
+                details: "Email the partner after the review".into(),
+                priority: "high".into(),
+                model_status: "open".into(),
+                due_at: "2026-03-12".into(),
+                source_path: "journals/text/2026-03-11.md".into(),
+                source_excerpt: "Need to send a follow-up tomorrow.".into(),
+                metadata_json: "{\"kind\":\"todo\"}".into(),
+            }],
+            "manifest-1",
+        )
+        .unwrap();
+        assert_eq!(written, 1);
+
+        let todos = list_workspace_todos(tmp.path(), 20).unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0]["status"], "open");
+        assert_eq!(todos[0]["priority"], "high");
+
+        let updated = update_workspace_todo_status(
+            tmp.path(),
+            &WorkspaceTodoStatusUpdate {
+                id: "todo-follow-up".into(),
+                status_override: "done".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(updated["status"], "done");
+
+        let todos = list_workspace_todos(tmp.path(), 20).unwrap();
+        assert_eq!(todos[0]["status"], "done");
+
+        replace_workspace_todos(tmp.path(), &[], "manifest-2").unwrap();
+        let todos = list_workspace_todos(tmp.path(), 20).unwrap();
+        assert!(todos.is_empty());
+    }
+
+    #[test]
+    fn workspace_events_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        let written = replace_workspace_events(
+            tmp.path(),
+            &[WorkspaceEventUpsert {
+                id: "event-launch-review".into(),
+                title: "Launch review".into(),
+                details: "Review the launch checklist".into(),
+                location: "Berlin".into(),
+                status: "confirmed".into(),
+                start_at: "2026-03-12T09:00:00Z".into(),
+                end_at: "2026-03-12T10:00:00Z".into(),
+                all_day: false,
+                source_path: "journals/text/2026-03-11.md".into(),
+                source_excerpt: "Launch review tomorrow at 9.".into(),
+                metadata_json: "{\"kind\":\"event\"}".into(),
+            }],
+            "manifest-1",
+        )
+        .unwrap();
+        assert_eq!(written, 1);
+
+        let events = list_workspace_events(tmp.path(), 20).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["title"], "Launch review");
+        assert_eq!(events[0]["status"], "confirmed");
+
+        replace_workspace_events(tmp.path(), &[], "manifest-2").unwrap();
+        let events = list_workspace_events(tmp.path(), 20).unwrap();
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1328,6 +2125,75 @@ mod tests {
         let cached = cached.expect("cache should exist");
         assert_eq!(cached.domain, "example.com");
         assert_eq!(cached.title, "Example");
+    }
+
+    #[test]
+    fn content_source_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        upsert_content_source(
+            tmp.path(),
+            &ContentSourceUpsert {
+                source_key: "https://example.com/feed.xml".into(),
+                domain: "example.com".into(),
+                title: "Example Feed".into(),
+                html_url: "https://example.com".into(),
+                xml_url: "https://example.com/feed.xml".into(),
+                source_kind: "rss".into(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+
+        update_content_source_fetch(
+            tmp.path(),
+            "https://example.com/feed.xml",
+            "2026-03-10T10:00:00Z",
+            Some("etag-1"),
+            Some("Wed, 10 Mar 2026 10:00:00 GMT"),
+            None,
+            true,
+        )
+        .unwrap();
+
+        let sources = list_content_sources(tmp.path(), 10).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_key, "https://example.com/feed.xml");
+        assert_eq!(sources[0].etag, "etag-1");
+    }
+
+    #[test]
+    fn content_item_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        upsert_content_item(
+            tmp.path(),
+            &ContentItemUpsert {
+                id: "item-1".into(),
+                source_key: "https://example.com/feed.xml".into(),
+                source_title: "Example Feed".into(),
+                source_kind: "rss".into(),
+                domain: "example.com".into(),
+                canonical_url: "https://example.com/posts/1".into(),
+                external_id: "guid-1".into(),
+                title: "First post".into(),
+                author: "Example Author".into(),
+                summary: "Summary".into(),
+                content_text: "Body".into(),
+                content_hash: "hash-1".into(),
+                embedding: vec![1, 2, 3, 4],
+                published_at: "2026-03-10T10:00:00Z".into(),
+                discovered_at: "2026-03-10T10:05:00Z".into(),
+            },
+        )
+        .unwrap();
+
+        let items = list_recent_content_items(tmp.path(), 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].canonical_url, "https://example.com/posts/1");
+        assert_eq!(items[0].source_title, "Example Feed");
     }
 
 }

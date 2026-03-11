@@ -1785,10 +1785,10 @@ pub struct MemoryConfig {
     /// For sqlite backend: prune conversation rows older than this many days
     #[serde(default = "default_conversation_retention_days")]
     pub conversation_retention_days: u32,
-    /// Embedding provider: "none" | "openai" | "custom:URL"
+    /// Embedding provider: "builtin" | "none" | "openai" | "openrouter" | "custom:URL"
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
-    /// Embedding model name (e.g. "text-embedding-3-small")
+    /// Embedding model name (e.g. "builtin-384-v1" or "text-embedding-3-small")
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
     /// Embedding vector dimensions
@@ -1848,7 +1848,7 @@ pub struct MemoryConfig {
 }
 
 fn default_embedding_provider() -> String {
-    "none".into()
+    "builtin".into()
 }
 fn default_hygiene_enabled() -> bool {
     true
@@ -1863,10 +1863,10 @@ fn default_conversation_retention_days() -> u32 {
     30
 }
 fn default_embedding_model() -> String {
-    "text-embedding-3-small".into()
+    "builtin-384-v1".into()
 }
 fn default_embedding_dims() -> usize {
-    1536
+    384
 }
 fn default_vector_weight() -> f64 {
     0.7
@@ -2388,9 +2388,9 @@ pub struct ModelRouteConfig {
 /// ```toml
 /// [[embedding_routes]]
 /// hint = "semantic"
-/// provider = "openai"
-/// model = "text-embedding-3-small"
-/// dimensions = 1536
+/// provider = "builtin"
+/// model = "builtin-384-v1"
+/// dimensions = 384
 ///
 /// [memory]
 /// embedding_model = "hint:semantic"
@@ -2399,7 +2399,7 @@ pub struct ModelRouteConfig {
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
     pub hint: String,
-    /// Embedding provider (`none`, `openai`, or `custom:<url>`)
+    /// Embedding provider (`builtin`, `none`, `openai`, `openrouter`, or `custom:<url>`)
     pub provider: String,
     /// Embedding model to use with that provider
     pub model: String,
@@ -5172,6 +5172,9 @@ default_temperature = 0.7
         assert_eq!(m.backend, "sqlite");
         assert!(m.auto_save);
         assert!(m.hygiene_enabled);
+        assert_eq!(m.embedding_provider, "builtin");
+        assert_eq!(m.embedding_model, "builtin-384-v1");
+        assert_eq!(m.embedding_dimensions, 384);
         assert_eq!(m.archive_after_days, 7);
         assert_eq!(m.purge_after_days, 30);
         assert_eq!(m.conversation_retention_days, 30);

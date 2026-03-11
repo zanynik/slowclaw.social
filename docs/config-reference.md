@@ -308,15 +308,16 @@ allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
 |---|---|---|
 | `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `none` |
 | `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded) |
-| `embedding_provider` | `none` | `none`, `openai`, or custom endpoint |
-| `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` route |
-| `embedding_dimensions` | `1536` | expected vector size for selected embedding model |
+| `embedding_provider` | `builtin` | `builtin`, `none`, `openai`, `openrouter`, or custom endpoint |
+| `embedding_model` | `builtin-384-v1` | embedding model ID, or `hint:<name>` route |
+| `embedding_dimensions` | `384` | expected vector size for selected embedding model |
 | `vector_weight` | `0.7` | hybrid ranking vector weight |
 | `keyword_weight` | `0.3` | hybrid ranking keyword weight |
 
 Notes:
 
 - Memory context injection ignores legacy `assistant_resp*` auto-save keys to prevent old model-authored summaries from being treated as facts.
+- `embedding_provider = "builtin"` is the app-managed local default. It downloads the all-MiniLM assets automatically on first use, caches them locally, and then runs without a daemon or API key.
 
 ## `[[model_routes]]` and `[[embedding_routes]]`
 
@@ -336,7 +337,7 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | Key | Default | Purpose |
 |---|---|---|
 | `hint` | _required_ | Route hint name (e.g. `"semantic"`, `"archive"`, `"faq"`) |
-| `provider` | _required_ | Embedding provider (`"none"`, `"openai"`, or `"custom:<url>"`) |
+| `provider` | _required_ | Embedding provider (`"builtin"`, `"none"`, `"openai"`, `"openrouter"`, or `"custom:<url>"`) |
 | `model` | _required_ | Embedding model to use with that provider |
 | `dimensions` | unset | Optional embedding dimension override for this route |
 | `api_key` | unset | Optional API key override for this route's provider |
@@ -352,9 +353,9 @@ model = "provider/model-id"
 
 [[embedding_routes]]
 hint = "semantic"
-provider = "openai"
-model = "text-embedding-3-small"
-dimensions = 1536
+provider = "builtin"
+model = "builtin-384-v1"
+dimensions = 384
 ```
 
 Upgrade strategy:

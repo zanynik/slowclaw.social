@@ -234,7 +234,7 @@ zeroclaw agent --provider anthropic -m "hello"
 | **向量数据库** | Embeddings 以 BLOB 存储于 SQLite，余弦相似度搜索 |
 | **关键词搜索** | FTS5 虚拟表，BM25 评分 |
 | **混合合并** | 自定义加权合并函数（`vector.rs`） |
-| **Embeddings** | `EmbeddingProvider` trait — OpenAI、自定义 URL 或 noop |
+| **Embeddings** | `EmbeddingProvider` trait — 内置本地 embeddings、OpenAI、自定义 URL 或 noop |
 | **分块** | 基于行的 Markdown 分块器，保留标题结构 |
 | **缓存** | SQLite `embedding_cache` 表，LRU 淘汰策略 |
 | **安全重索引** | 原子化重建 FTS5 + 重新嵌入缺失向量 |
@@ -245,7 +245,7 @@ Agent 通过工具自动进行记忆的回忆、保存和管理。
 [memory]
 backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
 auto_save = true
-embedding_provider = "none"    # "none", "openai", "custom:https://..."
+embedding_provider = "builtin" # "builtin", "none", "openai", "openrouter", "custom:https://..."
 vector_weight = 0.7
 keyword_weight = 0.3
 ```
@@ -270,7 +270,7 @@ default_temperature = 0.7
 [memory]
 backend = "sqlite"             # sqlite | lucid | markdown | none
 auto_save = true
-embedding_provider = "none"    # none | openai | custom:https://...
+embedding_provider = "builtin" # builtin | none | openai | openrouter | custom:https://...
 
 [gateway]
 host = "127.0.0.1"
