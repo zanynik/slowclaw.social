@@ -71,7 +71,7 @@ const WORKSPACE_SYNTH_EXTRACTOR_SPECS: [WorkspaceSynthExtractorSpec; 5] = [
     WorkspaceSynthExtractorSpec {
         workflow_key: WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY,
         name: "Workspace Clip Extractor",
-        goal: "Extract transcript-backed clip plans from recent journals and transcript text. Write only the clip_plans handoff JSON for Rust to keep as pipeline artifacts.",
+        goal: "Extract clip plans only from audio/video transcript sidecars under journals/text/transcriptions. Write only the clip_plans handoff JSON for Rust to keep as pipeline artifacts.",
         handoff_path: WORKSPACE_SYNTHESIZER_CLIP_PLANS_PATH,
         max_items: MAX_CLIP_PLANS,
     },
@@ -425,7 +425,7 @@ The runtime uses this skill as the shared guidance layer, then runs specialized 
 - `insightPosts`: concise feed-ready text only.\n\
 - `todos`: only explicit actions or commitments.\n\
 - `events`: only when timing or scheduling is actually supported by the source.\n\
-- `clipPlans`: only when transcript text contains a quotable segment with clear start/end timing context.\n\
+- `clipPlans`: only from transcript sidecars under `journals/text/transcriptions/**`, and only when transcript text contains a quotable segment with clear start/end timing context.\n\
 - `journalTitles`: only for journal note files that deserve clearer durable titles.\n\
 \n\
 ## Runtime Notes\n\n\
@@ -474,7 +474,7 @@ pub fn render_extractor_skill_markdown(workflow_key: &str) -> Result<String> {
         WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => (
             "clipPlans",
             clip_plans_schema_json()?,
-            "- Emit only transcript-backed segments with enough context to plan an edit later.\n\
+            "- Emit only transcript-backed segments from audio/video transcript sidecars under journals/text/transcriptions/** or journals/text/transcript/**.\n\
 - `transcriptQuote` must be a real quote from the source excerpt.\n\
 - Use precise `startAt` and `endAt` values from the transcript context when available.\n",
         ),
@@ -880,6 +880,13 @@ fn normalize_clip_plan_items(mut items: Vec<ClipPlanCandidate>) -> Result<Vec<Cl
         item.end_at = item.end_at.trim().to_string();
         item.source_path = normalize_source_path(&item.source_path)?;
         item.source_excerpt = truncate_with_ellipsis(item.source_excerpt.trim(), 280);
+        if !item.source_path.starts_with("journals/text/transcriptions/")
+            && !item.source_path.starts_with("journals/text/transcript/")
+        {
+            anyhow::bail!(
+                "clipPlans items must point to transcript sidecars under journals/text/transcriptions"
+            );
+        }
         if item.title.trim().is_empty() {
             anyhow::bail!("clipPlans items require non-empty title");
         }
@@ -1108,6 +1115,7 @@ pub fn apply_manifest(
     manifest: &WorkspaceSynthesisManifest,
     manifest_id: &str,
 ) -> Result<WorkspaceSynthesisApplyResult> {
+    local_store::initialize(workspace_dir)?;
     let output_root = workspace_dir.join(WORKSPACE_SYNTHESIZER_OUTPUT_ROOT);
     let clip_dir = workspace_dir.join(WORKSPACE_SYNTHESIZER_CLIP_PLAN_DIR);
     let pipeline_dir = workspace_dir.join("posts/workspace_synthesizer/pipeline");
@@ -1160,9 +1168,24 @@ pub fn apply_manifest(
         })
         .collect();
 
-    let todo_count = local_store::replace_workspace_todos(workspace_dir, &todo_items, manifest_id)?;
-    let event_count =
-        local_store::replace_workspace_events(workspace_dir, &event_items, manifest_id)?;
+    let processed_source_paths = collect_processed_source_paths(
+        &manifest.insight_posts,
+        &manifest.todos,
+        &manifest.events,
+        &manifest.clip_plans,
+    );
+    let todo_count = local_store::replace_workspace_todos(
+        workspace_dir,
+        &todo_items,
+        manifest_id,
+        &processed_source_paths,
+    )?;
+    let event_count = local_store::replace_workspace_events(
+        workspace_dir,
+        &event_items,
+        manifest_id,
+        &processed_source_paths,
+    )?;
     let counts = WorkspaceSynthArtifactCounts {
         insight_posts: insight_post_paths.len(),
         todos: todo_count,
@@ -1240,7 +1263,9 @@ fn build_apply_summary(
 pub fn apply_handoff_files(
     workspace_dir: &Path,
     manifest_id: &str,
+    processed_source_paths: &[String],
 ) -> Result<WorkspaceSynthesisApplyResult> {
+    local_store::initialize(workspace_dir)?;
     let output_root = workspace_dir.join(WORKSPACE_SYNTHESIZER_OUTPUT_ROOT);
     let clip_dir = workspace_dir.join(WORKSPACE_SYNTHESIZER_CLIP_PLAN_DIR);
     let pipeline_root = pipeline_dir(workspace_dir);
@@ -1420,7 +1445,12 @@ pub fn apply_handoff_files(
                 }
             })
             .collect();
-        match local_store::replace_workspace_todos(workspace_dir, &todo_items, manifest_id) {
+        match local_store::replace_workspace_todos(
+            workspace_dir,
+            &todo_items,
+            manifest_id,
+            processed_source_paths,
+        ) {
             Ok(written) => {
                 result.counts.todos = written;
                 result.artifact_states.todos =
@@ -1456,7 +1486,12 @@ pub fn apply_handoff_files(
                 }
             })
             .collect();
-        match local_store::replace_workspace_events(workspace_dir, &event_items, manifest_id) {
+        match local_store::replace_workspace_events(
+            workspace_dir,
+            &event_items,
+            manifest_id,
+            processed_source_paths,
+        ) {
             Ok(written) => {
                 result.counts.events = written;
                 result.artifact_states.events =
@@ -1522,6 +1557,29 @@ pub fn apply_handoff_files(
         ),
     };
     Ok(legacy_result)
+}
+
+fn collect_processed_source_paths(
+    insight_posts: &[InsightPostCandidate],
+    todos: &[TodoCandidate],
+    events: &[EventCandidate],
+    clip_plans: &[ClipPlanCandidate],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for source_path in insight_posts
+        .iter()
+        .map(|item| item.source_path.as_str())
+        .chain(todos.iter().map(|item| item.source_path.as_str()))
+        .chain(events.iter().map(|item| item.source_path.as_str()))
+        .chain(clip_plans.iter().map(|item| item.source_path.as_str()))
+    {
+        let trimmed = source_path.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
 }
 
 fn write_insight_posts(
@@ -1624,6 +1682,22 @@ mod tests {
     }
 
     #[test]
+    fn normalize_clip_plan_items_rejects_non_transcript_sources() {
+        let err = normalize_clip_plan_items(vec![ClipPlanCandidate {
+            title: "Moment".to_string(),
+            transcript_quote: "Quote".to_string(),
+            start_at: "00:00:01.000".to_string(),
+            end_at: "00:00:05.000".to_string(),
+            source_path: "journals/text/2026-03-11.md".to_string(),
+            source_excerpt: "Quote".to_string(),
+            ..ClipPlanCandidate::default()
+        }])
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("clipPlans items must point to transcript sidecars"));
+    }
+
+    #[test]
     fn apply_handoff_files_applies_present_files_and_skips_missing_ones() {
         let tmp = tempdir().unwrap();
         let insight_posts = InsightPostFile {
@@ -1651,7 +1725,8 @@ mod tests {
         write_json_file(&insight_posts_path(tmp.path()), &insight_posts);
         write_json_file(&todos_path(tmp.path()), &todos);
 
-        let applied = apply_handoff_files(tmp.path(), "run-1").unwrap();
+        let processed_source_paths = vec!["journals/text/2026-03-11.md".to_string()];
+        let applied = apply_handoff_files(tmp.path(), "run-1", &processed_source_paths).unwrap();
 
         assert!(applied.applied_any);
         assert!(!applied.had_errors);
@@ -1703,7 +1778,8 @@ mod tests {
         }
         fs::write(&events_path, events_raw).unwrap();
 
-        let applied = apply_handoff_files(tmp.path(), "run-2").unwrap();
+        let processed_source_paths = vec!["journals/text/2026-03-11.md".to_string()];
+        let applied = apply_handoff_files(tmp.path(), "run-2", &processed_source_paths).unwrap();
 
         assert!(applied.applied_any);
         assert!(applied.had_errors);
@@ -1733,7 +1809,8 @@ mod tests {
         };
         write_json_file(&manifest_path(tmp.path()), &manifest);
 
-        let applied = apply_handoff_files(tmp.path(), "run-legacy").unwrap();
+        let processed_source_paths = vec!["journals/text/2026-03-11.md".to_string()];
+        let applied = apply_handoff_files(tmp.path(), "run-legacy", &processed_source_paths).unwrap();
 
         assert!(applied.applied_any);
         assert!(!applied.had_errors);

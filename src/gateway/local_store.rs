@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -544,6 +544,7 @@ pub fn replace_workspace_todos(
     workspace_dir: &Path,
     items: &[WorkspaceTodoUpsert],
     manifest_id: &str,
+    processed_source_paths: &[String],
 ) -> Result<usize> {
     let mut conn = open_conn(&db_path(workspace_dir))?;
     let tx = conn.transaction()?;
@@ -587,11 +588,12 @@ pub fn replace_workspace_todos(
         written += 1;
     }
 
-    tx.execute(
-        "UPDATE workspace_todos
-         SET archived = 1, updated_at = ?2
-         WHERE last_manifest_id != ?1",
-        params![manifest_id, now],
+    archive_workspace_rows_for_sources(
+        &tx,
+        "workspace_todos",
+        manifest_id,
+        &now,
+        processed_source_paths,
     )
     .context("Failed to archive stale workspace todos")?;
 
@@ -705,6 +707,7 @@ pub fn replace_workspace_events(
     workspace_dir: &Path,
     items: &[WorkspaceEventUpsert],
     manifest_id: &str,
+    processed_source_paths: &[String],
 ) -> Result<usize> {
     let mut conn = open_conn(&db_path(workspace_dir))?;
     let tx = conn.transaction()?;
@@ -752,16 +755,47 @@ pub fn replace_workspace_events(
         written += 1;
     }
 
-    tx.execute(
-        "UPDATE workspace_events
-         SET archived = 1, updated_at = ?2
-         WHERE last_manifest_id != ?1",
-        params![manifest_id, now],
+    archive_workspace_rows_for_sources(
+        &tx,
+        "workspace_events",
+        manifest_id,
+        &now,
+        processed_source_paths,
     )
     .context("Failed to archive stale workspace events")?;
 
     tx.commit()?;
     Ok(written)
+}
+
+fn archive_workspace_rows_for_sources(
+    tx: &rusqlite::Transaction<'_>,
+    table_name: &str,
+    manifest_id: &str,
+    now: &str,
+    processed_source_paths: &[String],
+) -> Result<()> {
+    if processed_source_paths.is_empty() {
+        return Ok(());
+    }
+    let mut placeholders = Vec::with_capacity(processed_source_paths.len());
+    for index in 0..processed_source_paths.len() {
+        placeholders.push(format!("?{}", index + 3));
+    }
+    let query = format!(
+        "UPDATE {table_name}
+         SET archived = 1, updated_at = ?2
+         WHERE last_manifest_id != ?1
+           AND source_path IN ({})",
+        placeholders.join(", ")
+    );
+    let mut params_vec = Vec::with_capacity(processed_source_paths.len() + 2);
+    params_vec.push(manifest_id.to_string());
+    params_vec.push(now.to_string());
+    params_vec.extend(processed_source_paths.iter().cloned());
+    tx.execute(&query, params_from_iter(params_vec.iter()))
+        .with_context(|| format!("Failed to archive stale rows in {table_name}"))?;
+    Ok(())
 }
 
 pub fn list_workspace_events(workspace_dir: &Path, limit: usize) -> Result<Vec<serde_json::Value>> {
@@ -2110,6 +2144,7 @@ mod tests {
                 metadata_json: "{\"kind\":\"todo\"}".into(),
             }],
             "manifest-1",
+            &["journals/text/2026-03-11.md".into()],
         )
         .unwrap();
         assert_eq!(written, 1);
@@ -2132,9 +2167,76 @@ mod tests {
         let todos = list_workspace_todos(tmp.path(), 20).unwrap();
         assert_eq!(todos[0]["status"], "done");
 
-        replace_workspace_todos(tmp.path(), &[], "manifest-2").unwrap();
+        replace_workspace_todos(
+            tmp.path(),
+            &[],
+            "manifest-2",
+            &["journals/text/2026-03-11.md".into()],
+        )
+        .unwrap();
         let todos = list_workspace_todos(tmp.path(), 20).unwrap();
         assert!(todos.is_empty());
+    }
+
+    #[test]
+    fn workspace_todos_preserve_other_sources_when_replacing_subset() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        replace_workspace_todos(
+            tmp.path(),
+            &[
+                WorkspaceTodoUpsert {
+                    id: "todo-a".into(),
+                    title: "Todo A".into(),
+                    details: String::new(),
+                    priority: "medium".into(),
+                    model_status: "open".into(),
+                    due_at: String::new(),
+                    source_path: "journals/text/a.md".into(),
+                    source_excerpt: "A".into(),
+                    metadata_json: "{}".into(),
+                },
+                WorkspaceTodoUpsert {
+                    id: "todo-b".into(),
+                    title: "Todo B".into(),
+                    details: String::new(),
+                    priority: "medium".into(),
+                    model_status: "open".into(),
+                    due_at: String::new(),
+                    source_path: "journals/text/b.md".into(),
+                    source_excerpt: "B".into(),
+                    metadata_json: "{}".into(),
+                },
+            ],
+            "manifest-1",
+            &["journals/text/a.md".into(), "journals/text/b.md".into()],
+        )
+        .unwrap();
+
+        replace_workspace_todos(
+            tmp.path(),
+            &[WorkspaceTodoUpsert {
+                id: "todo-a-2".into(),
+                title: "Todo A2".into(),
+                details: String::new(),
+                priority: "medium".into(),
+                model_status: "open".into(),
+                due_at: String::new(),
+                source_path: "journals/text/a.md".into(),
+                source_excerpt: "A2".into(),
+                metadata_json: "{}".into(),
+            }],
+            "manifest-2",
+            &["journals/text/a.md".into()],
+        )
+        .unwrap();
+
+        let todos = list_workspace_todos(tmp.path(), 20).unwrap();
+        assert_eq!(todos.len(), 2);
+        assert!(todos.iter().any(|item| item["id"] == "todo-a-2"));
+        assert!(todos.iter().any(|item| item["id"] == "todo-b"));
+        assert!(!todos.iter().any(|item| item["id"] == "todo-a"));
     }
 
     #[test]
@@ -2158,6 +2260,7 @@ mod tests {
                 metadata_json: "{\"kind\":\"event\"}".into(),
             }],
             "manifest-1",
+            &["journals/text/2026-03-11.md".into()],
         )
         .unwrap();
         assert_eq!(written, 1);
@@ -2167,9 +2270,82 @@ mod tests {
         assert_eq!(events[0]["title"], "Launch review");
         assert_eq!(events[0]["status"], "confirmed");
 
-        replace_workspace_events(tmp.path(), &[], "manifest-2").unwrap();
+        replace_workspace_events(
+            tmp.path(),
+            &[],
+            "manifest-2",
+            &["journals/text/2026-03-11.md".into()],
+        )
+        .unwrap();
         let events = list_workspace_events(tmp.path(), 20).unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn workspace_events_preserve_other_sources_when_replacing_subset() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        replace_workspace_events(
+            tmp.path(),
+            &[
+                WorkspaceEventUpsert {
+                    id: "event-a".into(),
+                    title: "Event A".into(),
+                    details: String::new(),
+                    location: String::new(),
+                    status: "confirmed".into(),
+                    start_at: "2026-03-12T09:00:00Z".into(),
+                    end_at: String::new(),
+                    all_day: false,
+                    source_path: "journals/text/a.md".into(),
+                    source_excerpt: "A".into(),
+                    metadata_json: "{}".into(),
+                },
+                WorkspaceEventUpsert {
+                    id: "event-b".into(),
+                    title: "Event B".into(),
+                    details: String::new(),
+                    location: String::new(),
+                    status: "confirmed".into(),
+                    start_at: "2026-03-13T09:00:00Z".into(),
+                    end_at: String::new(),
+                    all_day: false,
+                    source_path: "journals/text/b.md".into(),
+                    source_excerpt: "B".into(),
+                    metadata_json: "{}".into(),
+                },
+            ],
+            "manifest-1",
+            &["journals/text/a.md".into(), "journals/text/b.md".into()],
+        )
+        .unwrap();
+
+        replace_workspace_events(
+            tmp.path(),
+            &[WorkspaceEventUpsert {
+                id: "event-a-2".into(),
+                title: "Event A2".into(),
+                details: String::new(),
+                location: String::new(),
+                status: "confirmed".into(),
+                start_at: "2026-03-14T09:00:00Z".into(),
+                end_at: String::new(),
+                all_day: false,
+                source_path: "journals/text/a.md".into(),
+                source_excerpt: "A2".into(),
+                metadata_json: "{}".into(),
+            }],
+            "manifest-2",
+            &["journals/text/a.md".into()],
+        )
+        .unwrap();
+
+        let events = list_workspace_events(tmp.path(), 20).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|item| item["id"] == "event-a-2"));
+        assert!(events.iter().any(|item| item["id"] == "event-b"));
+        assert!(!events.iter().any(|item| item["id"] == "event-a"));
     }
 
     #[test]

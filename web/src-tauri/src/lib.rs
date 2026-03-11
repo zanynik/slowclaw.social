@@ -133,6 +133,11 @@ fn validate_secret_locator(service: &str, account: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn ui_command_error(context: &str, user_message: &str, err: impl std::fmt::Display) -> String {
+    eprintln!("{context}: {err}");
+    user_message.to_string()
+}
+
 fn lock_gateway_state<'a>(
     state: &'a Arc<Mutex<GatewayRuntimeState>>,
 ) -> Result<std::sync::MutexGuard<'a, GatewayRuntimeState>, String> {
@@ -239,11 +244,39 @@ fn ensure_desktop_gateway_token() -> Result<String, String> {
     Ok(generated)
 }
 
-async fn persist_provider_api_key_to_config(api_key: Option<String>) -> Result<(), String> {
+async fn clear_provider_api_key_from_config() -> Result<(), String> {
     let mut config = zeroclaw::Config::load_or_init()
         .await
         .map_err(|e| format!("failed to load config: {e}"))?;
-    config.api_key = api_key;
+    if config.api_key.is_none() {
+        return Ok(());
+    }
+    config.api_key = None;
+    config
+        .save()
+        .await
+        .map_err(|e| format!("failed to save config: {e}"))
+}
+
+async fn clear_matching_provider_api_key_from_config(expected: &str) -> Result<(), String> {
+    let expected = expected.trim();
+    if expected.is_empty() {
+        return Ok(());
+    }
+
+    let mut config = zeroclaw::Config::load_or_init()
+        .await
+        .map_err(|e| format!("failed to load config: {e}"))?;
+    if config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(|value| value != expected)
+    {
+        return Ok(());
+    }
+
+    config.api_key = None;
     config
         .save()
         .await
@@ -281,6 +314,9 @@ async fn restart_embedded_gateway(
 
     let key_from_keyring = provider_api_key_from_keyring()?;
     if let Some(key) = key_from_keyring {
+        if let Err(err) = clear_matching_provider_api_key_from_config(&key).await {
+            eprintln!("provider api key migration failed: {err}");
+        }
         config.api_key = Some(key);
     }
     let provider_api_key_set = config
@@ -585,9 +621,10 @@ fn run_openai_device_login_worker(
                     verification_url: None,
                     user_code: None,
                     fast_link: None,
-                    error: Some(error),
+                    error: Some("Unable to start the OpenAI setup command.".to_string()),
                 };
             }
+            eprintln!("openai setup start failed: {error}");
             return;
         }
     };
@@ -646,8 +683,9 @@ fn run_openai_device_login_worker(
                     guard.status.completed = false;
                     guard.status.state = "error".to_string();
                     guard.status.message = "Failed while waiting for OpenAI setup command.".to_string();
-                    guard.status.error = Some(err.to_string());
+                    guard.status.error = Some("Unable to monitor the OpenAI setup command.".to_string());
                 }
+                eprintln!("openai setup wait failed: {err}");
                 break;
             }
         }
@@ -658,12 +696,16 @@ fn run_openai_device_login_worker(
 fn get_secret(req: SecretGetRequest) -> Result<SecretGetResponse, String> {
     validate_secret_locator(&req.service, &req.account)?;
     let entry = keyring::Entry::new(req.service.trim(), req.account.trim())
-        .map_err(|e| format!("failed to open keyring entry: {e}"))?;
+        .map_err(|e| ui_command_error("secure storage open failed", "Failed to access secure storage.", e))?;
 
     match entry.get_password() {
         Ok(value) => Ok(SecretGetResponse { value: Some(value) }),
         Err(keyring::Error::NoEntry) => Ok(SecretGetResponse { value: None }),
-        Err(e) => Err(format!("failed to read keyring secret: {e}")),
+        Err(e) => Err(ui_command_error(
+            "secure storage read failed",
+            "Failed to read the secure value.",
+            e,
+        )),
     }
 }
 
@@ -674,20 +716,28 @@ fn set_secret(req: SecretSetRequest) -> Result<(), String> {
         return Err("value is required".to_string());
     }
     let entry = keyring::Entry::new(req.service.trim(), req.account.trim())
-        .map_err(|e| format!("failed to open keyring entry: {e}"))?;
+        .map_err(|e| ui_command_error("secure storage open failed", "Failed to access secure storage.", e))?;
     entry
         .set_password(&req.value)
-        .map_err(|e| format!("failed to write keyring secret: {e}"))
+        .map_err(|e| ui_command_error(
+            "secure storage write failed",
+            "Failed to save the secure value.",
+            e,
+        ))
 }
 
 #[tauri::command]
 fn delete_secret(req: SecretGetRequest) -> Result<(), String> {
     validate_secret_locator(&req.service, &req.account)?;
     let entry = keyring::Entry::new(req.service.trim(), req.account.trim())
-        .map_err(|e| format!("failed to open keyring entry: {e}"))?;
+        .map_err(|e| ui_command_error("secure storage open failed", "Failed to access secure storage.", e))?;
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("failed to delete keyring secret: {e}")),
+        Err(e) => Err(ui_command_error(
+            "secure storage delete failed",
+            "Failed to delete the secure value.",
+            e,
+        )),
     }
 }
 
@@ -702,13 +752,25 @@ fn generate_mobile_pairing_qr(
 ) -> Result<GatewayQrPayload, String> {
     let info = snapshot_gateway_state(&state.inner)?;
     let mobile_gateway_url = resolve_mobile_gateway_url(&info.gateway_url);
-    let token = ensure_desktop_gateway_token()?;
+    let token = ensure_desktop_gateway_token().map_err(|e| {
+        ui_command_error(
+            "desktop gateway token generation failed",
+            "Failed to prepare the desktop pairing token.",
+            e,
+        )
+    })?;
     let qr_value = serde_json::to_string(&serde_json::json!({
         "gateway_url": mobile_gateway_url.clone(),
         "gatewayUrl": mobile_gateway_url.clone(),
         "token": token.clone(),
     }))
-    .map_err(|e| format!("failed to encode QR payload: {e}"))?;
+    .map_err(|e| {
+        ui_command_error(
+            "QR payload encode failed",
+            "Failed to generate the pairing QR payload.",
+            e,
+        )
+    })?;
 
     Ok(GatewayQrPayload {
         gateway_url: mobile_gateway_url,
@@ -722,7 +784,13 @@ fn get_desktop_gateway_bootstrap(
     state: tauri::State<'_, GatewayState>,
 ) -> Result<DesktopGatewayBootstrap, String> {
     let info = snapshot_gateway_state(&state.inner)?;
-    let token = ensure_desktop_gateway_token()?;
+    let token = ensure_desktop_gateway_token().map_err(|e| {
+        ui_command_error(
+            "desktop gateway token generation failed",
+            "Failed to prepare the desktop gateway token.",
+            e,
+        )
+    })?;
     Ok(DesktopGatewayBootstrap {
         gateway_url: info.gateway_url,
         token,
@@ -731,8 +799,16 @@ fn get_desktop_gateway_bootstrap(
 
 #[tauri::command]
 async fn restart_gateway_daemon(state: tauri::State<'_, GatewayState>) -> Result<String, String> {
-    let _ = ensure_desktop_gateway_token()?;
-    let info = restart_embedded_gateway(state.inner.clone()).await?;
+    let _ = ensure_desktop_gateway_token().map_err(|e| {
+        ui_command_error(
+            "desktop gateway token generation failed",
+            "Failed to prepare the desktop gateway token.",
+            e,
+        )
+    })?;
+    let info = restart_embedded_gateway(state.inner.clone())
+        .await
+        .map_err(|e| ui_command_error("gateway restart failed", "Failed to restart the desktop gateway.", e))?;
     Ok(info.gateway_url)
 }
 
@@ -743,27 +819,42 @@ async fn set_provider_api_key(
 ) -> Result<EmbeddedGatewayInfo, String> {
     let normalized = value.trim().to_string();
     let entry = keyring::Entry::new(PROVIDER_SECRET_SERVICE, PROVIDER_API_KEY_SECRET_ACCOUNT)
-        .map_err(|e| format!("failed to open provider key entry: {e}"))?;
+        .map_err(|e| ui_command_error("provider keyring open failed", "Failed to access the provider key store.", e))?;
 
     if normalized.is_empty() {
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}
-            Err(e) => return Err(format!("failed to clear provider API key: {e}")),
+            Err(e) => {
+                return Err(ui_command_error(
+                    "provider keyring delete failed",
+                    "Failed to clear the provider API key.",
+                    e,
+                ))
+            }
         }
     } else {
         entry
             .set_password(&normalized)
-            .map_err(|e| format!("failed to save provider API key: {e}"))?;
+            .map_err(|e| {
+                ui_command_error(
+                    "provider keyring write failed",
+                    "Failed to save the provider API key.",
+                    e,
+                )
+            })?;
     }
 
-    persist_provider_api_key_to_config(if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    })
-    .await?;
+    clear_provider_api_key_from_config().await.map_err(|e| {
+        ui_command_error(
+            "provider config cleanup failed",
+            "Failed to update desktop configuration after saving the provider API key.",
+            e,
+        )
+    })?;
 
-    restart_embedded_gateway(state.inner.clone()).await
+    restart_embedded_gateway(state.inner.clone())
+        .await
+        .map_err(|e| ui_command_error("gateway restart failed", "Failed to restart the desktop gateway.", e))
 }
 
 #[tauri::command]
@@ -798,8 +889,9 @@ fn get_openai_device_code_status(
                 next.state = "error".to_string();
                 next.completed = false;
                 next.message = "Unable to verify existing OpenAI auth status.".to_string();
-                next.error = Some(err);
+                next.error = Some("Unable to verify existing OpenAI auth status.".to_string());
             }
+            eprintln!("openai auth status probe failed: {err}");
         }
     }
 

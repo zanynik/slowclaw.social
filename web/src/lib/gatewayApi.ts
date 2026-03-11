@@ -48,16 +48,30 @@ function authHeaders(token?: string, contentType?: string): HeadersInit {
   };
 }
 
+function normalizeGatewayErrorMessage(value: unknown, status: number): string {
+  if (typeof value !== "string") {
+    return `Request failed (${status})`;
+  }
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return `Request failed (${status})`;
+  }
+  const maxLength = 240;
+  return compact.length > maxLength ? `${compact.slice(0, maxLength - 3)}...` : compact;
+}
+
 async function parseJsonOrThrow(res: Response) {
   const text = await res.text();
   let data: any = {};
   try {
     data = text ? JSON.parse(text) : {};
   } catch {
-    data = { raw: text };
+    data = {};
   }
   if (!res.ok) {
-    throw new Error(String(data?.error || `Request failed (${res.status})`));
+    throw new Error(
+      normalizeGatewayErrorMessage(data?.error ?? data?.message, res.status)
+    );
   }
   return data;
 }

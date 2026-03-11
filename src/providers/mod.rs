@@ -761,7 +761,12 @@ pub fn sanitize_api_error(input: &str) -> String {
         end -= 1;
     }
 
-    format!("{}...", &scrubbed[..end])
+    let original_len = scrubbed.chars().count();
+    format!(
+        "{}... (truncated from {} chars)",
+        &scrubbed[..end],
+        original_len
+    )
 }
 
 /// Build a sanitized provider error from a failed HTTP response.

@@ -3659,6 +3659,7 @@ function App() {
       return;
     }
     void Promise.all([
+      refreshLibrary("journal"),
       refreshLibrary("feed"),
       loadWorkspaceTodos(),
       loadWorkspaceEvents()
@@ -5699,36 +5700,11 @@ function App() {
         {mobileTab === "todos" ? (
           <div className="stack">
             <div className="card">
-              <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
-                <div className="stack-sm">
-                  <h2 style={{ margin: 0 }}>Todos</h2>
-                  <p className="text-sm muted" style={{ margin: 0 }}>
-                    Action items extracted from journals and transcripts. Marking one done keeps the model suggestion but preserves your override locally.
-                  </p>
-                </div>
-                <div className="row" style={{ gap: "0.45rem", alignItems: "center" }}>
-                  <button
-                    type="button"
-                    className="ghost text-sm"
-                    onClick={() => void refreshWorkspaceViews({ runSynthIfPending: true })}
-                  >
-                    Refresh
-                  </button>
-                  <button
-                    type="button"
-                    className="primary text-sm"
-                    onClick={() => void runWorkspaceSynthesizerManual()}
-                    disabled={
-                      workspaceSynthBusy || workspaceSynthRunning || workspaceSynthPendingCount === 0
-                    }
-                  >
-                    {workspaceSynthBusy || workspaceSynthRunning
-                      ? "Processing..."
-                      : workspaceSynthPendingCount > 0
-                        ? `Process ${workspaceSynthPendingCount}`
-                        : "Up to date"}
-                  </button>
-                </div>
+              <div className="stack-sm">
+                <h2 style={{ margin: 0 }}>Todos</h2>
+                <p className="text-sm muted" style={{ margin: 0 }}>
+                  Action items extracted from journals and transcripts. Marking one done keeps the model suggestion but preserves your override locally.
+                </p>
               </div>
 
               <div className="workspace-synth-card">
@@ -5737,16 +5713,6 @@ function App() {
                   <span className="status-pill">Done {doneTodos.length}</span>
                   <span className="status-pill">Overdue {overdueTodoCount}</span>
                 </div>
-                <span className="text-sm muted">
-                  Synthesizer: {workspaceSynthRunning
-                    ? `processing ${Math.max(1, workspaceSynthSelectedCount)} entr${Math.max(1, workspaceSynthSelectedCount) === 1 ? "y" : "ies"}`
-                    : workspaceSynthPendingCount > 0
-                      ? `${workspaceSynthPendingCount} pending`
-                      : "up to date"}
-                  {workspaceSynthStatus.lastRunAt
-                    ? ` • ${formatTimestamp(workspaceSynthStatus.lastRunAt)}`
-                    : ""}
-                </span>
                 <div className="workspace-synth-artifacts">
                   {workspaceSynthArtifacts.map((artifact) => (
                     <span
@@ -5856,36 +5822,11 @@ function App() {
         {mobileTab === "events" ? (
           <div className="stack">
             <div className="card">
-              <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
-                <div className="stack-sm">
-                  <h2 style={{ margin: 0 }}>Events</h2>
-                  <p className="text-sm muted" style={{ margin: 0 }}>
-                    Calendar-style commitments extracted from the workspace. Upcoming sections are ordered chronologically so mobile and desktop show the same timeline.
-                  </p>
-                </div>
-                <div className="row" style={{ gap: "0.45rem", alignItems: "center" }}>
-                  <button
-                    type="button"
-                    className="ghost text-sm"
-                    onClick={() => void refreshWorkspaceViews({ runSynthIfPending: true })}
-                  >
-                    Refresh
-                  </button>
-                  <button
-                    type="button"
-                    className="primary text-sm"
-                    onClick={() => void runWorkspaceSynthesizerManual()}
-                    disabled={
-                      workspaceSynthBusy || workspaceSynthRunning || workspaceSynthPendingCount === 0
-                    }
-                  >
-                    {workspaceSynthBusy || workspaceSynthRunning
-                      ? "Processing..."
-                      : workspaceSynthPendingCount > 0
-                        ? `Process ${workspaceSynthPendingCount}`
-                        : "Up to date"}
-                  </button>
-                </div>
+              <div className="stack-sm">
+                <h2 style={{ margin: 0 }}>Events</h2>
+                <p className="text-sm muted" style={{ margin: 0 }}>
+                  Calendar-style commitments extracted from the workspace. Upcoming sections are ordered chronologically so mobile and desktop show the same timeline.
+                </p>
               </div>
 
               <div className="workspace-synth-card">
@@ -5894,16 +5835,6 @@ function App() {
                   <span className="status-pill">Upcoming {upcomingEventItems.length}</span>
                   <span className="status-pill">Past {pastEventItems.length}</span>
                 </div>
-                <span className="text-sm muted">
-                  Synthesizer: {workspaceSynthRunning
-                    ? `processing ${Math.max(1, workspaceSynthSelectedCount)} entr${Math.max(1, workspaceSynthSelectedCount) === 1 ? "y" : "ies"}`
-                    : workspaceSynthPendingCount > 0
-                      ? `${workspaceSynthPendingCount} pending`
-                      : "up to date"}
-                  {workspaceSynthStatus.lastRunAt
-                    ? ` • ${formatTimestamp(workspaceSynthStatus.lastRunAt)}`
-                    : ""}
-                </span>
                 <div className="workspace-synth-artifacts">
                   {workspaceSynthArtifacts.map((artifact) => (
                     <span

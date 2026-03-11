@@ -725,6 +725,38 @@ fn local_media_capabilities(config: &Config) -> MediaToolCapabilities {
     command_media_backend(config.workspace_dir.clone(), config.transcription.clone()).capabilities()
 }
 
+fn frontend_error_payload(message: impl Into<String>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "error": message.into() }))
+}
+
+fn frontend_internal_error<E: std::fmt::Display>(
+    status: StatusCode,
+    context: &str,
+    user_message: &str,
+    err: E,
+) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::warn!(context, error = %err, "Frontend request failed");
+    (status, frontend_error_payload(user_message))
+}
+
+fn frontend_internal_error_response<E: std::fmt::Display>(
+    status: StatusCode,
+    context: &str,
+    user_message: &str,
+    err: E,
+) -> axum::response::Response {
+    frontend_internal_error(status, context, user_message, err).into_response()
+}
+
+fn frontend_background_error<E: std::fmt::Display>(
+    context: &str,
+    user_message: &str,
+    err: E,
+) -> String {
+    tracing::warn!(context, error = %err, "Frontend background task failed");
+    user_message.to_string()
+}
+
 async fn handle_media_capabilities(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -774,9 +806,13 @@ async fn handle_runtime_config_update(
         next.transcription.model = transcription_model.to_string();
     }
 
-    if let Err(e) = next.save().await {
-        let err = serde_json::json!({"error": format!("Failed to save config: {e}")});
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+    if let Err(err) = next.save().await {
+        return frontend_internal_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime config save",
+            "Failed to save runtime settings.",
+            err,
+        );
     }
     *state.config.lock() = next.clone();
 
@@ -890,9 +926,11 @@ async fn handle_sync_export(
     let workspace_dir = state.config.lock().workspace_dir.clone();
     match export_workspace_sync_snapshot(&workspace_dir) {
         Ok(snapshot) => (StatusCode::OK, Json(serde_json::json!(snapshot))),
-        Err(err) => (
+        Err(err) => frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to export sync snapshot: {err}")})),
+            "workspace sync export",
+            "Failed to export the workspace sync snapshot.",
+            err,
         ),
     }
 }
@@ -916,9 +954,11 @@ async fn handle_sync_import(
                 "imported": true,
             })),
         ),
-        Err(err) => (
+        Err(err) => frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to import sync snapshot: {err}")})),
+            "workspace sync import",
+            "Failed to import the workspace sync snapshot.",
+            err,
         ),
     }
 }
@@ -2407,8 +2447,16 @@ async fn run_workspace_synthesizer_orchestrator(
     }
 
     let workspace_for_apply = workspace_dir.to_path_buf();
+    let processed_source_paths = target_sources
+        .iter()
+        .map(|item| item.source_path.clone())
+        .collect::<Vec<_>>();
     let mut applied = tokio::task::spawn_blocking(move || {
-        workspace_synthesizer::apply_handoff_files(&workspace_for_apply, &Utc::now().to_rfc3339())
+        workspace_synthesizer::apply_handoff_files(
+            &workspace_for_apply,
+            &Utc::now().to_rfc3339(),
+            &processed_source_paths,
+        )
     })
     .await
     .context("workspace synthesis apply task failed")??;
@@ -2547,9 +2595,10 @@ fn queue_workflow_run(
         let skill_markdown = match std::fs::read_to_string(&skill_abs) {
             Ok(raw) => raw,
             Err(err) => {
-                let final_error = format!(
-                    "Content agent run failed.\n\nUnable to read skill `{}`: {err}",
-                    workflow_for_worker.skill_path
+                let final_error = frontend_background_error(
+                    "content agent skill read",
+                    "Content agent run failed because the skill file could not be read.",
+                    &err,
                 );
                 let _ = local_store::create_chat_message(
                     &workspace_for_worker,
@@ -2711,9 +2760,10 @@ fn queue_workflow_run(
                     }
                 }
                 Err(err) => {
-                    let final_error = truncate_with_ellipsis(
-                        &format!("Workspace synthesis orchestration failed.\n\n{err:#}"),
-                        4000,
+                    let final_error = frontend_background_error(
+                        "workspace synthesis orchestration",
+                        "Workspace synthesis failed during orchestration.",
+                        &err,
                     );
                     let _ = local_store::create_chat_message(
                         &workspace_for_worker,
@@ -2775,10 +2825,13 @@ fn queue_workflow_run(
             Ok(Ok(reply)) => {
                 if is_workspace_synth {
                     let workspace_for_apply = workspace_for_worker.clone();
+                    let selected_source_paths =
+                        synth_status_snapshot.selected_source_paths.clone();
                     let apply_result = tokio::task::spawn_blocking(move || {
                         workspace_synthesizer::apply_handoff_files(
                             &workspace_for_apply,
                             &Utc::now().to_rfc3339(),
+                            &selected_source_paths,
                         )
                     })
                     .await;
@@ -2861,9 +2914,10 @@ fn queue_workflow_run(
                             }
                         }
                         Ok(Err(err)) => {
-                            let final_error = truncate_with_ellipsis(
-                                &format!("Workspace synthesis apply failed.\n\n{err:#}"),
-                                4000,
+                            let final_error = frontend_background_error(
+                                "workspace synthesis apply",
+                                "Workspace synthesis failed while applying generated files.",
+                                &err,
                             );
                             let _ = local_store::create_chat_message(
                                 &workspace_for_worker,
@@ -2898,9 +2952,10 @@ fn queue_workflow_run(
                             );
                         }
                         Err(err) => {
-                            let final_error = truncate_with_ellipsis(
-                                &format!("Workspace synthesis apply task failed.\n\n{err:#}"),
-                                4000,
+                            let final_error = frontend_background_error(
+                                "workspace synthesis apply task",
+                                "Workspace synthesis apply task failed.",
+                                &err,
                             );
                             let _ = local_store::create_chat_message(
                                 &workspace_for_worker,
@@ -2982,8 +3037,11 @@ fn queue_workflow_run(
                 }
             }
             Ok(Err(err)) => {
-                let final_error =
-                    truncate_with_ellipsis(&format!("Content agent run failed.\n\n{err:#}"), 4000);
+                let final_error = frontend_background_error(
+                    "content agent run",
+                    "Content agent run failed.",
+                    &err,
+                );
                 let _ = local_store::create_chat_message(
                     &workspace_for_worker,
                     &thread_id_for_worker,
@@ -3378,11 +3436,12 @@ async fn handle_chat_list(
 
     match local_store::list_chat_messages(&workspace_dir, thread_id, limit) {
         Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))),
-        Err(e) => {
-            tracing::warn!("Chat API list failed: {e}");
-            let err = serde_json::json!({"error": e.to_string()});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "chat message list",
+            "Failed to load chat messages.",
+            err,
+        ),
     }
 }
 
@@ -3486,8 +3545,11 @@ async fn handle_chat_send(
                         }
                     }
                     Err(err) => {
-                        let err_text =
-                            crate::util::truncate_with_ellipsis(&format!("{err:#}"), 2000);
+                        let err_text = frontend_background_error(
+                            "chat message worker",
+                            "Chat request failed.",
+                            &err,
+                        );
                         let _ = local_store::create_chat_message(
                             &workspace_for_worker,
                             &thread_id_owned,
@@ -3512,11 +3574,12 @@ async fn handle_chat_send(
 
             (StatusCode::OK, Json(record))
         }
-        Err(e) => {
-            tracing::warn!("Chat API send failed: {e}");
-            let err = serde_json::json!({"error": e.to_string()});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "chat message create",
+            "Failed to queue the chat message.",
+            err,
+        ),
     }
 }
 
@@ -3533,10 +3596,11 @@ async fn handle_feed_workflow_settings(
     let store = match load_or_seed_feed_workflow_settings_store(&workspace_dir) {
         Ok(store) => store,
         Err(err) => {
-            tracing::warn!("Failed to load workflow settings store: {err}");
-            return (
+            return frontend_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
+                "feed workflow settings load",
+                "Failed to load content agent settings.",
+                err,
             );
         }
     };
@@ -3578,10 +3642,11 @@ async fn handle_feed_workflow_settings_update(
     let mut store = match load_or_seed_feed_workflow_settings_store(&workspace_dir) {
         Ok(store) => store,
         Err(err) => {
-            tracing::warn!("Failed to load workflow settings store for update: {err}");
-            return (
+            return frontend_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
+                "feed workflow settings load for update",
+                "Failed to load content agent settings.",
+                err,
             );
         }
     };
@@ -3638,19 +3703,23 @@ async fn handle_feed_workflow_settings_update(
             workflow_record.output_prefix.trim_end_matches('/'),
         );
         if let Err(err) = std::fs::write(&skill_abs, replacement_skill) {
-            return (
+            return frontend_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("failed to update skill: {err}")})),
+                "feed workflow skill update",
+                "Failed to update the content agent skill.",
+                err,
             );
         }
 
         let creation_skill_markdown = match ensure_workflow_bot_creation_skill(&workspace_dir) {
             Ok(markdown) => markdown,
             Err(err) => {
-                return (
+                return frontend_internal_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("{err:#}")})),
-                )
+                    "feed workflow creation skill load",
+                    "Failed to load the workflow creation skill.",
+                    err,
+                );
             }
         };
         let authoring_prompt = render_content_agent_authoring_prompt(
@@ -3673,9 +3742,11 @@ async fn handle_feed_workflow_settings_update(
         match authoring_result {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => {
-                return (
+                return frontend_internal_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("content agent update failed: {err:#}")})),
+                    "feed workflow content agent update",
+                    "Content agent update failed.",
+                    err,
                 );
             }
             Err(_) => {
@@ -3687,15 +3758,19 @@ async fn handle_feed_workflow_settings_update(
         }
 
         if let Err(err) = validate_content_agent_skill_contract(&skill_abs) {
-            return (
+            return frontend_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("updated skill failed validation: {err:#}")})),
+                "feed workflow updated skill validation",
+                "The updated content agent skill failed validation.",
+                err,
             );
         }
     } else if let Err(err) = ensure_content_agent_skill_file(&workspace_dir, &workflow_record) {
-        return (
+        return frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("failed to ensure skill: {err:#}")})),
+            "feed workflow skill ensure",
+            "Failed to prepare the content agent skill.",
+            err,
         );
     }
 
@@ -3703,10 +3778,11 @@ async fn handle_feed_workflow_settings_update(
         .workflows
         .insert(workflow.key.to_string(), workflow_record.clone());
     if let Err(err) = save_feed_workflow_settings_store(&workspace_dir, &store) {
-        tracing::warn!("Failed to persist workflow settings: {err}");
-        return (
+        return frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
+            "feed workflow settings persist",
+            "Failed to save content agent settings.",
+            err,
         );
     }
 
@@ -3779,13 +3855,12 @@ async fn handle_feed_workflow_run(
                 "workflowBot": workflow_bot,
             })),
         ),
-        Err(err) => {
-            tracing::warn!("Failed to queue manual workflow run: {err}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
-            )
-        }
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "feed workflow run queue",
+            "Failed to queue the content agent run.",
+            err,
+        ),
     }
 }
 
@@ -3816,13 +3891,12 @@ async fn handle_feed_workflow_auto_run(
                 "items": items,
             })),
         ),
-        Err(err) => {
-            tracing::warn!("Failed to auto-run eligible content agents: {err}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
-            )
-        }
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "feed workflow auto run",
+            "Failed to queue eligible content agents.",
+            err,
+        ),
     }
 }
 
@@ -3878,18 +3952,22 @@ async fn handle_workspace_synthesizer_run(
         ) {
             Ok(selection) => selection,
             Err(err) => {
-                return (
+                return frontend_internal_error(
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": err.to_string()})),
+                    "workspace synthesizer source selection",
+                    "That journal entry cannot be queued for synthesis.",
+                    err,
                 );
             }
         },
         None => match select_workspace_synth_sources(&workspace_dir, &[], false) {
             Ok(selection) => selection,
             Err(err) => {
-                return (
+                return frontend_internal_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": err.to_string()})),
+                    "workspace synthesizer pending selection",
+                    "Failed to inspect pending journal entries for synthesis.",
+                    err,
                 );
             }
         },
@@ -3927,9 +4005,11 @@ async fn handle_workspace_synthesizer_run(
                 "threadId": thread_id,
             })),
         ),
-        Err(err) => (
+        Err(err) => frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
+            "workspace synthesizer run queue",
+            "Failed to queue the workspace synthesis run.",
+            err,
         ),
     }
 }
@@ -3964,9 +4044,11 @@ async fn handle_workspace_synthesizer_auto_run(
                 "queued": false,
             })),
         ),
-        Err(err) => (
+        Err(err) => frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
+            "workspace synthesizer auto run",
+            "Failed to queue workspace synthesis automatically.",
+            err,
         ),
     }
 }
@@ -3984,9 +4066,11 @@ async fn handle_workspace_todos_list(
     let limit = query.limit.unwrap_or(100);
     match local_store::list_workspace_todos(&workspace_dir, limit) {
         Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))),
-        Err(err) => (
+        Err(err) => frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err.to_string() })),
+            "workspace todo list",
+            "Failed to load workspace todos.",
+            err,
         ),
     }
 }
@@ -4015,9 +4099,11 @@ async fn handle_workspace_todo_update(
     };
     match local_store::update_workspace_todo_status(&workspace_dir, &update) {
         Ok(item) => (StatusCode::OK, Json(serde_json::json!({ "item": item }))),
-        Err(err) => (
+        Err(err) => frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err.to_string() })),
+            "workspace todo update",
+            "Failed to update the todo status.",
+            err,
         ),
     }
 }
@@ -4035,9 +4121,11 @@ async fn handle_workspace_events_list(
     let limit = query.limit.unwrap_or(100);
     match local_store::list_workspace_events(&workspace_dir, limit) {
         Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))),
-        Err(err) => (
+        Err(err) => frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err.to_string() })),
+            "workspace event list",
+            "Failed to load workspace events.",
+            err,
         ),
     }
 }
@@ -4084,12 +4172,16 @@ async fn handle_feed_personalized(
 
     let (embedder, embedder_message) = match resolve_feed_embedder(&config_snapshot).await {
         Ok((embedder, message)) => (embedder, message),
-        Err(err) => (
-            None,
-            Some(format!(
-                "Failed to initialize the configured embedding provider: {err}"
-            )),
-        ),
+        Err(err) => {
+            tracing::warn!("Failed to initialize the configured embedding provider: {err}");
+            (
+                None,
+                Some(
+                    "Configured feed embeddings are unavailable. Showing fallback feed results."
+                        .to_string(),
+                ),
+            )
+        }
     };
 
     if let Err(err) = refresh_cached_content_sources(&workspace_dir, embedder.clone()).await {
@@ -4112,11 +4204,11 @@ async fn handle_feed_personalized(
             ),
             Err(err) => {
                 if items.is_empty() {
-                    return (
+                    return frontend_internal_error(
                         StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "error": format!("Failed to fetch Bluesky candidates: {err}")
-                        })),
+                        "feed personalized fallback candidate fetch",
+                        "Failed to load Bluesky fallback results.",
+                        err,
                     );
                 }
             }
@@ -4138,6 +4230,7 @@ async fn handle_feed_personalized(
     let profile = match rebuild_interest_profile(&config_snapshot, embedder.clone()).await {
         Ok(profile) => profile,
         Err(err) => {
+            tracing::warn!("Failed to rebuild interest profile: {err}");
             let mut items = recent_content_items.clone();
             match fallback_candidates().await {
                 Ok(candidates) => append_feed_items_up_to_limit(
@@ -4147,11 +4240,11 @@ async fn handle_feed_personalized(
                 ),
                 Err(fetch_err) => {
                     if items.is_empty() {
-                        return (
+                        return frontend_internal_error(
                             StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "error": format!("Failed to fetch Bluesky candidates: {fetch_err}")
-                            })),
+                            "feed personalized profile fallback candidate fetch",
+                            "Failed to load Bluesky fallback results.",
+                            fetch_err,
                         );
                     }
                 }
@@ -4163,7 +4256,7 @@ async fn handle_feed_personalized(
                     "profileStatus": "fallbackRaw",
                     "profileStats": InterestProfileStats::default(),
                     "usedFallback": true,
-                    "message": format!("Failed to rebuild interest profile: {err}"),
+                    "message": "Personalized ranking is unavailable right now. Showing fallback feed results.",
                 })),
             );
         }
@@ -4179,11 +4272,11 @@ async fn handle_feed_personalized(
             ),
             Err(err) => {
                 if items.is_empty() {
-                    return (
+                    return frontend_internal_error(
                         StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "error": format!("Failed to fetch Bluesky candidates: {err}")
-                        })),
+                        "feed personalized candidate fetch",
+                        "Failed to load Bluesky fallback results.",
+                        err,
                     );
                 }
             }
@@ -4228,11 +4321,11 @@ async fn handle_feed_personalized(
                 let raw_candidates = match fallback_candidates().await {
                     Ok(candidates) => candidates,
                     Err(fetch_err) => {
-                        return (
+                        return frontend_internal_error(
                             StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "error": format!("Failed to fetch Bluesky candidates: {fetch_err}")
-                            })),
+                            "feed personalized ranked candidate fetch",
+                            "Failed to load Bluesky results.",
+                            fetch_err,
                         );
                     }
                 };
@@ -4389,10 +4482,11 @@ async fn handle_feed_workflow_template_create(
     let store = match load_or_seed_feed_workflow_settings_store(&workspace_dir) {
         Ok(store) => store,
         Err(err) => {
-            tracing::warn!("Failed to load workflow settings store for create: {err}");
-            return (
+            return frontend_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
+                "feed workflow template store load",
+                "Failed to load content agent settings.",
+                err,
             );
         }
     };
@@ -4411,32 +4505,40 @@ async fn handle_feed_workflow_template_create(
 
     if let Some(parent) = skill_abs.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
-            return (
+            return frontend_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("failed to create skill directory: {err}")})),
+                "feed workflow template skill dir create",
+                "Failed to create the content agent skill directory.",
+                err,
             );
         }
     }
     if let Err(err) = std::fs::create_dir_all(workspace_dir.join(&output_dir_rel)) {
-        return (
+        return frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("failed to create output directory: {err}")})),
+            "feed workflow template output dir create",
+            "Failed to create the content agent output directory.",
+            err,
         );
     }
     if let Err(err) = std::fs::write(&skill_abs, skill_body) {
-        return (
+        return frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("failed to write skill: {err}")})),
+            "feed workflow template skill write",
+            "Failed to write the content agent skill.",
+            err,
         );
     }
 
     let creation_skill_markdown = match ensure_workflow_bot_creation_skill(&workspace_dir) {
         Ok(markdown) => markdown,
         Err(err) => {
-            return (
+            return frontend_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("{err:#}")})),
-            )
+                "feed workflow template creation skill load",
+                "Failed to load the workflow creation skill.",
+                err,
+            );
         }
     };
     let creation_prompt = render_content_agent_authoring_prompt(
@@ -4466,10 +4568,11 @@ async fn handle_feed_workflow_template_create(
     ) {
         Ok(record) => record,
         Err(err) => {
-            tracing::warn!("Failed to persist workflow template create request: {err}");
-            return (
+            return frontend_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
+                "feed workflow template request persist",
+                "Failed to queue content agent creation.",
+                err,
             );
         }
     };
@@ -4541,9 +4644,10 @@ async fn handle_feed_workflow_template_create(
         let creation_reply = match creation_result {
             Ok(Ok(reply)) => reply,
             Ok(Err(err)) => {
-                let err_text = truncate_with_ellipsis(
-                    &format!("workflow bot creation agent failed: {err:#}"),
-                    2000,
+                let err_text = frontend_background_error(
+                    "feed workflow template create agent",
+                    "Content agent creation failed.",
+                    &err,
                 );
                 persist_error(&err_text);
                 return;
@@ -4560,9 +4664,10 @@ async fn handle_feed_workflow_template_create(
 
         let skill_abs_for_worker = workspace_for_worker.join(&skill_rel_for_worker);
         if let Err(err) = validate_content_agent_skill_contract(&skill_abs_for_worker) {
-            let err_text = truncate_with_ellipsis(
-                &format!("generated content agent skill failed validation: {err:#}"),
-                2000,
+            let err_text = frontend_background_error(
+                "feed workflow template skill validation",
+                "The generated content agent skill failed validation.",
+                &err,
             );
             persist_error(&err_text);
             return;
@@ -4570,8 +4675,11 @@ async fn handle_feed_workflow_template_create(
         let final_skill = match std::fs::read_to_string(&skill_abs_for_worker) {
             Ok(raw) => raw,
             Err(err) => {
-                let err_text =
-                    truncate_with_ellipsis(&format!("failed to read generated skill: {err}"), 2000);
+                let err_text = frontend_background_error(
+                    "feed workflow template skill read",
+                    "Failed to read the generated content agent skill.",
+                    &err,
+                );
                 persist_error(&err_text);
                 return;
             }
@@ -4584,9 +4692,10 @@ async fn handle_feed_workflow_template_create(
         let mut worker_store = match load_or_seed_feed_workflow_settings_store(&workspace_for_worker) {
             Ok(store) => store,
             Err(err) => {
-                let err_text = truncate_with_ellipsis(
-                    &format!("failed to load workflow settings store: {err:#}"),
-                    2000,
+                let err_text = frontend_background_error(
+                    "feed workflow template worker store load",
+                    "Failed to load content agent settings.",
+                    &err,
                 );
                 persist_error(&err_text);
                 return;
@@ -4619,9 +4728,10 @@ async fn handle_feed_workflow_template_create(
             .workflows
             .insert(workflow_key_for_worker.clone(), workflow_record);
         if let Err(err) = save_feed_workflow_settings_store(&workspace_for_worker, &worker_store) {
-            let err_text = truncate_with_ellipsis(
-                &format!("failed to persist workflow settings store: {err:#}"),
-                2000,
+            let err_text = frontend_background_error(
+                "feed workflow template worker store persist",
+                "Failed to save content agent settings.",
+                &err,
             );
             persist_error(&err_text);
             return;
@@ -4766,9 +4876,12 @@ async fn handle_feed_workflow_comment(
             ) {
                 Ok(record) => record,
                 Err(err) => {
-                    tracing::warn!("Failed to persist feed workflow quickfix request: {err}");
-                    let payload = serde_json::json!({"error": err.to_string()});
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(payload));
+                    return frontend_internal_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "feed workflow quickfix persist",
+                        "Failed to save the workflow quickfix request.",
+                        err,
+                    );
                 }
             };
             let user_id = user_record
@@ -4827,9 +4940,12 @@ async fn handle_feed_workflow_comment(
     ) {
         Ok(record) => record,
         Err(err) => {
-            tracing::warn!("Failed to persist feed workflow comment: {err}");
-            let payload = serde_json::json!({"error": err.to_string()});
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(payload));
+            return frontend_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "feed workflow comment persist",
+                "Failed to queue the workflow comment.",
+                err,
+            );
         }
     };
 
@@ -4897,7 +5013,11 @@ async fn handle_feed_workflow_comment(
                 }
             }
             Err(err) => {
-                let err_text = crate::util::truncate_with_ellipsis(&format!("{err:#}"), 2000);
+                let err_text = frontend_background_error(
+                    "feed workflow comment worker",
+                    "Comment processing failed.",
+                    &err,
+                );
                 let _ = local_store::create_chat_message(
                     &workspace_for_worker,
                     &thread_id_for_worker,
@@ -4948,13 +5068,12 @@ async fn handle_drafts_list(
     let limit = query.limit.unwrap_or(20).clamp(1, 200);
     match local_store::list_drafts(&workspace_dir, limit) {
         Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))),
-        Err(err) => {
-            tracing::warn!("Drafts list failed: {err}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
-            )
-        }
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "draft list",
+            "Failed to load drafts.",
+            err,
+        ),
     }
 }
 
@@ -4976,13 +5095,12 @@ async fn handle_drafts_upsert(
     };
     match local_store::upsert_draft(&workspace_dir, &payload) {
         Ok(record) => (StatusCode::OK, Json(record)),
-        Err(err) => {
-            tracing::warn!("Draft upsert failed: {err}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
-            )
-        }
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "draft upsert",
+            "Failed to save the draft.",
+            err,
+        ),
     }
 }
 
@@ -4998,13 +5116,12 @@ async fn handle_post_history_list(
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     match local_store::list_post_history(&workspace_dir, limit) {
         Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))),
-        Err(err) => {
-            tracing::warn!("Post history list failed: {err}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
-            )
-        }
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "post history list",
+            "Failed to load post history.",
+            err,
+        ),
     }
 }
 
@@ -5030,13 +5147,12 @@ async fn handle_post_history_create(
     };
     match local_store::create_post_history(&workspace_dir, &payload) {
         Ok(record) => (StatusCode::OK, Json(record)),
-        Err(err) => {
-            tracing::warn!("Post history create failed: {err}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
-            )
-        }
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "post history create",
+            "Failed to save post history.",
+            err,
+        ),
     }
 }
 
@@ -5285,17 +5401,25 @@ async fn handle_media_upload(
     let rel_path = media_storage_rel_path(kind, &original_name);
     let abs_path = workspace_dir.join(&rel_path);
     if let Some(parent) = abs_path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            let err = serde_json::json!({"error": format!("Failed to create media directory: {e}")});
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+        if let Err(err) = tokio::fs::create_dir_all(parent).await {
+            return frontend_internal_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "media upload dir create",
+                "Failed to prepare media storage for the upload.",
+                err,
+            );
         }
     }
 
     let mut file = match tokio::fs::File::create(&abs_path).await {
         Ok(f) => f,
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to create upload file: {e}")});
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+        Err(err) => {
+            return frontend_internal_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "media upload file create",
+                "Failed to create the uploaded media file.",
+                err,
+            );
         }
     };
 
@@ -5304,17 +5428,25 @@ async fn handle_media_upload(
     while let Some(frame_result) = body.frame().await {
         let frame = match frame_result {
             Ok(frame) => frame,
-            Err(e) => {
+            Err(err) => {
                 let _ = tokio::fs::remove_file(&abs_path).await;
-                let err = serde_json::json!({"error": format!("Upload stream error: {e}")});
-                return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+                return frontend_internal_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "media upload stream",
+                    "The upload stream could not be read.",
+                    err,
+                );
             }
         };
         if let Some(data) = frame.data_ref() {
-            if let Err(e) = file.write_all(data).await {
+            if let Err(err) = file.write_all(data).await {
                 let _ = tokio::fs::remove_file(&abs_path).await;
-                let err = serde_json::json!({"error": format!("Failed writing upload file: {e}")});
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+                return frontend_internal_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "media upload file write",
+                    "Failed while writing the uploaded media file.",
+                    err,
+                );
             }
             bytes_written = bytes_written.saturating_add(data.len() as u64);
         }
@@ -5389,15 +5521,23 @@ async fn handle_journal_text(
     let rel_path = text_journal_rel_path(title);
     let abs_path = workspace_dir.join(&rel_path);
     if let Some(parent) = abs_path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            let err = serde_json::json!({"error": format!("Failed to create journal directory: {e}")});
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+        if let Err(err) = tokio::fs::create_dir_all(parent).await {
+            return frontend_internal_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "journal text dir create",
+                "Failed to prepare journal storage.",
+                err,
+            );
         }
     }
     let file_body = format!("{content}\n");
-    if let Err(e) = tokio::fs::write(&abs_path, file_body).await {
-        let err = serde_json::json!({"error": format!("Failed to save journal note: {e}")});
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+    if let Err(err) = tokio::fs::write(&abs_path, file_body).await {
+        return frontend_internal_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "journal text save",
+            "Failed to save the journal note.",
+            err,
+        );
     }
 
     let pb_record = match create_journal_entry_metadata(
@@ -5446,11 +5586,12 @@ async fn handle_media_stream(
 
     match ServeFile::new(abs_path).oneshot(req).await {
         Ok(resp) => resp.into_response(),
-        Err(e) => {
-            tracing::warn!("Media stream failed: {e}");
-            let err = serde_json::json!({"error": format!("Media stream failed: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response()
-        }
+        Err(err) => frontend_internal_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "media stream",
+            "Failed to stream the media file.",
+            err,
+        ),
     }
 }
 
@@ -5467,10 +5608,12 @@ async fn handle_library_items(
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
     match list_workspace_library_items(&workspace_dir, scope, limit) {
         Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "items": items }))).into_response(),
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to list library items: {e}")});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response()
-        }
+        Err(err) => frontend_internal_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "library item list",
+            "Failed to list library items.",
+            err,
+        ),
     }
 }
 
@@ -5496,10 +5639,12 @@ async fn handle_library_text(
                 .unwrap_or_else(|| query.path.clone());
             (StatusCode::OK, Json(serde_json::json!({"path": rel, "content": content}))).into_response()
         }
-        Err(e) => {
-            let err = serde_json::json!({"error": format!("Failed to read text file: {e}")});
-            (StatusCode::NOT_FOUND, Json(err)).into_response()
-        }
+        Err(err) => frontend_internal_error_response(
+            StatusCode::NOT_FOUND,
+            "library text read",
+            "Failed to read the requested text file.",
+            err,
+        ),
     }
 }
 
@@ -5517,14 +5662,22 @@ async fn handle_library_save_text(
         return (StatusCode::BAD_REQUEST, Json(err)).into_response();
     };
     if let Some(parent) = path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            let err = serde_json::json!({"error": format!("Failed to create directory: {e}")});
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+        if let Err(err) = tokio::fs::create_dir_all(parent).await {
+            return frontend_internal_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "library text dir create",
+                "Failed to prepare the destination folder.",
+                err,
+            );
         }
     }
-    if let Err(e) = tokio::fs::write(&path, &body.content).await {
-        let err = serde_json::json!({"error": format!("Failed to save text file: {e}")});
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+    if let Err(err) = tokio::fs::write(&path, &body.content).await {
+        return frontend_internal_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "library text save",
+            "Failed to save the text file.",
+            err,
+        );
     }
     let rel = path
         .strip_prefix(&workspace_dir)
@@ -5564,9 +5717,13 @@ async fn handle_library_delete(
         return (StatusCode::NOT_FOUND, Json(err)).into_response();
     }
 
-    if let Err(e) = tokio::fs::remove_file(&abs_path).await {
-        let err = serde_json::json!({"error": format!("Failed to delete file: {e}")});
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+    if let Err(err) = tokio::fs::remove_file(&abs_path).await {
+        return frontend_internal_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "library delete",
+            "Failed to delete the file.",
+            err,
+        );
     }
 
     let mut removed_related: Vec<String> = Vec::new();
@@ -5856,7 +6013,11 @@ fn enqueue_transcription_job(
             Err(error) => JournalTranscriptionJob {
                 status: "error".to_string(),
                 transcript_path: Some(task_transcript_rel_path.clone()),
-                error: Some(error.to_string()),
+                error: Some(frontend_background_error(
+                    "journal transcription",
+                    "Transcription failed.",
+                    &error,
+                )),
                 updated_at: chrono::Utc::now().to_rfc3339(),
             },
         };
