@@ -24,6 +24,7 @@ jobs:
             docs_only: ${{ steps.scope.outputs.docs_only }}
             docs_changed: ${{ steps.scope.outputs.docs_changed }}
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
+            web_changed: ${{ steps.scope.outputs.web_changed }}
             workflow_changed: ${{ steps.scope.outputs.workflow_changed }}
             docs_files: ${{ steps.scope.outputs.docs_files }}
             base_sha: ${{ steps.scope.outputs.base_sha }}
@@ -95,6 +96,44 @@ jobs:
             - name: Check binary size
               run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
 
+    platform-smoke:
+        name: Platform Smoke (${{ matrix.os }})
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 20
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [windows-latest, macos-14]
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - name: Run native runtime shell smoke test
+              run: cargo test --locked native_builds_shell_command --lib --verbose
+
+    web-build:
+        name: Web Build
+        needs: [changes]
+        if: needs.changes.outputs.web_changed == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 20
+                  cache: npm
+                  cache-dependency-path: web/package-lock.json
+            - name: Install web dependencies
+              working-directory: web
+              run: npm ci
+            - name: Build web app
+              working-directory: web
+              run: npm run build
+
     docs-only:
         name: Docs-Only Fast Path
         needs: [changes]
@@ -107,7 +146,7 @@ jobs:
     non-rust:
         name: Non-Rust Fast Path
         needs: [changes]
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.rust_changed != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.rust_changed != 'true' && needs.changes.outputs.web_changed != 'true'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - name: Skip Rust jobs for non-Rust change scope
@@ -236,7 +275,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
+        needs: [changes, lint, test, build, platform-smoke, web-build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, license-file-owner-guard]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - name: Enforce required status
@@ -246,11 +285,13 @@ jobs:
 
                   event_name="${{ github.event_name }}"
                   rust_changed="${{ needs.changes.outputs.rust_changed }}"
+                  web_changed="${{ needs.changes.outputs.web_changed }}"
                   docs_changed="${{ needs.changes.outputs.docs_changed }}"
                   workflow_changed="${{ needs.changes.outputs.workflow_changed }}"
                   docs_result="${{ needs.docs-quality.result }}"
                   workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
                   license_owner_result="${{ needs.license-file-owner-guard.result }}"
+                  web_build_result="${{ needs.web-build.result }}"
 
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
                     echo "workflow_owner_approval=${workflow_owner_result}"
@@ -271,8 +312,8 @@ jobs:
                     exit 0
                   fi
 
-                  if [ "$rust_changed" != "true" ]; then
-                    echo "rust_changed=false (non-rust fast path)"
+                  if [ "$rust_changed" != "true" ] && [ "$web_changed" != "true" ]; then
+                    echo "rust_changed=false web_changed=false (non-rust fast path)"
                     echo "workflow_owner_approval=${workflow_owner_result}"
                     echo "license_file_owner_guard=${license_owner_result}"
                     if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
@@ -291,15 +332,42 @@ jobs:
                     exit 0
                   fi
 
+                  if [ "$rust_changed" != "true" ] && [ "$web_changed" = "true" ]; then
+                    echo "web_build=${web_build_result}"
+                    echo "workflow_owner_approval=${workflow_owner_result}"
+                    echo "license_file_owner_guard=${license_owner_result}"
+                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
+                      echo "Workflow files changed but workflow owner approval gate did not pass."
+                      exit 1
+                    fi
+                    if [ "$event_name" = "pull_request" ] && [ "$license_owner_result" != "success" ]; then
+                      echo "License file owner guard did not pass."
+                      exit 1
+                    fi
+                    if [ "$web_build_result" != "success" ]; then
+                      echo "Web-only change detected, but web-build did not pass."
+                      exit 1
+                    fi
+                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
+                      echo "Web-only change touched docs, but docs-quality did not pass."
+                      exit 1
+                    fi
+                    echo "Web-only checks passed."
+                    exit 0
+                  fi
+
                   lint_result="${{ needs.lint.result }}"
                   lint_strict_delta_result="${{ needs.lint.result }}"
                   test_result="${{ needs.test.result }}"
                   build_result="${{ needs.build.result }}"
+                  platform_smoke_result="${{ needs.platform-smoke.result }}"
 
                   echo "lint=${lint_result}"
                   echo "lint_strict_delta=${lint_strict_delta_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
+                  echo "platform_smoke=${platform_smoke_result}"
+                  echo "web_build=${web_build_result}"
                   echo "docs=${docs_result}"
                   echo "workflow_owner_approval=${workflow_owner_result}"
                   echo "license_file_owner_guard=${license_owner_result}"
@@ -315,8 +383,12 @@ jobs:
                   fi
 
                   if [ "$event_name" = "pull_request" ]; then
-                    if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                    if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ] || [ "$platform_smoke_result" != "success" ]; then
                       echo "Required PR CI jobs did not pass."
+                      exit 1
+                    fi
+                    if [ "$web_changed" = "true" ] && [ "$web_build_result" != "success" ]; then
+                      echo "PR changed web UI, but web-build did not pass."
                       exit 1
                     fi
                     if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
@@ -327,8 +399,12 @@ jobs:
                     exit 0
                   fi
 
-                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ] || [ "$platform_smoke_result" != "success" ]; then
                     echo "Required push CI jobs did not pass."
+                    exit 1
+                  fi
+                  if [ "$web_changed" = "true" ] && [ "$web_build_result" != "success" ]; then
+                    echo "Push changed web UI, but web-build did not pass."
                     exit 1
                   fi
 

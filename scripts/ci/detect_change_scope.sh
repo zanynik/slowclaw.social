@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Detect change scope for CI pipeline.
-# Classifies changed files into docs-only, rust, workflow categories
+# Classifies changed files into docs-only, rust, workflow, and web categories
 # and writes results to $GITHUB_OUTPUT.
 #
 # Required environment variables:
@@ -23,6 +23,7 @@ if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
     echo "docs_only=false"
     echo "docs_changed=false"
     echo "rust_changed=true"
+    echo "web_changed=true"
     echo "workflow_changed=false"
     echo "base_sha="
   } >> "$GITHUB_OUTPUT"
@@ -46,6 +47,7 @@ if [ -z "$CHANGED" ]; then
     echo "docs_only=false"
     echo "docs_changed=false"
     echo "rust_changed=false"
+    echo "web_changed=false"
     echo "workflow_changed=false"
     echo "base_sha=$DIFF_BASE"
   } >> "$GITHUB_OUTPUT"
@@ -56,6 +58,7 @@ fi
 docs_only=true
 docs_changed=false
 rust_changed=false
+web_changed=false
 workflow_changed=false
 docs_files=()
 while IFS= read -r file; do
@@ -91,12 +94,17 @@ while IFS= read -r file; do
     || [[ "$file" == "deny.toml" ]]; then
     rust_changed=true
   fi
+
+  if [[ "$file" == web/* ]]; then
+    web_changed=true
+  fi
 done <<< "$CHANGED"
 
 {
   echo "docs_only=$docs_only"
   echo "docs_changed=$docs_changed"
   echo "rust_changed=$rust_changed"
+  echo "web_changed=$web_changed"
   echo "workflow_changed=$workflow_changed"
   echo "base_sha=$DIFF_BASE"
   echo "docs_files<<EOF"

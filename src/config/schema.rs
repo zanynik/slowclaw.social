@@ -856,6 +856,13 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Additional browser origins allowed to call the desktop gateway.
+    ///
+    /// ZeroClaw always allows a small built-in local allowlist for desktop/mobile
+    /// development. Use this only when you intentionally need extra origins.
+    #[serde(default)]
+    pub desktop_cors_allowed_origins: Vec<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -904,6 +911,7 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            desktop_cors_allowed_origins: Vec::new(),
         }
     }
 }
@@ -4338,6 +4346,13 @@ impl Config {
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
         }
+        for (index, origin) in self.gateway.desktop_cors_allowed_origins.iter().enumerate() {
+            if origin.trim().is_empty() {
+                anyhow::bail!(
+                    "gateway.desktop_cors_allowed_origins[{index}] must not be empty"
+                );
+            }
+        }
 
         // Autonomy
         if self.autonomy.max_actions_per_hour == 0 {
@@ -6162,6 +6177,7 @@ channel_id = "C123"
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_ttl_secs, 300);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert!(g.desktop_cors_allowed_origins.is_empty());
     }
 
     #[test]
@@ -6193,6 +6209,10 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            desktop_cors_allowed_origins: vec![
+                "http://localhost:1420".into(),
+                "https://review.example".into(),
+            ],
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -6205,6 +6225,10 @@ channel_id = "C123"
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
+        assert_eq!(
+            parsed.desktop_cors_allowed_origins,
+            vec!["http://localhost:1420", "https://review.example"]
+        );
     }
 
     #[test]

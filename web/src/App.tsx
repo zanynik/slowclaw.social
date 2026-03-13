@@ -1,6 +1,7 @@
 import { lazy, Suspense, FormEvent, useEffect, useRef, useState } from "react";
 import type { AtpAgent, AppBskyFeedDefs } from "@atproto/api";
 import type { BlueskySession } from "./lib/bluesky";
+import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
   saveJournalText,
@@ -88,6 +89,10 @@ import {
   runFeedContentAgentNow,
   saveDraft as saveDraftViaGateway,
   saveLibraryText,
+  streamClawChatMessages,
+  streamClawChatResult,
+  streamJournalTranscriptionStatus,
+  streamWorkspaceSynthesizerStatus,
   submitFeedContentAgentComment,
   transcribeJournalMedia,
   updateWorkspaceTodoStatus,
@@ -97,14 +102,17 @@ import {
 } from "./lib/gatewayApi";
 import type {
   FeedContentAgentItem,
+  GatewayEventStreamHandle,
+  JournalTranscriptionStatus,
   InterestProfileStats,
   MediaCapabilities,
-  PersonalizedBlueskyItem,
+  PersonalizedFeedItem,
   WorkspaceEventItem,
   WorkspaceSynthArtifactState,
   WorkspaceSynthesizerStatus,
   WorkspaceTodoItem,
 } from "./lib/gatewayApi";
+import { ProductivityView } from "./views/ProductivityView";
 
 const CHAT_THREAD_STORAGE_KEY = "slowclaw.chat.thread_id";
 const CHAT_GATEWAY_BASE_URL_STORAGE_KEY = "slowclaw.chat.gateway_base_url";
@@ -123,7 +131,7 @@ const DEFAULT_RECORDING_HINT = "Ready to add a journal note, audio, or video.";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
-type MobileTab = "journal" | "feed" | "todos" | "events" | "profile";
+type MobileTab = "journal" | "feed" | "productivity" | "profile";
 type ThemeMode = "light" | "dark";
 type DesktopGatewayBootstrap = {
   token?: string | null;
@@ -156,12 +164,10 @@ function defaultMobileTab(): MobileTab {
     return "journal";
   }
   const saved = window.localStorage.getItem(UI_TAB_STORAGE_KEY);
-  return saved === "feed" ||
-    saved === "todos" ||
-    saved === "events" ||
-    saved === "profile"
-    ? saved
-    : "journal";
+  if (saved === "todos" || saved === "events") {
+    return "productivity";
+  }
+  return saved === "feed" || saved === "productivity" || saved === "profile" ? saved : "journal";
 }
 
 function useIsLargeScreen() {
@@ -204,7 +210,13 @@ function parseDateValue(value?: string | null) {
   if (!value) {
     return null;
   }
-  const parsed = new Date(String(value));
+  const normalized = String(value).trim();
+  const localDateOnly = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (localDateOnly) {
+    const [, year, month, day] = localDateOnly;
+    return new Date(Number(year), Number(month) - 1, Number(day));
+  }
+  const parsed = new Date(normalized);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
@@ -230,26 +242,39 @@ function todoPriorityRank(priority: string) {
   return 2;
 }
 
+function hasExplicitTime(value?: string | null) {
+  return Boolean(value && /[T\s]\d{2}:\d{2}/.test(String(value)));
+}
+
 function formatTodoDueLabel(value?: string | null) {
   const due = parseDateValue(value);
   if (!due) {
     return "No due date";
   }
+  const showTime = hasExplicitTime(value);
   const now = new Date();
   const today = startOfLocalDay(now);
   const tomorrow = new Date(today);
   tomorrow.setDate(today.getDate() + 1);
   const dueDay = startOfLocalDay(due);
-  if (dueDay.getTime() < today.getTime()) {
-    return `Overdue · ${due.toLocaleDateString()}`;
+  if ((showTime && due.getTime() < now.getTime()) || (!showTime && dueDay.getTime() < today.getTime())) {
+    return showTime
+      ? `Overdue · ${due.toLocaleDateString()} · ${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+      : `Overdue · ${due.toLocaleDateString()}`;
   }
   if (dueDay.getTime() === today.getTime()) {
-    return `Due today · ${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+    return showTime
+      ? `Due today · ${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+      : "Due today";
   }
   if (dueDay.getTime() === tomorrow.getTime()) {
-    return `Due tomorrow · ${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+    return showTime
+      ? `Due tomorrow · ${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+      : "Due tomorrow";
   }
-  return `Due ${due.toLocaleDateString()}${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) !== "Invalid Date" ? ` · ${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}`;
+  return showTime
+    ? `Due ${due.toLocaleDateString()} · ${due.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+    : `Due ${due.toLocaleDateString()}`;
 }
 
 function formatEventTiming(
@@ -282,13 +307,6 @@ function formatEventTiming(
     hour: "numeric",
     minute: "2-digit"
   })}`;
-}
-
-function formatDayKey(date: Date) {
-  const year = date.getFullYear();
-  const month = `${date.getMonth() + 1}`.padStart(2, "0");
-  const day = `${date.getDate()}`.padStart(2, "0");
-  return `${year}-${month}-${day}`;
 }
 
 function workspaceSynthArtifactTone(state?: WorkspaceSynthArtifactState) {
@@ -830,6 +848,8 @@ function App() {
   const [feedSidebarOpen, setFeedSidebarOpen] = useState(false);
   const [feedCreateWorkflowOpen, setFeedCreateWorkflowOpen] = useState(false);
   const [journalItems, setJournalItems] = useState<LibraryItem[]>([]);
+  const [journalSearchQuery, setJournalSearchQuery] = useState("");
+  const [journalSidebarStatus, setJournalSidebarStatus] = useState("");
   const [feedItems, setFeedItems] = useState<LibraryItem[]>([]);
   const [libraryStatus, setLibraryStatus] = useState("Library idle");
   const [selectedJournalPath, setSelectedJournalPath] = useState<string>("");
@@ -894,6 +914,7 @@ function App() {
   } | null>(null);
   const [aiSetupStatus, setAiSetupStatus] = useState<OpenAiDeviceCodeStatus | null>(null);
   const [aiSetupBusy, setAiSetupBusy] = useState(false);
+  const [aiSetupBrowserStatus, setAiSetupBrowserStatus] = useState("");
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerApiKeyStatus, setProviderApiKeyStatus] = useState("");
   const [settingsProvider, setSettingsProvider] = useState("");
@@ -924,16 +945,20 @@ function App() {
   const autosaveTimerRef = useRef<number | null>(null);
   const journalAutosaveTimerRef = useRef<number | null>(null);
   const journalStatusTimerRef = useRef<number | null>(null);
+  const journalSidebarStatusTimerRef = useRef<number | null>(null);
   const feedAutosaveTimersRef = useRef<Record<string, number>>({});
   const feedDraftLoadingRef = useRef<Record<string, boolean>>({});
+  const aiSetupAutoOpenedUrlRef = useRef("");
   const loadedTextPathRef = useRef<string>("");
   const loadedCaptionPathRef = useRef<string>("");
-  const activeTranscriptionPollRef = useRef<Record<string, boolean>>({});
+  const activeTranscriptionPollRef = useRef<Record<string, GatewayEventStreamHandle | undefined>>({});
   const selectedJournalPathRef = useRef<string>("");
   const mobileScannerVideoRef = useRef<HTMLVideoElement | null>(null);
   const mobileScannerStreamRef = useRef<MediaStream | null>(null);
   const mobileScannerRafRef = useRef<number | null>(null);
-  const workflowPollAbortRef = useRef<AbortController | null>(null);
+  const workflowPollAbortRef = useRef<GatewayEventStreamHandle | null>(null);
+  const chatThreadStreamRef = useRef<GatewayEventStreamHandle | null>(null);
+  const workspaceSynthStreamRef = useRef<GatewayEventStreamHandle | null>(null);
 
   // Recording State
   const [isRecording, setIsRecording] = useState(false);
@@ -967,12 +992,11 @@ function App() {
   const [feedSource, setFeedSource] = useState<"local" | "bluesky">("local");
   const [workspaceTodos, setWorkspaceTodos] = useState<WorkspaceTodoItem[]>([]);
   const [workspaceEvents, setWorkspaceEvents] = useState<WorkspaceEventItem[]>([]);
-  const [selectedEventDay, setSelectedEventDay] = useState(() => formatDayKey(new Date()));
   const [workspaceSynthStatus, setWorkspaceSynthStatus] = useState<WorkspaceSynthesizerStatus>({
     status: "idle"
   });
   const [workspaceSynthBusy, setWorkspaceSynthBusy] = useState(false);
-  const [blueskyFeedItems, setBlueskyFeedItems] = useState<PersonalizedBlueskyItem[]>([]);
+  const [blueskyFeedItems, setBlueskyFeedItems] = useState<PersonalizedFeedItem[]>([]);
   const [blueskyFeedLoading, setBlueskyFeedLoading] = useState(false);
   const [blueskyFeedStatus, setBlueskyFeedStatus] = useState("");
   const [blueskyProfileStats, setBlueskyProfileStats] = useState<InterestProfileStats>({
@@ -984,8 +1008,7 @@ function App() {
     ignoredCount: 0,
   });
   const workspaceTabActive =
-    mobileTab === "todos" ||
-    mobileTab === "events" ||
+    mobileTab === "productivity" ||
     (mobileTab === "feed" && feedSource === "local");
   const workspaceSynthArtifacts = [
     { key: "posts", label: "Posts", state: workspaceSynthStatus.artifactStates?.insightPosts },
@@ -993,6 +1016,12 @@ function App() {
     { key: "events", label: "Events", state: workspaceSynthStatus.artifactStates?.events },
     { key: "clips", label: "Clips", state: workspaceSynthStatus.artifactStates?.clipPlans }
   ];
+  const workspaceSynthArtifactBadges = workspaceSynthArtifacts.map((artifact) => ({
+    key: artifact.key,
+    label: workspaceSynthArtifactLabel(artifact.label, artifact.state),
+    toneClassName: workspaceSynthArtifactTone(artifact.state),
+    title: artifact.state?.error || artifact.state?.path || ""
+  }));
   const workspaceSynthRunning =
     workspaceSynthStatus.status === "pending" || workspaceSynthStatus.status === "processing";
   const workspaceSynthPendingCount = Number(workspaceSynthStatus.pendingSourceCount || 0);
@@ -1161,7 +1190,13 @@ function App() {
       if (journalStatusTimerRef.current) {
         window.clearTimeout(journalStatusTimerRef.current);
       }
-      workflowPollAbortRef.current?.abort();
+      if (journalSidebarStatusTimerRef.current) {
+        window.clearTimeout(journalSidebarStatusTimerRef.current);
+      }
+      workflowPollAbortRef.current?.close();
+      chatThreadStreamRef.current?.close();
+      workspaceSynthStreamRef.current?.close();
+      Object.values(activeTranscriptionPollRef.current).forEach((handle) => handle?.close());
     };
   }, [mediaPreviewUrl]);
 
@@ -1172,6 +1207,16 @@ function App() {
     }
     journalStatusTimerRef.current = window.setTimeout(() => {
       setJournalSaveStatus((current) => (current === message ? "Journal idle" : current));
+    }, holdMs);
+  }
+
+  function holdJournalSidebarStatus(message: string, holdMs: number = 2500) {
+    setJournalSidebarStatus(message);
+    if (journalSidebarStatusTimerRef.current) {
+      window.clearTimeout(journalSidebarStatusTimerRef.current);
+    }
+    journalSidebarStatusTimerRef.current = window.setTimeout(() => {
+      setJournalSidebarStatus((current) => (current === message ? "" : current));
     }, holdMs);
   }
 
@@ -1523,13 +1568,71 @@ function App() {
     }
   }
 
+  function applyJournalTranscriptionStatus(
+    mediaPath: string,
+    statusResult: JournalTranscriptionStatus
+  ) {
+    const normalizedPath = mediaPath.trim();
+    const status = String(statusResult.status || "").toLowerCase();
+    const isStillSelected = () => selectedJournalPathRef.current === mediaPath;
+
+    if (status === "done") {
+      setJournalTranscriptionStatusByPath((prev) => ({
+        ...prev,
+        [normalizedPath]: "done"
+      }));
+      const transcriptPath = String(statusResult.path || "");
+      const transcriptText = String(statusResult.text || "");
+      if (isStillSelected()) {
+        loadedTextPathRef.current = transcriptPath;
+        setSelectedJournalText(transcriptText);
+        setJournalDraftText(transcriptText);
+        setJournalSaveStatus("Transcription ready");
+        setJournalTranscribing(false);
+      }
+      return;
+    }
+
+    if (status === "error") {
+      setJournalTranscriptionStatusByPath((prev) => ({
+        ...prev,
+        [normalizedPath]: "error"
+      }));
+      if (isStillSelected()) {
+        setJournalTranscribing(false);
+        setJournalSaveStatus(
+          `Transcription failed (${String(statusResult.error || "unknown error")})`
+        );
+      }
+      return;
+    }
+
+    if (status === "queued" || status === "running") {
+      setJournalTranscriptionStatusByPath((prev) => ({
+        ...prev,
+        [normalizedPath]: status as "queued" | "running"
+      }));
+      if (isStillSelected()) {
+        setJournalTranscribing(true);
+        setJournalSaveStatus(
+          status === "queued" ? "Transcription queued..." : "Transcription in progress..."
+        );
+      }
+      return;
+    }
+
+    setJournalTranscriptionStatusByPath((prev) => ({
+      ...prev,
+      [normalizedPath]: "idle"
+    }));
+    if (isStillSelected()) {
+      setJournalTranscribing(false);
+    }
+  }
+
   async function waitForTranscriptForMedia(
     mediaPath: string,
     token: string | undefined,
-    {
-      maxAttempts = 45,
-      pollMs = 2000
-    }: { maxAttempts?: number; pollMs?: number } = {}
   ) {
     const normalizedPath = mediaPath.trim();
     if (!normalizedPath) {
@@ -1538,80 +1641,26 @@ function App() {
     if (activeTranscriptionPollRef.current[normalizedPath]) {
       return;
     }
-    activeTranscriptionPollRef.current[normalizedPath] = true;
-    const isStillSelected = () => selectedJournalPathRef.current === mediaPath;
-    try {
-      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-        try {
-          const statusResult = await getJournalTranscriptionStatus(
-            mediaPath,
-            token,
-            gatewayBaseUrl
-          );
-          const status = String(statusResult.status || "").toLowerCase();
-          if (status === "done") {
-            setJournalTranscriptionStatusByPath((prev) => ({
-              ...prev,
-              [normalizedPath]: "done"
-            }));
-            const transcriptPath = String(statusResult.path || "");
-            const transcriptText = String(statusResult.text || "");
-            if (isStillSelected()) {
-              loadedTextPathRef.current = transcriptPath;
-              setSelectedJournalText(transcriptText);
-              setJournalDraftText(transcriptText);
-              setJournalSaveStatus("Transcription ready");
-              setJournalTranscribing(false);
-            }
-            return;
-          }
-          if (status === "error") {
-            setJournalTranscriptionStatusByPath((prev) => ({
-              ...prev,
-              [normalizedPath]: "error"
-            }));
-            if (isStillSelected()) {
-              setJournalTranscribing(false);
-              setJournalSaveStatus(
-                `Transcription failed (${String(statusResult.error || "unknown error")})`
-              );
-            }
-            return;
-          }
-          if (status === "queued" || status === "running") {
-            setJournalTranscriptionStatusByPath((prev) => ({
-              ...prev,
-              [normalizedPath]: status as "queued" | "running"
-            }));
-            if (isStillSelected()) {
-              setJournalTranscribing(true);
-              setJournalSaveStatus(
-                status === "queued" ? "Transcription queued..." : "Transcription in progress..."
-              );
-            }
-          } else {
-            setJournalTranscriptionStatusByPath((prev) => ({
-              ...prev,
-              [normalizedPath]: "idle"
-            }));
-            if (isStillSelected()) {
-              setJournalTranscribing(false);
-            }
-            return;
-          }
-        } catch {
-          if (isStillSelected()) {
-            setJournalTranscribing(false);
-          }
-          return;
+    const stream = streamJournalTranscriptionStatus(
+      mediaPath,
+      (statusResult) => {
+        applyJournalTranscriptionStatus(mediaPath, statusResult);
+      },
+      token,
+      gatewayBaseUrl,
+      () => {
+        if (selectedJournalPathRef.current === mediaPath) {
+          setJournalTranscribing(false);
         }
-        await new Promise((resolve) => window.setTimeout(resolve, pollMs));
       }
-      if (isStillSelected()) {
-        setJournalSaveStatus("Transcription still in queue. Check back in a moment.");
-      }
+    );
+    activeTranscriptionPollRef.current[normalizedPath] = stream;
+    try {
+      await stream.done;
     } finally {
-      delete activeTranscriptionPollRef.current[normalizedPath];
+      if (activeTranscriptionPollRef.current[normalizedPath] === stream) {
+        delete activeTranscriptionPollRef.current[normalizedPath];
+      }
     }
   }
 
@@ -2582,15 +2631,11 @@ function App() {
   async function pollChatResult(opts: {
     threadId: string;
     messageId: string;
-    maxAttempts: number;
     onDone: (reply: ClawChatMessage) => void;
     onError: (errText: string) => void;
     onTimeout?: () => void;
   }) {
-    // Abort any previous poll
-    workflowPollAbortRef.current?.abort();
-    const controller = new AbortController();
-    workflowPollAbortRef.current = controller;
+    workflowPollAbortRef.current?.close();
 
     let token = chatGatewayToken.trim();
     if (!token && isDesktopClient) {
@@ -2599,42 +2644,26 @@ function App() {
     if (!token && !isDesktopClient) {
       return;
     }
-
-    for (let attempt = 0; attempt < opts.maxAttempts; attempt += 1) {
-      if (controller.signal.aborted) {
-        return;
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, 2500));
-      if (controller.signal.aborted) {
-        return;
-      }
-      try {
-        const messages = await listClawChatMessages(opts.threadId, token || undefined, gatewayBaseUrl);
-        const userMessage = messages.find((msg) => msg.id === opts.messageId);
-        const reply = messages.find(
-          (msg) => msg.replyToId === opts.messageId && msg.role === "assistant"
-        );
-
-        if (reply && (reply.status === "error" || !!reply.error)) {
-          opts.onError(reply.error || reply.content || "operation failed");
+    const stream = streamClawChatResult(
+      opts.threadId,
+      opts.messageId,
+      (snapshot) => {
+        if (snapshot.status === "error") {
+          opts.onError(snapshot.error || snapshot.reply?.content || "operation failed");
           return;
         }
-        if (userMessage?.status === "error") {
-          opts.onError(userMessage.error || "operation failed");
-          return;
+        if (snapshot.status === "done" && snapshot.reply) {
+          opts.onDone(snapshot.reply);
         }
-
-        const userStatus = String(userMessage?.status || "").toLowerCase();
-        if (reply && (reply.status === "done" || userStatus === "done")) {
-          opts.onDone(reply);
-          return;
-        }
-      } catch {
-        // Keep polling within the attempt budget.
+      },
+      token || undefined,
+      gatewayBaseUrl,
+      () => {
+        opts.onTimeout?.();
       }
-    }
-
-    opts.onTimeout?.();
+    );
+    workflowPollAbortRef.current = stream;
+    await stream.done;
   }
 
   async function pollWorkflowTemplateCreateResult(
@@ -2647,7 +2676,6 @@ function App() {
     await pollChatResult({
       threadId,
       messageId,
-      maxAttempts: 72,
       onDone: (reply) => {
         const successText = (reply.content || `Created ${botLabel}.`).trim();
         setWorkflowTemplateStatus(successText);
@@ -2677,7 +2705,6 @@ function App() {
     await pollChatResult({
       threadId,
       messageId,
-      maxAttempts: 12,
       onDone: (reply) => {
         const successText = reply.content || "Workflow modification applied.";
         setFeedCommentStatusByPath((prev) => ({ ...prev, [path]: successText }));
@@ -3055,7 +3082,6 @@ function App() {
       await createClawChatUserMessageViaGateway(threadId, content, token, gatewayBaseUrl);
       setChatInput("");
       setChatStatus("Message queued (waiting for SlowClaw reply)");
-      await refreshClawChat();
     } catch (error) {
       setChatStatus(
         `Failed to queue chat message (${error instanceof Error ? error.message : String(error)})`
@@ -3539,27 +3565,41 @@ function App() {
       );
       setBlueskyFeedItems(res.items);
       setBlueskyProfileStats(res.profileStats);
+      const refreshedLabel = res.refreshedAt
+        ? ` Last refresh ${formatTimestamp(res.refreshedAt)}.`
+        : "";
       if (res.profileStatus === "embeddingUnavailable") {
         setBlueskyFeedStatus(
           res.message ||
-            "Personalized feed needs a configured embedding provider. Showing recent cached content and raw Bluesky items when possible."
+            `Personalized feed needs a configured embedding provider. Showing recent cached content and raw fallback items when possible.${refreshedLabel}`
         );
       } else if (res.profileStatus === "noInterests") {
         setBlueskyFeedStatus(
-          res.message || "Personalized feed starts after text items exist under posts/."
+          res.message || `Personalized feed starts after text items exist under posts/.${refreshedLabel}`
+        );
+      } else if (res.refreshState === "refreshing") {
+        setBlueskyFeedStatus(
+          res.message || `Updating the world feed in the background.${refreshedLabel}`
+        );
+      } else if (res.refreshState === "stale") {
+        setBlueskyFeedStatus(
+          res.message || `Refreshing the world feed soon. Showing the last ranked results.${refreshedLabel}`
         );
       } else if (res.usedFallback) {
-        setBlueskyFeedStatus(res.message || "Showing recent cached content and fallback items.");
+        setBlueskyFeedStatus(
+          res.message || `Showing recent cached content and fallback items while the world feed warms up.${refreshedLabel}`
+        );
       } else {
         setBlueskyFeedStatus(
-          res.profileStats.interestCount > 0
-            ? `Personalized by ${res.profileStats.interestCount} workspace interests.`
-            : ""
+          res.message ||
+            (res.profileStats.interestCount > 0
+              ? `Personalized by ${res.profileStats.interestCount} workspace interests.${refreshedLabel}`
+              : refreshedLabel.trim())
         );
       }
     } catch (error) {
-      console.error("Failed to fetch Bluesky feed", error);
-      setBlueskyFeedStatus(error instanceof Error ? error.message : "Failed to load Bluesky feed.");
+      console.error("Failed to fetch world feed", error);
+      setBlueskyFeedStatus(error instanceof Error ? error.message : "Failed to load world feed.");
       setBlueskyFeedItems([]);
     } finally {
       setBlueskyFeedLoading(false);
@@ -3618,10 +3658,16 @@ function App() {
     }
 
     let cancelled = false;
-    const poll = async () => {
-      if (cancelled) {
+    let stream: GatewayEventStreamHandle | null = null;
+    const start = async () => {
+      let token = chatGatewayToken.trim();
+      if (!token && isDesktopClient) {
+        token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+      }
+      if (!token && !isDesktopClient) {
         return;
       }
+
       await Promise.all([
         loadWorkspaceSynthStatus(),
         loadWorkflowRunStatuses(),
@@ -3629,21 +3675,47 @@ function App() {
         loadWorkspaceTodos(),
         loadWorkspaceEvents()
       ]);
+      if (cancelled) {
+        return;
+      }
+
+      workspaceSynthStreamRef.current?.close();
+      stream = streamWorkspaceSynthesizerStatus(
+        (status) => {
+          setWorkspaceSynthStatus(status);
+          void Promise.all([
+            loadWorkflowRunStatuses(),
+            refreshLibrary("feed"),
+            loadWorkspaceTodos(),
+            loadWorkspaceEvents()
+          ]);
+          if (status.status === "done" || status.status === "error") {
+            void refreshLibrary("journal");
+          }
+        },
+        token || undefined,
+        gatewayBaseUrl,
+        () => {
+          void loadWorkspaceSynthStatus();
+        }
+      );
+      workspaceSynthStreamRef.current = stream;
+      await stream.done;
     };
 
-    void poll();
-    const timer = window.setInterval(() => {
-      void poll();
-    }, 4000);
-
+    void start();
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      stream?.close();
+      if (workspaceSynthStreamRef.current === stream) {
+        workspaceSynthStreamRef.current = null;
+      }
     };
   }, [
     workspaceTabActive,
     chatGatewayToken,
     gatewayBaseUrl,
+    isDesktopClient,
     workflowBots,
     workspaceSynthStatus.status
   ]);
@@ -3763,6 +3835,72 @@ function App() {
     return core.invoke<T>(cmd, args);
   }
 
+  function preferredOpenAiAuthUrl(status?: OpenAiDeviceCodeStatus | null) {
+    const fastLink = String(status?.fastLink || "").trim();
+    if (fastLink) {
+      return fastLink;
+    }
+    const verificationUrl = String(status?.verificationUrl || "").trim();
+    return verificationUrl;
+  }
+
+  async function copyTextToClipboard(value: string, successMessage: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setAiSetupBrowserStatus(successMessage);
+    } catch (error) {
+      setAiSetupBrowserStatus(
+        `Couldn't copy the link (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function openExternalUrlInBrowser(url: string, source: "auto" | "manual" = "manual") {
+    const trimmed = url.trim();
+    if (!trimmed) {
+      return false;
+    }
+    try {
+      if (isDesktopClient) {
+        await invokeDesktopCommandStrict("open_external_url", { url: trimmed });
+      } else {
+        const popup = window.open(trimmed, "_blank", "noopener,noreferrer");
+        if (!popup) {
+          throw new Error("popup blocked");
+        }
+      }
+      setAiSetupBrowserStatus(
+        source === "auto"
+          ? "Browser opened automatically. Finish login there, then return here."
+          : "Opened the login page in your browser."
+      );
+      return true;
+    } catch (error) {
+      setAiSetupBrowserStatus(
+        source === "auto"
+          ? `Couldn't open the browser automatically (${error instanceof Error ? error.message : String(error)}). Use Open in Browser or Copy Link.`
+          : `Couldn't open the browser (${error instanceof Error ? error.message : String(error)})`
+      );
+      return false;
+    }
+  }
+
+  async function openWorkspaceJournalsFolder() {
+    if (!isDesktopClient) {
+      return;
+    }
+    holdJournalSidebarStatus("Opening journals folder...");
+    try {
+      await invokeDesktopCommandStrict<string>("open_workspace_journals_folder");
+      holdJournalSidebarStatus("Opened journals folder.");
+    } catch (error) {
+      holdJournalSidebarStatus(
+        `Couldn't open journals folder (${error instanceof Error ? error.message : String(error)})`,
+        4000
+      );
+    }
+  }
+
   async function syncDesktopGatewayBootstrap(): Promise<string | null> {
     if (!isDesktopClient) {
       return null;
@@ -3827,6 +3965,8 @@ function App() {
       });
       return;
     }
+    aiSetupAutoOpenedUrlRef.current = "";
+    setAiSetupBrowserStatus("");
     setAiSetupBusy(true);
     try {
       const next = await invokeDesktopCommandStrict<OpenAiDeviceCodeStatus>(
@@ -4213,6 +4353,26 @@ function App() {
   }, [isDesktopClient, aiSetupStatus?.running]);
 
   useEffect(() => {
+    if (!isDesktopClient) {
+      return;
+    }
+    const authUrl = preferredOpenAiAuthUrl(aiSetupStatus);
+    if (!authUrl || aiSetupAutoOpenedUrlRef.current) {
+      return;
+    }
+    if (aiSetupStatus?.state !== "awaiting_user") {
+      return;
+    }
+    aiSetupAutoOpenedUrlRef.current = authUrl;
+    void openExternalUrlInBrowser(authUrl, "auto");
+  }, [
+    aiSetupStatus?.fastLink,
+    aiSetupStatus?.state,
+    aiSetupStatus?.verificationUrl,
+    isDesktopClient
+  ]);
+
+  useEffect(() => {
     if (mobileTab !== "profile") {
       return;
     }
@@ -4227,12 +4387,52 @@ function App() {
   }, [mobileTab, feedSource, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
-    void refreshClawChat();
-    const timer = window.setInterval(() => {
-      void refreshClawChat();
-    }, 1500);
+    let cancelled = false;
+    let stream: GatewayEventStreamHandle | null = null;
+    const start = async () => {
+      let token = chatGatewayToken.trim();
+      if (!token && isDesktopClient) {
+        token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+      }
+      const threadId = chatThreadId.trim();
+      if (!threadId) {
+        setChatMessages([]);
+        setChatStatus("No chat thread yet. Send a message to start.");
+        return;
+      }
+      if (!token && !isDesktopClient) {
+        setChatStatus("Chat blocked (gateway token missing). Pair mobile with desktop QR.");
+        return;
+      }
+
+      stream = streamClawChatMessages(
+        threadId,
+        (snapshot) => {
+          setChatMessages(snapshot.items);
+          setChatStatus(`Chat thread loaded (${snapshot.items.length} messages)`);
+        },
+        token || undefined,
+        gatewayBaseUrl,
+        (error) => {
+          if (!cancelled) {
+            setChatStatus(
+              `Chat unavailable (${error instanceof Error ? error.message : String(error)})`
+            );
+          }
+        }
+      );
+      chatThreadStreamRef.current = stream;
+      await stream.done;
+    };
+
+    chatThreadStreamRef.current?.close();
+    void start();
     return () => {
-      window.clearInterval(timer);
+      cancelled = true;
+      stream?.close();
+      if (chatThreadStreamRef.current === stream) {
+        chatThreadStreamRef.current = null;
+      }
     };
   }, [chatThreadId, chatGatewayToken, gatewayBaseUrl, isDesktopClient]);
 
@@ -4353,6 +4553,19 @@ function App() {
   }, []);
 
   const journalList = journalItems;
+  const normalizedJournalSearchQuery = journalSearchQuery.trim().toLocaleLowerCase();
+  const filteredJournalList = normalizedJournalSearchQuery
+    ? journalList.filter((item) => {
+        const searchableText = [
+          item.title,
+          item.previewText || "",
+          item.path === selectedJournalPath ? selectedJournalText : ""
+        ]
+          .join("\n")
+          .toLocaleLowerCase();
+        return searchableText.includes(normalizedJournalSearchQuery);
+      })
+    : journalList;
   const feedList = feedItems;
   const postedHistory = history.filter((item) => item.status === "success");
   const needsMobileQrLogin = !isDesktopClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
@@ -4400,7 +4613,12 @@ function App() {
     );
   const overdueTodoCount = openTodos.filter((item) => {
     const due = parseDateValue(item.dueAt);
-    return due ? due.getTime() < now.getTime() : false;
+    if (!due) {
+      return false;
+    }
+    return hasExplicitTime(item.dueAt)
+      ? due.getTime() < now.getTime()
+      : startOfLocalDay(due).getTime() < todayStart.getTime();
   }).length;
   const todayEventItems = workspaceEvents
     .filter((item) => {
@@ -4432,51 +4650,6 @@ function App() {
       (a, b) =>
         (parseDateValue(b.startAt)?.getTime() || 0) - (parseDateValue(a.startAt)?.getTime() || 0)
     );
-  const eventDates = workspaceEvents
-    .map((item) => parseDateValue(item.startAt))
-    .filter((value): value is Date => value !== null)
-    .sort((a, b) => a.getTime() - b.getTime());
-  const selectedDayDate = parseDateValue(`${selectedEventDay}T00:00:00`);
-  const calendarAnchor = eventDates.find((date) => isSameLocalDay(date, now)) ||
-    eventDates.find((date) => selectedDayDate ? isSameLocalDay(date, selectedDayDate) : false) ||
-    eventDates[0] ||
-    now;
-  const monthStripLabel = calendarAnchor.toLocaleDateString([], {
-    month: "long",
-    year: "numeric"
-  });
-  const stripMonthStart = new Date(calendarAnchor.getFullYear(), calendarAnchor.getMonth(), 1);
-  const stripMonthEnd = new Date(calendarAnchor.getFullYear(), calendarAnchor.getMonth() + 1, 0);
-  const monthStripDays: Date[] = [];
-  for (let day = 1; day <= stripMonthEnd.getDate(); day += 1) {
-    monthStripDays.push(new Date(stripMonthStart.getFullYear(), stripMonthStart.getMonth(), day));
-  }
-  const eventCountByDay = workspaceEvents.reduce<Record<string, number>>((acc, item) => {
-    const start = parseDateValue(item.startAt);
-    if (!start) {
-      return acc;
-    }
-    const key = formatDayKey(start);
-    acc[key] = (acc[key] || 0) + 1;
-    return acc;
-  }, {});
-  const filteredEventItems = workspaceEvents
-    .filter((item) => {
-      const start = parseDateValue(item.startAt);
-      return start ? formatDayKey(start) === selectedEventDay : false;
-    })
-    .slice()
-    .sort(
-      (a, b) =>
-        (parseDateValue(a.startAt)?.getTime() || 0) - (parseDateValue(b.startAt)?.getTime() || 0)
-    );
-  const selectedDayHeading = selectedDayDate
-    ? selectedDayDate.toLocaleDateString([], {
-        weekday: "long",
-        month: "short",
-        day: "numeric"
-      })
-    : selectedEventDay;
   const isFreshNoteMode = !selectedJournalItem;
   const selectedJournalTranscriptionStatus =
     selectedJournalItem?.kind === "audio"
@@ -4487,23 +4660,53 @@ function App() {
     <>
       <div className="row-between" style={{ marginBottom: "1.5rem" }}>
         <h2>Journals</h2>
-        {mode === "mobile" ? (
-          <button
-            type="button"
-            className="ghost"
-            onClick={() => setJournalSidebarOpen(false)}
-            title="Close recent journals"
-          >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>
-          </button>
-        ) : null}
+        <div className="row" style={{ gap: "0.5rem", alignItems: "center" }}>
+          {isDesktopClient ? (
+            <button
+              type="button"
+              className="ghost text-sm"
+              onClick={() => void openWorkspaceJournalsFolder()}
+              title="Open the journals folder inside the workspace"
+            >
+              Open Folder
+            </button>
+          ) : null}
+          {mode === "mobile" ? (
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setJournalSidebarOpen(false)}
+              title="Close recent journals"
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="stack-sm" style={{ marginBottom: "1rem" }}>
+        <input
+          type="search"
+          value={journalSearchQuery}
+          onChange={(e) => setJournalSearchQuery(e.target.value)}
+          placeholder="Search title or content"
+          aria-label="Search journals"
+        />
+        <div className="row-between text-sm muted" style={{ gap: "0.75rem" }}>
+          <span>
+            {filteredJournalList.length} of {journalItems.length}
+          </span>
+          {journalSidebarStatus ? <span>{journalSidebarStatus}</span> : null}
+        </div>
       </div>
 
       {journalItems.length === 0 ? (
         <p className="text-center muted">No journals found.</p>
+      ) : filteredJournalList.length === 0 ? (
+        <p className="text-center muted">No journals match your search.</p>
       ) : (
         <div className="stack">
-          {journalItems.map(item => (
+          {filteredJournalList.map(item => (
             <div key={item.path} className="row-between" style={{ padding: "0.8rem", background: selectedJournalPath === item.path ? "color-mix(in srgb, var(--line) 40%, transparent)" : "transparent", borderRadius: "12px" }}>
               <div
                 className="stack"
@@ -4722,13 +4925,14 @@ function App() {
 
       <main className="page-content">
         {mobileTab === "journal" ? (
-          <div className={showDesktopJournalSidebar ? "journal-desktop-layout" : "stack"}>
-            {showDesktopJournalSidebar ? (
-              <aside className="sidebar sidebar-desktop open">
-                {renderJournalSidebarContent(false, "desktop")}
-              </aside>
-            ) : null}
-            <div className={`stack journal-main ${isWritingNote ? "journal-main-writing" : ""}`}>
+          <ViewErrorBoundary title="Journal">
+            <div className={showDesktopJournalSidebar ? "journal-desktop-layout" : "stack"}>
+              {showDesktopJournalSidebar ? (
+                <aside className="sidebar sidebar-desktop open">
+                  {renderJournalSidebarContent(false, "desktop")}
+                </aside>
+              ) : null}
+              <div className={`stack journal-main ${isWritingNote ? "journal-main-writing" : ""}`}>
               {!isWritingNote && !isCaptureZenMode && (
                 <div className="card">
                   <div className="text-center">
@@ -4978,13 +5182,15 @@ function App() {
                 </div>
               )}
 
+              </div>
             </div>
-          </div>
+          </ViewErrorBoundary>
         ) : null}
 
         {mobileTab === "feed" ? (
-          <div className="stack">
-            <div className="card">
+          <ViewErrorBoundary title="Feed">
+            <div className="stack">
+              <div className="card">
               <div className="row-between">
                 <h2>Your Feed</h2>
                 <div className="row" style={{ gap: "0.35rem", alignItems: "center" }}>
@@ -5341,14 +5547,14 @@ function App() {
 
               {feedSource === "bluesky" ? (
                 blueskyFeedLoading ? (
-                  <p className="text-center muted" style={{ padding: "2rem" }}>Loading personalized feed...</p>
+                  <p className="text-center muted" style={{ padding: "2rem" }}>Loading world feed...</p>
                 ) : blueskyFeedItems.length === 0 ? (
                   <div className="stack-sm" style={{ padding: "2rem" }}>
                     {blueskyFeedStatus ? (
                       <p className="text-center muted">{blueskyFeedStatus}</p>
                     ) : null}
                     <p className="text-center muted">
-                      No personalized items found yet. Add workspace posts, cached sources, or connect Bluesky.
+                      No world-feed items found yet. Add workspace posts, seed more RSS sources, or connect Bluesky.
                     </p>
                   </div>
                 ) : (
@@ -5359,6 +5565,7 @@ function App() {
                     {blueskyFeedItems.map((item, idx) => {
                       if (item.sourceType === "web" && item.webPreview) {
                         const preview = item.webPreview;
+                        const selectedSource = item.feedSource;
                         return (
                           <div key={`${preview.url}-${idx}`} className="feed-item">
                             <div className="feed-header">
@@ -5366,7 +5573,16 @@ function App() {
                                 <div className="stack-sm" style={{ gap: "0.05rem" }}>
                                   <strong>{preview.title || preview.domain}</strong>
                                   <span className="muted text-sm" style={{ fontWeight: "normal" }}>
-                                    Web source via {preview.provider}
+                                    {selectedSource?.label
+                                      ? `from ${selectedSource.label}`
+                                      : `Web source via ${preview.provider}`}
+                                    {selectedSource?.matchedInterestLabel
+                                      ? ` · source matched ${selectedSource.matchedInterestLabel}${
+                                          selectedSource.matchedInterestScore != null
+                                            ? ` (${(selectedSource.matchedInterestScore * 100).toFixed(0)}%)`
+                                            : ""
+                                        }`
+                                      : ""}
                                   </span>
                                 </div>
                               </div>
@@ -5418,6 +5634,7 @@ function App() {
                       const author = post.author;
                       const record = post.record as any;
                       const text = String(record?.text || "");
+                      const feedSource = item.feedSource;
                       const embedNode = renderBlueskyEmbed(post.embed as any);
                       const facetLinks = Array.isArray(record?.facets)
                         ? record.facets
@@ -5448,6 +5665,18 @@ function App() {
                                 <span className="muted text-sm" style={{ fontWeight: "normal" }}>
                                   @{author.handle}
                                 </span>
+                                {feedSource?.label ? (
+                                  <span className="muted text-sm" style={{ fontWeight: "normal" }}>
+                                    from {feedSource.label}
+                                    {feedSource.matchedInterestLabel
+                                      ? ` · feed matched ${feedSource.matchedInterestLabel}${
+                                          feedSource.matchedInterestScore != null
+                                            ? ` (${(feedSource.matchedInterestScore * 100).toFixed(0)}%)`
+                                            : ""
+                                        }`
+                                      : ""}
+                                  </span>
+                                ) : null}
                               </div>
                             </div>
                             <div className="feed-time">{formatTimestamp(post.indexedAt)}</div>
@@ -5693,346 +5922,34 @@ function App() {
                   )}
                 </div>
               )}
+              </div>
             </div>
-          </div>
+          </ViewErrorBoundary>
         ) : null}
 
-        {mobileTab === "todos" ? (
-          <div className="stack">
-            <div className="card">
-              <div className="stack-sm">
-                <h2 style={{ margin: 0 }}>Todos</h2>
-                <p className="text-sm muted" style={{ margin: 0 }}>
-                  Action items extracted from journals and transcripts. Marking one done keeps the model suggestion but preserves your override locally.
-                </p>
-              </div>
-
-              <div className="workspace-synth-card">
-                <div className="planner-overview-row">
-                  <span className="status-pill">Open {openTodos.length}</span>
-                  <span className="status-pill">Done {doneTodos.length}</span>
-                  <span className="status-pill">Overdue {overdueTodoCount}</span>
-                </div>
-                <div className="workspace-synth-artifacts">
-                  {workspaceSynthArtifacts.map((artifact) => (
-                    <span
-                      key={artifact.key}
-                      className={`status-pill workspace-synth-pill ${workspaceSynthArtifactTone(artifact.state)}`}
-                      title={artifact.state?.error || artifact.state?.path || ""}
-                    >
-                      {workspaceSynthArtifactLabel(artifact.label, artifact.state)}
-                    </span>
-                  ))}
-                </div>
-                {workspaceSynthStatus.lastSummary ? (
-                  <span className="text-sm muted">{workspaceSynthStatus.lastSummary}</span>
-                ) : null}
-              </div>
-
-              {openTodos.length === 0 && doneTodos.length === 0 ? (
-                <div className="planner-empty-state">
-                  <p className="text-center muted" style={{ margin: 0 }}>
-                    No todos extracted from your workspace yet.
-                  </p>
-                </div>
-              ) : (
-                <div className="stack">
-                  {openTodos.length > 0 ? (
-                    <div className="stack">
-                      <div className="planner-section-header">
-                        <h3 style={{ margin: 0 }}>Open</h3>
-                        <span className="text-sm muted">{openTodos.length}</span>
-                      </div>
-                      {openTodos.map((item) => (
-                        <div key={item.id} className="planner-item-card">
-                          <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
-                            <div className="stack-sm" style={{ gap: "0.35rem" }}>
-                              <strong>{item.title}</strong>
-                              <div className="planner-chip-row">
-                                <span className={`planner-chip planner-chip-priority-${item.priority || "medium"}`}>
-                                  {(item.priority || "medium").toUpperCase()}
-                                </span>
-                                <span className="planner-chip">
-                                  {formatTodoDueLabel(item.dueAt)}
-                                </span>
-                                <span className="planner-chip">
-                                  {item.modelStatus || item.status}
-                                </span>
-                              </div>
-                            </div>
-                            <button
-                              type="button"
-                              className="primary text-sm"
-                              style={{ padding: "0.35rem 0.75rem", borderRadius: "999px" }}
-                              onClick={() => void toggleWorkspaceTodo(item)}
-                            >
-                              Done
-                            </button>
-                          </div>
-                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
-                          {(item.sourcePath || item.sourceExcerpt) ? (
-                            <div className="planner-item-meta text-sm muted">
-                              {item.sourcePath ? <code>{item.sourcePath}</code> : null}
-                              {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
-                            </div>
-                          ) : null}
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  {doneTodos.length > 0 ? (
-                    <div className="stack">
-                      <div className="planner-section-header">
-                        <h3 style={{ margin: 0 }}>Completed</h3>
-                        <span className="text-sm muted">{doneTodos.length}</span>
-                      </div>
-                      {doneTodos.map((item) => (
-                        <div key={item.id} className="planner-item-card planner-item-card-done">
-                          <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
-                            <div className="stack-sm" style={{ gap: "0.35rem" }}>
-                              <strong>{item.title}</strong>
-                              <div className="planner-chip-row">
-                                <span className="planner-chip">Completed</span>
-                                <span className="planner-chip">
-                                  Updated {formatTimestamp(item.updated)}
-                                </span>
-                              </div>
-                            </div>
-                            <button
-                              type="button"
-                              className="ghost text-sm"
-                              style={{ padding: "0.35rem 0.75rem", borderRadius: "999px" }}
-                              onClick={() => void toggleWorkspaceTodo(item)}
-                            >
-                              Reopen
-                            </button>
-                          </div>
-                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-                </div>
-              )}
-            </div>
-          </div>
-        ) : null}
-
-        {mobileTab === "events" ? (
-          <div className="stack">
-            <div className="card">
-              <div className="stack-sm">
-                <h2 style={{ margin: 0 }}>Events</h2>
-                <p className="text-sm muted" style={{ margin: 0 }}>
-                  Calendar-style commitments extracted from the workspace. Upcoming sections are ordered chronologically so mobile and desktop show the same timeline.
-                </p>
-              </div>
-
-              <div className="workspace-synth-card">
-                <div className="planner-overview-row">
-                  <span className="status-pill">Today {todayEventItems.length}</span>
-                  <span className="status-pill">Upcoming {upcomingEventItems.length}</span>
-                  <span className="status-pill">Past {pastEventItems.length}</span>
-                </div>
-                <div className="workspace-synth-artifacts">
-                  {workspaceSynthArtifacts.map((artifact) => (
-                    <span
-                      key={artifact.key}
-                      className={`status-pill workspace-synth-pill ${workspaceSynthArtifactTone(artifact.state)}`}
-                      title={artifact.state?.error || artifact.state?.path || ""}
-                    >
-                      {workspaceSynthArtifactLabel(artifact.label, artifact.state)}
-                    </span>
-                  ))}
-                </div>
-                {workspaceEvents.length > 0 ? (
-                  <div className="events-calendar-strip">
-                    <div className="planner-section-header" style={{ marginTop: 0 }}>
-                      <strong>{monthStripLabel}</strong>
-                      <button
-                        type="button"
-                        className="ghost text-sm"
-                        onClick={() => setSelectedEventDay(formatDayKey(new Date()))}
-                      >
-                        Today
-                      </button>
-                    </div>
-                    <div className="events-calendar-days" role="tablist" aria-label="Event day filter">
-                      {monthStripDays.map((day) => {
-                        const dayKey = formatDayKey(day);
-                        const isSelected = dayKey === selectedEventDay;
-                        const hasEvents = (eventCountByDay[dayKey] || 0) > 0;
-                        return (
-                          <button
-                            key={dayKey}
-                            type="button"
-                            role="tab"
-                            aria-selected={isSelected}
-                            className={`events-calendar-day${isSelected ? " selected" : ""}${hasEvents ? " has-events" : ""}`}
-                            onClick={() => setSelectedEventDay(dayKey)}
-                          >
-                            <span className="events-calendar-dow">
-                              {day.toLocaleDateString([], { weekday: "short" })}
-                            </span>
-                            <span className="events-calendar-date">{day.getDate()}</span>
-                            <span className="events-calendar-count">
-                              {hasEvents ? eventCountByDay[dayKey] : ""}
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-
-              {workspaceEvents.length === 0 ? (
-                <div className="planner-empty-state">
-                  <p className="text-center muted" style={{ margin: 0 }}>
-                    No events extracted from your workspace yet.
-                  </p>
-                </div>
-              ) : (
-                <div className="stack">
-                  <div className="stack">
-                    <div className="planner-section-header">
-                      <h3 style={{ margin: 0 }}>Agenda</h3>
-                      <span className="text-sm muted">
-                        {selectedDayHeading} · {filteredEventItems.length}
-                      </span>
-                    </div>
-                    {filteredEventItems.length === 0 ? (
-                      <div className="planner-empty-state">
-                        <p className="text-center muted" style={{ margin: 0 }}>
-                          No events on {selectedDayHeading}.
-                        </p>
-                      </div>
-                    ) : (
-                      filteredEventItems.map((item) => (
-                        <div key={`agenda-${item.id}`} className="planner-item-card">
-                          <div className="stack-sm" style={{ gap: "0.35rem" }}>
-                            <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
-                              <strong>{item.title}</strong>
-                              <span className="planner-chip">{item.status}</span>
-                            </div>
-                            <div className="planner-chip-row">
-                              <span className="planner-chip">
-                                {formatEventTiming(item.startAt, item.endAt, item.allDay)}
-                              </span>
-                              {item.location ? <span className="planner-chip">{item.location}</span> : null}
-                            </div>
-                          </div>
-                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
-                          {(item.sourcePath || item.sourceExcerpt) ? (
-                            <div className="planner-item-meta text-sm muted">
-                              {item.sourcePath ? <code>{item.sourcePath}</code> : null}
-                              {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
-                            </div>
-                          ) : null}
-                        </div>
-                      ))
-                    )}
-                  </div>
-
-                  {todayEventItems.length > 0 ? (
-                    <div className="stack">
-                      <div className="planner-section-header">
-                        <h3 style={{ margin: 0 }}>Today</h3>
-                        <span className="text-sm muted">{todayEventItems.length}</span>
-                      </div>
-                      {todayEventItems.map((item) => (
-                        <div key={item.id} className="planner-item-card">
-                          <div className="stack-sm" style={{ gap: "0.35rem" }}>
-                            <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
-                              <strong>{item.title}</strong>
-                              <span className="planner-chip">{item.status}</span>
-                            </div>
-                            <div className="planner-chip-row">
-                              <span className="planner-chip">
-                                {formatEventTiming(item.startAt, item.endAt, item.allDay)}
-                              </span>
-                              {item.location ? <span className="planner-chip">{item.location}</span> : null}
-                            </div>
-                          </div>
-                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
-                          {(item.sourcePath || item.sourceExcerpt) ? (
-                            <div className="planner-item-meta text-sm muted">
-                              {item.sourcePath ? <code>{item.sourcePath}</code> : null}
-                              {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
-                            </div>
-                          ) : null}
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  {upcomingEventItems.length > 0 ? (
-                    <div className="stack">
-                      <div className="planner-section-header">
-                        <h3 style={{ margin: 0 }}>Upcoming</h3>
-                        <span className="text-sm muted">{upcomingEventItems.length}</span>
-                      </div>
-                      {upcomingEventItems.map((item) => (
-                        <div key={item.id} className="planner-item-card">
-                          <div className="stack-sm" style={{ gap: "0.35rem" }}>
-                            <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
-                              <strong>{item.title}</strong>
-                              <span className="planner-chip">{item.status}</span>
-                            </div>
-                            <div className="planner-chip-row">
-                              <span className="planner-chip">
-                                {formatEventTiming(item.startAt, item.endAt, item.allDay)}
-                              </span>
-                              {item.location ? <span className="planner-chip">{item.location}</span> : null}
-                            </div>
-                          </div>
-                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
-                          {(item.sourcePath || item.sourceExcerpt) ? (
-                            <div className="planner-item-meta text-sm muted">
-                              {item.sourcePath ? <code>{item.sourcePath}</code> : null}
-                              {item.sourceExcerpt ? <span>{item.sourceExcerpt}</span> : null}
-                            </div>
-                          ) : null}
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  {pastEventItems.length > 0 ? (
-                    <div className="stack">
-                      <div className="planner-section-header">
-                        <h3 style={{ margin: 0 }}>Recent Past</h3>
-                        <span className="text-sm muted">{pastEventItems.length}</span>
-                      </div>
-                      {pastEventItems.map((item) => (
-                        <div key={item.id} className="planner-item-card planner-item-card-past">
-                          <div className="stack-sm" style={{ gap: "0.35rem" }}>
-                            <div className="row-between" style={{ gap: "0.8rem", alignItems: "flex-start" }}>
-                              <strong>{item.title}</strong>
-                              <span className="planner-chip">{item.status}</span>
-                            </div>
-                            <div className="planner-chip-row">
-                              <span className="planner-chip">
-                                {formatEventTiming(item.startAt, item.endAt, item.allDay)}
-                              </span>
-                              {item.location ? <span className="planner-chip">{item.location}</span> : null}
-                            </div>
-                          </div>
-                          {item.details ? <div className="planner-item-body">{item.details}</div> : null}
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-                </div>
-              )}
-            </div>
-          </div>
+        {mobileTab === "productivity" ? (
+          <ViewErrorBoundary title="Productivity">
+            <ProductivityView
+              openTodos={openTodos}
+              doneTodos={doneTodos}
+              overdueTodoCount={overdueTodoCount}
+              todayEventItems={todayEventItems}
+              upcomingEventItems={upcomingEventItems}
+              pastEventItems={pastEventItems}
+              workspaceSynthStatus={workspaceSynthStatus}
+              workspaceSynthArtifactBadges={workspaceSynthArtifactBadges}
+              formatTodoDueLabel={formatTodoDueLabel}
+              formatEventTiming={formatEventTiming}
+              formatTimestamp={formatTimestamp}
+              onToggleTodo={(item) => void toggleWorkspaceTodo(item)}
+            />
+          </ViewErrorBoundary>
         ) : null}
 
         {mobileTab === "profile" ? (
-          <div className="stack">
-            <div className="card">
+          <ViewErrorBoundary title="Profile">
+            <div className="stack">
+              <div className="card">
               <div className="row-between">
                 <h2>Configuration</h2>
                 <button
@@ -6144,9 +6061,9 @@ function App() {
               </form>
             </div>
 
-            {isDesktopClient && (
-              <>
-                <div className="card">
+              {isDesktopClient && (
+                <>
+                  <div className="card">
                   <h2>Local Runtime & Pairing</h2>
                   <div className="stack">
                     <p className="text-sm muted">
@@ -6185,7 +6102,7 @@ function App() {
                   </div>
                 </div>
 
-                <div className="card">
+                  <div className="card">
                   <h2>Sync Peer</h2>
                   <div className="stack">
                     <p className="text-sm muted">
@@ -6242,7 +6159,7 @@ function App() {
                   </div>
                 </div>
 
-                <div className="card">
+                  <div className="card">
                   <div className="row-between">
                     <h2>AI Setup</h2>
                     <button
@@ -6284,21 +6201,57 @@ function App() {
                       State: {aiSetupStatus?.state || "idle"}
                     </div>
                     <p className="text-sm">{aiSetupStatus?.message || "Not started."}</p>
-                    {aiSetupStatus?.verificationUrl ? (
-                      <p className="text-sm">
-                        URL:{" "}
-                        <a href={aiSetupStatus.verificationUrl} target="_blank" rel="noreferrer">
-                          {aiSetupStatus.verificationUrl}
-                        </a>
-                      </p>
-                    ) : null}
-                    {aiSetupStatus?.fastLink ? (
-                      <p className="text-sm">
-                        Fast Link:{" "}
-                        <a href={aiSetupStatus.fastLink} target="_blank" rel="noreferrer">
-                          {aiSetupStatus.fastLink}
-                        </a>
-                      </p>
+                    {preferredOpenAiAuthUrl(aiSetupStatus) ? (
+                      <div
+                        className="stack"
+                        style={{
+                          gap: "0.5rem",
+                          padding: "0.85rem",
+                          borderRadius: "14px",
+                          border: "1px solid var(--line)",
+                          background: "var(--surface-2)"
+                        }}
+                      >
+                        <p className="text-sm">
+                          <strong>
+                            {aiSetupStatus?.fastLink ? "OpenAI login link" : "OpenAI verification page"}
+                          </strong>
+                        </p>
+                        <div className="row" style={{ gap: "0.5rem", flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            className="primary"
+                            onClick={() => void openExternalUrlInBrowser(preferredOpenAiAuthUrl(aiSetupStatus))}
+                          >
+                            Open in Browser
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost"
+                            onClick={() => void copyTextToClipboard(
+                              preferredOpenAiAuthUrl(aiSetupStatus),
+                              "Copied the login link."
+                            )}
+                          >
+                            Copy Link
+                          </button>
+                        </div>
+                        <div
+                          className="text-sm"
+                          style={{
+                            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                            overflowWrap: "anywhere",
+                            wordBreak: "break-word"
+                          }}
+                        >
+                          {preferredOpenAiAuthUrl(aiSetupStatus)}
+                        </div>
+                        {aiSetupStatus?.fastLink && aiSetupStatus?.verificationUrl ? (
+                          <div className="text-sm muted" style={{ overflowWrap: "anywhere", wordBreak: "break-word" }}>
+                            Verification page fallback: {aiSetupStatus.verificationUrl}
+                          </div>
+                        ) : null}
+                      </div>
                     ) : null}
                     {aiSetupStatus?.userCode ? (
                       <div className="row" style={{ alignItems: "center" }}>
@@ -6306,11 +6259,17 @@ function App() {
                         <button
                           type="button"
                           className="ghost"
-                          onClick={() => void navigator.clipboard.writeText(aiSetupStatus.userCode || "")}
+                          onClick={() => void copyTextToClipboard(
+                            aiSetupStatus.userCode || "",
+                            "Copied the OpenAI device code."
+                          )}
                         >
                           Copy Code
                         </button>
                       </div>
+                    ) : null}
+                    {aiSetupBrowserStatus ? (
+                      <p className="text-sm muted">{aiSetupBrowserStatus}</p>
                     ) : null}
                     {aiSetupStatus?.completed ? (
                       <p className="text-sm" style={{ color: "var(--success)" }}>
@@ -6324,9 +6283,10 @@ function App() {
                     ) : null}
                   </div>
                 </div>
-              </>
-            )}
-          </div>
+                </>
+              )}
+            </div>
+          </ViewErrorBoundary>
         ) : null}
       </main>
 
@@ -6350,25 +6310,16 @@ function App() {
           </button>
           <button
             type="button"
-            className={mobileTab === "todos" ? "active" : ""}
-            onClick={() => setMobileTab("todos")}
+            className={mobileTab === "productivity" ? "active" : ""}
+            onClick={() => setMobileTab("productivity")}
           >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path><path d="M7 7h6"></path><path d="M7 15h8"></path></svg>
             <span className="bottom-nav-label">
-              Todos
-              {openTodos.length > 0 ? <span className="bottom-nav-badge">{openTodos.length}</span> : null}
-            </span>
-          </button>
-          <button
-            type="button"
-            className={mobileTab === "events" ? "active" : ""}
-            onClick={() => setMobileTab("events")}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
-            <span className="bottom-nav-label">
-              Events
-              {todayEventItems.length + upcomingEventItems.length > 0 ? (
-                <span className="bottom-nav-badge">{todayEventItems.length + upcomingEventItems.length}</span>
+              Productivity
+              {openTodos.length + todayEventItems.length + upcomingEventItems.length > 0 ? (
+                <span className="bottom-nav-badge">
+                  {openTodos.length + todayEventItems.length + upcomingEventItems.length}
+                </span>
               ) : null}
             </span>
           </button>

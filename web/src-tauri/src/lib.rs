@@ -514,6 +514,84 @@ fn workspace_root_dir() -> PathBuf {
         .unwrap_or(tauri_manifest_dir)
 }
 
+fn open_path_with_system_handler(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer");
+        command.arg(path);
+        command
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    let status = command
+        .status()
+        .map_err(|e| format!("failed to launch folder opener: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "folder opener exited with code {}",
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+fn open_url_with_system_handler(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("url is required".to_string());
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err("only http(s) urls can be opened".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(trimmed);
+        command
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer");
+        command.arg(trimmed);
+        command
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(trimmed);
+        command
+    };
+
+    let status = command
+        .status()
+        .map_err(|e| format!("failed to launch browser: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "browser opener exited with code {}",
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
 fn slowclaw_binary_next_to_current_exe() -> Option<PathBuf> {
     let current_exe = std::env::current_exe().ok()?;
     let file_name = if cfg!(target_os = "windows") {
@@ -858,6 +936,40 @@ async fn set_provider_api_key(
 }
 
 #[tauri::command]
+async fn open_workspace_journals_folder() -> Result<String, String> {
+    let config = zeroclaw::Config::load_or_init()
+        .await
+        .map_err(|e| ui_command_error("journals folder config load failed", "Failed to load the workspace configuration.", e))?;
+    let journals_dir = config.workspace_dir.join("journals");
+    std::fs::create_dir_all(&journals_dir).map_err(|e| {
+        ui_command_error(
+            "journals folder create failed",
+            "Failed to prepare the journals folder.",
+            e,
+        )
+    })?;
+    open_path_with_system_handler(&journals_dir).map_err(|e| {
+        ui_command_error(
+            "journals folder open failed",
+            "Failed to open the journals folder.",
+            e,
+        )
+    })?;
+    Ok(journals_dir.display().to_string())
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    open_url_with_system_handler(&url).map_err(|e| {
+        ui_command_error(
+            "external url open failed",
+            "Failed to open the link in your browser.",
+            e,
+        )
+    })
+}
+
+#[tauri::command]
 fn get_openai_device_code_status(
     state: tauri::State<'_, OpenAiDeviceCodeState>,
 ) -> Result<OpenAiDeviceCodeStatus, String> {
@@ -964,6 +1076,8 @@ pub fn run() {
             get_desktop_gateway_bootstrap,
             restart_gateway_daemon,
             set_provider_api_key,
+            open_workspace_journals_folder,
+            open_external_url,
             get_openai_device_code_status,
             start_openai_device_code_login,
             show_main_window

@@ -57,6 +57,7 @@ mod cost;
 mod cron;
 mod daemon;
 mod doctor;
+mod feed;
 mod gateway;
 mod health;
 mod heartbeat;

@@ -1546,6 +1546,12 @@ textarea {
   line-height: 1.2;
 }
 
+.planner-chip-kind {
+  border-color: color-mix(in srgb, var(--accent) 22%, var(--line));
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  color: color-mix(in srgb, var(--accent) 68%, var(--ink));
+}
+
 .planner-chip-priority-high {
   border-color: color-mix(in srgb, var(--error) 40%, var(--line));
   background: color-mix(in srgb, var(--error) 10%, var(--surface));
@@ -1580,6 +1586,14 @@ textarea {
 
 .planner-item-card-past {
   opacity: 0.88;
+}
+
+.productivity-filter-strip {
+  margin-top: 1rem;
+}
+
+.productivity-filter-strip button {
+  white-space: nowrap;
 }
 
 .events-calendar-strip {

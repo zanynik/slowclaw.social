@@ -205,9 +205,15 @@ Lưu ý:
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
 | `host` | `127.0.0.1` | Địa chỉ bind |
-| `port` | `3000` | Cổng lắng nghe gateway |
+| `port` | `42617` | Cổng lắng nghe gateway |
 | `require_pairing` | `true` | Yêu cầu ghép nối trước khi xác thực bearer |
 | `allow_public_bind` | `false` | Chặn lộ public do vô ý |
+| `desktop_cors_allowed_origins` | `[]` | Các origin trình duyệt bổ sung được phép gọi desktop gateway ngoài allowlist local tích hợp sẵn |
+
+Lưu ý:
+
+- Desktop CORS mặc định được giới hạn hẹp. Các origin local dùng cho web UI đi kèm đã được cho phép tự động.
+- Chỉ thêm `desktop_cors_allowed_origins` khi bạn thực sự cần cho một origin desktop web khác truy cập local gateway.
 
 ## `[autonomy]`
 

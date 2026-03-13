@@ -76,6 +76,145 @@ async function parseJsonOrThrow(res: Response) {
   return data;
 }
 
+export type GatewayEventStreamHandle = {
+  close: () => void;
+  done: Promise<void>;
+};
+
+export type ChatThreadStreamSnapshot = {
+  threadId: string;
+  items: ClawChatMessage[];
+};
+
+export type ChatResultStreamSnapshot = {
+  threadId: string;
+  messageId: string;
+  status: "pending" | "processing" | "done" | "error" | string;
+  reply?: ClawChatMessage;
+  error?: string;
+};
+
+export type JournalTranscriptionStatus = {
+  ok?: boolean;
+  mediaPath?: string;
+  path?: string;
+  jsonPath?: string;
+  srtPath?: string;
+  text?: string;
+  status: string;
+  error?: string;
+  updatedAt?: string;
+};
+
+async function parseGatewayErrorResponse(res: Response): Promise<string> {
+  const text = await res.text();
+  let data: any = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = {};
+  }
+  return normalizeGatewayErrorMessage(data?.error ?? data?.message, res.status);
+}
+
+type GatewayStreamOptions = {
+  bearerToken?: string;
+  gatewayBaseUrl?: string;
+  onEvent: (event: string, payload: any) => void;
+  onError?: (error: Error) => void;
+};
+
+function openGatewayEventStream(
+  path: string,
+  options: GatewayStreamOptions
+): GatewayEventStreamHandle {
+  const controller = new AbortController();
+  const done = (async () => {
+    const res = await fetch(resolveGatewayEndpoint(path, options.gatewayBaseUrl), {
+      headers: {
+        ...authHeaders(options.bearerToken),
+        Accept: "text/event-stream"
+      },
+      signal: controller.signal
+    });
+
+    if (!res.ok) {
+      throw new Error(await parseGatewayErrorResponse(res));
+    }
+    if (!res.body) {
+      throw new Error("Streaming response body unavailable");
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    const flushBlock = (rawBlock: string) => {
+      const lines = rawBlock.split(/\n/);
+      let eventName = "message";
+      const dataLines: string[] = [];
+      for (const line of lines) {
+        if (!line || line.startsWith(":")) {
+          continue;
+        }
+        if (line.startsWith("event:")) {
+          eventName = line.slice("event:".length).trim() || "message";
+          continue;
+        }
+        if (line.startsWith("data:")) {
+          dataLines.push(line.slice("data:".length).trimStart());
+        }
+      }
+      if (!dataLines.length) {
+        return;
+      }
+      const rawData = dataLines.join("\n");
+      let payload: any = rawData;
+      try {
+        payload = JSON.parse(rawData);
+      } catch {
+        payload = rawData;
+      }
+      options.onEvent(eventName, payload);
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        const finalChunk = buffer.trim();
+        if (finalChunk) {
+          flushBlock(finalChunk.replace(/\r/g, ""));
+        }
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      let separatorIndex = buffer.indexOf("\n\n");
+      while (separatorIndex >= 0) {
+        const block = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+        flushBlock(block.replace(/\r/g, ""));
+        separatorIndex = buffer.indexOf("\n\n");
+      }
+    }
+  })().catch((error) => {
+    if (controller.signal.aborted) {
+      return;
+    }
+    if (options.onError) {
+      options.onError(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    throw error;
+  });
+
+  return {
+    close() {
+      controller.abort();
+    },
+    done
+  };
+}
+
 export type RuntimeConfigSnapshot = {
   defaultProvider: string;
   defaultModel: string;
@@ -241,7 +380,7 @@ export type PersonalizedFeedRequest = {
   limit?: number;
 };
 
-export type PersonalizedBlueskyItem = {
+export type PersonalizedFeedItem = {
   sourceType?: "bluesky" | "web";
   feedItem: any;
   webPreview?: {
@@ -253,6 +392,12 @@ export type PersonalizedBlueskyItem = {
     provider: string;
     providerSnippet?: string | null;
     discoveredAt: string;
+  } | null;
+  feedSource?: {
+    label: string;
+    description?: string | null;
+    matchedInterestLabel?: string | null;
+    matchedInterestScore?: number | null;
   } | null;
   score?: number | null;
   matchedInterestLabel?: string | null;
@@ -269,12 +414,14 @@ export type InterestProfileStats = {
   ignoredCount: number;
 };
 
-export type PersonalizedBlueskyFeedResponse = {
-  items: PersonalizedBlueskyItem[];
+export type PersonalizedFeedResponse = {
+  items: PersonalizedFeedItem[];
   profileStatus: string;
   profileStats: InterestProfileStats;
   usedFallback: boolean;
   message?: string;
+  refreshState: "fresh" | "refreshing" | "stale" | "warming" | string;
+  refreshedAt?: string | null;
 };
 
 export type WorkspaceSyncFile = {
@@ -363,7 +510,7 @@ export async function fetchPersonalizedFeed(
   payload: PersonalizedFeedRequest,
   bearerToken?: string,
   gatewayBaseUrl?: string
-): Promise<PersonalizedBlueskyFeedResponse> {
+): Promise<PersonalizedFeedResponse> {
   const res = await fetch(resolveGatewayEndpoint("/api/feed/personalized", gatewayBaseUrl), {
     method: "POST",
     headers: authHeaders(bearerToken, "application/json"),
@@ -393,6 +540,21 @@ export async function fetchPersonalizedFeed(
                 discoveredAt: String(item.webPreview.discoveredAt || "")
               }
             : null,
+          feedSource: item?.feedSource
+            ? {
+                label: String(item.feedSource.label || ""),
+                description: item.feedSource.description
+                  ? String(item.feedSource.description)
+                  : null,
+                matchedInterestLabel: item.feedSource.matchedInterestLabel
+                  ? String(item.feedSource.matchedInterestLabel)
+                  : null,
+                matchedInterestScore:
+                  item?.feedSource?.matchedInterestScore == null
+                    ? null
+                    : Number(item.feedSource.matchedInterestScore)
+              }
+            : null,
           score: item?.score == null ? null : Number(item.score),
           matchedInterestLabel: item?.matchedInterestLabel ? String(item.matchedInterestLabel) : null,
           matchedInterestScore:
@@ -410,7 +572,9 @@ export async function fetchPersonalizedFeed(
       ignoredCount: Number(data.profileStats?.ignoredCount || 0)
     },
     usedFallback: Boolean(data.usedFallback),
-    message: typeof data.message === "string" ? data.message : undefined
+    message: typeof data.message === "string" ? data.message : undefined,
+    refreshState: typeof data.refreshState === "string" ? data.refreshState : "warming",
+    refreshedAt: typeof data.refreshedAt === "string" ? data.refreshedAt : null
   };
 }
 
@@ -545,6 +709,26 @@ export async function getJournalTranscriptionStatus(
   return parseJsonOrThrow(res);
 }
 
+export function streamJournalTranscriptionStatus(
+  mediaPath: string,
+  onStatus: (status: JournalTranscriptionStatus) => void,
+  bearerToken?: string,
+  gatewayBaseUrl?: string,
+  onError?: (error: Error) => void
+): GatewayEventStreamHandle {
+  const trimmedPath = mediaPath.trim();
+  if (!trimmedPath) {
+    throw new Error("Media path is required");
+  }
+  const params = new URLSearchParams({ mediaPath: trimmedPath });
+  return openGatewayEventStream(`/api/journal/transcribe/stream?${params.toString()}`, {
+    bearerToken,
+    gatewayBaseUrl,
+    onEvent: (_event, payload) => onStatus(payload as JournalTranscriptionStatus),
+    onError
+  });
+}
+
 export async function archivePostedLibraryItem(
   path: string,
   bearerToken?: string,
@@ -648,6 +832,34 @@ export async function listClawChatMessages(
   return items.map((item: any) => mapChatRecord(item, threadId));
 }
 
+export function streamClawChatMessages(
+  threadId: string,
+  onSnapshot: (snapshot: ChatThreadStreamSnapshot) => void,
+  bearerToken?: string,
+  gatewayBaseUrl?: string,
+  onError?: (error: Error) => void
+): GatewayEventStreamHandle {
+  const id = threadId.trim();
+  if (!id) {
+    throw new Error("threadId is required");
+  }
+  const params = new URLSearchParams({ threadId: id, limit: "200" });
+  return openGatewayEventStream(`/api/chat/stream?${params.toString()}`, {
+    bearerToken,
+    gatewayBaseUrl,
+    onEvent: (_event, payload) => {
+      const items = Array.isArray(payload?.items)
+        ? payload.items.map((item: any) => mapChatRecord(item, id))
+        : [];
+      onSnapshot({
+        threadId: String(payload?.threadId || id),
+        items
+      });
+    },
+    onError
+  });
+}
+
 export async function createClawChatUserMessage(
   threadId: string,
   content: string,
@@ -660,6 +872,40 @@ export async function createClawChatUserMessage(
     body: JSON.stringify({ threadId, content })
   });
   return parseJsonOrThrow(res);
+}
+
+export function streamClawChatResult(
+  threadId: string,
+  messageId: string,
+  onSnapshot: (snapshot: ChatResultStreamSnapshot) => void,
+  bearerToken?: string,
+  gatewayBaseUrl?: string,
+  onError?: (error: Error) => void
+): GatewayEventStreamHandle {
+  const trimmedThreadId = threadId.trim();
+  const trimmedMessageId = messageId.trim();
+  if (!trimmedThreadId || !trimmedMessageId) {
+    throw new Error("threadId and messageId are required");
+  }
+  const params = new URLSearchParams({
+    threadId: trimmedThreadId,
+    messageId: trimmedMessageId
+  });
+  return openGatewayEventStream(`/api/chat/result/stream?${params.toString()}`, {
+    bearerToken,
+    gatewayBaseUrl,
+    onEvent: (_event, payload) => {
+      const reply = payload?.reply ? mapChatRecord(payload.reply, trimmedThreadId) : undefined;
+      onSnapshot({
+        threadId: String(payload?.threadId || trimmedThreadId),
+        messageId: String(payload?.messageId || trimmedMessageId),
+        status: String(payload?.status || "pending"),
+        reply,
+        error: payload?.error ? String(payload.error) : undefined
+      });
+    },
+    onError
+  });
 }
 
 export async function submitFeedContentAgentComment(
@@ -874,6 +1120,99 @@ export async function getWorkspaceSynthesizerStatus(
         }
       : undefined
   };
+}
+
+export function streamWorkspaceSynthesizerStatus(
+  onStatus: (status: WorkspaceSynthesizerStatus) => void,
+  bearerToken?: string,
+  gatewayBaseUrl?: string,
+  onError?: (error: Error) => void
+): GatewayEventStreamHandle {
+  return openGatewayEventStream("/api/workspace/synthesizer/stream", {
+    bearerToken,
+    gatewayBaseUrl,
+    onEvent: (_event, payload) => {
+      onStatus({
+        status: String(payload?.status || "idle"),
+        triggerReason: payload?.triggerReason ? String(payload.triggerReason) : undefined,
+        threadId: payload?.threadId ? String(payload.threadId) : undefined,
+        lastRunAt: payload?.lastRunAt ? String(payload.lastRunAt) : undefined,
+        lastSourceUpdatedAt:
+          typeof payload?.lastSourceUpdatedAt === "number" ? payload.lastSourceUpdatedAt : undefined,
+        pendingSourceCount:
+          typeof payload?.pendingSourceCount === "number" ? payload.pendingSourceCount : undefined,
+        pendingWordCount:
+          typeof payload?.pendingWordCount === "number" ? payload.pendingWordCount : undefined,
+        selectedSourcePaths: Array.isArray(payload?.selectedSourcePaths)
+          ? payload.selectedSourcePaths.map((value: unknown) => String(value))
+          : undefined,
+        lastSummary: payload?.lastSummary ? String(payload.lastSummary) : undefined,
+        lastError: payload?.lastError ? String(payload.lastError) : undefined,
+        lastManifestPath: payload?.lastManifestPath ? String(payload.lastManifestPath) : undefined,
+        artifactCounts: payload?.artifactCounts
+          ? {
+              insightPosts: Number(payload.artifactCounts.insightPosts || 0),
+              todos: Number(payload.artifactCounts.todos || 0),
+              events: Number(payload.artifactCounts.events || 0),
+              clipPlans: Number(payload.artifactCounts.clipPlans || 0)
+            }
+          : undefined,
+        artifactStates: payload?.artifactStates
+          ? {
+              insightPosts: payload.artifactStates.insightPosts
+                ? {
+                    status: String(payload.artifactStates.insightPosts.status || ""),
+                    path: payload.artifactStates.insightPosts.path
+                      ? String(payload.artifactStates.insightPosts.path)
+                      : undefined,
+                    itemCount: Number(payload.artifactStates.insightPosts.itemCount || 0),
+                    error: payload.artifactStates.insightPosts.error
+                      ? String(payload.artifactStates.insightPosts.error)
+                      : undefined
+                  }
+                : undefined,
+              todos: payload.artifactStates.todos
+                ? {
+                    status: String(payload.artifactStates.todos.status || ""),
+                    path: payload.artifactStates.todos.path
+                      ? String(payload.artifactStates.todos.path)
+                      : undefined,
+                    itemCount: Number(payload.artifactStates.todos.itemCount || 0),
+                    error: payload.artifactStates.todos.error
+                      ? String(payload.artifactStates.todos.error)
+                      : undefined
+                  }
+                : undefined,
+              events: payload.artifactStates.events
+                ? {
+                    status: String(payload.artifactStates.events.status || ""),
+                    path: payload.artifactStates.events.path
+                      ? String(payload.artifactStates.events.path)
+                      : undefined,
+                    itemCount: Number(payload.artifactStates.events.itemCount || 0),
+                    error: payload.artifactStates.events.error
+                      ? String(payload.artifactStates.events.error)
+                      : undefined
+                  }
+                : undefined,
+              clipPlans: payload.artifactStates.clipPlans
+                ? {
+                    status: String(payload.artifactStates.clipPlans.status || ""),
+                    path: payload.artifactStates.clipPlans.path
+                      ? String(payload.artifactStates.clipPlans.path)
+                      : undefined,
+                    itemCount: Number(payload.artifactStates.clipPlans.itemCount || 0),
+                    error: payload.artifactStates.clipPlans.error
+                      ? String(payload.artifactStates.clipPlans.error)
+                      : undefined
+                  }
+                : undefined
+            }
+          : undefined
+      });
+    },
+    onError
+  });
 }
 
 export async function runWorkspaceSynthesizerNow(

@@ -250,6 +250,8 @@ pub struct WorkspaceSynthesizerStatus {
     #[serde(default)]
     pub trigger_reason: String,
     #[serde(default)]
+    pub journal_save_cooldown_until: String,
+    #[serde(default)]
     pub thread_id: String,
     #[serde(default)]
     pub last_run_at: String,
@@ -833,7 +835,10 @@ fn normalize_todo_items(mut items: Vec<TodoCandidate>) -> Result<Vec<TodoCandida
         if item.title.trim().is_empty() {
             anyhow::bail!("todos items require non-empty title");
         }
-        let seed = format!("{}|{}|{}", item.title, item.source_path, item.source_excerpt);
+        let seed = format!(
+            "{}|{}|{}|{}",
+            item.title, item.details, item.due_at, item.source_path
+        );
         item.id = unique_id(&used_ids, &item.id, &seed, "todo");
         used_ids.insert(item.id.clone());
     }
@@ -1679,6 +1684,27 @@ mod tests {
         assert_eq!(normalized.todos[0].priority, "medium");
         assert_eq!(normalized.todos[0].status, "open");
         assert_eq!(normalized.events[0].status, "confirmed");
+    }
+
+    #[test]
+    fn todo_ids_stay_stable_when_only_source_excerpt_changes() {
+        let base = TodoCandidate {
+            title: "Email the team".to_string(),
+            details: "Share the launch checklist".to_string(),
+            due_at: "2026-03-12".to_string(),
+            source_path: "journals/text/2026-03-11.md".to_string(),
+            source_excerpt: "Need to send the checklist tomorrow.".to_string(),
+            ..TodoCandidate::default()
+        };
+
+        let first = normalize_todo_items(vec![base.clone()]).unwrap();
+        let second = normalize_todo_items(vec![TodoCandidate {
+            source_excerpt: "Need to send the checklist first thing tomorrow.".to_string(),
+            ..base
+        }])
+        .unwrap();
+
+        assert_eq!(first[0].id, second[0].id);
     }
 
     #[test]

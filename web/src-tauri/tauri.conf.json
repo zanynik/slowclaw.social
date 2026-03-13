@@ -24,7 +24,7 @@
       "capabilities": [
         "default"
       ],
-      "csp": null
+      "csp": "default-src 'self'; base-uri 'self'; form-action 'self'; frame-src 'none'; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://127.0.0.1:* http://localhost:* https:; img-src 'self' data: blob: http://127.0.0.1:* http://localhost:* https:; media-src 'self' blob: http://127.0.0.1:* http://localhost:* https:"
     }
   },
   "bundle": {

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -158,6 +158,9 @@ pub struct FeedWebSourceRecord {
     pub title: String,
     pub html_url: String,
     pub xml_url: String,
+    pub description: String,
+    pub topics_csv: String,
+    pub metadata_embedding: Vec<u8>,
     pub enabled: bool,
     pub source_kind: String,
     pub created_at: String,
@@ -170,6 +173,9 @@ pub struct FeedWebSourceUpsert {
     pub title: String,
     pub html_url: String,
     pub xml_url: String,
+    pub description: String,
+    pub topics_csv: String,
+    pub metadata_embedding: Vec<u8>,
     pub enabled: bool,
     pub source_kind: String,
 }
@@ -199,6 +205,56 @@ pub struct FeedWebCacheUpsert {
     pub snippet: String,
     pub search_query: String,
     pub fetched_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonalizedFeedCacheRecord {
+    pub feed_key: String,
+    pub cache_key: String,
+    pub payload_json: String,
+    pub score: f64,
+    pub sort_order: i64,
+    pub refreshed_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonalizedFeedCacheUpsert {
+    pub feed_key: String,
+    pub cache_key: String,
+    pub payload_json: String,
+    pub score: f64,
+    pub sort_order: i64,
+    pub refreshed_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonalizedFeedStateRecord {
+    pub feed_key: String,
+    pub dirty: bool,
+    pub refresh_status: String,
+    pub refreshed_at: String,
+    pub refresh_started_at: String,
+    pub refresh_finished_at: String,
+    pub last_error: String,
+    pub profile_status: String,
+    pub profile_stats_json: String,
+    pub details_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonalizedFeedStateUpsert {
+    pub feed_key: String,
+    pub dirty: bool,
+    pub refresh_status: String,
+    pub refreshed_at: String,
+    pub refresh_started_at: String,
+    pub refresh_finished_at: String,
+    pub last_error: String,
+    pub profile_status: String,
+    pub profile_stats_json: String,
+    pub details_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -544,7 +600,7 @@ pub fn replace_workspace_todos(
     workspace_dir: &Path,
     items: &[WorkspaceTodoUpsert],
     manifest_id: &str,
-    processed_source_paths: &[String],
+    _processed_source_paths: &[String],
 ) -> Result<usize> {
     let mut conn = open_conn(&db_path(workspace_dir))?;
     let tx = conn.transaction()?;
@@ -568,8 +624,13 @@ pub fn replace_workspace_todos(
                 source_excerpt = excluded.source_excerpt,
                 metadata_json = excluded.metadata_json,
                 updated_at = excluded.updated_at,
-                last_manifest_id = excluded.last_manifest_id,
-                archived = 0",
+                last_manifest_id = excluded.last_manifest_id
+             WHERE workspace_todos.title != excluded.title
+                OR workspace_todos.details != excluded.details
+                OR workspace_todos.priority != excluded.priority
+                OR workspace_todos.model_status != excluded.model_status
+                OR workspace_todos.due_at != excluded.due_at
+                OR workspace_todos.source_path != excluded.source_path",
             params![
                 item.id,
                 item.title,
@@ -587,15 +648,6 @@ pub fn replace_workspace_todos(
         .with_context(|| format!("Failed to upsert workspace todo {}", item.id))?;
         written += 1;
     }
-
-    archive_workspace_rows_for_sources(
-        &tx,
-        "workspace_todos",
-        manifest_id,
-        &now,
-        processed_source_paths,
-    )
-    .context("Failed to archive stale workspace todos")?;
 
     tx.commit()?;
     Ok(written)
@@ -707,7 +759,7 @@ pub fn replace_workspace_events(
     workspace_dir: &Path,
     items: &[WorkspaceEventUpsert],
     manifest_id: &str,
-    processed_source_paths: &[String],
+    _processed_source_paths: &[String],
 ) -> Result<usize> {
     let mut conn = open_conn(&db_path(workspace_dir))?;
     let tx = conn.transaction()?;
@@ -733,8 +785,15 @@ pub fn replace_workspace_events(
                 source_excerpt = excluded.source_excerpt,
                 metadata_json = excluded.metadata_json,
                 updated_at = excluded.updated_at,
-                last_manifest_id = excluded.last_manifest_id,
-                archived = 0",
+                last_manifest_id = excluded.last_manifest_id
+             WHERE workspace_events.title != excluded.title
+                OR workspace_events.details != excluded.details
+                OR workspace_events.location != excluded.location
+                OR workspace_events.status != excluded.status
+                OR workspace_events.start_at != excluded.start_at
+                OR workspace_events.end_at != excluded.end_at
+                OR workspace_events.all_day != excluded.all_day
+                OR workspace_events.source_path != excluded.source_path",
             params![
                 item.id,
                 item.title,
@@ -755,47 +814,8 @@ pub fn replace_workspace_events(
         written += 1;
     }
 
-    archive_workspace_rows_for_sources(
-        &tx,
-        "workspace_events",
-        manifest_id,
-        &now,
-        processed_source_paths,
-    )
-    .context("Failed to archive stale workspace events")?;
-
     tx.commit()?;
     Ok(written)
-}
-
-fn archive_workspace_rows_for_sources(
-    tx: &rusqlite::Transaction<'_>,
-    table_name: &str,
-    manifest_id: &str,
-    now: &str,
-    processed_source_paths: &[String],
-) -> Result<()> {
-    if processed_source_paths.is_empty() {
-        return Ok(());
-    }
-    let mut placeholders = Vec::with_capacity(processed_source_paths.len());
-    for index in 0..processed_source_paths.len() {
-        placeholders.push(format!("?{}", index + 3));
-    }
-    let query = format!(
-        "UPDATE {table_name}
-         SET archived = 1, updated_at = ?2
-         WHERE last_manifest_id != ?1
-           AND source_path IN ({})",
-        placeholders.join(", ")
-    );
-    let mut params_vec = Vec::with_capacity(processed_source_paths.len() + 2);
-    params_vec.push(manifest_id.to_string());
-    params_vec.push(now.to_string());
-    params_vec.extend(processed_source_paths.iter().cloned());
-    tx.execute(&query, params_from_iter(params_vec.iter()))
-        .with_context(|| format!("Failed to archive stale rows in {table_name}"))?;
-    Ok(())
 }
 
 pub fn list_workspace_events(workspace_dir: &Path, limit: usize) -> Result<Vec<serde_json::Value>> {
@@ -1196,7 +1216,8 @@ pub fn upsert_feed_interest_source(
 pub fn list_feed_web_sources(workspace_dir: &Path) -> Result<Vec<FeedWebSourceRecord>> {
     let conn = open_conn(&db_path(workspace_dir))?;
     let mut stmt = conn.prepare(
-        "SELECT domain, title, html_url, xml_url, enabled, source_kind, created_at, updated_at
+        "SELECT domain, title, html_url, xml_url, description, topics_csv, metadata_embedding,
+                enabled, source_kind, created_at, updated_at
          FROM feed_web_sources
          WHERE enabled = 1
          ORDER BY title ASC, domain ASC",
@@ -1207,10 +1228,13 @@ pub fn list_feed_web_sources(workspace_dir: &Path) -> Result<Vec<FeedWebSourceRe
             title: row.get(1)?,
             html_url: row.get(2)?,
             xml_url: row.get(3)?,
-            enabled: row.get::<_, i64>(4)? != 0,
-            source_kind: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
+            description: row.get(4)?,
+            topics_csv: row.get(5)?,
+            metadata_embedding: row.get(6)?,
+            enabled: row.get::<_, i64>(7)? != 0,
+            source_kind: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
         })
     })?;
 
@@ -1229,12 +1253,16 @@ pub fn upsert_feed_web_source(
     let now = Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO feed_web_sources (
-            domain, title, html_url, xml_url, enabled, source_kind, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+            domain, title, html_url, xml_url, description, topics_csv, metadata_embedding,
+            enabled, source_kind, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
          ON CONFLICT(domain) DO UPDATE SET
             title = excluded.title,
             html_url = excluded.html_url,
             xml_url = excluded.xml_url,
+            description = excluded.description,
+            topics_csv = excluded.topics_csv,
+            metadata_embedding = excluded.metadata_embedding,
             enabled = excluded.enabled,
             source_kind = excluded.source_kind,
             updated_at = excluded.updated_at",
@@ -1243,6 +1271,9 @@ pub fn upsert_feed_web_source(
             source.title,
             source.html_url,
             source.xml_url,
+            source.description,
+            source.topics_csv,
+            source.metadata_embedding,
             if source.enabled { 1 } else { 0 },
             source.source_kind,
             now
@@ -1255,6 +1286,9 @@ pub fn upsert_feed_web_source(
         title: source.title.clone(),
         html_url: source.html_url.clone(),
         xml_url: source.xml_url.clone(),
+        description: source.description.clone(),
+        topics_csv: source.topics_csv.clone(),
+        metadata_embedding: source.metadata_embedding.clone(),
         enabled: source.enabled,
         source_kind: source.source_kind.clone(),
         created_at: now.clone(),
@@ -1336,6 +1370,209 @@ pub fn upsert_feed_web_cache(
         fetched_at: item.fetched_at.clone(),
         updated_at: now,
     })
+}
+
+pub fn list_personalized_feed_cache(
+    workspace_dir: &Path,
+    feed_key: &str,
+    limit: usize,
+) -> Result<Vec<PersonalizedFeedCacheRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let lim = i64::try_from(limit.max(1)).unwrap_or(100);
+    let mut stmt = conn.prepare(
+        "SELECT feed_key, cache_key, payload_json, score, sort_order, refreshed_at, updated_at
+         FROM personalized_feed_cache
+         WHERE feed_key = ?1
+         ORDER BY sort_order ASC, score DESC, cache_key ASC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![feed_key.trim(), lim], |row| {
+        Ok(PersonalizedFeedCacheRecord {
+            feed_key: row.get(0)?,
+            cache_key: row.get(1)?,
+            payload_json: row.get(2)?,
+            score: row.get(3)?,
+            sort_order: row.get(4)?,
+            refreshed_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn replace_personalized_feed_cache(
+    workspace_dir: &Path,
+    feed_key: &str,
+    items: &[PersonalizedFeedCacheUpsert],
+) -> Result<()> {
+    let mut conn = open_conn(&db_path(workspace_dir))?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM personalized_feed_cache WHERE feed_key = ?1",
+        params![feed_key.trim()],
+    )
+    .with_context(|| format!("Failed to clear personalized feed cache for {}", feed_key.trim()))?;
+
+    for item in items {
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO personalized_feed_cache (
+                feed_key, cache_key, payload_json, score, sort_order, refreshed_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                item.feed_key.trim(),
+                item.cache_key.trim(),
+                item.payload_json,
+                item.score,
+                item.sort_order,
+                item.refreshed_at,
+                now,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "Failed to insert personalized feed cache row {} for {}",
+                item.cache_key,
+                item.feed_key
+            )
+        })?;
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn get_personalized_feed_state(
+    workspace_dir: &Path,
+    feed_key: &str,
+) -> Result<Option<PersonalizedFeedStateRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT feed_key, dirty, refresh_status, refreshed_at, refresh_started_at,
+                refresh_finished_at, last_error, profile_status, profile_stats_json,
+                details_json, updated_at
+         FROM personalized_feed_state
+         WHERE feed_key = ?1
+         LIMIT 1",
+    )?;
+    let row = stmt
+        .query_row(params![feed_key.trim()], |row| {
+            Ok(PersonalizedFeedStateRecord {
+                feed_key: row.get(0)?,
+                dirty: row.get::<_, i64>(1)? != 0,
+                refresh_status: row.get(2)?,
+                refreshed_at: row.get(3)?,
+                refresh_started_at: row.get(4)?,
+                refresh_finished_at: row.get(5)?,
+                last_error: row.get(6)?,
+                profile_status: row.get(7)?,
+                profile_stats_json: row.get(8)?,
+                details_json: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+pub fn upsert_personalized_feed_state(
+    workspace_dir: &Path,
+    state: &PersonalizedFeedStateUpsert,
+) -> Result<PersonalizedFeedStateRecord> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO personalized_feed_state (
+            feed_key, dirty, refresh_status, refreshed_at, refresh_started_at,
+            refresh_finished_at, last_error, profile_status, profile_stats_json,
+            details_json, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(feed_key) DO UPDATE SET
+            dirty = excluded.dirty,
+            refresh_status = excluded.refresh_status,
+            refreshed_at = excluded.refreshed_at,
+            refresh_started_at = excluded.refresh_started_at,
+            refresh_finished_at = excluded.refresh_finished_at,
+            last_error = excluded.last_error,
+            profile_status = excluded.profile_status,
+            profile_stats_json = excluded.profile_stats_json,
+            details_json = excluded.details_json,
+            updated_at = excluded.updated_at",
+        params![
+            state.feed_key.trim(),
+            if state.dirty { 1 } else { 0 },
+            state.refresh_status.trim(),
+            state.refreshed_at.trim(),
+            state.refresh_started_at.trim(),
+            state.refresh_finished_at.trim(),
+            state.last_error.trim(),
+            state.profile_status.trim(),
+            state.profile_stats_json.trim(),
+            state.details_json.trim(),
+            now,
+        ],
+    )
+    .with_context(|| format!("Failed to upsert personalized feed state {}", state.feed_key))?;
+
+    Ok(PersonalizedFeedStateRecord {
+        feed_key: state.feed_key.trim().to_string(),
+        dirty: state.dirty,
+        refresh_status: state.refresh_status.trim().to_string(),
+        refreshed_at: state.refreshed_at.trim().to_string(),
+        refresh_started_at: state.refresh_started_at.trim().to_string(),
+        refresh_finished_at: state.refresh_finished_at.trim().to_string(),
+        last_error: state.last_error.trim().to_string(),
+        profile_status: state.profile_status.trim().to_string(),
+        profile_stats_json: state.profile_stats_json.trim().to_string(),
+        details_json: state.details_json.trim().to_string(),
+        updated_at: now,
+    })
+}
+
+pub fn mark_personalized_feed_dirty(workspace_dir: &Path, feed_key: &str) -> Result<()> {
+    let current = get_personalized_feed_state(workspace_dir, feed_key)?;
+    let current = current.unwrap_or(PersonalizedFeedStateRecord {
+        feed_key: feed_key.trim().to_string(),
+        dirty: true,
+        refresh_status: "idle".to_string(),
+        refreshed_at: String::new(),
+        refresh_started_at: String::new(),
+        refresh_finished_at: String::new(),
+        last_error: String::new(),
+        profile_status: String::new(),
+        profile_stats_json: "{}".to_string(),
+        details_json: "{}".to_string(),
+        updated_at: String::new(),
+    });
+    let _ = upsert_personalized_feed_state(
+        workspace_dir,
+        &PersonalizedFeedStateUpsert {
+            feed_key: current.feed_key,
+            dirty: true,
+            refresh_status: current.refresh_status,
+            refreshed_at: current.refreshed_at,
+            refresh_started_at: current.refresh_started_at,
+            refresh_finished_at: current.refresh_finished_at,
+            last_error: current.last_error,
+            profile_status: current.profile_status,
+            profile_stats_json: if current.profile_stats_json.trim().is_empty() {
+                "{}".to_string()
+            } else {
+                current.profile_stats_json
+            },
+            details_json: if current.details_json.trim().is_empty() {
+                "{}".to_string()
+            } else {
+                current.details_json
+            },
+        },
+    )?;
+    Ok(())
 }
 
 pub fn list_content_sources(workspace_dir: &Path, limit: usize) -> Result<Vec<ContentSourceRecord>> {
@@ -1853,6 +2090,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             title TEXT NOT NULL DEFAULT '',
             html_url TEXT NOT NULL DEFAULT '',
             xml_url TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            topics_csv TEXT NOT NULL DEFAULT '',
+            metadata_embedding BLOB NOT NULL DEFAULT X'',
             enabled INTEGER NOT NULL DEFAULT 1,
             source_kind TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
@@ -1875,6 +2115,35 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_feed_web_cache_updated
             ON feed_web_cache(updated_at);
+
+        CREATE TABLE IF NOT EXISTS personalized_feed_cache (
+            feed_key TEXT NOT NULL DEFAULT '',
+            cache_key TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '',
+            score REAL NOT NULL DEFAULT 0.0,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            refreshed_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(feed_key, cache_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_personalized_feed_cache_order
+            ON personalized_feed_cache(feed_key, sort_order, score);
+
+        CREATE TABLE IF NOT EXISTS personalized_feed_state (
+            feed_key TEXT PRIMARY KEY,
+            dirty INTEGER NOT NULL DEFAULT 1,
+            refresh_status TEXT NOT NULL DEFAULT 'idle',
+            refreshed_at TEXT NOT NULL DEFAULT '',
+            refresh_started_at TEXT NOT NULL DEFAULT '',
+            refresh_finished_at TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            profile_status TEXT NOT NULL DEFAULT '',
+            profile_stats_json TEXT NOT NULL DEFAULT '{}',
+            details_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_personalized_feed_state_updated
+            ON personalized_feed_state(updated_at);
 
         CREATE TABLE IF NOT EXISTS content_sources (
             source_key TEXT PRIMARY KEY,
@@ -1931,7 +2200,51 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
     }
 
+    ensure_column(
+        &conn,
+        "feed_web_sources",
+        "description",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &conn,
+        "feed_web_sources",
+        "topics_csv",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &conn,
+        "feed_web_sources",
+        "metadata_embedding",
+        "BLOB NOT NULL DEFAULT X''",
+    )?;
+
     Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, sql_type: &str) -> Result<()> {
+    if column_exists(conn, table, column)? {
+        return Ok(());
+    }
+
+    conn.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
+    ))
+    .with_context(|| format!("Failed to add column {table}.{column}"))?;
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("Failed to inspect schema for {}", table))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row?.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
@@ -1990,6 +2303,8 @@ mod tests {
         assert!(table_exists(&conn, "feed_interest_sources").unwrap());
         assert!(table_exists(&conn, "feed_web_sources").unwrap());
         assert!(table_exists(&conn, "feed_web_cache").unwrap());
+        assert!(table_exists(&conn, "personalized_feed_cache").unwrap());
+        assert!(table_exists(&conn, "personalized_feed_state").unwrap());
         assert!(table_exists(&conn, "content_sources").unwrap());
         assert!(table_exists(&conn, "content_items").unwrap());
     }
@@ -2175,7 +2490,9 @@ mod tests {
         )
         .unwrap();
         let todos = list_workspace_todos(tmp.path(), 20).unwrap();
-        assert!(todos.is_empty());
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0]["id"].as_str(), Some("todo-follow-up"));
+        assert_eq!(todos[0]["status"].as_str(), Some("done"));
     }
 
     #[test]
@@ -2233,10 +2550,111 @@ mod tests {
         .unwrap();
 
         let todos = list_workspace_todos(tmp.path(), 20).unwrap();
-        assert_eq!(todos.len(), 2);
+        assert_eq!(todos.len(), 3);
         assert!(todos.iter().any(|item| item["id"] == "todo-a-2"));
         assert!(todos.iter().any(|item| item["id"] == "todo-b"));
-        assert!(!todos.iter().any(|item| item["id"] == "todo-a"));
+        assert!(todos.iter().any(|item| item["id"] == "todo-a"));
+    }
+
+    #[test]
+    fn workspace_todos_do_not_unarchive_on_reextract() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        replace_workspace_todos(
+            tmp.path(),
+            &[WorkspaceTodoUpsert {
+                id: "todo-archive".into(),
+                title: "Archive me".into(),
+                details: String::new(),
+                priority: "medium".into(),
+                model_status: "open".into(),
+                due_at: String::new(),
+                source_path: "journals/text/archive.md".into(),
+                source_excerpt: "Archive me".into(),
+                metadata_json: "{}".into(),
+            }],
+            "manifest-1",
+            &["journals/text/archive.md".into()],
+        )
+        .unwrap();
+
+        let conn = open_conn(&db_path(tmp.path())).unwrap();
+        conn.execute(
+            "UPDATE workspace_todos SET archived = 1 WHERE id = ?1",
+            params!["todo-archive"],
+        )
+        .unwrap();
+
+        replace_workspace_todos(
+            tmp.path(),
+            &[WorkspaceTodoUpsert {
+                id: "todo-archive".into(),
+                title: "Archive me".into(),
+                details: "Still archived".into(),
+                priority: "high".into(),
+                model_status: "open".into(),
+                due_at: String::new(),
+                source_path: "journals/text/archive.md".into(),
+                source_excerpt: "Archive me again".into(),
+                metadata_json: "{\"kind\":\"todo\"}".into(),
+            }],
+            "manifest-2",
+            &["journals/text/archive.md".into()],
+        )
+        .unwrap();
+
+        assert!(list_workspace_todos(tmp.path(), 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn workspace_todos_skip_updated_at_churn_when_meaningful_fields_match() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        replace_workspace_todos(
+            tmp.path(),
+            &[WorkspaceTodoUpsert {
+                id: "todo-stable".into(),
+                title: "Stable todo".into(),
+                details: "Keep it steady".into(),
+                priority: "medium".into(),
+                model_status: "open".into(),
+                due_at: "2026-03-12".into(),
+                source_path: "journals/text/stable.md".into(),
+                source_excerpt: "First excerpt".into(),
+                metadata_json: "{\"version\":1}".into(),
+            }],
+            "manifest-1",
+            &["journals/text/stable.md".into()],
+        )
+        .unwrap();
+
+        let initial = list_workspace_todos(tmp.path(), 20).unwrap();
+        let initial_updated = initial[0]["updated"].as_str().unwrap().to_string();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        replace_workspace_todos(
+            tmp.path(),
+            &[WorkspaceTodoUpsert {
+                id: "todo-stable".into(),
+                title: "Stable todo".into(),
+                details: "Keep it steady".into(),
+                priority: "medium".into(),
+                model_status: "open".into(),
+                due_at: "2026-03-12".into(),
+                source_path: "journals/text/stable.md".into(),
+                source_excerpt: "Edited excerpt should not churn".into(),
+                metadata_json: "{\"version\":2}".into(),
+            }],
+            "manifest-2",
+            &["journals/text/stable.md".into()],
+        )
+        .unwrap();
+
+        let after = list_workspace_todos(tmp.path(), 20).unwrap();
+        assert_eq!(after[0]["updated"].as_str(), Some(initial_updated.as_str()));
     }
 
     #[test]
@@ -2278,7 +2696,8 @@ mod tests {
         )
         .unwrap();
         let events = list_workspace_events(tmp.path(), 20).unwrap();
-        assert!(events.is_empty());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"].as_str(), Some("event-launch-review"));
     }
 
     #[test]
@@ -2342,10 +2761,119 @@ mod tests {
         .unwrap();
 
         let events = list_workspace_events(tmp.path(), 20).unwrap();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert!(events.iter().any(|item| item["id"] == "event-a-2"));
         assert!(events.iter().any(|item| item["id"] == "event-b"));
-        assert!(!events.iter().any(|item| item["id"] == "event-a"));
+        assert!(events.iter().any(|item| item["id"] == "event-a"));
+    }
+
+    #[test]
+    fn workspace_events_do_not_unarchive_on_reextract() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        replace_workspace_events(
+            tmp.path(),
+            &[WorkspaceEventUpsert {
+                id: "event-archive".into(),
+                title: "Archive event".into(),
+                details: String::new(),
+                location: String::new(),
+                status: "confirmed".into(),
+                start_at: "2026-03-12T09:00:00Z".into(),
+                end_at: String::new(),
+                all_day: false,
+                source_path: "journals/text/archive-event.md".into(),
+                source_excerpt: "Archive this event".into(),
+                metadata_json: "{}".into(),
+            }],
+            "manifest-1",
+            &["journals/text/archive-event.md".into()],
+        )
+        .unwrap();
+
+        let conn = open_conn(&db_path(tmp.path())).unwrap();
+        conn.execute(
+            "UPDATE workspace_events SET archived = 1 WHERE id = ?1",
+            params!["event-archive"],
+        )
+        .unwrap();
+
+        replace_workspace_events(
+            tmp.path(),
+            &[WorkspaceEventUpsert {
+                id: "event-archive".into(),
+                title: "Archive event".into(),
+                details: "Still archived".into(),
+                location: "Berlin".into(),
+                status: "confirmed".into(),
+                start_at: "2026-03-12T09:00:00Z".into(),
+                end_at: String::new(),
+                all_day: false,
+                source_path: "journals/text/archive-event.md".into(),
+                source_excerpt: "Archive this event again".into(),
+                metadata_json: "{\"kind\":\"event\"}".into(),
+            }],
+            "manifest-2",
+            &["journals/text/archive-event.md".into()],
+        )
+        .unwrap();
+
+        assert!(list_workspace_events(tmp.path(), 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn workspace_events_skip_updated_at_churn_when_meaningful_fields_match() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        replace_workspace_events(
+            tmp.path(),
+            &[WorkspaceEventUpsert {
+                id: "event-stable".into(),
+                title: "Stable event".into(),
+                details: "Agenda".into(),
+                location: "Berlin".into(),
+                status: "confirmed".into(),
+                start_at: "2026-03-12T09:00:00Z".into(),
+                end_at: "2026-03-12T10:00:00Z".into(),
+                all_day: false,
+                source_path: "journals/text/stable-event.md".into(),
+                source_excerpt: "First event excerpt".into(),
+                metadata_json: "{\"version\":1}".into(),
+            }],
+            "manifest-1",
+            &["journals/text/stable-event.md".into()],
+        )
+        .unwrap();
+
+        let initial = list_workspace_events(tmp.path(), 20).unwrap();
+        let initial_updated = initial[0]["updated"].as_str().unwrap().to_string();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        replace_workspace_events(
+            tmp.path(),
+            &[WorkspaceEventUpsert {
+                id: "event-stable".into(),
+                title: "Stable event".into(),
+                details: "Agenda".into(),
+                location: "Berlin".into(),
+                status: "confirmed".into(),
+                start_at: "2026-03-12T09:00:00Z".into(),
+                end_at: "2026-03-12T10:00:00Z".into(),
+                all_day: false,
+                source_path: "journals/text/stable-event.md".into(),
+                source_excerpt: "Edited event excerpt should not churn".into(),
+                metadata_json: "{\"version\":2}".into(),
+            }],
+            "manifest-2",
+            &["journals/text/stable-event.md".into()],
+        )
+        .unwrap();
+
+        let after = list_workspace_events(tmp.path(), 20).unwrap();
+        assert_eq!(after[0]["updated"].as_str(), Some(initial_updated.as_str()));
     }
 
     #[test]
@@ -2479,6 +3007,9 @@ mod tests {
                 title: "Example".into(),
                 html_url: "https://example.com".into(),
                 xml_url: "https://example.com/feed.xml".into(),
+                description: "Example source".into(),
+                topics_csv: "testing,feeds".into(),
+                metadata_embedding: vec![1, 2, 3, 4],
                 enabled: true,
                 source_kind: "seed".into(),
             },
@@ -2488,6 +3019,8 @@ mod tests {
         let sources = list_feed_web_sources(tmp.path()).unwrap();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].domain, "example.com");
+        assert_eq!(sources[0].topics_csv, "testing,feeds");
+        assert_eq!(sources[0].metadata_embedding, vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -2641,6 +3174,58 @@ mod tests {
         update_content_item_embedding(tmp.path(), "item-missing", &[9, 8, 7, 6]).unwrap();
         let missing_after = list_content_items_missing_embeddings(tmp.path(), 10).unwrap();
         assert!(missing_after.is_empty());
+    }
+
+    #[test]
+    fn personalized_feed_cache_and_state_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        replace_personalized_feed_cache(
+            tmp.path(),
+            "world",
+            &[PersonalizedFeedCacheUpsert {
+                feed_key: "world".into(),
+                cache_key: "item-1".into(),
+                payload_json: "{\"sourceType\":\"web\"}".into(),
+                score: 0.87,
+                sort_order: 0,
+                refreshed_at: "2026-03-13T10:00:00Z".into(),
+            }],
+        )
+        .unwrap();
+        upsert_personalized_feed_state(
+            tmp.path(),
+            &PersonalizedFeedStateUpsert {
+                feed_key: "world".into(),
+                dirty: false,
+                refresh_status: "idle".into(),
+                refreshed_at: "2026-03-13T10:00:00Z".into(),
+                refresh_started_at: "2026-03-13T09:59:00Z".into(),
+                refresh_finished_at: "2026-03-13T10:00:00Z".into(),
+                last_error: String::new(),
+                profile_status: "ready".into(),
+                profile_stats_json: "{\"interestCount\":2}".into(),
+                details_json: "{\"selectedSources\":[]}".into(),
+            },
+        )
+        .unwrap();
+
+        let cache = list_personalized_feed_cache(tmp.path(), "world", 10).unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].cache_key, "item-1");
+
+        let state = get_personalized_feed_state(tmp.path(), "world")
+            .unwrap()
+            .expect("feed state should exist");
+        assert_eq!(state.refresh_status, "idle");
+        assert_eq!(state.profile_status, "ready");
+
+        mark_personalized_feed_dirty(tmp.path(), "world").unwrap();
+        let dirty_state = get_personalized_feed_state(tmp.path(), "world")
+            .unwrap()
+            .expect("dirty state should exist");
+        assert!(dirty_state.dirty);
     }
 
 }

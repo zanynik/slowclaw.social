@@ -269,6 +269,12 @@ Notes:
 | `port` | `42617` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
+| `desktop_cors_allowed_origins` | `[]` | extra browser origins allowed to call the desktop gateway in addition to the built-in local allowlist |
+
+Notes:
+
+- Desktop CORS is intentionally narrow by default. Local development origins used by the bundled web UI are allowed automatically.
+- Add `desktop_cors_allowed_origins` only when you intentionally need another desktop web origin to reach the local gateway.
 
 ## `[autonomy]`
 

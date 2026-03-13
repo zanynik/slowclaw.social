@@ -7,6 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod article_synthesizer;
 pub mod static_files;
 pub mod local_store;
 pub mod feed_web_sources;
@@ -26,8 +27,11 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{Datelike, Utc};
 use axum::{
     extract::{ConnectInfo, Path as AxumPath, Query, Request, State},
-    http::{header, HeaderMap, Method, StatusCode},
-    response::{IntoResponse, Json},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Json,
+    },
     routing::{get, patch, post},
     Router,
 };
@@ -35,14 +39,17 @@ use http_body_util::BodyExt as _;
 use parking_lot::Mutex;
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceExt as _;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeFile;
 use tower_http::timeout::TimeoutLayer;
@@ -69,6 +76,7 @@ const JOURNAL_MEDIA_DIR: &str = "journals/media";
 const SYNC_ALLOWED_ROOTS: &[&str] = &["journals", "posts", "skills"];
 const CONTENT_AGENT_APP_OPEN_STALE_SECS: i64 = 15 * 60;
 const WORKSPACE_SYNTHESIZER_WORKFLOW_KEY: &str = "workspace_synthesizer";
+const WORKSPACE_SYNTH_JOURNAL_SAVE_COOLDOWN_SECS: i64 = 60;
 const LEGACY_AUDIO_INSIGHT_CLIPS_GOAL: &str =
     "Use my journal notes and available audio/video transcripts to identify practical insights and turn them into concise feed-ready posts, with each post saved as a separate file in posts/.";
 
@@ -279,9 +287,40 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     }
 }
 
-fn desktop_cors_layer() -> CorsLayer {
+const DEFAULT_DESKTOP_CORS_ORIGINS: &[&str] = &[
+    "http://localhost:1420",
+    "http://127.0.0.1:1420",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+    "tauri://localhost",
+];
+
+fn desktop_cors_allowed_origins(config: &Config) -> Vec<HeaderValue> {
+    let mut seen = BTreeSet::new();
+    let mut origins = Vec::new();
+
+    for origin in DEFAULT_DESKTOP_CORS_ORIGINS
+        .iter()
+        .copied()
+        .map(str::to_string)
+        .chain(config.gateway.desktop_cors_allowed_origins.iter().cloned())
+    {
+        let trimmed = origin.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        match HeaderValue::from_str(trimmed) {
+            Ok(value) => origins.push(value),
+            Err(err) => tracing::warn!(origin = trimmed, error = %err, "Skipping invalid desktop CORS origin"),
+        }
+    }
+
+    origins
+}
+
+fn desktop_cors_layer(config: &Config) -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(desktop_cors_allowed_origins(config))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -290,7 +329,16 @@ fn desktop_cors_layer() -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers(Any)
+        .allow_headers([
+            header::ACCEPT,
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::IF_NONE_MATCH,
+            header::HeaderName::from_static("idempotency-key"),
+            header::HeaderName::from_static("last-event-id"),
+            header::HeaderName::from_static("x-pairing-code"),
+            header::HeaderName::from_static("x-webhook-secret"),
+        ])
 }
 
 /// Shared state for all axum handlers
@@ -561,6 +609,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/media/capabilities", get(handle_media_capabilities))
         .route("/webhook", post(handle_webhook))
         .route("/api/chat/messages", get(handle_chat_list).post(handle_chat_send))
+        .route("/api/chat/stream", get(handle_chat_stream))
+        .route("/api/chat/result/stream", get(handle_chat_result_stream))
         .route(
             "/api/feed/workflow-comment",
             post(handle_feed_workflow_comment),
@@ -578,6 +628,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/workspace/synthesizer/status",
             get(handle_workspace_synthesizer_status),
+        )
+        .route(
+            "/api/workspace/synthesizer/stream",
+            get(handle_workspace_synthesizer_stream),
         )
         .route(
             "/api/workspace/synthesizer/run",
@@ -631,6 +685,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/journal/transcribe/status",
             get(handle_journal_transcribe_status),
         )
+        .route(
+            "/api/journal/transcribe/stream",
+            get(handle_journal_transcribe_stream),
+        )
         .route("/api/library/items", get(handle_library_items))
         .route("/api/library/text", get(handle_library_text))
         .route("/api/library/save-text", post(handle_library_save_text))
@@ -649,7 +707,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .merge(media_router)
         .route("/_app/{*path}", get(static_files::handle_static))
         .fallback(get(static_files::handle_spa_fallback))
-        .layer(desktop_cors_layer());
+        .layer(desktop_cors_layer(&config));
 
     // Run the server
     axum::serve(
@@ -725,8 +783,83 @@ fn local_media_capabilities(config: &Config) -> MediaToolCapabilities {
     command_media_backend(config.workspace_dir.clone(), config.transcription.clone()).capabilities()
 }
 
-fn frontend_error_payload(message: impl Into<String>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "error": message.into() }))
+fn frontend_error_code_from_context(context: &str) -> String {
+    let mut code = String::with_capacity(context.len() + "_FAILED".len());
+    let mut previous_was_separator = true;
+    for ch in context.chars() {
+        if ch.is_ascii_alphanumeric() {
+            code.push(ch.to_ascii_uppercase());
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            code.push('_');
+            previous_was_separator = true;
+        }
+    }
+    while code.ends_with('_') {
+        code.pop();
+    }
+    if code.is_empty() {
+        "FRONTEND_REQUEST".to_string()
+    } else {
+        format!("{code}_FAILED")
+    }
+}
+
+fn frontend_error_payload(
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "error": message.into(),
+        "code": code.into(),
+    }))
+}
+
+fn frontend_error_payload_with_meta(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    extra: serde_json::Value,
+) -> Json<serde_json::Value> {
+    let mut payload = serde_json::Map::new();
+    payload.insert("error".to_string(), serde_json::Value::String(message.into()));
+    payload.insert("code".to_string(), serde_json::Value::String(code.into()));
+    if let serde_json::Value::Object(extra_fields) = extra {
+        payload.extend(extra_fields);
+    }
+    Json(serde_json::Value::Object(payload))
+}
+
+fn frontend_error_response(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, frontend_error_payload(code, message))
+}
+
+fn frontend_error_response_with_meta(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    extra: serde_json::Value,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, frontend_error_payload_with_meta(code, message, extra))
+}
+
+fn frontend_error_response_with_retry_after(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    retry_after: u64,
+) -> (StatusCode, Json<serde_json::Value>) {
+    frontend_error_response_with_meta(
+        status,
+        code,
+        message,
+        serde_json::json!({
+            "retry_after": retry_after,
+        }),
+    )
 }
 
 fn frontend_internal_error<E: std::fmt::Display>(
@@ -736,7 +869,7 @@ fn frontend_internal_error<E: std::fmt::Display>(
     err: E,
 ) -> (StatusCode, Json<serde_json::Value>) {
     tracing::warn!(context, error = %err, "Frontend request failed");
-    (status, frontend_error_payload(user_message))
+    frontend_error_response(status, frontend_error_code_from_context(context), user_message)
 }
 
 fn frontend_internal_error_response<E: std::fmt::Display>(
@@ -755,6 +888,23 @@ fn frontend_background_error<E: std::fmt::Display>(
 ) -> String {
     tracing::warn!(context, error = %err, "Frontend background task failed");
     user_message.to_string()
+}
+
+fn sse_json_event(name: &str, payload: &serde_json::Value) -> Result<Event, Infallible> {
+    let serialized = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
+    Ok(Event::default().event(name).data(serialized))
+}
+
+fn frontend_event_stream(
+    rx: mpsc::Receiver<Result<Event, Infallible>>,
+) -> axum::response::Response {
+    Sse::new(ReceiverStream::new(rx))
+        .keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+        )
+        .into_response()
 }
 
 async fn handle_media_capabilities(
@@ -784,13 +934,21 @@ async fn handle_runtime_config_update(
 
     let provider = body.default_provider.trim();
     if provider.is_empty() {
-        let err = serde_json::json!({"error": "defaultProvider is required"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "RUNTIME_CONFIG_DEFAULT_PROVIDER_REQUIRED",
+            "defaultProvider is required",
+        )
+        .into_response();
     }
     let model = body.default_model.trim();
     if model.is_empty() {
-        let err = serde_json::json!({"error": "defaultModel is required"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "RUNTIME_CONFIG_DEFAULT_MODEL_REQUIRED",
+            "defaultModel is required",
+        )
+        .into_response();
     }
 
     let mut next = state.config.lock().clone();
@@ -839,11 +997,12 @@ async fn handle_pair(
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_pair(&rate_key) {
         tracing::warn!("/pair rate limit exceeded");
-        let err = serde_json::json!({
-            "error": "Too many pairing requests. Please retry later.",
-            "retry_after": RATE_LIMIT_WINDOW_SECS,
-        });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        return frontend_error_response_with_retry_after(
+            StatusCode::TOO_MANY_REQUESTS,
+            "PAIR_RATE_LIMITED",
+            "Too many pairing requests. Please retry later.",
+            RATE_LIMIT_WINDOW_SECS,
+        );
     }
 
     let code = headers
@@ -875,18 +1034,22 @@ async fn handle_pair(
         }
         Ok(None) => {
             tracing::warn!("🔐 Pairing attempt with invalid code");
-            let err = serde_json::json!({"error": "Invalid pairing code"});
-            (StatusCode::FORBIDDEN, Json(err))
+            frontend_error_response(
+                StatusCode::FORBIDDEN,
+                "PAIR_INVALID_CODE",
+                "Invalid pairing code",
+            )
         }
         Err(lockout_secs) => {
             tracing::warn!(
                 "🔐 Pairing locked out — too many failed attempts ({lockout_secs}s remaining)"
             );
-            let err = serde_json::json!({
-                "error": format!("Too many failed attempts. Try again in {lockout_secs}s."),
-                "retry_after": lockout_secs
-            });
-            (StatusCode::TOO_MANY_REQUESTS, Json(err))
+            frontend_error_response_with_retry_after(
+                StatusCode::TOO_MANY_REQUESTS,
+                "PAIR_ATTEMPTS_LOCKED",
+                format!("Too many failed attempts. Try again in {lockout_secs}s."),
+                lockout_secs,
+            )
         }
     }
 }
@@ -900,12 +1063,18 @@ async fn handle_pair_new_code(
         return err;
     }
     if !state.pairing.require_pairing() {
-        let err = serde_json::json!({"error": "Pairing is disabled in config"});
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "PAIRING_DISABLED",
+            "Pairing is disabled in config",
+        );
     }
     let Some(code) = state.pairing.regenerate_pairing_code() else {
-        let err = serde_json::json!({"error": "Failed to generate pairing code"});
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+        return frontend_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PAIR_CODE_GENERATION_FAILED",
+            "Failed to generate pairing code",
+        );
     };
     let body = serde_json::json!({
         "ok": true,
@@ -946,14 +1115,19 @@ async fn handle_sync_import(
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
     match import_workspace_sync_snapshot(&workspace_dir, &snapshot) {
-        Ok((imported_files, imported_db)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "importedFiles": imported_files,
-                "importedDb": imported_db,
-                "imported": true,
-            })),
-        ),
+        Ok((imported_files, imported_db)) => {
+            if imported_files > 0 || imported_db {
+                let _ = crate::feed::mark_world_feed_dirty(&workspace_dir);
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "importedFiles": imported_files,
+                    "importedDb": imported_db,
+                    "imported": true,
+                })),
+            )
+        }
         Err(err) => frontend_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "workspace sync import",
@@ -1035,6 +1209,14 @@ struct ChatSendBody {
     #[serde(rename = "threadId")]
     thread_id: String,
     content: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatResultStreamQuery {
+    #[serde(rename = "threadId")]
+    thread_id: String,
+    #[serde(rename = "messageId")]
+    message_id: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -1387,6 +1569,14 @@ fn built_in_content_agent_specs() -> &'static [BuiltInContentAgentSpec] {
             enabled_by_default: false,
         },
         BuiltInContentAgentSpec {
+            key: article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY,
+            name: "Long-Form Articles",
+            goal: "Build clean long-form articles from journal notes over time. Decide whether to refine an existing article or create a new one, then hand off JSON for Rust to materialize markdown under posts/articles/.",
+            output_prefix: "posts/articles/",
+            visible_in_ui: true,
+            enabled_by_default: false,
+        },
+        BuiltInContentAgentSpec {
             key: "audio_insight_clips",
             name: "Audio Insight Clips",
             goal: "Create simple vertical video clips from my journal audio recordings. If a transcript is missing, generate it first, extract exact insightful lines, build black-background text cards, and render a feed-ready mp4 into posts/.",
@@ -1601,6 +1791,9 @@ fn canonical_content_agent_skill_body(record: &FeedContentAgentRecord) -> Result
         | workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY
         | workspace_synthesizer::WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => {
             workspace_synthesizer::render_extractor_skill_markdown(&record.workflow_key)?
+        }
+        article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY => {
+            article_synthesizer::render_skill_markdown(output_dir)
         }
         "audio_insight_clips" => render_audio_insight_clip_skill_markdown(output_dir),
         _ => render_template_skill_markdown(&record.workflow_bot, &goal, output_dir),
@@ -2030,6 +2223,159 @@ fn save_workspace_synthesizer_status(
     }
 }
 
+fn is_workspace_transcript_source_path(path: &str) -> bool {
+    let normalized = path.trim().trim_start_matches('/').replace('\\', "/");
+    normalized.starts_with("journals/text/transcriptions/")
+        || normalized.starts_with("journals/text/transcript/")
+}
+
+fn should_run_workspace_synth_clip_extractor(
+    trigger_reason: &str,
+    target_sources: &[WorkspaceSynthSourceCandidate],
+) -> bool {
+    trigger_reason.eq_ignore_ascii_case("transcript-ready")
+        || target_sources
+            .iter()
+            .any(|item| is_workspace_transcript_source_path(&item.source_path))
+}
+
+fn set_workspace_synth_journal_save_cooldown(workspace_dir: &StdPath, cooldown_until: &str) {
+    let mut next = workspace_synthesizer::load_status(workspace_dir);
+    next.journal_save_cooldown_until = cooldown_until.trim().to_string();
+    if let Err(err) = workspace_synthesizer::save_status(workspace_dir, &next) {
+        tracing::warn!(
+            "Failed to persist workspace synthesizer journal-save cooldown: {err}"
+        );
+    }
+}
+
+fn clear_workspace_synth_journal_save_cooldown(
+    workspace_dir: &StdPath,
+    expected_cooldown_until: Option<&str>,
+) {
+    let mut next = workspace_synthesizer::load_status(workspace_dir);
+    if let Some(expected) = expected_cooldown_until {
+        if next.journal_save_cooldown_until.trim() != expected.trim() {
+            return;
+        }
+    }
+    if next.journal_save_cooldown_until.trim().is_empty() {
+        return;
+    }
+    next.journal_save_cooldown_until.clear();
+    if let Err(err) = workspace_synthesizer::save_status(workspace_dir, &next) {
+        tracing::warn!(
+            "Failed to clear workspace synthesizer journal-save cooldown: {err}"
+        );
+    }
+}
+
+fn workspace_synth_cooldown_wait_duration(cooldown_until: &str) -> Duration {
+    chrono::DateTime::parse_from_rfc3339(cooldown_until.trim())
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+        .and_then(|deadline| (deadline - Utc::now()).to_std().ok())
+        .unwrap_or_default()
+}
+
+fn schedule_workspace_synth_after_journal_save_cooldown(
+    state: AppState,
+    cooldown_until: String,
+) {
+    tokio::spawn(async move {
+        loop {
+            let wait = workspace_synth_cooldown_wait_duration(&cooldown_until);
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+
+            let workspace_dir = state.config.lock().workspace_dir.clone();
+            let status = workspace_synthesizer::load_status(&workspace_dir);
+            if status.journal_save_cooldown_until.trim() != cooldown_until {
+                return;
+            }
+
+            if matches!(status.status.as_str(), "pending" | "processing") {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+
+            let store = match load_or_seed_feed_workflow_settings_store(&workspace_dir) {
+                Ok(store) => store,
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to load workflow settings while dispatching journal-save cooldown: {err}"
+                    );
+                    clear_workspace_synth_journal_save_cooldown(
+                        &workspace_dir,
+                        Some(&cooldown_until),
+                    );
+                    return;
+                }
+            };
+            let Some(record) = store.workflows.get(WORKSPACE_SYNTHESIZER_WORKFLOW_KEY) else {
+                clear_workspace_synth_journal_save_cooldown(&workspace_dir, Some(&cooldown_until));
+                return;
+            };
+            if !record.enabled {
+                clear_workspace_synth_journal_save_cooldown(&workspace_dir, Some(&cooldown_until));
+                return;
+            }
+
+            let selection = match select_workspace_synth_sources(&workspace_dir, &[], false) {
+                Ok(selection) => selection,
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to select workspace synth sources after journal-save cooldown: {err}"
+                    );
+                    clear_workspace_synth_journal_save_cooldown(
+                        &workspace_dir,
+                        Some(&cooldown_until),
+                    );
+                    return;
+                }
+            };
+            let latest_source_updated_at = selection
+                .pending
+                .iter()
+                .map(|item| item.modified_at)
+                .max()
+                .unwrap_or(0);
+            if latest_source_updated_at <= 0 || selection.selected.is_empty() {
+                clear_workspace_synth_journal_save_cooldown(&workspace_dir, Some(&cooldown_until));
+                return;
+            }
+
+            match queue_workspace_synthesizer_run(
+                state.clone(),
+                "journal-save",
+                latest_source_updated_at,
+                selection.pending.len(),
+                selection.selected_word_count,
+                selection.selected,
+            ) {
+                Ok(_) => {
+                    clear_workspace_synth_journal_save_cooldown(
+                        &workspace_dir,
+                        Some(&cooldown_until),
+                    );
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to queue workspace synthesis after journal-save cooldown: {err}"
+                    );
+                    clear_workspace_synth_journal_save_cooldown(
+                        &workspace_dir,
+                        Some(&cooldown_until),
+                    );
+                    return;
+                }
+            }
+        }
+    });
+}
+
 fn queue_eligible_content_agents_for_trigger(
     state: &AppState,
     trigger: ContentAgentAutoRunTrigger,
@@ -2110,6 +2456,24 @@ fn queue_workspace_synthesizer_for_trigger(
     }
 
     let status = workspace_synthesizer::load_status(&workspace_dir);
+    if reason.eq_ignore_ascii_case("journal-save") {
+        let cooldown_until = (Utc::now()
+            + chrono::Duration::seconds(WORKSPACE_SYNTH_JOURNAL_SAVE_COOLDOWN_SECS))
+        .to_rfc3339();
+        set_workspace_synth_journal_save_cooldown(&workspace_dir, &cooldown_until);
+        schedule_workspace_synth_after_journal_save_cooldown(state.clone(), cooldown_until);
+        if matches!(status.status.as_str(), "pending" | "processing")
+            && !status.thread_id.trim().is_empty()
+        {
+            return Ok(Some(status.thread_id));
+        }
+        return Ok(None);
+    }
+    if reason.eq_ignore_ascii_case("app-open")
+        && !status.journal_save_cooldown_until.trim().is_empty()
+    {
+        return Ok(None);
+    }
     if reason.eq_ignore_ascii_case("app-open")
         && status.last_source_updated_at > 0
         && status.last_source_updated_at >= latest_source_updated_at
@@ -2341,6 +2705,7 @@ async fn run_workspace_synthesizer_orchestrator(
     orchestrator_workflow: &FeedContentAgentDefinition,
     orchestrator_skill_markdown: &str,
     media_tool_summary: &str,
+    trigger_reason: &str,
     target_sources: &[WorkspaceSynthSourceCandidate],
 ) -> Result<(String, workspace_synthesizer::WorkspaceSynthesisApplyResult)> {
     let store = load_or_seed_feed_workflow_settings_store(workspace_dir)?;
@@ -2351,6 +2716,11 @@ async fn run_workspace_synthesizer_orchestrator(
     let mut artifact_states = workspace_synth_default_artifact_states();
 
     for extractor_spec in workspace_synthesizer::extractor_specs() {
+        if extractor_spec.workflow_key == workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY
+            && !should_run_workspace_synth_clip_extractor(trigger_reason, target_sources)
+        {
+            continue;
+        }
         let Some(extractor_workflow) = workflow_definition_by_key(&store, extractor_spec.workflow_key) else {
             let error = format!("missing extractor workflow `{}`", extractor_spec.workflow_key);
             if let Some(state) =
@@ -2503,6 +2873,7 @@ fn queue_workflow_run(
     source: &'static str,
 ) -> Result<String> {
     let workspace_dir = state.config.lock().workspace_dir.clone();
+    let _ = crate::feed::mark_world_feed_dirty(&workspace_dir);
     let thread_id = format!("workflow:{}", workflow.key);
     let user_content = format!("[run] Triggered {} for {}", source, workflow.bot_name);
 
@@ -2645,6 +3016,7 @@ fn queue_workflow_run(
                 &workflow_for_worker,
                 &skill_markdown,
                 &media_tool_summary,
+                source,
                 &workspace_synth_targets,
             )
             .await
@@ -2809,8 +3181,38 @@ fn queue_workflow_run(
             }
             return;
         }
-        let run_prompt =
-            render_content_agent_run_prompt(&workflow_for_worker, &skill_markdown, &media_tool_summary);
+        if workflow_for_worker.key == article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY {
+            if let Err(err) = article_synthesizer::reset_handoff_file(&workspace_for_worker) {
+                let final_error = frontend_background_error(
+                    "article synthesis handoff reset",
+                    "Long-form article synthesis failed while clearing the previous handoff.",
+                    &err,
+                );
+                let _ = local_store::create_chat_message(
+                    &workspace_for_worker,
+                    &thread_id_for_worker,
+                    "assistant",
+                    "",
+                    "error",
+                    "workflow-runner",
+                    Some(&user_id_for_worker),
+                    Some(&final_error),
+                );
+                let _ = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id_for_worker,
+                    "error",
+                    Some(&final_error),
+                );
+                return;
+            }
+        }
+        let run_prompt = render_content_agent_run_prompt(
+            &workspace_for_worker,
+            &workflow_for_worker,
+            &skill_markdown,
+            &media_tool_summary,
+        );
         let run_result = tokio::time::timeout(
             Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
             run_local_agent_prompt_in_thread(
@@ -2987,6 +3389,133 @@ fn queue_workflow_run(
                                 Some(final_error),
                                 None,
                                 None,
+                            );
+                        }
+                    }
+                    return;
+                }
+
+                if workflow_for_worker.key == article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY {
+                    let workspace_for_apply = workspace_for_worker.clone();
+                    let apply_result = tokio::task::spawn_blocking(move || {
+                        article_synthesizer::apply_handoff_file(&workspace_for_apply)
+                    })
+                    .await;
+
+                    match apply_result {
+                        Ok(Ok(applied)) => {
+                            if applied.had_errors && !applied.applied_any {
+                                let final_error = truncate_with_ellipsis(&applied.summary, 4000);
+                                let _ = local_store::create_chat_message(
+                                    &workspace_for_worker,
+                                    &thread_id_for_worker,
+                                    "assistant",
+                                    "",
+                                    "error",
+                                    "workflow-runner",
+                                    Some(&user_id_for_worker),
+                                    Some(&final_error),
+                                );
+                                let _ = local_store::patch_chat_status(
+                                    &workspace_for_worker,
+                                    &user_id_for_worker,
+                                    "error",
+                                    Some(&final_error),
+                                );
+                            } else {
+                                let combined_reply = if reply.trim().is_empty() {
+                                    applied.summary.clone()
+                                } else {
+                                    format!("{}\n\nAgent reply:\n{}", applied.summary, reply.trim())
+                                };
+                                let final_reply =
+                                    truncate_with_ellipsis(combined_reply.trim(), 4000);
+                                let _ = local_store::create_chat_message(
+                                    &workspace_for_worker,
+                                    &thread_id_for_worker,
+                                    "assistant",
+                                    &final_reply,
+                                    "done",
+                                    "workflow-runner",
+                                    Some(&user_id_for_worker),
+                                    None,
+                                );
+                                let _ = local_store::patch_chat_status(
+                                    &workspace_for_worker,
+                                    &user_id_for_worker,
+                                    "done",
+                                    None,
+                                );
+                                match load_feed_workflow_settings_store(&workspace_for_worker) {
+                                    Ok(mut store) => {
+                                        if let Some(record) =
+                                            store.workflows.get_mut(&workflow_for_worker.key)
+                                        {
+                                            record.last_run_at = Some(Utc::now().to_rfc3339());
+                                            if let Err(err) = save_feed_workflow_settings_store(
+                                                &workspace_for_worker,
+                                                &store,
+                                            ) {
+                                                tracing::warn!(
+                                                    "Failed to persist content agent last_run_at for `{}`: {err}",
+                                                    workflow_for_worker.key
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            "Failed to load workflow settings store after run success for `{}`: {err}",
+                                            workflow_for_worker.key
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            let final_error = frontend_background_error(
+                                "article synthesis apply",
+                                "Long-form article synthesis failed while applying the generated handoff.",
+                                &err,
+                            );
+                            let _ = local_store::create_chat_message(
+                                &workspace_for_worker,
+                                &thread_id_for_worker,
+                                "assistant",
+                                "",
+                                "error",
+                                "workflow-runner",
+                                Some(&user_id_for_worker),
+                                Some(&final_error),
+                            );
+                            let _ = local_store::patch_chat_status(
+                                &workspace_for_worker,
+                                &user_id_for_worker,
+                                "error",
+                                Some(&final_error),
+                            );
+                        }
+                        Err(err) => {
+                            let final_error = frontend_background_error(
+                                "article synthesis apply task",
+                                "Long-form article synthesis apply task failed.",
+                                &err,
+                            );
+                            let _ = local_store::create_chat_message(
+                                &workspace_for_worker,
+                                &thread_id_for_worker,
+                                "assistant",
+                                "",
+                                "error",
+                                "workflow-runner",
+                                Some(&user_id_for_worker),
+                                Some(&final_error),
+                            );
+                            let _ = local_store::patch_chat_status(
+                                &workspace_for_worker,
+                                &user_id_for_worker,
+                                "error",
+                                Some(&final_error),
                             );
                         }
                     }
@@ -3328,6 +3857,7 @@ fn render_content_agent_authoring_prompt(
 }
 
 fn render_content_agent_run_prompt(
+    workspace_dir: &StdPath,
     workflow: &FeedContentAgentDefinition,
     skill_markdown: &str,
     media_tool_summary: &str,
@@ -3365,6 +3895,22 @@ fn render_content_agent_run_prompt(
         prompt.push_str("- Omit any handoff file that has no strong candidates, or write an empty `items` array.\n");
         prompt.push_str("- Do not directly write feed posts, todos, events, or clip plan outputs.\n");
         prompt.push_str("- Use direct file edits in the workspace so the runtime can validate and apply each handoff independently.\n");
+    } else if workflow.key == article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY {
+        prompt.push_str(&format!(
+            "- Write only one JSON handoff file at `{}`.\n",
+            article_synthesizer::ARTICLE_HANDOFF_PATH
+        ));
+        prompt.push_str(&format!(
+            "- Rust will validate that handoff and materialize visible markdown under `{}`.\n",
+            article_synthesizer::ARTICLE_OUTPUT_ROOT
+        ));
+        prompt.push_str("- Do not write visible article markdown files directly during the run.\n");
+        prompt.push_str("- Use `rewriteArticle` only when the target file hash from the inventory still matches.\n");
+        prompt.push_str("- Use `createArticle` when no existing article is the right fit.\n");
+        prompt.push_str("- Read existing article contents before rewriting one so the new body preserves continuity.\n\n");
+        prompt.push_str("## Existing Article Inventory\n");
+        prompt.push_str(&article_synthesizer::article_inventory_markdown(workspace_dir));
+        prompt.push_str("\n\n");
     } else {
         prompt.push_str(&format!("- Write feed-visible artifacts only under `{}`.\n", workflow.output_prefix));
         prompt.push_str(&format!("- Hidden intermediate artifacts may go under `{}/pipeline/` or `{}/artifacts/`.\n", workflow.output_prefix.trim_end_matches('/'), workflow.output_prefix.trim_end_matches('/')));
@@ -3416,6 +3962,73 @@ fn maybe_apply_workflow_comment_quickfix(
     Ok(None)
 }
 
+fn chat_messages_payload(
+    workspace_dir: &StdPath,
+    thread_id: &str,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    let items = local_store::list_chat_messages(workspace_dir, thread_id, limit)?;
+    Ok(serde_json::json!({
+        "threadId": thread_id,
+        "items": items,
+    }))
+}
+
+fn chat_result_payload(
+    workspace_dir: &StdPath,
+    thread_id: &str,
+    message_id: &str,
+) -> Result<serde_json::Value> {
+    let items = local_store::list_chat_messages(workspace_dir, thread_id, 500)?;
+    let user_message = items
+        .iter()
+        .find(|item| item.get("id").and_then(serde_json::Value::as_str) == Some(message_id));
+    let reply = items.iter().find(|item| {
+        item.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+            && item.get("replyToId").and_then(serde_json::Value::as_str) == Some(message_id)
+    });
+
+    let user_status = user_message
+        .and_then(|item| item.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("pending")
+        .to_ascii_lowercase();
+    let reply_status = reply
+        .and_then(|item| item.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let reply_error = reply
+        .and_then(|item| item.get("error"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    let status = if reply_status == "error" || reply_error.is_some() || user_status == "error" {
+        "error"
+    } else if reply_status == "done" || user_status == "done" {
+        "done"
+    } else if user_status == "processing" || reply_status == "processing" {
+        "processing"
+    } else {
+        "pending"
+    };
+
+    let error = reply_error.or_else(|| {
+        user_message
+            .and_then(|item| item.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
+
+    Ok(serde_json::json!({
+        "threadId": thread_id,
+        "messageId": message_id,
+        "status": status,
+        "reply": reply.cloned(),
+        "error": error,
+    }))
+}
+
 async fn handle_chat_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3445,6 +4058,117 @@ async fn handle_chat_list(
     }
 }
 
+async fn handle_chat_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ChatListQuery>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Chat stream") {
+        return err.into_response();
+    }
+
+    let thread_id = query
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default")
+        .to_string();
+    let limit = query.limit.unwrap_or(200).clamp(1, 500);
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let (tx, rx) = mpsc::channel(8);
+
+    tokio::spawn(async move {
+        let mut last_snapshot = String::new();
+        loop {
+            match chat_messages_payload(&workspace_dir, &thread_id, limit) {
+                Ok(payload) => {
+                    let fingerprint = serde_json::to_string(&payload).unwrap_or_default();
+                    if fingerprint != last_snapshot {
+                        last_snapshot = fingerprint;
+                        if tx.send(sse_json_event("messages", &payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    let payload = serde_json::json!({
+                        "error": "Failed to load chat messages.",
+                        "code": frontend_error_code_from_context("chat message stream"),
+                    });
+                    let _ = tx.send(sse_json_event("error", &payload)).await;
+                    tracing::warn!(error = %err, "Chat stream failed");
+                    break;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+    });
+
+    frontend_event_stream(rx)
+}
+
+async fn handle_chat_result_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ChatResultStreamQuery>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Chat result stream") {
+        return err.into_response();
+    }
+
+    let thread_id = query.thread_id.trim().to_string();
+    let message_id = query.message_id.trim().to_string();
+    if thread_id.is_empty() || message_id.is_empty() {
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "CHAT_RESULT_STREAM_INVALID_REQUEST",
+            "threadId and messageId are required",
+        )
+        .into_response();
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let (tx, rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        let mut last_snapshot = String::new();
+        loop {
+            match chat_result_payload(&workspace_dir, &thread_id, &message_id) {
+                Ok(payload) => {
+                    let fingerprint = serde_json::to_string(&payload).unwrap_or_default();
+                    if fingerprint != last_snapshot {
+                        last_snapshot = fingerprint;
+                        if tx.send(sse_json_event("chat_result", &payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    let status = payload
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("pending");
+                    if matches!(status, "done" | "error") {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let payload = serde_json::json!({
+                        "error": "Failed to load chat result.",
+                        "code": frontend_error_code_from_context("chat result stream"),
+                    });
+                    let _ = tx.send(sse_json_event("error", &payload)).await;
+                    tracing::warn!(error = %err, "Chat result stream failed");
+                    break;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+    });
+
+    frontend_event_stream(rx)
+}
+
 async fn handle_chat_send(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3457,8 +4181,11 @@ async fn handle_chat_send(
     let thread_id = body.thread_id.trim();
     let content = body.content.trim();
     if thread_id.is_empty() || content.is_empty() {
-        let err = serde_json::json!({"error": "threadId and content are required"});
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "CHAT_MESSAGE_INVALID_REQUEST",
+            "threadId and content are required",
+        );
     }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
@@ -3652,16 +4379,22 @@ async fn handle_feed_workflow_settings_update(
     };
 
     let Some(workflow) = workflow_definition_by_key(&store, &workflow_key) else {
-        let err = serde_json::json!({
-            "error": "unknown workflowKey",
-            "supportedWorkflowKeys": store.workflows.keys().collect::<Vec<_>>(),
-        });
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response_with_meta(
+            StatusCode::BAD_REQUEST,
+            "WORKFLOW_KEY_UNKNOWN",
+            "unknown workflowKey",
+            serde_json::json!({
+                "supportedWorkflowKeys": store.workflows.keys().collect::<Vec<_>>(),
+            }),
+        );
     };
 
     let Some(mut workflow_record) = store.workflows.get(&workflow.key).cloned() else {
-        let err = serde_json::json!({"error": "workflow record missing"});
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "WORKFLOW_RECORD_MISSING",
+            "workflow record missing",
+        );
     };
     let updated_goal = normalize_goal_text(body.goal.or(body.prompt));
     let previous_goal = normalize_goal_text(workflow_record.goal.clone())
@@ -3671,17 +4404,21 @@ async fn handle_feed_workflow_settings_update(
         .clone()
         .or_else(|| previous_goal.clone())
     else {
-        let err = serde_json::json!({"error": "goal is required"});
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "WORKFLOW_GOAL_REQUIRED",
+            "goal is required",
+        );
     };
     let media_capabilities = local_media_capabilities(&state.config.lock().clone());
     if goal_requests_media_output(&goal)
         && !(media_capabilities.transcribe_media && media_capabilities.compose_simple_clip)
     {
-        let err = serde_json::json!({
-            "error": required_media_capability_reason(media_capabilities),
-        });
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "WORKFLOW_MEDIA_CAPABILITY_REQUIRED",
+            required_media_capability_reason(media_capabilities),
+        );
     }
     let goal_changed = updated_goal
         .as_ref()
@@ -3750,9 +4487,13 @@ async fn handle_feed_workflow_settings_update(
                 );
             }
             Err(_) => {
-                return (
+                return frontend_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("content agent update timed out after {}s", CONTENT_AGENT_TIMEOUT_SECS)})),
+                    "WORKFLOW_CONTENT_AGENT_UPDATE_TIMED_OUT",
+                    format!(
+                        "content agent update timed out after {}s",
+                        CONTENT_AGENT_TIMEOUT_SECS
+                    ),
                 );
             }
         }
@@ -3828,20 +4569,26 @@ async fn handle_feed_workflow_run(
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let store = load_or_seed_feed_workflow_settings_store(&workspace_dir).unwrap_or_default();
     let Some(workflow) = workflow_definition_by_key(&store, &workflow_key) else {
-        let err = serde_json::json!({
-            "error": "unknown workflowKey",
-            "supportedWorkflowKeys": store.workflows.keys().collect::<Vec<_>>(),
-        });
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response_with_meta(
+            StatusCode::BAD_REQUEST,
+            "WORKFLOW_KEY_UNKNOWN",
+            "unknown workflowKey",
+            serde_json::json!({
+                "supportedWorkflowKeys": store.workflows.keys().collect::<Vec<_>>(),
+            }),
+        );
     };
     let media_capabilities = local_media_capabilities(&state.config.lock().clone());
     if let Some(reason) = workflow_unsupported_reason(&workflow, media_capabilities) {
-        let err = serde_json::json!({
-            "error": reason,
-            "workflowKey": workflow_key,
-            "workflowBot": workflow.bot_name,
-        });
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response_with_meta(
+            StatusCode::BAD_REQUEST,
+            "WORKFLOW_UNSUPPORTED",
+            reason,
+            serde_json::json!({
+                "workflowKey": workflow_key,
+                "workflowBot": workflow.bot_name,
+            }),
+        );
     }
 
     let workflow_bot = workflow.bot_name.clone();
@@ -3908,6 +4655,16 @@ async fn handle_workspace_synthesizer_status(
         return err;
     }
 
+    let status = workspace_synthesizer_status_payload(&state);
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+fn workspace_synthesizer_status_payload(
+    state: &AppState,
+) -> workspace_synthesizer::WorkspaceSynthesizerStatus {
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let mut status = workspace_synthesizer::load_status(&workspace_dir);
     if let Ok(selection) = select_workspace_synth_sources(&workspace_dir, &[], false) {
@@ -3921,10 +4678,41 @@ async fn handle_workspace_synthesizer_status(
                 .collect();
         }
     }
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({}))),
-    )
+    status
+}
+
+async fn handle_workspace_synthesizer_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Workspace synthesizer stream") {
+        return err.into_response();
+    }
+
+    let state_for_stream = state.clone();
+    let (tx, rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        let mut last_snapshot = String::new();
+        loop {
+            let payload = workspace_synthesizer_status_payload(&state_for_stream);
+            let value = serde_json::to_value(&payload).unwrap_or_else(|_| serde_json::json!({}));
+            let fingerprint = serde_json::to_string(&value).unwrap_or_default();
+            if fingerprint != last_snapshot {
+                last_snapshot = fingerprint;
+                if tx.send(sse_json_event("workspace_synth_status", &value)).await.is_err() {
+                    break;
+                }
+            }
+
+            if matches!(payload.status.as_str(), "done" | "error" | "idle") {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+    });
+
+    frontend_event_stream(rx)
 }
 
 async fn handle_workspace_synthesizer_run(
@@ -4087,9 +4875,10 @@ async fn handle_workspace_todo_update(
 
     let status = body.status.unwrap_or_default().trim().to_ascii_lowercase();
     if status != "open" && status != "done" {
-        return (
+        return frontend_error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "status must be `open` or `done`"})),
+            "WORKSPACE_TODO_STATUS_INVALID",
+            "status must be `open` or `done`",
         );
     }
     let workspace_dir = state.config.lock().workspace_dir.clone();
@@ -4141,7 +4930,6 @@ async fn handle_feed_personalized(
 
     let limit = body.limit.unwrap_or(30).clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
     let config_snapshot = state.config.lock().clone();
-    let workspace_dir = config_snapshot.workspace_dir.clone();
     let bluesky_auth = match (
         body.service_url
             .as_deref()
@@ -4151,268 +4939,25 @@ async fn handle_feed_personalized(
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty()),
-    ) {
-        (Some(service_url), Some(access_jwt)) => {
-            Some((service_url.to_string(), access_jwt.to_string()))
-        }
+        ) {
+        (Some(service_url), Some(access_jwt)) => Some(crate::feed::BlueskyAuth {
+            service_url: service_url.to_string(),
+            access_jwt: access_jwt.to_string(),
+        }),
         _ => None,
     };
-
-    let fallback_candidates = || {
-        let bluesky_auth = bluesky_auth.clone();
-        async move {
-            match bluesky_auth.as_ref() {
-                Some((service_url, access_jwt)) => {
-                    fetch_bluesky_fallback_candidates(service_url, access_jwt, limit).await
-                }
-                None => Ok(Vec::new()),
-            }
-        }
-    };
-
-    let (embedder, embedder_message) = match resolve_feed_embedder(&config_snapshot).await {
-        Ok((embedder, message)) => (embedder, message),
-        Err(err) => {
-            tracing::warn!("Failed to initialize the configured embedding provider: {err}");
-            (
-                None,
-                Some(
-                    "Configured feed embeddings are unavailable. Showing fallback feed results."
-                        .to_string(),
-                ),
-            )
-        }
-    };
-
-    if let Err(err) = refresh_cached_content_sources(&workspace_dir, embedder.clone()).await {
-        tracing::warn!("Failed to refresh cached content sources: {err}");
-    }
-
-    if let Some(embedder) = embedder.as_ref() {
-        spawn_cached_content_item_embedding_backfill(workspace_dir.clone(), embedder.clone());
-    }
-
-    let recent_content_items = build_recent_content_items(&workspace_dir, limit).unwrap_or_default();
-
-    let Some(embedder) = embedder else {
-        let mut items = recent_content_items.clone();
-        match fallback_candidates().await {
-            Ok(candidates) => append_feed_items_up_to_limit(
-                &mut items,
-                build_raw_personalized_items(candidates, limit),
-                limit,
-            ),
-            Err(err) => {
-                if items.is_empty() {
-                    return frontend_internal_error(
-                        StatusCode::BAD_GATEWAY,
-                        "feed personalized fallback candidate fetch",
-                        "Failed to load Bluesky fallback results.",
-                        err,
-                    );
-                }
-            }
-        }
-        return (
+    match crate::feed::load_world_feed(&config_snapshot, bluesky_auth, limit).await {
+        Ok(response) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "items": items,
-                "profileStatus": "embeddingUnavailable",
-                "profileStats": InterestProfileStats::default(),
-                "usedFallback": true,
-                "message": embedder_message.unwrap_or_else(|| {
-                    "Configured feed embeddings are unavailable. Showing recent cached content and raw Bluesky items when available.".to_string()
-                }),
-            })),
-        );
-    };
-
-    let profile = match rebuild_interest_profile(&config_snapshot, embedder.clone()).await {
-        Ok(profile) => profile,
-        Err(err) => {
-            tracing::warn!("Failed to rebuild interest profile: {err}");
-            let mut items = recent_content_items.clone();
-            match fallback_candidates().await {
-                Ok(candidates) => append_feed_items_up_to_limit(
-                    &mut items,
-                    build_raw_personalized_items(candidates, limit),
-                    limit,
-                ),
-                Err(fetch_err) => {
-                    if items.is_empty() {
-                        return frontend_internal_error(
-                            StatusCode::BAD_GATEWAY,
-                            "feed personalized profile fallback candidate fetch",
-                            "Failed to load Bluesky fallback results.",
-                            fetch_err,
-                        );
-                    }
-                }
-            }
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "items": items,
-                    "profileStatus": "fallbackRaw",
-                    "profileStats": InterestProfileStats::default(),
-                    "usedFallback": true,
-                    "message": "Personalized ranking is unavailable right now. Showing fallback feed results.",
-                })),
-            );
-        }
-    };
-
-    if profile.status != "ready" || profile.interests.is_empty() {
-        let mut items = recent_content_items.clone();
-        match fallback_candidates().await {
-            Ok(candidates) => append_feed_items_up_to_limit(
-                &mut items,
-                build_raw_personalized_items(candidates, limit),
-                limit,
-            ),
-            Err(err) => {
-                if items.is_empty() {
-                    return frontend_internal_error(
-                        StatusCode::BAD_GATEWAY,
-                        "feed personalized candidate fetch",
-                        "Failed to load Bluesky fallback results.",
-                        err,
-                    );
-                }
-            }
-        }
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "items": items,
-                "profileStatus": profile.status,
-                "profileStats": profile.stats,
-                "usedFallback": true,
-                "message": "Personalized feed starts after text items exist under posts/.",
-            })),
-        );
+            Json(serde_json::to_value(response).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "feed personalized",
+            "Failed to load the personalized world feed.",
+            err,
+        ),
     }
-
-    let mut ranked_items = match rank_cached_content_items(&workspace_dir, &profile.interests, limit) {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!("Failed to rank cached content items: {err}");
-            Vec::new()
-        }
-    };
-
-    let (ranked_bluesky_items, raw_bluesky_candidates, mut fallback_message): (
-        Vec<PersonalizedBlueskyItem>,
-        Vec<CandidateFeedPost>,
-        Option<String>,
-    ) = match bluesky_auth.as_ref() {
-        Some((service_url, access_jwt)) => match collect_ranked_bluesky_matches(
-            service_url,
-            access_jwt,
-            embedder.clone(),
-            &profile.interests,
-            limit,
-        )
-        .await
-        {
-            Ok((items, raw_candidates)) => (items, raw_candidates, None),
-            Err(err) => {
-                tracing::warn!("Failed to rank personalized Bluesky feed: {err}");
-                let raw_candidates = match fallback_candidates().await {
-                    Ok(candidates) => candidates,
-                    Err(fetch_err) => {
-                        return frontend_internal_error(
-                            StatusCode::BAD_GATEWAY,
-                            "feed personalized ranked candidate fetch",
-                            "Failed to load Bluesky results.",
-                            fetch_err,
-                        );
-                    }
-                };
-                (
-                    Vec::new(),
-                    raw_candidates,
-                    Some("Personalized Bluesky ranking failed. Raw Bluesky results are available.".to_string()),
-                )
-            }
-        },
-        None => (Vec::new(), Vec::new(), None),
-    };
-    ranked_items.extend(ranked_bluesky_items);
-
-    match collect_web_search_candidates(&config_snapshot, &profile.interests).await {
-        Ok(web_candidates) if !web_candidates.is_empty() => {
-            match rank_web_candidates(
-                &workspace_dir,
-                embedder,
-                &profile.interests,
-                web_candidates,
-                limit,
-            )
-            .await
-            {
-                Ok(mut web_items) => ranked_items.append(&mut web_items),
-                Err(err) => {
-                    tracing::warn!("Failed to rank web feed candidates: {err}");
-                    if fallback_message.is_none() {
-                        fallback_message = Some(
-                            "Web link discovery failed; showing cached and Bluesky results only."
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-        }
-        Ok(_) => {}
-        Err(err) => {
-            tracing::warn!("Failed to collect web feed candidates: {err}");
-            if fallback_message.is_none() {
-                fallback_message =
-                    Some("Web link discovery failed; showing cached and Bluesky results only.".to_string());
-            }
-        }
-    }
-
-    sort_personalized_items(&mut ranked_items);
-    ranked_items.truncate(limit);
-    if ranked_items.is_empty() {
-        let mut fallback_items = recent_content_items;
-        append_feed_items_up_to_limit(
-            &mut fallback_items,
-            build_raw_personalized_items(raw_bluesky_candidates, limit),
-            limit,
-        );
-        let message = fallback_message.unwrap_or_else(|| {
-            if fallback_items.is_empty() {
-                "No personalized matches are available yet.".to_string()
-            } else {
-                "No matches passed the similarity threshold. Showing recent cached content and raw Bluesky items."
-                    .to_string()
-            }
-        });
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "items": fallback_items,
-                "profileStatus": "fallbackRaw",
-                "profileStats": profile.stats,
-                "usedFallback": true,
-                "message": message,
-            })),
-        );
-    }
-
-    let used_fallback = false;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "items": ranked_items,
-            "profileStatus": profile.status,
-            "profileStats": profile.stats,
-            "usedFallback": used_fallback,
-            "message": fallback_message,
-        })),
-    )
 }
 
 async fn handle_feed_workflow_template_create(
@@ -4431,28 +4976,29 @@ async fn handle_feed_workflow_template_create(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
     let Some(name) = name else {
-        return (
+        return frontend_error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "name is required"})),
+            "WORKFLOW_TEMPLATE_NAME_REQUIRED",
+            "name is required",
         );
     };
 
     let goal = normalize_goal_text(body.goal.clone().or(body.prompt.clone()));
     let Some(goal) = goal else {
-        return (
+        return frontend_error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "goal is required"})),
+            "WORKFLOW_TEMPLATE_GOAL_REQUIRED",
+            "goal is required",
         );
     };
     let media_capabilities = local_media_capabilities(&state.config.lock().clone());
     if goal_requests_media_output(&goal)
         && !(media_capabilities.transcribe_media && media_capabilities.compose_simple_clip)
     {
-        return (
+        return frontend_error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": required_media_capability_reason(media_capabilities),
-            })),
+            "WORKFLOW_TEMPLATE_MEDIA_CAPABILITY_REQUIRED",
+            required_media_capability_reason(media_capabilities),
         );
     }
     let workflow_name = name.clone();
@@ -4491,9 +5037,10 @@ async fn handle_feed_workflow_template_create(
         }
     };
     if workflow_definition_by_key(&store, &workflow_key).is_some() {
-        return (
+        return frontend_error_response(
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "workflow key already exists"})),
+            "WORKFLOW_TEMPLATE_KEY_CONFLICT",
+            "workflow key already exists",
         );
     }
 
@@ -4823,16 +5370,25 @@ async fn handle_feed_workflow_comment(
     let requested_path = body.path.trim().trim_start_matches('/').to_string();
     let comment = body.comment.trim();
     if requested_path.is_empty() || comment.is_empty() {
-        let err = serde_json::json!({"error": "path and comment are required"});
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "WORKFLOW_COMMENT_INVALID_REQUEST",
+            "path and comment are required",
+        );
     }
     if comment.chars().count() > 1500 {
-        let err = serde_json::json!({"error": "comment is too long (max 1500 characters)"});
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "WORKFLOW_COMMENT_TOO_LONG",
+            "comment is too long (max 1500 characters)",
+        );
     }
     if !requested_path.starts_with("posts/") {
-        let err = serde_json::json!({"error": "workflow comments are only supported for posts/* feed items"});
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "WORKFLOW_COMMENT_PATH_UNSUPPORTED",
+            "workflow comments are only supported for posts/* feed items",
+        );
     }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
@@ -4843,25 +5399,36 @@ async fn handle_feed_workflow_comment(
             .map(|item| item.output_prefix)
             .collect();
         let err = serde_json::json!({
-            "error": "No editable workflow is mapped to this feed path yet",
             "supportedPrefixes": supported_prefixes,
         });
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response_with_meta(
+            StatusCode::BAD_REQUEST,
+            "WORKFLOW_COMMENT_TARGET_UNMAPPED",
+            "No editable workflow is mapped to this feed path yet",
+            err,
+        );
     };
 
     let Some(resolved_target) = resolve_workspace_text_path(&workspace_dir, &requested_path) else {
-        let err = serde_json::json!({"error": "invalid feed item path"});
-        return (StatusCode::BAD_REQUEST, Json(err));
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "WORKFLOW_COMMENT_TARGET_INVALID",
+            "invalid feed item path",
+        );
     };
     if !resolved_target.exists() || !resolved_target.is_file() {
-        let err = serde_json::json!({"error": "feed item file not found"});
-        return (StatusCode::NOT_FOUND, Json(err));
+        return frontend_error_response(
+            StatusCode::NOT_FOUND,
+            "WORKFLOW_COMMENT_TARGET_NOT_FOUND",
+            "feed item file not found",
+        );
     }
 
     let quickfix_result =
         maybe_apply_workflow_comment_quickfix(&workspace_dir, &workflow, &requested_path, comment);
     match quickfix_result {
         Ok(Some(quickfix_message)) => {
+            let _ = crate::feed::mark_world_feed_dirty(&workspace_dir);
             let thread_id = format!("workflow:{}", workflow.key);
             let user_content = format!("[{requested_path}] {comment}");
             let user_record = match local_store::create_chat_message(
@@ -4986,6 +5553,7 @@ async fn handle_feed_workflow_comment(
 
         match result {
             Ok(reply) => {
+                let _ = crate::feed::mark_world_feed_dirty(&workspace_for_worker);
                 let reply_text = if reply.trim().is_empty() {
                     "Workflow update applied."
                 } else {
@@ -5173,10 +5741,11 @@ fn pairing_auth_error(
         return None;
     }
     tracing::warn!("{scope}: rejected — not paired / invalid bearer token");
-    let err = serde_json::json!({
-        "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
-    });
-    Some((StatusCode::UNAUTHORIZED, Json(err)))
+    Some(frontend_error_response(
+        StatusCode::UNAUTHORIZED,
+        "PAIRING_REQUIRED",
+        "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>",
+    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -5501,8 +6070,12 @@ async fn handle_journal_text(
     }
     let content = body.content.trim();
     if content.is_empty() {
-        let err = serde_json::json!({"error": "content is required"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "JOURNAL_CONTENT_REQUIRED",
+            "content is required",
+        )
+        .into_response();
     }
 
     let title = body
@@ -5576,12 +6149,20 @@ async fn handle_media_stream(
     }
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let Some(abs_path) = resolve_workspace_media_path(&workspace_dir, &path) else {
-        let err = serde_json::json!({"error": "Invalid media path"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "MEDIA_PATH_INVALID",
+            "Invalid media path",
+        )
+        .into_response();
     };
     if !abs_path.exists() || !abs_path.is_file() {
-        let err = serde_json::json!({"error": "Media file not found"});
-        return (StatusCode::NOT_FOUND, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::NOT_FOUND,
+            "MEDIA_FILE_NOT_FOUND",
+            "Media file not found",
+        )
+        .into_response();
     }
 
     match ServeFile::new(abs_path).oneshot(req).await {
@@ -5627,8 +6208,12 @@ async fn handle_library_text(
     }
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let Some(path) = resolve_workspace_text_path(&workspace_dir, &query.path) else {
-        let err = serde_json::json!({"error": "Invalid text path"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "LIBRARY_TEXT_PATH_INVALID",
+            "Invalid text path",
+        )
+        .into_response();
     };
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => {
@@ -5648,6 +6233,12 @@ async fn handle_library_text(
     }
 }
 
+fn maybe_mark_world_feed_dirty_for_path(workspace_dir: &StdPath, rel_path: &str) {
+    if rel_path.trim_start_matches('/').starts_with("posts/") {
+        let _ = crate::feed::mark_world_feed_dirty(workspace_dir);
+    }
+}
+
 async fn handle_library_save_text(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5658,8 +6249,12 @@ async fn handle_library_save_text(
     }
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let Some(path) = resolve_workspace_text_path(&workspace_dir, &body.path) else {
-        let err = serde_json::json!({"error": "Invalid text path"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "LIBRARY_TEXT_PATH_INVALID",
+            "Invalid text path",
+        )
+        .into_response();
     };
     if let Some(parent) = path.parent() {
         if let Err(err) = tokio::fs::create_dir_all(parent).await {
@@ -5684,6 +6279,7 @@ async fn handle_library_save_text(
         .ok()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or(body.path);
+    maybe_mark_world_feed_dirty_for_path(&workspace_dir, &rel);
     (StatusCode::OK, Json(serde_json::json!({"ok": true, "path": rel}))).into_response()
 }
 
@@ -5697,8 +6293,12 @@ async fn handle_library_delete(
     }
     let requested = body.path.trim().trim_start_matches('/').to_string();
     if requested.is_empty() {
-        let err = serde_json::json!({"error": "path is required"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "LIBRARY_PATH_REQUIRED",
+            "path is required",
+        )
+        .into_response();
     }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
@@ -5709,12 +6309,20 @@ async fn handle_library_delete(
         resolve_workspace_text_path(&workspace_dir, &requested)
     };
     let Some(abs_path) = target_path else {
-        let err = serde_json::json!({"error": "Invalid path"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "LIBRARY_PATH_INVALID",
+            "Invalid path",
+        )
+        .into_response();
     };
     if !abs_path.exists() || !abs_path.is_file() {
-        let err = serde_json::json!({"error": "File not found"});
-        return (StatusCode::NOT_FOUND, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::NOT_FOUND,
+            "LIBRARY_FILE_NOT_FOUND",
+            "File not found",
+        )
+        .into_response();
     }
 
     if let Err(err) = tokio::fs::remove_file(&abs_path).await {
@@ -5756,6 +6364,8 @@ async fn handle_library_delete(
         }
     }
 
+    maybe_mark_world_feed_dirty_for_path(&workspace_dir, &requested);
+
     let body = serde_json::json!({
         "ok": true,
         "path": requested,
@@ -5775,38 +6385,58 @@ async fn handle_journal_transcribe(
 
     let requested = body.media_path.trim().trim_start_matches('/').to_string();
     if requested.is_empty() {
-        let err = serde_json::json!({"error": "mediaPath is required"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "TRANSCRIPTION_MEDIA_PATH_REQUIRED",
+            "mediaPath is required",
+        )
+        .into_response();
     }
 
     let config_snapshot = state.config.lock().clone();
     if !config_snapshot.transcription.enabled {
-        let err = serde_json::json!({
-            "error": "Transcription is disabled. Enable [transcription] enabled = true in config."
-        });
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "TRANSCRIPTION_DISABLED",
+            "Transcription is disabled. Enable [transcription] enabled = true in config.",
+        )
+        .into_response();
     }
     let media_capabilities = local_media_capabilities(&config_snapshot);
     if !media_capabilities.transcribe_media {
-        let err = serde_json::json!({
-            "error": "Local transcription is unavailable on this device. Check local media capabilities in settings."
-        });
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "TRANSCRIPTION_UNAVAILABLE",
+            "Local transcription is unavailable on this device. Check local media capabilities in settings.",
+        )
+        .into_response();
     }
 
     let workspace_dir = config_snapshot.workspace_dir.clone();
     let Some(abs_media_path) = resolve_workspace_media_path(&workspace_dir, &requested) else {
-        let err = serde_json::json!({"error": "Invalid media path"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "TRANSCRIPTION_MEDIA_PATH_INVALID",
+            "Invalid media path",
+        )
+        .into_response();
     };
     if !abs_media_path.exists() || !abs_media_path.is_file() {
-        let err = serde_json::json!({"error": "Media file not found"});
-        return (StatusCode::NOT_FOUND, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::NOT_FOUND,
+            "TRANSCRIPTION_MEDIA_FILE_NOT_FOUND",
+            "Media file not found",
+        )
+        .into_response();
     }
 
     let Some(transcript_rel_path) = transcript_rel_path_for_media(&requested) else {
-        let err = serde_json::json!({"error": "Could not derive transcript path"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "TRANSCRIPTION_PATH_UNAVAILABLE",
+            "Could not derive transcript path",
+        )
+        .into_response();
     };
     let transcript_abs_path = workspace_dir.join(&transcript_rel_path);
     let transcript_json_path = transcript_json_rel_path(&transcript_rel_path);
@@ -5852,6 +6482,63 @@ async fn handle_journal_transcribe(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+async fn journal_transcribe_status_payload(
+    state: &AppState,
+    requested: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let Some(transcript_rel_path) = transcript_rel_path_for_media(requested) else {
+        return Err(frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "TRANSCRIPTION_PATH_UNAVAILABLE",
+            "Could not derive transcript path",
+        ));
+    };
+    let transcript_abs_path = workspace_dir.join(&transcript_rel_path);
+    let transcript_json_path = transcript_json_rel_path(&transcript_rel_path);
+    let transcript_srt_path = transcript_srt_rel_path(&transcript_rel_path);
+
+    if transcript_abs_path.exists() && transcript_abs_path.is_file() {
+        let transcript_text = tokio::fs::read_to_string(&transcript_abs_path)
+            .await
+            .unwrap_or_default();
+        if !transcript_text.trim().is_empty() {
+            return Ok(serde_json::json!({
+                "ok": true,
+                "mediaPath": requested,
+                "path": transcript_rel_path,
+                "jsonPath": transcript_json_path,
+                "srtPath": transcript_srt_path,
+                "text": transcript_text,
+                "status": "done",
+            }));
+        }
+    }
+
+    let jobs = state.journal_transcription_jobs.lock();
+    if let Some(job) = jobs.get(requested) {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "mediaPath": requested,
+            "path": transcript_rel_path,
+            "jsonPath": transcript_json_path,
+            "srtPath": transcript_srt_path,
+            "status": job.status,
+            "error": job.error,
+            "updatedAt": job.updated_at,
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "mediaPath": requested,
+        "path": transcript_rel_path,
+        "jsonPath": transcript_json_path,
+        "srtPath": transcript_srt_path,
+        "status": "idle",
+    }))
+}
+
 async fn handle_journal_transcribe_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5863,61 +6550,80 @@ async fn handle_journal_transcribe_status(
 
     let requested = query.media_path.trim().trim_start_matches('/').to_string();
     if requested.is_empty() {
-        let err = serde_json::json!({"error": "mediaPath is required"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "TRANSCRIPTION_MEDIA_PATH_REQUIRED",
+            "mediaPath is required",
+        )
+        .into_response();
     }
 
-    let workspace_dir = state.config.lock().workspace_dir.clone();
-    let Some(transcript_rel_path) = transcript_rel_path_for_media(&requested) else {
-        let err = serde_json::json!({"error": "Could not derive transcript path"});
-        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
-    };
-    let transcript_abs_path = workspace_dir.join(&transcript_rel_path);
-    let transcript_json_path = transcript_json_rel_path(&transcript_rel_path);
-    let transcript_srt_path = transcript_srt_rel_path(&transcript_rel_path);
+    match journal_transcribe_status_payload(&state, &requested).await {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
 
-    if transcript_abs_path.exists() && transcript_abs_path.is_file() {
-        let transcript_text = tokio::fs::read_to_string(&transcript_abs_path)
-            .await
-            .unwrap_or_default();
-        if !transcript_text.trim().is_empty() {
-            let body = serde_json::json!({
-                "ok": true,
-                "mediaPath": requested,
-                "path": transcript_rel_path,
-                "jsonPath": transcript_json_path,
-                "srtPath": transcript_srt_path,
-                "text": transcript_text,
-                "status": "done",
-            });
-            return (StatusCode::OK, Json(body)).into_response();
+async fn handle_journal_transcribe_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<JournalTranscribeStatusQuery>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Journal transcribe stream") {
+        return err.into_response();
+    }
+
+    let requested = query.media_path.trim().trim_start_matches('/').to_string();
+    if requested.is_empty() {
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "TRANSCRIPTION_MEDIA_PATH_REQUIRED",
+            "mediaPath is required",
+        )
+        .into_response();
+    }
+
+    if let Err(err) = journal_transcribe_status_payload(&state, &requested).await {
+        return err.into_response();
+    }
+
+    let state_for_stream = state.clone();
+    let (tx, rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        let mut last_snapshot = String::new();
+        loop {
+            match journal_transcribe_status_payload(&state_for_stream, &requested).await {
+                Ok(payload) => {
+                    let fingerprint = serde_json::to_string(&payload).unwrap_or_default();
+                    if fingerprint != last_snapshot {
+                        last_snapshot = fingerprint;
+                        if tx.send(sse_json_event("transcription_status", &payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    let status = payload
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("idle");
+                    if matches!(status, "done" | "error" | "idle") {
+                        break;
+                    }
+                }
+                Err((_, Json(body))) => {
+                    let payload = serde_json::json!({
+                        "error": body.get("error").and_then(serde_json::Value::as_str).unwrap_or("Failed to load transcription status."),
+                        "code": body.get("code").and_then(serde_json::Value::as_str).unwrap_or("TRANSCRIPTION_STREAM_FAILED"),
+                    });
+                    let _ = tx.send(sse_json_event("error", &payload)).await;
+                    break;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(1500)).await;
         }
-    }
-
-    let jobs = state.journal_transcription_jobs.lock();
-    if let Some(job) = jobs.get(&requested) {
-        let body = serde_json::json!({
-            "ok": true,
-            "mediaPath": requested,
-            "path": transcript_rel_path,
-            "jsonPath": transcript_json_path,
-            "srtPath": transcript_srt_path,
-            "status": job.status,
-            "error": job.error,
-            "updatedAt": job.updated_at,
-        });
-        return (StatusCode::OK, Json(body)).into_response();
-    }
-
-    let body = serde_json::json!({
-        "ok": true,
-        "mediaPath": requested,
-        "path": transcript_rel_path,
-        "jsonPath": transcript_json_path,
-        "srtPath": transcript_srt_path,
-        "status": "idle",
     });
-    (StatusCode::OK, Json(body)).into_response()
+
+    frontend_event_stream(rx)
 }
 
 fn transcript_rel_path_for_media(media_rel_path: &str) -> Option<String> {
@@ -6522,6 +7228,10 @@ const INTEREST_EMA_NEW_WEIGHT: f32 = 0.2;
 const BLUESKY_TIMELINE_LIMIT_MAX: usize = 100;
 const BLUESKY_DISCOVER_FEED_URI: &str =
     "at://did:plc:qh3lfd7q24h3fn3pejqr25ct/app.bsky.feed.generator/whats-hot";
+const BLUESKY_FEED_GENERATOR_DISCOVERY_PAGE_LIMIT: usize = 2;
+const BLUESKY_FEED_GENERATOR_DISCOVERY_PAGE_SIZE: usize = 25;
+const BLUESKY_FEED_GENERATOR_MATCH_LIMIT: usize = 4;
+const BLUESKY_FEED_SOURCE_MATCH_THRESHOLD: f32 = 0.55;
 const BLUESKY_PERSONALIZED_PAGE_LIMIT_PER_SOURCE: usize = 10;
 const BLUESKY_PERSONALIZED_MATCH_LIMIT: usize = 10;
 const WORKSPACE_SYNTH_BATCH_WORD_LIMIT: usize = 500;
@@ -6574,10 +7284,20 @@ struct InterestProfileStats {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct BlueskyFeedSourceContext {
+    label: String,
+    description: Option<String>,
+    matched_interest_label: Option<String>,
+    matched_interest_score: Option<f32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PersonalizedBlueskyItem {
     source_type: String,
     feed_item: serde_json::Value,
     web_preview: Option<WebFeedPreview>,
+    feed_source: Option<BlueskyFeedSourceContext>,
     score: Option<f32>,
     matched_interest_label: Option<String>,
     matched_interest_score: Option<f32>,
@@ -6594,6 +7314,16 @@ struct ActiveInterest {
 struct CandidateFeedPost {
     feed_item: serde_json::Value,
     text: String,
+    feed_source: Option<BlueskyFeedSourceContext>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateFeedGenerator {
+    uri: String,
+    display_name: String,
+    description: String,
+    creator_handle: String,
+    creator_display_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -6617,17 +7347,53 @@ struct ParsedFeedEntry {
     published_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlueskyCandidateSource {
+#[derive(Debug, Clone)]
+enum BlueskyCandidateSourceEndpoint {
     HomeTimeline,
-    Discover,
+    FeedGenerator { uri: String },
+}
+
+#[derive(Debug, Clone)]
+struct BlueskyCandidateSource {
+    endpoint: BlueskyCandidateSourceEndpoint,
+    label: String,
+    feed_source: Option<BlueskyFeedSourceContext>,
 }
 
 impl BlueskyCandidateSource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::HomeTimeline => "home",
-            Self::Discover => "discover",
+    fn home_timeline() -> Self {
+        Self {
+            endpoint: BlueskyCandidateSourceEndpoint::HomeTimeline,
+            label: "home".to_string(),
+            feed_source: Some(BlueskyFeedSourceContext {
+                label: "Home timeline".to_string(),
+                description: None,
+                matched_interest_label: None,
+                matched_interest_score: None,
+            }),
+        }
+    }
+
+    fn feed_generator(
+        uri: impl Into<String>,
+        label: impl Into<String>,
+        feed_source: Option<BlueskyFeedSourceContext>,
+    ) -> Self {
+        Self {
+            endpoint: BlueskyCandidateSourceEndpoint::FeedGenerator { uri: uri.into() },
+            label: label.into(),
+            feed_source,
+        }
+    }
+
+    fn request_label(&self) -> &str {
+        self.label.as_str()
+    }
+
+    fn endpoint_key(&self) -> String {
+        match &self.endpoint {
+            BlueskyCandidateSourceEndpoint::HomeTimeline => "home".to_string(),
+            BlueskyCandidateSourceEndpoint::FeedGenerator { uri } => format!("feed:{uri}"),
         }
     }
 }
@@ -6914,25 +7680,37 @@ fn extract_bluesky_post_text(feed_item: &serde_json::Value) -> String {
         .to_string()
 }
 
-fn bluesky_candidate_sources() -> [BlueskyCandidateSource; 2] {
-    [BlueskyCandidateSource::HomeTimeline, BlueskyCandidateSource::Discover]
+fn default_bluesky_candidate_sources() -> Vec<BlueskyCandidateSource> {
+    vec![
+        BlueskyCandidateSource::home_timeline(),
+        BlueskyCandidateSource::feed_generator(
+            BLUESKY_DISCOVER_FEED_URI,
+            "discover".to_string(),
+            Some(BlueskyFeedSourceContext {
+                label: "Discover".to_string(),
+                description: None,
+                matched_interest_label: None,
+                matched_interest_score: None,
+            }),
+        ),
+    ]
 }
 
 fn build_bluesky_feed_endpoint(
     service_url: &str,
-    source: BlueskyCandidateSource,
+    source: &BlueskyCandidateSource,
     cursor: Option<&str>,
     limit: usize,
 ) -> String {
     let trimmed_service = service_url.trim().trim_end_matches('/');
     let normalized_limit = limit.clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
-    let mut url = match source {
-        BlueskyCandidateSource::HomeTimeline => format!(
+    let mut url = match &source.endpoint {
+        BlueskyCandidateSourceEndpoint::HomeTimeline => format!(
             "{trimmed_service}/xrpc/app.bsky.feed.getTimeline?limit={normalized_limit}"
         ),
-        BlueskyCandidateSource::Discover => format!(
+        BlueskyCandidateSourceEndpoint::FeedGenerator { uri } => format!(
             "{trimmed_service}/xrpc/app.bsky.feed.getFeed?feed={}&limit={normalized_limit}",
-            urlencoding::encode(BLUESKY_DISCOVER_FEED_URI)
+            urlencoding::encode(uri)
         ),
     };
 
@@ -6942,6 +7720,57 @@ fn build_bluesky_feed_endpoint(
     }
 
     url
+}
+
+fn build_bluesky_feed_generator_discovery_endpoint(
+    service_url: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> String {
+    let trimmed_service = service_url.trim().trim_end_matches('/');
+    let normalized_limit = limit.clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
+    let mut url = format!(
+        "{trimmed_service}/xrpc/app.bsky.unspecced.getPopularFeedGenerators?limit={normalized_limit}"
+    );
+
+    if let Some(next_cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) {
+        url.push_str("&cursor=");
+        url.push_str(urlencoding::encode(next_cursor).as_ref());
+    }
+
+    url
+}
+
+fn bluesky_feed_generator_label(candidate: &CandidateFeedGenerator) -> String {
+    non_empty_string(candidate.display_name.clone())
+        .or_else(|| non_empty_string(candidate.creator_display_name.clone()))
+        .or_else(|| non_empty_string(candidate.creator_handle.clone()))
+        .unwrap_or_else(|| candidate.uri.clone())
+}
+
+fn bluesky_feed_generator_search_text(candidate: &CandidateFeedGenerator) -> String {
+    [
+        candidate.display_name.trim(),
+        candidate.description.trim(),
+        candidate.creator_display_name.trim(),
+        candidate.creator_handle.trim(),
+    ]
+    .into_iter()
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn append_unique_bluesky_sources(
+    target: &mut Vec<BlueskyCandidateSource>,
+    extra: Vec<BlueskyCandidateSource>,
+) {
+    let mut seen: HashSet<String> = target.iter().map(BlueskyCandidateSource::endpoint_key).collect();
+    for source in extra {
+        if seen.insert(source.endpoint_key()) {
+            target.push(source);
+        }
+    }
 }
 
 fn bluesky_candidate_dedup_key(feed_item: &serde_json::Value) -> Option<String> {
@@ -6983,6 +7812,7 @@ fn build_raw_personalized_items(
             source_type: "bluesky".to_string(),
             feed_item: candidate.feed_item,
             web_preview: None,
+            feed_source: candidate.feed_source,
             score: None,
             matched_interest_label: None,
             matched_interest_score: None,
@@ -6991,10 +7821,174 @@ fn build_raw_personalized_items(
         .collect()
 }
 
+async fn fetch_bluesky_feed_generator_page(
+    service_url: &str,
+    access_jwt: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<CandidateFeedGenerator>, Option<String>)> {
+    let url = build_bluesky_feed_generator_discovery_endpoint(service_url, cursor, limit);
+    let response = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(access_jwt.trim())
+        .send()
+        .await
+        .context("Failed to fetch Bluesky feed generators")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Bluesky feed generator request failed ({status}): {body}");
+    }
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .context("Failed to decode Bluesky feed generator response")?;
+    let feeds = json
+        .get("feeds")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let next_cursor = json
+        .get("cursor")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let generators = feeds
+        .into_iter()
+        .filter_map(|item| {
+            let uri = item
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?
+                .to_string();
+            Some(CandidateFeedGenerator {
+                uri,
+                display_name: item
+                    .get("displayName")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                description: item
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                creator_handle: item
+                    .get("creator")
+                    .and_then(|creator| creator.get("handle"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                creator_display_name: item
+                    .get("creator")
+                    .and_then(|creator| creator.get("displayName"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            })
+        })
+        .collect();
+
+    Ok((generators, next_cursor))
+}
+
+async fn collect_ranked_bluesky_feed_sources(
+    service_url: &str,
+    access_jwt: &str,
+    embedder: Arc<dyn memory::embeddings::EmbeddingProvider>,
+    interests: &[ActiveInterest],
+) -> Result<Vec<BlueskyCandidateSource>> {
+    let mut generators = Vec::new();
+    let mut seen_uris = HashSet::new();
+    let mut cursor: Option<String> = None;
+
+    for _ in 0..BLUESKY_FEED_GENERATOR_DISCOVERY_PAGE_LIMIT {
+        let (page, next_cursor) = fetch_bluesky_feed_generator_page(
+            service_url,
+            access_jwt,
+            cursor.as_deref(),
+            BLUESKY_FEED_GENERATOR_DISCOVERY_PAGE_SIZE,
+        )
+        .await?;
+        if page.is_empty() {
+            break;
+        }
+
+        for generator in page {
+            if seen_uris.insert(generator.uri.clone()) {
+                generators.push(generator);
+            }
+        }
+
+        let Some(next_cursor) = next_cursor.filter(|value| !value.trim().is_empty()) else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    let mut ranked = Vec::new();
+    for generator in generators {
+        let search_text = bluesky_feed_generator_search_text(&generator);
+        if search_text.trim().is_empty() {
+            continue;
+        }
+
+        let embedding = embedder
+            .embed_one(&search_text)
+            .await
+            .with_context(|| format!("Failed to embed Bluesky feed {}", generator.uri))?;
+        let (best_weighted, best_similarity, best_label) =
+            best_interest_match(&embedding, interests);
+        if best_weighted < BLUESKY_FEED_SOURCE_MATCH_THRESHOLD {
+            continue;
+        }
+        let label = bluesky_feed_generator_label(&generator);
+        let description = non_empty_string(generator.description.clone());
+
+        ranked.push((
+            best_weighted,
+            BlueskyCandidateSource::feed_generator(
+                generator.uri,
+                label.clone(),
+                Some(BlueskyFeedSourceContext {
+                    label,
+                    description,
+                    matched_interest_label: best_label,
+                    matched_interest_score: if best_similarity > 0.0 {
+                        Some(best_similarity)
+                    } else {
+                        None
+                    },
+                }),
+            ),
+        ));
+    }
+
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(ranked
+        .into_iter()
+        .take(BLUESKY_FEED_GENERATOR_MATCH_LIMIT)
+        .map(|(_, source)| source)
+        .collect())
+}
+
 async fn fetch_bluesky_candidate_page(
     service_url: &str,
     access_jwt: &str,
-    source: BlueskyCandidateSource,
+    source: &BlueskyCandidateSource,
     cursor: Option<&str>,
     limit: usize,
 ) -> Result<(Vec<CandidateFeedPost>, Option<String>)> {
@@ -7004,21 +7998,26 @@ async fn fetch_bluesky_candidate_page(
         .bearer_auth(access_jwt.trim())
         .send()
         .await
-        .with_context(|| format!("Failed to fetch Bluesky {} feed", source.label()))?;
+        .with_context(|| format!("Failed to fetch Bluesky {} feed", source.request_label()))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!(
             "Bluesky {} feed request failed ({status}): {body}",
-            source.label()
+            source.request_label()
         );
     }
 
     let json: serde_json::Value = response
         .json()
         .await
-        .with_context(|| format!("Failed to decode Bluesky {} feed response", source.label()))?;
+        .with_context(|| {
+            format!(
+                "Failed to decode Bluesky {} feed response",
+                source.request_label()
+            )
+        })?;
     let feed = json
         .get("feed")
         .and_then(serde_json::Value::as_array)
@@ -7034,6 +8033,7 @@ async fn fetch_bluesky_candidate_page(
             .map(|feed_item| CandidateFeedPost {
                 text: extract_bluesky_post_text(&feed_item),
                 feed_item,
+                feed_source: source.feed_source.clone(),
             })
             .collect(),
         next_cursor,
@@ -7047,11 +8047,11 @@ async fn fetch_bluesky_fallback_candidates(
 ) -> Result<Vec<CandidateFeedPost>> {
     let mut seen = BTreeSet::new();
     let mut all_candidates = Vec::new();
-    for source in bluesky_candidate_sources() {
+    for source in default_bluesky_candidate_sources() {
         let (page, _) = fetch_bluesky_candidate_page(
             service_url,
             access_jwt,
-            source,
+            &source,
             None,
             limit.min(BLUESKY_PERSONALIZED_PAGE_SIZE),
         )
@@ -7094,6 +8094,9 @@ fn seed_default_feed_web_sources(workspace_dir: &StdPath) -> Result<()> {
                 title: source.title.to_string(),
                 html_url: source.html_url.to_string(),
                 xml_url: source.xml_url.to_string(),
+                description: String::new(),
+                topics_csv: String::new(),
+                metadata_embedding: Vec::new(),
                 enabled: true,
                 source_kind: FEED_WEB_SOURCE_KIND.to_string(),
             },
@@ -7804,6 +8807,7 @@ fn build_recent_content_items(
                     "publishedAt": item.published_at,
                 }),
                 web_preview: Some(preview),
+                feed_source: None,
                 score: None,
                 matched_interest_label: None,
                 matched_interest_score: None,
@@ -7842,6 +8846,7 @@ fn rank_cached_content_items(
                 "publishedAt": item.published_at,
             }),
             web_preview: Some(preview),
+            feed_source: None,
             score: Some(best_weighted),
             matched_interest_label: best_label,
             matched_interest_score: if best_similarity > 0.0 {
@@ -8262,12 +9267,14 @@ async fn rank_bluesky_candidates(
 ) -> Result<Vec<PersonalizedBlueskyItem>> {
     let mut ranked = Vec::new();
     for candidate in candidates {
+        let feed_source = candidate.feed_source.clone();
         let trimmed = candidate.text.trim();
         if trimmed.is_empty() {
             ranked.push(PersonalizedBlueskyItem {
                 source_type: "bluesky".to_string(),
                 feed_item: candidate.feed_item,
                 web_preview: None,
+                feed_source,
                 score: None,
                 matched_interest_label: None,
                 matched_interest_score: None,
@@ -8288,6 +9295,7 @@ async fn rank_bluesky_candidates(
             source_type: "bluesky".to_string(),
             feed_item: candidate.feed_item,
             web_preview: None,
+            feed_source,
             score: Some(best_weighted),
             matched_interest_label: best_label,
             matched_interest_score: if best_similarity > 0.0 {
@@ -8340,6 +9348,7 @@ async fn rank_web_candidates(
                 "domain": candidate.domain,
             }),
             web_preview: Some(preview),
+            feed_source: None,
             score: Some(best_weighted),
             matched_interest_label: best_label,
             matched_interest_score: if best_similarity > 0.0 {
@@ -8367,14 +9376,29 @@ async fn collect_ranked_bluesky_matches(
     let mut raw_candidates = Vec::new();
     let mut seen = BTreeSet::new();
     let target_matches = limit.min(BLUESKY_PERSONALIZED_MATCH_LIMIT);
+    let mut candidate_sources = match collect_ranked_bluesky_feed_sources(
+        service_url,
+        access_jwt,
+        embedder.clone(),
+        interests,
+    )
+    .await
+    {
+        Ok(sources) => sources,
+        Err(err) => {
+            tracing::warn!("Failed to rank Bluesky feed generators: {err}");
+            Vec::new()
+        }
+    };
+    append_unique_bluesky_sources(&mut candidate_sources, default_bluesky_candidate_sources());
 
-    for source in bluesky_candidate_sources() {
+    for source in candidate_sources {
         let mut cursor: Option<String> = None;
         for _ in 0..BLUESKY_PERSONALIZED_PAGE_LIMIT_PER_SOURCE {
             let (page, next_cursor) = fetch_bluesky_candidate_page(
                 service_url,
                 access_jwt,
-                source,
+                &source,
                 cursor.as_deref(),
                 BLUESKY_PERSONALIZED_PAGE_SIZE,
             )
@@ -9031,13 +10055,28 @@ mod tests {
     fn build_bluesky_feed_endpoint_uses_discover_feed_generator() {
         let url = build_bluesky_feed_endpoint(
             "https://bsky.social/",
-            BlueskyCandidateSource::Discover,
+            &BlueskyCandidateSource::feed_generator(
+                BLUESKY_DISCOVER_FEED_URI,
+                "discover",
+                None,
+            ),
             Some("cursor-1"),
             30,
         );
         assert!(url.contains("/xrpc/app.bsky.feed.getFeed?feed="));
         assert!(url.contains("app.bsky.feed.generator%2Fwhats-hot"));
         assert!(url.contains("cursor=cursor-1"));
+    }
+
+    #[test]
+    fn build_bluesky_feed_generator_discovery_endpoint_uses_popular_generators() {
+        let url = build_bluesky_feed_generator_discovery_endpoint(
+            "https://bsky.social/",
+            Some("cursor-2"),
+            25,
+        );
+        assert!(url.contains("/xrpc/app.bsky.unspecced.getPopularFeedGenerators?limit=25"));
+        assert!(url.contains("cursor=cursor-2"));
     }
 
     #[test]
@@ -9048,14 +10087,17 @@ mod tests {
                 CandidateFeedPost {
                     text: "first".to_string(),
                     feed_item: serde_json::json!({"post": {"uri": "at://post/1"}}),
+                    feed_source: None,
                 },
                 CandidateFeedPost {
                     text: "second".to_string(),
                     feed_item: serde_json::json!({"post": {"uri": "at://post/1"}}),
+                    feed_source: None,
                 },
                 CandidateFeedPost {
                     text: "third".to_string(),
                     feed_item: serde_json::json!({"post": {"uri": "at://post/2"}}),
+                    feed_source: None,
                 },
             ],
             &mut seen,
@@ -9072,6 +10114,7 @@ mod tests {
                 source_type: "bluesky".to_string(),
                 feed_item: serde_json::json!({"post": {"indexedAt": "2026-03-09T09:00:00Z"}}),
                 web_preview: None,
+                feed_source: None,
                 score: Some(0.8),
                 matched_interest_label: None,
                 matched_interest_score: None,
@@ -9081,6 +10124,7 @@ mod tests {
                 source_type: "bluesky".to_string(),
                 feed_item: serde_json::json!({"post": {"indexedAt": "2026-03-09T10:00:00Z"}}),
                 web_preview: None,
+                feed_source: None,
                 score: Some(0.8),
                 matched_interest_label: None,
                 matched_interest_score: None,
@@ -9090,6 +10134,7 @@ mod tests {
                 source_type: "bluesky".to_string(),
                 feed_item: serde_json::json!({"post": {"indexedAt": "2026-03-09T11:00:00Z"}}),
                 web_preview: None,
+                feed_source: None,
                 score: Some(0.6),
                 matched_interest_label: None,
                 matched_interest_score: None,
@@ -9824,6 +10869,36 @@ mod tests {
     }
 
     #[test]
+    fn pairing_auth_error_returns_structured_code() {
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(true, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            pb_chat_base_url: None,
+            pb_chat_collection: "chat_messages".into(),
+            pb_chat_token: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let Some((status, Json(payload))) = pairing_auth_error(&state, &HeaderMap::new(), "test") else {
+            panic!("pairing_auth_error should reject missing bearer token");
+        };
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(payload["error"], "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>");
+        assert_eq!(payload["code"], "PAIRING_REQUIRED");
+    }
+
+    #[test]
     fn list_library_feed_scope_includes_posts_only() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path();
@@ -9931,6 +11006,7 @@ mod tests {
         let payload = response.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(parsed["error"], "name is required");
+        assert_eq!(parsed["code"], "WORKFLOW_TEMPLATE_NAME_REQUIRED");
     }
 
     #[tokio::test]
@@ -9977,6 +11053,7 @@ mod tests {
         let payload = response.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(parsed["error"], "goal is required");
+        assert_eq!(parsed["code"], "WORKFLOW_TEMPLATE_GOAL_REQUIRED");
     }
 
     #[tokio::test]
@@ -10044,6 +11121,9 @@ mod tests {
         let defs = workflow_definitions(&store);
 
         assert!(defs.iter().any(|workflow| workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY));
+        assert!(defs.iter().any(|workflow| {
+            workflow.key == article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY
+        }));
         assert!(!defs.iter().any(|workflow| {
             workflow.key == workspace_synthesizer::WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY
         }));
@@ -10130,6 +11210,62 @@ mod tests {
             100,
             ContentAgentAutoRunTrigger::AppOpen
         ));
+    }
+
+    #[test]
+    fn workspace_synth_clip_extractor_runs_only_for_transcript_inputs() {
+        let journal_only = vec![WorkspaceSynthSourceCandidate {
+            source_path: "journals/text/2026-03-11.md".to_string(),
+            content_hash: "hash-a".to_string(),
+            word_count: 120,
+            modified_at: 100,
+        }];
+        let transcript_batch = vec![WorkspaceSynthSourceCandidate {
+            source_path: "journals/text/transcriptions/audio/clip.txt".to_string(),
+            content_hash: "hash-b".to_string(),
+            word_count: 120,
+            modified_at: 101,
+        }];
+
+        assert!(!should_run_workspace_synth_clip_extractor(
+            "journal-save",
+            &journal_only
+        ));
+        assert!(should_run_workspace_synth_clip_extractor(
+            "journal-save",
+            &transcript_batch
+        ));
+        assert!(should_run_workspace_synth_clip_extractor(
+            "transcript-ready",
+            &journal_only
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_synth_journal_save_uses_cooldown_before_queueing() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let journal_dir = workspace.join("journals/text");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        std::fs::write(journal_dir.join("entry.md"), "fresh journal note\n").unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        let state = test_app_state_with_config(config);
+        let mut store = load_or_seed_feed_workflow_settings_store(workspace).unwrap();
+        store
+            .workflows
+            .get_mut(WORKSPACE_SYNTHESIZER_WORKFLOW_KEY)
+            .expect("workspace synthesizer workflow should exist")
+            .enabled = true;
+        save_feed_workflow_settings_store(workspace, &store).unwrap();
+
+        let thread_id = queue_workspace_synthesizer_for_trigger(&state, "journal-save").unwrap();
+        assert!(thread_id.is_none());
+
+        let status = workspace_synthesizer::load_status(workspace);
+        assert!(status.thread_id.trim().is_empty());
+        assert!(!status.journal_save_cooldown_until.trim().is_empty());
     }
 
     #[test]
