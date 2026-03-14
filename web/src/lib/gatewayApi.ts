@@ -321,6 +321,7 @@ export type WorkspaceSynthesizerStatus = {
   lastSummary?: string;
   lastError?: string;
   lastManifestPath?: string;
+  renamedSources?: { fromPath: string; toPath: string }[];
   artifactCounts?: {
     insightPosts?: number;
     todos?: number;
@@ -1059,6 +1060,14 @@ export async function getWorkspaceSynthesizerStatus(
     lastSummary: data?.lastSummary ? String(data.lastSummary) : undefined,
     lastError: data?.lastError ? String(data.lastError) : undefined,
     lastManifestPath: data?.lastManifestPath ? String(data.lastManifestPath) : undefined,
+    renamedSources: Array.isArray(data?.renamedSources)
+      ? data.renamedSources
+          .map((value: any) => ({
+            fromPath: String(value?.fromPath || "").trim(),
+            toPath: String(value?.toPath || "").trim()
+          }))
+          .filter((value: { fromPath: string; toPath: string }) => value.fromPath && value.toPath)
+      : undefined,
     artifactCounts: data?.artifactCounts
       ? {
           insightPosts: Number(data.artifactCounts.insightPosts || 0),
@@ -1149,6 +1158,16 @@ export function streamWorkspaceSynthesizerStatus(
         lastSummary: payload?.lastSummary ? String(payload.lastSummary) : undefined,
         lastError: payload?.lastError ? String(payload.lastError) : undefined,
         lastManifestPath: payload?.lastManifestPath ? String(payload.lastManifestPath) : undefined,
+        renamedSources: Array.isArray(payload?.renamedSources)
+          ? payload.renamedSources
+              .map((value: any) => ({
+                fromPath: String(value?.fromPath || "").trim(),
+                toPath: String(value?.toPath || "").trim()
+              }))
+              .filter(
+                (value: { fromPath: string; toPath: string }) => value.fromPath && value.toPath
+              )
+          : undefined,
         artifactCounts: payload?.artifactCounts
           ? {
               insightPosts: Number(payload.artifactCounts.insightPosts || 0),

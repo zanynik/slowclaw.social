@@ -1392,6 +1392,9 @@ function App() {
       setJournalSaveStatus("Write something first");
       return;
     }
+    if (!selectedJournalItem && selectedJournalPath.trim()) {
+      return;
+    }
 
     let token = normalizeGatewayToken(chatGatewayToken);
     if (!token && isDesktopClient) {
@@ -3721,6 +3724,21 @@ function App() {
   ]);
 
   useEffect(() => {
+    const currentPath = selectedJournalPath.trim();
+    if (!currentPath) {
+      return;
+    }
+    const renamed = workspaceSynthStatus.renamedSources?.find(
+      (item) => item.fromPath === currentPath && item.toPath !== currentPath
+    );
+    if (!renamed) {
+      return;
+    }
+    loadedTextPathRef.current = renamed.toPath;
+    setSelectedJournalPath(renamed.toPath);
+  }, [selectedJournalPath, workspaceSynthStatus.renamedSources]);
+
+  useEffect(() => {
     if (!workspaceTabActive) {
       return;
     }
@@ -4532,6 +4550,7 @@ function App() {
 
   useEffect(() => {
     if (!selectedJournalItem && !journalDraftText.trim()) return;
+    if (!selectedJournalItem && selectedJournalPath.trim()) return;
     if (selectedJournalItem && selectedJournalItem.kind === "text" && loadedTextPathRef.current !== selectedJournalItem.path) return;
     if (selectedJournalItem && journalDraftText === selectedJournalText) return;
 
@@ -4542,7 +4561,7 @@ function App() {
     return () => {
       if (journalAutosaveTimerRef.current) window.clearTimeout(journalAutosaveTimerRef.current);
     };
-  }, [journalDraftText, selectedJournalItem, selectedJournalText, chatGatewayToken, gatewayBaseUrl]);
+  }, [journalDraftText, selectedJournalItem, selectedJournalPath, selectedJournalText, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     return () => {

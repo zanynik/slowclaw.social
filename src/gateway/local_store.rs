@@ -600,12 +600,16 @@ pub fn replace_workspace_todos(
     workspace_dir: &Path,
     items: &[WorkspaceTodoUpsert],
     manifest_id: &str,
-    _processed_source_paths: &[String],
+    processed_source_paths: &[String],
 ) -> Result<usize> {
     let mut conn = open_conn(&db_path(workspace_dir))?;
     let tx = conn.transaction()?;
     let now = Utc::now().to_rfc3339();
     let mut written = 0usize;
+
+    // Collect IDs from the current manifest so we know what's still active
+    let current_ids: std::collections::HashSet<&str> =
+        items.iter().map(|i| i.id.as_str()).collect();
 
     for item in items {
         tx.execute(
@@ -647,6 +651,27 @@ pub fn replace_workspace_todos(
         )
         .with_context(|| format!("Failed to upsert workspace todo {}", item.id))?;
         written += 1;
+    }
+
+    // Archive stale todos: items whose source was re-processed but were not
+    // re-extracted by the model (i.e. the model no longer considers them relevant).
+    // Only archive from sources we actually processed — don't touch items from
+    // other sources that weren't part of this run.
+    for src in processed_source_paths {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM workspace_todos WHERE source_path = ?1 AND archived = 0",
+        )?;
+        let stale_ids: Vec<String> = stmt
+            .query_map(params![src.trim()], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .filter(|id| !current_ids.contains(id.as_str()))
+            .collect();
+        for stale_id in &stale_ids {
+            tx.execute(
+                "UPDATE workspace_todos SET archived = 1, updated_at = ?2 WHERE id = ?1",
+                params![stale_id, now],
+            )?;
+        }
     }
 
     tx.commit()?;
@@ -759,12 +784,15 @@ pub fn replace_workspace_events(
     workspace_dir: &Path,
     items: &[WorkspaceEventUpsert],
     manifest_id: &str,
-    _processed_source_paths: &[String],
+    processed_source_paths: &[String],
 ) -> Result<usize> {
     let mut conn = open_conn(&db_path(workspace_dir))?;
     let tx = conn.transaction()?;
     let now = Utc::now().to_rfc3339();
     let mut written = 0usize;
+
+    let current_ids: std::collections::HashSet<&str> =
+        items.iter().map(|i| i.id.as_str()).collect();
 
     for item in items {
         tx.execute(
@@ -812,6 +840,24 @@ pub fn replace_workspace_events(
         )
         .with_context(|| format!("Failed to upsert workspace event {}", item.id))?;
         written += 1;
+    }
+
+    // Archive stale events from processed sources not re-extracted
+    for src in processed_source_paths {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM workspace_events WHERE source_path = ?1 AND archived = 0",
+        )?;
+        let stale_ids: Vec<String> = stmt
+            .query_map(params![src.trim()], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .filter(|id| !current_ids.contains(id.as_str()))
+            .collect();
+        for stale_id in &stale_ids {
+            tx.execute(
+                "UPDATE workspace_events SET archived = 1, updated_at = ?2 WHERE id = ?1",
+                params![stale_id, now],
+            )?;
+        }
     }
 
     tx.commit()?;
@@ -966,16 +1012,46 @@ pub fn rename_journal_entry_path(
     old_path: &str,
     new_path: &str,
     title: &str,
-) -> Result<()> {
+) -> Result<usize> {
     let conn = open_conn(&db_path(workspace_dir))?;
-    conn.execute(
-        "UPDATE journal_entries
-         SET workspace_path = ?2, title = ?3
-         WHERE workspace_path = ?1",
-        params![old_path.trim(), new_path.trim(), title.trim()],
-    )
-    .with_context(|| format!("Failed to rename journal entry {} -> {}", old_path, new_path))?;
-    Ok(())
+    let old_trimmed = old_path.trim();
+    let new_trimmed = new_path.trim();
+    let title_trimmed = title.trim();
+    let now = Utc::now().to_rfc3339();
+
+    let rows = conn
+        .execute(
+            "UPDATE journal_entries
+             SET workspace_path = ?2, title = ?3
+             WHERE workspace_path = ?1",
+            params![old_trimmed, new_trimmed, title_trimmed],
+        )
+        .with_context(|| {
+            format!(
+                "Failed to rename journal entry {} -> {}",
+                old_trimmed, new_trimmed
+            )
+        })?;
+
+    if rows == 0 {
+        tracing::warn!(
+            old_path = old_trimmed,
+            new_path = new_trimmed,
+            "rename_journal_entry_path: no rows matched old_path, DB may be out of sync"
+        );
+    }
+
+    // Cascade rename to todos and events that reference this source
+    let _ = conn.execute(
+        "UPDATE workspace_todos SET source_path = ?2, updated_at = ?3 WHERE source_path = ?1",
+        params![old_trimmed, new_trimmed, now],
+    );
+    let _ = conn.execute(
+        "UPDATE workspace_events SET source_path = ?2, updated_at = ?3 WHERE source_path = ?1",
+        params![old_trimmed, new_trimmed, now],
+    );
+
+    Ok(rows)
 }
 
 pub fn create_journal_entry_metadata(

@@ -273,6 +273,8 @@ pub struct WorkspaceSynthesizerStatus {
     pub artifact_counts: WorkspaceSynthArtifactCounts,
     #[serde(default)]
     pub artifact_states: WorkspaceSynthArtifactStates,
+    #[serde(default)]
+    pub renamed_sources: Vec<WorkspaceSynthRenamedSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1095,13 +1097,18 @@ fn apply_source_path_renames(
             fs::rename(&old_abs, &candidate_abs).with_context(|| {
                 format!("failed to rename {} -> {}", old_abs.display(), candidate_abs.display())
             })?;
-            let _ = local_store::rename_workspace_synth_source_path(
+            if let Err(e) = local_store::rename_workspace_synth_source_path(
                 workspace_dir,
                 old_rel,
                 &candidate_rel,
-            );
-            let _ =
-                local_store::rename_journal_entry_path(workspace_dir, old_rel, &candidate_rel, &item.title);
+            ) {
+                tracing::warn!(old = old_rel, new = %candidate_rel, err = %e, "synth source path rename failed");
+            }
+            match local_store::rename_journal_entry_path(workspace_dir, old_rel, &candidate_rel, &item.title) {
+                Ok(0) => tracing::warn!(old = old_rel, new = %candidate_rel, "journal rename: no DB rows matched"),
+                Err(e) => tracing::warn!(old = old_rel, new = %candidate_rel, err = %e, "journal rename failed"),
+                _ => {}
+            }
             reserved_targets.insert(candidate_rel.clone());
             rename_map.insert(old_rel.to_string(), candidate_rel);
         }

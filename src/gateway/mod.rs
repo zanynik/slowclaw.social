@@ -2181,6 +2181,7 @@ fn save_workspace_synthesizer_status(
     last_error: Option<String>,
     artifact_counts: Option<workspace_synthesizer::WorkspaceSynthArtifactCounts>,
     artifact_states: Option<workspace_synthesizer::WorkspaceSynthArtifactStates>,
+    renamed_sources: Option<Vec<workspace_synthesizer::WorkspaceSynthRenamedSource>>,
 ) {
     let mut next = workspace_synthesizer::load_status(workspace_dir);
     next.status = status.to_string();
@@ -2217,6 +2218,11 @@ fn save_workspace_synthesizer_status(
         next.artifact_states = artifact_states;
     } else if status != "done" {
         next.artifact_states = workspace_synthesizer::WorkspaceSynthArtifactStates::default();
+    }
+    if let Some(renamed_sources) = renamed_sources {
+        next.renamed_sources = renamed_sources;
+    } else if status != "done" {
+        next.renamed_sources.clear();
     }
     if let Err(err) = workspace_synthesizer::save_status(workspace_dir, &next) {
         tracing::warn!("Failed to persist workspace synthesizer status `{status}`: {err}");
@@ -2535,6 +2541,7 @@ fn queue_workspace_synthesizer_run(
         pending_source_count,
         pending_word_count,
         Some(selected_source_paths),
+        None,
         None,
         None,
         None,
@@ -2908,6 +2915,7 @@ fn queue_workflow_run(
             None,
             None,
             None,
+            None,
         );
     }
 
@@ -2959,6 +2967,7 @@ fn queue_workflow_run(
                 None,
                 None,
                 None,
+                None,
             );
         }
 
@@ -3000,6 +3009,7 @@ fn queue_workflow_run(
                         None,
                         None,
                         Some(final_error),
+                        None,
                         None,
                         None,
                     );
@@ -3064,6 +3074,7 @@ fn queue_workflow_run(
                             Some(final_error),
                             Some(applied.counts.clone()),
                             Some(applied.artifact_states.clone()),
+                            Some(applied.renamed_sources.clone()),
                         );
                     } else {
                         let processed_paths = mark_workspace_synth_sources_processed(
@@ -3128,6 +3139,7 @@ fn queue_workflow_run(
                             None,
                             Some(applied.counts.clone()),
                             Some(applied.artifact_states.clone()),
+                            Some(applied.renamed_sources.clone()),
                         );
                     }
                 }
@@ -3176,6 +3188,7 @@ fn queue_workflow_run(
                         Some(final_error),
                         None,
                         Some(workspace_synth_default_artifact_states()),
+                        None,
                     );
                 }
             }
@@ -3273,6 +3286,7 @@ fn queue_workflow_run(
                                     Some(final_error),
                                     Some(applied.counts.clone()),
                                     Some(applied.artifact_states.clone()),
+                                    Some(applied.renamed_sources.clone()),
                                 );
                             } else {
                                 let combined_reply = if reply.trim().is_empty() {
@@ -3312,6 +3326,7 @@ fn queue_workflow_run(
                                     None,
                                     Some(applied.counts.clone()),
                                     Some(applied.artifact_states.clone()),
+                                    Some(applied.renamed_sources.clone()),
                                 );
                             }
                         }
@@ -3351,6 +3366,7 @@ fn queue_workflow_run(
                                 Some(final_error),
                                 None,
                                 None,
+                                None,
                             );
                         }
                         Err(err) => {
@@ -3387,6 +3403,7 @@ fn queue_workflow_run(
                                 None,
                                 None,
                                 Some(final_error),
+                                None,
                                 None,
                                 None,
                             );
@@ -3602,6 +3619,7 @@ fn queue_workflow_run(
                         Some(final_error),
                         None,
                         None,
+                        None,
                     );
                 }
             }
@@ -3639,6 +3657,7 @@ fn queue_workflow_run(
                         None,
                         None,
                         Some(final_error),
+                        None,
                         None,
                         None,
                     );
