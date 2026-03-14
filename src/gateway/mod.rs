@@ -33,7 +33,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json,
     },
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use http_body_util::BodyExt as _;
@@ -645,6 +645,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/workspace/synthesizer/auto-run",
             post(handle_workspace_synthesizer_auto_run),
+        )
+        .route(
+            "/api/workspace/world-feed/interests",
+            get(handle_world_feed_interests_list).post(handle_world_feed_interest_create),
+        )
+        .route(
+            "/api/workspace/world-feed/interests/{interest_id}",
+            delete(handle_world_feed_interest_delete),
         )
         .route("/api/workspace/todos", get(handle_workspace_todos_list))
         .route(
@@ -5856,6 +5864,99 @@ async fn handle_feed_personalized(
     }
 }
 
+async fn handle_world_feed_interests_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "World feed interests") {
+        return err;
+    }
+    let config_snapshot = state.config.lock().clone();
+    match crate::feed::list_world_feed_interest_diagnostics(&config_snapshot) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(response).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "world feed interests",
+            "Failed to load world-feed interests.",
+            err,
+        ),
+    }
+}
+
+async fn handle_world_feed_interest_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WorldFeedInterestCreateRequest>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "World feed interest create") {
+        return err;
+    }
+    let label = body
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Open protocols, developer tools, startups, AI products");
+    let config_snapshot = state.config.lock().clone();
+    match crate::feed::create_dummy_world_feed_interest(&config_snapshot, label).await {
+        Ok(item) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "created": true,
+                "item": item,
+            })),
+        ),
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "world feed interest create",
+            "Failed to create diagnostic world-feed interest.",
+            err,
+        ),
+    }
+}
+
+async fn handle_world_feed_interest_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(interest_id): AxumPath<String>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "World feed interest delete") {
+        return err;
+    }
+    let trimmed_interest_id = interest_id.trim();
+    if trimmed_interest_id.is_empty() {
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "WORLD_FEED_INTEREST_ID_REQUIRED",
+            "interest id is required",
+        );
+    }
+    let config_snapshot = state.config.lock().clone();
+    match crate::feed::delete_dummy_world_feed_interest(&config_snapshot, trimmed_interest_id) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "deleted": true,
+                "interestId": trimmed_interest_id,
+            })),
+        ),
+        Ok(false) => frontend_error_response(
+            StatusCode::NOT_FOUND,
+            "WORLD_FEED_INTEREST_NOT_FOUND",
+            "world-feed interest not found",
+        ),
+        Err(err) => frontend_internal_error(
+            StatusCode::BAD_REQUEST,
+            "world feed interest delete",
+            "Failed to delete world-feed interest.",
+            err,
+        ),
+    }
+}
+
 async fn handle_feed_workflow_template_create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8212,6 +8313,12 @@ struct PersonalizedFeedRequest {
     service_url: Option<String>,
     access_jwt: Option<String>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorldFeedInterestCreateRequest {
+    label: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -12085,6 +12192,8 @@ mod tests {
             workflow.key == article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY
         }));
         assert!(!defs.iter().any(|workflow| workflow.key == "weekly_highlights"));
+        assert!(!defs.iter().any(|workflow| workflow.key == "bluesky_insight_posts"));
+        assert!(!defs.iter().any(|workflow| workflow.key == "audio_insight_clips"));
     }
 
     #[test]
@@ -12179,7 +12288,8 @@ mod tests {
 
         let skill_store = workspace_synthesizer::load_or_seed_skill_store(workspace).unwrap();
         let weekly = skill_store.skills.get("weekly_highlights").unwrap();
-        assert!(weekly.enabled);
+        assert!(!weekly.enabled);
+        assert!(!weekly.visible_in_ui);
         assert_eq!(weekly.goal, "Create compact weekly summary posts.");
     }
 

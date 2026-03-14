@@ -1237,6 +1237,15 @@ pub fn decay_feed_interests(workspace_dir: &Path, decay_rate: f64) -> Result<usi
     Ok(updated)
 }
 
+pub fn delete_feed_interest(workspace_dir: &Path, interest_id: &str) -> Result<bool> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let deleted = conn.execute(
+        "DELETE FROM feed_interests WHERE id = ?1",
+        params![interest_id],
+    )?;
+    Ok(deleted > 0)
+}
+
 pub fn get_feed_interest_source(
     workspace_dir: &Path,
     source_path: &str,
@@ -3046,6 +3055,28 @@ mod tests {
         assert_eq!(decayed, 1);
         let interests = list_feed_interests(tmp.path()).unwrap();
         assert!(interests[0].health_score < 0.8);
+    }
+
+    #[test]
+    fn delete_feed_interest_removes_row() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        let interest = upsert_feed_interest(
+            tmp.path(),
+            &FeedInterestUpsert {
+                id: None,
+                label: "Test Interest".into(),
+                source_path: "state/world_feed_diagnostics/dummy/test.md".into(),
+                embedding: vec![1, 2, 3, 4],
+                health_score: 0.7,
+                last_seen_at: "2026-03-09T12:00:00Z".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(delete_feed_interest(tmp.path(), &interest.id).unwrap());
+        assert!(list_feed_interests(tmp.path()).unwrap().is_empty());
     }
 
     #[test]

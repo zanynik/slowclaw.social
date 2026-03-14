@@ -61,7 +61,42 @@ function print_help {
     echo -e "  ${GREEN}logs${NC}    View logs"
     echo -e "  ${GREEN}build${NC}   Rebuild images"
     echo -e "  ${GREEN}ci${NC}      Run local CI checks in Docker (see ./dev/ci.sh)"
+    echo -e "  ${GREEN}trim${NC}    Remove local build/cache artifacts"
     echo -e "  ${GREEN}clean${NC}   Stop and wipe workspace data"
+}
+
+trim_artifacts() {
+    local mode="${1:-default}"
+    local removed_any=0
+    local paths=(
+        "target"
+        "web/src-tauri/target"
+        ".cache/buildx-smoke"
+        "tmp_site"
+    )
+
+    if [ "$mode" = "deep" ]; then
+        paths+=(
+            "web/node_modules"
+        )
+    fi
+
+    echo -e "${YELLOW}🧹 Trimming generated artifacts...${NC}"
+    for path in "${paths[@]}"; do
+        if [ -e "$path" ]; then
+            rm -rf "$path"
+            echo "  removed $path"
+            removed_any=1
+        fi
+    done
+
+    if [ "$removed_any" -eq 0 ]; then
+        echo "  nothing to remove"
+    fi
+
+    if [ "$mode" = "deep" ]; then
+        echo -e "${YELLOW}ℹ️  Deep trim removed web/node_modules; run 'npm install' in web/ before the next web build.${NC}"
+    fi
 }
 
 if [ -z "$1" ]; then
@@ -117,6 +152,14 @@ case "$1" in
             ./ci.sh "${@:-all}"
         else
             ./dev/ci.sh "${@:-all}"
+        fi
+        ;;
+
+    trim)
+        if [ "${2:-}" = "--deep" ]; then
+            trim_artifacts deep
+        else
+            trim_artifacts default
         fi
         ;;
 

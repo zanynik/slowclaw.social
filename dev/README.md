@@ -84,6 +84,22 @@ Stop containers and remove volumes and generated config:
 
 **Note:** This removes `target/.zeroclaw` (config/DB) but leaves the `playground/` directory intact. To fully wipe everything, manually delete `playground/`.
 
+For routine disk cleanup without resetting the dev environment:
+
+```bash
+./dev/cli.sh trim
+```
+
+This removes local generated artifacts such as `target/`, `web/src-tauri/target/`, `.cache/buildx-smoke/`, and `tmp_site/`.
+
+If you also want to reclaim web dependency space:
+
+```bash
+./dev/cli.sh trim --deep
+```
+
+Deep trim also removes `web/node_modules/`, so the next web build will require `npm install` in `web/`.
+
 ## Local CI/CD (Docker-Only)
 
 Use this when you want CI-style validation without relying on GitHub Actions and without running Rust toolchain commands on your host.

@@ -65,10 +65,12 @@ import type {
 } from "./lib/types";
 import {
   archivePostedLibraryItem,
+  createWorldFeedDummyInterest,
   createClawChatUserMessage as createClawChatUserMessageViaGateway,
   createFeedContentAgent,
   createJournalTextViaGateway,
   createPostHistory,
+  deleteWorldFeedInterest,
   deleteLibraryItem,
   exportWorkspaceSyncSnapshot,
   fetchPersonalizedFeed,
@@ -81,6 +83,7 @@ import {
   listClawChatMessages,
   listDrafts as listDraftsViaGateway,
   listFeedContentAgents,
+  listWorldFeedInterests,
   listWorkspaceEvents,
   listWorkspaceTodos,
   listLibraryItems,
@@ -109,6 +112,8 @@ import type {
   InterestProfileStats,
   MediaCapabilities,
   PersonalizedFeedItem,
+  PersonalizedFeedResponse,
+  WorldFeedInterestItem,
   WorkspaceEventItem,
   WorkspaceSynthArtifactState,
   WorkspaceSynthSkillItem,
@@ -1044,6 +1049,13 @@ function App() {
   const [blueskyFeedItems, setBlueskyFeedItems] = useState<PersonalizedFeedItem[]>([]);
   const [blueskyFeedLoading, setBlueskyFeedLoading] = useState(false);
   const [blueskyFeedStatus, setBlueskyFeedStatus] = useState("");
+  const [blueskyFeedSnapshot, setBlueskyFeedSnapshot] = useState<PersonalizedFeedResponse | null>(null);
+  const [worldFeedInterests, setWorldFeedInterests] = useState<WorldFeedInterestItem[]>([]);
+  const [worldFeedInterestsLoading, setWorldFeedInterestsLoading] = useState(false);
+  const [worldFeedInterestStatus, setWorldFeedInterestStatus] = useState("");
+  const [worldFeedDummyLabel, setWorldFeedDummyLabel] = useState(
+    "Open protocols, developer tools, startups, AI products"
+  );
   const [blueskyProfileStats, setBlueskyProfileStats] = useState<InterestProfileStats>({
     interestCount: 0,
     sourceCount: 0,
@@ -3837,14 +3849,18 @@ function App() {
         gatewayBaseUrl
       );
       setBlueskyFeedItems(res.items);
+      setBlueskyFeedSnapshot(res);
       setBlueskyProfileStats(res.profileStats);
       const refreshedLabel = res.refreshedAt
         ? ` Last refresh ${formatTimestamp(res.refreshedAt)}.`
         : "";
+      const shortlistedLabel = res.selectedSources.length
+        ? ` ${res.selectedSources.length} source${res.selectedSources.length === 1 ? "" : "s"} shortlisted.`
+        : "";
       if (res.profileStatus === "embeddingUnavailable") {
         setBlueskyFeedStatus(
           res.message ||
-            `Personalized feed needs a configured embedding provider. Showing recent cached content and raw fallback items when possible.${refreshedLabel}`
+            `Personalized feed needs a configured embedding provider. Ranked matching is disabled until embeddings are available.${refreshedLabel}`
         );
       } else if (res.profileStatus === "noInterests") {
         setBlueskyFeedStatus(
@@ -3852,21 +3868,21 @@ function App() {
         );
       } else if (res.refreshState === "refreshing") {
         setBlueskyFeedStatus(
-          res.message || `Updating the world feed in the background.${refreshedLabel}`
+          res.message || `Updating the world feed in the background. Showing the last ranked snapshot.${refreshedLabel}${shortlistedLabel}`
         );
       } else if (res.refreshState === "stale") {
         setBlueskyFeedStatus(
-          res.message || `Refreshing the world feed soon. Showing the last ranked results.${refreshedLabel}`
+          res.message || `Refresh is overdue. Showing the last ranked snapshot until a new pass completes.${refreshedLabel}${shortlistedLabel}`
         );
       } else if (res.usedFallback) {
         setBlueskyFeedStatus(
-          res.message || `Showing recent cached content and fallback items while the world feed warms up.${refreshedLabel}`
+          res.message || `Showing fallback content, not a fully ranked world feed yet.${refreshedLabel}${shortlistedLabel}`
         );
       } else {
         setBlueskyFeedStatus(
           res.message ||
             (res.profileStats.interestCount > 0
-              ? `Personalized by ${res.profileStats.interestCount} workspace interests.${refreshedLabel}`
+              ? `Ranked by ${res.profileStats.interestCount} workspace interests.${refreshedLabel}${shortlistedLabel}`
               : refreshedLabel.trim())
         );
       }
@@ -3874,14 +3890,69 @@ function App() {
       console.error("Failed to fetch world feed", error);
       setBlueskyFeedStatus(error instanceof Error ? error.message : "Failed to load world feed.");
       setBlueskyFeedItems([]);
+      setBlueskyFeedSnapshot(null);
     } finally {
       setBlueskyFeedLoading(false);
+    }
+  }
+
+  async function loadWorldFeedInterests() {
+    setWorldFeedInterestsLoading(true);
+    setWorldFeedInterestStatus("");
+    try {
+      const items = await listWorldFeedInterests(chatGatewayToken, gatewayBaseUrl);
+      setWorldFeedInterests(items);
+    } catch (error) {
+      console.error("Failed to load world-feed interests", error);
+      setWorldFeedInterestStatus(
+        error instanceof Error ? error.message : "Failed to load world-feed interests."
+      );
+      setWorldFeedInterests([]);
+    } finally {
+      setWorldFeedInterestsLoading(false);
+    }
+  }
+
+  async function createDiagnosticWorldFeedInterest(event?: FormEvent) {
+    event?.preventDefault();
+    setWorldFeedInterestStatus("");
+    try {
+      const created = await createWorldFeedDummyInterest(
+        worldFeedDummyLabel,
+        chatGatewayToken,
+        gatewayBaseUrl
+      );
+      setWorldFeedInterestStatus(`Added diagnostic interest: ${created.label}`);
+      await Promise.all([loadWorldFeedInterests(), fetchBlueskyFeed()]);
+    } catch (error) {
+      console.error("Failed to create world-feed diagnostic interest", error);
+      setWorldFeedInterestStatus(
+        error instanceof Error ? error.message : "Failed to create diagnostic interest."
+      );
+    }
+  }
+
+  async function removeDiagnosticWorldFeedInterest(item: WorldFeedInterestItem) {
+    setWorldFeedInterestStatus("");
+    try {
+      await deleteWorldFeedInterest(item.id, chatGatewayToken, gatewayBaseUrl);
+      setWorldFeedInterestStatus(`Removed diagnostic interest: ${item.label}`);
+      await Promise.all([loadWorldFeedInterests(), fetchBlueskyFeed()]);
+    } catch (error) {
+      console.error("Failed to delete world-feed diagnostic interest", error);
+      setWorldFeedInterestStatus(
+        error instanceof Error ? error.message : "Failed to delete diagnostic interest."
+      );
     }
   }
 
   useEffect(() => {
     if (feedSource === "bluesky") {
       void fetchBlueskyFeed();
+      void loadWorldFeedInterests();
+    } else {
+      setWorldFeedInterests([]);
+      setWorldFeedInterestStatus("");
     }
   }, [feedSource, session, creds.serviceUrl, chatGatewayToken, gatewayBaseUrl]);
 
@@ -6096,6 +6167,162 @@ function App() {
                     {blueskyFeedStatus ? (
                       <p className="text-sm muted" style={{ padding: "0 0.25rem" }}>{blueskyFeedStatus}</p>
                     ) : null}
+                    {blueskyFeedSnapshot ? (
+                      <div className="workflow-settings-panel stack" style={{ gap: "0.65rem" }}>
+                        <div className="row-between" style={{ alignItems: "center", gap: "0.8rem" }}>
+                          <h3 style={{ margin: 0 }}>World Feed Signals</h3>
+                          <span className="text-sm muted">
+                            {blueskyFeedItems.length} item{blueskyFeedItems.length === 1 ? "" : "s"}
+                          </span>
+                        </div>
+                        <div className="feed-agent-facts">
+                          <div>
+                            <span className="text-sm muted">Mode</span>
+                            <strong>{blueskyFeedSnapshot.usedFallback ? "Fallback" : "Ranked"}</strong>
+                          </div>
+                          <div>
+                            <span className="text-sm muted">Refresh state</span>
+                            <strong>{blueskyFeedSnapshot.refreshState || "warming"}</strong>
+                          </div>
+                          <div>
+                            <span className="text-sm muted">Interests</span>
+                            <strong>{blueskyProfileStats.interestCount}</strong>
+                          </div>
+                          <div>
+                            <span className="text-sm muted">Shortlisted sources</span>
+                            <strong>{blueskyFeedSnapshot.selectedSources.length}</strong>
+                          </div>
+                        </div>
+                        {blueskyFeedSnapshot.usedFallback ? (
+                          <div className="feed-comment-status">
+                            Current items are fallback/recent content, not the final ranked world-feed snapshot.
+                          </div>
+                        ) : null}
+                        {blueskyFeedSnapshot.lastError ? (
+                          <div className="feed-comment-status">
+                            Last refresh error: {blueskyFeedSnapshot.lastError}
+                          </div>
+                        ) : null}
+                        {blueskyFeedSnapshot.selectedSources.length ? (
+                          <div className="stack" style={{ gap: "0.45rem" }}>
+                            <span className="text-sm muted">Top shortlisted sources</span>
+                            {blueskyFeedSnapshot.selectedSources.slice(0, 6).map((source) => (
+                              <div key={source.key} className="workflow-run-card">
+                                <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
+                                  <span className="feed-bot-chip">
+                                    <span className="feed-bot-avatar">
+                                      {(source.protocol || "?").slice(0, 1).toUpperCase()}
+                                    </span>
+                                    <span>{source.label}</span>
+                                  </span>
+                                  <span className="text-sm muted">
+                                    {(source.score * 100).toFixed(0)}%
+                                  </span>
+                                </div>
+                                <div className="text-sm muted">
+                                  {(source.protocol || "source").toUpperCase()}
+                                  {source.matchedInterestLabel
+                                    ? ` · matched ${source.matchedInterestLabel}${
+                                        source.matchedInterestScore != null
+                                          ? ` (${(source.matchedInterestScore * 100).toFixed(0)}%)`
+                                          : ""
+                                      }`
+                                    : ""}
+                                </div>
+                                {source.description ? (
+                                  <div className="text-sm muted">{source.description}</div>
+                                ) : null}
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-sm muted" style={{ margin: 0 }}>
+                            No source shortlist is available yet for this refresh cycle.
+                          </p>
+                        )}
+                        <div className="stack" style={{ gap: "0.45rem" }}>
+                          <div className="row-between" style={{ gap: "0.75rem", alignItems: "center" }}>
+                            <span className="text-sm muted">Interest vectors</span>
+                            <span className="text-sm muted">
+                              {worldFeedInterests.length} total
+                            </span>
+                          </div>
+                          <p className="text-sm muted" style={{ margin: 0 }}>
+                            Diagnostic approach: adding one broad synthetic interest is reasonable for testing relay/feed discovery.
+                            It is useful in development as long as synthetic vectors are clearly marked and removable.
+                          </p>
+                          <form
+                            className="row"
+                            style={{ gap: "0.5rem", alignItems: "stretch", flexWrap: "wrap" }}
+                            onSubmit={(event) => void createDiagnosticWorldFeedInterest(event)}
+                          >
+                            <input
+                              value={worldFeedDummyLabel}
+                              onChange={(event) => setWorldFeedDummyLabel(event.target.value)}
+                              placeholder="Diagnostic interest label"
+                              style={{ flex: 1, minWidth: "18rem" }}
+                            />
+                            <button
+                              type="submit"
+                              className="secondary"
+                              disabled={worldFeedInterestsLoading || !worldFeedDummyLabel.trim()}
+                            >
+                              Add dummy interest
+                            </button>
+                          </form>
+                          {worldFeedInterestStatus ? (
+                            <div className="feed-comment-status">{worldFeedInterestStatus}</div>
+                          ) : null}
+                          {worldFeedInterestsLoading ? (
+                            <p className="text-sm muted" style={{ margin: 0 }}>
+                              Loading interest vectors...
+                            </p>
+                          ) : worldFeedInterests.length ? (
+                            worldFeedInterests.map((interest) => (
+                              <div key={interest.id} className="workflow-run-card">
+                                <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
+                                  <span className="feed-bot-chip">
+                                    <span className="feed-bot-avatar">
+                                      {interest.synthetic ? "D" : "I"}
+                                    </span>
+                                    <span>{interest.label}</span>
+                                  </span>
+                                  <span className="text-sm muted">
+                                    health {(interest.healthScore * 100).toFixed(0)}%
+                                  </span>
+                                </div>
+                                <div className="text-sm muted">
+                                  {interest.synthetic ? "Diagnostic synthetic vector" : "Workspace-derived vector"}
+                                  {` · ${interest.embeddingDimensions} dims`}
+                                </div>
+                                <div className="text-sm muted">
+                                  source {interest.sourcePath}
+                                </div>
+                                <div className="text-sm muted">
+                                  updated {formatTimestamp(interest.updatedAt)}
+                                  {interest.lastSeenAt ? ` · seen ${formatTimestamp(interest.lastSeenAt)}` : ""}
+                                </div>
+                                {interest.deletable ? (
+                                  <div className="row" style={{ justifyContent: "flex-end" }}>
+                                    <button
+                                      type="button"
+                                      className="secondary danger"
+                                      onClick={() => void removeDiagnosticWorldFeedInterest(interest)}
+                                    >
+                                      Delete dummy
+                                    </button>
+                                  </div>
+                                ) : null}
+                              </div>
+                            ))
+                          ) : (
+                            <p className="text-sm muted" style={{ margin: 0 }}>
+                              No interest vectors exist yet.
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    ) : null}
                     {blueskyFeedItems.map((item, idx) => {
                       if (item.sourceType === "web" && item.webPreview) {
                         const preview = item.webPreview;
@@ -6110,6 +6337,9 @@ function App() {
                                     {selectedSource?.label
                                       ? `from ${selectedSource.label}`
                                       : `Web source via ${preview.provider}`}
+                                    {selectedSource?.sourceScore != null
+                                      ? ` · source ${(selectedSource.sourceScore * 100).toFixed(0)}%`
+                                      : ""}
                                     {selectedSource?.matchedInterestLabel
                                       ? ` · source matched ${selectedSource.matchedInterestLabel}${
                                           selectedSource.matchedInterestScore != null
@@ -6202,6 +6432,9 @@ function App() {
                                 {feedSource?.label ? (
                                   <span className="muted text-sm" style={{ fontWeight: "normal" }}>
                                     from {feedSource.label}
+                                    {feedSource.sourceScore != null
+                                      ? ` · source ${(feedSource.sourceScore * 100).toFixed(0)}%`
+                                      : ""}
                                     {feedSource.matchedInterestLabel
                                       ? ` · feed matched ${feedSource.matchedInterestLabel}${
                                           feedSource.matchedInterestScore != null

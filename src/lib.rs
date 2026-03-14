@@ -72,6 +72,15 @@ pub(crate) mod workflow_assets;
 
 pub use config::Config;
 
+pub async fn has_openai_codex_auth(profile_override: Option<&str>) -> anyhow::Result<bool> {
+    let config = Config::load_or_init().await?;
+    let auth_service = auth::AuthService::from_config(&config);
+    Ok(auth_service
+        .get_valid_openai_access_token(profile_override)
+        .await?
+        .is_some())
+}
+
 pub async fn run_scheduler(config: Config) -> anyhow::Result<()> {
     cron::scheduler::run(config).await
 }

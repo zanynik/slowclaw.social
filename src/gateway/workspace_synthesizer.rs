@@ -368,7 +368,7 @@ const WORKSPACE_SYNTH_SKILL_SPECS: [WorkspaceSynthSkillSpec; 14] = [
         output_prefix: "posts/bluesky_insight_posts/",
         handler_kind: WorkspaceSynthSkillHandlerKind::DirectPostOutput,
         enabled_by_default: false,
-        visible_in_ui: true,
+        visible_in_ui: false,
     },
     WorkspaceSynthSkillSpec {
         key: "weekly_highlights",
@@ -377,7 +377,7 @@ const WORKSPACE_SYNTH_SKILL_SPECS: [WorkspaceSynthSkillSpec; 14] = [
         output_prefix: "posts/weekly_highlights/",
         handler_kind: WorkspaceSynthSkillHandlerKind::DirectPostOutput,
         enabled_by_default: false,
-        visible_in_ui: true,
+        visible_in_ui: false,
     },
     WorkspaceSynthSkillSpec {
         key: article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY,
@@ -386,7 +386,7 @@ const WORKSPACE_SYNTH_SKILL_SPECS: [WorkspaceSynthSkillSpec; 14] = [
         output_prefix: "posts/articles/",
         handler_kind: WorkspaceSynthSkillHandlerKind::ArticleHandoff,
         enabled_by_default: false,
-        visible_in_ui: true,
+        visible_in_ui: false,
     },
     WorkspaceSynthSkillSpec {
         key: "audio_insight_clips",
@@ -395,7 +395,7 @@ const WORKSPACE_SYNTH_SKILL_SPECS: [WorkspaceSynthSkillSpec; 14] = [
         output_prefix: "posts/audio_insight_clips/",
         handler_kind: WorkspaceSynthSkillHandlerKind::DirectMediaOutput,
         enabled_by_default: false,
-        visible_in_ui: true,
+        visible_in_ui: false,
     },
 ];
 
@@ -918,6 +918,16 @@ fn default_skill_visible_in_ui() -> bool {
     true
 }
 
+fn is_retired_workspace_synth_skill_key(skill_key: &str) -> bool {
+    matches!(
+        skill_key.trim(),
+        "bluesky_insight_posts"
+            | "weekly_highlights"
+            | "audio_insight_clips"
+            | article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY
+    )
+}
+
 pub fn manifest_schema_json() -> Result<String> {
     let schema = schema_for!(WorkspaceSynthesisManifest);
     serde_json::to_string_pretty(&schema).context("failed to serialize workspace synthesis schema")
@@ -1050,12 +1060,18 @@ fn normalize_skill_record(skill_key: &str, mut record: WorkspaceSynthSkillRecord
     record.output_prefix = normalize_skill_output_prefix(&record.output_prefix, skill_key);
     record.goal = record.goal.trim().to_string();
     record.artifact_rules_override = record.artifact_rules_override.trim().to_string();
-    record.visible_in_ui = record.visible_in_ui || default_skill_visible_in_ui();
     if let Some(spec) = skill_spec_by_key(skill_key) {
         record.handler_kind = spec.handler_kind;
+        record.visible_in_ui = spec.visible_in_ui;
         if record.goal.is_empty() {
             record.goal = spec.goal.to_string();
         }
+    } else {
+        record.visible_in_ui = record.visible_in_ui || default_skill_visible_in_ui();
+    }
+    if is_retired_workspace_synth_skill_key(skill_key) {
+        record.visible_in_ui = false;
+        record.enabled = false;
     }
     record
 }

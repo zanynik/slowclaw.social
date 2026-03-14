@@ -436,6 +436,7 @@ export type PersonalizedFeedItem = {
     description?: string | null;
     matchedInterestLabel?: string | null;
     matchedInterestScore?: number | null;
+    sourceScore?: number | null;
   } | null;
   score?: number | null;
   matchedInterestLabel?: string | null;
@@ -460,6 +461,31 @@ export type PersonalizedFeedResponse = {
   message?: string;
   refreshState: "fresh" | "refreshing" | "stale" | "warming" | string;
   refreshedAt?: string | null;
+  refreshStatus?: string;
+  lastError?: string | null;
+  selectedSources: Array<{
+    protocol: string;
+    key: string;
+    label: string;
+    score: number;
+    description?: string | null;
+    matchedInterestLabel?: string | null;
+    matchedInterestScore?: number | null;
+    metadata?: any;
+  }>;
+};
+
+export type WorldFeedInterestItem = {
+  id: string;
+  label: string;
+  sourcePath: string;
+  healthScore: number;
+  lastSeenAt: string;
+  createdAt: string;
+  updatedAt: string;
+  embeddingDimensions: number;
+  synthetic: boolean;
+  deletable: boolean;
 };
 
 export type WorkspaceSyncFile = {
@@ -590,7 +616,11 @@ export async function fetchPersonalizedFeed(
                 matchedInterestScore:
                   item?.feedSource?.matchedInterestScore == null
                     ? null
-                    : Number(item.feedSource.matchedInterestScore)
+                    : Number(item.feedSource.matchedInterestScore),
+                sourceScore:
+                  item?.feedSource?.sourceScore == null
+                    ? null
+                    : Number(item.feedSource.sourceScore)
               }
             : null,
           score: item?.score == null ? null : Number(item.score),
@@ -612,8 +642,93 @@ export async function fetchPersonalizedFeed(
     usedFallback: Boolean(data.usedFallback),
     message: typeof data.message === "string" ? data.message : undefined,
     refreshState: typeof data.refreshState === "string" ? data.refreshState : "warming",
-    refreshedAt: typeof data.refreshedAt === "string" ? data.refreshedAt : null
+    refreshedAt: typeof data.refreshedAt === "string" ? data.refreshedAt : null,
+    refreshStatus: typeof data.refreshStatus === "string" ? data.refreshStatus : undefined,
+    lastError: typeof data.lastError === "string" ? data.lastError : null,
+    selectedSources: Array.isArray(data.selectedSources)
+      ? data.selectedSources.map((item: any) => ({
+          protocol: String(item?.protocol || ""),
+          key: String(item?.key || ""),
+          label: String(item?.label || ""),
+          score: Number(item?.score || 0),
+          description: item?.description ? String(item.description) : null,
+          matchedInterestLabel: item?.matchedInterestLabel
+            ? String(item.matchedInterestLabel)
+            : null,
+          matchedInterestScore:
+            item?.matchedInterestScore == null ? null : Number(item.matchedInterestScore),
+          metadata: item?.metadata ?? null
+        }))
+      : []
   };
+}
+
+export async function listWorldFeedInterests(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<WorldFeedInterestItem[]> {
+  const res = await fetch(resolveGatewayEndpoint("/api/workspace/world-feed/interests", gatewayBaseUrl), {
+    headers: authHeaders(bearerToken)
+  });
+  const data = await parseJsonOrThrow(res);
+  const items = Array.isArray(data?.items) ? data.items : [];
+  return items.map((item: any) => ({
+    id: String(item?.id || ""),
+    label: String(item?.label || ""),
+    sourcePath: String(item?.sourcePath || ""),
+    healthScore: Number(item?.healthScore || 0),
+    lastSeenAt: String(item?.lastSeenAt || ""),
+    createdAt: String(item?.createdAt || ""),
+    updatedAt: String(item?.updatedAt || ""),
+    embeddingDimensions: Number(item?.embeddingDimensions || 0),
+    synthetic: Boolean(item?.synthetic),
+    deletable: Boolean(item?.deletable),
+  }));
+}
+
+export async function createWorldFeedDummyInterest(
+  label: string,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<WorldFeedInterestItem> {
+  const res = await fetch(resolveGatewayEndpoint("/api/workspace/world-feed/interests", gatewayBaseUrl), {
+    method: "POST",
+    headers: authHeaders(bearerToken, "application/json"),
+    body: JSON.stringify({ label })
+  });
+  const data = await parseJsonOrThrow(res);
+  const item = data?.item || {};
+  return {
+    id: String(item?.id || ""),
+    label: String(item?.label || ""),
+    sourcePath: String(item?.sourcePath || ""),
+    healthScore: Number(item?.healthScore || 0),
+    lastSeenAt: String(item?.lastSeenAt || ""),
+    createdAt: String(item?.createdAt || ""),
+    updatedAt: String(item?.updatedAt || ""),
+    embeddingDimensions: Number(item?.embeddingDimensions || 0),
+    synthetic: Boolean(item?.synthetic),
+    deletable: Boolean(item?.deletable),
+  };
+}
+
+export async function deleteWorldFeedInterest(
+  interestId: string,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+) {
+  const trimmed = interestId.trim();
+  if (!trimmed) {
+    throw new Error("Interest id is required");
+  }
+  const res = await fetch(
+    resolveGatewayEndpoint(`/api/workspace/world-feed/interests/${encodeURIComponent(trimmed)}`, gatewayBaseUrl),
+    {
+      method: "DELETE",
+      headers: authHeaders(bearerToken)
+    }
+  );
+  return parseJsonOrThrow(res);
 }
 
 export async function exportWorkspaceSyncSnapshot(

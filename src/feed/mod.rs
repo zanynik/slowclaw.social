@@ -20,12 +20,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use uuid::Uuid;
 
 pub use traits::FeedSource;
 
 pub const WORLD_FEED_KEY: &str = "world";
 
 const WORLD_FEED_CACHE_TTL_SECS: i64 = 5 * 60;
+const WORLD_FEED_COLD_START_SYNC_TIMEOUT_SECS: u64 = 8;
 const FEED_PROFILE_MAX_CHARS: usize = 2_400;
 const FEED_EMBED_BATCH_SIZE: usize = 16;
 const FEED_MATCH_THRESHOLD: f32 = 0.62;
@@ -58,6 +60,7 @@ const NOSTR_LOOKBACK_SECS: u64 = 7 * 24 * 60 * 60;
 const NOSTR_RELAY_METADATA_TIMEOUT_SECS: u64 = 5;
 const NOSTR_RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 const NOSTR_EVENT_FETCH_TIMEOUT_SECS: u64 = 8;
+const NOSTR_PRIMAL_FALLBACK_RELAY: &str = "wss://relay.primal.net";
 const WEB_SEARCH_RESULT_LIMIT_PER_QUERY: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +104,7 @@ pub struct FeedSourceContext {
     pub description: Option<String>,
     pub matched_interest_label: Option<String>,
     pub matched_interest_score: Option<f32>,
+    pub source_score: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +143,9 @@ pub struct PersonalizedFeedResponse {
     pub message: Option<String>,
     pub refresh_state: String,
     pub refreshed_at: Option<String>,
+    pub refresh_status: String,
+    pub last_error: Option<String>,
+    pub selected_sources: Vec<SelectedSource>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +161,27 @@ pub struct FeedProfile {
     pub status: String,
     pub stats: InterestProfileStats,
     pub interests: Vec<InterestVector>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedInterestDiagnosticItem {
+    pub id: String,
+    pub label: String,
+    pub source_path: String,
+    pub health_score: f64,
+    pub last_seen_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub embedding_dimensions: usize,
+    pub synthetic: bool,
+    pub deletable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedInterestDiagnosticsResponse {
+    pub items: Vec<FeedInterestDiagnosticItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +207,8 @@ pub struct FeedCandidate {
     pub item: PersonalizedFeedItem,
     pub original_index: usize,
 }
+
+const WORLD_FEED_SYNTHETIC_INTEREST_PREFIX: &str = "state/world_feed_diagnostics/dummy/";
 
 #[derive(Debug, Clone)]
 struct ActiveInterest {
@@ -230,6 +260,7 @@ impl BlueskyCandidateSource {
                 description: None,
                 matched_interest_label: None,
                 matched_interest_score: None,
+                source_score: Some(0.18),
             }),
             stage1_score: 0.18,
         }
@@ -246,6 +277,7 @@ impl BlueskyCandidateSource {
                 description: None,
                 matched_interest_label: None,
                 matched_interest_score: None,
+                source_score: Some(0.2),
             }),
             stage1_score: 0.2,
         }
@@ -257,6 +289,38 @@ impl BlueskyCandidateSource {
             BlueskyCandidateSourceEndpoint::FeedGenerator { uri } => format!("feed:{uri}"),
         }
     }
+}
+
+fn fallback_bluesky_selected_sources() -> Vec<SelectedSource> {
+    vec![
+        SelectedSource {
+            protocol: FeedProtocol::Bluesky,
+            key: "home".to_string(),
+            label: "Home timeline".to_string(),
+            stage1_score: 0.18,
+            description: Some(
+                "Fallback Bluesky home timeline while interest-matched feeds warm up.".to_string(),
+            ),
+            matched_interest_label: None,
+            matched_interest_score: None,
+            metadata_json: serde_json::json!({}),
+        },
+        SelectedSource {
+            protocol: FeedProtocol::Bluesky,
+            key: format!("feed:{BLUESKY_DISCOVER_FEED_URI}"),
+            label: "Discover".to_string(),
+            stage1_score: 0.2,
+            description: Some(
+                "Fallback Bluesky Discover feed while personalized feed matching warms up."
+                    .to_string(),
+            ),
+            matched_interest_label: None,
+            matched_interest_score: None,
+            metadata_json: serde_json::json!({
+                "uri": BLUESKY_DISCOVER_FEED_URI,
+            }),
+        },
+    ]
 }
 
 #[derive(Debug, Clone)]
@@ -344,9 +408,55 @@ impl FeedRanker {
         if has_strong_match {
             ranked_items.retain(|candidate| candidate.item.passed_threshold);
         }
-        ranked_items.truncate(limit);
+        ranked_items = interleave_ranked_candidates_by_source(ranked_items, limit);
         Ok(ranked_items.into_iter().map(|candidate| candidate.item).collect())
     }
+}
+
+fn interleave_ranked_candidates_by_source(
+    ranked_items: Vec<RankedCandidate>,
+    limit: usize,
+) -> Vec<RankedCandidate> {
+    if ranked_items.len() <= 2 {
+        return ranked_items.into_iter().take(limit).collect();
+    }
+
+    let mut buckets: Vec<(String, Vec<RankedCandidate>)> = Vec::new();
+    for candidate in ranked_items {
+        let source_key = candidate_source_mix_key(&candidate.item);
+        if let Some((_, bucket)) = buckets.iter_mut().find(|(key, _)| key == &source_key) {
+            bucket.push(candidate);
+        } else {
+            buckets.push((source_key, vec![candidate]));
+        }
+    }
+
+    if buckets.len() <= 1 {
+        return buckets
+            .into_iter()
+            .flat_map(|(_, bucket)| bucket)
+            .take(limit)
+            .collect();
+    }
+
+    let mut interleaved = Vec::new();
+    loop {
+        let mut advanced = false;
+        for (_, bucket) in &mut buckets {
+            if bucket.is_empty() {
+                continue;
+            }
+            interleaved.push(bucket.remove(0));
+            advanced = true;
+            if interleaved.len() >= limit {
+                return interleaved;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    interleaved
 }
 
 pub fn mark_world_feed_dirty(workspace_dir: &Path) -> Result<()> {
@@ -359,22 +469,34 @@ pub async fn load_world_feed(
     limit: usize,
 ) -> Result<PersonalizedFeedResponse> {
     let workspace_dir = &config.workspace_dir;
-    let state = local_store::get_personalized_feed_state(workspace_dir, WORLD_FEED_KEY)?
-        .unwrap_or_else(default_feed_state_record);
-    let cache_records = local_store::list_personalized_feed_cache(workspace_dir, WORLD_FEED_KEY, limit)?;
-    let cached_items = deserialize_cached_items(&cache_records);
-    let cache_exists = !cached_items.is_empty();
-    let inflight = world_feed_refresh_inflight()
-        .lock()
-        .contains(workspace_dir);
-    let refresh_state = compute_refresh_state(cache_exists, &state, inflight);
     let embeddings_disabled = config
         .memory
         .embedding_provider
         .trim()
         .eq_ignore_ascii_case("none");
+    let mut state = local_store::get_personalized_feed_state(workspace_dir, WORLD_FEED_KEY)?
+        .unwrap_or_else(default_feed_state_record);
+    let mut cache_records =
+        local_store::list_personalized_feed_cache(workspace_dir, WORLD_FEED_KEY, limit)?;
+    let mut cached_items = deserialize_cached_items(&cache_records);
+    let mut cache_exists = !cached_items.is_empty();
+    let mut inflight = world_feed_refresh_inflight().lock().contains(workspace_dir);
+    let mut refresh_state = compute_refresh_state(cache_exists, &state, inflight);
+
     if should_refresh_world_feed(cache_exists, &state, inflight) && !embeddings_disabled {
-        spawn_world_feed_refresh(config.clone(), bluesky_auth.clone());
+        if !cache_exists && !inflight {
+            prime_world_feed_refresh(config.clone(), bluesky_auth.clone()).await;
+            state = local_store::get_personalized_feed_state(workspace_dir, WORLD_FEED_KEY)?
+                .unwrap_or_else(default_feed_state_record);
+            cache_records =
+                local_store::list_personalized_feed_cache(workspace_dir, WORLD_FEED_KEY, limit)?;
+            cached_items = deserialize_cached_items(&cache_records);
+            cache_exists = !cached_items.is_empty();
+            inflight = world_feed_refresh_inflight().lock().contains(workspace_dir);
+            refresh_state = compute_refresh_state(cache_exists, &state, inflight);
+        } else {
+            spawn_world_feed_refresh(config.clone(), bluesky_auth.clone());
+        }
     }
 
     let profile_status = if !state.profile_status.trim().is_empty() {
@@ -387,7 +509,14 @@ pub async fn load_world_feed(
         "warming".to_string()
     };
     let profile_stats = parse_profile_stats(&state.profile_stats_json);
+    let selected_sources = parse_selected_sources(&state.details_json);
     let refreshed_at = non_empty_string(state.refreshed_at.clone());
+    let last_error = non_empty_string(state.last_error.clone());
+    let refresh_status = if state.refresh_status.trim().is_empty() {
+        "idle".to_string()
+    } else {
+        state.refresh_status.clone()
+    };
 
     if cache_exists {
         return Ok(PersonalizedFeedResponse {
@@ -404,6 +533,9 @@ pub async fn load_world_feed(
             ),
             refresh_state,
             refreshed_at,
+            refresh_status,
+            last_error,
+            selected_sources,
         });
     }
 
@@ -440,29 +572,68 @@ pub async fn load_world_feed(
         ),
         refresh_state,
         refreshed_at,
+        refresh_status,
+        last_error,
+        selected_sources,
     })
 }
 
 fn spawn_world_feed_refresh(config: Config, bluesky_auth: Option<BlueskyAuth>) {
     let workspace_dir = config.workspace_dir.clone();
-    {
-        let mut inflight = world_feed_refresh_inflight().lock();
-        if !inflight.insert(workspace_dir.clone()) {
-            return;
-        }
+    if !begin_world_feed_refresh(&workspace_dir) {
+        return;
     }
-
-    mark_world_feed_refreshing(&workspace_dir);
     tokio::spawn(async move {
         let refresh_result = refresh_world_feed(config, bluesky_auth).await;
         if let Err(err) = refresh_result {
             tracing::warn!("Failed to refresh world feed: {err}");
             record_world_feed_refresh_error(&workspace_dir, &err.to_string());
         }
-        world_feed_refresh_inflight()
-            .lock()
-            .remove(&workspace_dir);
+        finish_world_feed_refresh(&workspace_dir);
     });
+}
+
+async fn prime_world_feed_refresh(config: Config, bluesky_auth: Option<BlueskyAuth>) {
+    let workspace_dir = config.workspace_dir.clone();
+    if !begin_world_feed_refresh(&workspace_dir) {
+        return;
+    }
+
+    match tokio::time::timeout(
+        Duration::from_secs(WORLD_FEED_COLD_START_SYNC_TIMEOUT_SECS),
+        refresh_world_feed(config.clone(), bluesky_auth.clone()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            finish_world_feed_refresh(&workspace_dir);
+        }
+        Ok(Err(err)) => {
+            tracing::warn!("Failed to prime world feed: {err}");
+            record_world_feed_refresh_error(&workspace_dir, &err.to_string());
+            finish_world_feed_refresh(&workspace_dir);
+        }
+        Err(_) => {
+            finish_world_feed_refresh(&workspace_dir);
+            spawn_world_feed_refresh(config, bluesky_auth);
+        }
+    }
+}
+
+fn begin_world_feed_refresh(workspace_dir: &Path) -> bool {
+    let mut inflight = world_feed_refresh_inflight().lock();
+    if !inflight.insert(workspace_dir.to_path_buf()) {
+        return false;
+    }
+    drop(inflight);
+    mark_world_feed_refreshing(workspace_dir);
+    true
+}
+
+fn finish_world_feed_refresh(workspace_dir: &Path) {
+    world_feed_refresh_inflight()
+        .lock()
+        .remove(workspace_dir);
 }
 
 async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -> Result<()> {
@@ -721,6 +892,21 @@ fn parse_profile_stats(raw: &str) -> InterestProfileStats {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
+fn parse_selected_sources(raw: &str) -> Vec<SelectedSource> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let items = value
+        .get("selectedSources")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value::<SelectedSource>(item).ok())
+        .collect()
+}
+
 fn deserialize_cached_items(
     records: &[local_store::PersonalizedFeedCacheRecord],
 ) -> Vec<PersonalizedFeedItem> {
@@ -807,6 +993,10 @@ fn selected_source_summary(source: &SelectedSource) -> serde_json::Value {
         "key": source.key,
         "label": source.label,
         "score": source.stage1_score,
+        "description": source.description,
+        "matchedInterestLabel": source.matched_interest_label,
+        "matchedInterestScore": source.matched_interest_score,
+        "metadata": source.metadata_json,
     })
 }
 
@@ -838,6 +1028,7 @@ fn build_recent_content_fallback(workspace_dir: &Path, limit: usize) -> Result<V
                     description: Some(format!("RSS/Atom source from {}", item.domain)),
                     matched_interest_label: None,
                     matched_interest_score: None,
+                    source_score: None,
                 }),
                 score: None,
                 matched_interest_label: None,
@@ -870,6 +1061,42 @@ fn configured_nostr_world_feed_relays(config: &Config) -> Vec<String> {
             }
             seen.insert(lower)
         })
+        .collect()
+}
+
+fn fallback_nostr_world_feed_relays(config: &Config) -> Vec<String> {
+    let mut relays = configured_nostr_world_feed_relays(config);
+    if !relays
+        .iter()
+        .any(|relay| relay.eq_ignore_ascii_case(NOSTR_PRIMAL_FALLBACK_RELAY))
+    {
+        relays.insert(0, NOSTR_PRIMAL_FALLBACK_RELAY.to_string());
+    }
+    relays.truncate(NOSTR_SELECTED_RELAY_LIMIT.max(1));
+    relays
+}
+
+fn fallback_nostr_selected_source(relay_url: &str) -> SelectedSource {
+    let relay_http_url = nostr_relay_http_url(relay_url).unwrap_or_default();
+    SelectedSource {
+        protocol: FeedProtocol::Nostr,
+        key: relay_url.to_string(),
+        label: nostr_relay_label(relay_url, None),
+        stage1_score: 0.2,
+        description: Some("Fallback Nostr relay while interest-matched relays warm up.".to_string()),
+        matched_interest_label: None,
+        matched_interest_score: None,
+        metadata_json: serde_json::json!({
+            "relayUrl": relay_url,
+            "domain": resolve_feed_web_domain(&relay_http_url).unwrap_or_default(),
+        }),
+    }
+}
+
+fn fallback_nostr_selected_sources(config: &Config) -> Vec<SelectedSource> {
+    fallback_nostr_world_feed_relays(config)
+        .into_iter()
+        .map(|relay| fallback_nostr_selected_source(&relay))
         .collect()
 }
 
@@ -1040,6 +1267,95 @@ fn non_empty_string(value: String) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn is_synthetic_interest_source(source_path: &str) -> bool {
+    source_path
+        .trim()
+        .starts_with(WORLD_FEED_SYNTHETIC_INTEREST_PREFIX)
+}
+
+fn feed_interest_to_diagnostic(
+    record: local_store::FeedInterestRecord,
+) -> FeedInterestDiagnosticItem {
+    FeedInterestDiagnosticItem {
+        id: record.id,
+        label: record.label,
+        source_path: record.source_path.clone(),
+        health_score: record.health_score,
+        last_seen_at: record.last_seen_at,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        embedding_dimensions: bytes_to_vec(&record.embedding).len(),
+        synthetic: is_synthetic_interest_source(&record.source_path),
+        deletable: is_synthetic_interest_source(&record.source_path),
+    }
+}
+
+pub fn list_world_feed_interest_diagnostics(
+    config: &Config,
+) -> Result<FeedInterestDiagnosticsResponse> {
+    let items = local_store::list_feed_interests(&config.workspace_dir)?
+        .into_iter()
+        .map(feed_interest_to_diagnostic)
+        .collect();
+    Ok(FeedInterestDiagnosticsResponse { items })
+}
+
+pub async fn create_dummy_world_feed_interest(
+    config: &Config,
+    label: &str,
+) -> Result<FeedInterestDiagnosticItem> {
+    let normalized_label = label.trim();
+    if normalized_label.is_empty() {
+        anyhow::bail!("Interest label is required");
+    }
+    let embedder = resolve_feed_embedder(config)
+        .await?
+        .0
+        .context("Configured embedding provider is unavailable.")?;
+    let embedding = embedder
+        .embed_one(normalized_label)
+        .await
+        .context("Failed to embed dummy world-feed interest.")?;
+    if embedding.is_empty() {
+        anyhow::bail!("Dummy world-feed interest embedding was empty.");
+    }
+    let now = Utc::now().to_rfc3339();
+    let source_path = format!(
+        "{WORLD_FEED_SYNTHETIC_INTEREST_PREFIX}{}.md",
+        Uuid::new_v4().simple()
+    );
+    let record = local_store::upsert_feed_interest(
+        &config.workspace_dir,
+        &local_store::FeedInterestUpsert {
+            id: None,
+            label: normalized_label.to_string(),
+            source_path,
+            embedding: vec_to_bytes(&embedding),
+            health_score: 0.72,
+            last_seen_at: now,
+        },
+    )?;
+    mark_world_feed_dirty(&config.workspace_dir)?;
+    Ok(feed_interest_to_diagnostic(record))
+}
+
+pub fn delete_dummy_world_feed_interest(config: &Config, interest_id: &str) -> Result<bool> {
+    let interest = local_store::list_feed_interests(&config.workspace_dir)?
+        .into_iter()
+        .find(|item| item.id == interest_id);
+    let Some(interest) = interest else {
+        return Ok(false);
+    };
+    if !is_synthetic_interest_source(&interest.source_path) {
+        anyhow::bail!("Only synthetic diagnostic world-feed interests can be deleted.");
+    }
+    let deleted = local_store::delete_feed_interest(&config.workspace_dir, interest_id)?;
+    if deleted {
+        mark_world_feed_dirty(&config.workspace_dir)?;
+    }
+    Ok(deleted)
 }
 
 async fn select_feed_embedder(config: &Config) -> Result<Option<SharedEmbedder>> {
@@ -1463,14 +1779,12 @@ impl FeedSource for BlueskyFeedSource {
             .collect();
         let embeddings = embed_text_batch(self.embedder.clone(), &search_texts).await?;
         let mut ranked = Vec::new();
+        let mut weak_matches = Vec::new();
         for (generator, embedding) in generators.into_iter().zip(embeddings.into_iter()) {
             let (weighted_score, similarity, matched_label) =
                 best_interest_match(&embedding, &profile.interests);
-            if weighted_score < BLUESKY_FEED_SOURCE_MATCH_THRESHOLD {
-                continue;
-            }
             let label = bluesky_feed_generator_label(&generator);
-            ranked.push(SelectedSource {
+            let selected = SelectedSource {
                 protocol: FeedProtocol::Bluesky,
                 key: format!("feed:{}", generator.uri),
                 label: label.clone(),
@@ -1486,7 +1800,12 @@ impl FeedSource for BlueskyFeedSource {
                     "uri": generator.uri,
                     "creatorHandle": generator.creator_handle,
                 }),
-            });
+            };
+            if weighted_score >= BLUESKY_FEED_SOURCE_MATCH_THRESHOLD {
+                ranked.push(selected);
+            } else {
+                weak_matches.push(selected);
+            }
         }
         ranked.sort_by(|left, right| {
             right
@@ -1494,8 +1813,25 @@ impl FeedSource for BlueskyFeedSource {
                 .partial_cmp(&left.stage1_score)
                 .unwrap_or(Ordering::Equal)
         });
-        ranked.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT);
-        Ok(ranked)
+        if !ranked.is_empty() {
+            ranked.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT);
+            return Ok(ranked);
+        }
+
+        weak_matches.sort_by(|left, right| {
+            right
+                .stage1_score
+                .partial_cmp(&left.stage1_score)
+                .unwrap_or(Ordering::Equal)
+        });
+        if !weak_matches.is_empty() {
+            weak_matches.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT.min(2));
+            append_selected_sources_unique(&mut weak_matches, fallback_bluesky_selected_sources());
+            weak_matches.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT);
+            return Ok(weak_matches);
+        }
+
+        Ok(fallback_bluesky_selected_sources())
     }
 
     async fn fetch_candidates(
@@ -1592,7 +1928,7 @@ impl FeedSource for NostrFeedSource {
     async fn discover_sources(&self, profile: &FeedProfile) -> Result<Vec<SelectedSource>> {
         let relay_urls = configured_nostr_world_feed_relays(&self.config);
         if relay_urls.is_empty() {
-            return Ok(Vec::new());
+            return Ok(fallback_nostr_selected_sources(&self.config));
         }
 
         let mut relay_metadata = Vec::new();
@@ -1645,8 +1981,11 @@ impl FeedSource for NostrFeedSource {
             strong_matches.truncate(NOSTR_SELECTED_RELAY_LIMIT);
             return Ok(strong_matches);
         }
-        ranked.truncate(NOSTR_SELECTED_RELAY_LIMIT);
-        Ok(ranked)
+        if !ranked.is_empty() {
+            ranked.truncate(NOSTR_SELECTED_RELAY_LIMIT);
+            return Ok(ranked);
+        }
+        Ok(fallback_nostr_selected_sources(&self.config))
     }
 
     async fn fetch_candidates(
@@ -1726,6 +2065,7 @@ impl FeedSource for NostrFeedSource {
                             description: selected.description.clone(),
                             matched_interest_label: selected.matched_interest_label.clone(),
                             matched_interest_score: selected.matched_interest_score,
+                            source_score: Some(selected.stage1_score),
                         }),
                         score: None,
                         matched_interest_label: None,
@@ -1887,6 +2227,7 @@ impl FeedSource for RssFeedSource {
                         description: selected.description.clone(),
                         matched_interest_label: selected.matched_interest_label.clone(),
                         matched_interest_score: selected.matched_interest_score,
+                        source_score: Some(selected.stage1_score),
                     }),
                     score: None,
                     matched_interest_label: None,
@@ -2347,6 +2688,7 @@ async fn collect_web_search_augmented_candidates(
                         description: source.description.clone(),
                         matched_interest_label: source.matched_interest_label.clone(),
                         matched_interest_score: source.matched_interest_score,
+                        source_score: Some(source.stage1_score),
                     }),
                     score: None,
                     matched_interest_label: None,
@@ -2432,6 +2774,18 @@ fn rank_candidate_cmp(left: &RankedCandidate, right: &RankedCandidate) -> Orderi
     left.original_index.cmp(&right.original_index)
 }
 
+fn candidate_source_mix_key(item: &PersonalizedFeedItem) -> String {
+    if let Some(label) = item
+        .feed_source
+        .as_ref()
+        .map(|source| source.label.trim())
+        .filter(|label| !label.is_empty())
+    {
+        return label.to_ascii_lowercase();
+    }
+    item.source_type.trim().to_ascii_lowercase()
+}
+
 fn item_sort_timestamp(item: &PersonalizedFeedItem) -> &str {
     if let Some(discovered_at) = item
         .web_preview
@@ -2492,6 +2846,7 @@ fn selected_source_to_bluesky_source(source: &SelectedSource) -> Option<BlueskyC
                 description: source.description.clone(),
                 matched_interest_label: source.matched_interest_label.clone(),
                 matched_interest_score: source.matched_interest_score,
+                source_score: Some(source.stage1_score),
             }),
             stage1_score: source.stage1_score,
         });
@@ -2510,6 +2865,7 @@ fn selected_source_to_bluesky_source(source: &SelectedSource) -> Option<BlueskyC
             description: source.description.clone(),
             matched_interest_label: source.matched_interest_label.clone(),
             matched_interest_score: source.matched_interest_score,
+            source_score: Some(source.stage1_score),
         }),
         stage1_score: source.stage1_score,
     })
@@ -2522,6 +2878,19 @@ fn append_unique_bluesky_sources(
     let mut seen: HashSet<String> = target.iter().map(BlueskyCandidateSource::endpoint_key).collect();
     for source in extra {
         if seen.insert(source.endpoint_key()) {
+            target.push(source);
+        }
+    }
+}
+
+fn append_selected_sources_unique(target: &mut Vec<SelectedSource>, extra: Vec<SelectedSource>) {
+    let mut seen: HashSet<String> = target
+        .iter()
+        .map(|source| format!("{:?}:{}", source.protocol, source.key))
+        .collect();
+    for source in extra {
+        let key = format!("{:?}:{}", source.protocol, source.key);
+        if seen.insert(key) {
             target.push(source);
         }
     }
@@ -3108,11 +3477,50 @@ mod tests {
                 description: Some("Systems programming".into()),
                 matched_interest_label: Some("Rust systems".into()),
                 matched_interest_score: Some(0.91),
+                source_score: Some(0.77),
             }),
             score: Some(0.88),
             matched_interest_label: Some("Rust systems".into()),
             matched_interest_score: Some(0.91),
             passed_threshold: true,
+        }
+    }
+
+    fn ranked_candidate_for_test(
+        url: &str,
+        source_label: &str,
+        score: f32,
+        original_index: usize,
+    ) -> RankedCandidate {
+        RankedCandidate {
+            dedupe_key: url.to_string(),
+            item: PersonalizedFeedItem {
+                source_type: "web".into(),
+                feed_item: serde_json::json!({ "url": url }),
+                web_preview: Some(WebFeedPreview {
+                    url: url.to_string(),
+                    title: source_label.to_string(),
+                    description: "Example description".into(),
+                    image_url: None,
+                    domain: "example.com".into(),
+                    provider: "RSS/Atom".into(),
+                    provider_snippet: None,
+                    discovered_at: "2026-03-13T10:00:00Z".into(),
+                }),
+                feed_source: Some(FeedSourceContext {
+                    label: source_label.to_string(),
+                    description: None,
+                    matched_interest_label: None,
+                    matched_interest_score: None,
+                    source_score: Some(score),
+                }),
+                score: Some(score),
+                matched_interest_label: None,
+                matched_interest_score: None,
+                passed_threshold: true,
+            },
+            original_index,
+            score,
         }
     }
 
@@ -3296,6 +3704,23 @@ mod tests {
         assert!(sources.iter().any(|source| matches!(source.endpoint, BlueskyCandidateSourceEndpoint::HomeTimeline)));
     }
 
+    #[test]
+    fn fallback_bluesky_selected_sources_include_home_and_discover() {
+        let sources = fallback_bluesky_selected_sources();
+        assert!(sources.iter().any(|source| source.key == "home"));
+        assert!(sources
+            .iter()
+            .any(|source| source.key == format!("feed:{BLUESKY_DISCOVER_FEED_URI}")));
+    }
+
+    #[test]
+    fn fallback_nostr_selected_sources_include_primal() {
+        let sources = fallback_nostr_selected_sources(&Config::default());
+        assert!(sources
+            .iter()
+            .any(|source| source.key.eq_ignore_ascii_case(NOSTR_PRIMAL_FALLBACK_RELAY)));
+    }
+
     #[tokio::test]
     async fn feed_ranker_batches_and_preserves_input_order_for_ties() {
         let profile = test_profile();
@@ -3413,6 +3838,21 @@ mod tests {
         assert_eq!(items[0].matched_interest_label.as_deref(), Some("Rust systems"));
         assert_eq!(items[0].passed_threshold, false);
         assert!(items[0].score.unwrap_or_default() > 0.0);
+    }
+
+    #[test]
+    fn interleave_ranked_candidates_by_source_rotates_sources() {
+        let ranked = vec![
+            ranked_candidate_for_test("https://example.com/a1", "Alpha", 0.95, 0),
+            ranked_candidate_for_test("https://example.com/a2", "Alpha", 0.94, 1),
+            ranked_candidate_for_test("https://example.com/b1", "Beta", 0.93, 2),
+            ranked_candidate_for_test("https://example.com/b2", "Beta", 0.92, 3),
+        ];
+        let items = interleave_ranked_candidates_by_source(ranked, 4);
+        assert_eq!(items[0].item.feed_source.as_ref().unwrap().label, "Alpha");
+        assert_eq!(items[1].item.feed_source.as_ref().unwrap().label, "Beta");
+        assert_eq!(items[2].item.feed_source.as_ref().unwrap().label, "Alpha");
+        assert_eq!(items[3].item.feed_source.as_ref().unwrap().label, "Beta");
     }
 
     #[test]

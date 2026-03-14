@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>slowclaw.social | Reclaim the Internet</title>
+  <meta name="description"
+    content="A revolutionary journaling and social media curation app. Journal in peace, let local AI curate your voice, and consume feeds aligned with your deep interests.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Inter:wght@300;400;500;600&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-glow bg-glow-a" aria-hidden="true"></div>
+  <div class="bg-glow bg-glow-b" aria-hidden="true"></div>
+  <div class="bg-glow bg-glow-c" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <nav class="nav shell">
+      <a class="brand" href="#top" aria-label="slowclaw.social home">
+        <div class="brand-mark">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+          </svg>
+        </div>
+        <span>slowclaw.social</span>
+      </a>
+      <div class="nav-links">
+        <a href="#journaling">Journal</a>
+        <a href="#ai-curation">AI Output</a>
+        <a href="#feed">Consumption</a>
+      </div>
+      <a class="btn btn-glass" href="https://github.com/zanynik/slowclaw.social" target="_blank"
+        rel="noreferrer">Source</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero shell reveal">
+      <div class="hero-copy">
+        <p class="eyebrow">The Internet Is Not Dead</p>
+        <h1>Reclaim your voice from the algorithm.</h1>
+        <p class="lede">
+          Half the world has something to say and can't. The other half has nothing to say and keeps saying it.
+          <strong>slowclaw.social</strong> is your private sanctuary to journal organically, let local AI refine your
+          thoughts, and consume social media on your own terms.
+        </p>
+        <div class="hero-actions">
+          <a class="btn btn-accent" href="#journaling">Discover How</a>
+          <a class="btn btn-outline" href="https://github.com/zanynik/slowclaw.social">View on GitHub</a>
+        </div>
+        <ul class="hero-chips" aria-label="Key features">
+          <li>Private Workspace</li>
+          <li>Local AI Models</li>
+          <li>Personalized Vectors</li>
+          <li>No Engagement Farming</li>
+        </ul>
+      </div>
+
+      <div class="hero-panel terminal" aria-label="Example workspace output">
+        <div class="terminal-bar">
+          <div class="mac-dots">
+            <span></span><span></span><span></span>
+          </div>
+          <strong>workspace-agent</strong>
+        </div>
+        <pre><code>$ slowclaw --status
+
+[SYSTEM] Local AI models loaded
+[WORKSPACE] Secure private directory initialized
+[DATA] Vectorizing local journals...
+[INTEGRATION] Blue Sky feed connected
+
+Activating personalized experience...
+</code></pre>
+        <div class="terminal-feed" id="runFeed" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section class="section shell reveal" id="journaling">
+      <div class="section-head">
+        <p class="eyebrow">Phase 01: Input</p>
+        <h2>Journal in absolute peace.</h2>
+      </div>
+      <div class="feature-grid">
+        <article class="card glass-card">
+          <div class="icon-wrapper accent-gradient">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <line x1="16" y1="13" x2="8" y2="13"></line>
+              <line x1="16" y1="17" x2="8" y2="17"></line>
+              <line x1="10" y1="9" x2="8" y2="9"></line>
+            </svg>
+          </div>
+          <h3>Multimodal Logging</h3>
+          <p>
+            Whether it's an audio brain dump, a quick video diary, or a long-form text rant. Get your raw, unfiltered
+            thoughts out.
+          </p>
+        </article>
+
+        <article class="card glass-card">
+          <div class="icon-wrapper accent-gradient">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+            </svg>
+          </div>
+          <h3>100% Private</h3>
+          <p>
+            Everything is stored firmly on your laptop's workspace. No cloud syncs, no data scraping. Your thoughts are
+            yours alone.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section shell reveal" id="ai-curation">
+      <div class="section-head">
+        <p class="eyebrow">Phase 02: Output</p>
+        <h2>Let AI package your genius.</h2>
+        <p class="section-desc">You shouldn't have to be a copywriter to be heard. We handle the packaging, keeping your
+          exact tone.</p>
+      </div>
+
+      <div class="split-cards">
+        <article class="card glass-card highlight">
+          <h3>Effortless Content</h3>
+          <p>
+            Local AI models run over your journals to automatically generate tweet-style posts, long-form articles, and
+            edited video clips.
+          </p>
+          <ul class="feature-list">
+            <li>Preserves your unique speaking tone</li>
+            <li>Generates multiple format options</li>
+            <li>100% optional—you decide if and what to publish</li>
+          </ul>
+        </article>
+
+        <article class="card glass-card">
+          <h3>Break the Silence</h3>
+          <p>
+            Lower the barrier to entry for sharing meaningful insights. Replace the noise of engagement farmers with
+            real, profound human thoughts—yours.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section shell reveal" id="feed">
+      <div class="section-head">
+        <p class="eyebrow">Phase 03: Consumption</p>
+        <h2>Consume based on values, not virality.</h2>
+      </div>
+
+      <div class="steps dark-steps">
+        <article class="step-card glass-card">
+          <div class="step-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="2" y1="12" x2="22" y2="12"></line>
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z">
+              </path>
+            </svg>
+          </div>
+          <h3>Personal Vectors</h3>
+          <p>
+            The app vectorizes your private notes to deeply map your true interests—beyond surface-level clicks and
+            likes.
+          </p>
+        </article>
+
+        <article class="step-card glass-card">
+          <div class="step-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.21 15.89A10 10 0 1 1 8 2.83"></path>
+              <path d="M22 12A10 10 0 0 0 12 2v10z"></path>
+            </svg>
+          </div>
+          <h3>Connect Integrations</h3>
+          <p>
+            Link permissionless platforms like Blue Sky. Feed data streams directly to your local workspace for
+            processing.
+          </p>
+        </article>
+
+        <article class="step-card glass-card">
+          <div class="step-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="4" y1="21" x2="4" y2="14"></line>
+              <line x1="4" y1="10" x2="4" y2="3"></line>
+              <line x1="12" y1="21" x2="12" y2="12"></line>
+              <line x1="12" y1="8" x2="12" y2="3"></line>
+              <line x1="20" y1="21" x2="20" y2="16"></line>
+              <line x1="20" y1="12" x2="20" y2="3"></line>
+              <line x1="1" y1="14" x2="7" y2="14"></line>
+              <line x1="9" y1="8" x2="15" y2="8"></line>
+              <line x1="17" y1="16" x2="23" y2="16"></line>
+            </svg>
+          </div>
+          <h3>Intelligent Filtering</h3>
+          <p>
+            Your feed is curated by matching incoming content against your personal vectors. See what actually matters
+            to <em>you</em>.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section shell reveal" id="quickstart">
+      <div class="section-head">
+        <p class="eyebrow">Phase 04: Get Started</p>
+        <h2>Quick Start</h2>
+      </div>
+
+      <div class="split-cards">
+        <article class="card glass-card">
+          <h3>1. Prerequisites</h3>
+          <p>Required: Rust toolchain (<code>rustc</code>, <code>cargo</code>)</p>
+          <p>Optional (for rebuilding the web UI): Node.js 18+</p>
+        </article>
+
+        <article class="card glass-card">
+          <h3>2. Build</h3>
+          <pre style="background: rgba(0,0,0,0.3); padding: 1rem; border-radius: 8px;"><code>cargo build --release</code></pre>
+          <p>Binary path: <code>./target/release/slowclaw</code></p>
+        </article>
+
+        <article class="card glass-card">
+          <h3>3. Run</h3>
+          <pre style="background: rgba(0,0,0,0.3); padding: 1rem; border-radius: 8px;"><code>./target/release/slowclaw gateway</code></pre>
+          <p>Or for full scheduling + chat worker runtime:</p>
+          <pre style="background: rgba(0,0,0,0.3); padding: 1rem; border-radius: 8px;"><code>./target/release/slowclaw daemon</code></pre>
+        </article>
+
+        <article class="card glass-card highlight">
+          <h3>4. Coming Soon</h3>
+          <p>Native apps are currently in development to bring the full experience to your devices.</p>
+          <ul class="feature-list">
+            <li>Mac OS desktop .dmg</li>
+            <li>iOS App</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="site-footer shell">
+    <div>
+      <p class="footer-brand">slowclaw.social</p>
+      <p class="footer-copy">Reclaiming the internet, one journal at a time.</p>
+    </div>
+    <div class="footer-links">
+      <a href="https://github.com/zanynik/slowclaw.social" target="_blank" rel="noreferrer">GitHub</a>
+      <a href="#">Privacy Protocol</a>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+
+</html>

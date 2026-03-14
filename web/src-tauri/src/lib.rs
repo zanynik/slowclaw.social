@@ -420,48 +420,10 @@ fn extract_first_url(line: &str) -> Option<String> {
     None
 }
 
-fn openai_auth_is_configured_from_status_output(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("openai-codex")
-        && lower.contains("active profiles:")
-        && lower.contains("openai-codex:")
-}
-
-fn run_openai_auth_status_probe() -> Result<bool, String> {
-    let mut attempts: Vec<(String, Command)> = Vec::new();
-    if let Some(binary_path) = slowclaw_binary_next_to_current_exe() {
-        let mut command = Command::new(&binary_path);
-        command.args(["auth", "status"]);
-        attempts.push((binary_path.display().to_string(), command));
-    }
-    let mut command = Command::new("slowclaw");
-    command.args(["auth", "status"]);
-    attempts.push(("slowclaw".to_string(), command));
-
-    let workspace_dir = workspace_root_dir();
-    let mut fallback = Command::new("cargo");
-    fallback
-        .args(["run", "--quiet", "--bin", "slowclaw", "--", "auth", "status"])
-        .current_dir(workspace_dir);
-    attempts.push(("cargo run --bin slowclaw".to_string(), fallback));
-
-    let mut errors = Vec::new();
-    for (label, mut cmd) in attempts {
-        match cmd.output() {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if output.status.success() {
-                    return Ok(openai_auth_is_configured_from_status_output(&stdout));
-                }
-                errors.push(format!(
-                    "{label} exited with code {}",
-                    output.status.code().unwrap_or(-1)
-                ));
-            }
-            Err(err) => errors.push(format!("{label}: {err}")),
-        }
-    }
-    Err(format!("failed to check OpenAI auth status ({})", errors.join("; ")))
+async fn run_openai_auth_status_probe() -> Result<bool, String> {
+    zeroclaw::has_openai_codex_auth(None)
+        .await
+        .map_err(|err| format!("failed to check OpenAI auth status ({err})"))
 }
 
 fn update_openai_status_from_line(
@@ -970,7 +932,7 @@ fn open_external_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_openai_device_code_status(
+async fn get_openai_device_code_status(
     state: tauri::State<'_, OpenAiDeviceCodeState>,
 ) -> Result<OpenAiDeviceCodeStatus, String> {
     let current = snapshot_openai_status(&state.inner)?;
@@ -979,7 +941,7 @@ fn get_openai_device_code_status(
     }
 
     let mut next = current;
-    match run_openai_auth_status_probe() {
+    match run_openai_auth_status_probe().await {
         Ok(true) => {
             next.state = "authenticated".to_string();
             next.completed = true;
