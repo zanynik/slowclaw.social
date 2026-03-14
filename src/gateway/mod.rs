@@ -6239,8 +6239,8 @@ async fn handle_library_text(
             let rel = path
                 .strip_prefix(&workspace_dir)
                 .ok()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| query.path.clone());
+                .map(workspace_relative_display_path)
+                .unwrap_or_else(|| normalize_workspace_relative_path(&query.path));
             (StatusCode::OK, Json(serde_json::json!({"path": rel, "content": content}))).into_response()
         }
         Err(err) => frontend_internal_error_response(
@@ -6253,7 +6253,7 @@ async fn handle_library_text(
 }
 
 fn maybe_mark_world_feed_dirty_for_path(workspace_dir: &StdPath, rel_path: &str) {
-    if rel_path.trim_start_matches('/').starts_with("posts/") {
+    if normalize_workspace_relative_path(rel_path).starts_with("posts/") {
         let _ = crate::feed::mark_world_feed_dirty(workspace_dir);
     }
 }
@@ -6296,8 +6296,8 @@ async fn handle_library_save_text(
     let rel = path
         .strip_prefix(&workspace_dir)
         .ok()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or(body.path);
+        .map(workspace_relative_display_path)
+        .unwrap_or_else(|| normalize_workspace_relative_path(&body.path));
     maybe_mark_world_feed_dirty_for_path(&workspace_dir, &rel);
     (StatusCode::OK, Json(serde_json::json!({"ok": true, "path": rel}))).into_response()
 }
@@ -6310,7 +6310,7 @@ async fn handle_library_delete(
     if let Some(err) = pairing_auth_error(&state, &headers, "Library delete") {
         return err.into_response();
     }
-    let requested = body.path.trim().trim_start_matches('/').to_string();
+    let requested = normalize_workspace_relative_path(&body.path);
     if requested.is_empty() {
         return frontend_error_response(
             StatusCode::BAD_REQUEST,
@@ -6402,7 +6402,7 @@ async fn handle_journal_transcribe(
         return err.into_response();
     }
 
-    let requested = body.media_path.trim().trim_start_matches('/').to_string();
+    let requested = normalize_workspace_relative_path(&body.media_path);
     if requested.is_empty() {
         return frontend_error_response(
             StatusCode::BAD_REQUEST,
@@ -6567,7 +6567,7 @@ async fn handle_journal_transcribe_status(
         return err.into_response();
     }
 
-    let requested = query.media_path.trim().trim_start_matches('/').to_string();
+    let requested = normalize_workspace_relative_path(&query.media_path);
     if requested.is_empty() {
         return frontend_error_response(
             StatusCode::BAD_REQUEST,
@@ -6592,7 +6592,7 @@ async fn handle_journal_transcribe_stream(
         return err.into_response();
     }
 
-    let requested = query.media_path.trim().trim_start_matches('/').to_string();
+    let requested = normalize_workspace_relative_path(&query.media_path);
     if requested.is_empty() {
         return frontend_error_response(
             StatusCode::BAD_REQUEST,
@@ -6991,12 +6991,23 @@ fn text_journal_rel_path(title: &str) -> String {
     )
 }
 
+fn normalize_workspace_relative_path(requested: &str) -> String {
+    requested
+        .trim()
+        .trim_start_matches('/')
+        .replace('\\', "/")
+}
+
+fn workspace_relative_display_path(path: &StdPath) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 fn resolve_workspace_media_path(workspace_dir: &StdPath, requested: &str) -> Option<PathBuf> {
-    let trimmed = requested.trim_start_matches('/');
+    let trimmed = normalize_workspace_relative_path(requested);
     if trimmed.is_empty() {
         return None;
     }
-    let candidate = workspace_dir.join(trimmed);
+    let candidate = workspace_dir.join(&trimmed);
     let resolved = candidate.canonicalize().ok()?;
     if !resolved.starts_with(workspace_dir) {
         return None;
@@ -7009,11 +7020,11 @@ fn resolve_workspace_media_path(workspace_dir: &StdPath, requested: &str) -> Opt
 }
 
 fn resolve_workspace_text_path(workspace_dir: &StdPath, requested: &str) -> Option<PathBuf> {
-    let trimmed = requested.trim_start_matches('/');
+    let trimmed = normalize_workspace_relative_path(requested);
     if trimmed.is_empty() {
         return None;
     }
-    let candidate = workspace_dir.join(trimmed);
+    let candidate = workspace_dir.join(&trimmed);
     let parent = candidate.parent()?.to_path_buf();
     let parent_resolved = parent.canonicalize().unwrap_or(parent);
     if !parent_resolved.starts_with(workspace_dir) {
@@ -7150,7 +7161,7 @@ fn collect_library_items_recursive(
             }
         };
         let rel = match path.strip_prefix(workspace_dir) {
-            Ok(p) => p.to_string_lossy().to_string(),
+            Ok(p) => workspace_relative_display_path(p),
             Err(_) => continue,
         };
         let rel_lower = rel.to_ascii_lowercase();

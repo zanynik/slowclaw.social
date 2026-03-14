@@ -953,6 +953,8 @@ function App() {
   const loadedCaptionPathRef = useRef<string>("");
   const activeTranscriptionPollRef = useRef<Record<string, GatewayEventStreamHandle | undefined>>({});
   const selectedJournalPathRef = useRef<string>("");
+  const journalLoadRequestRef = useRef(0);
+  const openedJournalPathRef = useRef("");
   const mobileScannerVideoRef = useRef<HTMLVideoElement | null>(null);
   const mobileScannerStreamRef = useRef<MediaStream | null>(null);
   const mobileScannerRafRef = useRef<number | null>(null);
@@ -1405,6 +1407,8 @@ function App() {
       return;
     }
     setJournalSaveStatus("Saving journal note...");
+    const saveOriginPath = selectedJournalPathRef.current.trim();
+    const saveWasFreshDraft = !selectedJournalItem && !saveOriginPath;
     try {
       let resultPath = "";
       let nextSelectedPath = selectedJournalPath;
@@ -1483,8 +1487,13 @@ function App() {
       }
       holdJournalStatus("Saved");
       await refreshLibrary("journal");
-      if (nextSelectedPath) {
+      const currentSelectionPath = selectedJournalPathRef.current.trim();
+      const shouldRestoreSelection =
+        (saveWasFreshDraft && !currentSelectionPath) || currentSelectionPath === saveOriginPath;
+      if (shouldRestoreSelection && nextSelectedPath) {
+        selectedJournalPathRef.current = nextSelectedPath;
         setSelectedJournalPath(nextSelectedPath);
+        setSelectedJournalText(content);
       }
       void loadWorkspaceSynthStatus();
     } catch (error) {
@@ -1513,6 +1522,9 @@ function App() {
       await deleteLibraryItem(item.path, token || undefined, gatewayBaseUrl);
       setPendingDeleteJournalItem(null);
       if (selectedJournalPath === item.path) {
+        journalLoadRequestRef.current += 1;
+        openedJournalPathRef.current = "";
+        selectedJournalPathRef.current = "";
         setSelectedJournalPath("");
         setSelectedJournalItem(null);
         setSelectedJournalText("");
@@ -1743,8 +1755,17 @@ function App() {
   }
 
   async function openLibraryItem(item: LibraryItem, scope: "journal" | "feed") {
+    let journalLoadRequestId = 0;
+    const isCurrentJournalSelection = () =>
+      scope === "journal" &&
+      journalLoadRequestRef.current === journalLoadRequestId &&
+      selectedJournalPathRef.current === item.path;
+
     if (scope === "journal") {
       setJournalTranscribing(false);
+      journalLoadRequestRef.current += 1;
+      journalLoadRequestId = journalLoadRequestRef.current;
+      selectedJournalPathRef.current = item.path;
       setSelectedJournalItem(item);
       setSelectedJournalPath(item.path);
       if (item.kind === "text" || item.kind === "image") {
@@ -1763,6 +1784,9 @@ function App() {
           ? (await getJournal(localId)).content || ""
           : await readLibraryText(item.path, token, gatewayBaseUrl);
         if (scope === "journal") {
+          if (!isCurrentJournalSelection()) {
+            return;
+          }
           loadedTextPathRef.current = item.path;
           setSelectedJournalText(content);
           setJournalDraftText(content);
@@ -1773,7 +1797,11 @@ function App() {
         }
       } catch (error) {
         if (scope === "journal") {
+          if (!isCurrentJournalSelection()) {
+            return;
+          }
           setSelectedJournalText("");
+          setJournalDraftText("");
         } else {
           setSelectedFeedText("");
           setFeedEditStatus(
@@ -1813,6 +1841,9 @@ function App() {
           setFeedCaptionText(item.previewText || item.title || "");
         }
       } else {
+        if (!isCurrentJournalSelection()) {
+          return;
+        }
         loadedTextPathRef.current = loadedPath;
         if (hasLoadedPath) {
           setSelectedJournalText(loadedContent);
@@ -1833,6 +1864,9 @@ function App() {
 
         try {
           const statusResult = await getJournalTranscriptionStatus(item.path, token, gatewayBaseUrl);
+          if (!isCurrentJournalSelection()) {
+            return;
+          }
           const status = String(statusResult.status || "").toLowerCase();
           if (status === "done") {
             setJournalTranscriptionStatusByPath((prev) => ({
@@ -1871,13 +1905,18 @@ function App() {
             setJournalTranscribing(false);
           }
         } catch {
-          setJournalTranscribing(false);
+          if (isCurrentJournalSelection()) {
+            setJournalTranscribing(false);
+          }
         }
       }
     }
   }
 
   function resetJournalSession() {
+    journalLoadRequestRef.current += 1;
+    openedJournalPathRef.current = "";
+    selectedJournalPathRef.current = "";
     setJournalDraftText("");
     setSelectedJournalText("");
     setSelectedJournalItem(null);
@@ -1990,13 +2029,16 @@ function App() {
       setFeedDraftsByPath((prev) => ({ ...prev, [item.path]: content }));
       setFeedDraftSourceByPath((prev) => ({ ...prev, [item.path]: sourcePath }));
     } catch (error) {
+      const fallbackContent = item.previewText || item.title || "";
       setFeedDraftsByPath((prev) => ({
         ...prev,
-        [item.path]: item.previewText || item.title || ""
+        [item.path]: fallbackContent
       }));
-      setFeedEditStatus(
-        `Feed load failed (${error instanceof Error ? error.message : String(error)})`
-      );
+      if (!fallbackContent.trim()) {
+        setFeedEditStatus(
+          `Feed load failed (${error instanceof Error ? error.message : String(error)})`
+        );
+      }
     } finally {
       delete feedDraftLoadingRef.current[item.path];
       setFeedDraftLoadingByPath((prev) => ({ ...prev, [item.path]: false }));
@@ -4466,9 +4508,17 @@ function App() {
     const item = journalItems.find((entry) => entry.path === selectedJournalPath) || null;
     setSelectedJournalItem(item);
     if (item) {
+      if (openedJournalPathRef.current === item.path) {
+        return;
+      }
+      openedJournalPathRef.current = item.path;
       void openLibraryItem(item, "journal");
     } else {
+      openedJournalPathRef.current = "";
       setSelectedJournalText("");
+      if (!selectedJournalPath.trim()) {
+        setJournalDraftText("");
+      }
     }
   }, [journalItems, selectedJournalPath]);
 
@@ -4731,7 +4781,7 @@ function App() {
                 className="stack"
                 style={{ gap: '4px', flex: 1, cursor: 'pointer' }}
                 onClick={() => {
-                  void openLibraryItem(item, "journal");
+                  setSelectedJournalPath(item.path);
                   if (closeOnSelect) {
                     setJournalSidebarOpen(false);
                   }
