@@ -918,6 +918,14 @@ function App() {
   const [workspaceSynthSkillsByKey, setWorkspaceSynthSkillsByKey] = useState<
     Record<string, WorkspaceSynthSkillItem | undefined>
   >({});
+  const [activeWorkspaceSynthSkillKey, setActiveWorkspaceSynthSkillKey] = useState("");
+  const [workspaceSynthSkillDraftByKey, setWorkspaceSynthSkillDraftByKey] = useState<
+    Record<string, string | undefined>
+  >({});
+  const [workspaceSynthSkillSaveStatusByKey, setWorkspaceSynthSkillSaveStatusByKey] = useState<
+    Record<string, string | undefined>
+  >({});
+  const [workspaceSynthSkillSavingKey, setWorkspaceSynthSkillSavingKey] = useState("");
   const [workflowSettingsDraftByKey, setWorkflowSettingsDraftByKey] = useState<
     Record<string, WorkflowSettingsDraft | undefined>
   >({});
@@ -1061,6 +1069,9 @@ function App() {
   }));
   const workspaceSynthRunning =
     workspaceSynthStatus.status === "pending" || workspaceSynthStatus.status === "processing";
+  const workspaceSynthProviderBlockedReason = workspaceSynthStatus.providerBlockedReason?.trim() || "";
+  const workspaceSynthProviderReady =
+    workspaceSynthStatus.providerReady !== false && !workspaceSynthProviderBlockedReason;
   const workspaceSynthPendingCount = Number(workspaceSynthStatus.pendingSourceCount || 0);
   const workspaceSynthSelectedCount = workspaceSynthStatus.selectedSourcePaths?.length || 0;
   const feedAttributedBots = [...workspaceSynthSkillBots, ...workflowBots];
@@ -2358,6 +2369,7 @@ function App() {
     try {
       const items = await listWorkspaceSynthSkills(token || undefined, gatewayBaseUrl);
       const byKey: Record<string, WorkspaceSynthSkillItem | undefined> = {};
+      const drafts: Record<string, string | undefined> = {};
       const bots: WorkflowBotMeta[] = [];
       for (const item of items) {
         const key = item.skillKey.trim();
@@ -2365,12 +2377,17 @@ function App() {
           continue;
         }
         byKey[key] = item;
+        drafts[key] = item.artifactRulesOverride || item.artifactRules || "";
         bots.push(workflowBotMetaFromSynthSkill(item));
       }
       bots.sort((a, b) => a.name.localeCompare(b.name));
       setWorkspaceSynthSkillItems(items);
       setWorkspaceSynthSkillsByKey(byKey);
+      setWorkspaceSynthSkillDraftByKey(drafts);
       setWorkspaceSynthSkillBots(bots);
+      if (activeWorkspaceSynthSkillKey && !byKey[activeWorkspaceSynthSkillKey]) {
+        setActiveWorkspaceSynthSkillKey("");
+      }
     } catch (error) {
       setFeedEditStatus(
         `Workspace synth skills unavailable (${error instanceof Error ? error.message : String(error)})`
@@ -2472,6 +2489,7 @@ function App() {
       setFeedCreateWorkflowOpen(false);
       setFeedSidebarOpen(true);
       setActiveWorkflowBotKey("");
+      setActiveWorkspaceSynthSkillKey(bot.key);
       setFeedEditStatus("Feed idle");
       return;
     }
@@ -2609,6 +2627,72 @@ function App() {
       );
     } finally {
       setWorkspaceSynthSkillToggleBusyKey("");
+    }
+  }
+
+  async function saveWorkspaceSynthSkillArtifactRules(skillKey: string, resetToDefault?: boolean) {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      setWorkspaceSynthSkillSaveStatusByKey((prev) => ({
+        ...prev,
+        [skillKey]: "Save blocked (gateway token missing)."
+      }));
+      return;
+    }
+
+    const existing = workspaceSynthSkillsByKey[skillKey];
+    if (!existing) {
+      void loadWorkspaceSynthSkillSettings();
+      return;
+    }
+
+    const nextOverride = resetToDefault
+      ? ""
+      : (workspaceSynthSkillDraftByKey[skillKey] || "").trim();
+
+    setWorkspaceSynthSkillSavingKey(skillKey);
+    setWorkspaceSynthSkillSaveStatusByKey((prev) => ({
+      ...prev,
+      [skillKey]: resetToDefault ? "Restoring default artifact rules..." : "Saving artifact rules..."
+    }));
+    try {
+      const result = await updateWorkspaceSynthSkill(
+        {
+          skillKey,
+          artifactRulesOverride: nextOverride
+        },
+        token || undefined,
+        gatewayBaseUrl
+      );
+      setWorkspaceSynthSkillsByKey((prev) => ({ ...prev, [skillKey]: result.item }));
+      setWorkspaceSynthSkillItems((prev) =>
+        prev.map((item) => (item.skillKey === skillKey ? result.item : item))
+      );
+      setWorkspaceSynthSkillDraftByKey((prev) => ({
+        ...prev,
+        [skillKey]: result.item.artifactRulesOverride || result.item.artifactRules || ""
+      }));
+      setWorkspaceSynthSkillSaveStatusByKey((prev) => ({
+        ...prev,
+        [skillKey]: resetToDefault
+          ? "Using built-in artifact rules."
+          : "Artifact rules saved for future workspace synthesis runs."
+      }));
+      setFeedEditStatus(
+        resetToDefault
+          ? `${existing.name || skillKey} restored to built-in artifact rules`
+          : `${existing.name || skillKey} artifact rules updated`
+      );
+    } catch (error) {
+      setWorkspaceSynthSkillSaveStatusByKey((prev) => ({
+        ...prev,
+        [skillKey]: `Save failed (${error instanceof Error ? error.message : String(error)})`
+      }));
+    } finally {
+      setWorkspaceSynthSkillSavingKey("");
     }
   }
 
@@ -3935,6 +4019,17 @@ function App() {
     ) {
       return;
     }
+    setFeedEditStatus((prev) => {
+      if (!prev.startsWith("Processing ")) {
+        return prev;
+      }
+      if (workspaceSynthStatus.status === "error") {
+        return workspaceSynthStatus.lastError?.trim()
+          ? `Synthesis error: ${workspaceSynthStatus.lastError.trim()}`
+          : "Synthesis error";
+      }
+      return "Feed idle";
+    });
     void Promise.all([
       refreshLibrary("journal"),
       refreshLibrary("feed"),
@@ -5331,9 +5426,13 @@ function App() {
                               force: selectedJournalWasProcessed
                             })
                           }
-                          disabled={workspaceSynthBusy || workspaceSynthRunning}
+                          disabled={
+                            workspaceSynthBusy || workspaceSynthRunning || !workspaceSynthProviderReady
+                          }
                           title={
-                            selectedJournalWasProcessed
+                            !workspaceSynthProviderReady
+                              ? workspaceSynthProviderBlockedReason
+                              : selectedJournalWasProcessed
                               ? "Run the synthesizer again for this journal entry"
                               : "Process this journal entry now"
                           }
@@ -5484,12 +5583,18 @@ function App() {
                       {runtimeMediaSummary}
                     </p>
                   ) : null}
+                  {!workspaceSynthProviderReady && workspaceSynthProviderBlockedReason ? (
+                    <div className="feed-comment-status">{workspaceSynthProviderBlockedReason}</div>
+                  ) : null}
                   <button
                     type="button"
                     className="primary text-sm"
                     style={{ width: "100%", borderRadius: "10px" }}
                     onClick={() => void runWorkspaceSynthesizerManual()}
-                    disabled={workspaceSynthBusy || workspaceSynthRunning}
+                    disabled={
+                      workspaceSynthBusy || workspaceSynthRunning || !workspaceSynthProviderReady
+                    }
+                    title={!workspaceSynthProviderReady ? workspaceSynthProviderBlockedReason : undefined}
                   >
                     {workspaceSynthBusy || workspaceSynthRunning ? "Running..." : "Run Workspace Synthesizer"}
                   </button>
@@ -5504,9 +5609,14 @@ function App() {
                       const saved = workspaceSynthSkillsByKey[bot.key];
                       const isBusy = workspaceSynthSkillToggleBusyKey === bot.key;
                       const enableBlocked = saved?.enabled === false && saved?.supported === false;
+                      const isActive = activeWorkspaceSynthSkillKey === bot.key;
                       return (
                         <div key={bot.key} className="feed-workflow-bot-row">
-                          <div className="feed-workflow-bot-open">
+                          <button
+                            type="button"
+                            className="feed-workflow-bot-open"
+                            onClick={() => setActiveWorkspaceSynthSkillKey(bot.key)}
+                          >
                             <span className="stack" style={{ gap: "0.2rem", width: "100%" }}>
                               <span className="feed-bot-chip">
                                 <span className="feed-bot-avatar">{bot.avatar}</span>
@@ -5520,8 +5630,13 @@ function App() {
                                   {saved.unsupportedReason}
                                 </span>
                               ) : null}
+                              {isActive ? (
+                                <span className="feed-bot-goal text-sm muted">
+                                  Editing artifact rules
+                                </span>
+                              ) : null}
                             </span>
-                          </div>
+                          </button>
                           <button
                             type="button"
                             className={saved?.enabled === false ? "ghost text-sm" : "primary text-sm"}
@@ -5541,6 +5656,110 @@ function App() {
                       </p>
                     ) : null}
                   </div>
+                  {activeWorkspaceSynthSkillKey
+                    ? (() => {
+                        const activeSkill = workspaceSynthSkillsByKey[activeWorkspaceSynthSkillKey];
+                        if (!activeSkill) {
+                          return null;
+                        }
+                        const draft =
+                          workspaceSynthSkillDraftByKey[activeWorkspaceSynthSkillKey] ??
+                          activeSkill.artifactRulesOverride ??
+                          activeSkill.artifactRules ??
+                          "";
+                        const saveStatus =
+                          workspaceSynthSkillSaveStatusByKey[activeWorkspaceSynthSkillKey] || "";
+                        const isSaving =
+                          workspaceSynthSkillSavingKey === activeWorkspaceSynthSkillKey;
+                        const usingOverride = Boolean(
+                          activeSkill.artifactRulesOverride &&
+                            activeSkill.artifactRulesOverride.trim()
+                        );
+                        return (
+                          <div className="workflow-settings-panel stack">
+                            <div className="row-between">
+                              <h3 style={{ margin: 0 }}>{activeSkill.name}</h3>
+                              <button
+                                type="button"
+                                className="ghost text-sm"
+                                onClick={() => setActiveWorkspaceSynthSkillKey("")}
+                              >
+                                Close
+                              </button>
+                            </div>
+                            <p className="text-sm muted" style={{ margin: 0 }}>
+                              Customize the Artifact Rules section for this skill. These rules are injected into the bundled workspace synthesis prompt.
+                            </p>
+                            {activeSkill.artifactRules ? (
+                              <div className="stack" style={{ gap: "0.3rem" }}>
+                                <span className="text-sm muted">Built-in rules</span>
+                                <pre className="workflow-run-detail">{activeSkill.artifactRules}</pre>
+                              </div>
+                            ) : null}
+                            <label className="stack" style={{ gap: "0.35rem" }}>
+                              <span className="text-sm">
+                                {usingOverride ? "Custom artifact rules" : "Artifact rules"}
+                              </span>
+                              <textarea
+                                rows={8}
+                                value={draft}
+                                onChange={(e) =>
+                                  setWorkspaceSynthSkillDraftByKey((prev) => ({
+                                    ...prev,
+                                    [activeWorkspaceSynthSkillKey]: e.target.value
+                                  }))
+                                }
+                              />
+                            </label>
+                            <div className="feed-comment-actions">
+                              <button
+                                type="button"
+                                className="primary text-sm"
+                                style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
+                                onClick={() =>
+                                  void saveWorkspaceSynthSkillArtifactRules(activeWorkspaceSynthSkillKey)
+                                }
+                                disabled={isSaving}
+                              >
+                                {isSaving ? "Saving..." : "Save Rules"}
+                              </button>
+                              <button
+                                type="button"
+                                className="ghost text-sm"
+                                style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
+                                onClick={() =>
+                                  setWorkspaceSynthSkillDraftByKey((prev) => ({
+                                    ...prev,
+                                    [activeWorkspaceSynthSkillKey]:
+                                      activeSkill.artifactRulesOverride ||
+                                      activeSkill.artifactRules ||
+                                      ""
+                                  }))
+                                }
+                                disabled={isSaving}
+                              >
+                                Revert Draft
+                              </button>
+                              <button
+                                type="button"
+                                className="ghost text-sm"
+                                style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
+                                onClick={() =>
+                                  void saveWorkspaceSynthSkillArtifactRules(
+                                    activeWorkspaceSynthSkillKey,
+                                    true
+                                  )
+                                }
+                                disabled={isSaving || !usingOverride}
+                              >
+                                Use Built-in
+                              </button>
+                            </div>
+                            {saveStatus ? <div className="feed-comment-status">{saveStatus}</div> : null}
+                          </div>
+                        );
+                      })()
+                    : null}
                   {workspaceSynthStatus.skillRuns?.length ? (
                     <div className="stack" style={{ gap: "0.45rem" }}>
                       <span className="text-sm muted">Recent skill activity</span>
@@ -5557,6 +5776,11 @@ function App() {
                           </div>
                           {run.summary ? (
                             <div className="text-sm muted">{run.summary}</div>
+                          ) : null}
+                          {typeof run.durationMs === "number" && run.durationMs > 0 ? (
+                            <div className="text-sm muted">
+                              Duration: {(run.durationMs / 1000).toFixed(run.durationMs >= 10_000 ? 0 : 1)}s
+                            </div>
                           ) : null}
                           {run.error ? (
                             <div className="feed-comment-status">{run.error}</div>

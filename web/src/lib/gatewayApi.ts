@@ -319,15 +319,20 @@ export type WorkspaceSynthSkillItem = {
   unsupportedReason?: string;
   goal?: string;
   handlerKind?: "split_handoff" | "article_handoff" | "direct_post_output" | "direct_media_output" | string;
+  artifactRules?: string;
+  artifactRulesOverride?: string;
 };
 
 export type WorkspaceSynthSkillUpdatePayload = {
   skillKey: string;
   enabled?: boolean;
+  artifactRulesOverride?: string;
 };
 
 export type WorkspaceSynthesizerStatus = {
   status: "idle" | "pending" | "processing" | "done" | "error" | string;
+  providerReady?: boolean;
+  providerBlockedReason?: string;
   triggerReason?: string;
   threadId?: string;
   lastRunAt?: string;
@@ -370,6 +375,9 @@ export type WorkspaceSynthSkillRunState = {
   summary?: string;
   error?: string;
   itemCount?: number;
+  startedAt?: string;
+  finishedAt?: string;
+  durationMs?: number;
 };
 
 export type WorkspaceTodoItem = {
@@ -998,7 +1006,11 @@ function mapWorkspaceSynthSkillItem(item: any): WorkspaceSynthSkillItem {
       ? String(item.unsupportedReason)
       : undefined,
     goal: item?.goal ? String(item.goal) : undefined,
-    handlerKind: item?.handlerKind ? String(item.handlerKind) : undefined
+    handlerKind: item?.handlerKind ? String(item.handlerKind) : undefined,
+    artifactRules: item?.artifactRules ? String(item.artifactRules) : undefined,
+    artifactRulesOverride: item?.artifactRulesOverride
+      ? String(item.artifactRulesOverride)
+      : undefined
   };
 }
 
@@ -1080,6 +1092,10 @@ export async function autoRunEligibleFeedContentAgents(
 function mapWorkspaceSynthStatusPayload(data: any): WorkspaceSynthesizerStatus {
   return {
     status: String(data?.status || "idle"),
+    providerReady: data?.providerReady == null ? undefined : Boolean(data.providerReady),
+    providerBlockedReason: data?.providerBlockedReason
+      ? String(data.providerBlockedReason)
+      : undefined,
     triggerReason: data?.triggerReason ? String(data.triggerReason) : undefined,
     threadId: data?.threadId ? String(data.threadId) : undefined,
     lastRunAt: data?.lastRunAt ? String(data.lastRunAt) : undefined,
@@ -1172,7 +1188,11 @@ function mapWorkspaceSynthStatusPayload(data: any): WorkspaceSynthesizerStatus {
           status: item?.status ? String(item.status) : undefined,
           summary: item?.summary ? String(item.summary) : undefined,
           error: item?.error ? String(item.error) : undefined,
-          itemCount: Number(item?.itemCount || 0)
+          itemCount: Number(item?.itemCount || 0),
+          startedAt: item?.startedAt ? String(item.startedAt) : undefined,
+          finishedAt: item?.finishedAt ? String(item.finishedAt) : undefined,
+          durationMs:
+            item?.durationMs == null ? undefined : Number(item.durationMs || 0)
         }))
       : undefined
   };

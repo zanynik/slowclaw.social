@@ -28,16 +28,41 @@ pub const WORKSPACE_SYNTHESIZER_CLIP_PLANS_PATH: &str =
     "posts/workspace_synthesizer/pipeline/clip_plans.json";
 pub const WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH: &str =
     "posts/workspace_synthesizer/pipeline/journal_titles.json";
+pub const WORKSPACE_SYNTHESIZER_PRIMITIVES_DIR: &str =
+    "posts/workspace_synthesizer/pipeline/primitives";
+pub const WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH: &str =
+    "posts/workspace_synthesizer/pipeline/primitives/entities.json";
+pub const WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH: &str =
+    "posts/workspace_synthesizer/pipeline/primitives/events.json";
+pub const WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH: &str =
+    "posts/workspace_synthesizer/pipeline/primitives/assertions.json";
+pub const WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH: &str =
+    "posts/workspace_synthesizer/pipeline/primitives/actions.json";
+pub const WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH: &str =
+    "posts/workspace_synthesizer/pipeline/primitives/segments.json";
+pub const WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH: &str =
+    "posts/workspace_synthesizer/pipeline/primitives/structures.json";
 pub const WORKSPACE_SYNTHESIZER_MANIFEST_PATH: &str =
     "posts/workspace_synthesizer/pipeline/synthesis_manifest.json";
 pub const WORKSPACE_SYNTHESIZER_CLIP_PLAN_DIR: &str = "posts/workspace_synthesizer/pipeline/clips";
 const WORKSPACE_SYNTHESIZER_STATUS_PATH: &str = "state/workspace_synthesizer_status.json";
 const WORKSPACE_SYNTH_SKILLS_PATH: &str = "state/workspace_synth_skills.json";
+pub const WORKSPACE_ENTITY_EXTRACTOR_WORKFLOW_KEY: &str = "workspace_entity_extractor";
+pub const WORKSPACE_ACTION_EXTRACTOR_WORKFLOW_KEY: &str = "workspace_action_extractor";
+pub const WORKSPACE_PRIMITIVE_EVENT_EXTRACTOR_WORKFLOW_KEY: &str =
+    "workspace_primitive_event_extractor";
+pub const WORKSPACE_ASSERTION_EXTRACTOR_WORKFLOW_KEY: &str = "workspace_assertion_extractor";
+pub const WORKSPACE_SEGMENT_EXTRACTOR_WORKFLOW_KEY: &str = "workspace_segment_extractor";
 const MAX_INSIGHT_POSTS: usize = 18;
 const MAX_TODOS: usize = 30;
 const MAX_EVENTS: usize = 20;
 const MAX_CLIP_PLANS: usize = 12;
 const MAX_JOURNAL_TITLES: usize = 8;
+const MAX_ENTITIES: usize = 80;
+const MAX_ASSERTIONS: usize = 60;
+const MAX_ACTIONS: usize = 30;
+const MAX_SEGMENTS: usize = 40;
+const MAX_STRUCTURES: usize = 24;
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkspaceSynthExtractorSpec {
@@ -95,6 +120,8 @@ pub struct WorkspaceSynthSkillRecord {
     pub visible_in_ui: bool,
     #[serde(default)]
     pub handler_kind: WorkspaceSynthSkillHandlerKind,
+    #[serde(default)]
+    pub artifact_rules_override: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -125,6 +152,10 @@ pub struct WorkspaceSynthSkillResponseItem {
     pub goal: String,
     #[serde(default)]
     pub handler_kind: WorkspaceSynthSkillHandlerKind,
+    #[serde(default)]
+    pub artifact_rules: String,
+    #[serde(default)]
+    pub artifact_rules_override: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -146,6 +177,12 @@ pub struct WorkspaceSynthSkillRunState {
     pub error: String,
     #[serde(default)]
     pub item_count: usize,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub finished_at: String,
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -157,9 +194,45 @@ pub struct WorkspaceSynthSkillDefinition {
     pub goal: String,
     pub handler_kind: WorkspaceSynthSkillHandlerKind,
     pub visible_in_ui: bool,
+    pub artifact_rules_override: String,
 }
 
-const WORKSPACE_SYNTH_EXTRACTOR_SPECS: [WorkspaceSynthExtractorSpec; 5] = [
+const WORKSPACE_SYNTH_EXTRACTOR_SPECS: [WorkspaceSynthExtractorSpec; 10] = [
+    WorkspaceSynthExtractorSpec {
+        workflow_key: WORKSPACE_ENTITY_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Entity Extractor",
+        goal: "Extract canonical entities from recent journals and transcripts. Write only the primitive entities handoff JSON for Rust to compile into downstream outputs.",
+        handoff_path: WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH,
+        max_items: MAX_ENTITIES,
+    },
+    WorkspaceSynthExtractorSpec {
+        workflow_key: WORKSPACE_ACTION_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Action Extractor",
+        goal: "Extract explicit actions, commitments, and follow-ups from recent journals and transcripts. Write only the primitive actions handoff JSON for Rust to compile into planner outputs.",
+        handoff_path: WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH,
+        max_items: MAX_ACTIONS,
+    },
+    WorkspaceSynthExtractorSpec {
+        workflow_key: WORKSPACE_PRIMITIVE_EVENT_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Primitive Event Extractor",
+        goal: "Extract scheduled or notable events from recent journals and transcripts. Write only the primitive events handoff JSON for Rust to compile into planner outputs and timelines.",
+        handoff_path: WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH,
+        max_items: MAX_EVENTS,
+    },
+    WorkspaceSynthExtractorSpec {
+        workflow_key: WORKSPACE_ASSERTION_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Assertion Extractor",
+        goal: "Extract explicit claims, beliefs, questions, and decisions from recent journals and transcripts. Write only the primitive assertions handoff JSON for Rust to compile into downstream outputs.",
+        handoff_path: WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH,
+        max_items: MAX_ASSERTIONS,
+    },
+    WorkspaceSynthExtractorSpec {
+        workflow_key: WORKSPACE_SEGMENT_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Segment Extractor",
+        goal: "Extract named spans from recent journals and transcripts. Use timestamps when transcript timing is available and write only the primitive segments handoff JSON for Rust to compile into clip plans and navigation structures.",
+        handoff_path: WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH,
+        max_items: MAX_SEGMENTS,
+    },
     WorkspaceSynthExtractorSpec {
         workflow_key: WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY,
         name: "Workspace Insight Extractor",
@@ -197,7 +270,52 @@ const WORKSPACE_SYNTH_EXTRACTOR_SPECS: [WorkspaceSynthExtractorSpec; 5] = [
     },
 ];
 
-const WORKSPACE_SYNTH_SKILL_SPECS: [WorkspaceSynthSkillSpec; 9] = [
+const WORKSPACE_SYNTH_SKILL_SPECS: [WorkspaceSynthSkillSpec; 14] = [
+    WorkspaceSynthSkillSpec {
+        key: WORKSPACE_ENTITY_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Entity Extractor",
+        goal: "Extract canonical entities from recent journals and transcripts. Write only the primitive entities handoff JSON for Rust to compile into downstream outputs.",
+        output_prefix: "posts/workspace_synthesizer/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::SplitHandoff,
+        enabled_by_default: false,
+        visible_in_ui: false,
+    },
+    WorkspaceSynthSkillSpec {
+        key: WORKSPACE_ACTION_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Action Extractor",
+        goal: "Extract explicit actions, commitments, and follow-ups from recent journals and transcripts. Write only the primitive actions handoff JSON for Rust to compile into planner outputs.",
+        output_prefix: "posts/workspace_synthesizer/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::SplitHandoff,
+        enabled_by_default: false,
+        visible_in_ui: false,
+    },
+    WorkspaceSynthSkillSpec {
+        key: WORKSPACE_PRIMITIVE_EVENT_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Primitive Event Extractor",
+        goal: "Extract scheduled or notable events from recent journals and transcripts. Write only the primitive events handoff JSON for Rust to compile into planner outputs and timelines.",
+        output_prefix: "posts/workspace_synthesizer/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::SplitHandoff,
+        enabled_by_default: false,
+        visible_in_ui: false,
+    },
+    WorkspaceSynthSkillSpec {
+        key: WORKSPACE_ASSERTION_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Assertion Extractor",
+        goal: "Extract explicit claims, beliefs, questions, and decisions from recent journals and transcripts. Write only the primitive assertions handoff JSON for Rust to compile into downstream outputs.",
+        output_prefix: "posts/workspace_synthesizer/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::SplitHandoff,
+        enabled_by_default: false,
+        visible_in_ui: false,
+    },
+    WorkspaceSynthSkillSpec {
+        key: WORKSPACE_SEGMENT_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Segment Extractor",
+        goal: "Extract named spans from recent journals and transcripts. Use timestamps when transcript timing is available and write only the primitive segments handoff JSON for Rust to compile into clip plans and navigation structures.",
+        output_prefix: "posts/workspace_synthesizer/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::SplitHandoff,
+        enabled_by_default: false,
+        visible_in_ui: false,
+    },
     WorkspaceSynthSkillSpec {
         key: WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY,
         name: "Workspace Insight Extractor",
@@ -396,6 +514,157 @@ pub struct JournalTitleCandidate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct PrimitiveProvenance {
+    #[serde(default)]
+    pub source_path: String,
+    #[serde(default)]
+    pub source_excerpt: String,
+    #[serde(default)]
+    pub start_at: String,
+    #[serde(default)]
+    pub end_at: String,
+    #[serde(default)]
+    pub speaker: String,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityCandidate {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub canonical_name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub attributes: serde_json::Value,
+    #[serde(default)]
+    pub provenance: PrimitiveProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimitiveEventCandidate {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub start_at: String,
+    #[serde(default)]
+    pub end_at: String,
+    #[serde(default)]
+    pub participants: Vec<String>,
+    #[serde(default)]
+    pub related_entities: Vec<String>,
+    #[serde(default)]
+    pub details: String,
+    #[serde(default)]
+    pub provenance: PrimitiveProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AssertionCandidate {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub polarity: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub speaker: String,
+    #[serde(default)]
+    pub related_entities: Vec<String>,
+    #[serde(default)]
+    pub related_event_ids: Vec<String>,
+    #[serde(default)]
+    pub provenance: PrimitiveProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionCandidate {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub details: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub priority: String,
+    #[serde(default)]
+    pub due_at: String,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub related_entities: Vec<String>,
+    #[serde(default)]
+    pub related_assertion_ids: Vec<String>,
+    #[serde(default)]
+    pub provenance: PrimitiveProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentCandidate {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub topic: String,
+    #[serde(default)]
+    pub source_path: String,
+    #[serde(default)]
+    pub start_at: String,
+    #[serde(default)]
+    pub end_at: String,
+    #[serde(default)]
+    pub speaker: String,
+    #[serde(default)]
+    pub transcript_quote: String,
+    #[serde(default)]
+    pub purpose: String,
+    #[serde(default)]
+    pub provenance: PrimitiveProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StructureCandidate {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub source_primitive_ids: Vec<String>,
+    #[serde(default)]
+    pub format_hint: String,
+    #[serde(default)]
+    pub provenance: PrimitiveProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct InsightPostFile {
     #[serde(default = "manifest_version")]
     pub version: String,
@@ -439,11 +708,69 @@ pub struct JournalTitleFile {
     pub items: Vec<JournalTitleCandidate>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityFile {
+    #[serde(default = "manifest_version")]
+    pub version: String,
+    #[serde(default)]
+    pub items: Vec<EntityCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimitiveEventFile {
+    #[serde(default = "manifest_version")]
+    pub version: String,
+    #[serde(default)]
+    pub items: Vec<PrimitiveEventCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AssertionFile {
+    #[serde(default = "manifest_version")]
+    pub version: String,
+    #[serde(default)]
+    pub items: Vec<AssertionCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionFile {
+    #[serde(default = "manifest_version")]
+    pub version: String,
+    #[serde(default)]
+    pub items: Vec<ActionCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentFile {
+    #[serde(default = "manifest_version")]
+    pub version: String,
+    #[serde(default)]
+    pub items: Vec<SegmentCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StructureFile {
+    #[serde(default = "manifest_version")]
+    pub version: String,
+    #[serde(default)]
+    pub items: Vec<StructureCandidate>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSynthesizerStatus {
     #[serde(default = "default_idle_status")]
     pub status: String,
+    #[serde(default = "default_true")]
+    pub provider_ready: bool,
+    #[serde(default)]
+    pub provider_blocked_reason: String,
     #[serde(default)]
     pub trigger_reason: String,
     #[serde(default)]
@@ -487,6 +814,18 @@ pub struct WorkspaceSynthArtifactCounts {
     pub events: usize,
     #[serde(default)]
     pub clip_plans: usize,
+    #[serde(default)]
+    pub primitive_entities: usize,
+    #[serde(default)]
+    pub primitive_events: usize,
+    #[serde(default)]
+    pub primitive_assertions: usize,
+    #[serde(default)]
+    pub primitive_actions: usize,
+    #[serde(default)]
+    pub primitive_segments: usize,
+    #[serde(default)]
+    pub primitive_structures: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -513,6 +852,18 @@ pub struct WorkspaceSynthArtifactStates {
     pub events: WorkspaceSynthArtifactState,
     #[serde(default)]
     pub clip_plans: WorkspaceSynthArtifactState,
+    #[serde(default)]
+    pub primitive_entities: WorkspaceSynthArtifactState,
+    #[serde(default)]
+    pub primitive_events: WorkspaceSynthArtifactState,
+    #[serde(default)]
+    pub primitive_assertions: WorkspaceSynthArtifactState,
+    #[serde(default)]
+    pub primitive_actions: WorkspaceSynthArtifactState,
+    #[serde(default)]
+    pub primitive_segments: WorkspaceSynthArtifactState,
+    #[serde(default)]
+    pub primitive_structures: WorkspaceSynthArtifactState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -555,6 +906,10 @@ fn default_idle_status() -> String {
     "idle".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_skill_enabled() -> bool {
     true
 }
@@ -592,6 +947,36 @@ fn clip_plans_schema_json() -> Result<String> {
 fn journal_titles_schema_json() -> Result<String> {
     let schema = schema_for!(JournalTitleFile);
     serde_json::to_string_pretty(&schema).context("failed to serialize journal titles schema")
+}
+
+fn entities_schema_json() -> Result<String> {
+    let schema = schema_for!(EntityFile);
+    serde_json::to_string_pretty(&schema).context("failed to serialize entities schema")
+}
+
+fn primitive_events_schema_json() -> Result<String> {
+    let schema = schema_for!(PrimitiveEventFile);
+    serde_json::to_string_pretty(&schema).context("failed to serialize primitive events schema")
+}
+
+fn assertions_schema_json() -> Result<String> {
+    let schema = schema_for!(AssertionFile);
+    serde_json::to_string_pretty(&schema).context("failed to serialize assertions schema")
+}
+
+fn actions_schema_json() -> Result<String> {
+    let schema = schema_for!(ActionFile);
+    serde_json::to_string_pretty(&schema).context("failed to serialize actions schema")
+}
+
+fn segments_schema_json() -> Result<String> {
+    let schema = schema_for!(SegmentFile);
+    serde_json::to_string_pretty(&schema).context("failed to serialize segments schema")
+}
+
+fn structures_schema_json() -> Result<String> {
+    let schema = schema_for!(StructureFile);
+    serde_json::to_string_pretty(&schema).context("failed to serialize structures schema")
 }
 
 pub fn extractor_specs() -> &'static [WorkspaceSynthExtractorSpec] {
@@ -664,6 +1049,7 @@ fn normalize_skill_record(skill_key: &str, mut record: WorkspaceSynthSkillRecord
     };
     record.output_prefix = normalize_skill_output_prefix(&record.output_prefix, skill_key);
     record.goal = record.goal.trim().to_string();
+    record.artifact_rules_override = record.artifact_rules_override.trim().to_string();
     record.visible_in_ui = record.visible_in_ui || default_skill_visible_in_ui();
     if let Some(spec) = skill_spec_by_key(skill_key) {
         record.handler_kind = spec.handler_kind;
@@ -727,20 +1113,16 @@ Create simple vertical video clips from journal audio recordings.\n\n\
 
 fn built_in_skill_markdown(record: &WorkspaceSynthSkillRecord) -> Result<String> {
     let output_dir = record.output_prefix.trim_end_matches('/');
-    let body = match record.skill_key.as_str() {
-        WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY
-        | WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY
-        | WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY
-        | WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY
-        | WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => {
-            render_extractor_skill_markdown(&record.skill_key)?
-        }
+    let body = if is_extractor_workflow_key(&record.skill_key) {
+        render_extractor_skill_markdown(&record.skill_key)?
+    } else {
+        match record.skill_key.as_str() {
         article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY => {
             article_synthesizer::render_skill_markdown(output_dir)
         }
         "audio_insight_clips" => render_audio_insight_clip_skill_markdown(output_dir),
         _ => render_template_skill_markdown(&record.name, &record.goal, output_dir),
-    };
+    }};
     Ok(body)
 }
 
@@ -753,6 +1135,49 @@ fn skill_definition_from_record(record: &WorkspaceSynthSkillRecord) -> Workspace
         goal: record.goal.clone(),
         handler_kind: record.handler_kind,
         visible_in_ui: record.visible_in_ui,
+        artifact_rules_override: record.artifact_rules_override.clone(),
+    }
+}
+
+pub fn extract_markdown_section(markdown: &str, section_heading: &str) -> Option<String> {
+    let heading = section_heading.trim();
+    if heading.is_empty() {
+        return None;
+    }
+    let mut capture = false;
+    let mut lines = Vec::new();
+    let needle = format!("## {heading}");
+    for line in markdown.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.trim() == needle {
+            capture = true;
+            continue;
+        }
+        if capture && trimmed.starts_with("## ") {
+            break;
+        }
+        if capture {
+            lines.push(trimmed);
+        }
+    }
+    let section = lines.join("\n").trim().to_string();
+    if section.is_empty() {
+        None
+    } else {
+        Some(section)
+    }
+}
+
+pub fn artifact_rules_from_markdown(markdown: &str) -> String {
+    extract_markdown_section(markdown, "Artifact Rules").unwrap_or_default()
+}
+
+pub fn effective_artifact_rules(markdown: &str, override_text: &str) -> String {
+    let trimmed_override = override_text.trim();
+    if !trimmed_override.is_empty() {
+        trimmed_override.to_string()
+    } else {
+        artifact_rules_from_markdown(markdown)
     }
 }
 
@@ -797,6 +1222,7 @@ fn built_in_skill_record(spec: WorkspaceSynthSkillSpec) -> WorkspaceSynthSkillRe
         built_in_skill_fingerprint: None,
         visible_in_ui: spec.visible_in_ui,
         handler_kind: spec.handler_kind,
+        artifact_rules_override: String::new(),
     };
     record = normalize_skill_record(&key, record);
     if let Ok(body) = built_in_skill_markdown(&record) {
@@ -904,39 +1330,67 @@ pub fn render_skill_markdown() -> Result<String> {
     Ok(format!(
         "# Workspace Synthesizer\n\n\
 This is the index skill for workspace synthesis.\n\n\
-The runtime uses this skill as the shared guidance layer, then runs specialized extractor skills for each artifact family:\n\
-- `{insight_key}` -> `{insight_posts_path}`\n\
-- `{todo_key}` -> `{todos_path}`\n\
-- `{event_key}` -> `{events_path}`\n\
-- `{clip_key}` -> `{clip_plans_path}`\n\
-- `{title_key}` -> `{journal_titles_path}`\n\n\
+The runtime uses this skill as the shared guidance layer, then runs specialized extractor skills that primarily produce durable app artifacts:\n\
+- Primary artifact files: `{insight_posts_path}`, `{todos_path}`, `{events_path}`, `{clip_plans_path}`, `{journal_titles_path}`\n\
+\n\
+- Optional helper primitive files when explicitly enabled:\n\
+- `{entity_key}` -> `{entities_path}`\n\
+- `{action_key}` -> `{actions_path}`\n\
+- `{primitive_event_key}` -> `{primitive_events_path}`\n\
+- `{assertion_key}` -> `{assertions_path}`\n\
+- `{segment_key}` -> `{segments_path}`\n\
+\n\
+Primary workflow keys:\n\
+- `{insight_key}`\n\
+- `{todo_key}`\n\
+- `{event_key}`\n\
+- `{clip_key}`\n\
+- `{title_key}`\n\n\
 ## Role\n\n\
 - Read from `journals/text/**` and available transcript text under `journals/text/transcriptions/**`.\n\
 - Act as the global policy layer for all workspace extraction.\n\
-- The Rust runtime decides which extractor skills to run and validates each handoff file independently.\n\
+- Durable app artifacts are the primary product output.\n\
+- Primitive handoffs are optional helper artifacts, not the default product memory layer.\n\
+- The Rust runtime decides which extractor skills to run, validates each handoff file independently, and can compile missing app outputs from primitive files when those helper files are present.\n\
 - Extractor skills, not this index skill alone, own the small typed JSON outputs.\n\n\
 ## Shared Guardrails\n\n\
 - Prefer fewer, higher-signal artifacts over exhaustive extraction.\n\
-- Every emitted item must include `sourcePath` and `sourceExcerpt`.\n\
+- Every emitted item must include source provenance.\n\
 - Use workspace-relative journal paths only.\n\
 - Do not create final feed posts, todos, events, or clip plan output files directly.\n\
 - Desktop and mobile must both be supported. Clip rendering may be unavailable, but clip planning is still allowed.\n\n\
-## Artifact Policy\n\n\
-- `insightPosts`: concise feed-ready text only.\n\
-- `todos`: only explicit actions or commitments.\n\
-- `events`: only when timing or scheduling is actually supported by the source.\n\
-- `clipPlans`: only from transcript sidecars under `journals/text/transcriptions/**`, and only when transcript text contains a quotable segment with clear start/end timing context.\n\
-- `journalTitles`: only for journal note files that deserve clearer durable titles.\n\
+## Primary Artifact Policy\n\n\
+- `insightPosts`: concise, keepable or publishable text artifacts under `posts/`.\n\
+- `todos`: planner tasks that persist in the workspace database.\n\
+- `events`: planner events that persist in the workspace database.\n\
+- `clipPlans`: transcript-backed editing plans and clip artifacts.\n\
+- `journalTitles`: operational file-improvement output.\n\
+\n\
+## Optional Helper Policy\n\n\
+- `segments`: useful when timestamps unlock deterministic media editing.\n\
+- `actions` and `primitiveEvents`: useful when primary planner outputs are not emitted directly.\n\
+- `assertions`, `entities`, and `structures`: optional helper context only; do not treat them as the default persisted product layer.\n\
 \n\
 ## Runtime Notes\n\n\
-- Each extractor writes one small typed JSON handoff file.\n\
+- App-shaped handoffs remain the primary path.\n\
+- Primitive helper handoffs are optional and disabled by default to keep runs cheaper.\n\
 - Rust materializes final outputs and keeps planner data out of the feed.\n\
 - Partial success is allowed: one extractor can fail without discarding the others.\n",
+        entity_key = WORKSPACE_ENTITY_EXTRACTOR_WORKFLOW_KEY,
+        action_key = WORKSPACE_ACTION_EXTRACTOR_WORKFLOW_KEY,
+        primitive_event_key = WORKSPACE_PRIMITIVE_EVENT_EXTRACTOR_WORKFLOW_KEY,
+        assertion_key = WORKSPACE_ASSERTION_EXTRACTOR_WORKFLOW_KEY,
+        segment_key = WORKSPACE_SEGMENT_EXTRACTOR_WORKFLOW_KEY,
         insight_key = WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY,
         todo_key = WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY,
         event_key = WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY,
         clip_key = WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY,
         title_key = WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY,
+        entities_path = WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH,
+        actions_path = WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH,
+        primitive_events_path = WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH,
+        assertions_path = WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH,
+        segments_path = WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH,
         insight_posts_path = WORKSPACE_SYNTHESIZER_INSIGHT_POSTS_PATH,
         todos_path = WORKSPACE_SYNTHESIZER_TODOS_PATH,
         events_path = WORKSPACE_SYNTHESIZER_EVENTS_PATH,
@@ -950,33 +1404,74 @@ pub fn render_extractor_skill_markdown(workflow_key: &str) -> Result<String> {
         anyhow::bail!("unknown workspace synthesizer extractor `{workflow_key}`");
     };
     let (artifact_name, schema_json, artifact_rules) = match spec.workflow_key {
+        WORKSPACE_ENTITY_EXTRACTOR_WORKFLOW_KEY => (
+            "entities",
+            entities_schema_json()?,
+            "- Optional helper output only.\n\
+- Emit canonical nouns that matter, including people, projects, orgs, dates, and amounts when useful.\n\
+- Use `canonicalName` for the stable label and `aliases` for surface forms.\n\
+- Include provenance for every emitted entity.\n",
+        ),
+        WORKSPACE_ACTION_EXTRACTOR_WORKFLOW_KEY => (
+            "actions",
+            actions_schema_json()?,
+            "- Optional helper output only.\n\
+- Emit explicit actions, commitments, follow-ups, or requests.\n\
+- Avoid vague aspirations unless the source makes the next step clear.\n\
+- These are durable planner inputs, not presentation-layer todos.\n",
+        ),
+        WORKSPACE_PRIMITIVE_EVENT_EXTRACTOR_WORKFLOW_KEY => (
+            "primitiveEvents",
+            primitive_events_schema_json()?,
+            "- Optional helper output only.\n\
+- Emit scheduled or notable events with source-supported timing when available.\n\
+- These are durable timeline records, not presentation-layer calendar views.\n\
+- Do not invent time, location, or participant details.\n",
+        ),
+        WORKSPACE_ASSERTION_EXTRACTOR_WORKFLOW_KEY => (
+            "assertions",
+            assertions_schema_json()?,
+            "- Optional helper output only.\n\
+- Emit explicit claims, opinions, beliefs, questions, or decisions.\n\
+- Prefer precise text over paraphrased abstractions when possible.\n\
+- Include related entity and event ids when the linkage is clear from the source.\n",
+        ),
+        WORKSPACE_SEGMENT_EXTRACTOR_WORKFLOW_KEY => (
+            "segments",
+            segments_schema_json()?,
+            "- Optional helper output only.\n\
+- Emit named spans with a clear topic or purpose.\n\
+- Use `startAt` and `endAt` only for transcript-backed sources.\n\
+- Text-journal segments may omit timing and still be valid.\n\
+- Prefer segments that are directly useful for clips, navigation, or media reuse.\n",
+        ),
         WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY => (
             "insightPosts",
             insight_posts_schema_json()?,
-            "- Emit concise, feed-ready text only.\n\
-- No titles, no markdown bullets, no surrounding quotes.\n\
-- Only include items strong enough to stand alone in the workspace feed.\n",
+            "- This is a primary durable artifact path.\n\
+- Emit concise, keepable or publishable text only.\n\
+- No titles, no markdown bullets, no surrounding quotes.\n",
         ),
         WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY => (
             "todos",
             todos_schema_json()?,
-            "- Emit only explicit next actions, tasks, or commitments.\n\
-- Avoid vague aspirations unless the source clearly implies an actionable todo.\n\
+            "- This is a primary durable artifact path.\n\
+- Emit only explicit next actions, tasks, or commitments.\n\
 - Prefer stable titles and put nuance in `details`.\n",
         ),
         WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY => (
             "events",
             events_schema_json()?,
-            "- Emit only items with a clear date, time, or scheduled plan.\n\
-- Use `allDay` only when timing is date-level rather than time-specific.\n\
+            "- This is a primary durable artifact path.\n\
+- Emit only items with a clear date, time, or scheduled plan.\n\
 - Do not invent timing or location details.\n",
         ),
         WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => (
             "clipPlans",
             clip_plans_schema_json()?,
-            "- Emit only transcript-backed segments from audio/video transcript sidecars under journals/text/transcriptions/** or journals/text/transcript/**.\n\
-- `transcriptQuote` must be a real quote from the source excerpt.\n\
-- Use precise `startAt` and `endAt` values from the transcript context when available.\n",
+            "- This is a primary durable artifact path.\n\
+- Emit only transcript-backed segments from audio/video transcript sidecars under journals/text/transcriptions/** or journals/text/transcript/**.\n\
+- Prefer precise `startAt` and `endAt` values from transcript context when available.\n",
         ),
         WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => (
             "journalTitles",
@@ -1000,7 +1495,7 @@ Create one small typed JSON handoff file for the workspace synthesis pipeline.\n
 ## Artifact Scope\n\n\
 - This extractor owns only `{artifact_name}`.\n\
 - Maximum items: {max_items}\n\
-- Every item must include `sourcePath` and `sourceExcerpt`.\n\
+- Every item must include provenance rooted in workspace-relative journal paths.\n\
 - Use workspace-relative journal paths only.\n\n\
 ## Artifact Rules\n\n\
 {artifact_rules}\n\
@@ -1032,27 +1527,41 @@ Read the workspace journal corpus and extract structured artifacts into small ty
 - `journals/text/transcriptions/**`\n\n\
 ## Required Output\n\n\
 - Write zero or more JSON files under `{pipeline_dir}`.\n\
-- Allowed files: `{insight_posts_path}`, `{todos_path}`, `{events_path}`, `{clip_plans_path}`, `{journal_titles_path}`.\n\
+- Primary artifact files: `{insight_posts_path}`, `{todos_path}`, `{events_path}`, `{clip_plans_path}`, `{journal_titles_path}`.\n\
+- Optional helper files when explicitly needed: `{entities_path}`, `{primitive_events_path}`, `{assertions_path}`, `{actions_path}`, `{segments_path}`, `{structures_path}`.\n\
 - Overwrite each emitted file completely with valid JSON.\n\
 - Omit files for artifact types with no strong candidates, or write empty `items` arrays.\n\
 - Do not write final feed posts, todos, events, or any other files yourself.\n\
-- The Rust runtime will validate each handoff file independently and route artifacts by type.\n\n\
+- The Rust runtime will validate each handoff file independently and may compile missing app outputs from helper primitive files when those are present.\n\n\
 ## Extraction Scope\n\n\
-- `insightPosts`: concise feed-ready post text only. No headings, no markdown bullets, no surrounding quotes.\n\
-- `todos`: concrete action items only when the journal makes a clear commitment or next step explicit.\n\
-- `events`: only when the source includes a clear date/time or scheduled plan.\n\
-- `clipPlans`: only when transcripts contain a quotable segment with enough context to plan a clip.\n\
+- `insightPosts`: concise, keepable or publishable text artifacts under `posts/`.\n\
+- `actions`: concrete action items only when the journal makes a clear commitment or next step explicit.\n\
+- `todos`: durable planner tasks.\n\
+- `events`: durable planner events.\n\
+- `clipPlans`: transcript-backed editing plans or clip artifacts.\n\
+- `entities`: optional helper context when useful.\n\
+- `primitiveEvents`: optional helper event timeline data when useful.\n\
+- `assertions`: explicit claims, beliefs, questions, or decisions.\n\
+- `segments`: named spans, with timestamps for transcripts and untimed sections for plain text journals.\n\
+- `structures`: optional draft outputs such as feed-ready posts, outlines, or summaries. Use only when clearly useful.\n\
 - `journalTitles`: only for journal note files that deserve clearer durable titles.\n\n\
 ## Quality Rules\n\n\
 - Prefer fewer, high-signal artifacts over exhaustive extraction.\n\
-- Keep `insightPosts` short enough to be feed-friendly.\n\
-- Every item must include `sourcePath` and `sourceExcerpt`.\n\
+- Write app-shaped artifacts directly when the checked skills ask for them.\n\
+- Use assertions, entities, or structures only as helper reasoning when needed.\n\
+- Segments are especially valuable when transcript timing unlocks downstream media tooling.\n\
+- Every item must include source provenance.\n\
 - Use stable lowercase ids with letters, numbers, and dashes when possible.\n\
 - Use workspace-relative journal paths only.\n\
 - If an artifact type has nothing worth emitting, return an empty array for that type.\n\
 - Never include comments, markdown fences, or trailing prose in the JSON file.\n\n\
 ## Output Limits\n\n\
 - Maximum {max_posts} `insightPosts`\n\
+- Maximum {max_entities} `entities`\n\
+- Maximum {max_assertions} `assertions`\n\
+- Maximum {max_actions} `actions`\n\
+- Maximum {max_segments} `segments`\n\
+- Maximum {max_structures} `structures`\n\
 - Maximum {max_todos} `todos`\n\
 - Maximum {max_events} `events`\n\
 - Maximum {max_clips} `clipPlans`\n\
@@ -1061,22 +1570,69 @@ Read the workspace journal corpus and extract structured artifacts into small ty
 - {media_summary}\n\
 - This workflow must work on desktop and mobile runtimes. Clip plans are allowed even when rendering is unavailable.\n\n\
 ## JSON Schemas\n\n\
+### `{entities_path}`\n\
+```json\n\
+{entities_schema}\n\
+```\n\
+\n\
+### `{primitive_events_path}`\n\
+```json\n\
+{primitive_events_schema}\n\
+```\n\
+\n\
+### `{assertions_path}`\n\
+```json\n\
+{assertions_schema}\n\
+```\n\
+\n\
+### `{actions_path}`\n\
+```json\n\
+{actions_schema}\n\
+```\n\
+\n\
+### `{segments_path}`\n\
+```json\n\
+{segments_schema}\n\
+```\n\
+\n\
+### `{structures_path}`\n\
+```json\n\
+{structures_schema}\n\
+```\n\
+\n\
 ### `{insight_posts_path}`\n\
 ```json\n\
 {insight_posts_schema}\n\
 ```\n",
         pipeline_dir = WORKSPACE_SYNTHESIZER_PIPELINE_DIR,
+        entities_path = WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH,
+        primitive_events_path = WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH,
+        assertions_path = WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH,
+        actions_path = WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH,
+        segments_path = WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH,
+        structures_path = WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH,
         insight_posts_path = WORKSPACE_SYNTHESIZER_INSIGHT_POSTS_PATH,
         todos_path = WORKSPACE_SYNTHESIZER_TODOS_PATH,
         events_path = WORKSPACE_SYNTHESIZER_EVENTS_PATH,
         clip_plans_path = WORKSPACE_SYNTHESIZER_CLIP_PLANS_PATH,
         journal_titles_path = WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH,
         max_posts = MAX_INSIGHT_POSTS,
+        max_entities = MAX_ENTITIES,
+        max_assertions = MAX_ASSERTIONS,
+        max_actions = MAX_ACTIONS,
+        max_segments = MAX_SEGMENTS,
+        max_structures = MAX_STRUCTURES,
         max_todos = MAX_TODOS,
         max_events = MAX_EVENTS,
         max_clips = MAX_CLIP_PLANS,
         max_titles = MAX_JOURNAL_TITLES,
         media_summary = media_summary.trim(),
+        entities_schema = entities_schema_json()?.trim(),
+        primitive_events_schema = primitive_events_schema_json()?.trim(),
+        assertions_schema = assertions_schema_json()?.trim(),
+        actions_schema = actions_schema_json()?.trim(),
+        segments_schema = segments_schema_json()?.trim(),
+        structures_schema = structures_schema_json()?.trim(),
         insight_posts_schema = insight_posts_schema.trim(),
     ) + &format!(
         "\n\n### `{todos_path}`\n\
@@ -1137,6 +1693,30 @@ pub fn journal_titles_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join(WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH)
 }
 
+pub fn primitive_entities_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH)
+}
+
+pub fn primitive_events_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH)
+}
+
+pub fn primitive_assertions_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH)
+}
+
+pub fn primitive_actions_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH)
+}
+
+pub fn primitive_segments_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH)
+}
+
+pub fn primitive_structures_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH)
+}
+
 pub fn status_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join(WORKSPACE_SYNTHESIZER_STATUS_PATH)
 }
@@ -1149,6 +1729,12 @@ pub fn reset_handoff_files(workspace_dir: &Path) -> Result<()> {
         events_path(workspace_dir),
         clip_plans_path(workspace_dir),
         journal_titles_path(workspace_dir),
+        primitive_entities_path(workspace_dir),
+        primitive_events_path(workspace_dir),
+        primitive_assertions_path(workspace_dir),
+        primitive_actions_path(workspace_dir),
+        primitive_segments_path(workspace_dir),
+        primitive_structures_path(workspace_dir),
     ];
     for path in handoff_paths {
         match fs::remove_file(&path) {
@@ -1334,6 +1920,86 @@ fn load_optional_journal_titles_file(workspace_dir: &Path) -> Result<Option<Vec<
     Ok(Some(normalize_journal_title_items(file.items)?))
 }
 
+fn load_optional_entities_file(workspace_dir: &Path) -> Result<Option<Vec<EntityCandidate>>> {
+    let path = primitive_entities_path(workspace_dir);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let mut file: EntityFile =
+        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    normalize_file_version(&mut file.version, "entities")?;
+    Ok(Some(normalize_entity_items(file.items)?))
+}
+
+fn load_optional_primitive_events_file(
+    workspace_dir: &Path,
+) -> Result<Option<Vec<PrimitiveEventCandidate>>> {
+    let path = primitive_events_path(workspace_dir);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let mut file: PrimitiveEventFile =
+        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    normalize_file_version(&mut file.version, "primitive events")?;
+    Ok(Some(normalize_primitive_event_items(file.items)?))
+}
+
+fn load_optional_assertions_file(workspace_dir: &Path) -> Result<Option<Vec<AssertionCandidate>>> {
+    let path = primitive_assertions_path(workspace_dir);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let mut file: AssertionFile =
+        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    normalize_file_version(&mut file.version, "assertions")?;
+    Ok(Some(normalize_assertion_items(file.items)?))
+}
+
+fn load_optional_actions_file(workspace_dir: &Path) -> Result<Option<Vec<ActionCandidate>>> {
+    let path = primitive_actions_path(workspace_dir);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let mut file: ActionFile =
+        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    normalize_file_version(&mut file.version, "actions")?;
+    Ok(Some(normalize_action_items(file.items)?))
+}
+
+fn load_optional_segments_file(workspace_dir: &Path) -> Result<Option<Vec<SegmentCandidate>>> {
+    let path = primitive_segments_path(workspace_dir);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let mut file: SegmentFile =
+        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    normalize_file_version(&mut file.version, "segments")?;
+    Ok(Some(normalize_segment_items(file.items)?))
+}
+
+fn load_optional_structures_file(workspace_dir: &Path) -> Result<Option<Vec<StructureCandidate>>> {
+    let path = primitive_structures_path(workspace_dir);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let mut file: StructureFile =
+        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    normalize_file_version(&mut file.version, "structures")?;
+    Ok(Some(normalize_structure_items(file.items)?))
+}
+
 fn normalize_manifest(mut manifest: WorkspaceSynthesisManifest) -> Result<WorkspaceSynthesisManifest> {
     if manifest.version.trim().is_empty() {
         manifest.version = manifest_version();
@@ -1484,6 +2150,216 @@ fn normalize_journal_title_items(
         }
     }
     Ok(out)
+}
+
+fn is_transcript_source_path(path: &str) -> bool {
+    path.starts_with("journals/text/transcriptions/") || path.starts_with("journals/text/transcript/")
+}
+
+fn normalize_optional_id_list(values: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values.iter() {
+        let normalized = normalize_id(value);
+        if !normalized.is_empty() && seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    *values = out;
+}
+
+fn normalize_provenance(
+    provenance: &mut PrimitiveProvenance,
+    fallback_source_path: Option<&str>,
+    require_timed_transcript: bool,
+) -> Result<()> {
+    let raw_source_path = if provenance.source_path.trim().is_empty() {
+        fallback_source_path.unwrap_or_default()
+    } else {
+        provenance.source_path.as_str()
+    };
+    provenance.source_path = normalize_source_path(raw_source_path)?;
+    provenance.source_excerpt = truncate_with_ellipsis(provenance.source_excerpt.trim(), 280);
+    provenance.start_at = provenance.start_at.trim().to_string();
+    provenance.end_at = provenance.end_at.trim().to_string();
+    provenance.speaker = truncate_with_ellipsis(provenance.speaker.trim(), 120);
+    if let Some(confidence) = provenance.confidence.as_mut() {
+        *confidence = confidence.clamp(0.0, 1.0);
+    }
+    let has_timing = !provenance.start_at.is_empty() || !provenance.end_at.is_empty();
+    if has_timing && !is_transcript_source_path(&provenance.source_path) {
+        anyhow::bail!("timed primitive provenance must point to transcript sidecars");
+    }
+    if require_timed_transcript && (!has_timing || !is_transcript_source_path(&provenance.source_path)) {
+        anyhow::bail!("timed primitive items must point to transcript sidecars with startAt/endAt");
+    }
+    Ok(())
+}
+
+fn normalize_entity_items(mut items: Vec<EntityCandidate>) -> Result<Vec<EntityCandidate>> {
+    if items.len() > MAX_ENTITIES {
+        items.truncate(MAX_ENTITIES);
+    }
+    let mut used_ids = HashSet::new();
+    for item in &mut items {
+        item.kind = truncate_with_ellipsis(item.kind.trim(), 60);
+        item.canonical_name = truncate_with_ellipsis(item.canonical_name.trim(), 160);
+        item.aliases = item
+            .aliases
+            .iter()
+            .map(|alias| truncate_with_ellipsis(alias.trim(), 160))
+            .filter(|alias| !alias.is_empty())
+            .collect();
+        normalize_provenance(&mut item.provenance, None, false)?;
+        if item.canonical_name.is_empty() {
+            anyhow::bail!("entities items require non-empty canonicalName");
+        }
+        let seed = format!("{}|{}|{}", item.canonical_name, item.kind, item.provenance.source_path);
+        item.id = unique_id(&used_ids, &item.id, &seed, "entity");
+        used_ids.insert(item.id.clone());
+    }
+    Ok(items)
+}
+
+fn normalize_primitive_event_items(mut items: Vec<PrimitiveEventCandidate>) -> Result<Vec<PrimitiveEventCandidate>> {
+    if items.len() > MAX_EVENTS {
+        items.truncate(MAX_EVENTS);
+    }
+    let mut used_ids = HashSet::new();
+    for item in &mut items {
+        item.title = truncate_with_ellipsis(item.title.trim(), 120);
+        item.kind = truncate_with_ellipsis(item.kind.trim(), 60);
+        item.status = normalize_event_status(&item.status);
+        item.details = truncate_with_ellipsis(item.details.trim(), 600);
+        normalize_optional_id_list(&mut item.participants);
+        normalize_optional_id_list(&mut item.related_entities);
+        normalize_provenance(&mut item.provenance, None, false)?;
+        item.start_at = if item.start_at.trim().is_empty() {
+            item.provenance.start_at.clone()
+        } else {
+            item.start_at.trim().to_string()
+        };
+        item.end_at = if item.end_at.trim().is_empty() {
+            item.provenance.end_at.clone()
+        } else {
+            item.end_at.trim().to_string()
+        };
+        if item.title.is_empty() {
+            anyhow::bail!("primitive events items require non-empty title");
+        }
+        let seed = format!("{}|{}|{}", item.title, item.start_at, item.provenance.source_path);
+        item.id = unique_id(&used_ids, &item.id, &seed, "pevent");
+        used_ids.insert(item.id.clone());
+    }
+    Ok(items)
+}
+
+fn normalize_assertion_items(mut items: Vec<AssertionCandidate>) -> Result<Vec<AssertionCandidate>> {
+    if items.len() > MAX_ASSERTIONS {
+        items.truncate(MAX_ASSERTIONS);
+    }
+    let mut used_ids = HashSet::new();
+    for item in &mut items {
+        item.text = truncate_with_ellipsis(item.text.trim(), 400);
+        item.kind = truncate_with_ellipsis(item.kind.trim(), 60);
+        item.polarity = truncate_with_ellipsis(item.polarity.trim(), 30);
+        item.status = truncate_with_ellipsis(item.status.trim(), 30);
+        item.speaker = truncate_with_ellipsis(item.speaker.trim(), 120);
+        normalize_optional_id_list(&mut item.related_entities);
+        normalize_optional_id_list(&mut item.related_event_ids);
+        normalize_provenance(&mut item.provenance, None, false)?;
+        if item.speaker.is_empty() && !item.provenance.speaker.is_empty() {
+            item.speaker = item.provenance.speaker.clone();
+        }
+        if item.text.is_empty() {
+            anyhow::bail!("assertions items require non-empty text");
+        }
+        let seed = format!("{}|{}|{}", item.text, item.kind, item.provenance.source_path);
+        item.id = unique_id(&used_ids, &item.id, &seed, "assertion");
+        used_ids.insert(item.id.clone());
+    }
+    Ok(items)
+}
+
+fn normalize_action_items(mut items: Vec<ActionCandidate>) -> Result<Vec<ActionCandidate>> {
+    if items.len() > MAX_ACTIONS {
+        items.truncate(MAX_ACTIONS);
+    }
+    let mut used_ids = HashSet::new();
+    for item in &mut items {
+        item.title = truncate_with_ellipsis(item.title.trim(), 120);
+        item.details = truncate_with_ellipsis(item.details.trim(), 600);
+        item.status = normalize_todo_status(&item.status);
+        item.priority = normalize_priority(&item.priority);
+        item.owner = truncate_with_ellipsis(item.owner.trim(), 120);
+        normalize_optional_id_list(&mut item.related_entities);
+        normalize_optional_id_list(&mut item.related_assertion_ids);
+        normalize_provenance(&mut item.provenance, None, false)?;
+        if item.title.is_empty() {
+            anyhow::bail!("actions items require non-empty title");
+        }
+        let seed = format!("{}|{}|{}", item.title, item.due_at, item.provenance.source_path);
+        item.id = unique_id(&used_ids, &item.id, &seed, "action");
+        used_ids.insert(item.id.clone());
+    }
+    Ok(items)
+}
+
+fn normalize_segment_items(mut items: Vec<SegmentCandidate>) -> Result<Vec<SegmentCandidate>> {
+    if items.len() > MAX_SEGMENTS {
+        items.truncate(MAX_SEGMENTS);
+    }
+    let mut used_ids = HashSet::new();
+    for item in &mut items {
+        item.label = truncate_with_ellipsis(item.label.trim(), 120);
+        item.topic = truncate_with_ellipsis(item.topic.trim(), 160);
+        item.source_path = normalize_source_path(&item.source_path)?;
+        item.start_at = item.start_at.trim().to_string();
+        item.end_at = item.end_at.trim().to_string();
+        item.speaker = truncate_with_ellipsis(item.speaker.trim(), 120);
+        item.transcript_quote = truncate_with_ellipsis(item.transcript_quote.trim(), 400);
+        item.purpose = truncate_with_ellipsis(item.purpose.trim(), 160);
+        normalize_provenance(&mut item.provenance, Some(&item.source_path), false)?;
+        let has_timing = !item.start_at.is_empty() || !item.end_at.is_empty();
+        if has_timing && !is_transcript_source_path(&item.source_path) {
+            anyhow::bail!("segments with timing must point to transcript sidecars");
+        }
+        if item.label.is_empty() && item.topic.is_empty() {
+            anyhow::bail!("segments items require non-empty label or topic");
+        }
+        let seed = format!(
+            "{}|{}|{}|{}",
+            item.label, item.topic, item.start_at, item.source_path
+        );
+        item.id = unique_id(&used_ids, &item.id, &seed, "segment");
+        used_ids.insert(item.id.clone());
+    }
+    Ok(items)
+}
+
+fn normalize_structure_items(mut items: Vec<StructureCandidate>) -> Result<Vec<StructureCandidate>> {
+    if items.len() > MAX_STRUCTURES {
+        items.truncate(MAX_STRUCTURES);
+    }
+    let mut used_ids = HashSet::new();
+    for item in &mut items {
+        item.kind = truncate_with_ellipsis(item.kind.trim(), 60);
+        item.title = truncate_with_ellipsis(item.title.trim(), 120);
+        item.body = truncate_with_ellipsis(item.body.trim(), 1200);
+        item.format_hint = truncate_with_ellipsis(item.format_hint.trim(), 60);
+        normalize_optional_id_list(&mut item.source_primitive_ids);
+        normalize_provenance(&mut item.provenance, None, false)?;
+        if item.kind.is_empty() {
+            anyhow::bail!("structures items require non-empty kind");
+        }
+        if item.body.is_empty() {
+            anyhow::bail!("structures items require non-empty body");
+        }
+        let seed = format!("{}|{}|{}", item.kind, item.body, item.provenance.source_path);
+        item.id = unique_id(&used_ids, &item.id, &seed, "structure");
+        used_ids.insert(item.id.clone());
+    }
+    Ok(items)
 }
 
 fn normalize_source_path(raw: &str) -> Result<String> {
@@ -1672,6 +2548,326 @@ fn rewrite_source_path(path: &mut String, rename_map: &HashMap<String, String>) 
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct LoadedPrimitiveHandoffs {
+    entities: Option<Vec<EntityCandidate>>,
+    events: Option<Vec<PrimitiveEventCandidate>>,
+    assertions: Option<Vec<AssertionCandidate>>,
+    actions: Option<Vec<ActionCandidate>>,
+    segments: Option<Vec<SegmentCandidate>>,
+    structures: Option<Vec<StructureCandidate>>,
+}
+
+fn primitive_artifact_states_default() -> WorkspaceSynthArtifactStates {
+    WorkspaceSynthArtifactStates {
+        insight_posts: skipped_artifact_state(WORKSPACE_SYNTHESIZER_INSIGHT_POSTS_PATH),
+        todos: skipped_artifact_state(WORKSPACE_SYNTHESIZER_TODOS_PATH),
+        events: skipped_artifact_state(WORKSPACE_SYNTHESIZER_EVENTS_PATH),
+        clip_plans: skipped_artifact_state(WORKSPACE_SYNTHESIZER_CLIP_PLANS_PATH),
+        primitive_entities: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH),
+        primitive_events: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH),
+        primitive_assertions: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH),
+        primitive_actions: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH),
+        primitive_segments: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH),
+        primitive_structures: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH),
+    }
+}
+
+fn compile_todos_from_actions(items: &[ActionCandidate]) -> Vec<TodoCandidate> {
+    items.iter()
+        .map(|item| TodoCandidate {
+            id: item.id.clone(),
+            title: item.title.clone(),
+            details: item.details.clone(),
+            priority: item.priority.clone(),
+            status: item.status.clone(),
+            due_at: item.due_at.clone(),
+            source_path: item.provenance.source_path.clone(),
+            source_excerpt: item.provenance.source_excerpt.clone(),
+        })
+        .collect()
+}
+
+fn compile_events_from_primitive_events(items: &[PrimitiveEventCandidate]) -> Vec<EventCandidate> {
+    items.iter()
+        .map(|item| EventCandidate {
+            id: item.id.clone(),
+            title: item.title.clone(),
+            details: item.details.clone(),
+            location: String::new(),
+            status: item.status.clone(),
+            start_at: item.start_at.clone(),
+            end_at: item.end_at.clone(),
+            all_day: item.start_at.len() == 10 && item.end_at.is_empty(),
+            source_path: item.provenance.source_path.clone(),
+            source_excerpt: item.provenance.source_excerpt.clone(),
+        })
+        .collect()
+}
+
+fn compile_clip_plans_from_segments(
+    segments: &[SegmentCandidate],
+    assertions: &[AssertionCandidate],
+    structures: &[StructureCandidate],
+) -> Vec<ClipPlanCandidate> {
+    segments
+        .iter()
+        .filter(|item| !item.start_at.is_empty() && !item.end_at.is_empty() && is_transcript_source_path(&item.source_path))
+        .take(MAX_CLIP_PLANS)
+        .map(|item| {
+            let mut notes_parts = Vec::new();
+            if !item.purpose.is_empty() {
+                notes_parts.push(item.purpose.clone());
+            }
+            if let Some(assertion) = assertions
+                .iter()
+                .find(|assertion| assertion.provenance.source_path == item.source_path)
+            {
+                notes_parts.push(format!("Assertion: {}", assertion.text));
+            }
+            if let Some(structure) = structures
+                .iter()
+                .find(|structure| structure.provenance.source_path == item.source_path)
+            {
+                notes_parts.push(format!("Structure: {}", structure.kind));
+            }
+            ClipPlanCandidate {
+                id: item.id.clone(),
+                title: if item.label.is_empty() {
+                    truncate_with_ellipsis(&item.topic, 120)
+                } else {
+                    item.label.clone()
+                },
+                source_path: item.source_path.clone(),
+                source_excerpt: item.provenance.source_excerpt.clone(),
+                transcript_quote: if item.transcript_quote.is_empty() {
+                    item.provenance.source_excerpt.clone()
+                } else {
+                    item.transcript_quote.clone()
+                },
+                start_at: item.start_at.clone(),
+                end_at: item.end_at.clone(),
+                notes: truncate_with_ellipsis(&notes_parts.join(" | "), 600),
+            }
+        })
+        .collect()
+}
+
+fn compile_insight_posts_from_primitives(
+    assertions: &[AssertionCandidate],
+    segments: &[SegmentCandidate],
+    structures: &[StructureCandidate],
+) -> Vec<InsightPostCandidate> {
+    let mut items = assertions
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.kind.to_ascii_lowercase().as_str(),
+                "claim" | "belief" | "decision" | "question"
+            )
+        })
+        .take(MAX_INSIGHT_POSTS)
+        .map(|item| {
+            let supporting_segment = segments
+                .iter()
+                .find(|segment| segment.provenance.source_path == item.provenance.source_path);
+            let text = supporting_segment
+                .and_then(|segment| {
+                    if segment.transcript_quote.trim().is_empty() {
+                        None
+                    } else {
+                        Some(segment.transcript_quote.as_str())
+                    }
+                })
+                .unwrap_or(item.text.as_str());
+            InsightPostCandidate {
+                id: item.id.clone(),
+                text: truncate_with_ellipsis(text, 480),
+                source_path: item.provenance.source_path.clone(),
+                source_excerpt: item.provenance.source_excerpt.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    if !items.is_empty() {
+        return items;
+    }
+    items = structures
+        .iter()
+        .filter(|item| item.kind.eq_ignore_ascii_case("post"))
+        .take(MAX_INSIGHT_POSTS)
+        .map(|item| InsightPostCandidate {
+            id: item.id.clone(),
+            text: truncate_with_ellipsis(&item.body, 480),
+            source_path: item.provenance.source_path.clone(),
+            source_excerpt: item.provenance.source_excerpt.clone(),
+        })
+        .collect();
+    items
+}
+
+fn apply_primitive_handoff_files(
+    workspace_dir: &Path,
+    manifest_id: &str,
+    processed_source_paths: &[String],
+    handoffs: LoadedPrimitiveHandoffs,
+    legacy_insight_items: Option<Vec<InsightPostCandidate>>,
+    legacy_todo_items: Option<Vec<TodoCandidate>>,
+    legacy_event_items: Option<Vec<EventCandidate>>,
+    legacy_clip_plan_items: Option<Vec<ClipPlanCandidate>>,
+    journal_title_items: Option<Vec<JournalTitleCandidate>>,
+    result: &mut WorkspaceSynthesisApplyResult,
+    error_messages: &mut Vec<String>,
+) -> Result<()> {
+    let rename_map = match journal_title_items.as_deref() {
+        Some(items) if !items.is_empty() => match apply_source_path_renames(items, workspace_dir) {
+            Ok(map) => map,
+            Err(err) => {
+                result.had_errors = true;
+                error_messages.push(format!("journal titles: {err}"));
+                HashMap::new()
+            }
+        },
+        _ => HashMap::new(),
+    };
+
+    if !rename_map.is_empty() {
+        result.renamed_sources = rename_map
+            .iter()
+            .map(|(from_path, to_path)| WorkspaceSynthRenamedSource {
+                from_path: from_path.clone(),
+                to_path: to_path.clone(),
+            })
+            .collect();
+        result.applied_any = true;
+    }
+
+    let used_entities = handoffs.entities.is_some();
+    let used_primitive_events = handoffs.events.is_some();
+    let used_assertions = handoffs.assertions.is_some();
+    let used_actions = handoffs.actions.is_some();
+    let used_segments = handoffs.segments.is_some();
+    let used_structures = handoffs.structures.is_some();
+
+    let entities = handoffs.entities.unwrap_or_default();
+    let primitive_events = handoffs.events.unwrap_or_default();
+    let assertions = handoffs.assertions.unwrap_or_default();
+    let actions = handoffs.actions.unwrap_or_default();
+    let mut segments = handoffs.segments.unwrap_or_default();
+    let mut structures = handoffs.structures.unwrap_or_default();
+
+    for item in &mut segments {
+        rewrite_source_path(&mut item.source_path, &rename_map);
+        rewrite_source_path(&mut item.provenance.source_path, &rename_map);
+    }
+    for item in &mut structures {
+        rewrite_source_path(&mut item.provenance.source_path, &rename_map);
+    }
+
+    result.counts.primitive_entities = entities.len();
+    result.counts.primitive_events = primitive_events.len();
+    result.counts.primitive_assertions = assertions.len();
+    result.counts.primitive_actions = actions.len();
+    result.counts.primitive_segments = segments.len();
+    result.counts.primitive_structures = structures.len();
+    result.artifact_states.primitive_entities = if used_entities {
+        applied_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH, entities.len())
+    } else {
+        skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH)
+    };
+    result.artifact_states.primitive_events = if used_primitive_events {
+        applied_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH, primitive_events.len())
+    } else {
+        skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH)
+    };
+    result.artifact_states.primitive_assertions = if used_assertions {
+        applied_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH, assertions.len())
+    } else {
+        skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH)
+    };
+    result.artifact_states.primitive_actions = if used_actions {
+        applied_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH, actions.len())
+    } else {
+        skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH)
+    };
+    result.artifact_states.primitive_segments = if used_segments {
+        applied_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH, segments.len())
+    } else {
+        skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH)
+    };
+    result.artifact_states.primitive_structures = if used_structures {
+        applied_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH, structures.len())
+    } else {
+        skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH)
+    };
+
+    let compiled_insight_posts = if used_structures || used_assertions {
+        compile_insight_posts_from_primitives(&assertions, &segments, &structures)
+    } else {
+        legacy_insight_items.unwrap_or_default()
+    };
+    let compiled_todos = if used_actions {
+        compile_todos_from_actions(&actions)
+    } else {
+        legacy_todo_items.unwrap_or_default()
+    };
+    let compiled_events = if used_primitive_events {
+        compile_events_from_primitive_events(&primitive_events)
+    } else {
+        legacy_event_items.unwrap_or_default()
+    };
+    let compiled_clip_plans = if used_segments {
+        compile_clip_plans_from_segments(&segments, &assertions, &structures)
+    } else {
+        legacy_clip_plan_items.unwrap_or_default()
+    };
+
+    let manifest = WorkspaceSynthesisManifest {
+        version: manifest_version(),
+        insight_posts: compiled_insight_posts,
+        todos: compiled_todos,
+        events: compiled_events,
+        clip_plans: compiled_clip_plans,
+        run_summary: ManifestRunSummary {
+            notes: format!(
+                "Compiled app outputs from primitive handoffs: entities={}, events={}, assertions={}, actions={}, segments={}, optional_draft_structures={}.",
+                entities.len(),
+                primitive_events.len(),
+                assertions.len(),
+                actions.len(),
+                segments.len(),
+                structures.len()
+            ),
+        },
+    };
+
+    let mut applied = apply_manifest(workspace_dir, &manifest, manifest_id)?;
+    if !rename_map.is_empty() {
+        applied.renamed_sources = result.renamed_sources.clone();
+    }
+    applied.artifact_states = result.artifact_states.clone();
+    applied.counts.primitive_entities = entities.len();
+    applied.counts.primitive_events = primitive_events.len();
+    applied.counts.primitive_assertions = assertions.len();
+    applied.counts.primitive_actions = actions.len();
+    applied.counts.primitive_segments = segments.len();
+    applied.counts.primitive_structures = structures.len();
+    applied.summary = format!(
+        "{} Primitive compilation active.",
+        build_apply_summary(
+            &applied.counts,
+            applied.renamed_sources.len(),
+            applied.had_errors,
+            applied.applied_any,
+            error_messages
+        )
+    );
+    *result = applied;
+    if result.counts.todos == 0 && !processed_source_paths.is_empty() {
+        result.counts.todos = 0;
+    }
+    Ok(())
+}
+
 pub fn apply_manifest(
     workspace_dir: &Path,
     manifest: &WorkspaceSynthesisManifest,
@@ -1753,6 +2949,7 @@ pub fn apply_manifest(
         todos: todo_count,
         events: event_count,
         clip_plans: clip_plan_paths.len(),
+        ..WorkspaceSynthArtifactCounts::default()
     };
     let summary = format!(
         "Applied workspace synthesis: {} feed posts, {} todos, {} events, {} clip plans.",
@@ -1846,21 +3043,102 @@ pub fn apply_handoff_files(
     let journal_titles_file_path = journal_titles_path(workspace_dir);
 
     let mut result = WorkspaceSynthesisApplyResult {
-        artifact_states: WorkspaceSynthArtifactStates {
-            insight_posts: skipped_artifact_state(WORKSPACE_SYNTHESIZER_INSIGHT_POSTS_PATH),
-            todos: skipped_artifact_state(WORKSPACE_SYNTHESIZER_TODOS_PATH),
-            events: skipped_artifact_state(WORKSPACE_SYNTHESIZER_EVENTS_PATH),
-            clip_plans: skipped_artifact_state(WORKSPACE_SYNTHESIZER_CLIP_PLANS_PATH),
-        },
+        artifact_states: primitive_artifact_states_default(),
         ..WorkspaceSynthesisApplyResult::default()
     };
     let mut saw_split_file = false;
+    let mut saw_primitive_file = false;
     let mut error_messages = Vec::new();
+    let mut primitive_handoffs = LoadedPrimitiveHandoffs::default();
     let mut insight_items: Option<Vec<InsightPostCandidate>> = None;
     let mut todo_items_raw: Option<Vec<TodoCandidate>> = None;
     let mut event_items_raw: Option<Vec<EventCandidate>> = None;
     let mut clip_plan_items: Option<Vec<ClipPlanCandidate>> = None;
     let mut journal_title_items: Option<Vec<JournalTitleCandidate>> = None;
+
+    if primitive_entities_path(workspace_dir).is_file() {
+        saw_primitive_file = true;
+        match load_optional_entities_file(workspace_dir) {
+            Ok(Some(items)) => primitive_handoffs.entities = Some(items),
+            Ok(None) => {}
+            Err(err) => {
+                result.had_errors = true;
+                result.artifact_states.primitive_entities =
+                    error_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH, &err);
+                error_messages.push(format!("entities: {err}"));
+            }
+        }
+    }
+
+    if primitive_events_path(workspace_dir).is_file() {
+        saw_primitive_file = true;
+        match load_optional_primitive_events_file(workspace_dir) {
+            Ok(Some(items)) => primitive_handoffs.events = Some(items),
+            Ok(None) => {}
+            Err(err) => {
+                result.had_errors = true;
+                result.artifact_states.primitive_events =
+                    error_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH, &err);
+                error_messages.push(format!("primitive events: {err}"));
+            }
+        }
+    }
+
+    if primitive_assertions_path(workspace_dir).is_file() {
+        saw_primitive_file = true;
+        match load_optional_assertions_file(workspace_dir) {
+            Ok(Some(items)) => primitive_handoffs.assertions = Some(items),
+            Ok(None) => {}
+            Err(err) => {
+                result.had_errors = true;
+                result.artifact_states.primitive_assertions =
+                    error_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH, &err);
+                error_messages.push(format!("assertions: {err}"));
+            }
+        }
+    }
+
+    if primitive_actions_path(workspace_dir).is_file() {
+        saw_primitive_file = true;
+        match load_optional_actions_file(workspace_dir) {
+            Ok(Some(items)) => primitive_handoffs.actions = Some(items),
+            Ok(None) => {}
+            Err(err) => {
+                result.had_errors = true;
+                result.artifact_states.primitive_actions =
+                    error_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH, &err);
+                error_messages.push(format!("actions: {err}"));
+            }
+        }
+    }
+
+    if primitive_segments_path(workspace_dir).is_file() {
+        saw_primitive_file = true;
+        match load_optional_segments_file(workspace_dir) {
+            Ok(Some(items)) => primitive_handoffs.segments = Some(items),
+            Ok(None) => {}
+            Err(err) => {
+                result.had_errors = true;
+                result.artifact_states.primitive_segments =
+                    error_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH, &err);
+                error_messages.push(format!("segments: {err}"));
+            }
+        }
+    }
+
+    if primitive_structures_path(workspace_dir).is_file() {
+        saw_primitive_file = true;
+        match load_optional_structures_file(workspace_dir) {
+            Ok(Some(items)) => primitive_handoffs.structures = Some(items),
+            Ok(None) => {}
+            Err(err) => {
+                result.had_errors = true;
+                result.artifact_states.primitive_structures =
+                    error_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH, &err);
+                error_messages.push(format!("structures: {err}"));
+            }
+        }
+    }
 
     if insight_posts_file_path.is_file() {
         saw_split_file = true;
@@ -1930,6 +3208,23 @@ pub fn apply_handoff_files(
         }
     }
 
+    if saw_primitive_file && !saw_split_file {
+        apply_primitive_handoff_files(
+            workspace_dir,
+            manifest_id,
+            processed_source_paths,
+            primitive_handoffs,
+            insight_items,
+            todo_items_raw,
+            event_items_raw,
+            clip_plan_items,
+            journal_title_items,
+            &mut result,
+            &mut error_messages,
+        )?;
+        return Ok(result);
+    }
+
     let rename_map = match journal_title_items.as_deref() {
         Some(items) if !items.is_empty() => match apply_source_path_renames(items, workspace_dir) {
             Ok(map) => map,
@@ -1969,6 +3264,93 @@ pub fn apply_handoff_files(
             for item in items {
                 rewrite_source_path(&mut item.source_path, &rename_map);
             }
+        }
+    }
+
+    let primitive_entities = primitive_handoffs.entities.unwrap_or_default();
+    let primitive_events = primitive_handoffs.events.unwrap_or_default();
+    let primitive_assertions = primitive_handoffs.assertions.unwrap_or_default();
+    let primitive_actions = primitive_handoffs.actions.unwrap_or_default();
+    let mut primitive_segments = primitive_handoffs.segments.unwrap_or_default();
+    let mut primitive_structures = primitive_handoffs.structures.unwrap_or_default();
+
+    for item in &mut primitive_segments {
+        rewrite_source_path(&mut item.source_path, &rename_map);
+        rewrite_source_path(&mut item.provenance.source_path, &rename_map);
+    }
+    for item in &mut primitive_structures {
+        rewrite_source_path(&mut item.provenance.source_path, &rename_map);
+    }
+
+    result.counts.primitive_entities = primitive_entities.len();
+    result.counts.primitive_events = primitive_events.len();
+    result.counts.primitive_assertions = primitive_assertions.len();
+    result.counts.primitive_actions = primitive_actions.len();
+    result.counts.primitive_segments = primitive_segments.len();
+    result.counts.primitive_structures = primitive_structures.len();
+    if saw_primitive_file {
+        if result.artifact_states.primitive_entities.status != "error" {
+            result.artifact_states.primitive_entities = applied_artifact_state(
+                WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH,
+                primitive_entities.len(),
+            );
+        }
+        if result.artifact_states.primitive_events.status != "error" {
+            result.artifact_states.primitive_events = applied_artifact_state(
+                WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH,
+                primitive_events.len(),
+            );
+        }
+        if result.artifact_states.primitive_assertions.status != "error" {
+            result.artifact_states.primitive_assertions = applied_artifact_state(
+                WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH,
+                primitive_assertions.len(),
+            );
+        }
+        if result.artifact_states.primitive_actions.status != "error" {
+            result.artifact_states.primitive_actions = applied_artifact_state(
+                WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH,
+                primitive_actions.len(),
+            );
+        }
+        if result.artifact_states.primitive_segments.status != "error" {
+            result.artifact_states.primitive_segments = applied_artifact_state(
+                WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH,
+                primitive_segments.len(),
+            );
+        }
+        if result.artifact_states.primitive_structures.status != "error" {
+            result.artifact_states.primitive_structures = applied_artifact_state(
+                WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH,
+                primitive_structures.len(),
+            );
+        }
+    }
+
+    if insight_items.is_none() && (!primitive_assertions.is_empty() || !primitive_structures.is_empty()) {
+        let compiled = compile_insight_posts_from_primitives(
+            &primitive_assertions,
+            &primitive_segments,
+            &primitive_structures,
+        );
+        if !compiled.is_empty() {
+            insight_items = Some(compiled);
+        }
+    }
+    if todo_items_raw.is_none() && !primitive_actions.is_empty() {
+        todo_items_raw = Some(compile_todos_from_actions(&primitive_actions));
+    }
+    if event_items_raw.is_none() && !primitive_events.is_empty() {
+        event_items_raw = Some(compile_events_from_primitive_events(&primitive_events));
+    }
+    if clip_plan_items.is_none() && !primitive_segments.is_empty() {
+        let compiled = compile_clip_plans_from_segments(
+            &primitive_segments,
+            &primitive_assertions,
+            &primitive_structures,
+        );
+        if !compiled.is_empty() {
+            clip_plan_items = Some(compiled);
         }
     }
 
@@ -2118,6 +3500,7 @@ pub fn apply_handoff_files(
             WORKSPACE_SYNTHESIZER_MANIFEST_PATH,
             legacy_manifest.clip_plans.len(),
         ),
+        ..WorkspaceSynthArtifactStates::default()
     };
     Ok(legacy_result)
 }
@@ -2334,6 +3717,114 @@ mod tests {
     }
 
     #[test]
+    fn normalize_segment_items_allows_untimed_text_journal_segments() {
+        let items = normalize_segment_items(vec![SegmentCandidate {
+            label: "Product demo".to_string(),
+            topic: "demo".to_string(),
+            source_path: "journals/text/2026-03-11.md".to_string(),
+            provenance: PrimitiveProvenance {
+                source_path: "journals/text/2026-03-11.md".to_string(),
+                source_excerpt: "Talked through the demo section.".to_string(),
+                ..PrimitiveProvenance::default()
+            },
+            ..SegmentCandidate::default()
+        }])
+        .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert!(items[0].start_at.is_empty());
+        assert!(items[0].end_at.is_empty());
+    }
+
+    #[test]
+    fn normalize_segment_items_rejects_timing_outside_transcripts() {
+        let err = normalize_segment_items(vec![SegmentCandidate {
+            label: "Timed segment".to_string(),
+            source_path: "journals/text/2026-03-11.md".to_string(),
+            start_at: "00:00:01.000".to_string(),
+            end_at: "00:00:05.000".to_string(),
+            provenance: PrimitiveProvenance {
+                source_path: "journals/text/2026-03-11.md".to_string(),
+                source_excerpt: "Timed excerpt".to_string(),
+                ..PrimitiveProvenance::default()
+            },
+            ..SegmentCandidate::default()
+        }])
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("segments with timing must point to transcript sidecars"));
+    }
+
+    #[test]
+    fn normalize_action_items_generates_stable_ids() {
+        let base = ActionCandidate {
+            title: "Email the team".to_string(),
+            due_at: "2026-03-12".to_string(),
+            provenance: PrimitiveProvenance {
+                source_path: "journals/text/2026-03-11.md".to_string(),
+                source_excerpt: "Need to email the team tomorrow.".to_string(),
+                ..PrimitiveProvenance::default()
+            },
+            ..ActionCandidate::default()
+        };
+
+        let first = normalize_action_items(vec![base.clone()]).unwrap();
+        let second = normalize_action_items(vec![ActionCandidate {
+            details: "Share the latest synthesis update.".to_string(),
+            ..base
+        }])
+        .unwrap();
+
+        assert_eq!(first[0].id, second[0].id);
+    }
+
+    #[test]
+    fn artifact_rules_from_markdown_extracts_section_body() {
+        let markdown = "\
+# Skill
+
+## Artifact Rules
+
+- Emit concise, feed-ready text only.
+- No titles.
+
+## Output Schema
+
+Use JSON.
+";
+
+        assert_eq!(
+            artifact_rules_from_markdown(markdown),
+            "- Emit concise, feed-ready text only.\n- No titles."
+        );
+    }
+
+    #[test]
+    fn effective_artifact_rules_prefers_override_text() {
+        let markdown = "\
+## Artifact Rules
+
+- Built-in rule.
+";
+
+        assert_eq!(
+            effective_artifact_rules(markdown, "  - Custom rule.\n- Another rule.  "),
+            "- Custom rule.\n- Another rule."
+        );
+    }
+
+    #[test]
+    fn artifact_rules_from_markdown_returns_empty_when_missing() {
+        let markdown = "\
+## Goal
+
+Do something useful.
+";
+
+        assert!(artifact_rules_from_markdown(markdown).is_empty());
+    }
+
+    #[test]
     fn apply_handoff_files_applies_present_files_and_skips_missing_ones() {
         let tmp = tempdir().unwrap();
         let insight_posts = InsightPostFile {
@@ -2457,5 +3948,114 @@ mod tests {
         );
         let event_rows = local_store::list_workspace_events(tmp.path(), 20).unwrap();
         assert_eq!(event_rows.len(), 1);
+    }
+
+    #[test]
+    fn apply_handoff_files_compiles_app_outputs_from_primitives() {
+        let tmp = tempdir().unwrap();
+        write_json_file(
+            &primitive_actions_path(tmp.path()),
+            &ActionFile {
+                version: "1".to_string(),
+                items: vec![ActionCandidate {
+                    id: "email-team".to_string(),
+                    title: "Email the team".to_string(),
+                    details: "Share the primitive-first update.".to_string(),
+                    status: "open".to_string(),
+                    priority: "high".to_string(),
+                    due_at: "2026-03-12T09:00:00Z".to_string(),
+                    provenance: PrimitiveProvenance {
+                        source_path: "journals/text/2026-03-11.md".to_string(),
+                        source_excerpt: "Need to email the team tomorrow morning.".to_string(),
+                        ..PrimitiveProvenance::default()
+                    },
+                    ..ActionCandidate::default()
+                }],
+            },
+        );
+        write_json_file(
+            &primitive_segments_path(tmp.path()),
+            &SegmentFile {
+                version: "1".to_string(),
+                items: vec![SegmentCandidate {
+                    id: "product-demo".to_string(),
+                    label: "Product demo".to_string(),
+                    topic: "demo".to_string(),
+                    source_path: "journals/text/transcriptions/demo.txt".to_string(),
+                    start_at: "00:00:01.000".to_string(),
+                    end_at: "00:00:05.000".to_string(),
+                    transcript_quote: "Here is the strongest part of the demo.".to_string(),
+                    provenance: PrimitiveProvenance {
+                        source_path: "journals/text/transcriptions/demo.txt".to_string(),
+                        source_excerpt: "Here is the strongest part of the demo.".to_string(),
+                        start_at: "00:00:01.000".to_string(),
+                        end_at: "00:00:05.000".to_string(),
+                        ..PrimitiveProvenance::default()
+                    },
+                    ..SegmentCandidate::default()
+                }],
+            },
+        );
+        write_json_file(
+            &primitive_assertions_path(tmp.path()),
+            &AssertionFile {
+                version: "1".to_string(),
+                items: vec![AssertionCandidate {
+                    id: "product-belief".to_string(),
+                    text: "The sharper workflow makes the product demo easier to follow.".to_string(),
+                    kind: "belief".to_string(),
+                    provenance: PrimitiveProvenance {
+                        source_path: "journals/text/2026-03-11.md".to_string(),
+                        source_excerpt: "The sharper workflow makes the demo easier to follow.".to_string(),
+                        ..PrimitiveProvenance::default()
+                    },
+                    ..AssertionCandidate::default()
+                }],
+            },
+        );
+        write_json_file(
+            &primitive_structures_path(tmp.path()),
+            &StructureFile {
+                version: "1".to_string(),
+                items: vec![StructureCandidate {
+                    id: "draft-post".to_string(),
+                    kind: "post".to_string(),
+                    body: "This is only a draft structure and should not win over assertions."
+                        .to_string(),
+                    provenance: PrimitiveProvenance {
+                        source_path: "journals/text/2026-03-11.md".to_string(),
+                        source_excerpt: "Draft structure excerpt.".to_string(),
+                        ..PrimitiveProvenance::default()
+                    },
+                    ..StructureCandidate::default()
+                }],
+            },
+        );
+
+        let processed_source_paths = vec!["journals/text/2026-03-11.md".to_string()];
+        let applied = apply_handoff_files(tmp.path(), "run-primitive", &processed_source_paths).unwrap();
+
+        assert!(applied.applied_any);
+        assert_eq!(applied.counts.todos, 1);
+        assert_eq!(applied.counts.clip_plans, 1);
+        assert_eq!(applied.counts.insight_posts, 1);
+        assert_eq!(applied.counts.primitive_actions, 1);
+        assert_eq!(applied.counts.primitive_segments, 1);
+        assert_eq!(applied.counts.primitive_assertions, 1);
+        assert_eq!(applied.counts.primitive_structures, 1);
+        assert_eq!(applied.artifact_states.primitive_actions.status, "applied");
+        assert_eq!(applied.artifact_states.primitive_segments.status, "applied");
+        assert!(tmp
+            .path()
+            .join("posts/workspace_synthesizer/product-belief.md")
+            .exists());
+        assert!(!tmp
+            .path()
+            .join("posts/workspace_synthesizer/draft-post.md")
+            .exists());
+        assert!(tmp
+            .path()
+            .join("posts/workspace_synthesizer/pipeline/clips/product-demo.json")
+            .exists());
     }
 }

@@ -13,6 +13,7 @@ pub mod local_store;
 pub mod feed_web_sources;
 pub mod workspace_synthesizer;
 
+use crate::auth::AuthService;
 use crate::config::{Config, TranscriptionConfig};
 use crate::gateway::feed_web_sources::DEFAULT_FEED_WEB_SOURCES;
 use crate::media::{command_media_backend, MediaToolCapabilities};
@@ -1367,6 +1368,7 @@ struct FeedContentAgentAutoRunBody {
 struct WorkspaceSynthSkillUpdateBody {
     skill_key: String,
     enabled: Option<bool>,
+    artifact_rules_override: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1959,6 +1961,7 @@ fn migrate_workspace_synth_managed_workflows(
                 built_in_skill_fingerprint: None,
                 visible_in_ui: spec.visible_in_ui,
                 handler_kind: spec.handler_kind,
+                artifact_rules_override: String::new(),
             });
         skill_record.enabled = legacy.enabled;
         if let Some(goal) = normalize_goal_text(legacy.goal.clone())
@@ -2025,21 +2028,28 @@ fn workspace_synth_skill_unsupported_reason(
 }
 
 fn workspace_synth_skill_response_item(
+    workspace_dir: &StdPath,
     skill: &workspace_synthesizer::WorkspaceSynthSkillDefinition,
-    enabled: bool,
+    record: &workspace_synthesizer::WorkspaceSynthSkillRecord,
     media_capabilities: MediaToolCapabilities,
 ) -> workspace_synthesizer::WorkspaceSynthSkillResponseItem {
     let unsupported_reason = workspace_synth_skill_unsupported_reason(skill, media_capabilities);
+    let artifact_rules = std::fs::read_to_string(workspace_dir.join(&skill.skill_path))
+        .ok()
+        .map(|body| workspace_synthesizer::artifact_rules_from_markdown(&body))
+        .unwrap_or_default();
     workspace_synthesizer::WorkspaceSynthSkillResponseItem {
         skill_key: skill.key.clone(),
         name: skill.name.clone(),
         skill_path: skill.skill_path.clone(),
         output_prefix: skill.output_prefix.clone(),
-        enabled,
+        enabled: record.enabled,
         supported: unsupported_reason.is_none(),
         unsupported_reason,
         goal: skill.goal.clone(),
         handler_kind: skill.handler_kind,
+        artifact_rules,
+        artifact_rules_override: record.artifact_rules_override.clone(),
     }
 }
 
@@ -2677,6 +2687,42 @@ fn workspace_synth_default_artifact_states() -> workspace_synthesizer::Workspace
             item_count: 0,
             error: String::new(),
         },
+        primitive_entities: workspace_synthesizer::WorkspaceSynthArtifactState {
+            status: "skipped".to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH.to_string(),
+            item_count: 0,
+            error: String::new(),
+        },
+        primitive_events: workspace_synthesizer::WorkspaceSynthArtifactState {
+            status: "skipped".to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH.to_string(),
+            item_count: 0,
+            error: String::new(),
+        },
+        primitive_assertions: workspace_synthesizer::WorkspaceSynthArtifactState {
+            status: "skipped".to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH.to_string(),
+            item_count: 0,
+            error: String::new(),
+        },
+        primitive_actions: workspace_synthesizer::WorkspaceSynthArtifactState {
+            status: "skipped".to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH.to_string(),
+            item_count: 0,
+            error: String::new(),
+        },
+        primitive_segments: workspace_synthesizer::WorkspaceSynthArtifactState {
+            status: "skipped".to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH.to_string(),
+            item_count: 0,
+            error: String::new(),
+        },
+        primitive_structures: workspace_synthesizer::WorkspaceSynthArtifactState {
+            status: "skipped".to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH.to_string(),
+            item_count: 0,
+            error: String::new(),
+        },
     }
 }
 
@@ -2685,6 +2731,21 @@ fn workspace_synth_artifact_state_mut<'a>(
     workflow_key: &str,
 ) -> Option<&'a mut workspace_synthesizer::WorkspaceSynthArtifactState> {
     match workflow_key {
+        workspace_synthesizer::WORKSPACE_ENTITY_EXTRACTOR_WORKFLOW_KEY => {
+            Some(&mut states.primitive_entities)
+        }
+        workspace_synthesizer::WORKSPACE_ACTION_EXTRACTOR_WORKFLOW_KEY => {
+            Some(&mut states.primitive_actions)
+        }
+        workspace_synthesizer::WORKSPACE_PRIMITIVE_EVENT_EXTRACTOR_WORKFLOW_KEY => {
+            Some(&mut states.primitive_events)
+        }
+        workspace_synthesizer::WORKSPACE_ASSERTION_EXTRACTOR_WORKFLOW_KEY => {
+            Some(&mut states.primitive_assertions)
+        }
+        workspace_synthesizer::WORKSPACE_SEGMENT_EXTRACTOR_WORKFLOW_KEY => {
+            Some(&mut states.primitive_segments)
+        }
         workspace_synthesizer::WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY => {
             Some(&mut states.insight_posts)
         }
@@ -2727,20 +2788,182 @@ fn workspace_synth_skill_run_state(
         summary,
         error,
         item_count,
+        started_at: String::new(),
+        finished_at: String::new(),
+        duration_ms: 0,
     }
 }
 
-fn render_workspace_synth_extractor_run_prompt(
+fn workspace_synth_skill_run_state_timed(
+    skill: &workspace_synthesizer::WorkspaceSynthSkillDefinition,
+    status: &str,
+    summary: String,
+    error: String,
+    item_count: usize,
+    started_at: chrono::DateTime<Utc>,
+    finished_at: chrono::DateTime<Utc>,
+) -> workspace_synthesizer::WorkspaceSynthSkillRunState {
+    let duration_ms = (finished_at - started_at).num_milliseconds().max(0) as u64;
+    workspace_synthesizer::WorkspaceSynthSkillRunState {
+        skill_key: skill.key.clone(),
+        name: skill.name.clone(),
+        output_prefix: skill.output_prefix.clone(),
+        handler_kind: skill.handler_kind,
+        status: status.to_string(),
+        summary,
+        error,
+        item_count,
+        started_at: started_at.to_rfc3339(),
+        finished_at: finished_at.to_rfc3339(),
+        duration_ms,
+    }
+}
+
+fn parse_provider_name_and_profile(raw: &str) -> (&str, Option<&str>) {
+    if raw.starts_with("custom:") || raw.starts_with("anthropic-custom:") {
+        return (raw, None);
+    }
+    if let Some((name, profile)) = raw.split_once(':') {
+        let trimmed_name = name.trim();
+        let trimmed_profile = profile.trim();
+        if !trimmed_name.is_empty() && !trimmed_profile.is_empty() {
+            return (trimmed_name, Some(trimmed_profile));
+        }
+    }
+    (raw.trim(), None)
+}
+
+fn workspace_synth_provider_is_local(provider_name: &str, api_url: Option<&str>) -> bool {
+    let normalized = provider_name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    if providers::list_providers().iter().any(|info| {
+        info.local
+            && (info.name.eq_ignore_ascii_case(&normalized)
+                || info
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(&normalized)))
+    }) {
+        return true;
+    }
+    if matches!(
+        normalized.as_str(),
+        "lmstudio"
+            | "lm-studio"
+            | "llamacpp"
+            | "llama.cpp"
+            | "sglang"
+            | "vllm"
+            | "osaurus"
+    ) {
+        return true;
+    }
+    if normalized.starts_with("custom:") {
+        let candidate = provider_name
+            .trim()
+            .strip_prefix("custom:")
+            .or(api_url)
+            .unwrap_or("");
+        return candidate.contains("localhost")
+            || candidate.contains("127.0.0.1")
+            || candidate.contains("0.0.0.0");
+    }
+    false
+}
+
+async fn workspace_synth_provider_readiness(state: &AppState) -> (bool, String) {
+    let config = state.config.lock().clone();
+    let raw_provider = config
+        .default_provider
+        .as_deref()
+        .unwrap_or("openai-codex")
+        .trim()
+        .to_string();
+    let (provider_name, profile_override) = parse_provider_name_and_profile(&raw_provider);
+
+    if provider_name.is_empty() {
+        return (
+            false,
+            "Select an AI provider before running the workspace synthesizer.".to_string(),
+        );
+    }
+
+    if workspace_synth_provider_is_local(provider_name, config.api_url.as_deref()) {
+        return (true, String::new());
+    }
+
+    if config
+        .api_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return (true, String::new());
+    }
+
+    let auth = AuthService::from_config(&config);
+    let has_auth = match provider_name.to_ascii_lowercase().as_str() {
+        "openai-codex" | "openai_codex" | "codex" => auth
+            .get_valid_openai_access_token(profile_override)
+            .await
+            .ok()
+            .flatten()
+            .is_some(),
+        "gemini" | "google" | "google-gemini" => auth
+            .get_provider_bearer_token("gemini", profile_override)
+            .await
+            .ok()
+            .flatten()
+            .is_some(),
+        other => auth
+            .get_provider_bearer_token(other, profile_override)
+            .await
+            .ok()
+            .flatten()
+            .is_some(),
+    };
+
+    if has_auth {
+        return (true, String::new());
+    }
+
+    let reason = if provider_name.eq_ignore_ascii_case("openai-codex")
+        || provider_name.eq_ignore_ascii_case("openai_codex")
+        || provider_name.eq_ignore_ascii_case("codex")
+    {
+        "OpenAI login required. Finish OpenAI setup in the app before running workspace synthesis."
+            .to_string()
+    } else if provider_name.eq_ignore_ascii_case("gemini")
+        || provider_name.eq_ignore_ascii_case("google")
+        || provider_name.eq_ignore_ascii_case("google-gemini")
+    {
+        "Gemini login required. Finish Gemini setup before running workspace synthesis."
+            .to_string()
+    } else {
+        format!(
+            "Provider `{}` is not ready. Add credentials or switch to a local provider before running workspace synthesis.",
+            raw_provider.trim()
+        )
+    };
+    (false, reason)
+}
+
+fn render_workspace_synth_split_batch_prompt(
     orchestrator: &FeedContentAgentDefinition,
     orchestrator_skill_markdown: &str,
-    extractor: &FeedContentAgentDefinition,
-    extractor_skill_markdown: &str,
+    split_skills: &[(
+        workspace_synthesizer::WorkspaceSynthSkillDefinition,
+        workspace_synthesizer::WorkspaceSynthExtractorSpec,
+        String,
+    )],
     media_tool_summary: &str,
-    handoff_path: &str,
     target_sources: &[WorkspaceSynthSourceCandidate],
 ) -> String {
     let mut prompt = String::new();
-    prompt.push_str("Run the following workspace extractor skill and write only its typed handoff file.\n\n");
+    prompt.push_str(
+        "Run the workspace synthesizer fast extraction bundle and write only the allowed typed handoff files.\n\n",
+    );
     prompt.push_str("## Workspace Synthesizer Index Skill\n");
     prompt.push_str(&format!("- Name: {}\n", orchestrator.bot_name));
     prompt.push_str(&format!("- Key: {}\n", orchestrator.key));
@@ -2748,15 +2971,24 @@ fn render_workspace_synth_extractor_run_prompt(
     prompt.push_str("```markdown\n");
     prompt.push_str(orchestrator_skill_markdown.trim());
     prompt.push_str("\n```\n\n");
-    prompt.push_str("## Extractor Skill\n");
-    prompt.push_str(&format!("- Name: {}\n", extractor.bot_name));
-    prompt.push_str(&format!("- Key: {}\n", extractor.key));
-    prompt.push_str(&format!("- Goal: {}\n", extractor.goal.trim()));
-    prompt.push_str(&format!("- Skill file: `{}`\n", extractor.skill_path));
-    prompt.push_str(&format!("- Allowed output file: `{}`\n\n", handoff_path));
-    prompt.push_str("```markdown\n");
-    prompt.push_str(extractor_skill_markdown.trim());
-    prompt.push_str("\n```\n\n");
+    prompt.push_str("## Enabled Extractor Skills In This Bundle\n");
+    for (skill, spec, artifact_rules) in split_skills {
+        prompt.push_str(&format!("### {}\n", skill.name));
+        prompt.push_str(&format!("- Key: {}\n", skill.key));
+        prompt.push_str(&format!("- Goal: {}\n", skill.goal.trim()));
+        prompt.push_str(&format!("- Allowed output file: `{}`\n", spec.handoff_path));
+        prompt.push_str("- Artifact rules for this skill:\n");
+        if artifact_rules.trim().is_empty() {
+            prompt.push_str("  - Use the built-in artifact rules for this skill.\n\n");
+        } else {
+            for line in artifact_rules.lines() {
+                prompt.push_str("  ");
+                prompt.push_str(line.trim_end());
+                prompt.push('\n');
+            }
+            prompt.push('\n');
+        }
+    }
     prompt.push_str("## Execution Rules\n");
     if !target_sources.is_empty() {
         prompt.push_str("## Target Sources For This Run\n");
@@ -2774,11 +3006,50 @@ fn render_workspace_synth_extractor_run_prompt(
     prompt.push_str("- If a needed transcript for journal media is missing, use `transcribe_media` and save outputs under `journals/text/transcriptions/**`.\n");
     prompt.push_str(&format!("- {media_tool_summary}\n"));
     prompt.push_str("- For deterministic media transforms, use only the built-in media tools that are available on this device.\n");
-    prompt.push_str("- Write exactly one handoff file at the allowed path, even if the `items` array is empty.\n");
+    prompt.push_str("- Write each allowed handoff file exactly once, even if its `items` array is empty.\n");
+    prompt.push_str("- Allowed handoff files for this run:\n");
+    for (_, spec, _) in split_skills {
+        prompt.push_str(&format!("  - `{}`\n", spec.handoff_path));
+    }
     prompt.push_str("- Do not write any other handoff file, final feed post, todo, event, or clip artifact.\n");
     prompt.push_str("- Use direct file edits in the workspace, not code blocks in chat.\n");
-    prompt.push_str("- Reply with a concise summary of what you wrote to the handoff file.\n");
+    prompt.push_str("- Reply with a concise summary of what you wrote across the handoff files.\n");
     prompt
+}
+
+async fn run_workspace_synth_split_batch_call(
+    state: &AppState,
+    orchestrator_workflow: &FeedContentAgentDefinition,
+    orchestrator_skill_markdown: &str,
+    split_skills: &[(
+        workspace_synthesizer::WorkspaceSynthSkillDefinition,
+        workspace_synthesizer::WorkspaceSynthExtractorSpec,
+        String,
+    )],
+    media_tool_summary: &str,
+    target_sources: &[WorkspaceSynthSourceCandidate],
+) -> Result<String> {
+    let prompt = render_workspace_synth_split_batch_prompt(
+        orchestrator_workflow,
+        orchestrator_skill_markdown,
+        split_skills,
+        media_tool_summary,
+        target_sources,
+    );
+    let subthread_id = format!("workflow:{}:split-batch", orchestrator_workflow.key);
+    match tokio::time::timeout(
+        Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
+        run_local_agent_prompt_in_thread(state, &subthread_id, &prompt),
+    )
+    .await
+    {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(err)) => Err(err).context("workspace synth split bundle failed"),
+        Err(_) => anyhow::bail!(
+            "workspace synth split bundle timed out after {}s",
+            CONTENT_AGENT_TIMEOUT_SECS
+        ),
+    }
 }
 
 async fn run_workspace_synthesizer_orchestrator(
@@ -2799,6 +3070,9 @@ async fn run_workspace_synthesizer_orchestrator(
     let mut split_artifact_states = workspace_synth_default_artifact_states();
     let mut split_skill_defs = Vec::new();
     let mut skill_runs = Vec::new();
+    let mut pending_split_skills = Vec::new();
+    let mut split_batch_started_at = None;
+    let mut split_batch_finished_at = None;
 
     for skill in workspace_synthesizer::skill_definitions(&skill_store) {
         let enabled = skill_store
@@ -2869,6 +3143,61 @@ async fn run_workspace_synthesizer_orchestrator(
             }
         };
 
+        if !pending_split_skills.is_empty()
+            && skill.handler_kind != workspace_synthesizer::WorkspaceSynthSkillHandlerKind::SplitHandoff
+        {
+            let started_at = Utc::now();
+            match run_workspace_synth_split_batch_call(
+                state,
+                orchestrator_workflow,
+                orchestrator_skill_markdown,
+                &pending_split_skills,
+                media_tool_summary,
+                target_sources,
+            )
+            .await
+            {
+                Ok(reply) => {
+                    let finished_at = Utc::now();
+                    split_batch_started_at = Some(started_at);
+                    split_batch_finished_at = Some(finished_at);
+                    let trimmed = reply.trim();
+                    if !trimmed.is_empty() {
+                        skill_replies.push(format!("Fast extraction bundle: {}", trimmed));
+                    }
+                    split_skill_defs.extend(
+                        pending_split_skills
+                            .iter()
+                            .map(|(split_skill, _, _)| split_skill.clone()),
+                    );
+                }
+                Err(err) => {
+                    let finished_at = Utc::now();
+                    let message = truncate_with_ellipsis(&format!("{err:#}"), 800);
+                    for (split_skill, _, _) in &pending_split_skills {
+                        if let Some(state) = workspace_synth_artifact_state_mut(
+                            &mut split_artifact_states,
+                            &split_skill.key,
+                        ) {
+                            state.status = "error".to_string();
+                            state.error = message.clone();
+                        }
+                        skill_runs.push(workspace_synth_skill_run_state_timed(
+                            split_skill,
+                            "error",
+                            String::new(),
+                            message.clone(),
+                            0,
+                            started_at,
+                            finished_at,
+                        ));
+                        skill_errors.push(format!("{} failed: {}", split_skill.name, message));
+                    }
+                }
+            }
+            pending_split_skills.clear();
+        }
+
         match skill.handler_kind {
             workspace_synthesizer::WorkspaceSynthSkillHandlerKind::SplitHandoff => {
                 let Some(spec) = workspace_synthesizer::extractor_spec_by_key(&skill.key) else {
@@ -2889,69 +3218,11 @@ async fn run_workspace_synthesizer_orchestrator(
                     skill_errors.push(message);
                     continue;
                 };
-                workspace_synthesizer::reset_skill_outputs(workspace_dir, &skill)?;
-                let skill_workflow = workspace_synth_skill_as_workflow_definition(&skill);
-                let prompt = render_workspace_synth_extractor_run_prompt(
-                    orchestrator_workflow,
-                    orchestrator_skill_markdown,
-                    &skill_workflow,
+                let artifact_rules = workspace_synthesizer::effective_artifact_rules(
                     &skill_markdown,
-                    media_tool_summary,
-                    spec.handoff_path,
-                    target_sources,
+                    &skill.artifact_rules_override,
                 );
-                let subthread_id =
-                    format!("workflow:{}:{}", orchestrator_workflow.key, skill.key);
-                match tokio::time::timeout(
-                    Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
-                    run_local_agent_prompt_in_thread(state, &subthread_id, &prompt),
-                )
-                .await
-                {
-                    Ok(Ok(reply)) => {
-                        let trimmed = reply.trim();
-                        if !trimmed.is_empty() {
-                            skill_replies.push(format!("{}: {}", skill.name, trimmed));
-                        }
-                        split_skill_defs.push(skill.clone());
-                    }
-                    Ok(Err(err)) => {
-                        let message =
-                            truncate_with_ellipsis(&format!("{} failed: {err:#}", skill.name), 800);
-                        if let Some(state) =
-                            workspace_synth_artifact_state_mut(&mut split_artifact_states, &skill.key)
-                        {
-                            state.status = "error".to_string();
-                            state.error = message.clone();
-                        }
-                        skill_runs.push(workspace_synth_skill_run_state(
-                            &skill,
-                            "error",
-                            String::new(),
-                            message.clone(),
-                            0,
-                        ));
-                        skill_errors.push(message);
-                    }
-                    Err(_) => {
-                        let message =
-                            format!("{} timed out after {}s", skill.name, CONTENT_AGENT_TIMEOUT_SECS);
-                        if let Some(state) =
-                            workspace_synth_artifact_state_mut(&mut split_artifact_states, &skill.key)
-                        {
-                            state.status = "error".to_string();
-                            state.error = message.clone();
-                        }
-                        skill_runs.push(workspace_synth_skill_run_state(
-                            &skill,
-                            "error",
-                            String::new(),
-                            message.clone(),
-                            0,
-                        ));
-                        skill_errors.push(message);
-                    }
-                }
+                pending_split_skills.push((skill.clone(), spec, artifact_rules));
             }
             workspace_synthesizer::WorkspaceSynthSkillHandlerKind::ArticleHandoff => {
                 workspace_synthesizer::reset_skill_outputs(workspace_dir, &skill)?;
@@ -2964,6 +3235,7 @@ async fn run_workspace_synthesizer_orchestrator(
                 );
                 let subthread_id =
                     format!("workflow:{}:{}", orchestrator_workflow.key, skill.key);
+                let started_at = Utc::now();
                 match tokio::time::timeout(
                     Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
                     run_local_agent_prompt_in_thread(state, &subthread_id, &prompt),
@@ -2978,6 +3250,7 @@ async fn run_workspace_synthesizer_orchestrator(
                         .await
                         {
                             Ok(Ok(applied)) => {
+                                let finished_at = Utc::now();
                                 let item_count = applied.created_count + applied.updated_count;
                                 let summary = if reply.trim().is_empty() {
                                     applied.summary.clone()
@@ -2987,7 +3260,7 @@ async fn run_workspace_synthesizer_orchestrator(
                                 if !summary.trim().is_empty() {
                                     skill_replies.push(format!("{}: {}", skill.name, summary.trim()));
                                 }
-                                skill_runs.push(workspace_synth_skill_run_state(
+                                skill_runs.push(workspace_synth_skill_run_state_timed(
                                     &skill,
                                     if applied.had_errors { "error" } else { "applied" },
                                     applied.summary.clone(),
@@ -2997,62 +3270,76 @@ async fn run_workspace_synthesizer_orchestrator(
                                         String::new()
                                     },
                                     item_count,
+                                    started_at,
+                                    finished_at,
                                 ));
                                 if applied.had_errors {
                                     skill_errors.push(applied.summary.clone());
                                 }
                             }
                             Ok(Err(err)) => {
+                                let finished_at = Utc::now();
                                 let message = truncate_with_ellipsis(
                                     &format!("{} apply failed: {err:#}", skill.name),
                                     800,
                                 );
-                                skill_runs.push(workspace_synth_skill_run_state(
+                                skill_runs.push(workspace_synth_skill_run_state_timed(
                                     &skill,
                                     "error",
                                     String::new(),
                                     message.clone(),
                                     0,
+                                    started_at,
+                                    finished_at,
                                 ));
                                 skill_errors.push(message);
                             }
                             Err(err) => {
+                                let finished_at = Utc::now();
                                 let message = truncate_with_ellipsis(
                                     &format!("{} apply task failed: {err:#}", skill.name),
                                     800,
                                 );
-                                skill_runs.push(workspace_synth_skill_run_state(
+                                skill_runs.push(workspace_synth_skill_run_state_timed(
                                     &skill,
                                     "error",
                                     String::new(),
                                     message.clone(),
                                     0,
+                                    started_at,
+                                    finished_at,
                                 ));
                                 skill_errors.push(message);
                             }
                         }
                     }
                     Ok(Err(err)) => {
+                        let finished_at = Utc::now();
                         let message =
                             truncate_with_ellipsis(&format!("{} failed: {err:#}", skill.name), 800);
-                        skill_runs.push(workspace_synth_skill_run_state(
+                        skill_runs.push(workspace_synth_skill_run_state_timed(
                             &skill,
                             "error",
                             String::new(),
                             message.clone(),
                             0,
+                            started_at,
+                            finished_at,
                         ));
                         skill_errors.push(message);
                     }
                     Err(_) => {
+                        let finished_at = Utc::now();
                         let message =
                             format!("{} timed out after {}s", skill.name, CONTENT_AGENT_TIMEOUT_SECS);
-                        skill_runs.push(workspace_synth_skill_run_state(
+                        skill_runs.push(workspace_synth_skill_run_state_timed(
                             &skill,
                             "error",
                             String::new(),
                             message.clone(),
                             0,
+                            started_at,
+                            finished_at,
                         ));
                         skill_errors.push(message);
                     }
@@ -3069,6 +3356,7 @@ async fn run_workspace_synthesizer_orchestrator(
                 );
                 let subthread_id =
                     format!("workflow:{}:{}", orchestrator_workflow.key, skill.key);
+                let started_at = Utc::now();
                 match tokio::time::timeout(
                     Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
                     run_local_agent_prompt_in_thread(state, &subthread_id, &prompt),
@@ -3076,6 +3364,7 @@ async fn run_workspace_synthesizer_orchestrator(
                 .await
                 {
                     Ok(Ok(reply)) => {
+                        let finished_at = Utc::now();
                         let item_count = workspace_synthesizer::direct_output_file_count(
                             workspace_dir,
                             &skill.output_prefix,
@@ -3087,41 +3376,101 @@ async fn run_workspace_synthesizer_orchestrator(
                             reply.trim().to_string()
                         };
                         skill_replies.push(format!("{}: {}", skill.name, summary.trim()));
-                        skill_runs.push(workspace_synth_skill_run_state(
+                        skill_runs.push(workspace_synth_skill_run_state_timed(
                             &skill,
                             "applied",
                             summary,
                             String::new(),
                             item_count,
+                            started_at,
+                            finished_at,
                         ));
                     }
                     Ok(Err(err)) => {
+                        let finished_at = Utc::now();
                         let message =
                             truncate_with_ellipsis(&format!("{} failed: {err:#}", skill.name), 800);
-                        skill_runs.push(workspace_synth_skill_run_state(
+                        skill_runs.push(workspace_synth_skill_run_state_timed(
                             &skill,
                             "error",
                             String::new(),
                             message.clone(),
                             0,
+                            started_at,
+                            finished_at,
                         ));
                         skill_errors.push(message);
                     }
                     Err(_) => {
+                        let finished_at = Utc::now();
                         let message =
                             format!("{} timed out after {}s", skill.name, CONTENT_AGENT_TIMEOUT_SECS);
-                        skill_runs.push(workspace_synth_skill_run_state(
+                        skill_runs.push(workspace_synth_skill_run_state_timed(
                             &skill,
                             "error",
                             String::new(),
                             message.clone(),
                             0,
+                            started_at,
+                            finished_at,
                         ));
                         skill_errors.push(message);
                     }
                 }
             }
         }
+    }
+
+    if !pending_split_skills.is_empty() {
+        let started_at = Utc::now();
+        match run_workspace_synth_split_batch_call(
+            state,
+            orchestrator_workflow,
+            orchestrator_skill_markdown,
+            &pending_split_skills,
+            media_tool_summary,
+            target_sources,
+        )
+        .await
+        {
+            Ok(reply) => {
+                let finished_at = Utc::now();
+                split_batch_started_at = Some(started_at);
+                split_batch_finished_at = Some(finished_at);
+                let trimmed = reply.trim();
+                if !trimmed.is_empty() {
+                    skill_replies.push(format!("Fast extraction bundle: {}", trimmed));
+                }
+                split_skill_defs.extend(
+                    pending_split_skills
+                        .iter()
+                        .map(|(split_skill, _, _)| split_skill.clone()),
+                );
+            }
+            Err(err) => {
+                let finished_at = Utc::now();
+                let message = truncate_with_ellipsis(&format!("{err:#}"), 800);
+                for (split_skill, _, _) in &pending_split_skills {
+                    if let Some(state) =
+                        workspace_synth_artifact_state_mut(&mut split_artifact_states, &split_skill.key)
+                    {
+                        state.status = "error".to_string();
+                        state.error = message.clone();
+                    }
+                    skill_runs.push(workspace_synth_skill_run_state_timed(
+                        split_skill,
+                        "error",
+                        String::new(),
+                        message.clone(),
+                        0,
+                        started_at,
+                        finished_at,
+                    ));
+                    skill_errors.push(format!("{} failed: {}", split_skill.name, message));
+                }
+            }
+        }
+        pending_split_skills.clear();
     }
 
     let processed_source_paths = target_sources
@@ -3159,6 +3508,22 @@ async fn run_workspace_synthesizer_orchestrator(
     if !split_artifact_states.clip_plans.error.trim().is_empty() {
         applied.artifact_states.clip_plans = split_artifact_states.clip_plans.clone();
     }
+    if !split_artifact_states.primitive_entities.error.trim().is_empty() {
+        applied.artifact_states.primitive_entities = split_artifact_states.primitive_entities.clone();
+    }
+    if !split_artifact_states.primitive_actions.error.trim().is_empty() {
+        applied.artifact_states.primitive_actions = split_artifact_states.primitive_actions.clone();
+    }
+    if !split_artifact_states.primitive_events.error.trim().is_empty() {
+        applied.artifact_states.primitive_events = split_artifact_states.primitive_events.clone();
+    }
+    if !split_artifact_states.primitive_assertions.error.trim().is_empty() {
+        applied.artifact_states.primitive_assertions =
+            split_artifact_states.primitive_assertions.clone();
+    }
+    if !split_artifact_states.primitive_segments.error.trim().is_empty() {
+        applied.artifact_states.primitive_segments = split_artifact_states.primitive_segments.clone();
+    }
 
     for skill in split_skill_defs {
         let item_state = workspace_synth_artifact_state_mut(&mut applied.artifact_states, &skill.key)
@@ -3176,13 +3541,27 @@ async fn run_workspace_synthesizer_orchestrator(
         } else {
             "No items applied.".to_string()
         };
-        skill_runs.push(workspace_synth_skill_run_state(
-            &skill,
-            status,
-            summary,
-            item_state.error.clone(),
-            item_state.item_count,
-        ));
+        if let (Some(started_at), Some(finished_at)) =
+            (split_batch_started_at, split_batch_finished_at)
+        {
+            skill_runs.push(workspace_synth_skill_run_state_timed(
+                &skill,
+                status,
+                summary,
+                item_state.error.clone(),
+                item_state.item_count,
+                started_at,
+                finished_at,
+            ));
+        } else {
+            skill_runs.push(workspace_synth_skill_run_state(
+                &skill,
+                status,
+                summary,
+                item_state.error.clone(),
+                item_state.item_count,
+            ));
+        }
     }
 
     if !skill_errors.is_empty() {
@@ -4747,13 +5126,14 @@ async fn handle_workspace_synthesizer_skills(
     let media_capabilities = local_media_capabilities(&state.config.lock().clone());
     let items = workspace_synthesizer::skill_definitions(&store)
         .into_iter()
-        .map(|skill| {
-            let enabled = store
-                .skills
-                .get(&skill.key)
-                .map(|record| record.enabled)
-                .unwrap_or(true);
-            workspace_synth_skill_response_item(&skill, enabled, media_capabilities)
+        .filter_map(|skill| {
+            let record = store.skills.get(&skill.key)?;
+            Some(workspace_synth_skill_response_item(
+                &workspace_dir,
+                &skill,
+                record,
+                media_capabilities,
+            ))
         })
         .collect::<Vec<_>>();
 
@@ -4810,6 +5190,9 @@ async fn handle_workspace_synthesizer_skills_update(
             }
             record.enabled = enabled;
         }
+        if let Some(artifact_rules_override) = body.artifact_rules_override.clone() {
+            record.artifact_rules_override = artifact_rules_override.trim().to_string();
+        }
     }
 
     if let Err(err) = workspace_synthesizer::save_skill_store(&workspace_dir, &store) {
@@ -4821,9 +5204,17 @@ async fn handle_workspace_synthesizer_skills_update(
         );
     }
 
+    let Some(record) = store.skills.get(&skill.key) else {
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "WORKSPACE_SYNTH_SKILL_UNKNOWN",
+            "unknown skillKey",
+        );
+    };
     let item = workspace_synth_skill_response_item(
+        &workspace_dir,
         &skill,
-        store.skills.get(&skill.key).map(|record| record.enabled).unwrap_or(true),
+        record,
         media_capabilities,
     );
     (
@@ -5135,18 +5526,21 @@ async fn handle_workspace_synthesizer_status(
         return err;
     }
 
-    let status = workspace_synthesizer_status_payload(&state);
+    let status = workspace_synthesizer_status_payload(&state).await;
     (
         StatusCode::OK,
         Json(serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({}))),
     )
 }
 
-fn workspace_synthesizer_status_payload(
+async fn workspace_synthesizer_status_payload(
     state: &AppState,
 ) -> workspace_synthesizer::WorkspaceSynthesizerStatus {
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let mut status = workspace_synthesizer::load_status(&workspace_dir);
+    let (provider_ready, provider_blocked_reason) = workspace_synth_provider_readiness(state).await;
+    status.provider_ready = provider_ready;
+    status.provider_blocked_reason = provider_blocked_reason;
     if let Ok(selection) = select_workspace_synth_sources(&workspace_dir, &[], false) {
         status.pending_source_count = selection.pending.len();
         status.pending_word_count = selection.selected_word_count;
@@ -5174,7 +5568,7 @@ async fn handle_workspace_synthesizer_stream(
     tokio::spawn(async move {
         let mut last_snapshot = String::new();
         loop {
-            let payload = workspace_synthesizer_status_payload(&state_for_stream);
+            let payload = workspace_synthesizer_status_payload(&state_for_stream).await;
             let value = serde_json::to_value(&payload).unwrap_or_else(|_| serde_json::json!({}));
             let fingerprint = serde_json::to_string(&value).unwrap_or_default();
             if fingerprint != last_snapshot {
@@ -5202,6 +5596,17 @@ async fn handle_workspace_synthesizer_run(
 ) -> impl IntoResponse {
     if let Some(err) = pairing_auth_error(&state, &headers, "Workspace synthesizer run") {
         return err;
+    }
+
+    let (provider_ready, provider_blocked_reason) = workspace_synth_provider_readiness(&state).await;
+    if !provider_ready {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "queued": false,
+                "message": provider_blocked_reason,
+            })),
+        );
     }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
@@ -5289,6 +5694,17 @@ async fn handle_workspace_synthesizer_auto_run(
 ) -> impl IntoResponse {
     if let Some(err) = pairing_auth_error(&state, &headers, "Workspace synthesizer auto run") {
         return err;
+    }
+
+    let (provider_ready, provider_blocked_reason) = workspace_synth_provider_readiness(&state).await;
+    if !provider_ready {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "queued": false,
+                "message": provider_blocked_reason,
+            })),
+        );
     }
 
     let reason = body
@@ -11831,6 +12247,40 @@ mod tests {
             "transcript-ready",
             &journal_only
         ));
+    }
+
+    #[tokio::test]
+    async fn workspace_synth_provider_readiness_blocks_missing_openai_login() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let mut config = Config::default();
+        config.workspace_dir = workspace.join("workspace");
+        config.config_path = workspace.join(".zeroclaw").join("config.toml");
+        config.default_provider = Some("openai-codex".to_string());
+        config.api_key = None;
+
+        let state = test_app_state_with_config(config);
+        let (ready, reason) = workspace_synth_provider_readiness(&state).await;
+
+        assert!(!ready);
+        assert!(reason.contains("OpenAI login required"));
+    }
+
+    #[tokio::test]
+    async fn workspace_synth_provider_readiness_allows_local_provider_without_api_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let mut config = Config::default();
+        config.workspace_dir = workspace.join("workspace");
+        config.config_path = workspace.join(".zeroclaw").join("config.toml");
+        config.default_provider = Some("ollama".to_string());
+        config.api_key = None;
+
+        let state = test_app_state_with_config(config);
+        let (ready, reason) = workspace_synth_provider_readiness(&state).await;
+
+        assert!(ready);
+        assert!(reason.trim().is_empty());
     }
 
     #[tokio::test]
