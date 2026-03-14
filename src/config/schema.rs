@@ -61,7 +61,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
-/// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
+/// Resolution order: `ZEROCLAW_CONFIG_DIR` env → `ZEROCLAW_WORKSPACE` env → `~/.zeroclaw/config.toml`.
 /// Temp-directory workspace overrides are ignored unless `ZEROCLAW_ALLOW_TEMP_WORKSPACE` is enabled.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
@@ -3725,23 +3725,13 @@ fn default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
     Ok((config_dir.clone(), config_dir.join("workspace")))
 }
 
-const ACTIVE_WORKSPACE_STATE_FILE: &str = "active_workspace.toml";
 const ALLOW_TEMP_WORKSPACE_ENV: &str = "ZEROCLAW_ALLOW_TEMP_WORKSPACE";
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ActiveWorkspaceState {
-    config_dir: String,
-}
 
 fn default_config_dir() -> Result<PathBuf> {
     let home = UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
     Ok(home.join(".zeroclaw"))
-}
-
-fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
-    default_dir.join(ACTIVE_WORKSPACE_STATE_FILE)
 }
 
 /// Returns `true` if `path` lives under the OS temp directory.
@@ -3767,120 +3757,6 @@ fn temp_workspace_override_enabled() -> bool {
 
 fn should_ignore_temp_workspace(path: &Path) -> bool {
     is_temp_directory(path) && !temp_workspace_override_enabled()
-}
-
-async fn load_persisted_workspace_dirs(
-    default_config_dir: &Path,
-) -> Result<Option<(PathBuf, PathBuf)>> {
-    let state_path = active_workspace_state_path(default_config_dir);
-    if !state_path.exists() {
-        return Ok(None);
-    }
-
-    let contents = match fs::read_to_string(&state_path).await {
-        Ok(contents) => contents,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to read active workspace marker {}: {error}",
-                state_path.display()
-            );
-            return Ok(None);
-        }
-    };
-
-    let state: ActiveWorkspaceState = match toml::from_str(&contents) {
-        Ok(state) => state,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to parse active workspace marker {}: {error}",
-                state_path.display()
-            );
-            return Ok(None);
-        }
-    };
-
-    let raw_config_dir = state.config_dir.trim();
-    if raw_config_dir.is_empty() {
-        tracing::warn!(
-            "Ignoring active workspace marker {} because config_dir is empty",
-            state_path.display()
-        );
-        return Ok(None);
-    }
-
-    let parsed_dir = PathBuf::from(raw_config_dir);
-    let config_dir = if parsed_dir.is_absolute() {
-        parsed_dir
-    } else {
-        default_config_dir.join(parsed_dir)
-    };
-    Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
-}
-
-pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<()> {
-    let default_config_dir = default_config_dir()?;
-    let state_path = active_workspace_state_path(&default_config_dir);
-
-    // Guard: never persist a temp-directory path as the active workspace.
-    // This prevents transient test runs or one-off invocations from hijacking
-    // the daemon's config resolution.
-    #[cfg(not(test))]
-    if is_temp_directory(config_dir) {
-        tracing::warn!(
-            path = %config_dir.display(),
-            "Refusing to persist temp directory as active workspace marker"
-        );
-        return Ok(());
-    }
-
-    if config_dir == default_config_dir {
-        if state_path.exists() {
-            fs::remove_file(&state_path).await.with_context(|| {
-                format!(
-                    "Failed to clear active workspace marker: {}",
-                    state_path.display()
-                )
-            })?;
-        }
-        return Ok(());
-    }
-
-    fs::create_dir_all(&default_config_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create default config directory: {}",
-                default_config_dir.display()
-            )
-        })?;
-
-    let state = ActiveWorkspaceState {
-        config_dir: config_dir.to_string_lossy().into_owned(),
-    };
-    let serialized =
-        toml::to_string_pretty(&state).context("Failed to serialize active workspace marker")?;
-
-    let temp_path = default_config_dir.join(format!(
-        ".{ACTIVE_WORKSPACE_STATE_FILE}.tmp-{}",
-        uuid::Uuid::new_v4()
-    ));
-    fs::write(&temp_path, serialized).await.with_context(|| {
-        format!(
-            "Failed to write temporary active workspace marker: {}",
-            temp_path.display()
-        )
-    })?;
-
-    if let Err(error) = fs::rename(&temp_path, &state_path).await {
-        let _ = fs::remove_file(&temp_path).await;
-        anyhow::bail!(
-            "Failed to atomically persist active workspace marker {}: {error}",
-            state_path.display()
-        );
-    }
-
-    sync_directory(&default_config_dir).await?;
-    Ok(())
 }
 
 pub(crate) fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
@@ -3917,7 +3793,7 @@ pub(crate) fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf
 /// Resolve the current runtime config/workspace directories for onboarding flows.
 ///
 /// This mirrors the same precedence used by `Config::load_or_init()`:
-/// `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_WORKSPACE` > active workspace marker > defaults.
+/// `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_WORKSPACE` > `~/.zeroclaw/` (default).
 pub(crate) async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, PathBuf)> {
     let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
     let (config_dir, workspace_dir, _) =
@@ -3929,7 +3805,6 @@ pub(crate) async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, Pa
 enum ConfigResolutionSource {
     EnvConfigDir,
     EnvWorkspace,
-    ActiveWorkspaceMarker,
     DefaultConfigDir,
 }
 
@@ -3938,7 +3813,6 @@ impl ConfigResolutionSource {
         match self {
             Self::EnvConfigDir => "ZEROCLAW_CONFIG_DIR",
             Self::EnvWorkspace => "ZEROCLAW_WORKSPACE",
-            Self::ActiveWorkspaceMarker => "active_workspace.toml",
             Self::DefaultConfigDir => "default",
         }
     }
@@ -3979,16 +3853,6 @@ async fn resolve_runtime_config_dirs(
                 ));
             }
         }
-    }
-
-    if let Some((zeroclaw_dir, workspace_dir)) =
-        load_persisted_workspace_dirs(default_zeroclaw_dir).await?
-    {
-        return Ok((
-            zeroclaw_dir,
-            workspace_dir,
-            ConfigResolutionSource::ActiveWorkspaceMarker,
-        ));
     }
 
     Ok((
@@ -6924,16 +6788,6 @@ requires_openai_auth = true
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let default_workspace_dir = default_config_dir.join("workspace");
         let explicit_config_dir = default_config_dir.join("explicit-config");
-        let marker_config_dir = default_config_dir.join("profiles").join("alpha");
-        let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
-
-        fs::create_dir_all(&default_config_dir).await.unwrap();
-        let state = ActiveWorkspaceState {
-            config_dir: marker_config_dir.to_string_lossy().into_owned(),
-        };
-        fs::write(&state_path, toml::to_string(&state).unwrap())
-            .await
-            .unwrap();
 
         std::env::set_var("ZEROCLAW_CONFIG_DIR", &explicit_config_dir);
         std::env::remove_var("ZEROCLAW_WORKSPACE");
@@ -6951,35 +6805,6 @@ requires_openai_auth = true
         );
 
         std::env::remove_var("ZEROCLAW_CONFIG_DIR");
-        let _ = fs::remove_dir_all(default_config_dir).await;
-    }
-
-    #[test]
-    async fn resolve_runtime_config_dirs_uses_active_workspace_marker() {
-        let _env_guard = env_override_lock().await;
-        let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let default_workspace_dir = default_config_dir.join("workspace");
-        let marker_config_dir = default_config_dir.join("profiles").join("alpha");
-        let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
-
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
-        fs::create_dir_all(&default_config_dir).await.unwrap();
-        let state = ActiveWorkspaceState {
-            config_dir: marker_config_dir.to_string_lossy().into_owned(),
-        };
-        fs::write(&state_path, toml::to_string(&state).unwrap())
-            .await
-            .unwrap();
-
-        let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
-                .await
-                .unwrap();
-
-        assert_eq!(source, ConfigResolutionSource::ActiveWorkspaceMarker);
-        assert_eq!(config_dir, marker_config_dir);
-        assert_eq!(resolved_workspace_dir, marker_config_dir.join("workspace"));
-
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -7100,49 +6925,13 @@ default_model = "legacy-model"
     }
 
     #[test]
-    async fn load_or_init_uses_persisted_active_workspace_marker() {
-        let _env_guard = env_override_lock().await;
-        let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
-        let custom_config_dir = temp_home.join("profiles").join("agent-alpha");
-
-        fs::create_dir_all(&custom_config_dir).await.unwrap();
-        fs::write(
-            custom_config_dir.join("config.toml"),
-            "default_temperature = 0.7\ndefault_model = \"persisted-profile\"\n",
-        )
-        .await
-        .unwrap();
-
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
-
-        persist_active_workspace_config_dir(&custom_config_dir)
-            .await
-            .unwrap();
-
-        let config = Config::load_or_init().await.unwrap();
-
-        assert_eq!(config.config_path, custom_config_dir.join("config.toml"));
-        assert_eq!(config.workspace_dir, custom_config_dir.join("workspace"));
-        assert_eq!(config.default_model.as_deref(), Some("persisted-profile"));
-
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(temp_home).await;
-    }
-
-    #[test]
     async fn load_or_init_env_workspace_override_takes_priority_over_marker() {
         let _env_guard = env_override_lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
         let marker_config_dir = temp_home.join("profiles").join("persisted-profile");
         let env_workspace_dir = temp_home.join("env-workspace");
+        let legacy_marker_path = temp_home.join(".zeroclaw").join("active_workspace.toml");
 
         fs::create_dir_all(&marker_config_dir).await.unwrap();
         fs::write(
@@ -7151,12 +6940,21 @@ default_model = "legacy-model"
         )
         .await
         .unwrap();
+        fs::create_dir_all(legacy_marker_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(
+            &legacy_marker_path,
+            format!(
+                "config_dir = {:?}\n",
+                marker_config_dir.to_string_lossy().into_owned()
+            ),
+        )
+        .await
+        .unwrap();
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
-        persist_active_workspace_config_dir(&marker_config_dir)
-            .await
-            .unwrap();
         std::env::set_var(ALLOW_TEMP_WORKSPACE_ENV, "1");
         std::env::set_var("ZEROCLAW_WORKSPACE", &env_workspace_dir);
 
@@ -7164,6 +6962,7 @@ default_model = "legacy-model"
 
         assert_eq!(config.workspace_dir, env_workspace_dir.join("workspace"));
         assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));
+        assert_eq!(config.default_model.as_deref(), Some("gpt-5.3-codex"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
         std::env::remove_var(ALLOW_TEMP_WORKSPACE_ENV);
@@ -7175,37 +6974,6 @@ default_model = "legacy-model"
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
-    #[test]
-    async fn persist_active_workspace_marker_is_cleared_for_default_config_dir() {
-        let _env_guard = env_override_lock().await;
-        let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
-        let default_config_dir = temp_home.join(".zeroclaw");
-        let custom_config_dir = temp_home.join("profiles").join("custom-profile");
-        let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
-
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-
-        persist_active_workspace_config_dir(&custom_config_dir)
-            .await
-            .unwrap();
-        assert!(marker_path.exists());
-
-        persist_active_workspace_config_dir(&default_config_dir)
-            .await
-            .unwrap();
-        assert!(!marker_path.exists());
-
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(temp_home).await;
-    }
-
-    #[test]
     async fn env_override_empty_values_ignored() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();

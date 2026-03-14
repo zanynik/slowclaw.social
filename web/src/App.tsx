@@ -77,6 +77,7 @@ import {
   importWorkspaceSyncSnapshot,
   getRuntimeConfig,
   getWorkspaceSynthesizerStatus,
+  listWorkspaceSynthSkills,
   listClawChatMessages,
   listDrafts as listDraftsViaGateway,
   listFeedContentAgents,
@@ -95,6 +96,7 @@ import {
   streamWorkspaceSynthesizerStatus,
   submitFeedContentAgentComment,
   transcribeJournalMedia,
+  updateWorkspaceSynthSkill,
   updateWorkspaceTodoStatus,
   updateFeedContentAgent,
   updateRuntimeConfig,
@@ -109,6 +111,8 @@ import type {
   PersonalizedFeedItem,
   WorkspaceEventItem,
   WorkspaceSynthArtifactState,
+  WorkspaceSynthSkillItem,
+  WorkspaceSynthSkillRunState,
   WorkspaceSynthesizerStatus,
   WorkspaceTodoItem,
 } from "./lib/gatewayApi";
@@ -511,6 +515,7 @@ type WorkflowBotMeta = {
   avatar: string;
   outputPrefix: string;
   goal: string;
+  kind: "workflow" | "synth_skill";
 };
 
 type WorkflowSettingsDraft = {
@@ -547,7 +552,8 @@ function workflowBotByKey(key: string): WorkflowBotMeta {
     name: displayName,
     avatar,
     outputPrefix: `posts/${trimmed}/`,
-    goal: ""
+    goal: "",
+    kind: "workflow"
   };
 }
 
@@ -560,7 +566,22 @@ function workflowBotMetaFromSettings(item: FeedContentAgentItem): WorkflowBotMet
     name: workflowBot || fallback.name,
     avatar: (workflowBot || fallback.name).slice(0, 1).toUpperCase() || fallback.avatar,
     outputPrefix: outputPrefix || fallback.outputPrefix,
-    goal: String(item.goal || "").trim()
+    goal: String(item.goal || "").trim(),
+    kind: "workflow"
+  };
+}
+
+function workflowBotMetaFromSynthSkill(item: WorkspaceSynthSkillItem): WorkflowBotMeta {
+  const fallback = workflowBotByKey(item.skillKey);
+  const name = String(item.name || "").trim();
+  const outputPrefix = String(item.outputPrefix || "").trim();
+  return {
+    key: item.skillKey,
+    name: name || fallback.name,
+    avatar: (name || fallback.name).slice(0, 1).toUpperCase() || fallback.avatar,
+    outputPrefix: outputPrefix || fallback.outputPrefix,
+    goal: String(item.goal || "").trim(),
+    kind: "synth_skill"
   };
 }
 
@@ -587,6 +608,14 @@ function workflowSettingsDraftFromItem(item: FeedContentAgentItem): WorkflowSett
 
 function workflowBotForPath(path: string, bots: WorkflowBotMeta[]): WorkflowBotMeta | null {
   const normalized = path.trim().toLowerCase();
+  if (normalized.startsWith("posts/workspace_synthesizer/")) {
+    const synthInsight =
+      bots.find((bot) => bot.kind === "synth_skill" && bot.key === "workspace_insight_extractor") ||
+      bots.find((bot) => bot.kind === "synth_skill" && bot.outputPrefix.trim().toLowerCase() === "posts/workspace_synthesizer/");
+    if (synthInsight) {
+      return synthInsight;
+    }
+  }
   for (const bot of bots) {
     const prefix = bot.outputPrefix.trim().toLowerCase().replace(/^\/+/, "");
     if (!prefix) {
@@ -884,6 +913,11 @@ function App() {
   const [workflowSettingsByKey, setWorkflowSettingsByKey] = useState<
     Record<string, FeedContentAgentItem | undefined>
   >({});
+  const [workspaceSynthSkillItems, setWorkspaceSynthSkillItems] = useState<WorkspaceSynthSkillItem[]>([]);
+  const [workspaceSynthSkillBots, setWorkspaceSynthSkillBots] = useState<WorkflowBotMeta[]>([]);
+  const [workspaceSynthSkillsByKey, setWorkspaceSynthSkillsByKey] = useState<
+    Record<string, WorkspaceSynthSkillItem | undefined>
+  >({});
   const [workflowSettingsDraftByKey, setWorkflowSettingsDraftByKey] = useState<
     Record<string, WorkflowSettingsDraft | undefined>
   >({});
@@ -901,6 +935,7 @@ function App() {
   const [workflowTemplateSubmitting, setWorkflowTemplateSubmitting] = useState(false);
   const [workflowTemplateStatus, setWorkflowTemplateStatus] = useState("");
   const [workflowToggleBusyKey, setWorkflowToggleBusyKey] = useState("");
+  const [workspaceSynthSkillToggleBusyKey, setWorkspaceSynthSkillToggleBusyKey] = useState("");
   const [recordingHint, setRecordingHint] = useState(DEFAULT_RECORDING_HINT);
   const [mediaPreviewUrl, setMediaPreviewUrl] = useState<string>("");
   const [mediaPreviewMime, setMediaPreviewMime] = useState<string>("");
@@ -1028,6 +1063,7 @@ function App() {
     workspaceSynthStatus.status === "pending" || workspaceSynthStatus.status === "processing";
   const workspaceSynthPendingCount = Number(workspaceSynthStatus.pendingSourceCount || 0);
   const workspaceSynthSelectedCount = workspaceSynthStatus.selectedSourcePaths?.length || 0;
+  const feedAttributedBots = [...workspaceSynthSkillBots, ...workflowBots];
 
   useEffect(() => {
     let cancelled = false;
@@ -2177,6 +2213,7 @@ function App() {
     const status = await loadWorkspaceSynthStatus();
     await Promise.all([
       refreshLibrary("feed"),
+      loadWorkspaceSynthSkillSettings(),
       loadFeedWorkflowSettings(),
       loadWorkflowRunStatuses(),
       loadWorkspaceTodos(),
@@ -2286,8 +2323,10 @@ function App() {
           continue;
         }
         byKey[key] = item;
-        drafts[key] = workflowSettingsDraftFromItem(item);
-        bots.push(workflowBotMetaFromSettings(item));
+        if (key !== "workspace_synthesizer") {
+          drafts[key] = workflowSettingsDraftFromItem(item);
+          bots.push(workflowBotMetaFromSettings(item));
+        }
       }
 
       bots.sort((a, b) => a.name.localeCompare(b.name));
@@ -2304,6 +2343,38 @@ function App() {
       );
     } finally {
       setWorkflowSettingsLoading(false);
+    }
+  }
+
+  async function loadWorkspaceSynthSkillSettings() {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      return;
+    }
+
+    try {
+      const items = await listWorkspaceSynthSkills(token || undefined, gatewayBaseUrl);
+      const byKey: Record<string, WorkspaceSynthSkillItem | undefined> = {};
+      const bots: WorkflowBotMeta[] = [];
+      for (const item of items) {
+        const key = item.skillKey.trim();
+        if (!key) {
+          continue;
+        }
+        byKey[key] = item;
+        bots.push(workflowBotMetaFromSynthSkill(item));
+      }
+      bots.sort((a, b) => a.name.localeCompare(b.name));
+      setWorkspaceSynthSkillItems(items);
+      setWorkspaceSynthSkillsByKey(byKey);
+      setWorkspaceSynthSkillBots(bots);
+    } catch (error) {
+      setFeedEditStatus(
+        `Workspace synth skills unavailable (${error instanceof Error ? error.message : String(error)})`
+      );
     }
   }
 
@@ -2396,6 +2467,17 @@ function App() {
     }
   }
 
+  function openFeedBotSettings(bot: WorkflowBotMeta) {
+    if (bot.kind === "synth_skill") {
+      setFeedCreateWorkflowOpen(false);
+      setFeedSidebarOpen(true);
+      setActiveWorkflowBotKey("");
+      setFeedEditStatus("Feed idle");
+      return;
+    }
+    openWorkflowSettingsForBot(bot.key);
+  }
+
   function openWorkflowTemplateForm() {
     setFeedSidebarOpen(false);
     setActiveWorkflowBotKey("");
@@ -2465,6 +2547,68 @@ function App() {
       );
     } finally {
       setWorkflowToggleBusyKey("");
+    }
+  }
+
+  async function toggleWorkspaceSynthSkillEnabled(skillKey: string) {
+    let token = chatGatewayToken.trim();
+    if (!token && isDesktopClient) {
+      token = (await syncDesktopGatewayBootstrap())?.trim() || "";
+    }
+    if (!token && !isDesktopClient) {
+      setWorkflowTemplateStatus("Skill toggle blocked (gateway token missing).");
+      return;
+    }
+
+    const existing = workspaceSynthSkillsByKey[skillKey];
+    if (!existing) {
+      setWorkflowTemplateStatus("Workspace synth skills are not loaded yet.");
+      void loadWorkspaceSynthSkillSettings();
+      return;
+    }
+    const nextEnabled = !existing.enabled;
+    const skillName = existing.name || workflowBotByKey(skillKey).name;
+    if (nextEnabled && existing.supported === false) {
+      setWorkflowTemplateStatus(
+        existing.unsupportedReason || `${skillName} cannot run on this device.`
+      );
+      return;
+    }
+
+    setWorkspaceSynthSkillToggleBusyKey(skillKey);
+    setWorkflowTemplateStatus(
+      nextEnabled ? `Enabling ${skillName}...` : `Disabling ${skillName}...`
+    );
+    try {
+      const result = await updateWorkspaceSynthSkill(
+        {
+          skillKey,
+          enabled: nextEnabled
+        },
+        token || undefined,
+        gatewayBaseUrl
+      );
+      setWorkspaceSynthSkillsByKey((prev) => ({ ...prev, [skillKey]: result.item }));
+      setWorkspaceSynthSkillItems((prev) =>
+        prev.map((item) => (item.skillKey === skillKey ? result.item : item))
+      );
+      setWorkspaceSynthSkillBots((prev) =>
+        prev.map((bot) =>
+          bot.key === skillKey ? workflowBotMetaFromSynthSkill(result.item) : bot
+        )
+      );
+      setWorkflowTemplateStatus(
+        nextEnabled ? `${skillName} will be included in workspace synthesis` : `${skillName} disabled`
+      );
+      setFeedEditStatus(
+        nextEnabled ? `${skillName} enabled for regular workspace synthesis` : `${skillName} disabled`
+      );
+    } catch (error) {
+      setWorkflowTemplateStatus(
+        `${nextEnabled ? "Enable" : "Disable"} failed (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setWorkspaceSynthSkillToggleBusyKey("");
     }
   }
 
@@ -2610,7 +2754,7 @@ function App() {
   }
 
   async function submitWorkflowCommentForFeedItem(item: LibraryItem) {
-    const bot = workflowBotForPath(item.path, workflowBots);
+    const bot = workflowBotForPath(item.path, feedAttributedBots);
     if (!bot) {
       setFeedEditStatus("This feed item is not mapped to an editable workflow yet.");
       return;
@@ -3663,6 +3807,7 @@ function App() {
       setFeedCreateWorkflowOpen(false);
       return;
     }
+    void loadWorkspaceSynthSkillSettings();
     void loadFeedWorkflowSettings();
     void loadWorkspaceSynthStatus();
     void loadWorkspaceTodos();
@@ -5312,7 +5457,7 @@ function App() {
               {feedSource === "local" && feedSidebarOpen ? (
                 <div className="feed-workflow-drawer">
                   <div className="row-between">
-                    <h3 style={{ margin: 0 }}>Content Agents</h3>
+                    <h3 style={{ margin: 0 }}>Workspace Synthesizer</h3>
                     <button
                       type="button"
                       className="ghost text-sm"
@@ -5322,25 +5467,46 @@ function App() {
                     </button>
                   </div>
                   <p className="text-sm muted" style={{ margin: 0 }}>
-                    Agents create workspace feed content from journal notes and save results under <code>posts/</code>.
+                    The synthesizer is the main journal extraction agent. Check the skills you want applied regularly, then run the synthesizer to process pending journal entries.
                   </p>
+                  <div className="feed-agent-facts">
+                    <div>
+                      <span className="text-sm muted">Pending journal entries</span>
+                      <strong>{workspaceSynthPendingCount}</strong>
+                    </div>
+                    <div>
+                      <span className="text-sm muted">Selected this run</span>
+                      <strong>{workspaceSynthSelectedCount}</strong>
+                    </div>
+                  </div>
                   {runtimeMediaSummary ? (
                     <p className="text-sm muted" style={{ margin: 0 }}>
                       {runtimeMediaSummary}
                     </p>
                   ) : null}
+                  <button
+                    type="button"
+                    className="primary text-sm"
+                    style={{ width: "100%", borderRadius: "10px" }}
+                    onClick={() => void runWorkspaceSynthesizerManual()}
+                    disabled={workspaceSynthBusy || workspaceSynthRunning}
+                  >
+                    {workspaceSynthBusy || workspaceSynthRunning ? "Running..." : "Run Workspace Synthesizer"}
+                  </button>
+                  <div className="row-between" style={{ alignItems: "center", marginTop: "0.2rem" }}>
+                    <span className="text-sm muted">Journal skills</span>
+                    <span className="text-sm muted">
+                      {workspaceSynthSkillItems.filter((item) => item.enabled).length}/{workspaceSynthSkillItems.length} enabled
+                    </span>
+                  </div>
                   <div className="feed-workflow-bot-list">
-                    {workflowBots.map((bot) => {
-                      const saved = workflowSettingsByKey[bot.key];
-                      const isBusy = workflowToggleBusyKey === bot.key;
+                    {workspaceSynthSkillBots.map((bot) => {
+                      const saved = workspaceSynthSkillsByKey[bot.key];
+                      const isBusy = workspaceSynthSkillToggleBusyKey === bot.key;
                       const enableBlocked = saved?.enabled === false && saved?.supported === false;
                       return (
                         <div key={bot.key} className="feed-workflow-bot-row">
-                          <button
-                            type="button"
-                            className="feed-workflow-bot-open"
-                            onClick={() => openWorkflowSettingsForBot(bot.key)}
-                          >
+                          <div className="feed-workflow-bot-open">
                             <span className="stack" style={{ gap: "0.2rem", width: "100%" }}>
                               <span className="feed-bot-chip">
                                 <span className="feed-bot-avatar">{bot.avatar}</span>
@@ -5355,12 +5521,12 @@ function App() {
                                 </span>
                               ) : null}
                             </span>
-                          </button>
+                          </div>
                           <button
                             type="button"
                             className={saved?.enabled === false ? "ghost text-sm" : "primary text-sm"}
                             style={{ minWidth: "72px", borderRadius: "999px" }}
-                            onClick={() => void toggleContentAgentEnabled(bot.key)}
+                            onClick={() => void toggleWorkspaceSynthSkillEnabled(bot.key)}
                             disabled={isBusy || enableBlocked}
                             title={enableBlocked ? saved?.unsupportedReason : undefined}
                           >
@@ -5369,20 +5535,95 @@ function App() {
                         </div>
                       );
                     })}
-                    {!workflowBots.length ? (
+                    {!workspaceSynthSkillBots.length ? (
                       <p className="text-sm muted" style={{ margin: 0 }}>
-                        No content agents yet. Create one to start generating feed posts.
+                        No workspace synth skills are available yet.
                       </p>
                     ) : null}
                   </div>
-                  <button
-                    type="button"
-                    className="primary text-sm"
-                    style={{ width: "100%", borderRadius: "10px" }}
-                    onClick={openWorkflowTemplateForm}
-                  >
-                    Create Custom Agent
-                  </button>
+                  {workspaceSynthStatus.skillRuns?.length ? (
+                    <div className="stack" style={{ gap: "0.45rem" }}>
+                      <span className="text-sm muted">Recent skill activity</span>
+                      {workspaceSynthStatus.skillRuns.slice(0, 6).map((run: WorkspaceSynthSkillRunState) => (
+                        <div key={`synth-run-${run.skillKey}`} className="workflow-run-card">
+                          <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
+                            <span className="feed-bot-chip">
+                              <span className="feed-bot-avatar">
+                                {(run.name || run.skillKey || "S").slice(0, 1).toUpperCase()}
+                              </span>
+                              <span>{run.name || run.skillKey}</span>
+                            </span>
+                            <span className="text-sm muted">{run.status || "idle"}</span>
+                          </div>
+                          {run.summary ? (
+                            <div className="text-sm muted">{run.summary}</div>
+                          ) : null}
+                          {run.error ? (
+                            <div className="feed-comment-status">{run.error}</div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                  {workflowBots.length ? (
+                    <div className="stack" style={{ gap: "0.5rem" }}>
+                      <div className="row-between" style={{ alignItems: "center" }}>
+                        <span className="text-sm muted">Advanced: custom agents</span>
+                        <button
+                          type="button"
+                          className="ghost text-sm"
+                          onClick={openWorkflowTemplateForm}
+                        >
+                          Create
+                        </button>
+                      </div>
+                      <div className="feed-workflow-bot-list">
+                        {workflowBots.map((bot) => {
+                          const saved = workflowSettingsByKey[bot.key];
+                          const isBusy = workflowToggleBusyKey === bot.key;
+                          const enableBlocked = saved?.enabled === false && saved?.supported === false;
+                          return (
+                            <div key={bot.key} className="feed-workflow-bot-row">
+                              <button
+                                type="button"
+                                className="feed-workflow-bot-open"
+                                onClick={() => openWorkflowSettingsForBot(bot.key)}
+                              >
+                                <span className="stack" style={{ gap: "0.2rem", width: "100%" }}>
+                                  <span className="feed-bot-chip">
+                                    <span className="feed-bot-avatar">{bot.avatar}</span>
+                                    <span>{bot.name}</span>
+                                  </span>
+                                  {bot.goal ? (
+                                    <span className="feed-bot-goal text-sm muted">{bot.goal}</span>
+                                  ) : null}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                className={saved?.enabled === false ? "ghost text-sm" : "primary text-sm"}
+                                style={{ minWidth: "72px", borderRadius: "999px" }}
+                                onClick={() => void toggleContentAgentEnabled(bot.key)}
+                                disabled={isBusy || enableBlocked}
+                                title={enableBlocked ? saved?.unsupportedReason : undefined}
+                              >
+                                {isBusy ? "..." : saved?.enabled === false ? "Off" : "On"}
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      className="primary text-sm"
+                      style={{ width: "100%", borderRadius: "10px" }}
+                      onClick={openWorkflowTemplateForm}
+                    >
+                      Create Custom Agent
+                    </button>
+                  )}
                 </div>
               ) : null}
 
@@ -5813,7 +6054,7 @@ function App() {
               ) : (
                 <div className="stack">
                   {feedItems.map(item => {
-                    const workflowBot = workflowBotForPath(item.path, workflowBots);
+                    const workflowBot = workflowBotForPath(item.path, feedAttributedBots);
                     const isCommentOpen = activeFeedCommentPath === item.path;
                     const commentDraft = feedCommentDrafts[item.path] || "";
                     const commentStatus = feedCommentStatusByPath[item.path] || "";
@@ -5831,7 +6072,7 @@ function App() {
                                 type="button"
                                 className="feed-bot-chip"
                                 onClick={() => {
-                                  openWorkflowSettingsForBot(workflowBot.key);
+                                  openFeedBotSettings(workflowBot);
                                 }}
                                 title={`Open ${workflowBot.name} settings`}
                               >

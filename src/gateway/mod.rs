@@ -630,6 +630,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(handle_workspace_synthesizer_status),
         )
         .route(
+            "/api/workspace/synthesizer/skills",
+            get(handle_workspace_synthesizer_skills).patch(handle_workspace_synthesizer_skills_update),
+        )
+        .route(
             "/api/workspace/synthesizer/stream",
             get(handle_workspace_synthesizer_stream),
         )
@@ -1358,6 +1362,13 @@ struct FeedContentAgentAutoRunBody {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSynthSkillUpdateBody {
+    skill_key: String,
+    enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FeedContentAgentAutoRunItem {
@@ -1510,79 +1521,7 @@ fn built_in_content_agent_specs() -> &'static [BuiltInContentAgentSpec] {
             goal: "Use the workspace synthesizer index skill as shared guidance for specialized extractor skills. The runtime will run those extractors, validate their typed JSON handoffs, and turn them into feed posts, todos, events, and clip plans.",
             output_prefix: "posts/workspace_synthesizer/",
             visible_in_ui: true,
-            enabled_by_default: false,
-        },
-        BuiltInContentAgentSpec {
-            key: workspace_synthesizer::WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY,
-            name: "Workspace Insight Extractor",
-            goal: "Extract concise workspace feed posts from recent journals and transcripts. Write only the insight_posts handoff JSON for Rust to materialize into feed posts.",
-            output_prefix: "posts/workspace_synthesizer/",
-            visible_in_ui: false,
             enabled_by_default: true,
-        },
-        BuiltInContentAgentSpec {
-            key: workspace_synthesizer::WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY,
-            name: "Workspace Todo Extractor",
-            goal: "Extract concrete action items and commitments from recent journals and transcripts. Write only the todos handoff JSON for Rust to store in the planner.",
-            output_prefix: "posts/workspace_synthesizer/",
-            visible_in_ui: false,
-            enabled_by_default: true,
-        },
-        BuiltInContentAgentSpec {
-            key: workspace_synthesizer::WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY,
-            name: "Workspace Event Extractor",
-            goal: "Extract scheduled events with clear timing from recent journals and transcripts. Write only the events handoff JSON for Rust to store in the planner.",
-            output_prefix: "posts/workspace_synthesizer/",
-            visible_in_ui: false,
-            enabled_by_default: true,
-        },
-        BuiltInContentAgentSpec {
-            key: workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY,
-            name: "Workspace Clip Extractor",
-            goal: "Extract transcript-backed clip plans from recent journals and transcript text. Write only the clip_plans handoff JSON for Rust to keep as pipeline artifacts.",
-            output_prefix: "posts/workspace_synthesizer/",
-            visible_in_ui: false,
-            enabled_by_default: true,
-        },
-        BuiltInContentAgentSpec {
-            key: workspace_synthesizer::WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY,
-            name: "Workspace Journal Title Extractor",
-            goal: "Propose concise durable titles for the current journal note batch. Write only the journal_titles handoff JSON for Rust to rename journal note files.",
-            output_prefix: "posts/workspace_synthesizer/",
-            visible_in_ui: false,
-            enabled_by_default: true,
-        },
-        BuiltInContentAgentSpec {
-            key: "bluesky_insight_posts",
-            name: "Bluesky Insight Posts",
-            goal: "Create interesting Bluesky post drafts from my recent journal notes. Extract standout insights and save each post as a separate file in posts/ so it appears in the workspace feed.",
-            output_prefix: "posts/bluesky_insight_posts/",
-            visible_in_ui: true,
-            enabled_by_default: false,
-        },
-        BuiltInContentAgentSpec {
-            key: "weekly_highlights",
-            name: "Weekly Highlights",
-            goal: "Turn my recent journal notes into polished weekly highlight posts for the workspace feed. Save each highlight as a separate file in posts/.",
-            output_prefix: "posts/weekly_highlights/",
-            visible_in_ui: true,
-            enabled_by_default: false,
-        },
-        BuiltInContentAgentSpec {
-            key: article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY,
-            name: "Long-Form Articles",
-            goal: "Build clean long-form articles from journal notes over time. Decide whether to refine an existing article or create a new one, then hand off JSON for Rust to materialize markdown under posts/articles/.",
-            output_prefix: "posts/articles/",
-            visible_in_ui: true,
-            enabled_by_default: false,
-        },
-        BuiltInContentAgentSpec {
-            key: "audio_insight_clips",
-            name: "Audio Insight Clips",
-            goal: "Create simple vertical video clips from my journal audio recordings. If a transcript is missing, generate it first, extract exact insightful lines, build black-background text cards, and render a feed-ready mp4 into posts/.",
-            output_prefix: "posts/audio_insight_clips/",
-            visible_in_ui: true,
-            enabled_by_default: false,
         },
     ]
 }
@@ -1707,7 +1646,10 @@ fn workflow_definitions(store: &FeedContentAgentStore) -> Vec<FeedContentAgentDe
         .workflows
         .values()
         .map(feed_workflow_definition_from_record)
-        .filter(|workflow| workflow.visible_in_ui)
+        .filter(|workflow| {
+            workflow.visible_in_ui
+                && !workspace_synthesizer::is_managed_skill_key(&workflow.key)
+        })
         .collect();
     defs.sort_by(|a, b| a.key.cmp(&b.key));
     defs
@@ -1718,6 +1660,9 @@ fn workflow_definition_by_key(
     key: &str,
 ) -> Option<FeedContentAgentDefinition> {
     let normalized = key.trim().to_ascii_lowercase();
+    if workspace_synthesizer::is_managed_skill_key(&normalized) {
+        return None;
+    }
     store
         .workflows
         .get(&normalized)
@@ -1979,10 +1924,59 @@ fn save_feed_workflow_settings_store(
 
 fn load_or_seed_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedContentAgentStore> {
     let mut store = load_feed_workflow_settings_store(workspace_dir)?;
-    if ensure_built_in_content_agents(workspace_dir, &mut store)? {
+    let mut changed = ensure_built_in_content_agents(workspace_dir, &mut store)?;
+    if migrate_workspace_synth_managed_workflows(workspace_dir, &mut store)? {
+        changed = true;
+    }
+    if changed {
         save_feed_workflow_settings_store(workspace_dir, &store)?;
     }
     Ok(store)
+}
+
+fn migrate_workspace_synth_managed_workflows(
+    workspace_dir: &StdPath,
+    store: &mut FeedContentAgentStore,
+) -> Result<bool> {
+    let mut skill_store = workspace_synthesizer::load_or_seed_skill_store(workspace_dir)?;
+    let mut changed = false;
+
+    for spec in workspace_synthesizer::skill_specs() {
+        let key = spec.key.trim().to_ascii_lowercase();
+        let Some(legacy) = store.workflows.remove(&key) else {
+            continue;
+        };
+        let skill_record = skill_store
+            .skills
+            .entry(key.clone())
+            .or_insert_with(|| workspace_synthesizer::WorkspaceSynthSkillRecord {
+                skill_key: key.clone(),
+                name: spec.name.to_string(),
+                skill_path: format!("skills/workspace_synthesizer/{key}/SKILL.md"),
+                output_prefix: spec.output_prefix.to_string(),
+                enabled: spec.enabled_by_default,
+                goal: spec.goal.to_string(),
+                built_in_skill_fingerprint: None,
+                visible_in_ui: spec.visible_in_ui,
+                handler_kind: spec.handler_kind,
+            });
+        skill_record.enabled = legacy.enabled;
+        if let Some(goal) = normalize_goal_text(legacy.goal.clone())
+            .or_else(|| normalize_goal_text(legacy.settings.goal.clone()))
+            .or_else(|| normalize_goal_text(legacy.settings.prompt.clone()))
+        {
+            skill_record.goal = goal;
+        }
+        changed = true;
+    }
+
+    if workspace_synthesizer::ensure_built_in_skills(workspace_dir, &mut skill_store)? {
+        changed = true;
+    }
+    if changed {
+        workspace_synthesizer::save_skill_store(workspace_dir, &skill_store)?;
+    }
+    Ok(changed)
 }
 
 fn workflow_settings_response_item(
@@ -2005,6 +1999,47 @@ fn workflow_settings_response_item(
             .iter()
             .map(std::string::ToString::to_string)
             .collect(),
+    }
+}
+
+fn workspace_synth_skill_requires_media_capabilities(
+    skill: &workspace_synthesizer::WorkspaceSynthSkillDefinition,
+) -> bool {
+    matches!(
+        skill.handler_kind,
+        workspace_synthesizer::WorkspaceSynthSkillHandlerKind::DirectMediaOutput
+    ) || goal_requests_media_output(&skill.goal)
+}
+
+fn workspace_synth_skill_unsupported_reason(
+    skill: &workspace_synthesizer::WorkspaceSynthSkillDefinition,
+    media_capabilities: MediaToolCapabilities,
+) -> Option<String> {
+    if !workspace_synth_skill_requires_media_capabilities(skill) {
+        return None;
+    }
+    if media_capabilities.transcribe_media && media_capabilities.compose_simple_clip {
+        return None;
+    }
+    Some(required_media_capability_reason(media_capabilities))
+}
+
+fn workspace_synth_skill_response_item(
+    skill: &workspace_synthesizer::WorkspaceSynthSkillDefinition,
+    enabled: bool,
+    media_capabilities: MediaToolCapabilities,
+) -> workspace_synthesizer::WorkspaceSynthSkillResponseItem {
+    let unsupported_reason = workspace_synth_skill_unsupported_reason(skill, media_capabilities);
+    workspace_synthesizer::WorkspaceSynthSkillResponseItem {
+        skill_key: skill.key.clone(),
+        name: skill.name.clone(),
+        skill_path: skill.skill_path.clone(),
+        output_prefix: skill.output_prefix.clone(),
+        enabled,
+        supported: unsupported_reason.is_none(),
+        unsupported_reason,
+        goal: skill.goal.clone(),
+        handler_kind: skill.handler_kind,
     }
 }
 
@@ -2182,6 +2217,7 @@ fn save_workspace_synthesizer_status(
     artifact_counts: Option<workspace_synthesizer::WorkspaceSynthArtifactCounts>,
     artifact_states: Option<workspace_synthesizer::WorkspaceSynthArtifactStates>,
     renamed_sources: Option<Vec<workspace_synthesizer::WorkspaceSynthRenamedSource>>,
+    skill_runs: Option<Vec<workspace_synthesizer::WorkspaceSynthSkillRunState>>,
 ) {
     let mut next = workspace_synthesizer::load_status(workspace_dir);
     next.status = status.to_string();
@@ -2223,6 +2259,11 @@ fn save_workspace_synthesizer_status(
         next.renamed_sources = renamed_sources;
     } else if status != "done" {
         next.renamed_sources.clear();
+    }
+    if let Some(skill_runs) = skill_runs {
+        next.skill_runs = skill_runs;
+    } else if status != "done" {
+        next.skill_runs.clear();
     }
     if let Err(err) = workspace_synthesizer::save_status(workspace_dir, &next) {
         tracing::warn!("Failed to persist workspace synthesizer status `{status}`: {err}");
@@ -2547,6 +2588,7 @@ fn queue_workspace_synthesizer_run(
         None,
         None,
         None,
+        None,
     );
     Ok(thread_id)
 }
@@ -2655,6 +2697,39 @@ fn workspace_synth_artifact_state_mut<'a>(
     }
 }
 
+fn workspace_synth_skill_as_workflow_definition(
+    skill: &workspace_synthesizer::WorkspaceSynthSkillDefinition,
+) -> FeedContentAgentDefinition {
+    FeedContentAgentDefinition {
+        key: skill.key.clone(),
+        bot_name: skill.name.clone(),
+        editable_files: vec![skill.skill_path.clone()],
+        output_prefix: skill.output_prefix.clone(),
+        skill_path: skill.skill_path.clone(),
+        goal: skill.goal.clone(),
+        visible_in_ui: skill.visible_in_ui,
+    }
+}
+
+fn workspace_synth_skill_run_state(
+    skill: &workspace_synthesizer::WorkspaceSynthSkillDefinition,
+    status: &str,
+    summary: String,
+    error: String,
+    item_count: usize,
+) -> workspace_synthesizer::WorkspaceSynthSkillRunState {
+    workspace_synthesizer::WorkspaceSynthSkillRunState {
+        skill_key: skill.key.clone(),
+        name: skill.name.clone(),
+        output_prefix: skill.output_prefix.clone(),
+        handler_kind: skill.handler_kind,
+        status: status.to_string(),
+        summary,
+        error,
+        item_count,
+    }
+}
+
 fn render_workspace_synth_extractor_run_prompt(
     orchestrator: &FeedContentAgentDefinition,
     orchestrator_skill_markdown: &str,
@@ -2715,159 +2790,422 @@ async fn run_workspace_synthesizer_orchestrator(
     trigger_reason: &str,
     target_sources: &[WorkspaceSynthSourceCandidate],
 ) -> Result<(String, workspace_synthesizer::WorkspaceSynthesisApplyResult)> {
-    let store = load_or_seed_feed_workflow_settings_store(workspace_dir)?;
+    let skill_store = workspace_synthesizer::load_or_seed_skill_store(workspace_dir)?;
+    let media_capabilities = local_media_capabilities(&state.config.lock().clone());
     workspace_synthesizer::reset_handoff_files(workspace_dir)?;
 
-    let mut extractor_replies = Vec::new();
-    let mut extractor_errors = Vec::new();
-    let mut artifact_states = workspace_synth_default_artifact_states();
+    let mut skill_replies = Vec::new();
+    let mut skill_errors = Vec::new();
+    let mut split_artifact_states = workspace_synth_default_artifact_states();
+    let mut split_skill_defs = Vec::new();
+    let mut skill_runs = Vec::new();
 
-    for extractor_spec in workspace_synthesizer::extractor_specs() {
-        if extractor_spec.workflow_key == workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY
-            && !should_run_workspace_synth_clip_extractor(trigger_reason, target_sources)
-        {
-            continue;
-        }
-        let Some(extractor_workflow) = workflow_definition_by_key(&store, extractor_spec.workflow_key) else {
-            let error = format!("missing extractor workflow `{}`", extractor_spec.workflow_key);
-            if let Some(state) =
-                workspace_synth_artifact_state_mut(&mut artifact_states, extractor_spec.workflow_key)
-            {
-                state.status = "error".to_string();
-                state.error = error.clone();
-            }
-            extractor_errors.push(error);
-            continue;
-        };
-        let enabled = store
-            .workflows
-            .get(extractor_spec.workflow_key)
+    for skill in workspace_synthesizer::skill_definitions(&skill_store) {
+        let enabled = skill_store
+            .skills
+            .get(&skill.key)
             .map(|record| record.enabled)
             .unwrap_or(false);
         if !enabled {
+            skill_runs.push(workspace_synth_skill_run_state(
+                &skill,
+                "skipped",
+                "Disabled".to_string(),
+                String::new(),
+                0,
+            ));
+            continue;
+        }
+        if let Some(reason) = workspace_synth_skill_unsupported_reason(&skill, media_capabilities) {
+            skill_runs.push(workspace_synth_skill_run_state(
+                &skill,
+                "skipped",
+                reason.clone(),
+                reason.clone(),
+                0,
+            ));
+            skill_errors.push(format!("{} skipped: {}", skill.name, reason));
             continue;
         }
 
-        let extractor_skill_abs = workspace_dir.join(&extractor_workflow.skill_path);
-        let extractor_skill_markdown = match std::fs::read_to_string(&extractor_skill_abs) {
+        if skill.key == workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY
+            && !should_run_workspace_synth_clip_extractor(trigger_reason, target_sources)
+        {
+            skill_runs.push(workspace_synth_skill_run_state(
+                &skill,
+                "skipped",
+                "No transcript-backed clip candidates in this batch.".to_string(),
+                String::new(),
+                0,
+            ));
+            continue;
+        }
+        let skill_abs = workspace_dir.join(&skill.skill_path);
+        let skill_markdown = match std::fs::read_to_string(&skill_abs) {
             Ok(raw) => raw,
             Err(err) => {
                 let message = truncate_with_ellipsis(
                     &format!(
                         "{} failed: unable to read skill `{}`: {}",
-                        extractor_workflow.bot_name, extractor_workflow.skill_path, err
+                        skill.name, skill.skill_path, err
                     ),
                     800,
                 );
                 if let Some(state) =
-                    workspace_synth_artifact_state_mut(&mut artifact_states, extractor_spec.workflow_key)
+                    workspace_synth_artifact_state_mut(&mut split_artifact_states, &skill.key)
                 {
                     state.status = "error".to_string();
                     state.error = message.clone();
                 }
-                extractor_errors.push(message);
+                skill_runs.push(workspace_synth_skill_run_state(
+                    &skill,
+                    "error",
+                    String::new(),
+                    message.clone(),
+                    0,
+                ));
+                skill_errors.push(message);
                 continue;
             }
         };
-        let prompt = render_workspace_synth_extractor_run_prompt(
-            orchestrator_workflow,
-            orchestrator_skill_markdown,
-            &extractor_workflow,
-            &extractor_skill_markdown,
-            media_tool_summary,
-            extractor_spec.handoff_path,
-            target_sources,
-        );
-        let subthread_id = format!(
-            "workflow:{}:{}",
-            orchestrator_workflow.key, extractor_workflow.key
-        );
-        match tokio::time::timeout(
-            Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
-            run_local_agent_prompt_in_thread(state, &subthread_id, &prompt),
-        )
-        .await
-        {
-            Ok(Ok(reply)) => {
-                let trimmed = reply.trim();
-                if !trimmed.is_empty() {
-                    extractor_replies.push(format!("{}: {}", extractor_workflow.bot_name, trimmed));
+
+        match skill.handler_kind {
+            workspace_synthesizer::WorkspaceSynthSkillHandlerKind::SplitHandoff => {
+                let Some(spec) = workspace_synthesizer::extractor_spec_by_key(&skill.key) else {
+                    let message = format!("missing split handoff spec for `{}`", skill.key);
+                    if let Some(state) =
+                        workspace_synth_artifact_state_mut(&mut split_artifact_states, &skill.key)
+                    {
+                        state.status = "error".to_string();
+                        state.error = message.clone();
+                    }
+                    skill_runs.push(workspace_synth_skill_run_state(
+                        &skill,
+                        "error",
+                        String::new(),
+                        message.clone(),
+                        0,
+                    ));
+                    skill_errors.push(message);
+                    continue;
+                };
+                workspace_synthesizer::reset_skill_outputs(workspace_dir, &skill)?;
+                let skill_workflow = workspace_synth_skill_as_workflow_definition(&skill);
+                let prompt = render_workspace_synth_extractor_run_prompt(
+                    orchestrator_workflow,
+                    orchestrator_skill_markdown,
+                    &skill_workflow,
+                    &skill_markdown,
+                    media_tool_summary,
+                    spec.handoff_path,
+                    target_sources,
+                );
+                let subthread_id =
+                    format!("workflow:{}:{}", orchestrator_workflow.key, skill.key);
+                match tokio::time::timeout(
+                    Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
+                    run_local_agent_prompt_in_thread(state, &subthread_id, &prompt),
+                )
+                .await
+                {
+                    Ok(Ok(reply)) => {
+                        let trimmed = reply.trim();
+                        if !trimmed.is_empty() {
+                            skill_replies.push(format!("{}: {}", skill.name, trimmed));
+                        }
+                        split_skill_defs.push(skill.clone());
+                    }
+                    Ok(Err(err)) => {
+                        let message =
+                            truncate_with_ellipsis(&format!("{} failed: {err:#}", skill.name), 800);
+                        if let Some(state) =
+                            workspace_synth_artifact_state_mut(&mut split_artifact_states, &skill.key)
+                        {
+                            state.status = "error".to_string();
+                            state.error = message.clone();
+                        }
+                        skill_runs.push(workspace_synth_skill_run_state(
+                            &skill,
+                            "error",
+                            String::new(),
+                            message.clone(),
+                            0,
+                        ));
+                        skill_errors.push(message);
+                    }
+                    Err(_) => {
+                        let message =
+                            format!("{} timed out after {}s", skill.name, CONTENT_AGENT_TIMEOUT_SECS);
+                        if let Some(state) =
+                            workspace_synth_artifact_state_mut(&mut split_artifact_states, &skill.key)
+                        {
+                            state.status = "error".to_string();
+                            state.error = message.clone();
+                        }
+                        skill_runs.push(workspace_synth_skill_run_state(
+                            &skill,
+                            "error",
+                            String::new(),
+                            message.clone(),
+                            0,
+                        ));
+                        skill_errors.push(message);
+                    }
                 }
             }
-            Ok(Err(err)) => {
-                let message = truncate_with_ellipsis(
-                    &format!("{} failed: {err:#}", extractor_workflow.bot_name),
-                    800,
+            workspace_synthesizer::WorkspaceSynthSkillHandlerKind::ArticleHandoff => {
+                workspace_synthesizer::reset_skill_outputs(workspace_dir, &skill)?;
+                let skill_workflow = workspace_synth_skill_as_workflow_definition(&skill);
+                let prompt = render_content_agent_run_prompt(
+                    workspace_dir,
+                    &skill_workflow,
+                    &skill_markdown,
+                    media_tool_summary,
                 );
-                if let Some(state) =
-                    workspace_synth_artifact_state_mut(&mut artifact_states, extractor_spec.workflow_key)
+                let subthread_id =
+                    format!("workflow:{}:{}", orchestrator_workflow.key, skill.key);
+                match tokio::time::timeout(
+                    Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
+                    run_local_agent_prompt_in_thread(state, &subthread_id, &prompt),
+                )
+                .await
                 {
-                    state.status = "error".to_string();
-                    state.error = message.clone();
+                    Ok(Ok(reply)) => {
+                        let workspace_for_apply = workspace_dir.to_path_buf();
+                        match tokio::task::spawn_blocking(move || {
+                            article_synthesizer::apply_handoff_file(&workspace_for_apply)
+                        })
+                        .await
+                        {
+                            Ok(Ok(applied)) => {
+                                let item_count = applied.created_count + applied.updated_count;
+                                let summary = if reply.trim().is_empty() {
+                                    applied.summary.clone()
+                                } else {
+                                    format!("{} {}", applied.summary.trim(), reply.trim())
+                                };
+                                if !summary.trim().is_empty() {
+                                    skill_replies.push(format!("{}: {}", skill.name, summary.trim()));
+                                }
+                                skill_runs.push(workspace_synth_skill_run_state(
+                                    &skill,
+                                    if applied.had_errors { "error" } else { "applied" },
+                                    applied.summary.clone(),
+                                    if applied.had_errors {
+                                        applied.summary.clone()
+                                    } else {
+                                        String::new()
+                                    },
+                                    item_count,
+                                ));
+                                if applied.had_errors {
+                                    skill_errors.push(applied.summary.clone());
+                                }
+                            }
+                            Ok(Err(err)) => {
+                                let message = truncate_with_ellipsis(
+                                    &format!("{} apply failed: {err:#}", skill.name),
+                                    800,
+                                );
+                                skill_runs.push(workspace_synth_skill_run_state(
+                                    &skill,
+                                    "error",
+                                    String::new(),
+                                    message.clone(),
+                                    0,
+                                ));
+                                skill_errors.push(message);
+                            }
+                            Err(err) => {
+                                let message = truncate_with_ellipsis(
+                                    &format!("{} apply task failed: {err:#}", skill.name),
+                                    800,
+                                );
+                                skill_runs.push(workspace_synth_skill_run_state(
+                                    &skill,
+                                    "error",
+                                    String::new(),
+                                    message.clone(),
+                                    0,
+                                ));
+                                skill_errors.push(message);
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        let message =
+                            truncate_with_ellipsis(&format!("{} failed: {err:#}", skill.name), 800);
+                        skill_runs.push(workspace_synth_skill_run_state(
+                            &skill,
+                            "error",
+                            String::new(),
+                            message.clone(),
+                            0,
+                        ));
+                        skill_errors.push(message);
+                    }
+                    Err(_) => {
+                        let message =
+                            format!("{} timed out after {}s", skill.name, CONTENT_AGENT_TIMEOUT_SECS);
+                        skill_runs.push(workspace_synth_skill_run_state(
+                            &skill,
+                            "error",
+                            String::new(),
+                            message.clone(),
+                            0,
+                        ));
+                        skill_errors.push(message);
+                    }
                 }
-                extractor_errors.push(message);
             }
-            Err(_) => {
-                let message = format!(
-                    "{} timed out after {}s",
-                    extractor_workflow.bot_name, CONTENT_AGENT_TIMEOUT_SECS
+            workspace_synthesizer::WorkspaceSynthSkillHandlerKind::DirectPostOutput
+            | workspace_synthesizer::WorkspaceSynthSkillHandlerKind::DirectMediaOutput => {
+                let skill_workflow = workspace_synth_skill_as_workflow_definition(&skill);
+                let prompt = render_content_agent_run_prompt(
+                    workspace_dir,
+                    &skill_workflow,
+                    &skill_markdown,
+                    media_tool_summary,
                 );
-                if let Some(state) =
-                    workspace_synth_artifact_state_mut(&mut artifact_states, extractor_spec.workflow_key)
+                let subthread_id =
+                    format!("workflow:{}:{}", orchestrator_workflow.key, skill.key);
+                match tokio::time::timeout(
+                    Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
+                    run_local_agent_prompt_in_thread(state, &subthread_id, &prompt),
+                )
+                .await
                 {
-                    state.status = "error".to_string();
-                    state.error = message.clone();
+                    Ok(Ok(reply)) => {
+                        let item_count = workspace_synthesizer::direct_output_file_count(
+                            workspace_dir,
+                            &skill.output_prefix,
+                        )
+                        .unwrap_or(0);
+                        let summary = if reply.trim().is_empty() {
+                            format!("{} now has {} visible outputs.", skill.name, item_count)
+                        } else {
+                            reply.trim().to_string()
+                        };
+                        skill_replies.push(format!("{}: {}", skill.name, summary.trim()));
+                        skill_runs.push(workspace_synth_skill_run_state(
+                            &skill,
+                            "applied",
+                            summary,
+                            String::new(),
+                            item_count,
+                        ));
+                    }
+                    Ok(Err(err)) => {
+                        let message =
+                            truncate_with_ellipsis(&format!("{} failed: {err:#}", skill.name), 800);
+                        skill_runs.push(workspace_synth_skill_run_state(
+                            &skill,
+                            "error",
+                            String::new(),
+                            message.clone(),
+                            0,
+                        ));
+                        skill_errors.push(message);
+                    }
+                    Err(_) => {
+                        let message =
+                            format!("{} timed out after {}s", skill.name, CONTENT_AGENT_TIMEOUT_SECS);
+                        skill_runs.push(workspace_synth_skill_run_state(
+                            &skill,
+                            "error",
+                            String::new(),
+                            message.clone(),
+                            0,
+                        ));
+                        skill_errors.push(message);
+                    }
                 }
-                extractor_errors.push(message);
             }
         }
     }
 
-    let workspace_for_apply = workspace_dir.to_path_buf();
     let processed_source_paths = target_sources
         .iter()
         .map(|item| item.source_path.clone())
         .collect::<Vec<_>>();
-    let mut applied = tokio::task::spawn_blocking(move || {
-        workspace_synthesizer::apply_handoff_files(
-            &workspace_for_apply,
-            &Utc::now().to_rfc3339(),
-            &processed_source_paths,
-        )
-    })
-    .await
-    .context("workspace synthesis apply task failed")??;
+    let mut applied = if split_skill_defs.is_empty() {
+        workspace_synthesizer::WorkspaceSynthesisApplyResult {
+            artifact_states: workspace_synth_default_artifact_states(),
+            summary: "Workspace synthesis ran without split handoff skills.".to_string(),
+            ..workspace_synthesizer::WorkspaceSynthesisApplyResult::default()
+        }
+    } else {
+        let workspace_for_apply = workspace_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            workspace_synthesizer::apply_handoff_files(
+                &workspace_for_apply,
+                &Utc::now().to_rfc3339(),
+                &processed_source_paths,
+            )
+        })
+        .await
+        .context("workspace synthesis apply task failed")??
+    };
 
-    if !artifact_states.insight_posts.error.trim().is_empty() {
-        applied.artifact_states.insight_posts = artifact_states.insight_posts.clone();
+    if !split_artifact_states.insight_posts.error.trim().is_empty() {
+        applied.artifact_states.insight_posts = split_artifact_states.insight_posts.clone();
     }
-    if !artifact_states.todos.error.trim().is_empty() {
-        applied.artifact_states.todos = artifact_states.todos.clone();
+    if !split_artifact_states.todos.error.trim().is_empty() {
+        applied.artifact_states.todos = split_artifact_states.todos.clone();
     }
-    if !artifact_states.events.error.trim().is_empty() {
-        applied.artifact_states.events = artifact_states.events.clone();
+    if !split_artifact_states.events.error.trim().is_empty() {
+        applied.artifact_states.events = split_artifact_states.events.clone();
     }
-    if !artifact_states.clip_plans.error.trim().is_empty() {
-        applied.artifact_states.clip_plans = artifact_states.clip_plans.clone();
+    if !split_artifact_states.clip_plans.error.trim().is_empty() {
+        applied.artifact_states.clip_plans = split_artifact_states.clip_plans.clone();
     }
 
-    if !extractor_errors.is_empty() {
-        applied.had_errors = true;
-        let joined = extractor_errors.join(" | ");
-        if applied.summary.trim().is_empty() {
-            applied.summary = format!("Workspace synthesis extractor issues: {joined}");
+    for skill in split_skill_defs {
+        let item_state = workspace_synth_artifact_state_mut(&mut applied.artifact_states, &skill.key)
+            .map(|state| state.clone())
+            .unwrap_or_default();
+        let status = if item_state.status.trim().is_empty() {
+            "skipped"
         } else {
-            applied.summary = format!("{} Extractor issues: {}", applied.summary.trim(), joined);
+            item_state.status.as_str()
+        };
+        let summary = if !item_state.error.trim().is_empty() {
+            item_state.error.clone()
+        } else if item_state.item_count > 0 {
+            format!("Applied {} item(s) via {}.", item_state.item_count, skill.name)
+        } else {
+            "No items applied.".to_string()
+        };
+        skill_runs.push(workspace_synth_skill_run_state(
+            &skill,
+            status,
+            summary,
+            item_state.error.clone(),
+            item_state.item_count,
+        ));
+    }
+
+    if !skill_errors.is_empty() {
+        applied.had_errors = true;
+        let joined = skill_errors.join(" | ");
+        if applied.summary.trim().is_empty() {
+            applied.summary = format!("Workspace synthesis skill issues: {joined}");
+        } else {
+            applied.summary = format!("{} Skill issues: {}", applied.summary.trim(), joined);
         }
     }
+    if skill_runs.iter().any(|run| run.status == "applied") {
+        applied.applied_any = true;
+    }
+    applied.skill_runs = skill_runs;
 
-    let reply = if extractor_replies.is_empty() {
+    let reply = if skill_replies.is_empty() {
         applied.summary.clone()
     } else {
         format!(
-            "{}\n\nExtractor summaries:\n- {}",
+            "{}\n\nSkill summaries:\n- {}",
             applied.summary.trim(),
-            extractor_replies.join("\n- ")
+            skill_replies.join("\n- ")
         )
     };
 
@@ -2910,6 +3248,7 @@ fn queue_workflow_run(
             existing.pending_source_count,
             existing.pending_word_count,
             Some(existing.selected_source_paths.clone()),
+            None,
             None,
             None,
             None,
@@ -2968,6 +3307,7 @@ fn queue_workflow_run(
                 None,
                 None,
                 None,
+                None,
             );
         }
 
@@ -3009,6 +3349,7 @@ fn queue_workflow_run(
                         None,
                         None,
                         Some(final_error),
+                        None,
                         None,
                         None,
                         None,
@@ -3075,6 +3416,7 @@ fn queue_workflow_run(
                             Some(applied.counts.clone()),
                             Some(applied.artifact_states.clone()),
                             Some(applied.renamed_sources.clone()),
+                            Some(applied.skill_runs.clone()),
                         );
                     } else {
                         let processed_paths = mark_workspace_synth_sources_processed(
@@ -3140,6 +3482,7 @@ fn queue_workflow_run(
                             Some(applied.counts.clone()),
                             Some(applied.artifact_states.clone()),
                             Some(applied.renamed_sources.clone()),
+                            Some(applied.skill_runs.clone()),
                         );
                     }
                 }
@@ -3188,6 +3531,7 @@ fn queue_workflow_run(
                         Some(final_error),
                         None,
                         Some(workspace_synth_default_artifact_states()),
+                        None,
                         None,
                     );
                 }
@@ -3287,6 +3631,7 @@ fn queue_workflow_run(
                                     Some(applied.counts.clone()),
                                     Some(applied.artifact_states.clone()),
                                     Some(applied.renamed_sources.clone()),
+                                    Some(applied.skill_runs.clone()),
                                 );
                             } else {
                                 let combined_reply = if reply.trim().is_empty() {
@@ -3327,6 +3672,7 @@ fn queue_workflow_run(
                                     Some(applied.counts.clone()),
                                     Some(applied.artifact_states.clone()),
                                     Some(applied.renamed_sources.clone()),
+                                    Some(applied.skill_runs.clone()),
                                 );
                             }
                         }
@@ -3367,6 +3713,7 @@ fn queue_workflow_run(
                                 None,
                                 None,
                                 None,
+                                None,
                             );
                         }
                         Err(err) => {
@@ -3403,6 +3750,7 @@ fn queue_workflow_run(
                                 None,
                                 None,
                                 Some(final_error),
+                                None,
                                 None,
                                 None,
                                 None,
@@ -3620,6 +3968,7 @@ fn queue_workflow_run(
                         None,
                         None,
                         None,
+                        None,
                     );
                 }
             }
@@ -3657,6 +4006,7 @@ fn queue_workflow_run(
                         None,
                         None,
                         Some(final_error),
+                        None,
                         None,
                         None,
                         None,
@@ -4370,6 +4720,117 @@ async fn handle_feed_workflow_settings(
         StatusCode::OK,
         Json(serde_json::json!({
             "items": items,
+        })),
+    )
+}
+
+async fn handle_workspace_synthesizer_skills(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Workspace synthesizer skills") {
+        return err;
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let store = match workspace_synthesizer::load_or_seed_skill_store(&workspace_dir) {
+        Ok(store) => store,
+        Err(err) => {
+            return frontend_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace synthesizer skills load",
+                "Failed to load workspace synthesizer skills.",
+                err,
+            );
+        }
+    };
+    let media_capabilities = local_media_capabilities(&state.config.lock().clone());
+    let items = workspace_synthesizer::skill_definitions(&store)
+        .into_iter()
+        .map(|skill| {
+            let enabled = store
+                .skills
+                .get(&skill.key)
+                .map(|record| record.enabled)
+                .unwrap_or(true);
+            workspace_synth_skill_response_item(&skill, enabled, media_capabilities)
+        })
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "items": items,
+        })),
+    )
+}
+
+async fn handle_workspace_synthesizer_skills_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WorkspaceSynthSkillUpdateBody>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Workspace synthesizer skills update") {
+        return err;
+    }
+
+    let skill_key = body.skill_key.trim().to_ascii_lowercase();
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let mut store = match workspace_synthesizer::load_or_seed_skill_store(&workspace_dir) {
+        Ok(store) => store,
+        Err(err) => {
+            return frontend_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace synthesizer skills load for update",
+                "Failed to load workspace synthesizer skills.",
+                err,
+            );
+        }
+    };
+
+    let Some(skill) = workspace_synthesizer::skill_definition_by_key(&store, &skill_key) else {
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "WORKSPACE_SYNTH_SKILL_UNKNOWN",
+            "unknown skillKey",
+        );
+    };
+    let media_capabilities = local_media_capabilities(&state.config.lock().clone());
+    if let Some(record) = store.skills.get_mut(&skill.key) {
+        if let Some(enabled) = body.enabled {
+            if enabled
+                && workspace_synth_skill_unsupported_reason(&skill, media_capabilities).is_some()
+            {
+                return frontend_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "WORKSPACE_SYNTH_SKILL_UNSUPPORTED",
+                    workspace_synth_skill_unsupported_reason(&skill, media_capabilities)
+                        .unwrap_or_else(|| "This skill is not supported on this device.".to_string()),
+                );
+            }
+            record.enabled = enabled;
+        }
+    }
+
+    if let Err(err) = workspace_synthesizer::save_skill_store(&workspace_dir, &store) {
+        return frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace synthesizer skills persist",
+            "Failed to save workspace synthesizer skills.",
+            err,
+        );
+    }
+
+    let item = workspace_synth_skill_response_item(
+        &skill,
+        store.skills.get(&skill.key).map(|record| record.enabled).unwrap_or(true),
+        media_capabilities,
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "updated": true,
+            "item": item,
         })),
     )
 }
@@ -5412,11 +5873,22 @@ async fn handle_feed_workflow_comment(
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let store = load_or_seed_feed_workflow_settings_store(&workspace_dir).unwrap_or_default();
-    let Some(workflow) = workflow_for_feed_path(&store, &requested_path) else {
-        let supported_prefixes: Vec<String> = workflow_definitions(&store)
+    let synth_skill_store = workspace_synthesizer::load_or_seed_skill_store(&workspace_dir)
+        .unwrap_or_default();
+    let workflow = workflow_for_feed_path(&store, &requested_path).or_else(|| {
+        workspace_synthesizer::skill_for_feed_path(&synth_skill_store, &requested_path)
+            .map(|skill| workspace_synth_skill_as_workflow_definition(&skill))
+    });
+    let Some(workflow) = workflow else {
+        let mut supported_prefixes: Vec<String> = workflow_definitions(&store)
             .into_iter()
             .map(|item| item.output_prefix)
             .collect();
+        supported_prefixes.extend(
+            workspace_synthesizer::skill_definitions(&synth_skill_store)
+                .into_iter()
+                .map(|item| item.output_prefix),
+        );
         let err = serde_json::json!({
             "supportedPrefixes": supported_prefixes,
         });
@@ -7009,11 +7481,23 @@ fn resolve_workspace_media_path(workspace_dir: &StdPath, requested: &str) -> Opt
     }
     let candidate = workspace_dir.join(&trimmed);
     let resolved = candidate.canonicalize().ok()?;
-    if !resolved.starts_with(workspace_dir) {
+    // Canonicalize workspace_dir too so both sides use the same symlink resolution.
+    let workspace_resolved = workspace_dir.canonicalize().unwrap_or_else(|_| workspace_dir.to_path_buf());
+    if !resolved.starts_with(&workspace_resolved) {
+        tracing::debug!(
+            requested = %requested,
+            resolved = %resolved.display(),
+            workspace = %workspace_resolved.display(),
+            "resolve_workspace_media_path: resolved path not under workspace"
+        );
         return None;
     }
-    let journals_dir = workspace_dir.join("journals");
+    let journals_dir = workspace_resolved.join("journals");
     if !resolved.starts_with(journals_dir) {
+        tracing::debug!(
+            requested = %requested,
+            "resolve_workspace_media_path: resolved path not under journals/"
+        );
         return None;
     }
     Some(resolved)
@@ -7027,13 +7511,26 @@ fn resolve_workspace_text_path(workspace_dir: &StdPath, requested: &str) -> Opti
     let candidate = workspace_dir.join(&trimmed);
     let parent = candidate.parent()?.to_path_buf();
     let parent_resolved = parent.canonicalize().unwrap_or(parent);
-    if !parent_resolved.starts_with(workspace_dir) {
+    // Canonicalize workspace_dir too so both sides use the same symlink resolution.
+    let workspace_resolved = workspace_dir.canonicalize().unwrap_or_else(|_| workspace_dir.to_path_buf());
+    if !parent_resolved.starts_with(&workspace_resolved) {
+        tracing::debug!(
+            requested = %requested,
+            parent = %parent_resolved.display(),
+            workspace = %workspace_resolved.display(),
+            "resolve_workspace_text_path: parent not under workspace"
+        );
         return None;
     }
     let allowed = ["journals", "memory", "state", "posts", "outputs", "artifacts"];
-    let rel_parent = parent_resolved.strip_prefix(workspace_dir).ok()?;
+    let rel_parent = parent_resolved.strip_prefix(&workspace_resolved).ok()?;
     let first = rel_parent.components().next()?.as_os_str().to_string_lossy();
     if !allowed.iter().any(|a| *a == first) {
+        tracing::debug!(
+            requested = %requested,
+            first_component = %first,
+            "resolve_workspace_text_path: first component not in allowed list"
+        );
         return None;
     }
     Some(candidate)
@@ -11130,16 +11627,18 @@ mod tests {
 
         let store = load_or_seed_feed_workflow_settings_store(workspace).unwrap();
 
-        assert_eq!(store.workflows.len(), built_in_content_agent_specs().len());
-        for spec in built_in_content_agent_specs() {
-            let key = sanitize_workflow_key(spec.key);
-            let record = store.workflows.get(&key).expect("missing built-in content agent");
-            assert_eq!(record.workflow_bot, spec.name);
-            assert_eq!(record.goal.as_deref(), Some(spec.goal));
-            assert_eq!(record.enabled, spec.enabled_by_default);
-            assert_eq!(record.visible_in_ui, spec.visible_in_ui);
-            assert!(workspace.join(&record.skill_path).exists());
-        }
+        assert_eq!(store.workflows.len(), 1);
+        let key = sanitize_workflow_key(WORKSPACE_SYNTHESIZER_WORKFLOW_KEY);
+        let record = store.workflows.get(&key).expect("missing workspace synthesizer");
+        assert_eq!(record.workflow_bot, "Workspace Synthesizer");
+        assert!(record.enabled);
+        assert!(workspace.join(&record.skill_path).exists());
+
+        let skill_store = workspace_synthesizer::load_or_seed_skill_store(workspace).unwrap();
+        assert_eq!(
+            skill_store.skills.len(),
+            workspace_synthesizer::skill_specs().len()
+        );
     }
 
     #[test]
@@ -11151,9 +11650,6 @@ mod tests {
         let defs = workflow_definitions(&store);
 
         assert!(defs.iter().any(|workflow| workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY));
-        assert!(defs.iter().any(|workflow| {
-            workflow.key == article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY
-        }));
         assert!(!defs.iter().any(|workflow| {
             workflow.key == workspace_synthesizer::WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY
         }));
@@ -11169,6 +11665,10 @@ mod tests {
         assert!(!defs.iter().any(|workflow| {
             workflow.key == workspace_synthesizer::WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY
         }));
+        assert!(!defs.iter().any(|workflow| {
+            workflow.key == article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY
+        }));
+        assert!(!defs.iter().any(|workflow| workflow.key == "weekly_highlights"));
     }
 
     #[test]
@@ -11203,6 +11703,68 @@ mod tests {
             refreshed_record.built_in_skill_fingerprint.as_deref(),
             Some(expected_fingerprint.as_str())
         );
+    }
+
+    #[test]
+    fn load_or_seed_feed_workflow_settings_store_migrates_managed_workflows_into_synth_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+
+        let mut store = FeedContentAgentStore::default();
+        store.workflows.insert(
+            "weekly_highlights".to_string(),
+            normalize_workflow_record(
+                "weekly_highlights",
+                FeedContentAgentRecord {
+                    workflow_key: "weekly_highlights".to_string(),
+                    workflow_bot: "Weekly Highlights".to_string(),
+                    skill_path: "skills/weekly_highlights/SKILL.md".to_string(),
+                    output_prefix: "posts/weekly_highlights/".to_string(),
+                    enabled: true,
+                    editable_files: vec!["skills/weekly_highlights/SKILL.md".to_string()],
+                    goal: Some("Create compact weekly summary posts.".to_string()),
+                    last_triggered_at: None,
+                    last_run_at: None,
+                    last_triggered_source_updated_at: None,
+                    built_in_skill_fingerprint: None,
+                    visible_in_ui: true,
+                    settings: built_in_content_agent_settings(
+                        "Create compact weekly summary posts.",
+                    ),
+                },
+            ),
+        );
+        store.workflows.insert(
+            "custom_digest".to_string(),
+            normalize_workflow_record(
+                "custom_digest",
+                FeedContentAgentRecord {
+                    workflow_key: "custom_digest".to_string(),
+                    workflow_bot: "Custom Digest".to_string(),
+                    skill_path: "skills/custom_digest/SKILL.md".to_string(),
+                    output_prefix: "posts/custom_digest/".to_string(),
+                    enabled: true,
+                    editable_files: vec!["skills/custom_digest/SKILL.md".to_string()],
+                    goal: Some("Create a custom digest.".to_string()),
+                    last_triggered_at: None,
+                    last_run_at: None,
+                    last_triggered_source_updated_at: None,
+                    built_in_skill_fingerprint: None,
+                    visible_in_ui: true,
+                    settings: built_in_content_agent_settings("Create a custom digest."),
+                },
+            ),
+        );
+        save_feed_workflow_settings_store(workspace, &store).unwrap();
+
+        let migrated_store = load_or_seed_feed_workflow_settings_store(workspace).unwrap();
+        assert!(!migrated_store.workflows.contains_key("weekly_highlights"));
+        assert!(migrated_store.workflows.contains_key("custom_digest"));
+
+        let skill_store = workspace_synthesizer::load_or_seed_skill_store(workspace).unwrap();
+        let weekly = skill_store.skills.get("weekly_highlights").unwrap();
+        assert!(weekly.enabled);
+        assert_eq!(weekly.goal, "Create compact weekly summary posts.");
     }
 
     #[test]

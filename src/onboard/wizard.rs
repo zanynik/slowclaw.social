@@ -192,7 +192,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     );
 
     config.save().await?;
-    persist_workspace_selection(&config.config_path).await?;
+
 
     // ── Final summary ────────────────────────────────────────────
     print_summary(&config);
@@ -241,7 +241,7 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
     config.channels_config = setup_channels()?;
     config.save().await?;
-    persist_workspace_selection(&config.config_path).await?;
+
 
     println!();
     println!(
@@ -305,7 +305,7 @@ async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) ->
     apply_provider_update(&mut config, provider, api_key, model, provider_api_url);
 
     config.save().await?;
-    persist_workspace_selection(&config.config_path).await?;
+
 
     println!(
         "  {} Provider settings updated at {}",
@@ -539,7 +539,7 @@ async fn run_quick_setup_with_home(
     };
 
     config.save().await?;
-    persist_workspace_selection(&config.config_path).await?;
+
 
     // Scaffold minimal workspace files
     let default_ctx = ProjectContext {
@@ -2067,19 +2067,7 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
     Ok(())
 }
 
-async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
-    let config_dir = config_path
-        .parent()
-        .context("Config path must have a parent directory")?;
-    crate::config::schema::persist_active_workspace_config_dir(config_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to persist active workspace selection for {}",
-                config_dir.display()
-            )
-        })
-}
+
 
 // ── Step 1: Workspace ────────────────────────────────────────────
 

@@ -1,3 +1,4 @@
+use crate::gateway::article_synthesizer;
 use crate::gateway::local_store;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -31,6 +32,7 @@ pub const WORKSPACE_SYNTHESIZER_MANIFEST_PATH: &str =
     "posts/workspace_synthesizer/pipeline/synthesis_manifest.json";
 pub const WORKSPACE_SYNTHESIZER_CLIP_PLAN_DIR: &str = "posts/workspace_synthesizer/pipeline/clips";
 const WORKSPACE_SYNTHESIZER_STATUS_PATH: &str = "state/workspace_synthesizer_status.json";
+const WORKSPACE_SYNTH_SKILLS_PATH: &str = "state/workspace_synth_skills.json";
 const MAX_INSIGHT_POSTS: usize = 18;
 const MAX_TODOS: usize = 30;
 const MAX_EVENTS: usize = 20;
@@ -44,6 +46,117 @@ pub struct WorkspaceSynthExtractorSpec {
     pub goal: &'static str,
     pub handoff_path: &'static str,
     pub max_items: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSynthSkillHandlerKind {
+    SplitHandoff,
+    ArticleHandoff,
+    DirectPostOutput,
+    DirectMediaOutput,
+}
+
+impl Default for WorkspaceSynthSkillHandlerKind {
+    fn default() -> Self {
+        Self::SplitHandoff
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceSynthSkillSpec {
+    pub key: &'static str,
+    pub name: &'static str,
+    pub goal: &'static str,
+    pub output_prefix: &'static str,
+    pub handler_kind: WorkspaceSynthSkillHandlerKind,
+    pub enabled_by_default: bool,
+    pub visible_in_ui: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSynthSkillRecord {
+    #[serde(default)]
+    pub skill_key: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub skill_path: String,
+    #[serde(default)]
+    pub output_prefix: String,
+    #[serde(default = "default_skill_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub goal: String,
+    #[serde(default)]
+    pub built_in_skill_fingerprint: Option<String>,
+    #[serde(default = "default_skill_visible_in_ui")]
+    pub visible_in_ui: bool,
+    #[serde(default)]
+    pub handler_kind: WorkspaceSynthSkillHandlerKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSynthSkillStore {
+    #[serde(default)]
+    pub skills: HashMap<String, WorkspaceSynthSkillRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSynthSkillResponseItem {
+    #[serde(default)]
+    pub skill_key: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub skill_path: String,
+    #[serde(default)]
+    pub output_prefix: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub supported: bool,
+    #[serde(default)]
+    pub unsupported_reason: Option<String>,
+    #[serde(default)]
+    pub goal: String,
+    #[serde(default)]
+    pub handler_kind: WorkspaceSynthSkillHandlerKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSynthSkillRunState {
+    #[serde(default)]
+    pub skill_key: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub output_prefix: String,
+    #[serde(default)]
+    pub handler_kind: WorkspaceSynthSkillHandlerKind,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub item_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceSynthSkillDefinition {
+    pub key: String,
+    pub name: String,
+    pub skill_path: String,
+    pub output_prefix: String,
+    pub goal: String,
+    pub handler_kind: WorkspaceSynthSkillHandlerKind,
+    pub visible_in_ui: bool,
 }
 
 const WORKSPACE_SYNTH_EXTRACTOR_SPECS: [WorkspaceSynthExtractorSpec; 5] = [
@@ -81,6 +194,90 @@ const WORKSPACE_SYNTH_EXTRACTOR_SPECS: [WorkspaceSynthExtractorSpec; 5] = [
         goal: "Propose concise durable titles for the current journal note batch. Write only the journal_titles handoff JSON for Rust to rename journal note files.",
         handoff_path: WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH,
         max_items: MAX_JOURNAL_TITLES,
+    },
+];
+
+const WORKSPACE_SYNTH_SKILL_SPECS: [WorkspaceSynthSkillSpec; 9] = [
+    WorkspaceSynthSkillSpec {
+        key: WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Insight Extractor",
+        goal: "Extract concise workspace feed posts from recent journals and transcripts. Write only the insight_posts handoff JSON for Rust to materialize into feed posts.",
+        output_prefix: "posts/workspace_synthesizer/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::SplitHandoff,
+        enabled_by_default: true,
+        visible_in_ui: true,
+    },
+    WorkspaceSynthSkillSpec {
+        key: WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Todo Extractor",
+        goal: "Extract concrete action items and commitments from recent journals and transcripts. Write only the todos handoff JSON for Rust to store in the planner.",
+        output_prefix: "posts/workspace_synthesizer/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::SplitHandoff,
+        enabled_by_default: true,
+        visible_in_ui: true,
+    },
+    WorkspaceSynthSkillSpec {
+        key: WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Event Extractor",
+        goal: "Extract scheduled events with clear timing from recent journals and transcripts. Write only the events handoff JSON for Rust to store in the planner.",
+        output_prefix: "posts/workspace_synthesizer/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::SplitHandoff,
+        enabled_by_default: true,
+        visible_in_ui: true,
+    },
+    WorkspaceSynthSkillSpec {
+        key: WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Clip Extractor",
+        goal: "Extract transcript-backed clip plans from recent journals and transcript text. Write only the clip_plans handoff JSON for Rust to keep as pipeline artifacts.",
+        output_prefix: "posts/workspace_synthesizer/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::SplitHandoff,
+        enabled_by_default: true,
+        visible_in_ui: true,
+    },
+    WorkspaceSynthSkillSpec {
+        key: WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY,
+        name: "Workspace Journal Title Extractor",
+        goal: "Propose concise durable titles for the current journal note batch. Write only the journal_titles handoff JSON for Rust to rename journal note files.",
+        output_prefix: "posts/workspace_synthesizer/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::SplitHandoff,
+        enabled_by_default: true,
+        visible_in_ui: true,
+    },
+    WorkspaceSynthSkillSpec {
+        key: "bluesky_insight_posts",
+        name: "Bluesky Insight Posts",
+        goal: "Create interesting Bluesky post drafts from my recent journal notes. Extract standout insights and save each post as a separate file in posts/ so it appears in the workspace feed.",
+        output_prefix: "posts/bluesky_insight_posts/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::DirectPostOutput,
+        enabled_by_default: false,
+        visible_in_ui: true,
+    },
+    WorkspaceSynthSkillSpec {
+        key: "weekly_highlights",
+        name: "Weekly Highlights",
+        goal: "Turn my recent journal notes into polished weekly highlight posts for the workspace feed. Save each highlight as a separate file in posts/.",
+        output_prefix: "posts/weekly_highlights/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::DirectPostOutput,
+        enabled_by_default: false,
+        visible_in_ui: true,
+    },
+    WorkspaceSynthSkillSpec {
+        key: article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY,
+        name: "Long-Form Articles",
+        goal: "Build clean long-form articles from journal notes over time. Decide whether to refine an existing article or create a new one, then hand off JSON for Rust to materialize markdown under posts/articles/.",
+        output_prefix: "posts/articles/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::ArticleHandoff,
+        enabled_by_default: false,
+        visible_in_ui: true,
+    },
+    WorkspaceSynthSkillSpec {
+        key: "audio_insight_clips",
+        name: "Audio Insight Clips",
+        goal: "Create simple vertical video clips from my journal audio recordings. If a transcript is missing, generate it first, extract exact insightful lines, build black-background text cards, and render a feed-ready mp4 into posts/.",
+        output_prefix: "posts/audio_insight_clips/",
+        handler_kind: WorkspaceSynthSkillHandlerKind::DirectMediaOutput,
+        enabled_by_default: false,
+        visible_in_ui: true,
     },
 ];
 
@@ -275,6 +472,8 @@ pub struct WorkspaceSynthesizerStatus {
     pub artifact_states: WorkspaceSynthArtifactStates,
     #[serde(default)]
     pub renamed_sources: Vec<WorkspaceSynthRenamedSource>,
+    #[serde(default)]
+    pub skill_runs: Vec<WorkspaceSynthSkillRunState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -335,6 +534,8 @@ pub struct WorkspaceSynthesisApplyResult {
     pub applied_any: bool,
     #[serde(default)]
     pub had_errors: bool,
+    #[serde(default)]
+    pub skill_runs: Vec<WorkspaceSynthSkillRunState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -352,6 +553,14 @@ fn manifest_version() -> String {
 
 fn default_idle_status() -> String {
     "idle".to_string()
+}
+
+fn default_skill_enabled() -> bool {
+    true
+}
+
+fn default_skill_visible_in_ui() -> bool {
+    true
 }
 
 pub fn manifest_schema_json() -> Result<String> {
@@ -387,6 +596,293 @@ fn journal_titles_schema_json() -> Result<String> {
 
 pub fn extractor_specs() -> &'static [WorkspaceSynthExtractorSpec] {
     &WORKSPACE_SYNTH_EXTRACTOR_SPECS
+}
+
+pub fn skill_specs() -> &'static [WorkspaceSynthSkillSpec] {
+    &WORKSPACE_SYNTH_SKILL_SPECS
+}
+
+pub fn is_managed_skill_key(skill_key: &str) -> bool {
+    let normalized = skill_key.trim().to_ascii_lowercase();
+    skill_specs()
+        .iter()
+        .any(|spec| spec.key.eq_ignore_ascii_case(&normalized))
+}
+
+pub fn skill_spec_by_key(skill_key: &str) -> Option<WorkspaceSynthSkillSpec> {
+    skill_specs()
+        .iter()
+        .copied()
+        .find(|spec| spec.key.eq_ignore_ascii_case(skill_key.trim()))
+}
+
+pub fn skill_store_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(WORKSPACE_SYNTH_SKILLS_PATH)
+}
+
+fn normalize_skill_path(skill_key: &str) -> String {
+    format!(
+        "skills/workspace_synthesizer/{}/SKILL.md",
+        skill_key.trim().to_ascii_lowercase()
+    )
+}
+
+fn normalize_skill_output_prefix(prefix: &str, skill_key: &str) -> String {
+    let trimmed = prefix.trim().trim_start_matches('/').replace('\\', "/");
+    let mut normalized = if trimmed.is_empty() {
+        format!("posts/{}/", skill_key.trim().to_ascii_lowercase())
+    } else {
+        trimmed
+    };
+    if !normalized.starts_with("posts/") {
+        normalized = format!("posts/{}/", skill_key.trim().to_ascii_lowercase());
+    }
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
+}
+
+fn normalize_skill_record(skill_key: &str, mut record: WorkspaceSynthSkillRecord) -> WorkspaceSynthSkillRecord {
+    record.skill_key = skill_key.trim().to_ascii_lowercase();
+    if record.name.trim().is_empty() {
+        record.name = skill_spec_by_key(skill_key)
+            .map(|spec| spec.name.to_string())
+            .unwrap_or_else(|| skill_key.trim().to_string());
+    }
+    record.skill_path = {
+        let trimmed = record
+            .skill_path
+            .trim()
+            .trim_start_matches('/')
+            .replace('\\', "/");
+        if trimmed.is_empty() || trimmed.contains("..") || !trimmed.starts_with("skills/") {
+            normalize_skill_path(skill_key)
+        } else {
+            trimmed
+        }
+    };
+    record.output_prefix = normalize_skill_output_prefix(&record.output_prefix, skill_key);
+    record.goal = record.goal.trim().to_string();
+    record.visible_in_ui = record.visible_in_ui || default_skill_visible_in_ui();
+    if let Some(spec) = skill_spec_by_key(skill_key) {
+        record.handler_kind = spec.handler_kind;
+        if record.goal.is_empty() {
+            record.goal = spec.goal.to_string();
+        }
+    }
+    record
+}
+
+fn render_template_skill_markdown(skill_name: &str, goal: &str, output_dir: &str) -> String {
+    format!(
+        "# {skill_name}\n\n\
+Use this content agent to fulfill the following goal:\n\n\
+> {goal}\n\n\
+## Sources\n\n\
+- `journals/text/**`\n\
+- transcript files under `journals/text/transcriptions/**` when present\n\n\
+ - `journals/media/audio/**` and `journals/media/video/**` when the goal depends on journal media\n\n\
+## Output\n\n\
+- `{output_dir}`\n\n\
+## Output Rules\n\n\
+- Write feed-visible artifacts only under `{output_dir}`.\n\
+- Hidden intermediates may go under `{output_dir}/pipeline/` or `{output_dir}/artifacts/`.\n\
+- If generating multiple distinct post candidates, save each as a separate file.\n\
+- Prefer built-in runtime tools for media and transcription tasks; do not hardcode scripts or shell pipelines when a built-in tool exists.\n\
+- Keep unrelated workspace files untouched.\n"
+    )
+}
+
+fn render_audio_insight_clip_skill_markdown(output_dir: &str) -> String {
+    format!(
+        "# Audio Insight Clips\n\n\
+Create simple vertical video clips from journal audio recordings.\n\n\
+## Sources\n\n\
+- `journals/media/audio/**`\n\
+- `journals/text/transcriptions/audio/**` when present\n\
+- `journals/text/transcriptions/**` for existing transcript sidecars\n\
+- `journals/text/**` for context if useful\n\n\
+## Output\n\n\
+- Final feed-visible clips: `{output_dir}`\n\
+- Hidden intermediates: `{output_dir}/pipeline/`\n\n\
+## Workflow\n\n\
+1. Find one or more strong source recordings under `journals/media/audio/**`.\n\
+2. For each chosen recording, look for a transcript text file under `journals/text/transcriptions/**` using the same stem and relative media path.\n\
+3. If the transcript is missing, call the built-in `transcribe_media` tool for that recording.\n\
+4. Read the transcript and extract exact insightful lines. Do not rewrite the quoted line if it will appear inside the video card.\n\
+5. Optionally call `clean_audio` when the source recording is noisy.\n\
+6. If you need a precise quote segment, call `extract_audio_segment` with the exact start/end range.\n\
+7. Render the final clip with `compose_simple_clip` or `render_text_card_video` using white text on a black background.\n\
+8. Save the final `.mp4` directly under `{output_dir}` so it appears in the workspace feed.\n\n\
+## Output Rules\n\n\
+- Use a black background with white text cards.\n\
+- Prefer 1 to 3 exact lines per clip.\n\
+- Keep final clips concise and feed-ready.\n\
+- Put JSON manifests, transcripts, and other machine files only under `{output_dir}/pipeline/`.\n\
+- Prefer built-in runtime tools over shell commands or scripts.\n\
+- Do not overwrite unrelated posts.\n"
+    )
+}
+
+fn built_in_skill_markdown(record: &WorkspaceSynthSkillRecord) -> Result<String> {
+    let output_dir = record.output_prefix.trim_end_matches('/');
+    let body = match record.skill_key.as_str() {
+        WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY
+        | WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY
+        | WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY
+        | WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY
+        | WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => {
+            render_extractor_skill_markdown(&record.skill_key)?
+        }
+        article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY => {
+            article_synthesizer::render_skill_markdown(output_dir)
+        }
+        "audio_insight_clips" => render_audio_insight_clip_skill_markdown(output_dir),
+        _ => render_template_skill_markdown(&record.name, &record.goal, output_dir),
+    };
+    Ok(body)
+}
+
+fn skill_definition_from_record(record: &WorkspaceSynthSkillRecord) -> WorkspaceSynthSkillDefinition {
+    WorkspaceSynthSkillDefinition {
+        key: record.skill_key.clone(),
+        name: record.name.clone(),
+        skill_path: record.skill_path.clone(),
+        output_prefix: record.output_prefix.clone(),
+        goal: record.goal.clone(),
+        handler_kind: record.handler_kind,
+        visible_in_ui: record.visible_in_ui,
+    }
+}
+
+pub fn skill_definitions(store: &WorkspaceSynthSkillStore) -> Vec<WorkspaceSynthSkillDefinition> {
+    let mut defs = store
+        .skills
+        .values()
+        .map(skill_definition_from_record)
+        .filter(|skill| skill.visible_in_ui)
+        .collect::<Vec<_>>();
+    defs.sort_by(|a, b| a.key.cmp(&b.key));
+    defs
+}
+
+pub fn skill_definition_by_key(
+    store: &WorkspaceSynthSkillStore,
+    key: &str,
+) -> Option<WorkspaceSynthSkillDefinition> {
+    let normalized = key.trim().to_ascii_lowercase();
+    store.skills.get(&normalized).map(skill_definition_from_record)
+}
+
+pub fn skill_for_feed_path(
+    store: &WorkspaceSynthSkillStore,
+    path: &str,
+) -> Option<WorkspaceSynthSkillDefinition> {
+    let normalized_path = path.trim_start_matches('/').to_ascii_lowercase();
+    skill_definitions(store).into_iter().find(|skill| {
+        normalized_path.starts_with(&skill.output_prefix.to_ascii_lowercase())
+    })
+}
+
+fn built_in_skill_record(spec: WorkspaceSynthSkillSpec) -> WorkspaceSynthSkillRecord {
+    let key = spec.key.to_ascii_lowercase();
+    let mut record = WorkspaceSynthSkillRecord {
+        skill_key: key.clone(),
+        name: spec.name.to_string(),
+        skill_path: normalize_skill_path(&key),
+        output_prefix: spec.output_prefix.to_string(),
+        enabled: spec.enabled_by_default,
+        goal: spec.goal.to_string(),
+        built_in_skill_fingerprint: None,
+        visible_in_ui: spec.visible_in_ui,
+        handler_kind: spec.handler_kind,
+    };
+    record = normalize_skill_record(&key, record);
+    if let Ok(body) = built_in_skill_markdown(&record) {
+        record.built_in_skill_fingerprint = Some(content_agent_skill_fingerprint(&body));
+    }
+    record
+}
+
+pub fn load_skill_store(workspace_dir: &Path) -> Result<WorkspaceSynthSkillStore> {
+    let path = skill_store_path(workspace_dir);
+    if !path.exists() {
+        return Ok(WorkspaceSynthSkillStore::default());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut parsed: WorkspaceSynthSkillStore =
+        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    parsed.skills = parsed
+        .skills
+        .into_iter()
+        .map(|(key, record)| {
+            let normalized = key.trim().to_ascii_lowercase();
+            (normalized.clone(), normalize_skill_record(&normalized, record))
+        })
+        .collect();
+    Ok(parsed)
+}
+
+pub fn save_skill_store(workspace_dir: &Path, store: &WorkspaceSynthSkillStore) -> Result<()> {
+    let path = skill_store_path(workspace_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(store)?;
+    fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+pub fn ensure_built_in_skills(
+    workspace_dir: &Path,
+    store: &mut WorkspaceSynthSkillStore,
+) -> Result<bool> {
+    let mut changed = false;
+    for spec in skill_specs() {
+        let key = spec.key.to_ascii_lowercase();
+        if !store.skills.contains_key(&key) {
+            store.skills.insert(key.clone(), built_in_skill_record(*spec));
+            changed = true;
+        }
+        if let Some(record) = store.skills.get_mut(&key) {
+            *record = normalize_skill_record(&key, record.clone());
+            let canonical_body = built_in_skill_markdown(record)?;
+            let canonical_fingerprint = content_agent_skill_fingerprint(&canonical_body);
+            let skill_abs = workspace_dir.join(&record.skill_path);
+            let should_refresh = record
+                .built_in_skill_fingerprint
+                .as_deref()
+                != Some(canonical_fingerprint.as_str())
+                || !skill_abs.exists();
+            if should_refresh {
+                if let Some(parent) = skill_abs.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
+                }
+                fs::write(&skill_abs, canonical_body)
+                    .with_context(|| format!("failed to refresh {}", skill_abs.display()))?;
+                record.built_in_skill_fingerprint = Some(canonical_fingerprint);
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+pub fn load_or_seed_skill_store(workspace_dir: &Path) -> Result<WorkspaceSynthSkillStore> {
+    let mut store = load_skill_store(workspace_dir)?;
+    if ensure_built_in_skills(workspace_dir, &mut store)? {
+        save_skill_store(workspace_dir, &store)?;
+    }
+    Ok(store)
+}
+
+fn content_agent_skill_fingerprint(body: &str) -> String {
+    let digest = Sha256::digest(body.as_bytes());
+    hex::encode(digest)
 }
 
 pub fn is_extractor_workflow_key(workflow_key: &str) -> bool {
@@ -665,6 +1161,60 @@ pub fn reset_handoff_files(workspace_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn reset_skill_outputs(
+    workspace_dir: &Path,
+    skill: &WorkspaceSynthSkillDefinition,
+) -> Result<()> {
+    match skill.handler_kind {
+        WorkspaceSynthSkillHandlerKind::SplitHandoff => {
+            if let Some(handoff_rel) = extractor_handoff_path(&skill.key) {
+                let path = workspace_dir.join(handoff_rel);
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| format!("failed to clear {}", path.display()));
+                    }
+                }
+            }
+        }
+        WorkspaceSynthSkillHandlerKind::ArticleHandoff => {
+            article_synthesizer::reset_handoff_file(workspace_dir)?;
+        }
+        WorkspaceSynthSkillHandlerKind::DirectPostOutput
+        | WorkspaceSynthSkillHandlerKind::DirectMediaOutput => {}
+    }
+    Ok(())
+}
+
+pub fn direct_output_file_count(workspace_dir: &Path, output_prefix: &str) -> Result<usize> {
+    let rel = output_prefix.trim().trim_start_matches('/').trim_end_matches('/');
+    if rel.is_empty() {
+        return Ok(0);
+    }
+    let root = workspace_dir.join(rel);
+    if !root.exists() {
+        return Ok(0);
+    }
+    count_visible_outputs_recursive(&root, workspace_dir)
+}
+
+pub fn direct_output_paths(workspace_dir: &Path, output_prefix: &str) -> Result<Vec<String>> {
+    let rel = output_prefix.trim().trim_start_matches('/').trim_end_matches('/');
+    if rel.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = workspace_dir.join(rel);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    collect_visible_outputs_recursive(&root, workspace_dir, &mut out)?;
+    out.sort();
+    Ok(out)
 }
 
 pub fn load_status(workspace_dir: &Path) -> WorkspaceSynthesizerStatus {
@@ -1217,6 +1767,7 @@ pub fn apply_manifest(
         artifact_states: WorkspaceSynthArtifactStates::default(),
         applied_any: true,
         had_errors: false,
+        skill_runs: Vec::new(),
     })
 }
 
@@ -1645,6 +2196,58 @@ fn remove_stale_files(dir: &Path, keep_files: &HashSet<String>, preserve_dirs: &
         fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
     }
     Ok(())
+}
+
+fn collect_visible_outputs_recursive(
+    dir: &Path,
+    workspace_dir: &Path,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            let rel = path
+                .strip_prefix(workspace_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.ends_with("/pipeline")
+                || rel.contains("/pipeline/")
+                || rel.ends_with("/artifacts")
+                || rel.contains("/artifacts/")
+            {
+                continue;
+            }
+            collect_visible_outputs_recursive(&path, workspace_dir, out)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(workspace_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel.ends_with(".json") || rel.ends_with(".srt") || rel.ends_with(".caption.txt") {
+            continue;
+        }
+        out.push(rel);
+    }
+    Ok(())
+}
+
+fn count_visible_outputs_recursive(dir: &Path, workspace_dir: &Path) -> Result<usize> {
+    let mut out = Vec::new();
+    collect_visible_outputs_recursive(dir, workspace_dir, &mut out)?;
+    Ok(out.len())
 }
 
 #[cfg(test)]

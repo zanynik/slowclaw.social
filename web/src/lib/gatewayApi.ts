@@ -309,6 +309,23 @@ export type FeedContentAgentCreateResult = {
   creationSummary?: string;
 };
 
+export type WorkspaceSynthSkillItem = {
+  skillKey: string;
+  name: string;
+  skillPath: string;
+  outputPrefix: string;
+  enabled: boolean;
+  supported?: boolean;
+  unsupportedReason?: string;
+  goal?: string;
+  handlerKind?: "split_handoff" | "article_handoff" | "direct_post_output" | "direct_media_output" | string;
+};
+
+export type WorkspaceSynthSkillUpdatePayload = {
+  skillKey: string;
+  enabled?: boolean;
+};
+
 export type WorkspaceSynthesizerStatus = {
   status: "idle" | "pending" | "processing" | "done" | "error" | string;
   triggerReason?: string;
@@ -334,6 +351,7 @@ export type WorkspaceSynthesizerStatus = {
     events?: WorkspaceSynthArtifactState;
     clipPlans?: WorkspaceSynthArtifactState;
   };
+  skillRuns?: WorkspaceSynthSkillRunState[];
 };
 
 export type WorkspaceSynthArtifactState = {
@@ -341,6 +359,17 @@ export type WorkspaceSynthArtifactState = {
   path?: string;
   itemCount?: number;
   error?: string;
+};
+
+export type WorkspaceSynthSkillRunState = {
+  skillKey: string;
+  name: string;
+  outputPrefix?: string;
+  handlerKind?: string;
+  status?: "applied" | "skipped" | "error" | string;
+  summary?: string;
+  error?: string;
+  itemCount?: number;
 };
 
 export type WorkspaceTodoItem = {
@@ -957,6 +986,22 @@ function mapFeedContentAgentItem(item: any): FeedContentAgentItem {
   };
 }
 
+function mapWorkspaceSynthSkillItem(item: any): WorkspaceSynthSkillItem {
+  return {
+    skillKey: String(item?.skillKey || ""),
+    name: String(item?.name || ""),
+    skillPath: String(item?.skillPath || ""),
+    outputPrefix: String(item?.outputPrefix || ""),
+    enabled: item?.enabled !== false,
+    supported: item?.supported !== false,
+    unsupportedReason: item?.unsupportedReason
+      ? String(item.unsupportedReason)
+      : undefined,
+    goal: item?.goal ? String(item.goal) : undefined,
+    handlerKind: item?.handlerKind ? String(item.handlerKind) : undefined
+  };
+}
+
 export async function listFeedContentAgents(
   bearerToken?: string,
   gatewayBaseUrl?: string
@@ -1032,17 +1077,7 @@ export async function autoRunEligibleFeedContentAgents(
   };
 }
 
-export async function getWorkspaceSynthesizerStatus(
-  bearerToken?: string,
-  gatewayBaseUrl?: string
-): Promise<WorkspaceSynthesizerStatus> {
-  const res = await fetch(
-    resolveGatewayEndpoint("/api/workspace/synthesizer/status", gatewayBaseUrl),
-    {
-      headers: authHeaders(bearerToken)
-    }
-  );
-  const data = await parseJsonOrThrow(res);
+function mapWorkspaceSynthStatusPayload(data: any): WorkspaceSynthesizerStatus {
   return {
     status: String(data?.status || "idle"),
     triggerReason: data?.triggerReason ? String(data.triggerReason) : undefined,
@@ -1127,8 +1162,62 @@ export async function getWorkspaceSynthesizerStatus(
               }
             : undefined
         }
+      : undefined,
+    skillRuns: Array.isArray(data?.skillRuns)
+      ? data.skillRuns.map((item: any) => ({
+          skillKey: String(item?.skillKey || ""),
+          name: String(item?.name || ""),
+          outputPrefix: item?.outputPrefix ? String(item.outputPrefix) : undefined,
+          handlerKind: item?.handlerKind ? String(item.handlerKind) : undefined,
+          status: item?.status ? String(item.status) : undefined,
+          summary: item?.summary ? String(item.summary) : undefined,
+          error: item?.error ? String(item.error) : undefined,
+          itemCount: Number(item?.itemCount || 0)
+        }))
       : undefined
   };
+}
+
+export async function listWorkspaceSynthSkills(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<WorkspaceSynthSkillItem[]> {
+  const res = await fetch(resolveGatewayEndpoint("/api/workspace/synthesizer/skills", gatewayBaseUrl), {
+    headers: authHeaders(bearerToken)
+  });
+  const data = await parseJsonOrThrow(res);
+  const items = Array.isArray(data?.items) ? data.items : [];
+  return items.map(mapWorkspaceSynthSkillItem);
+}
+
+export async function updateWorkspaceSynthSkill(
+  payload: WorkspaceSynthSkillUpdatePayload,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<{ item: WorkspaceSynthSkillItem }> {
+  const res = await fetch(resolveGatewayEndpoint("/api/workspace/synthesizer/skills", gatewayBaseUrl), {
+    method: "PATCH",
+    headers: authHeaders(bearerToken, "application/json"),
+    body: JSON.stringify(payload)
+  });
+  const data = await parseJsonOrThrow(res);
+  return {
+    item: mapWorkspaceSynthSkillItem(data?.item || {})
+  };
+}
+
+export async function getWorkspaceSynthesizerStatus(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<WorkspaceSynthesizerStatus> {
+  const res = await fetch(
+    resolveGatewayEndpoint("/api/workspace/synthesizer/status", gatewayBaseUrl),
+    {
+      headers: authHeaders(bearerToken)
+    }
+  );
+  const data = await parseJsonOrThrow(res);
+  return mapWorkspaceSynthStatusPayload(data);
 }
 
 export function streamWorkspaceSynthesizerStatus(
@@ -1141,94 +1230,7 @@ export function streamWorkspaceSynthesizerStatus(
     bearerToken,
     gatewayBaseUrl,
     onEvent: (_event, payload) => {
-      onStatus({
-        status: String(payload?.status || "idle"),
-        triggerReason: payload?.triggerReason ? String(payload.triggerReason) : undefined,
-        threadId: payload?.threadId ? String(payload.threadId) : undefined,
-        lastRunAt: payload?.lastRunAt ? String(payload.lastRunAt) : undefined,
-        lastSourceUpdatedAt:
-          typeof payload?.lastSourceUpdatedAt === "number" ? payload.lastSourceUpdatedAt : undefined,
-        pendingSourceCount:
-          typeof payload?.pendingSourceCount === "number" ? payload.pendingSourceCount : undefined,
-        pendingWordCount:
-          typeof payload?.pendingWordCount === "number" ? payload.pendingWordCount : undefined,
-        selectedSourcePaths: Array.isArray(payload?.selectedSourcePaths)
-          ? payload.selectedSourcePaths.map((value: unknown) => String(value))
-          : undefined,
-        lastSummary: payload?.lastSummary ? String(payload.lastSummary) : undefined,
-        lastError: payload?.lastError ? String(payload.lastError) : undefined,
-        lastManifestPath: payload?.lastManifestPath ? String(payload.lastManifestPath) : undefined,
-        renamedSources: Array.isArray(payload?.renamedSources)
-          ? payload.renamedSources
-              .map((value: any) => ({
-                fromPath: String(value?.fromPath || "").trim(),
-                toPath: String(value?.toPath || "").trim()
-              }))
-              .filter(
-                (value: { fromPath: string; toPath: string }) => value.fromPath && value.toPath
-              )
-          : undefined,
-        artifactCounts: payload?.artifactCounts
-          ? {
-              insightPosts: Number(payload.artifactCounts.insightPosts || 0),
-              todos: Number(payload.artifactCounts.todos || 0),
-              events: Number(payload.artifactCounts.events || 0),
-              clipPlans: Number(payload.artifactCounts.clipPlans || 0)
-            }
-          : undefined,
-        artifactStates: payload?.artifactStates
-          ? {
-              insightPosts: payload.artifactStates.insightPosts
-                ? {
-                    status: String(payload.artifactStates.insightPosts.status || ""),
-                    path: payload.artifactStates.insightPosts.path
-                      ? String(payload.artifactStates.insightPosts.path)
-                      : undefined,
-                    itemCount: Number(payload.artifactStates.insightPosts.itemCount || 0),
-                    error: payload.artifactStates.insightPosts.error
-                      ? String(payload.artifactStates.insightPosts.error)
-                      : undefined
-                  }
-                : undefined,
-              todos: payload.artifactStates.todos
-                ? {
-                    status: String(payload.artifactStates.todos.status || ""),
-                    path: payload.artifactStates.todos.path
-                      ? String(payload.artifactStates.todos.path)
-                      : undefined,
-                    itemCount: Number(payload.artifactStates.todos.itemCount || 0),
-                    error: payload.artifactStates.todos.error
-                      ? String(payload.artifactStates.todos.error)
-                      : undefined
-                  }
-                : undefined,
-              events: payload.artifactStates.events
-                ? {
-                    status: String(payload.artifactStates.events.status || ""),
-                    path: payload.artifactStates.events.path
-                      ? String(payload.artifactStates.events.path)
-                      : undefined,
-                    itemCount: Number(payload.artifactStates.events.itemCount || 0),
-                    error: payload.artifactStates.events.error
-                      ? String(payload.artifactStates.events.error)
-                      : undefined
-                  }
-                : undefined,
-              clipPlans: payload.artifactStates.clipPlans
-                ? {
-                    status: String(payload.artifactStates.clipPlans.status || ""),
-                    path: payload.artifactStates.clipPlans.path
-                      ? String(payload.artifactStates.clipPlans.path)
-                      : undefined,
-                    itemCount: Number(payload.artifactStates.clipPlans.itemCount || 0),
-                    error: payload.artifactStates.clipPlans.error
-                      ? String(payload.artifactStates.clipPlans.error)
-                      : undefined
-                  }
-                : undefined
-            }
-          : undefined
-      });
+      onStatus(mapWorkspaceSynthStatusPayload(payload));
     },
     onError
   });
