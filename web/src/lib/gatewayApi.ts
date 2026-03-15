@@ -453,6 +453,17 @@ export type InterestProfileStats = {
   ignoredCount: number;
 };
 
+export type FeedSelectedSource = {
+  protocol: string;
+  key: string;
+  label: string;
+  score: number;
+  description?: string | null;
+  matchedInterestLabel?: string | null;
+  matchedInterestScore?: number | null;
+  metadata?: any;
+};
+
 export type PersonalizedFeedResponse = {
   items: PersonalizedFeedItem[];
   profileStatus: string;
@@ -463,16 +474,37 @@ export type PersonalizedFeedResponse = {
   refreshedAt?: string | null;
   refreshStatus?: string;
   lastError?: string | null;
-  selectedSources: Array<{
-    protocol: string;
-    key: string;
-    label: string;
-    score: number;
-    description?: string | null;
-    matchedInterestLabel?: string | null;
-    matchedInterestScore?: number | null;
-    metadata?: any;
-  }>;
+  selectedSources: FeedSelectedSource[];
+  diagnostics: {
+    rss: {
+      available: boolean;
+      scannedCount: number;
+      metadataFetchedCount: number;
+      shortlistedCount: number;
+      candidateCount: number;
+      sampledSources: FeedSelectedSource[];
+    };
+    nostr: {
+      available: boolean;
+      scannedCount: number;
+      metadataFetchedCount: number;
+      shortlistedCount: number;
+      candidateCount: number;
+      sampledSources: FeedSelectedSource[];
+    };
+    bluesky: {
+      available: boolean;
+      scannedCount: number;
+      metadataFetchedCount: number;
+      shortlistedCount: number;
+      candidateCount: number;
+      sampledSources: FeedSelectedSource[];
+    };
+    ranking: {
+      candidateCountBeforeRanking: number;
+      rankedItemCount: number;
+    };
+  };
 };
 
 export type WorldFeedInterestItem = {
@@ -585,6 +617,19 @@ export async function fetchPersonalizedFeed(
     })
   });
   const data = await parseJsonOrThrow(res);
+  const mapSelectedSource = (item: any) => ({
+    protocol: String(item?.protocol || ""),
+    key: String(item?.key || ""),
+    label: String(item?.label || ""),
+    score: Number(item?.score || 0),
+    description: item?.description ? String(item.description) : null,
+    matchedInterestLabel: item?.matchedInterestLabel
+      ? String(item.matchedInterestLabel)
+      : null,
+    matchedInterestScore:
+      item?.matchedInterestScore == null ? null : Number(item.matchedInterestScore),
+    metadata: item?.metadata ?? null
+  });
   return {
     items: Array.isArray(data.items)
       ? data.items.map((item: any) => ({
@@ -646,20 +691,44 @@ export async function fetchPersonalizedFeed(
     refreshStatus: typeof data.refreshStatus === "string" ? data.refreshStatus : undefined,
     lastError: typeof data.lastError === "string" ? data.lastError : null,
     selectedSources: Array.isArray(data.selectedSources)
-      ? data.selectedSources.map((item: any) => ({
-          protocol: String(item?.protocol || ""),
-          key: String(item?.key || ""),
-          label: String(item?.label || ""),
-          score: Number(item?.score || 0),
-          description: item?.description ? String(item.description) : null,
-          matchedInterestLabel: item?.matchedInterestLabel
-            ? String(item.matchedInterestLabel)
-            : null,
-          matchedInterestScore:
-            item?.matchedInterestScore == null ? null : Number(item.matchedInterestScore),
-          metadata: item?.metadata ?? null
-        }))
-      : []
+      ? data.selectedSources.map(mapSelectedSource)
+      : [],
+    diagnostics: {
+      rss: {
+        available: Boolean(data?.diagnostics?.rss?.available),
+        scannedCount: Number(data?.diagnostics?.rss?.scannedCount || 0),
+        metadataFetchedCount: Number(data?.diagnostics?.rss?.metadataFetchedCount || 0),
+        shortlistedCount: Number(data?.diagnostics?.rss?.shortlistedCount || 0),
+        candidateCount: Number(data?.diagnostics?.rss?.candidateCount || 0),
+        sampledSources: Array.isArray(data?.diagnostics?.rss?.sampledSources)
+          ? data.diagnostics.rss.sampledSources.map(mapSelectedSource)
+          : []
+      },
+      nostr: {
+        available: Boolean(data?.diagnostics?.nostr?.available),
+        scannedCount: Number(data?.diagnostics?.nostr?.scannedCount || 0),
+        metadataFetchedCount: Number(data?.diagnostics?.nostr?.metadataFetchedCount || 0),
+        shortlistedCount: Number(data?.diagnostics?.nostr?.shortlistedCount || 0),
+        candidateCount: Number(data?.diagnostics?.nostr?.candidateCount || 0),
+        sampledSources: Array.isArray(data?.diagnostics?.nostr?.sampledSources)
+          ? data.diagnostics.nostr.sampledSources.map(mapSelectedSource)
+          : []
+      },
+      bluesky: {
+        available: Boolean(data?.diagnostics?.bluesky?.available),
+        scannedCount: Number(data?.diagnostics?.bluesky?.scannedCount || 0),
+        metadataFetchedCount: Number(data?.diagnostics?.bluesky?.metadataFetchedCount || 0),
+        shortlistedCount: Number(data?.diagnostics?.bluesky?.shortlistedCount || 0),
+        candidateCount: Number(data?.diagnostics?.bluesky?.candidateCount || 0),
+        sampledSources: Array.isArray(data?.diagnostics?.bluesky?.sampledSources)
+          ? data.diagnostics.bluesky.sampledSources.map(mapSelectedSource)
+          : []
+      },
+      ranking: {
+        candidateCountBeforeRanking: Number(data?.diagnostics?.ranking?.candidateCountBeforeRanking || 0),
+        rankedItemCount: Number(data?.diagnostics?.ranking?.rankedItemCount || 0)
+      }
+    }
   };
 }
 

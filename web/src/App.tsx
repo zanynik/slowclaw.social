@@ -1053,6 +1053,11 @@ function App() {
   const [worldFeedInterests, setWorldFeedInterests] = useState<WorldFeedInterestItem[]>([]);
   const [worldFeedInterestsLoading, setWorldFeedInterestsLoading] = useState(false);
   const [worldFeedInterestStatus, setWorldFeedInterestStatus] = useState("");
+  const [worldFeedSampleIndexByProtocol, setWorldFeedSampleIndexByProtocol] = useState({
+    rss: 0,
+    nostr: 0,
+    bluesky: 0
+  });
   const [worldFeedDummyLabel, setWorldFeedDummyLabel] = useState(
     "Open protocols, developer tools, startups, AI products"
   );
@@ -3946,6 +3951,27 @@ function App() {
     }
   }
 
+  async function refreshWorldFeedDiagnostics() {
+    await Promise.all([fetchBlueskyFeed(), loadWorldFeedInterests()]);
+  }
+
+  function chooseNextWorldFeedSample(protocol: "rss" | "nostr" | "bluesky", sampleCount: number) {
+    if (sampleCount <= 1) {
+      return;
+    }
+    setWorldFeedSampleIndexByProtocol((prev) => {
+      const current = prev[protocol];
+      let next = current;
+      while (next === current) {
+        next = Math.floor(Math.random() * sampleCount);
+      }
+      return {
+        ...prev,
+        [protocol]: next
+      };
+    });
+  }
+
   useEffect(() => {
     if (feedSource === "bluesky") {
       void fetchBlueskyFeed();
@@ -3955,6 +3981,14 @@ function App() {
       setWorldFeedInterestStatus("");
     }
   }, [feedSource, session, creds.serviceUrl, chatGatewayToken, gatewayBaseUrl]);
+
+  useEffect(() => {
+    setWorldFeedSampleIndexByProtocol({
+      rss: 0,
+      nostr: 0,
+      bluesky: 0
+    });
+  }, [blueskyFeedSnapshot?.refreshedAt, blueskyFeedSnapshot?.refreshState]);
 
   useEffect(() => {
     if (mobileTab !== "feed" || feedSource !== "local") {
@@ -6171,9 +6205,20 @@ function App() {
                       <div className="workflow-settings-panel stack" style={{ gap: "0.65rem" }}>
                         <div className="row-between" style={{ alignItems: "center", gap: "0.8rem" }}>
                           <h3 style={{ margin: 0 }}>World Feed Signals</h3>
-                          <span className="text-sm muted">
-                            {blueskyFeedItems.length} item{blueskyFeedItems.length === 1 ? "" : "s"}
-                          </span>
+                          <div className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
+                            <span className="text-sm muted">
+                              {blueskyFeedItems.length} item{blueskyFeedItems.length === 1 ? "" : "s"}
+                            </span>
+                            <button
+                              type="button"
+                              className="ghost text-sm"
+                              style={{ padding: "0.3rem 0.65rem", borderRadius: "8px" }}
+                              onClick={() => void refreshWorldFeedDiagnostics()}
+                              disabled={blueskyFeedLoading || worldFeedInterestsLoading}
+                            >
+                              Refresh diagnostics
+                            </button>
+                          </div>
                         </div>
                         <div className="feed-agent-facts">
                           <div>
@@ -6192,6 +6237,123 @@ function App() {
                             <span className="text-sm muted">Shortlisted sources</span>
                             <strong>{blueskyFeedSnapshot.selectedSources.length}</strong>
                           </div>
+                        </div>
+                        <div className="stack" style={{ gap: "0.45rem" }}>
+                          <span className="text-sm muted">Discovery and matching</span>
+                          <div className="feed-agent-facts">
+                            <div>
+                              <span className="text-sm muted">RSS shortlisted</span>
+                              <strong>{blueskyFeedSnapshot.diagnostics.rss.shortlistedCount}</strong>
+                            </div>
+                            <div>
+                              <span className="text-sm muted">Nostr relays checked</span>
+                              <strong>{blueskyFeedSnapshot.diagnostics.nostr.scannedCount}</strong>
+                            </div>
+                            <div>
+                              <span className="text-sm muted">Bluesky algos checked</span>
+                              <strong>{blueskyFeedSnapshot.diagnostics.bluesky.scannedCount}</strong>
+                            </div>
+                            <div>
+                              <span className="text-sm muted">Candidates before ranking</span>
+                              <strong>{blueskyFeedSnapshot.diagnostics.ranking.candidateCountBeforeRanking}</strong>
+                            </div>
+                          </div>
+                          <div className="feed-agent-facts">
+                            <div>
+                              <span className="text-sm muted">RSS posts matched</span>
+                              <strong>{blueskyFeedSnapshot.diagnostics.rss.candidateCount}</strong>
+                            </div>
+                            <div>
+                              <span className="text-sm muted">Nostr metadata fetched</span>
+                              <strong>{blueskyFeedSnapshot.diagnostics.nostr.metadataFetchedCount}</strong>
+                            </div>
+                            <div>
+                              <span className="text-sm muted">Bluesky posts matched</span>
+                              <strong>{blueskyFeedSnapshot.diagnostics.bluesky.candidateCount}</strong>
+                            </div>
+                            <div>
+                              <span className="text-sm muted">Final ranked items</span>
+                              <strong>{blueskyFeedSnapshot.diagnostics.ranking.rankedItemCount}</strong>
+                            </div>
+                          </div>
+                          {([
+                            {
+                              key: "rss" as const,
+                              label: "RSS sample",
+                              data: blueskyFeedSnapshot.diagnostics.rss,
+                              empty: "No RSS source sample yet."
+                            },
+                            {
+                              key: "nostr" as const,
+                              label: "Nostr relay sample",
+                              data: blueskyFeedSnapshot.diagnostics.nostr,
+                              empty: "No Nostr relay sample yet."
+                            },
+                            {
+                              key: "bluesky" as const,
+                              label: "Bluesky feed sample",
+                              data: blueskyFeedSnapshot.diagnostics.bluesky,
+                              empty: "No Bluesky feed sample yet. This usually means auth is missing or discovery has not completed."
+                            }
+                          ]).map((protocol) => {
+                            const samples = protocol.data.sampledSources || [];
+                            const sample =
+                              samples.length > 0
+                                ? samples[worldFeedSampleIndexByProtocol[protocol.key] % samples.length]
+                                : null;
+                            return (
+                              <div key={protocol.key} className="workflow-run-card">
+                                <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
+                                  <span className="text-sm muted">{protocol.label}</span>
+                                  <div className="row" style={{ gap: "0.45rem", alignItems: "center" }}>
+                                    <span className="text-sm muted">
+                                      shortlisted {protocol.data.shortlistedCount}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      className="ghost text-sm"
+                                      style={{ padding: "0.25rem 0.55rem", borderRadius: "8px" }}
+                                      onClick={() => chooseNextWorldFeedSample(protocol.key, samples.length)}
+                                      disabled={samples.length <= 1}
+                                    >
+                                      Next sample
+                                    </button>
+                                  </div>
+                                </div>
+                                {sample ? (
+                                  <div className="stack-sm">
+                                    <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
+                                      <span className="feed-bot-chip">
+                                        <span className="feed-bot-avatar">
+                                          {(sample.protocol || "?").slice(0, 1).toUpperCase()}
+                                        </span>
+                                        <span>{sample.label}</span>
+                                      </span>
+                                      <span className="text-sm muted">
+                                        {(sample.score * 100).toFixed(0)}%
+                                      </span>
+                                    </div>
+                                    <div className="text-sm muted">
+                                      {sample.metadata?.uri
+                                        ? `uri ${sample.metadata.uri}`
+                                        : sample.metadata?.relayUrl
+                                          ? `relay ${sample.metadata.relayUrl}`
+                                          : sample.metadata?.domain
+                                            ? `domain ${sample.metadata.domain}`
+                                            : "No metadata captured yet."}
+                                    </div>
+                                    {sample.description ? (
+                                      <div className="text-sm muted">{sample.description}</div>
+                                    ) : null}
+                                  </div>
+                                ) : (
+                                  <p className="text-sm muted" style={{ margin: 0 }}>
+                                    {protocol.empty}
+                                  </p>
+                                )}
+                              </div>
+                            );
+                          })}
                         </div>
                         {blueskyFeedSnapshot.usedFallback ? (
                           <div className="feed-comment-status">

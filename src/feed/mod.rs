@@ -28,6 +28,7 @@ pub const WORLD_FEED_KEY: &str = "world";
 
 const WORLD_FEED_CACHE_TTL_SECS: i64 = 5 * 60;
 const WORLD_FEED_COLD_START_SYNC_TIMEOUT_SECS: u64 = 8;
+const WORLD_FEED_FALLBACK_MIN_BLUESKY_ITEMS: usize = 6;
 const FEED_PROFILE_MAX_CHARS: usize = 2_400;
 const FEED_EMBED_BATCH_SIZE: usize = 16;
 const FEED_MATCH_THRESHOLD: f32 = 0.62;
@@ -146,6 +147,7 @@ pub struct PersonalizedFeedResponse {
     pub refresh_status: String,
     pub last_error: Option<String>,
     pub selected_sources: Vec<SelectedSource>,
+    pub diagnostics: FeedRefreshDiagnostics,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +184,33 @@ pub struct FeedInterestDiagnosticItem {
 #[serde(rename_all = "camelCase")]
 pub struct FeedInterestDiagnosticsResponse {
     pub items: Vec<FeedInterestDiagnosticItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedProtocolDiagnostics {
+    pub available: bool,
+    pub scanned_count: usize,
+    pub metadata_fetched_count: usize,
+    pub shortlisted_count: usize,
+    pub candidate_count: usize,
+    pub sampled_sources: Vec<SelectedSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedRankingDiagnostics {
+    pub candidate_count_before_ranking: usize,
+    pub ranked_item_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedRefreshDiagnostics {
+    pub rss: FeedProtocolDiagnostics,
+    pub nostr: FeedProtocolDiagnostics,
+    pub bluesky: FeedProtocolDiagnostics,
+    pub ranking: FeedRankingDiagnostics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -510,6 +539,7 @@ pub async fn load_world_feed(
     };
     let profile_stats = parse_profile_stats(&state.profile_stats_json);
     let selected_sources = parse_selected_sources(&state.details_json);
+    let diagnostics = parse_refresh_diagnostics(&state.details_json);
     let refreshed_at = non_empty_string(state.refreshed_at.clone());
     let last_error = non_empty_string(state.last_error.clone());
     let refresh_status = if state.refresh_status.trim().is_empty() {
@@ -536,20 +566,26 @@ pub async fn load_world_feed(
             refresh_status,
             last_error,
             selected_sources,
+            diagnostics,
         });
     }
 
-    let mut fallback_items = build_recent_content_fallback(workspace_dir, limit)?;
+    let mut fallback_items = Vec::new();
     if let Some(auth) = bluesky_auth {
+        let bluesky_limit = limit
+            .min(limit.saturating_div(2).max(WORLD_FEED_FALLBACK_MIN_BLUESKY_ITEMS));
         let raw_candidates =
-            fetch_bluesky_fallback_candidates(&auth.service_url, &auth.access_jwt, limit)
+            fetch_bluesky_fallback_candidates(&auth.service_url, &auth.access_jwt, bluesky_limit)
                 .await
                 .unwrap_or_default();
-        append_feed_items_up_to_limit(
-            &mut fallback_items,
-            build_raw_feed_items(raw_candidates, limit),
-            limit,
-        );
+        let bluesky_items = build_raw_feed_items(raw_candidates, bluesky_limit);
+        let recent_limit = limit.saturating_sub(bluesky_items.len().min(bluesky_limit));
+        let recent_items = build_recent_content_fallback(workspace_dir, recent_limit)?;
+        fallback_items.extend(recent_items);
+        fallback_items.extend(bluesky_items);
+        fallback_items = interleave_personalized_items_by_source(fallback_items, limit);
+    } else {
+        fallback_items = build_recent_content_fallback(workspace_dir, limit)?;
     }
 
     Ok(PersonalizedFeedResponse {
@@ -575,6 +611,7 @@ pub async fn load_world_feed(
         refresh_status,
         last_error,
         selected_sources,
+        diagnostics,
     })
 }
 
@@ -682,10 +719,12 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
     }
 
     let rss_source = RssFeedSource::new(&config, embedder.clone());
-    let rss_selected = rss_source.discover_sources(&profile).await?;
+    let (rss_selected, mut rss_diagnostics) =
+        rss_source.discover_sources_with_diagnostics(&profile).await?;
     let mut candidates = rss_source
         .fetch_candidates(&profile, &rss_selected, limit_for_candidates())
         .await?;
+    rss_diagnostics.candidate_count = candidates.len();
 
     let mut selected_sources_json: Vec<serde_json::Value> = rss_selected
         .iter()
@@ -693,22 +732,60 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
         .collect();
 
     let nostr_source = NostrFeedSource::new(&config, embedder.clone());
-    let nostr_selected = nostr_source.discover_sources(&profile).await?;
+    let (nostr_selected, mut nostr_diagnostics) =
+        nostr_source.discover_sources_with_diagnostics(&profile).await?;
     selected_sources_json.extend(nostr_selected.iter().map(selected_source_summary));
     let mut nostr_candidates = nostr_source
         .fetch_candidates(&profile, &nostr_selected, limit_for_candidates())
         .await?;
+    nostr_diagnostics.candidate_count = nostr_candidates.len();
     candidates.append(&mut nostr_candidates);
 
+    let mut bluesky_diagnostics = FeedProtocolDiagnostics::default();
     if let Some(auth) = bluesky_auth {
         let bluesky_source = BlueskyFeedSource::new(auth, embedder.clone());
-        let bluesky_selected = bluesky_source.discover_sources(&profile).await?;
+        let (bluesky_selected, mut discovered_bluesky_diagnostics) =
+            bluesky_source.discover_sources_with_diagnostics(&profile).await?;
         selected_sources_json.extend(bluesky_selected.iter().map(selected_source_summary));
         let mut bluesky_candidates = bluesky_source
             .fetch_candidates(&profile, &bluesky_selected, limit_for_candidates())
             .await?;
+        discovered_bluesky_diagnostics.candidate_count = bluesky_candidates.len();
+        bluesky_diagnostics = discovered_bluesky_diagnostics;
         candidates.append(&mut bluesky_candidates);
     }
+
+    let mut refresh_diagnostics = FeedRefreshDiagnostics {
+        rss: rss_diagnostics,
+        nostr: nostr_diagnostics,
+        bluesky: bluesky_diagnostics,
+        ranking: FeedRankingDiagnostics::default(),
+    };
+
+    let discovery_details_json = serde_json::json!({
+        "selectedSources": selected_sources_json.clone(),
+        "diagnostics": refresh_diagnostics.clone(),
+    })
+    .to_string();
+    let current_state = local_store::get_personalized_feed_state(&workspace_dir, WORLD_FEED_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_else(default_feed_state_record);
+    let _ = local_store::upsert_personalized_feed_state(
+        &workspace_dir,
+        &local_store::PersonalizedFeedStateUpsert {
+            feed_key: WORLD_FEED_KEY.to_string(),
+            dirty: true,
+            refresh_status: "refreshing".to_string(),
+            refreshed_at: current_state.refreshed_at,
+            refresh_started_at: now.clone(),
+            refresh_finished_at: current_state.refresh_finished_at,
+            last_error: String::new(),
+            profile_status: profile.status.clone(),
+            profile_stats_json: serde_json::json!(profile.stats).to_string(),
+            details_json: discovery_details_json,
+        },
+    );
 
     if config.web_search.enabled {
         let mut web_aug = collect_web_search_augmented_candidates(
@@ -722,7 +799,9 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
         candidates.append(&mut web_aug);
     }
 
+    refresh_diagnostics.ranking.candidate_count_before_ranking = candidates.len();
     let ranked_items = FeedRanker::rank_candidates(embedder, &profile, candidates, 30).await?;
+    refresh_diagnostics.ranking.ranked_item_count = ranked_items.len();
     let refreshed_at = Utc::now().to_rfc3339();
     let cache_rows: Vec<local_store::PersonalizedFeedCacheUpsert> = ranked_items
         .iter()
@@ -751,6 +830,7 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
             profile_stats_json: serde_json::json!(profile.stats).to_string(),
             details_json: serde_json::json!({
                 "selectedSources": selected_sources_json,
+                "diagnostics": refresh_diagnostics,
             })
             .to_string(),
         },
@@ -907,6 +987,17 @@ fn parse_selected_sources(raw: &str) -> Vec<SelectedSource> {
         .collect()
 }
 
+fn parse_refresh_diagnostics(raw: &str) -> FeedRefreshDiagnostics {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return FeedRefreshDiagnostics::default();
+    };
+    value
+        .get("diagnostics")
+        .cloned()
+        .and_then(|item| serde_json::from_value::<FeedRefreshDiagnostics>(item).ok())
+        .unwrap_or_default()
+}
+
 fn deserialize_cached_items(
     records: &[local_store::PersonalizedFeedCacheRecord],
 ) -> Vec<PersonalizedFeedItem> {
@@ -970,6 +1061,52 @@ fn append_feed_items_up_to_limit(
     let remaining = limit - target.len();
     extra.truncate(remaining);
     target.extend(extra);
+}
+
+fn interleave_personalized_items_by_source(
+    items: Vec<PersonalizedFeedItem>,
+    limit: usize,
+) -> Vec<PersonalizedFeedItem> {
+    if items.len() <= 2 {
+        return items.into_iter().take(limit).collect();
+    }
+
+    let mut buckets: Vec<(String, Vec<PersonalizedFeedItem>)> = Vec::new();
+    for item in items {
+        let source_key = candidate_source_mix_key(&item);
+        if let Some((_, bucket)) = buckets.iter_mut().find(|(key, _)| key == &source_key) {
+            bucket.push(item);
+        } else {
+            buckets.push((source_key, vec![item]));
+        }
+    }
+
+    if buckets.len() <= 1 {
+        return buckets
+            .into_iter()
+            .flat_map(|(_, bucket)| bucket)
+            .take(limit)
+            .collect();
+    }
+
+    let mut interleaved = Vec::new();
+    loop {
+        let mut advanced = false;
+        for (_, bucket) in &mut buckets {
+            if bucket.is_empty() {
+                continue;
+            }
+            interleaved.push(bucket.remove(0));
+            advanced = true;
+            if interleaved.len() >= limit {
+                return interleaved;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    interleaved
 }
 
 fn cache_item_key(item: &PersonalizedFeedItem, index: usize) -> String {
@@ -1742,11 +1879,15 @@ impl BlueskyFeedSource {
     fn new(auth: BlueskyAuth, embedder: SharedEmbedder) -> Self {
         Self { auth, embedder }
     }
-}
 
-#[async_trait]
-impl FeedSource for BlueskyFeedSource {
-    async fn discover_sources(&self, profile: &FeedProfile) -> Result<Vec<SelectedSource>> {
+    async fn discover_sources_with_diagnostics(
+        &self,
+        profile: &FeedProfile,
+    ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
+        let mut diagnostics = FeedProtocolDiagnostics {
+            available: true,
+            ..FeedProtocolDiagnostics::default()
+        };
         let mut generators = Vec::new();
         let mut seen_uris = HashSet::new();
         let mut cursor: Option<String> = None;
@@ -1772,6 +1913,7 @@ impl FeedSource for BlueskyFeedSource {
             };
             cursor = Some(next_cursor);
         }
+        diagnostics.scanned_count = generators.len();
 
         let search_texts: Vec<String> = generators
             .iter()
@@ -1813,25 +1955,35 @@ impl FeedSource for BlueskyFeedSource {
                 .partial_cmp(&left.stage1_score)
                 .unwrap_or(Ordering::Equal)
         });
-        if !ranked.is_empty() {
+        let selected = if !ranked.is_empty() {
             ranked.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT);
-            return Ok(ranked);
-        }
+            ranked
+        } else {
+            weak_matches.sort_by(|left, right| {
+                right
+                    .stage1_score
+                    .partial_cmp(&left.stage1_score)
+                    .unwrap_or(Ordering::Equal)
+            });
+            if !weak_matches.is_empty() {
+                weak_matches.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT.min(2));
+                append_selected_sources_unique(&mut weak_matches, fallback_bluesky_selected_sources());
+                weak_matches.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT);
+                weak_matches
+            } else {
+                fallback_bluesky_selected_sources()
+            }
+        };
+        diagnostics.shortlisted_count = selected.len();
+        diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
+        Ok((selected, diagnostics))
+    }
+}
 
-        weak_matches.sort_by(|left, right| {
-            right
-                .stage1_score
-                .partial_cmp(&left.stage1_score)
-                .unwrap_or(Ordering::Equal)
-        });
-        if !weak_matches.is_empty() {
-            weak_matches.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT.min(2));
-            append_selected_sources_unique(&mut weak_matches, fallback_bluesky_selected_sources());
-            weak_matches.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT);
-            return Ok(weak_matches);
-        }
-
-        Ok(fallback_bluesky_selected_sources())
+#[async_trait]
+impl FeedSource for BlueskyFeedSource {
+    async fn discover_sources(&self, profile: &FeedProfile) -> Result<Vec<SelectedSource>> {
+        Ok(self.discover_sources_with_diagnostics(profile).await?.0)
     }
 
     async fn fetch_candidates(
@@ -1921,14 +2073,22 @@ impl NostrFeedSource {
             embedder,
         }
     }
-}
 
-#[async_trait]
-impl FeedSource for NostrFeedSource {
-    async fn discover_sources(&self, profile: &FeedProfile) -> Result<Vec<SelectedSource>> {
+    async fn discover_sources_with_diagnostics(
+        &self,
+        profile: &FeedProfile,
+    ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
         let relay_urls = configured_nostr_world_feed_relays(&self.config);
+        let mut diagnostics = FeedProtocolDiagnostics {
+            available: true,
+            scanned_count: relay_urls.len(),
+            ..FeedProtocolDiagnostics::default()
+        };
         if relay_urls.is_empty() {
-            return Ok(fallback_nostr_selected_sources(&self.config));
+            let selected = fallback_nostr_selected_sources(&self.config);
+            diagnostics.shortlisted_count = selected.len();
+            diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
+            return Ok((selected, diagnostics));
         }
 
         let mut relay_metadata = Vec::new();
@@ -1937,6 +2097,9 @@ impl FeedSource for NostrFeedSource {
             let metadata = fetch_nostr_relay_metadata(&relay_url)
                 .await
                 .unwrap_or(None);
+            if metadata.is_some() {
+                diagnostics.metadata_fetched_count += 1;
+            }
             search_texts.push(nostr_relay_search_text(&relay_url, metadata.as_ref()));
             relay_metadata.push((relay_url, metadata));
         }
@@ -1972,20 +2135,32 @@ impl FeedSource for NostrFeedSource {
                 .partial_cmp(&left.stage1_score)
                 .unwrap_or(Ordering::Equal)
         });
-        let mut strong_matches = ranked
-            .iter()
-            .filter(|source| source.stage1_score >= NOSTR_RELAY_MATCH_THRESHOLD)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !strong_matches.is_empty() {
-            strong_matches.truncate(NOSTR_SELECTED_RELAY_LIMIT);
-            return Ok(strong_matches);
-        }
-        if !ranked.is_empty() {
-            ranked.truncate(NOSTR_SELECTED_RELAY_LIMIT);
-            return Ok(ranked);
-        }
-        Ok(fallback_nostr_selected_sources(&self.config))
+        let selected = {
+            let mut strong_matches = ranked
+                .iter()
+                .filter(|source| source.stage1_score >= NOSTR_RELAY_MATCH_THRESHOLD)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !strong_matches.is_empty() {
+                strong_matches.truncate(NOSTR_SELECTED_RELAY_LIMIT);
+                strong_matches
+            } else if !ranked.is_empty() {
+                ranked.truncate(NOSTR_SELECTED_RELAY_LIMIT);
+                ranked
+            } else {
+                fallback_nostr_selected_sources(&self.config)
+            }
+        };
+        diagnostics.shortlisted_count = selected.len();
+        diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
+        Ok((selected, diagnostics))
+    }
+}
+
+#[async_trait]
+impl FeedSource for NostrFeedSource {
+    async fn discover_sources(&self, profile: &FeedProfile) -> Result<Vec<SelectedSource>> {
+        Ok(self.discover_sources_with_diagnostics(profile).await?.0)
     }
 
     async fn fetch_candidates(
@@ -2096,17 +2271,22 @@ impl RssFeedSource {
             embedder,
         }
     }
-}
 
-#[async_trait]
-impl FeedSource for RssFeedSource {
-    async fn discover_sources(&self, profile: &FeedProfile) -> Result<Vec<SelectedSource>> {
+    async fn discover_sources_with_diagnostics(
+        &self,
+        profile: &FeedProfile,
+    ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
         seed_default_feed_web_sources(&self.config.workspace_dir)?;
         let sources = ensure_catalog_metadata_embeddings(
             &self.config.workspace_dir,
             self.embedder.clone(),
         )
         .await?;
+        let mut diagnostics = FeedProtocolDiagnostics {
+            available: true,
+            scanned_count: sources.len(),
+            ..FeedProtocolDiagnostics::default()
+        };
         let mut ranked = Vec::new();
         for source in sources {
             let embedding = bytes_to_vec(&source.metadata_embedding);
@@ -2140,38 +2320,49 @@ impl FeedSource for RssFeedSource {
                 .partial_cmp(&left.stage1_score)
                 .unwrap_or(Ordering::Equal)
         });
-        let mut strong_matches = ranked
-            .iter()
-            .filter(|source| source.stage1_score >= RSS_SOURCE_MATCH_THRESHOLD)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !strong_matches.is_empty() {
-            strong_matches.truncate(RSS_SELECTED_SOURCE_LIMIT);
-            return Ok(strong_matches);
-        }
-        if !ranked.is_empty() {
-            ranked.truncate(RSS_SELECTED_SOURCE_LIMIT.min(4));
-            return Ok(ranked);
-        }
-        let fallback_sources = local_store::list_feed_web_sources(&self.config.workspace_dir)?;
-        Ok(fallback_sources
-            .into_iter()
-            .take(RSS_SELECTED_SOURCE_LIMIT.min(4))
-            .map(|source| SelectedSource {
-                protocol: FeedProtocol::Rss,
-                key: source.xml_url.clone(),
-                label: source.title,
-                stage1_score: 0.2,
-                description: non_empty_string(source.description),
-                matched_interest_label: None,
-                matched_interest_score: None,
-                metadata_json: serde_json::json!({
-                    "domain": source.domain,
-                    "topics": source.topics_csv,
-                    "htmlUrl": source.html_url,
-                }),
-            })
-            .collect())
+        let selected = {
+            let mut strong_matches = ranked
+                .iter()
+                .filter(|source| source.stage1_score >= RSS_SOURCE_MATCH_THRESHOLD)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !strong_matches.is_empty() {
+                strong_matches.truncate(RSS_SELECTED_SOURCE_LIMIT);
+                strong_matches
+            } else if !ranked.is_empty() {
+                ranked.truncate(RSS_SELECTED_SOURCE_LIMIT.min(4));
+                ranked
+            } else {
+                local_store::list_feed_web_sources(&self.config.workspace_dir)?
+                    .into_iter()
+                    .take(RSS_SELECTED_SOURCE_LIMIT.min(4))
+                    .map(|source| SelectedSource {
+                        protocol: FeedProtocol::Rss,
+                        key: source.xml_url.clone(),
+                        label: source.title,
+                        stage1_score: 0.2,
+                        description: non_empty_string(source.description),
+                        matched_interest_label: None,
+                        matched_interest_score: None,
+                        metadata_json: serde_json::json!({
+                            "domain": source.domain,
+                            "topics": source.topics_csv,
+                            "htmlUrl": source.html_url,
+                        }),
+                    })
+                    .collect()
+            }
+        };
+        diagnostics.shortlisted_count = selected.len();
+        diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
+        Ok((selected, diagnostics))
+    }
+}
+
+#[async_trait]
+impl FeedSource for RssFeedSource {
+    async fn discover_sources(&self, profile: &FeedProfile) -> Result<Vec<SelectedSource>> {
+        Ok(self.discover_sources_with_diagnostics(profile).await?.0)
     }
 
     async fn fetch_candidates(
