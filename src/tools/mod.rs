@@ -79,6 +79,12 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolProfile {
+    Full,
+    UiRestricted,
+}
+
 #[derive(Clone)]
 struct ArcDelegatingTool {
     inner: Arc<dyn Tool>,
@@ -111,6 +117,29 @@ impl Tool for ArcDelegatingTool {
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
+}
+
+fn tool_allowed_in_profile(name: &str, profile: ToolProfile) -> bool {
+    match profile {
+        ToolProfile::Full => true,
+        ToolProfile::UiRestricted => !matches!(
+            name,
+            "shell"
+                | "schedule"
+                | "cron_add"
+                | "cron_list"
+                | "cron_remove"
+                | "cron_run"
+                | "cron_runs"
+                | "cron_update"
+                | "git_operations"
+        ),
+    }
+}
+
+fn filter_tools_for_profile(mut tools: Vec<Arc<dyn Tool>>, profile: ToolProfile) -> Vec<Arc<dyn Tool>> {
+    tools.retain(|tool| tool_allowed_in_profile(tool.name(), profile));
+    tools
 }
 
 /// Create the default tool registry
@@ -172,6 +201,42 @@ pub fn all_tools_with_runtime(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    _composio_key: Option<&str>,
+    _composio_entity_id: Option<&str>,
+    _browser_config: &crate::config::BrowserConfig,
+    _http_config: &crate::config::HttpRequestConfig,
+    _web_fetch_config: &crate::config::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    _agents: &HashMap<String, crate::config::DelegateAgentConfig>,
+    _fallback_api_key: Option<&str>,
+    root_config: &crate::config::Config,
+) -> Vec<Box<dyn Tool>> {
+    all_tools_with_runtime_and_profile(
+        config,
+        security,
+        runtime,
+        ToolProfile::Full,
+        memory,
+        _composio_key,
+        _composio_entity_id,
+        _browser_config,
+        _http_config,
+        _web_fetch_config,
+        workspace_dir,
+        _agents,
+        _fallback_api_key,
+        root_config,
+    )
+}
+
+/// Create tool registry using an internal capability profile.
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+pub fn all_tools_with_runtime_and_profile(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    profile: ToolProfile,
     memory: Arc<dyn Memory>,
     _composio_key: Option<&str>,
     _composio_entity_id: Option<&str>,
@@ -263,7 +328,7 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    boxed_registry_from_arcs(tool_arcs)
+    boxed_registry_from_arcs(filter_tools_for_profile(tool_arcs, profile))
 }
 
 #[cfg(test)]
@@ -325,6 +390,114 @@ mod tests {
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"content_search"));
+    }
+
+    #[test]
+    fn full_profile_keeps_shell_scheduler_and_git_tools() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools_with_runtime_and_profile(
+            Arc::new(Config::default()),
+            &security,
+            Arc::new(NativeRuntime::new()),
+            ToolProfile::Full,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        for name in [
+            "shell",
+            "schedule",
+            "git_operations",
+            "cron_add",
+            "cron_list",
+            "cron_remove",
+            "cron_run",
+            "cron_runs",
+            "cron_update",
+        ] {
+            assert!(names.contains(&name), "missing tool {name} in full profile");
+        }
+    }
+
+    #[test]
+    fn ui_restricted_profile_omits_shell_scheduler_cron_and_git_tools() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools_with_runtime_and_profile(
+            Arc::new(Config::default()),
+            &security,
+            Arc::new(NativeRuntime::new()),
+            ToolProfile::UiRestricted,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        for name in [
+            "shell",
+            "schedule",
+            "git_operations",
+            "cron_add",
+            "cron_list",
+            "cron_remove",
+            "cron_run",
+            "cron_runs",
+            "cron_update",
+        ] {
+            assert!(!names.contains(&name), "unexpected tool {name} in UI profile");
+        }
+        for name in [
+            "file_read",
+            "file_write",
+            "file_edit",
+            "glob_search",
+            "content_search",
+            "memory_store",
+            "memory_recall",
+            "memory_forget",
+            "model_routing_config",
+            "task_plan",
+        ] {
+            assert!(names.contains(&name), "missing tool {name} in UI profile");
+        }
     }
 
     #[test]

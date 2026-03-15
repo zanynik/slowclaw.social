@@ -29,6 +29,7 @@ pub const WORLD_FEED_KEY: &str = "world";
 const WORLD_FEED_CACHE_TTL_SECS: i64 = 5 * 60;
 const WORLD_FEED_COLD_START_SYNC_TIMEOUT_SECS: u64 = 8;
 const WORLD_FEED_FALLBACK_MIN_BLUESKY_ITEMS: usize = 6;
+const WORLD_FEED_STAGE1_PREVIEW_TIMEOUT_SECS: u64 = 6;
 const FEED_PROFILE_MAX_CHARS: usize = 2_400;
 const FEED_EMBED_BATCH_SIZE: usize = 16;
 const FEED_MATCH_THRESHOLD: f32 = 0.62;
@@ -61,8 +62,12 @@ const NOSTR_LOOKBACK_SECS: u64 = 7 * 24 * 60 * 60;
 const NOSTR_RELAY_METADATA_TIMEOUT_SECS: u64 = 5;
 const NOSTR_RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 const NOSTR_EVENT_FETCH_TIMEOUT_SECS: u64 = 8;
+const NOSTR_NIP66_DISCOVERY_KIND: u16 = 30166;
+const NOSTR_NIP66_DISCOVERY_EVENT_LIMIT: usize = 64;
 const NOSTR_PRIMAL_FALLBACK_RELAY: &str = "wss://relay.primal.net";
 const WEB_SEARCH_RESULT_LIMIT_PER_QUERY: usize = 4;
+const STAGE1_KEYWORD_LIMIT: usize = 10;
+const STAGE1_KEYWORDS_PER_INTEREST_LIMIT: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -156,6 +161,8 @@ pub struct InterestVector {
     pub label: String,
     pub embedding: Vec<f32>,
     pub health_score: f32,
+    pub source_path: String,
+    pub keywords: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -235,6 +242,14 @@ pub struct FeedCandidate {
     pub rank_text: String,
     pub item: PersonalizedFeedItem,
     pub original_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedWorldFeedData {
+    profile: FeedProfile,
+    selected_sources: Vec<SelectedSource>,
+    diagnostics: FeedRefreshDiagnostics,
+    candidates: Vec<FeedCandidate>,
 }
 
 const WORLD_FEED_SYNTHETIC_INTEREST_PREFIX: &str = "state/world_feed_diagnostics/dummy/";
@@ -442,6 +457,54 @@ impl FeedRanker {
     }
 }
 
+fn rank_candidates_stage2(
+    profile: &FeedProfile,
+    candidates: Vec<FeedCandidate>,
+    limit: usize,
+) -> Vec<PersonalizedFeedItem> {
+    let keywords = broad_interest_keywords(profile);
+    let mut ranked = Vec::new();
+    for candidate in candidates {
+        let metadata_score = keyword_match_score(&candidate.rank_text, &keywords);
+        let final_score = (candidate.stage1_score * 0.7) + (metadata_score * 0.3);
+        let matched_keyword = first_matched_keyword(&candidate.rank_text, &keywords)
+            .map(|keyword| keyword.to_string());
+        let mut item = candidate.item;
+        item.score = Some(final_score);
+        item.matched_interest_label = matched_keyword;
+        item.matched_interest_score = if metadata_score > 0.0 {
+            Some(metadata_score)
+        } else {
+            None
+        };
+        item.passed_threshold = final_score > 0.0;
+        ranked.push(RankedCandidate {
+            dedupe_key: candidate.dedupe_key,
+            item,
+            original_index: candidate.original_index,
+            score: final_score,
+        });
+    }
+
+    let mut deduped: HashMap<String, RankedCandidate> = HashMap::new();
+    for candidate in ranked {
+        if let Some(existing) = deduped.get(&candidate.dedupe_key) {
+            if rank_candidate_cmp(&candidate, existing) != Ordering::Less {
+                continue;
+            }
+        }
+        deduped.insert(candidate.dedupe_key.clone(), candidate);
+    }
+
+    let mut ranked_items: Vec<RankedCandidate> = deduped.into_values().collect();
+    ranked_items.sort_by(rank_candidate_cmp);
+    ranked_items = interleave_ranked_candidates_by_source(ranked_items, limit);
+    ranked_items
+        .into_iter()
+        .map(|candidate| candidate.item)
+        .collect()
+}
+
 fn interleave_ranked_candidates_by_source(
     ranked_items: Vec<RankedCandidate>,
     limit: usize,
@@ -492,6 +555,87 @@ pub fn mark_world_feed_dirty(workspace_dir: &Path) -> Result<()> {
     local_store::mark_personalized_feed_dirty(workspace_dir, WORLD_FEED_KEY)
 }
 
+async fn build_prepared_world_feed_data(
+    config: &Config,
+    bluesky_auth: Option<BlueskyAuth>,
+    include_web_search: bool,
+) -> Result<Option<PreparedWorldFeedData>> {
+    let (embedder, _) = resolve_feed_embedder(config).await?;
+    let Some(embedder) = embedder else {
+        return Ok(None);
+    };
+
+    let profile = rebuild_interest_profile(config, embedder.clone()).await?;
+    if profile.interests.is_empty() || profile.status != "ready" {
+        return Ok(Some(PreparedWorldFeedData {
+            profile,
+            selected_sources: Vec::new(),
+            diagnostics: FeedRefreshDiagnostics::default(),
+            candidates: Vec::new(),
+        }));
+    }
+
+    let rss_source = RssFeedSource::new(config, embedder.clone());
+    let (rss_selected, mut rss_diagnostics) =
+        rss_source.discover_sources_with_diagnostics(&profile).await?;
+    let mut selected_sources = rss_selected.clone();
+    let mut candidates = rss_source
+        .fetch_candidates(&profile, &rss_selected, limit_for_candidates())
+        .await?;
+    rss_diagnostics.candidate_count = candidates.len();
+
+    let nostr_source = NostrFeedSource::new(config);
+    let (nostr_selected, mut nostr_diagnostics) =
+        nostr_source.discover_sources_with_diagnostics(&profile).await?;
+    selected_sources.extend(nostr_selected.iter().cloned());
+    let mut nostr_candidates = nostr_source
+        .fetch_candidates(&profile, &nostr_selected, limit_for_candidates())
+        .await?;
+    nostr_diagnostics.candidate_count = nostr_candidates.len();
+    candidates.append(&mut nostr_candidates);
+
+    let mut bluesky_diagnostics = FeedProtocolDiagnostics::default();
+    if let Some(auth) = bluesky_auth {
+        let bluesky_source = BlueskyFeedSource::new(auth);
+        let (bluesky_selected, mut discovered_bluesky_diagnostics) =
+            bluesky_source.discover_sources_with_diagnostics(&profile).await?;
+        selected_sources.extend(bluesky_selected.iter().cloned());
+        let mut bluesky_candidates = bluesky_source
+            .fetch_candidates(&profile, &bluesky_selected, limit_for_candidates())
+            .await?;
+        discovered_bluesky_diagnostics.candidate_count = bluesky_candidates.len();
+        bluesky_diagnostics = discovered_bluesky_diagnostics;
+        candidates.append(&mut bluesky_candidates);
+    }
+
+    if include_web_search && config.web_search.enabled {
+        let mut web_aug = collect_web_search_augmented_candidates(
+            config,
+            &profile,
+            &rss_selected,
+            candidates.len(),
+        )
+        .await
+        .unwrap_or_default();
+        candidates.append(&mut web_aug);
+    }
+
+    Ok(Some(PreparedWorldFeedData {
+        profile,
+        selected_sources,
+        diagnostics: FeedRefreshDiagnostics {
+            rss: rss_diagnostics,
+            nostr: nostr_diagnostics,
+            bluesky: bluesky_diagnostics,
+            ranking: FeedRankingDiagnostics {
+                candidate_count_before_ranking: candidates.len(),
+                ranked_item_count: 0,
+            },
+        },
+        candidates,
+    }))
+}
+
 pub async fn load_world_feed(
     config: &Config,
     bluesky_auth: Option<BlueskyAuth>,
@@ -503,29 +647,19 @@ pub async fn load_world_feed(
         .embedding_provider
         .trim()
         .eq_ignore_ascii_case("none");
-    let mut state = local_store::get_personalized_feed_state(workspace_dir, WORLD_FEED_KEY)?
+    let state = local_store::get_personalized_feed_state(workspace_dir, WORLD_FEED_KEY)?
         .unwrap_or_else(default_feed_state_record);
-    let mut cache_records =
+    let cache_records =
         local_store::list_personalized_feed_cache(workspace_dir, WORLD_FEED_KEY, limit)?;
-    let mut cached_items = deserialize_cached_items(&cache_records);
-    let mut cache_exists = !cached_items.is_empty();
+    let cached_items = deserialize_cached_items(&cache_records);
+    let cache_exists = !cached_items.is_empty();
     let mut inflight = world_feed_refresh_inflight().lock().contains(workspace_dir);
     let mut refresh_state = compute_refresh_state(cache_exists, &state, inflight);
 
     if should_refresh_world_feed(cache_exists, &state, inflight) && !embeddings_disabled {
-        if !cache_exists && !inflight {
-            prime_world_feed_refresh(config.clone(), bluesky_auth.clone()).await;
-            state = local_store::get_personalized_feed_state(workspace_dir, WORLD_FEED_KEY)?
-                .unwrap_or_else(default_feed_state_record);
-            cache_records =
-                local_store::list_personalized_feed_cache(workspace_dir, WORLD_FEED_KEY, limit)?;
-            cached_items = deserialize_cached_items(&cache_records);
-            cache_exists = !cached_items.is_empty();
-            inflight = world_feed_refresh_inflight().lock().contains(workspace_dir);
-            refresh_state = compute_refresh_state(cache_exists, &state, inflight);
-        } else {
-            spawn_world_feed_refresh(config.clone(), bluesky_auth.clone());
-        }
+        spawn_world_feed_refresh(config.clone(), bluesky_auth.clone());
+        inflight = world_feed_refresh_inflight().lock().contains(workspace_dir);
+        refresh_state = compute_refresh_state(cache_exists, &state, inflight);
     }
 
     let profile_status = if !state.profile_status.trim().is_empty() {
@@ -568,6 +702,37 @@ pub async fn load_world_feed(
             selected_sources,
             diagnostics,
         });
+    }
+
+    if !embeddings_disabled {
+        if let Ok(Ok(Some(prepared))) = tokio::time::timeout(
+            Duration::from_secs(WORLD_FEED_STAGE1_PREVIEW_TIMEOUT_SECS),
+            build_prepared_world_feed_data(config, bluesky_auth.clone(), false),
+        )
+        .await
+        {
+            if !prepared.candidates.is_empty() {
+                let preview_items = build_stage1_preview_items(&prepared.profile, prepared.candidates, limit);
+                if !preview_items.is_empty() {
+                    return Ok(PersonalizedFeedResponse {
+                        items: preview_items,
+                        profile_status: prepared.profile.status.clone(),
+                        profile_stats: prepared.profile.stats.clone(),
+                        used_fallback: true,
+                        message: Some(
+                            "Showing stage 1 world feed from keyword-matched sources. Refresh later for ranked ordering."
+                                .to_string(),
+                        ),
+                        refresh_state,
+                        refreshed_at,
+                        refresh_status,
+                        last_error,
+                        selected_sources: prepared.selected_sources,
+                        diagnostics: prepared.diagnostics,
+                    });
+                }
+            }
+        }
     }
 
     let mut fallback_items = Vec::new();
@@ -675,8 +840,7 @@ fn finish_world_feed_refresh(workspace_dir: &Path) {
 
 async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -> Result<()> {
     let workspace_dir = config.workspace_dir.clone();
-    let (embedder, _) = resolve_feed_embedder(&config).await?;
-    let Some(embedder) = embedder else {
+    let Some(mut prepared) = build_prepared_world_feed_data(&config, bluesky_auth, true).await? else {
         let now = Utc::now().to_rfc3339();
         let _ = local_store::upsert_personalized_feed_state(
             &workspace_dir,
@@ -696,9 +860,8 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
         return Ok(());
     };
 
-    let profile = rebuild_interest_profile(&config, embedder.clone()).await?;
     let now = Utc::now().to_rfc3339();
-    if profile.interests.is_empty() || profile.status != "ready" {
+    if prepared.profile.interests.is_empty() || prepared.profile.status != "ready" {
         local_store::replace_personalized_feed_cache(&workspace_dir, WORLD_FEED_KEY, &[])?;
         let _ = local_store::upsert_personalized_feed_state(
             &workspace_dir,
@@ -710,63 +873,26 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
                 refresh_started_at: now.clone(),
                 refresh_finished_at: now.clone(),
                 last_error: String::new(),
-                profile_status: profile.status.clone(),
-                profile_stats_json: serde_json::json!(profile.stats).to_string(),
-                details_json: "{\"selectedSources\":[]}".to_string(),
+                profile_status: prepared.profile.status.clone(),
+                profile_stats_json: serde_json::json!(prepared.profile.stats).to_string(),
+                details_json: serde_json::json!({
+                    "selectedSources": [],
+                    "diagnostics": prepared.diagnostics,
+                })
+                .to_string(),
             },
         )?;
         return Ok(());
     }
-
-    let rss_source = RssFeedSource::new(&config, embedder.clone());
-    let (rss_selected, mut rss_diagnostics) =
-        rss_source.discover_sources_with_diagnostics(&profile).await?;
-    let mut candidates = rss_source
-        .fetch_candidates(&profile, &rss_selected, limit_for_candidates())
-        .await?;
-    rss_diagnostics.candidate_count = candidates.len();
-
-    let mut selected_sources_json: Vec<serde_json::Value> = rss_selected
+    let selected_sources_json: Vec<serde_json::Value> = prepared
+        .selected_sources
         .iter()
         .map(selected_source_summary)
         .collect();
-
-    let nostr_source = NostrFeedSource::new(&config, embedder.clone());
-    let (nostr_selected, mut nostr_diagnostics) =
-        nostr_source.discover_sources_with_diagnostics(&profile).await?;
-    selected_sources_json.extend(nostr_selected.iter().map(selected_source_summary));
-    let mut nostr_candidates = nostr_source
-        .fetch_candidates(&profile, &nostr_selected, limit_for_candidates())
-        .await?;
-    nostr_diagnostics.candidate_count = nostr_candidates.len();
-    candidates.append(&mut nostr_candidates);
-
-    let mut bluesky_diagnostics = FeedProtocolDiagnostics::default();
-    if let Some(auth) = bluesky_auth {
-        let bluesky_source = BlueskyFeedSource::new(auth, embedder.clone());
-        let (bluesky_selected, mut discovered_bluesky_diagnostics) =
-            bluesky_source.discover_sources_with_diagnostics(&profile).await?;
-        selected_sources_json.extend(bluesky_selected.iter().map(selected_source_summary));
-        let mut bluesky_candidates = bluesky_source
-            .fetch_candidates(&profile, &bluesky_selected, limit_for_candidates())
-            .await?;
-        discovered_bluesky_diagnostics.candidate_count = bluesky_candidates.len();
-        bluesky_diagnostics = discovered_bluesky_diagnostics;
-        candidates.append(&mut bluesky_candidates);
-    }
-
-    let mut refresh_diagnostics = FeedRefreshDiagnostics {
-        rss: rss_diagnostics,
-        nostr: nostr_diagnostics,
-        bluesky: bluesky_diagnostics,
-        ranking: FeedRankingDiagnostics::default(),
-    };
-
     let discovery_details_json = serde_json::json!({
         "selectedSources": selected_sources_json.clone(),
-        "diagnostics": refresh_diagnostics.clone(),
-    })
-    .to_string();
+        "diagnostics": prepared.diagnostics.clone(),
+    }).to_string();
     let current_state = local_store::get_personalized_feed_state(&workspace_dir, WORLD_FEED_KEY)
         .ok()
         .flatten()
@@ -781,27 +907,14 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
             refresh_started_at: now.clone(),
             refresh_finished_at: current_state.refresh_finished_at,
             last_error: String::new(),
-            profile_status: profile.status.clone(),
-            profile_stats_json: serde_json::json!(profile.stats).to_string(),
+            profile_status: prepared.profile.status.clone(),
+            profile_stats_json: serde_json::json!(prepared.profile.stats).to_string(),
             details_json: discovery_details_json,
         },
     );
 
-    if config.web_search.enabled {
-        let mut web_aug = collect_web_search_augmented_candidates(
-            &config,
-            &profile,
-            &rss_selected,
-            candidates.len(),
-        )
-        .await
-        .unwrap_or_default();
-        candidates.append(&mut web_aug);
-    }
-
-    refresh_diagnostics.ranking.candidate_count_before_ranking = candidates.len();
-    let ranked_items = FeedRanker::rank_candidates(embedder, &profile, candidates, 30).await?;
-    refresh_diagnostics.ranking.ranked_item_count = ranked_items.len();
+    let ranked_items = rank_candidates_stage2(&prepared.profile, prepared.candidates, 30);
+    prepared.diagnostics.ranking.ranked_item_count = ranked_items.len();
     let refreshed_at = Utc::now().to_rfc3339();
     let cache_rows: Vec<local_store::PersonalizedFeedCacheUpsert> = ranked_items
         .iter()
@@ -826,11 +939,11 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
             refresh_started_at: now,
             refresh_finished_at: refreshed_at.clone(),
             last_error: String::new(),
-            profile_status: profile.status.clone(),
-            profile_stats_json: serde_json::json!(profile.stats).to_string(),
+            profile_status: prepared.profile.status.clone(),
+            profile_stats_json: serde_json::json!(prepared.profile.stats).to_string(),
             details_json: serde_json::json!({
                 "selectedSources": selected_sources_json,
-                "diagnostics": refresh_diagnostics,
+                "diagnostics": prepared.diagnostics,
             })
             .to_string(),
         },
@@ -1109,6 +1222,14 @@ fn interleave_personalized_items_by_source(
     interleaved
 }
 
+fn build_stage1_preview_items(
+    profile: &FeedProfile,
+    candidates: Vec<FeedCandidate>,
+    limit: usize,
+) -> Vec<PersonalizedFeedItem> {
+    rank_candidates_stage2(profile, candidates, limit)
+}
+
 fn cache_item_key(item: &PersonalizedFeedItem, index: usize) -> String {
     item.feed_item
         .get("url")
@@ -1235,6 +1356,103 @@ fn fallback_nostr_selected_sources(config: &Config) -> Vec<SelectedSource> {
         .into_iter()
         .map(|relay| fallback_nostr_selected_source(&relay))
         .collect()
+}
+
+async fn fetch_nip66_relay_candidates(
+    seed_relays: &[String],
+    keywords: &[String],
+) -> Result<Vec<SelectedSource>> {
+    if seed_relays.is_empty() || keywords.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let client = NostrClient::default();
+    let mut connected_relays = Vec::new();
+    for relay in seed_relays {
+        if client.add_relay(relay).await.is_ok()
+            && client
+                .try_connect_relay(relay, Duration::from_secs(NOSTR_RELAY_CONNECT_TIMEOUT_SECS))
+                .await
+                .is_ok()
+        {
+            connected_relays.push(relay.clone());
+        }
+    }
+    if connected_relays.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let filter = NostrFilter::new()
+        .kind(NostrKind::from(NOSTR_NIP66_DISCOVERY_KIND))
+        .since(NostrTimestamp::from_secs(
+            Utc::now().timestamp().saturating_sub(NOSTR_LOOKBACK_SECS as i64) as u64,
+        ))
+        .limit(NOSTR_NIP66_DISCOVERY_EVENT_LIMIT);
+    let events = client
+        .fetch_events_from(
+            connected_relays.iter().map(String::as_str),
+            filter,
+            Duration::from_secs(NOSTR_EVENT_FETCH_TIMEOUT_SECS),
+        )
+        .await?;
+    client.shutdown().await;
+
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for event in events {
+        let mut relay_url = event.tags.identifier().unwrap_or("").trim().to_string();
+        let mut relay_tags = Vec::new();
+        for tag in event.tags.iter() {
+            let values = tag.as_slice();
+            if values.is_empty() {
+                continue;
+            }
+            if values[0] == "r" && values.len() > 1 && relay_url.is_empty() {
+                relay_url = values[1].trim().to_string();
+            }
+            if values[0] == "t" && values.len() > 1 {
+                relay_tags.push(values[1].trim().to_string());
+            }
+        }
+        if relay_url.is_empty() || !seen.insert(relay_url.clone()) {
+            continue;
+        }
+        let label = resolve_feed_web_domain(&nostr_relay_http_url(&relay_url).unwrap_or_default())
+            .unwrap_or_else(|| relay_url.clone());
+        let search_text = format!(
+            "{}\n{}\n{}",
+            label,
+            event.content.trim(),
+            relay_tags.join(" ")
+        );
+        let keyword_score = keyword_match_score(&search_text, keywords);
+        if keyword_score <= 0.0 {
+            continue;
+        }
+        selected.push(SelectedSource {
+            protocol: FeedProtocol::Nostr,
+            key: relay_url.clone(),
+            label,
+            stage1_score: keyword_score,
+            description: non_empty_string(event.content.trim().to_string()),
+            matched_interest_label: first_matched_keyword(&search_text, keywords)
+                .map(|value| value.to_string()),
+            matched_interest_score: Some(keyword_score),
+            metadata_json: serde_json::json!({
+                "relayUrl": relay_url,
+                "tags": relay_tags,
+                "nip66": true,
+            }),
+        });
+    }
+    selected.sort_by(|left, right| {
+        right
+            .stage1_score
+            .partial_cmp(&left.stage1_score)
+            .unwrap_or(Ordering::Equal)
+    });
+    selected.truncate(NOSTR_SELECTED_RELAY_LIMIT);
+    Ok(selected)
 }
 
 fn nostr_relay_http_url(relay_url: &str) -> Option<String> {
@@ -1689,11 +1907,17 @@ async fn rebuild_interest_profile(config: &Config, embedder: SharedEmbedder) -> 
         stats,
         interests: active_interests
             .into_iter()
-            .map(|interest| InterestVector {
-                id: interest.record.id,
-                label: interest.record.label,
-                embedding: interest.embedding,
-                health_score: interest.record.health_score as f32,
+            .map(|interest| {
+                let source_text = load_interest_source_text(workspace_dir, &interest.record.source_path);
+                let keywords = derive_interest_keywords(&interest.record.label, &source_text);
+                InterestVector {
+                    id: interest.record.id,
+                    label: interest.record.label,
+                    embedding: interest.embedding,
+                    health_score: interest.record.health_score as f32,
+                    source_path: interest.record.source_path,
+                    keywords,
+                }
             })
             .collect(),
     })
@@ -1789,6 +2013,91 @@ fn derive_interest_label(default_title: &str, content: &str) -> String {
     "Workspace interest".to_string()
 }
 
+fn stage1_stopwords() -> &'static HashSet<&'static str> {
+    static WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    WORDS.get_or_init(|| {
+        HashSet::from([
+            "about", "after", "also", "been", "being", "because", "before", "between", "could",
+            "from", "have", "into", "just", "like", "more", "most", "only", "other", "over",
+            "really", "some", "than", "that", "their", "there", "these", "they", "this",
+            "those", "through", "very", "what", "when", "where", "which", "with", "would",
+            "your", "ours", "ourselves", "the", "and", "for", "are", "was", "were", "you",
+            "has", "had", "but", "not", "too", "out", "off", "its", "why", "how", "who",
+            "insight", "post", "notes", "note", "journal", "entry", "entries",
+        ])
+    })
+}
+
+fn broaden_stage1_keyword(term: &str) -> &'static [&'static str] {
+    match term {
+        "ai" => &["llm", "ml"],
+        "startup" | "startups" => &["founder", "business"],
+        "rust" => &["systems", "compiler"],
+        "bluesky" => &["bsky", "atproto"],
+        "nostr" => &["relay", "relays"],
+        "design" => &["product"],
+        "software" => &["programming"],
+        _ => &[],
+    }
+}
+
+fn score_terms_from_text(raw: &str, weight: f32, scores: &mut HashMap<String, f32>) {
+    for term in tokenize_terms(raw) {
+        if term.len() < 3 || stage1_stopwords().contains(term.as_str()) {
+            continue;
+        }
+        *scores.entry(term.clone()).or_insert(0.0) += weight;
+        for broadened in broaden_stage1_keyword(term.as_str()) {
+            *scores.entry((*broadened).to_string()).or_insert(0.0) += weight * 0.6;
+        }
+    }
+}
+
+fn derive_interest_keywords(label: &str, content: &str) -> Vec<String> {
+    let mut scores: HashMap<String, f32> = HashMap::new();
+    score_terms_from_text(label, 3.0, &mut scores);
+    let mut heading_count = 0;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            heading_count += 1;
+            score_terms_from_text(trimmed.trim_start_matches('#').trim(), 2.0, &mut scores);
+            if heading_count >= 4 {
+                break;
+            }
+        }
+    }
+    score_terms_from_text(&truncate_with_ellipsis(content.trim(), 600), 1.0, &mut scores);
+
+    let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked
+        .into_iter()
+        .map(|(term, _)| term)
+        .take(STAGE1_KEYWORDS_PER_INTEREST_LIMIT)
+        .collect()
+}
+
+fn load_interest_source_text(workspace_dir: &Path, source_path: &str) -> String {
+    let trimmed = source_path.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let path = workspace_dir.join(trimmed);
+    std::fs::read_to_string(path)
+        .map(|content| truncate_with_ellipsis(content.trim(), FEED_PROFILE_MAX_CHARS))
+        .unwrap_or_default()
+}
+
 fn content_hash_16(text: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -1840,8 +2149,67 @@ fn top_interest_terms(profile: &FeedProfile) -> BTreeSet<String> {
     interests
         .into_iter()
         .take(6)
-        .flat_map(|interest| tokenize_terms(&interest.label))
+        .flat_map(|interest| {
+            if interest.keywords.is_empty() {
+                tokenize_terms(&interest.label)
+            } else {
+                interest.keywords.clone()
+            }
+        })
         .collect()
+}
+
+fn broad_interest_keywords(profile: &FeedProfile) -> Vec<String> {
+    let mut scores: HashMap<String, f32> = HashMap::new();
+    for interest in &profile.interests {
+        let keywords = if interest.keywords.is_empty() {
+            tokenize_terms(&interest.label)
+        } else {
+            interest.keywords.clone()
+        };
+        for keyword in keywords {
+            if keyword.len() < 3 || stage1_stopwords().contains(keyword.as_str()) {
+                continue;
+            }
+            *scores.entry(keyword).or_insert(0.0) += interest.health_score.max(0.1);
+        }
+    }
+    let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked
+        .into_iter()
+        .map(|(keyword, _)| keyword)
+        .take(STAGE1_KEYWORD_LIMIT)
+        .collect()
+}
+
+fn keyword_match_score(text: &str, keywords: &[String]) -> f32 {
+    if keywords.is_empty() {
+        return 0.0;
+    }
+    let lower = text.to_ascii_lowercase();
+    let matched = keywords
+        .iter()
+        .filter(|keyword| lower.contains(keyword.as_str()))
+        .count();
+    if matched == 0 {
+        return 0.0;
+    }
+    matched as f32 / keywords.len() as f32
+}
+
+fn first_matched_keyword<'a>(text: &str, keywords: &'a [String]) -> Option<&'a str> {
+    let lower = text.to_ascii_lowercase();
+    keywords
+        .iter()
+        .find(|keyword| lower.contains(keyword.as_str()))
+        .map(|keyword| keyword.as_str())
 }
 
 fn tokenize_terms(raw: &str) -> Vec<String> {
@@ -1872,18 +2240,18 @@ async fn embed_text_batch(embedder: SharedEmbedder, texts: &[String]) -> Result<
 #[derive(Clone)]
 struct BlueskyFeedSource {
     auth: BlueskyAuth,
-    embedder: SharedEmbedder,
 }
 
 impl BlueskyFeedSource {
-    fn new(auth: BlueskyAuth, embedder: SharedEmbedder) -> Self {
-        Self { auth, embedder }
+    fn new(auth: BlueskyAuth) -> Self {
+        Self { auth }
     }
 
     async fn discover_sources_with_diagnostics(
         &self,
         profile: &FeedProfile,
     ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
+        let keywords = broad_interest_keywords(profile);
         let mut diagnostics = FeedProtocolDiagnostics {
             available: true,
             ..FeedProtocolDiagnostics::default()
@@ -1914,40 +2282,28 @@ impl BlueskyFeedSource {
             cursor = Some(next_cursor);
         }
         diagnostics.scanned_count = generators.len();
-
-        let search_texts: Vec<String> = generators
-            .iter()
-            .map(bluesky_feed_generator_search_text)
-            .collect();
-        let embeddings = embed_text_batch(self.embedder.clone(), &search_texts).await?;
         let mut ranked = Vec::new();
-        let mut weak_matches = Vec::new();
-        for (generator, embedding) in generators.into_iter().zip(embeddings.into_iter()) {
-            let (weighted_score, similarity, matched_label) =
-                best_interest_match(&embedding, &profile.interests);
+        for generator in generators {
+            let search_text = bluesky_feed_generator_search_text(&generator);
+            let keyword_score = keyword_match_score(&search_text, &keywords);
+            if keyword_score <= 0.0 {
+                continue;
+            }
             let label = bluesky_feed_generator_label(&generator);
-            let selected = SelectedSource {
+            ranked.push(SelectedSource {
                 protocol: FeedProtocol::Bluesky,
                 key: format!("feed:{}", generator.uri),
                 label: label.clone(),
-                stage1_score: weighted_score,
+                stage1_score: keyword_score,
                 description: non_empty_string(generator.description.clone()),
-                matched_interest_label: matched_label,
-                matched_interest_score: if similarity > 0.0 {
-                    Some(similarity)
-                } else {
-                    None
-                },
+                matched_interest_label: first_matched_keyword(&search_text, &keywords)
+                    .map(|value| value.to_string()),
+                matched_interest_score: Some(keyword_score),
                 metadata_json: serde_json::json!({
                     "uri": generator.uri,
                     "creatorHandle": generator.creator_handle,
                 }),
-            };
-            if weighted_score >= BLUESKY_FEED_SOURCE_MATCH_THRESHOLD {
-                ranked.push(selected);
-            } else {
-                weak_matches.push(selected);
-            }
+            });
         }
         ranked.sort_by(|left, right| {
             right
@@ -1959,20 +2315,7 @@ impl BlueskyFeedSource {
             ranked.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT);
             ranked
         } else {
-            weak_matches.sort_by(|left, right| {
-                right
-                    .stage1_score
-                    .partial_cmp(&left.stage1_score)
-                    .unwrap_or(Ordering::Equal)
-            });
-            if !weak_matches.is_empty() {
-                weak_matches.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT.min(2));
-                append_selected_sources_unique(&mut weak_matches, fallback_bluesky_selected_sources());
-                weak_matches.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT);
-                weak_matches
-            } else {
-                fallback_bluesky_selected_sources()
-            }
+            fallback_bluesky_selected_sources()
         };
         diagnostics.shortlisted_count = selected.len();
         diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
@@ -2063,14 +2406,12 @@ impl FeedSource for BlueskyFeedSource {
 #[derive(Clone)]
 struct NostrFeedSource {
     config: Config,
-    embedder: SharedEmbedder,
 }
 
 impl NostrFeedSource {
-    fn new(config: &Config, embedder: SharedEmbedder) -> Self {
+    fn new(config: &Config) -> Self {
         Self {
             config: config.clone(),
-            embedder,
         }
     }
 
@@ -2078,21 +2419,26 @@ impl NostrFeedSource {
         &self,
         profile: &FeedProfile,
     ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
+        let keywords = broad_interest_keywords(profile);
         let relay_urls = configured_nostr_world_feed_relays(&self.config);
         let mut diagnostics = FeedProtocolDiagnostics {
             available: true,
             scanned_count: relay_urls.len(),
             ..FeedProtocolDiagnostics::default()
         };
+        let mut selected = fetch_nip66_relay_candidates(&fallback_nostr_world_feed_relays(&self.config), &keywords)
+            .await
+            .unwrap_or_default();
         if relay_urls.is_empty() {
-            let selected = fallback_nostr_selected_sources(&self.config);
+            if selected.is_empty() {
+                selected = fallback_nostr_selected_sources(&self.config);
+            }
             diagnostics.shortlisted_count = selected.len();
             diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
             return Ok((selected, diagnostics));
         }
 
         let mut relay_metadata = Vec::new();
-        let mut search_texts = Vec::new();
         for relay_url in relay_urls {
             let metadata = fetch_nostr_relay_metadata(&relay_url)
                 .await
@@ -2100,28 +2446,25 @@ impl NostrFeedSource {
             if metadata.is_some() {
                 diagnostics.metadata_fetched_count += 1;
             }
-            search_texts.push(nostr_relay_search_text(&relay_url, metadata.as_ref()));
             relay_metadata.push((relay_url, metadata));
         }
-
-        let embeddings = embed_text_batch(self.embedder.clone(), &search_texts).await?;
         let mut ranked = Vec::new();
-        for ((relay_url, metadata), embedding) in relay_metadata.into_iter().zip(embeddings.into_iter()) {
-            let (weighted_score, similarity, matched_label) =
-                best_interest_match(&embedding, &profile.interests);
+        for (relay_url, metadata) in relay_metadata {
+            let search_text = nostr_relay_search_text(&relay_url, metadata.as_ref());
+            let keyword_score = keyword_match_score(&search_text, &keywords);
+            if keyword_score <= 0.0 {
+                continue;
+            }
             let relay_http_url = nostr_relay_http_url(&relay_url).unwrap_or_default();
             ranked.push(SelectedSource {
                 protocol: FeedProtocol::Nostr,
                 key: relay_url.clone(),
                 label: nostr_relay_label(&relay_url, metadata.as_ref()),
-                stage1_score: weighted_score,
+                stage1_score: keyword_score,
                 description: nostr_relay_description(metadata.as_ref()),
-                matched_interest_label: matched_label,
-                matched_interest_score: if similarity > 0.0 {
-                    Some(similarity)
-                } else {
-                    None
-                },
+                matched_interest_label: first_matched_keyword(&search_text, &keywords)
+                    .map(|value| value.to_string()),
+                matched_interest_score: Some(keyword_score),
                 metadata_json: serde_json::json!({
                     "relayUrl": relay_url,
                     "domain": resolve_feed_web_domain(&relay_http_url).unwrap_or_default(),
@@ -2135,22 +2478,18 @@ impl NostrFeedSource {
                 .partial_cmp(&left.stage1_score)
                 .unwrap_or(Ordering::Equal)
         });
-        let selected = {
-            let mut strong_matches = ranked
-                .iter()
-                .filter(|source| source.stage1_score >= NOSTR_RELAY_MATCH_THRESHOLD)
-                .cloned()
-                .collect::<Vec<_>>();
-            if !strong_matches.is_empty() {
-                strong_matches.truncate(NOSTR_SELECTED_RELAY_LIMIT);
-                strong_matches
-            } else if !ranked.is_empty() {
-                ranked.truncate(NOSTR_SELECTED_RELAY_LIMIT);
-                ranked
-            } else {
-                fallback_nostr_selected_sources(&self.config)
-            }
-        };
+        append_selected_sources_unique(&mut selected, ranked);
+        if selected.is_empty() {
+            selected = fallback_nostr_selected_sources(&self.config);
+        } else {
+            selected.sort_by(|left, right| {
+                right
+                    .stage1_score
+                    .partial_cmp(&left.stage1_score)
+                    .unwrap_or(Ordering::Equal)
+            });
+            selected.truncate(NOSTR_SELECTED_RELAY_LIMIT);
+        }
         diagnostics.shortlisted_count = selected.len();
         diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
         Ok((selected, diagnostics))
@@ -2287,26 +2626,28 @@ impl RssFeedSource {
             scanned_count: sources.len(),
             ..FeedProtocolDiagnostics::default()
         };
+        let keywords = broad_interest_keywords(profile);
         let mut ranked = Vec::new();
         for source in sources {
-            let embedding = bytes_to_vec(&source.metadata_embedding);
-            if embedding.is_empty() {
+            let metadata_text = catalog_metadata_text(
+                &source.title,
+                &source.domain,
+                &source.description,
+                &source.topics_csv,
+            );
+            let keyword_score = keyword_match_score(&metadata_text, &keywords);
+            if keyword_score <= 0.0 {
                 continue;
             }
-            let (weighted_score, similarity, matched_label) =
-                best_interest_match(&embedding, &profile.interests);
             ranked.push(SelectedSource {
                 protocol: FeedProtocol::Rss,
                 key: source.xml_url.clone(),
                 label: source.title.clone(),
-                stage1_score: weighted_score,
+                stage1_score: keyword_score,
                 description: non_empty_string(source.description.clone()),
-                matched_interest_label: matched_label,
-                matched_interest_score: if similarity > 0.0 {
-                    Some(similarity)
-                } else {
-                    None
-                },
+                matched_interest_label: first_matched_keyword(&metadata_text, &keywords)
+                    .map(|value| value.to_string()),
+                matched_interest_score: Some(keyword_score),
                 metadata_json: serde_json::json!({
                     "domain": source.domain,
                     "topics": source.topics_csv,
@@ -2320,38 +2661,28 @@ impl RssFeedSource {
                 .partial_cmp(&left.stage1_score)
                 .unwrap_or(Ordering::Equal)
         });
-        let selected = {
-            let mut strong_matches = ranked
-                .iter()
-                .filter(|source| source.stage1_score >= RSS_SOURCE_MATCH_THRESHOLD)
-                .cloned()
-                .collect::<Vec<_>>();
-            if !strong_matches.is_empty() {
-                strong_matches.truncate(RSS_SELECTED_SOURCE_LIMIT);
-                strong_matches
-            } else if !ranked.is_empty() {
-                ranked.truncate(RSS_SELECTED_SOURCE_LIMIT.min(4));
-                ranked
-            } else {
-                local_store::list_feed_web_sources(&self.config.workspace_dir)?
-                    .into_iter()
-                    .take(RSS_SELECTED_SOURCE_LIMIT.min(4))
-                    .map(|source| SelectedSource {
-                        protocol: FeedProtocol::Rss,
-                        key: source.xml_url.clone(),
-                        label: source.title,
-                        stage1_score: 0.2,
-                        description: non_empty_string(source.description),
-                        matched_interest_label: None,
-                        matched_interest_score: None,
-                        metadata_json: serde_json::json!({
-                            "domain": source.domain,
-                            "topics": source.topics_csv,
-                            "htmlUrl": source.html_url,
-                        }),
-                    })
-                    .collect()
-            }
+        let selected = if !ranked.is_empty() {
+            ranked.truncate(RSS_SELECTED_SOURCE_LIMIT);
+            ranked
+        } else {
+            local_store::list_feed_web_sources(&self.config.workspace_dir)?
+                .into_iter()
+                .take(RSS_SELECTED_SOURCE_LIMIT.min(4))
+                .map(|source| SelectedSource {
+                    protocol: FeedProtocol::Rss,
+                    key: source.xml_url.clone(),
+                    label: source.title,
+                    stage1_score: 0.2,
+                    description: non_empty_string(source.description),
+                    matched_interest_label: None,
+                    matched_interest_score: None,
+                    metadata_json: serde_json::json!({
+                        "domain": source.domain,
+                        "topics": source.topics_csv,
+                        "htmlUrl": source.html_url,
+                    }),
+                })
+                .collect()
         };
         diagnostics.shortlisted_count = selected.len();
         diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
@@ -3622,6 +3953,8 @@ mod tests {
                 label: "Rust systems".into(),
                 embedding: vec![1.0, 0.0, 0.0],
                 health_score: 1.0,
+                source_path: "posts/rust-systems.md".into(),
+                keywords: vec!["rust".into(), "systems".into()],
             }],
         }
     }
@@ -3638,6 +3971,8 @@ mod tests {
                 label: "Rust systems".into(),
                 embedding: vec![1.0, 0.0, 0.0],
                 health_score: 0.2,
+                source_path: "posts/rust-systems.md".into(),
+                keywords: vec!["rust".into(), "systems".into()],
             }],
         }
     }

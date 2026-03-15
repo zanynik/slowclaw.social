@@ -2048,10 +2048,29 @@ fn normalize_insight_post_items(
             anyhow::bail!("insightPosts items require non-empty text");
         }
         let seed = format!("{}|{}|{}", item.text, item.source_path, item.source_excerpt);
-        item.id = unique_id(&used_ids, &item.id, &seed, "post");
+        let preferred_id = if item.id.trim().is_empty() || item.id.starts_with("post-") {
+            preferred_insight_post_id(&item.text)
+        } else {
+            item.id.clone()
+        };
+        item.id = unique_id(&used_ids, &preferred_id, &seed, "post");
         used_ids.insert(item.id.clone());
     }
     Ok(items)
+}
+
+fn preferred_insight_post_id(text: &str) -> String {
+    let first_line = text.lines().next().unwrap_or("").trim();
+    let sentence = first_line
+        .split(['.', '!', '?', ':'])
+        .next()
+        .unwrap_or(first_line)
+        .trim();
+    let mut stem = normalize_title_stem(&truncate_with_ellipsis(sentence, 72));
+    if stem.is_empty() {
+        stem = format!("post-{}", short_hash(text));
+    }
+    stem
 }
 
 fn normalize_todo_items(mut items: Vec<TodoCandidate>) -> Result<Vec<TodoCandidate>> {

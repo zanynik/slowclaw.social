@@ -1204,6 +1204,22 @@ async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow:
     crate::agent::process_message(config, message).await
 }
 
+fn gateway_ui_tool_profile() -> crate::tools::ToolProfile {
+    crate::tools::ToolProfile::UiRestricted
+}
+
+async fn run_gateway_ui_chat_with_tools(
+    config: Config,
+    message: &str,
+) -> anyhow::Result<String> {
+    crate::agent::process_message_with_profile(
+        config,
+        message,
+        gateway_ui_tool_profile(),
+    )
+    .await
+}
+
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
@@ -2664,7 +2680,7 @@ async fn run_local_agent_prompt_in_thread(
     let config = content_agent_config_with_headroom(&state.config.lock().clone());
     crate::channels::with_channel_execution_context(
         channel_ctx,
-        crate::agent::process_message(config, prompt),
+        run_gateway_ui_chat_with_tools(config, prompt),
     )
     .await
 }
@@ -4991,7 +5007,7 @@ async fn handle_chat_send(
                 let config = state_for_worker.config.lock().clone();
                 let result = crate::channels::with_channel_execution_context(
                     channel_ctx,
-                    crate::agent::process_message(config, &content_owned),
+                    run_gateway_ui_chat_with_tools(config, &content_owned),
                 )
                 .await;
 
@@ -6555,7 +6571,7 @@ async fn handle_feed_workflow_comment(
         let config = state_for_worker.config.lock().clone();
         let result = crate::channels::with_channel_execution_context(
             channel_ctx,
-            crate::agent::process_message(config, &prompt),
+            run_gateway_ui_chat_with_tools(config, &prompt),
         )
         .await;
 
@@ -10927,6 +10943,61 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn gateway_ui_profile_omits_shell_scheduler_cron_and_git_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        let security = Arc::new(crate::security::SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let mem_cfg = crate::config::MemoryConfig {
+            backend: "markdown".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn crate::memory::Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, temp.path(), None).unwrap());
+        let tools = crate::tools::all_tools_with_runtime_and_profile(
+            Arc::new(config.clone()),
+            &security,
+            Arc::new(crate::runtime::NativeRuntime::new()),
+            gateway_ui_tool_profile(),
+            mem,
+            None,
+            None,
+            &crate::config::BrowserConfig::default(),
+            &crate::config::HttpRequestConfig::default(),
+            &crate::config::WebFetchConfig::default(),
+            temp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+        );
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+
+        for removed in [
+            "shell",
+            "schedule",
+            "git_operations",
+            "cron_add",
+            "cron_list",
+            "cron_remove",
+            "cron_run",
+            "cron_runs",
+            "cron_update",
+        ] {
+            assert!(
+                !names.contains(&removed),
+                "UI tool profile should not expose {removed}"
+            );
+            assert!(
+                tools.iter().find(|tool| tool.name() == removed).is_none(),
+                "UI tool profile should treat {removed} as unavailable"
+            );
         }
     }
 

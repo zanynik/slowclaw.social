@@ -8,7 +8,7 @@ use crate::providers::{
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
-use crate::tools::{self, Tool};
+use crate::tools::{self, Tool, ToolProfile};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
@@ -1848,6 +1848,13 @@ pub(crate) async fn agent_turn(
     .await
 }
 
+fn prompt_tool_summaries<'a>(tools_registry: &'a [Box<dyn Tool>]) -> Vec<(&'a str, &'a str)> {
+    tools_registry
+        .iter()
+        .map(|tool| (tool.name(), tool.description()))
+        .collect()
+}
+
 async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
@@ -2764,58 +2771,7 @@ pub async fn run(
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        (
-            "shell",
-            "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
-        ),
-        (
-            "file_read",
-            "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
-        ),
-        (
-            "file_write",
-            "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
-        ),
-        (
-            "memory_store",
-            "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
-        ),
-        (
-            "memory_recall",
-            "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
-        ),
-        (
-            "memory_forget",
-            "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
-        ),
-    ];
-    tool_descs.push((
-        "cron_add",
-        "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
-    ));
-    tool_descs.push((
-        "cron_list",
-        "List all cron jobs with schedule, status, and metadata.",
-    ));
-    tool_descs.push(("cron_remove", "Remove a cron job by job_id."));
-    tool_descs.push((
-        "cron_update",
-        "Patch a cron job (schedule, enabled, command/prompt, model, delivery, session_target).",
-    ));
-    tool_descs.push((
-        "cron_run",
-        "Force-run a cron job immediately and record a run history entry.",
-    ));
-    tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
-    tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-    ));
-    tool_descs.push((
-        "model_routing_config",
-        "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
-    ));
+    let tool_descs = prompt_tool_summaries(&tools_registry);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3061,9 +3017,12 @@ pub async fn run(
     Ok(final_output)
 }
 
-/// Process a single message through the full agent (with tools and memory).
-/// Used by channels and gateway webhook handlers.
-pub async fn process_message(config: Config, message: &str) -> Result<String> {
+/// Process a single message through the agent using the requested tool profile.
+pub async fn process_message_with_profile(
+    config: Config,
+    message: &str,
+    profile: ToolProfile,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -3087,10 +3046,11 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let tools_registry = tools::all_tools_with_runtime(
+    let tools_registry = tools::all_tools_with_runtime_and_profile(
         Arc::new(config.clone()),
         &security,
         runtime,
+        profile,
         mem.clone(),
         composio_key,
         composio_entity_id,
@@ -3125,15 +3085,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     )?;
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-    let tool_descs: Vec<(&str, &str)> = vec![
-        ("shell", "Execute terminal commands."),
-        ("file_read", "Read file contents."),
-        ("file_write", "Write file contents."),
-        ("memory_store", "Save to memory."),
-        ("memory_recall", "Search memory."),
-        ("memory_forget", "Delete a memory entry."),
-        ("model_routing_config", "Configure default model and scenario routing."),
-    ];
+    let tool_descs = prompt_tool_summaries(&tools_registry);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3181,6 +3133,12 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.agent.max_tool_iterations,
     )
     .await
+}
+
+/// Process a single message through the full agent (with tools and memory).
+/// Used by channels and gateway webhook handlers.
+pub async fn process_message(config: Config, message: &str) -> Result<String> {
+    process_message_with_profile(config, message, ToolProfile::Full).await
 }
 
 #[cfg(test)]
@@ -5152,6 +5110,121 @@ Let me check the result."#;
             system_prompt.contains("## Your Task"),
             "Native prompt should contain task instructions"
         );
+    }
+
+    #[test]
+    fn ui_restricted_prompt_omits_removed_tools() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = crate::config::MemoryConfig {
+            backend: "markdown".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let tools_registry = crate::tools::all_tools_with_runtime_and_profile(
+            Arc::new(config.clone()),
+            &security,
+            Arc::new(crate::runtime::NativeRuntime::new()),
+            ToolProfile::UiRestricted,
+            mem,
+            None,
+            None,
+            &crate::config::BrowserConfig::default(),
+            &crate::config::HttpRequestConfig::default(),
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &std::collections::HashMap::new(),
+            None,
+            &config,
+        );
+        let tool_descs = prompt_tool_summaries(&tools_registry);
+        let prompt = crate::channels::build_system_prompt_with_mode(
+            &config.workspace_dir,
+            "test-model",
+            &tool_descs,
+            &[],
+            Some(&config.identity),
+            None,
+            true,
+            config.skills.prompt_injection_mode,
+        );
+
+        for removed in [
+            "shell",
+            "schedule",
+            "git_operations",
+            "cron_add",
+            "cron_list",
+            "cron_remove",
+            "cron_run",
+            "cron_runs",
+            "cron_update",
+        ] {
+            assert!(
+                !prompt.contains(removed),
+                "UI restricted prompt should omit {removed}"
+            );
+        }
+        for allowed in ["file_read", "file_write", "memory_store", "model_routing_config"] {
+            assert!(
+                prompt.contains(allowed),
+                "UI restricted prompt should include {allowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_prompt_includes_shell_and_schedule_tools() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = crate::config::MemoryConfig {
+            backend: "markdown".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let tools_registry = crate::tools::all_tools_with_runtime_and_profile(
+            Arc::new(config.clone()),
+            &security,
+            Arc::new(crate::runtime::NativeRuntime::new()),
+            ToolProfile::Full,
+            mem,
+            None,
+            None,
+            &crate::config::BrowserConfig::default(),
+            &crate::config::HttpRequestConfig::default(),
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &std::collections::HashMap::new(),
+            None,
+            &config,
+        );
+        let tool_descs = prompt_tool_summaries(&tools_registry);
+        let prompt = crate::channels::build_system_prompt_with_mode(
+            &config.workspace_dir,
+            "test-model",
+            &tool_descs,
+            &[],
+            Some(&config.identity),
+            None,
+            true,
+            config.skills.prompt_injection_mode,
+        );
+
+        for expected in ["shell", "schedule", "git_operations", "cron_add"] {
+            assert!(prompt.contains(expected), "Full prompt should include {expected}");
+        }
     }
 
     // ── Cross-Alias & GLM Shortened Body Tests ──────────────────────────
