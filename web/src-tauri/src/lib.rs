@@ -92,7 +92,6 @@ struct GatewayRuntimeState {
     last_error: Option<String>,
     provider_api_key_set: bool,
     gateway_handle: Option<JoinHandle<()>>,
-    scheduler_handle: Option<JoinHandle<()>>,
 }
 
 impl Default for GatewayRuntimeState {
@@ -103,7 +102,6 @@ impl Default for GatewayRuntimeState {
             last_error: None,
             provider_api_key_set: false,
             gateway_handle: None,
-            scheduler_handle: None,
         }
     }
 }
@@ -121,6 +119,14 @@ struct OpenAiDeviceCodeRuntimeState {
 #[derive(Clone, Default)]
 struct OpenAiDeviceCodeState {
     inner: Arc<Mutex<OpenAiDeviceCodeRuntimeState>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnthropicTokenStatus {
+    is_set: bool,
+    message: String,
+    error: Option<String>,
 }
 
 fn validate_secret_locator(service: &str, account: &str) -> Result<(), String> {
@@ -286,21 +292,14 @@ async fn clear_matching_provider_api_key_from_config(expected: &str) -> Result<(
 async fn restart_embedded_gateway(
     shared: Arc<Mutex<GatewayRuntimeState>>,
 ) -> Result<EmbeddedGatewayInfo, String> {
-    let (old_gateway_handle, old_scheduler_handle) = {
+    let old_gateway_handle = {
         let mut guard = lock_gateway_state(&shared)?;
         guard.running = false;
-        (guard.gateway_handle.take(), guard.scheduler_handle.take())
+        guard.gateway_handle.take()
     };
-    let had_old_gateway = old_gateway_handle.is_some();
-    let had_old_scheduler = old_scheduler_handle.is_some();
 
     if let Some(handle) = old_gateway_handle {
         handle.abort();
-    }
-    if let Some(handle) = old_scheduler_handle {
-        handle.abort();
-    }
-    if had_old_gateway || had_old_scheduler {
         std::thread::sleep(Duration::from_millis(120));
     }
 
@@ -336,24 +335,6 @@ async fn restart_embedded_gateway(
         guard.provider_api_key_set = provider_api_key_set;
     }
 
-    let scheduler_enabled = config.cron.enabled;
-
-    let scheduler_config = config.clone();
-    let shared_for_scheduler = shared.clone();
-    let scheduler_handle = if scheduler_enabled {
-        Some(tauri::async_runtime::spawn(async move {
-            let result = zeroclaw::run_scheduler(scheduler_config).await;
-            if let Ok(mut guard) = shared_for_scheduler.lock() {
-                guard.scheduler_handle = None;
-                if let Err(err) = result {
-                    guard.last_error = Some(format!("scheduler: {err}"));
-                }
-            }
-        }))
-    } else {
-        None
-    };
-
     let shared_for_gateway = shared.clone();
     let gateway_handle = tauri::async_runtime::spawn(async move {
         let result = zeroclaw::gateway::run_gateway(&host, port, config).await;
@@ -369,7 +350,6 @@ async fn restart_embedded_gateway(
     {
         let mut guard = lock_gateway_state(&shared)?;
         guard.gateway_handle = Some(gateway_handle);
-        guard.scheduler_handle = scheduler_handle;
     }
 
     snapshot_gateway_state(&shared)
@@ -1007,6 +987,54 @@ fn start_openai_device_code_login(
 }
 
 #[tauri::command]
+async fn get_anthropic_token_status() -> Result<AnthropicTokenStatus, String> {
+    match zeroclaw::has_anthropic_auth(None).await {
+        Ok(true) => Ok(AnthropicTokenStatus {
+            is_set: true,
+            message: "Claude auth token is configured for this workspace.".to_string(),
+            error: None,
+        }),
+        Ok(false) => Ok(AnthropicTokenStatus {
+            is_set: false,
+            message: "No Claude auth token saved.".to_string(),
+            error: None,
+        }),
+        Err(e) => Ok(AnthropicTokenStatus {
+            is_set: false,
+            message: "Unable to check Claude auth status.".to_string(),
+            error: Some(format!("{e}")),
+        }),
+    }
+}
+
+#[tauri::command]
+async fn save_anthropic_token(
+    state: tauri::State<'_, GatewayState>,
+    token: String,
+) -> Result<AnthropicTokenStatus, String> {
+    let trimmed = token.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Token cannot be empty.".to_string());
+    }
+    zeroclaw::save_anthropic_token(trimmed)
+        .await
+        .map_err(|e| ui_command_error("anthropic token save failed", "Failed to save Claude token.", e))?;
+    let _ = restart_embedded_gateway(state.inner.clone()).await;
+    get_anthropic_token_status().await
+}
+
+#[tauri::command]
+async fn clear_anthropic_token(
+    state: tauri::State<'_, GatewayState>,
+) -> Result<AnthropicTokenStatus, String> {
+    zeroclaw::clear_anthropic_token()
+        .await
+        .map_err(|e| ui_command_error("anthropic token clear failed", "Failed to clear Claude token.", e))?;
+    let _ = restart_embedded_gateway(state.inner.clone()).await;
+    get_anthropic_token_status().await
+}
+
+#[tauri::command]
 fn show_main_window(window: tauri::Window) {
     if let Err(e) = window.show() {
         eprintln!("failed to show main window: {e}");
@@ -1042,6 +1070,9 @@ pub fn run() {
             open_external_url,
             get_openai_device_code_status,
             start_openai_device_code_login,
+            get_anthropic_token_status,
+            save_anthropic_token,
+            clear_anthropic_token,
             show_main_window
         ])
         .run(tauri::generate_context!())

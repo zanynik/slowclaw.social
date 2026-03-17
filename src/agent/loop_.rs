@@ -4707,11 +4707,11 @@ Done."#;
     #[test]
     fn parse_tool_call_value_accepts_top_level_parameters_alias() {
         let value = serde_json::json!({
-            "name": "schedule",
-            "parameters": {"action": "create", "message": "test"}
+            "name": "file_read",
+            "parameters": {"path": "/tmp/test.txt"}
         });
         let result = parse_tool_call_value(&value).expect("tool call should parse");
-        assert_eq!(result.name, "schedule");
+        assert_eq!(result.name, "file_read");
         assert_eq!(
             result.arguments.get("action").and_then(|v| v.as_str()),
             Some("create")
@@ -5155,17 +5155,7 @@ Let me check the result."#;
             config.skills.prompt_injection_mode,
         );
 
-        for removed in [
-            "shell",
-            "schedule",
-            "git_operations",
-            "cron_add",
-            "cron_list",
-            "cron_remove",
-            "cron_run",
-            "cron_runs",
-            "cron_update",
-        ] {
+        for removed in ["shell", "git_operations"] {
             assert!(
                 !prompt.contains(removed),
                 "UI restricted prompt should omit {removed}"
@@ -5180,7 +5170,7 @@ Let me check the result."#;
     }
 
     #[test]
-    fn full_prompt_includes_shell_and_schedule_tools() {
+    fn full_prompt_includes_shell_and_git_tools() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = crate::config::MemoryConfig {
@@ -5222,7 +5212,7 @@ Let me check the result."#;
             config.skills.prompt_injection_mode,
         );
 
-        for expected in ["shell", "schedule", "git_operations", "cron_add"] {
+        for expected in ["shell", "git_operations"] {
             assert!(prompt.contains(expected), "Full prompt should include {expected}");
         }
     }

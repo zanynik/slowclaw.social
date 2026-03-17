@@ -288,4 +288,99 @@ pub const DEFAULT_FEED_WEB_SOURCES: &[DefaultFeedWebSource] = &[
         html_url: "https://abortretry.fail",
         xml_url: "https://www.abortretry.fail/feed",
     },
+    // --- Mindfulness, Buddhism, Meditation, Consciousness ---
+    DefaultFeedWebSource {
+        title: "zenhabits.net",
+        domain: "zenhabits.net",
+        html_url: "https://zenhabits.net",
+        xml_url: "https://zenhabits.net/feed/",
+    },
+    DefaultFeedWebSource {
+        title: "tricycle.org",
+        domain: "tricycle.org",
+        html_url: "https://tricycle.org",
+        xml_url: "https://tricycle.org/feed/",
+    },
+    DefaultFeedWebSource {
+        title: "mindful.org",
+        domain: "mindful.org",
+        html_url: "https://www.mindful.org",
+        xml_url: "https://www.mindful.org/feed/",
+    },
+    DefaultFeedWebSource {
+        title: "lionsroar.com",
+        domain: "lionsroar.com",
+        html_url: "https://www.lionsroar.com",
+        xml_url: "https://www.lionsroar.com/feed/",
+    },
+    // --- Philosophy, Psychology, Ideas ---
+    DefaultFeedWebSource {
+        title: "fs.blog",
+        domain: "fs.blog",
+        html_url: "https://fs.blog",
+        xml_url: "https://fs.blog/feed/",
+    },
+    DefaultFeedWebSource {
+        title: "aeon.co",
+        domain: "aeon.co",
+        html_url: "https://aeon.co",
+        xml_url: "https://aeon.co/feed.rss",
+    },
+    DefaultFeedWebSource {
+        title: "psyche.co",
+        domain: "psyche.co",
+        html_url: "https://psyche.co",
+        xml_url: "https://psyche.co/feed",
+    },
+    DefaultFeedWebSource {
+        title: "themarginalian.org",
+        domain: "themarginalian.org",
+        html_url: "https://www.themarginalian.org",
+        xml_url: "https://www.themarginalian.org/feed/",
+    },
+    // --- Economics, Business, Social Innovation ---
+    DefaultFeedWebSource {
+        title: "marginalrevolution.com",
+        domain: "marginalrevolution.com",
+        html_url: "https://marginalrevolution.com",
+        xml_url: "https://marginalrevolution.com/feed",
+    },
+    DefaultFeedWebSource {
+        title: "evonomics.com",
+        domain: "evonomics.com",
+        html_url: "https://evonomics.com",
+        xml_url: "https://evonomics.com/feed/",
+    },
+    // --- AI Workflows, Productivity, Content Creation ---
+    DefaultFeedWebSource {
+        title: "every.to",
+        domain: "every.to",
+        html_url: "https://every.to",
+        xml_url: "https://every.to/feed.xml",
+    },
+    DefaultFeedWebSource {
+        title: "nesslabs.com",
+        domain: "nesslabs.com",
+        html_url: "https://nesslabs.com",
+        xml_url: "https://nesslabs.com/feed",
+    },
+    DefaultFeedWebSource {
+        title: "oneusefulthing.org",
+        domain: "oneusefulthing.org",
+        html_url: "https://www.oneusefulthing.org",
+        xml_url: "https://www.oneusefulthing.org/feed",
+    },
+    // --- Science, Interdisciplinary ---
+    DefaultFeedWebSource {
+        title: "nautil.us",
+        domain: "nautil.us",
+        html_url: "https://nautil.us",
+        xml_url: "https://nautil.us/feed/",
+    },
+    DefaultFeedWebSource {
+        title: "astralcodexten.com",
+        domain: "astralcodexten.com",
+        html_url: "https://www.astralcodexten.com",
+        xml_url: "https://www.astralcodexten.com/feed",
+    },
 ];

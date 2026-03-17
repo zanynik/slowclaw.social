@@ -53,8 +53,12 @@ import {
   saveSyncPeerTokenSecure,
   saveSyncPeerUrlSecure,
   saveCredentialsSecure,
+  loadNostrKeysSecure,
+  saveNostrKeysSecure,
 } from "./lib/secureStorage";
+import type { NostrKeys } from "./lib/secureStorage";
 import type {
+  AnthropicTokenStatus,
   BlueskyCredentials,
   ClawChatMessage,
   GatewayQrPayload,
@@ -963,6 +967,9 @@ function App() {
   const [aiSetupStatus, setAiSetupStatus] = useState<OpenAiDeviceCodeStatus | null>(null);
   const [aiSetupBusy, setAiSetupBusy] = useState(false);
   const [aiSetupBrowserStatus, setAiSetupBrowserStatus] = useState("");
+  const [claudeToken, setClaudeToken] = useState("");
+  const [claudeTokenStatus, setClaudeTokenStatus] = useState<AnthropicTokenStatus | null>(null);
+  const [claudeTokenBusy, setClaudeTokenBusy] = useState(false);
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerApiKeyStatus, setProviderApiKeyStatus] = useState("");
   const [settingsProvider, setSettingsProvider] = useState("");
@@ -1093,6 +1100,24 @@ function App() {
   const workspaceSynthSelectedCount = workspaceSynthStatus.selectedSourcePaths?.length || 0;
   const feedAttributedBots = [...workspaceSynthSkillBots, ...workflowBots];
 
+  // Bluesky interaction state
+  const [blueskyLikedUris, setBlueskyLikedUris] = useState<Record<string, string>>({});
+  const [expandedThreadUri, setExpandedThreadUri] = useState("");
+  const [threadData, setThreadData] = useState<any>(null);
+  const [threadLoading, setThreadLoading] = useState(false);
+  const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
+  const [replyingUri, setReplyingUri] = useState("");
+
+  // World feed sub-tabs & Me feed sub-tabs
+  const [worldFeedTab, setWorldFeedTab] = useState<"all" | "videos">("all");
+  const [videoFallbackItems, setVideoFallbackItems] = useState<any[]>([]);
+  const [videoFallbackLoading, setVideoFallbackLoading] = useState(false);
+  const [meFeedTab, setMeFeedTab] = useState<"drafts" | "published">("drafts");
+
+  // Nostr identity
+  const [nostrKeys, setNostrKeys] = useState<NostrKeys | null>(null);
+  const [nostrKeysBusy, setNostrKeysBusy] = useState(false);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -1106,12 +1131,18 @@ function App() {
             if (!cancelled) {
               setAgent(autoAgent);
               setSession(autoSession);
+              await saveBlueskySessionSecure(autoSession);
               setAuthMessage(`Signed in as ${autoSession.handle}`);
             }
           } catch {
             // Bluesky login is optional; keep app booting without it.
           }
         }
+      }
+      // Load Nostr keys
+      const storedNostrKeys = await loadNostrKeysSecure();
+      if (!cancelled && storedNostrKeys) {
+        setNostrKeys(storedNostrKeys);
       }
       if (!cancelled && isDesktopClient) {
         const secureGatewayToken = await loadGatewayTokenSecure();
@@ -3840,20 +3871,133 @@ function App() {
     setCaptureMode(null);
   }
 
+  function isJwtExpired(jwt: string): boolean {
+    try {
+      const [, payload] = jwt.split(".");
+      if (!payload) return true;
+      const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+      const data = JSON.parse(atob(padded)) as { exp?: number };
+      if (typeof data.exp !== "number") return false;
+      // Consider expired if less than 60 seconds remaining
+      return data.exp < Math.floor(Date.now() / 1000) + 60;
+    } catch {
+      return false;
+    }
+  }
+
+  async function ensureBlueskySession(): Promise<string | undefined> {
+    // Try existing session — but only if token is not expired
+    const existingJwt = session?.accessJwt;
+    if (existingJwt && !isJwtExpired(existingJwt)) {
+      return existingJwt;
+    }
+
+    // Token expired or missing — try refresh token first
+    const refreshToken = session?.refreshJwt;
+    if (refreshToken && creds.serviceUrl) {
+      try {
+        const bluesky = await loadBlueskyModule();
+        const refreshed = await bluesky.refreshBlueskySession(creds.serviceUrl, refreshToken);
+        setAgent(refreshed.agent);
+        setSession(refreshed.session);
+        await saveBlueskySessionSecure(refreshed.session);
+        setAuthMessage(`Session refreshed for ${refreshed.session.handle}`);
+        return refreshed.session.accessJwt;
+      } catch {
+        // Refresh token also expired, fall through to re-login
+      }
+    }
+
+    // Fall back to re-login with stored credentials
+    if (creds.handle.trim() && creds.appPassword.trim()) {
+      try {
+        const bluesky = await loadBlueskyModule();
+        const { agent: freshAgent, session: freshSession } = await bluesky.loginBluesky(creds);
+        setAgent(freshAgent);
+        setSession(freshSession);
+        await saveBlueskySessionSecure(freshSession);
+        setAuthMessage(`Signed in as ${freshSession.handle}`);
+        return freshSession.accessJwt;
+      } catch (loginErr) {
+        console.warn("Bluesky auto-login failed:", loginErr);
+      }
+    }
+
+    return undefined;
+  }
+
   async function fetchBlueskyFeed() {
     setBlueskyFeedLoading(true);
     setBlueskyFeedStatus("");
-    try {
-      const res = await fetchPersonalizedFeed(
+
+    async function doFetch(jwt: string | undefined) {
+      return await fetchPersonalizedFeed(
         {
           serviceUrl: creds.serviceUrl.trim() || undefined,
-          accessJwt: session?.accessJwt,
+          accessJwt: jwt,
           limit: 30
         },
         chatGatewayToken,
         gatewayBaseUrl
       );
-      setBlueskyFeedItems(res.items);
+    }
+
+    async function forceRefreshSession(): Promise<string | undefined> {
+      // Force a fresh login regardless of current session state
+      if (creds.handle.trim() && creds.appPassword.trim()) {
+        try {
+          const bluesky = await loadBlueskyModule();
+          const { agent: freshAgent, session: freshSession } = await bluesky.loginBluesky(creds);
+          setAgent(freshAgent);
+          setSession(freshSession);
+          await saveBlueskySessionSecure(freshSession);
+          setAuthMessage(`Re-authenticated as ${freshSession.handle}`);
+          return freshSession.accessJwt;
+        } catch (loginErr) {
+          console.warn("Bluesky force re-login failed:", loginErr);
+        }
+      }
+      return undefined;
+    }
+
+    try {
+      let activeJwt = await ensureBlueskySession();
+      let res: PersonalizedFeedResponse;
+      try {
+        res = await doFetch(activeJwt);
+      } catch (error) {
+        // On expired token error, force re-login and retry once
+        const bluesky = await loadBlueskyModule();
+        if (bluesky.isExpiredTokenError(error) || (error instanceof Error && /ExpiredToken/i.test(error.message))) {
+          activeJwt = await forceRefreshSession();
+          res = await doFetch(activeJwt);
+        } else {
+          throw error;
+        }
+      }
+
+      // Merge new items on top of existing, dedup by URI/URL
+      const existingKeys = new Set(
+        blueskyFeedItems.map((item) => {
+          if (item.sourceType === "bluesky") {
+            return (item.feedItem as any)?.post?.uri || "";
+          }
+          return item.webPreview?.url || "";
+        }).filter(Boolean)
+      );
+      const newItems = res.items.filter((item) => {
+        const key = item.sourceType === "bluesky"
+          ? (item.feedItem as any)?.post?.uri || ""
+          : item.webPreview?.url || "";
+        return key && !existingKeys.has(key);
+      });
+      if (blueskyFeedItems.length > 0 && newItems.length > 0) {
+        setBlueskyFeedItems([...newItems, ...blueskyFeedItems]);
+      } else {
+        setBlueskyFeedItems(res.items);
+      }
+
       setBlueskyFeedSnapshot(res);
       setBlueskyProfileStats(res.profileStats);
       const refreshedLabel = res.refreshedAt
@@ -3862,6 +4006,7 @@ function App() {
       const shortlistedLabel = res.selectedSources.length
         ? ` ${res.selectedSources.length} source${res.selectedSources.length === 1 ? "" : "s"} shortlisted.`
         : "";
+      const newLabel = newItems.length > 0 ? `${newItems.length} new. ` : "";
       if (res.profileStatus === "embeddingUnavailable") {
         setBlueskyFeedStatus(
           res.message ||
@@ -3869,35 +4014,227 @@ function App() {
         );
       } else if (res.profileStatus === "noInterests") {
         setBlueskyFeedStatus(
-          res.message || `Personalized feed starts after text items exist under posts/.${refreshedLabel}`
+          res.message || `Personalized feed starts after text items exist under posts/ or journals/.${refreshedLabel}`
         );
       } else if (res.refreshState === "refreshing") {
         setBlueskyFeedStatus(
-          res.message || `Updating the world feed in the background. Showing the last ranked snapshot.${refreshedLabel}${shortlistedLabel}`
+          res.message || `${newLabel}Updating the world feed in the background. Showing the last ranked snapshot.${refreshedLabel}${shortlistedLabel}`
         );
       } else if (res.refreshState === "stale") {
         setBlueskyFeedStatus(
-          res.message || `Refresh is overdue. Showing the last ranked snapshot until a new pass completes.${refreshedLabel}${shortlistedLabel}`
+          res.message || `${newLabel}Refresh is overdue. Showing the last ranked snapshot until a new pass completes.${refreshedLabel}${shortlistedLabel}`
         );
       } else if (res.usedFallback) {
         setBlueskyFeedStatus(
-          res.message || `Showing fallback content, not a fully ranked world feed yet.${refreshedLabel}${shortlistedLabel}`
+          res.message || `${newLabel}Showing fallback content, not a fully ranked world feed yet.${refreshedLabel}${shortlistedLabel}`
         );
       } else {
         setBlueskyFeedStatus(
           res.message ||
             (res.profileStats.interestCount > 0
-              ? `Ranked by ${res.profileStats.interestCount} workspace interests.${refreshedLabel}${shortlistedLabel}`
-              : refreshedLabel.trim())
+              ? `${newLabel}Ranked by ${res.profileStats.interestCount} workspace interests.${refreshedLabel}${shortlistedLabel}`
+              : `${newLabel}${refreshedLabel.trim()}`)
         );
       }
     } catch (error) {
       console.error("Failed to fetch world feed", error);
       setBlueskyFeedStatus(error instanceof Error ? error.message : "Failed to load world feed.");
-      setBlueskyFeedItems([]);
-      setBlueskyFeedSnapshot(null);
+      if (blueskyFeedItems.length === 0) {
+        setBlueskyFeedItems([]);
+        setBlueskyFeedSnapshot(null);
+      }
     } finally {
       setBlueskyFeedLoading(false);
+    }
+  }
+
+  async function handleLikeBlueskyPost(postUri: string, postCid: string) {
+    if (!agent || !session) return;
+    if (blueskyLikedUris[postUri]) {
+      // Unlike
+      const likeUri = blueskyLikedUris[postUri];
+      try {
+        const bluesky = await loadBlueskyModule();
+        await bluesky.unlikeBlueskyPost(agent, likeUri);
+        setBlueskyLikedUris((prev) => {
+          const next = { ...prev };
+          delete next[postUri];
+          return next;
+        });
+      } catch (err) {
+        console.error("Unlike failed:", err);
+      }
+    } else {
+      // Like
+      try {
+        const bluesky = await loadBlueskyModule();
+        const res = await bluesky.likeBlueskyPost(agent, session.did, postUri, postCid);
+        setBlueskyLikedUris((prev) => ({ ...prev, [postUri]: res.uri }));
+      } catch (err) {
+        console.error("Like failed:", err);
+      }
+    }
+  }
+
+  async function handleExpandThread(postUri: string) {
+    if (expandedThreadUri === postUri) {
+      setExpandedThreadUri("");
+      setThreadData(null);
+      return;
+    }
+    setExpandedThreadUri(postUri);
+    setThreadLoading(true);
+    setThreadData(null);
+    try {
+      const bluesky = await loadBlueskyModule();
+      const serviceUrl = creds.serviceUrl.trim() || "https://public.api.bsky.app";
+      const jwt = session?.accessJwt || "";
+      const data = await bluesky.fetchBlueskyThread(serviceUrl, jwt, postUri);
+      setThreadData(data);
+    } catch (err) {
+      console.error("Failed to fetch thread:", err);
+      setThreadData({ error: err instanceof Error ? err.message : "Failed to load thread" });
+    } finally {
+      setThreadLoading(false);
+    }
+  }
+
+  async function handleReplyToBlueskyPost(parentUri: string, parentCid: string, rootUri: string, rootCid: string) {
+    const text = replyDrafts[parentUri]?.trim();
+    if (!text || !agent || !session) return;
+    setReplyingUri(parentUri);
+    try {
+      const bluesky = await loadBlueskyModule();
+      await bluesky.replyToBlueskyPost(agent, session.did, text, parentUri, parentCid, rootUri, rootCid);
+      setReplyDrafts((prev) => {
+        const next = { ...prev };
+        delete next[parentUri];
+        return next;
+      });
+      // Refresh thread to show new reply
+      const serviceUrl = creds.serviceUrl.trim() || "https://public.api.bsky.app";
+      const data = await bluesky.fetchBlueskyThread(serviceUrl, session.accessJwt, expandedThreadUri || parentUri);
+      setThreadData(data);
+    } catch (err) {
+      console.error("Reply failed:", err);
+    } finally {
+      setReplyingUri("");
+    }
+  }
+
+  async function ensureNostrKeys(): Promise<NostrKeys | null> {
+    if (nostrKeys) return nostrKeys;
+    setNostrKeysBusy(true);
+    try {
+      const nostrModule = await import("./lib/nostr");
+      const keys = await nostrModule.generateNostrKeys();
+      await saveNostrKeysSecure(keys);
+      setNostrKeys(keys);
+      return keys;
+    } catch (err) {
+      console.error("Failed to generate Nostr keys:", err);
+      return null;
+    } finally {
+      setNostrKeysBusy(false);
+    }
+  }
+
+  async function handleNostrReaction(eventId: string, relayUrl: string) {
+    const keys = await ensureNostrKeys();
+    if (!keys) return;
+    try {
+      const nostrModule = await import("./lib/nostr");
+      const event = await nostrModule.createSignedEvent(keys, 7, "+", [["e", eventId], ["p", ""]]);
+      await nostrModule.publishToRelay(relayUrl, event);
+    } catch (err) {
+      console.error("Nostr reaction failed:", err);
+    }
+  }
+
+  async function handleNostrReply(eventId: string, relayUrl: string, content: string) {
+    const keys = await ensureNostrKeys();
+    if (!keys || !content.trim()) return;
+    try {
+      const nostrModule = await import("./lib/nostr");
+      const event = await nostrModule.createSignedEvent(keys, 1, content.trim(), [["e", eventId, relayUrl, "reply"]]);
+      await nostrModule.publishToRelay(relayUrl, event);
+    } catch (err) {
+      console.error("Nostr reply failed:", err);
+    }
+  }
+
+  async function fetchVideoFallback() {
+    if (videoFallbackLoading || videoFallbackItems.length > 0) return;
+    setVideoFallbackLoading(true);
+    const results: any[] = [];
+    try {
+      // Fetch from Bluesky "videos" feed generator (whats-hot-video)
+      const activeJwt = session?.accessJwt;
+      if (activeJwt) {
+        try {
+          const serviceUrl = (creds.serviceUrl.trim() || "https://bsky.social").replace(/\/+$/, "");
+          const feedUri = "at://did:plc:qh3lfd7q24h3fn3pejqr25ct/app.bsky.feed.generator/videos";
+          const url = `${serviceUrl}/xrpc/app.bsky.feed.getFeed?feed=${encodeURIComponent(feedUri)}&limit=15`;
+          const res = await fetch(url, {
+            headers: { Authorization: `Bearer ${activeJwt}` },
+            signal: AbortSignal.timeout(10000)
+          });
+          if (res.ok) {
+            const data = await res.json();
+            const feed = Array.isArray(data?.feed) ? data.feed : [];
+            for (const entry of feed) {
+              const post = entry?.post;
+              if (!post) continue;
+              const embed = post.embed;
+              if (embed?.$type === "app.bsky.embed.video#view" ||
+                  (embed?.$type === "app.bsky.embed.recordWithMedia#view" && embed?.media?.$type === "app.bsky.embed.video#view")) {
+                results.push({ source: "bluesky", post, feedItem: entry });
+              }
+            }
+          }
+        } catch (err) {
+          console.warn("Bluesky video feed fallback failed:", err);
+        }
+      }
+      // Fetch from Nostr primal relay (filter for video URLs in kind-1 notes)
+      try {
+        const primalRelayUrl = "wss://relay.primal.net";
+        const nostrVideos = await new Promise<any[]>((resolve) => {
+          const items: any[] = [];
+          const timeout = setTimeout(() => { try { ws.close(); } catch {} resolve(items); }, 6000);
+          const ws = new WebSocket(primalRelayUrl);
+          ws.onopen = () => {
+            const since = Math.floor(Date.now() / 1000) - 7 * 86400;
+            ws.send(JSON.stringify(["REQ", "vid", { kinds: [1], since, limit: 40 }]));
+          };
+          ws.onmessage = (msg) => {
+            try {
+              const data = JSON.parse(msg.data);
+              if (Array.isArray(data) && data[0] === "EVENT" && data[2]) {
+                const ev = data[2];
+                const content = String(ev.content || "");
+                if (/\.(mp4|webm|mov|m3u8)|video\.|youtu\.?be|vimeo/i.test(content)) {
+                  items.push(ev);
+                }
+              }
+              if (Array.isArray(data) && data[0] === "EOSE") {
+                clearTimeout(timeout);
+                ws.close();
+                resolve(items);
+              }
+            } catch {}
+          };
+          ws.onerror = () => { clearTimeout(timeout); resolve(items); };
+        });
+        for (const ev of nostrVideos.slice(0, 10)) {
+          results.push({ source: "nostr", event: ev, relayUrl: "wss://relay.primal.net" });
+        }
+      } catch (err) {
+        console.warn("Nostr video fallback failed:", err);
+      }
+    } finally {
+      setVideoFallbackItems(results);
+      setVideoFallbackLoading(false);
     }
   }
 
@@ -4290,6 +4627,21 @@ function App() {
     }
   }
 
+  async function openFeedLink(url: string) {
+    const trimmed = url.trim();
+    if (!trimmed) return;
+    try {
+      if (isDesktopClient) {
+        await invokeDesktopCommandStrict("open_external_url", { url: trimmed });
+      } else {
+        window.open(trimmed, "_blank", "noopener,noreferrer");
+      }
+    } catch {
+      // Best-effort fallback
+      window.open(trimmed, "_blank", "noopener,noreferrer");
+    }
+  }
+
   async function openWorkspaceJournalsFolder() {
     if (!isDesktopClient) {
       return;
@@ -4388,6 +4740,72 @@ function App() {
       });
     } finally {
       setAiSetupBusy(false);
+    }
+  }
+
+  async function loadAnthropicTokenStatus() {
+    if (!isDesktopClient) {
+      return;
+    }
+    try {
+      const next = await invokeDesktopCommandStrict<AnthropicTokenStatus>(
+        "get_anthropic_token_status"
+      );
+      setClaudeTokenStatus(next);
+    } catch (error) {
+      setClaudeTokenStatus({
+        isSet: false,
+        message: `Unable to check Claude auth status`,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async function saveAnthropicToken() {
+    if (!isDesktopClient) {
+      return;
+    }
+    const trimmed = claudeToken.trim();
+    if (!trimmed) {
+      return;
+    }
+    setClaudeTokenBusy(true);
+    try {
+      const next = await invokeDesktopCommandStrict<AnthropicTokenStatus>(
+        "save_anthropic_token",
+        { token: trimmed }
+      );
+      setClaudeTokenStatus(next);
+      setClaudeToken("");
+    } catch (error) {
+      setClaudeTokenStatus({
+        isSet: false,
+        message: `Failed to save Claude token`,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setClaudeTokenBusy(false);
+    }
+  }
+
+  async function clearAnthropicToken() {
+    if (!isDesktopClient) {
+      return;
+    }
+    setClaudeTokenBusy(true);
+    try {
+      const next = await invokeDesktopCommandStrict<AnthropicTokenStatus>(
+        "clear_anthropic_token"
+      );
+      setClaudeTokenStatus(next);
+    } catch (error) {
+      setClaudeTokenStatus({
+        isSet: false,
+        message: `Failed to clear Claude token`,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setClaudeTokenBusy(false);
     }
   }
 
@@ -4743,6 +5161,7 @@ function App() {
       return;
     }
     void loadOpenAiDeviceCodeStatus();
+    void loadAnthropicTokenStatus();
   }, [isDesktopClient]);
 
   useEffect(() => {
@@ -6193,7 +6612,7 @@ function App() {
                       <p className="text-center muted">{blueskyFeedStatus}</p>
                     ) : null}
                     <p className="text-center muted">
-                      No world-feed items found yet. Add workspace posts, seed more RSS sources, or connect Bluesky.
+                      No world-feed items found yet. Add workspace posts or journals, seed more RSS sources, or connect Bluesky.
                     </p>
                   </div>
                 ) : (
@@ -6351,6 +6770,11 @@ function App() {
                                     {protocol.empty}
                                   </p>
                                 )}
+                                {protocol.data.error ? (
+                                  <div className="feed-comment-status">
+                                    Error: {protocol.data.error}
+                                  </div>
+                                ) : null}
                               </div>
                             );
                           })}
@@ -6485,12 +6909,177 @@ function App() {
                         </div>
                       </div>
                     ) : null}
-                    {blueskyFeedItems.map((item, idx) => {
+                    <div className="world-feed-tabs">
+                      <button type="button" className={`world-feed-tab ${worldFeedTab === "all" ? "active" : ""}`} onClick={() => setWorldFeedTab("all")}>All</button>
+                      <button type="button" className={`world-feed-tab ${worldFeedTab === "videos" ? "active" : ""}`} onClick={() => { setWorldFeedTab("videos"); void fetchVideoFallback(); }}>Videos</button>
+                    </div>
+                    {(() => {
+                      const isVideoItem = (it: PersonalizedFeedItem) => {
+                        if (it.sourceType === "bluesky") {
+                          const embed = (it.feedItem as any)?.post?.embed;
+                          return embed?.$type === "app.bsky.embed.video#view" ||
+                            (embed?.$type === "app.bsky.embed.recordWithMedia#view" && embed?.media?.$type === "app.bsky.embed.video#view");
+                        }
+                        return false;
+                      };
+                      const visibleItems = worldFeedTab === "videos"
+                        ? blueskyFeedItems.filter(isVideoItem)
+                        : blueskyFeedItems;
+                      if (worldFeedTab === "videos" && visibleItems.length === 0) {
+                        // Show fallback video content from Bluesky video feed + Nostr
+                        if (videoFallbackLoading) {
+                          return <p className="text-center muted" style={{ padding: "1.5rem" }}>Loading videos...</p>;
+                        }
+                        if (videoFallbackItems.length === 0) {
+                          return <p className="text-center muted" style={{ padding: "1.5rem" }}>No video posts found yet. Try refreshing.</p>;
+                        }
+                        return videoFallbackItems.map((vItem, vi) => {
+                          if (vItem.source === "bluesky" && vItem.post) {
+                            const post = vItem.post;
+                            const author = post.author || {};
+                            const record = post.record as any;
+                            const vText = String(record?.text || "");
+                            const embedNode = renderBlueskyEmbed(post.embed as any);
+                            return (
+                              <div key={`vfb-${post.cid || vi}`} className="feed-item">
+                                <div className="feed-header">
+                                  <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                                    {author.avatar && <img src={author.avatar} alt="" style={{ width: "36px", height: "36px", borderRadius: "50%", objectFit: "cover" }} />}
+                                    <div className="stack-sm" style={{ gap: "0.05rem" }}>
+                                      <strong>{author.displayName || author.handle}</strong>
+                                      <span className="muted text-sm" style={{ fontWeight: "normal" }}>@{author.handle}</span>
+                                      <span className="muted text-sm" style={{ fontWeight: "normal" }}>via Bluesky Videos</span>
+                                    </div>
+                                  </div>
+                                  <div className="feed-time">{formatTimestamp(post.indexedAt)}</div>
+                                </div>
+                                <div className="feed-body" style={{ marginTop: "8px", wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
+                                  {renderLinkedText(vText)}
+                                </div>
+                                {embedNode}
+                                <div className="bsky-actions">
+                                  <button
+                                    type="button"
+                                    className={`bsky-action-btn ${blueskyLikedUris[post.uri] ? "liked" : ""}`}
+                                    onClick={() => void handleLikeBlueskyPost(post.uri, post.cid)}
+                                    disabled={!session}
+                                  >
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill={blueskyLikedUris[post.uri] ? "#f91880" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+                                    {post.likeCount || 0}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className={`bsky-action-btn ${expandedThreadUri === post.uri ? "liked" : ""}`}
+                                    onClick={() => void handleExpandThread(post.uri)}
+                                  >
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
+                                    {post.replyCount || 0}
+                                  </button>
+                                  <span className="bsky-action-btn" style={{ cursor: "default" }}>
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 1l4 4-4 4"></path><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><path d="M7 23l-4-4 4-4"></path><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
+                                    {post.repostCount || 0}
+                                  </span>
+                                </div>
+                                {expandedThreadUri === post.uri ? (
+                                  <div className="bsky-thread-panel">
+                                    {threadLoading ? (
+                                      <div className="bsky-thread-loading">Loading comments...</div>
+                                    ) : threadData?.thread?.replies?.length > 0 ? (
+                                      <div className="bsky-thread-replies">
+                                        {threadData.thread.replies.slice(0, 10).map((reply: any, ri: number) => {
+                                          const rPost = reply?.post;
+                                          if (!rPost) return null;
+                                          const rAuthor = rPost.author || {};
+                                          const rRecord = rPost.record as any;
+                                          return (
+                                            <div key={rPost.cid || ri} className="bsky-thread-reply">
+                                              {rAuthor.avatar ? <img src={rAuthor.avatar} alt="" className="bsky-reply-avatar" /> : <div className="bsky-reply-avatar" style={{ background: "var(--line)" }} />}
+                                              <div className="bsky-reply-body">
+                                                <span className="bsky-reply-author">{rAuthor.displayName || rAuthor.handle}</span>
+                                                <span className="bsky-reply-handle">@{rAuthor.handle}</span>
+                                                <div className="bsky-reply-text">{String(rRecord?.text || "")}</div>
+                                                <div className="bsky-reply-time">{formatTimestamp(rPost.indexedAt)}</div>
+                                              </div>
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    ) : (
+                                      <div className="text-sm muted">No replies yet.</div>
+                                    )}
+                                    {session ? (
+                                      <div className="bsky-reply-compose">
+                                        <textarea
+                                          className="bsky-reply-input"
+                                          rows={1}
+                                          placeholder="Write a reply..."
+                                          value={replyDrafts[post.uri] || ""}
+                                          onChange={(e) => {
+                                            e.target.style.height = "0px";
+                                            e.target.style.height = `${e.target.scrollHeight}px`;
+                                            setReplyDrafts((prev) => ({ ...prev, [post.uri]: e.target.value }));
+                                          }}
+                                        />
+                                        <button
+                                          type="button"
+                                          className="primary bsky-reply-send"
+                                          disabled={!replyDrafts[post.uri]?.trim() || replyingUri === post.uri}
+                                          onClick={() => void handleReplyToBlueskyPost(post.uri, post.cid, post.uri, post.cid)}
+                                        >
+                                          {replyingUri === post.uri ? "..." : "Reply"}
+                                        </button>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                ) : null}
+                              </div>
+                            );
+                          }
+                          if (vItem.source === "nostr" && vItem.event) {
+                            const ev = vItem.event;
+                            const content = String(ev.content || "");
+                            const npub = ev.pubkey ? ev.pubkey.slice(0, 12) + "..." : "anon";
+                            const videoUrlMatch = content.match(/(https?:\/\/[^\s]+\.(mp4|webm|mov|m3u8))/i);
+                            return (
+                              <div key={`vfn-${ev.id || vi}`} className="feed-item">
+                                <div className="feed-header">
+                                  <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                                    <div className="stack-sm" style={{ gap: "0.05rem" }}>
+                                      <strong>{npub}</strong>
+                                      <span className="muted text-sm" style={{ fontWeight: "normal" }}>via Nostr (primal)</span>
+                                    </div>
+                                  </div>
+                                  <div className="feed-time">{ev.created_at ? formatTimestamp(ev.created_at * 1000) : ""}</div>
+                                </div>
+                                <div className="feed-body" style={{ marginTop: "8px", wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
+                                  {renderLinkedText(content)}
+                                </div>
+                                {videoUrlMatch ? (
+                                  <div className="bluesky-embed-video-wrap" style={{ marginTop: "0.5rem" }}>
+                                    <video className="bluesky-embed-video" controls preload="metadata" src={videoUrlMatch[1]} />
+                                  </div>
+                                ) : null}
+                                <div className="bsky-actions">
+                                  <button type="button" className="bsky-action-btn" onClick={() => void handleNostrReaction(ev.id, vItem.relayUrl)} disabled={nostrKeysBusy}>
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+                                    Like
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          }
+                          return null;
+                        });
+                      }
+                      return visibleItems.map((item, idx) => {
                       if (item.sourceType === "web" && item.webPreview) {
                         const preview = item.webPreview;
                         const selectedSource = item.feedSource;
+                        const isNostr = preview.provider === "Nostr";
+                        const nostrEventId = isNostr ? (preview.url.split("/").pop() || "") : "";
+                        const nostrRelayUrl = isNostr && selectedSource?.label ? `wss://${selectedSource.label}` : "";
                         return (
-                          <div key={`${preview.url}-${idx}`} className="feed-item">
+                          <div key={`${preview.url}-${idx}`} className="feed-item" style={{ cursor: isNostr ? undefined : "pointer" }} onClick={() => { if (!isNostr && preview.url) void openFeedLink(preview.url); }}>
                             <div className="feed-header">
                               <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                                 <div className="stack-sm" style={{ gap: "0.05rem" }}>
@@ -6516,10 +7105,7 @@ function App() {
                                 {preview.discoveredAt ? formatTimestamp(preview.discoveredAt) : "now"}
                               </div>
                             </div>
-                            <a
-                              href={preview.url}
-                              target="_blank"
-                              rel="noreferrer"
+                            <div
                               className="bluesky-external-card"
                               style={{ marginTop: "0.75rem" }}
                             >
@@ -6537,7 +7123,7 @@ function App() {
                                 ) : null}
                                 <div className="bluesky-external-domain">{preview.domain || preview.url}</div>
                               </div>
-                            </a>
+                            </div>
                             {preview.providerSnippet ? (
                               <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
                                 Search snippet: {preview.providerSnippet}
@@ -6552,6 +7138,58 @@ function App() {
                                   : ""}
                               </div>
                             ) : null}
+                            {isNostr ? (
+                              <div className="bsky-actions">
+                                <button type="button" className="bsky-action-btn" onClick={() => void handleNostrReaction(nostrEventId, nostrRelayUrl)} disabled={nostrKeysBusy}>
+                                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+                                  Like
+                                </button>
+                                <button
+                                  type="button"
+                                  className="bsky-action-btn"
+                                  onClick={() => setExpandedThreadUri(expandedThreadUri === preview.url ? "" : preview.url)}
+                                >
+                                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
+                                  Reply
+                                </button>
+                              </div>
+                            ) : null}
+                            {isNostr && expandedThreadUri === preview.url ? (
+                              <div className="bsky-thread-panel">
+                                {nostrKeys ? (
+                                  <div className="text-sm muted" style={{ marginBottom: "0.4rem" }}>Replying as {nostrKeys.npub.slice(0, 16)}...</div>
+                                ) : (
+                                  <div className="nostr-identity-banner">
+                                    <span className="text-sm"><strong>Nostr Identity</strong></span>
+                                    <span className="text-sm muted">A new Nostr key pair will be created automatically when you reply.</span>
+                                  </div>
+                                )}
+                                <div className="bsky-reply-compose">
+                                  <textarea
+                                    className="bsky-reply-input"
+                                    rows={1}
+                                    placeholder="Reply to this note..."
+                                    value={replyDrafts[preview.url] || ""}
+                                    onChange={(e) => {
+                                      e.target.style.height = "0px";
+                                      e.target.style.height = `${e.target.scrollHeight}px`;
+                                      setReplyDrafts((prev) => ({ ...prev, [preview.url]: e.target.value }));
+                                    }}
+                                  />
+                                  <button
+                                    type="button"
+                                    className="primary bsky-reply-send"
+                                    disabled={!replyDrafts[preview.url]?.trim() || nostrKeysBusy}
+                                    onClick={() => {
+                                      void handleNostrReply(nostrEventId, nostrRelayUrl, replyDrafts[preview.url] || "");
+                                      setReplyDrafts((prev) => { const n = { ...prev }; delete n[preview.url]; return n; });
+                                    }}
+                                  >
+                                    Send
+                                  </button>
+                                </div>
+                              </div>
+                            ) : null}
                           </div>
                         );
                       }
@@ -6562,6 +7200,10 @@ function App() {
                       const text = String(record?.text || "");
                       const feedSource = item.feedSource;
                       const embedNode = renderBlueskyEmbed(post.embed as any);
+                      const postUri = post.uri;
+                      const postCid = post.cid;
+                      const isLiked = Boolean(blueskyLikedUris[postUri] || (post.viewer as any)?.like);
+                      const isThreadOpen = expandedThreadUri === postUri;
                       const facetLinks = Array.isArray(record?.facets)
                         ? record.facets
                             .flatMap((facet: any) =>
@@ -6581,6 +7223,9 @@ function App() {
                             (post.embed as any).$type === "app.bsky.embed.recordWithMedia#view" &&
                             (post.embed as any).media?.$type === "app.bsky.embed.external#view"
                         );
+                      // Find root URI/CID for replies (needed for reply threading)
+                      const rootUri = postUri;
+                      const rootCid = postCid;
                       return (
                         <div key={`${post.cid}-${idx}`} className="feed-item">
                           <div className="feed-header">
@@ -6649,30 +7294,159 @@ function App() {
                               ))}
                             </div>
                           ) : null}
-                          <div className="feed-stats row text-sm muted mt-2" style={{ gap: "1rem", marginTop: "0.8rem" }}>
-                            <span style={{ display: "flex", alignItems: "center", gap: "0.3rem" }}>
+                          <div className="bsky-actions">
+                            <button
+                              type="button"
+                              className={`bsky-action-btn ${isLiked ? "liked" : ""}`}
+                              onClick={() => void handleLikeBlueskyPost(postUri, postCid)}
+                              disabled={!session}
+                            >
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill={isLiked ? "#f91880" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+                              {(post.likeCount || 0) + (blueskyLikedUris[postUri] && !(post.viewer as any)?.like ? 1 : 0)}
+                            </button>
+                            <button
+                              type="button"
+                              className={`bsky-action-btn ${isThreadOpen ? "liked" : ""}`}
+                              onClick={() => void handleExpandThread(postUri)}
+                            >
                               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
                               {post.replyCount || 0}
-                            </span>
-                            <span style={{ display: "flex", alignItems: "center", gap: "0.3rem" }}>
+                            </button>
+                            <span className="bsky-action-btn" style={{ cursor: "default" }}>
                               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 1l4 4-4 4"></path><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><path d="M7 23l-4-4 4-4"></path><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
                               {post.repostCount || 0}
                             </span>
-                            <span style={{ display: "flex", alignItems: "center", gap: "0.3rem" }}>
-                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
-                              {post.likeCount || 0}
-                            </span>
                           </div>
+                          {isThreadOpen ? (
+                            <div className="bsky-thread-panel">
+                              {threadLoading ? (
+                                <div className="bsky-thread-loading">Loading comments...</div>
+                              ) : threadData?.error ? (
+                                <div className="text-sm muted">{threadData.error}</div>
+                              ) : threadData?.thread?.replies?.length > 0 ? (
+                                <div className="bsky-thread-replies">
+                                  {threadData.thread.replies.slice(0, 20).map((reply: any, ri: number) => {
+                                    const rPost = reply?.post;
+                                    if (!rPost) return null;
+                                    const rAuthor = rPost.author || {};
+                                    const rRecord = rPost.record as any;
+                                    const rText = String(rRecord?.text || "");
+                                    return (
+                                      <div key={rPost.cid || ri} className="bsky-thread-reply">
+                                        {rAuthor.avatar ? <img src={rAuthor.avatar} alt="" className="bsky-reply-avatar" /> : <div className="bsky-reply-avatar" style={{ background: "var(--line)" }} />}
+                                        <div className="bsky-reply-body">
+                                          <span className="bsky-reply-author">{rAuthor.displayName || rAuthor.handle}</span>
+                                          <span className="bsky-reply-handle">@{rAuthor.handle}</span>
+                                          <div className="bsky-reply-text">{renderLinkedText(rText)}</div>
+                                          <div className="bsky-reply-time">{formatTimestamp(rPost.indexedAt)}</div>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : (
+                                <div className="text-sm muted">No replies yet.</div>
+                              )}
+                              {session ? (
+                                <div className="bsky-reply-compose">
+                                  <textarea
+                                    className="bsky-reply-input"
+                                    rows={1}
+                                    placeholder="Write a reply..."
+                                    value={replyDrafts[postUri] || ""}
+                                    onChange={(e) => {
+                                      e.target.style.height = "0px";
+                                      e.target.style.height = `${e.target.scrollHeight}px`;
+                                      setReplyDrafts((prev) => ({ ...prev, [postUri]: e.target.value }));
+                                    }}
+                                  />
+                                  <button
+                                    type="button"
+                                    className="primary bsky-reply-send"
+                                    disabled={!replyDrafts[postUri]?.trim() || replyingUri === postUri}
+                                    onClick={() => void handleReplyToBlueskyPost(postUri, postCid, rootUri, rootCid)}
+                                  >
+                                    {replyingUri === postUri ? "..." : "Reply"}
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className="text-sm muted" style={{ marginTop: "0.5rem" }}>Sign in to Bluesky to reply.</div>
+                              )}
+                            </div>
+                          ) : null}
                         </div>
                       );
-                    })}
+                    });
+                    })()}
                   </div>
                 )
-              ) : feedItems.length === 0 ? (
-                <p className="text-center muted">No items in your workspace feed yet.</p>
               ) : (
                 <div className="stack">
-                  {feedItems.map(item => {
+                  {/* Me feed profile header */}
+                  <div className="me-profile-header">
+                    {session ? (
+                      <div className="me-profile-avatar-placeholder">{session.handle.charAt(0).toUpperCase()}</div>
+                    ) : (
+                      <div className="me-profile-avatar-placeholder">?</div>
+                    )}
+                    <div className="me-profile-info">
+                      <div className="me-profile-name">{session?.handle || "Your Profile"}</div>
+                      {session ? <div className="me-profile-handle">@{session.handle}</div> : null}
+                      <div className="me-profile-stats">
+                        <span><strong>{feedItems.length}</strong> draft{feedItems.length === 1 ? "" : "s"}</span>
+                        <span><strong>{postedHistory.length}</strong> published</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Me feed sub-tabs */}
+                  <div className="world-feed-tabs">
+                    <button type="button" className={`world-feed-tab ${meFeedTab === "drafts" ? "active" : ""}`} onClick={() => setMeFeedTab("drafts")}>Drafts</button>
+                    <button type="button" className={`world-feed-tab ${meFeedTab === "published" ? "active" : ""}`} onClick={() => setMeFeedTab("published")}>Published ({postedHistory.length})</button>
+                  </div>
+
+                  {meFeedTab === "published" ? (
+                    postedHistory.length === 0 ? (
+                      <p className="text-center muted" style={{ padding: "1.5rem" }}>No published posts yet.</p>
+                    ) : (
+                      <div className="stack">
+                        {postedHistory.slice(0, 40).map((item, idx) => (
+                          <div key={`${item.uri || item.created}-${idx}`} className="feed-item">
+                            <div className="feed-header">
+                              <div className="feed-title">
+                                {item.videoName || "Text post"}
+                                {item.status === "error" ? <span style={{ color: "var(--error)", marginLeft: "0.4rem" }}>(failed)</span> : null}
+                              </div>
+                              <div className="feed-time">{formatTimestamp(item.created)}</div>
+                            </div>
+                            {item.text ? (
+                              <div className="feed-body" style={{ maxHeight: "6rem", overflow: "hidden" }}>
+                                {item.text.slice(0, 300)}{item.text.length > 300 ? "..." : ""}
+                              </div>
+                            ) : null}
+                            <div className="feed-actions">
+                              {item.uri ? (
+                                <a
+                                  href={`https://bsky.app/profile/${session?.handle || ""}/post/${item.uri.split("/").pop()}`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="ghost text-sm"
+                                  style={{ padding: "0.35rem 0.75rem", borderRadius: "8px", textDecoration: "none" }}
+                                >
+                                  View on Bluesky
+                                </a>
+                              ) : null}
+                              {item.error ? (
+                                <span className="text-sm" style={{ color: "var(--error)" }}>{item.error}</span>
+                              ) : null}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )
+                  ) : feedItems.length === 0 ? (
+                    <p className="text-center muted" style={{ padding: "1.5rem" }}>No draft items in your workspace feed yet.</p>
+                  ) : feedItems.map(item => {
                     const workflowBot = workflowBotForPath(item.path, feedAttributedBots);
                     const isCommentOpen = activeFeedCommentPath === item.path;
                     const commentDraft = feedCommentDrafts[item.path] || "";
@@ -6818,37 +7592,6 @@ function App() {
                       </div>
                     );
                   })}
-                  {postedHistory.length > 0 && (
-                    <div className="posted-history">
-                      <button
-                        type="button"
-                        className="ghost posted-history-toggle"
-                        onClick={() => setFeedPostedSectionOpen((prev) => !prev)}
-                      >
-                        {feedPostedSectionOpen ? "Hide Posted" : `Show Posted (${postedHistory.length})`}
-                      </button>
-                      {feedPostedSectionOpen && (
-                        <div className="posted-history-list">
-                          {postedHistory.slice(0, 20).map((item, idx) => (
-                            <div key={`${item.uri || item.created}-${idx}`} className="posted-history-item">
-                              <div className="feed-title">{item.videoName || "Text post"}</div>
-                              <div className="feed-time">{formatTimestamp(item.created)}</div>
-                              {item.uri ? (
-                                <a
-                                  href={`https://bsky.app/profile/${session?.handle || ""}/post/${item.uri.split("/").pop()}`}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="text-sm"
-                                >
-                                  Open on Bluesky
-                                </a>
-                              ) : null}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
                 </div>
               )}
               </div>
@@ -7208,6 +7951,58 @@ function App() {
                     {aiSetupStatus?.error ? (
                       <p className="text-sm" style={{ color: "var(--danger)" }}>
                         {aiSetupStatus.error}
+                      </p>
+                    ) : null}
+                  </div>
+                </div>
+
+                  <div className="card">
+                  <h2>Claude / Anthropic</h2>
+                  <div className="stack">
+                    <p className="text-sm muted">
+                      Paste your Claude subscription token or Anthropic API key (<code>sk-ant-api…</code>). Runs <code>zeroclaw auth paste-token --provider anthropic</code> internally.
+                    </p>
+                    {claudeTokenStatus?.isSet ? (
+                      <div className="badge success" style={{ alignSelf: "flex-start" }}>
+                        Token saved ✓
+                      </div>
+                    ) : (
+                      <div className="badge" style={{ alignSelf: "flex-start" }}>
+                        Not configured
+                      </div>
+                    )}
+                    <input
+                      type="password"
+                      value={claudeToken}
+                      onChange={(e) => setClaudeToken(e.target.value)}
+                      placeholder="Paste Claude token or sk-ant-api key…"
+                      autoComplete="off"
+                    />
+                    <div className="row">
+                      <button
+                        type="button"
+                        className="primary"
+                        onClick={() => void saveAnthropicToken()}
+                        disabled={claudeTokenBusy || !claudeToken.trim()}
+                        style={{ flex: 1 }}
+                      >
+                        {claudeTokenBusy ? "Saving..." : "Save Token"}
+                      </button>
+                      <button
+                        type="button"
+                        className="danger"
+                        onClick={() => void clearAnthropicToken()}
+                        disabled={claudeTokenBusy || !claudeTokenStatus?.isSet}
+                      >
+                        Clear
+                      </button>
+                    </div>
+                    {claudeTokenStatus?.message ? (
+                      <p className="text-sm muted">{claudeTokenStatus.message}</p>
+                    ) : null}
+                    {claudeTokenStatus?.error ? (
+                      <p className="text-sm" style={{ color: "var(--danger)" }}>
+                        {claudeTokenStatus.error}
                       </p>
                     ) : null}
                   </div>

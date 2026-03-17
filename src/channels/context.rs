@@ -1,4 +1,3 @@
-use crate::cron::DeliveryConfig;
 use std::future::Future;
 
 #[derive(Debug, Clone)]
@@ -37,50 +36,20 @@ pub fn current_channel_execution_context() -> Option<ChannelExecutionContext> {
     CHANNEL_EXECUTION_CONTEXT.try_with(Clone::clone).ok()
 }
 
-/// Default cron delivery for jobs created while handling a channel message.
-///
-/// This allows generic scheduling tools (`cron_add`, `schedule`) to inherit the
-/// originating channel/thread without provider- or reminder-specific patches.
-pub fn default_cron_delivery_for_current_channel() -> Option<DeliveryConfig> {
-    let ctx = current_channel_execution_context()?;
-    let channel = ctx.channel.trim().to_ascii_lowercase();
-    let recipient = ctx.recipient.trim();
-    if recipient.is_empty() {
-        return None;
-    }
-
-    match channel.as_str() {
-        "pocketbase" => Some(DeliveryConfig {
-            mode: "announce".to_string(),
-            channel: Some("pocketbase".to_string()),
-            to: Some(recipient.to_string()),
-            best_effort: true,
-        }),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn no_context_returns_none() {
-        assert!(default_cron_delivery_for_current_channel().is_none());
-    }
-
     #[tokio::test]
-    async fn pocketbase_context_maps_to_announce_delivery() {
+    async fn channel_context_roundtrips() {
         let ctx = ChannelExecutionContext::new("pocketbase", "thread-123", Some("thread-123".into()));
-        let delivery = with_channel_execution_context(ctx, async {
-            default_cron_delivery_for_current_channel()
+        let retrieved = with_channel_execution_context(ctx, async {
+            current_channel_execution_context()
         })
         .await
-        .expect("delivery should exist");
+        .expect("context should exist");
 
-        assert_eq!(delivery.mode, "announce");
-        assert_eq!(delivery.channel.as_deref(), Some("pocketbase"));
-        assert_eq!(delivery.to.as_deref(), Some("thread-123"));
-        assert!(delivery.best_effort);
+        assert_eq!(retrieved.channel, "pocketbase");
+        assert_eq!(retrieved.recipient, "thread-123");
     }
 }

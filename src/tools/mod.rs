@@ -6,7 +6,7 @@
 //! `execute` method returning a structured [`ToolResult`].
 //!
 //! Tools are assembled into registries by [`default_tools`] (shell, file read/write)
-//! and [`all_tools`] (full set including memory, browser, cron, HTTP, delegation,
+//! and [`all_tools`] (full set including memory, media, web search,
 //! and optional integrations). Security policy enforcement is injected via
 //! [`SecurityPolicy`](crate::security::SecurityPolicy) at construction time.
 //!
@@ -17,12 +17,6 @@
 
 pub mod cli_discovery;
 pub mod content_search;
-pub mod cron_add;
-pub mod cron_list;
-pub mod cron_remove;
-pub mod cron_run;
-pub mod cron_runs;
-pub mod cron_update;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -33,7 +27,6 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod media_tools;
 pub mod model_routing_config;
-pub mod schedule;
 pub mod schema;
 pub mod shell;
 pub mod traits;
@@ -41,12 +34,6 @@ pub mod web_search_tool;
 pub mod task_plan;
 
 pub use content_search::ContentSearchTool;
-pub use cron_add::CronAddTool;
-pub use cron_list::CronListTool;
-pub use cron_remove::CronRemoveTool;
-pub use cron_run::CronRunTool;
-pub use cron_runs::CronRunsTool;
-pub use cron_update::CronUpdateTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -60,7 +47,6 @@ pub use media_tools::{
     StitchImagesWithAudioTool, TranscribeMediaTool,
 };
 pub use model_routing_config::ModelRoutingConfigTool;
-pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use shell::ShellTool;
@@ -124,15 +110,7 @@ fn tool_allowed_in_profile(name: &str, profile: ToolProfile) -> bool {
         ToolProfile::Full => true,
         ToolProfile::UiRestricted => !matches!(
             name,
-            "shell"
-                | "schedule"
-                | "cron_add"
-                | "cron_list"
-                | "cron_remove"
-                | "cron_run"
-                | "cron_runs"
-                | "cron_update"
-                | "git_operations"
+            "shell" | "git_operations"
         ),
     }
 }
@@ -260,16 +238,9 @@ pub fn all_tools_with_runtime_and_profile(
         Arc::new(FileEditTool::new(security.clone())),
         Arc::new(GlobSearchTool::new(security.clone())),
         Arc::new(ContentSearchTool::new(security.clone())),
-        Arc::new(CronAddTool::new(config.clone(), security.clone())),
-        Arc::new(CronListTool::new(config.clone())),
-        Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
-        Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
-        Arc::new(CronRunTool::new(config.clone(), security.clone())),
-        Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
-        Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
@@ -387,13 +358,12 @@ mod tests {
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"content_search"));
     }
 
     #[test]
-    fn full_profile_keeps_shell_scheduler_and_git_tools() {
+    fn full_profile_keeps_shell_and_git_tools() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -424,23 +394,13 @@ mod tests {
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        for name in [
-            "shell",
-            "schedule",
-            "git_operations",
-            "cron_add",
-            "cron_list",
-            "cron_remove",
-            "cron_run",
-            "cron_runs",
-            "cron_update",
-        ] {
+        for name in ["shell", "git_operations"] {
             assert!(names.contains(&name), "missing tool {name} in full profile");
         }
     }
 
     #[test]
-    fn ui_restricted_profile_omits_shell_scheduler_cron_and_git_tools() {
+    fn ui_restricted_profile_omits_shell_and_git_tools() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -471,17 +431,7 @@ mod tests {
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        for name in [
-            "shell",
-            "schedule",
-            "git_operations",
-            "cron_add",
-            "cron_list",
-            "cron_remove",
-            "cron_run",
-            "cron_runs",
-            "cron_update",
-        ] {
+        for name in ["shell", "git_operations"] {
             assert!(!names.contains(&name), "unexpected tool {name} in UI profile");
         }
         for name in [

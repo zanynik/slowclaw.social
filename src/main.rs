@@ -54,7 +54,6 @@ mod auth;
 mod channels;
 mod config;
 mod cost;
-mod cron;
 mod daemon;
 mod doctor;
 mod feed;
@@ -77,7 +76,6 @@ mod service;
 mod skillforge;
 mod skills;
 mod tools;
-mod tunnel;
 mod util;
 mod workflow_assets;
 
@@ -85,7 +83,7 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, CronCommands, IntegrationCommands, MigrateCommands, ServiceCommands,
+    ChannelCommands, IntegrationCommands, MigrateCommands, ServiceCommands,
     SkillCommands,
 };
 
@@ -212,14 +210,13 @@ Examples:
         host: Option<String>,
     },
 
-    /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
+    /// Start long-running autonomous runtime (gateway + heartbeat)
     #[command(long_about = "\
 Start the long-running autonomous daemon.
 
-Launches the full SlowClaw runtime: gateway server, all configured \
-channels (Telegram, Discord, Slack, etc.), heartbeat monitor, and \
-the cron scheduler. This is the recommended way to run SlowClaw in \
-production or as an always-on assistant.
+Launches the full SlowClaw runtime: gateway server and heartbeat \
+monitor. This is the recommended way to run SlowClaw in production \
+or as an always-on assistant.
 
 Use 'slowclaw service install' to register the daemon as an OS \
 service (systemd/launchd) for auto-start on boot.
@@ -289,32 +286,6 @@ Examples:
         /// Tool name(s) for `tool-freeze` (repeatable).
         #[arg(long = "tool")]
         tools: Vec<String>,
-    },
-
-    /// Configure and manage scheduled tasks
-    #[command(long_about = "\
-Configure and manage scheduled tasks.
-
-Schedule recurring, one-shot, or interval-based tasks using cron \
-expressions, RFC 3339 timestamps, durations, or fixed intervals.
-
-Cron expressions use the standard 5-field format: \
-'min hour day month weekday'. Timezones default to UTC; \
-override with --tz and an IANA timezone name.
-
-Examples:
-  slowclaw cron list
-  slowclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  slowclaw cron add '*/30 * * * *' 'Check system health'
-  slowclaw cron add '*/15 * * * *' 'workspace-script scripts/sync.sh'
-  slowclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
-  slowclaw cron add-every 60000 'Ping heartbeat'
-  slowclaw cron once 30m 'Run backup in 30 minutes'
-  slowclaw cron pause <task-id>
-  slowclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
-    Cron {
-        #[command(subcommand)]
-        cron_command: CronCommands,
     },
 
     /// Manage provider model catalogs
@@ -875,8 +846,6 @@ async fn main() -> Result<()> {
             domains,
             tools,
         } => handle_estop_command(&config, estop_command, level, domains, tools),
-
-        Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => match model_command {
             ModelCommands::Refresh {

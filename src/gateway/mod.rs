@@ -400,12 +400,17 @@ impl JournalTranscriptionJob {
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
-    // ── Security: refuse public bind without tunnel or explicit opt-in ──
-    if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
-    {
+    // Ensure the rustls CryptoProvider is installed. When the gateway is run
+    // as a library call (e.g. from Tauri) rather than via main(), the provider
+    // may not have been set up yet. Without this, any HTTPS request (RSS feeds,
+    // Bluesky API, Nostr relays, embedding providers) will panic.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // ── Security: refuse public bind without explicit opt-in ──
+    if is_public_bind(host) && !config.gateway.allow_public_bind {
         anyhow::bail!(
             "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
-             Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
+             Fix: use --host 127.0.0.1 (default) or set\n\
              [gateway] allow_public_bind = true in config.toml (NOT recommended)."
         );
     }
@@ -521,28 +526,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_max_keys,
     ));
 
-    // ── Tunnel ────────────────────────────────────────────────
-    let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
-    let mut tunnel_url: Option<String> = None;
-
-    if let Some(ref tun) = tunnel {
-        println!("🔗 Starting {} tunnel...", tun.name());
-        match tun.start(host, actual_port).await {
-            Ok(url) => {
-                println!("🌐 Tunnel active: {url}");
-                tunnel_url = Some(url);
-            }
-            Err(e) => {
-                println!("⚠️  Tunnel failed to start: {e}");
-                println!("   Falling back to local-only mode.");
-            }
-        }
-    }
-
     println!("🦀 SlowClaw Gateway listening on http://{display_addr}");
-    if let Some(ref url) = tunnel_url {
-        println!("  🌐 Public URL: {url}");
-    }
     println!("  🌐 Web UI: http://{display_addr}/");
     println!(
         "  💾 Local store: {}",
@@ -10947,7 +10931,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_ui_profile_omits_shell_scheduler_cron_and_git_tools() {
+    fn gateway_ui_profile_omits_shell_and_git_tools() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.workspace_dir = temp.path().to_path_buf();
@@ -10979,17 +10963,7 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
 
-        for removed in [
-            "shell",
-            "schedule",
-            "git_operations",
-            "cron_add",
-            "cron_list",
-            "cron_remove",
-            "cron_run",
-            "cron_runs",
-            "cron_update",
-        ] {
+        for removed in ["shell", "git_operations"] {
             assert!(
                 !names.contains(&removed),
                 "UI tool profile should not expose {removed}"

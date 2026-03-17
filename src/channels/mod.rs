@@ -15,10 +15,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub use cli::CliChannel;
-pub use context::{
-    default_cron_delivery_for_current_channel, with_channel_execution_context,
-    ChannelExecutionContext,
-};
+pub use context::{with_channel_execution_context, ChannelExecutionContext};
 pub use pocketbase::PocketBaseChannel;
 pub use traits::{Channel, SendMessage};
 

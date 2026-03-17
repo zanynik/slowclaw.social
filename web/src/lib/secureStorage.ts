@@ -5,6 +5,7 @@ const FALLBACK_KEY = "mysky.bluesky.credentials";
 const SECRET_SERVICE = "com.example.myskyposter";
 const SECRET_ACCOUNT = "bluesky.credentials";
 const SESSION_ACCOUNT = "bluesky.session";
+const NOSTR_KEYS_ACCOUNT = "nostr.keys";
 const GATEWAY_SECRET_SERVICE = "social.slowclaw.gateway";
 const GATEWAY_SECRET_ACCOUNT = "desktop.gateway.token";
 const SYNC_PEER_URL_ACCOUNT = "sync.peer.gateway_url";
@@ -107,6 +108,7 @@ export async function loadBlueskySessionSecure(): Promise<BlueskySession | null>
     }
     return {
       accessJwt: String(parsed.accessJwt),
+      refreshJwt: String(parsed.refreshJwt || ""),
       did: String(parsed.did),
       handle: String(parsed.handle)
     };
@@ -121,6 +123,41 @@ export async function saveBlueskySessionSecure(session: BlueskySession): Promise
       service: SECRET_SERVICE,
       account: SESSION_ACCOUNT,
       value: JSON.stringify(session)
+    }
+  });
+}
+
+export type NostrKeys = {
+  nsec: string;
+  npub: string;
+  secretKeyHex: string;
+  publicKeyHex: string;
+};
+
+export async function loadNostrKeysSecure(): Promise<NostrKeys | null> {
+  const res = await invokeTauri<SecretGetResponse>("get_secret", {
+    req: { service: SECRET_SERVICE, account: NOSTR_KEYS_ACCOUNT }
+  });
+  if (!res?.value) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(res.value) as Partial<NostrKeys>;
+    if (!parsed.nsec || !parsed.npub || !parsed.secretKeyHex || !parsed.publicKeyHex) {
+      return null;
+    }
+    return parsed as NostrKeys;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveNostrKeysSecure(keys: NostrKeys): Promise<void> {
+  await invokeTauri<void>("set_secret", {
+    req: {
+      service: SECRET_SERVICE,
+      account: NOSTR_KEYS_ACCOUNT,
+      value: JSON.stringify(keys)
     }
   });
 }

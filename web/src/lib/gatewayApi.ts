@@ -483,6 +483,7 @@ export type PersonalizedFeedResponse = {
       shortlistedCount: number;
       candidateCount: number;
       sampledSources: FeedSelectedSource[];
+      error?: string | null;
     };
     nostr: {
       available: boolean;
@@ -491,6 +492,7 @@ export type PersonalizedFeedResponse = {
       shortlistedCount: number;
       candidateCount: number;
       sampledSources: FeedSelectedSource[];
+      error?: string | null;
     };
     bluesky: {
       available: boolean;
@@ -499,6 +501,7 @@ export type PersonalizedFeedResponse = {
       shortlistedCount: number;
       candidateCount: number;
       sampledSources: FeedSelectedSource[];
+      error?: string | null;
     };
     ranking: {
       candidateCountBeforeRanking: number;
@@ -702,7 +705,8 @@ export async function fetchPersonalizedFeed(
         candidateCount: Number(data?.diagnostics?.rss?.candidateCount || 0),
         sampledSources: Array.isArray(data?.diagnostics?.rss?.sampledSources)
           ? data.diagnostics.rss.sampledSources.map(mapSelectedSource)
-          : []
+          : [],
+        error: data?.diagnostics?.rss?.error || null
       },
       nostr: {
         available: Boolean(data?.diagnostics?.nostr?.available),
@@ -712,7 +716,8 @@ export async function fetchPersonalizedFeed(
         candidateCount: Number(data?.diagnostics?.nostr?.candidateCount || 0),
         sampledSources: Array.isArray(data?.diagnostics?.nostr?.sampledSources)
           ? data.diagnostics.nostr.sampledSources.map(mapSelectedSource)
-          : []
+          : [],
+        error: data?.diagnostics?.nostr?.error || null
       },
       bluesky: {
         available: Boolean(data?.diagnostics?.bluesky?.available),
@@ -722,7 +727,8 @@ export async function fetchPersonalizedFeed(
         candidateCount: Number(data?.diagnostics?.bluesky?.candidateCount || 0),
         sampledSources: Array.isArray(data?.diagnostics?.bluesky?.sampledSources)
           ? data.diagnostics.bluesky.sampledSources.map(mapSelectedSource)
-          : []
+          : [],
+        error: data?.diagnostics?.bluesky?.error || null
       },
       ranking: {
         candidateCountBeforeRanking: Number(data?.diagnostics?.ranking?.candidateCountBeforeRanking || 0),

@@ -3,6 +3,7 @@ import type { BlueskyCredentials } from "./types";
 
 export type BlueskySession = {
   accessJwt: string;
+  refreshJwt: string;
   did: string;
   handle: string;
 };
@@ -22,10 +23,120 @@ export async function loginBluesky(creds: BlueskyCredentials) {
     agent,
     session: {
       accessJwt: res.data.accessJwt,
+      refreshJwt: res.data.refreshJwt,
       did: res.data.did,
       handle: res.data.handle
     } satisfies BlueskySession
   };
+}
+
+export async function refreshBlueskySession(
+  serviceUrl: string,
+  refreshJwt: string
+): Promise<{ agent: AtpAgent; session: BlueskySession }> {
+  const baseUrl = serviceUrl.replace(/\/+$/, "");
+  const res = await fetch(`${baseUrl}/xrpc/com.atproto.server.refreshSession`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${refreshJwt}` }
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Token refresh failed (${res.status}): ${text}`);
+  }
+  const data = await res.json();
+  const agent = createAgent(serviceUrl);
+  await agent.resumeSession({
+    accessJwt: data.accessJwt,
+    refreshJwt: data.refreshJwt,
+    did: data.did,
+    handle: data.handle,
+    active: true
+  });
+  return {
+    agent,
+    session: {
+      accessJwt: data.accessJwt,
+      refreshJwt: data.refreshJwt,
+      did: data.did,
+      handle: data.handle
+    }
+  };
+}
+
+export function isExpiredTokenError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /ExpiredToken|token.*expir/i.test(error.message);
+}
+
+export async function likeBlueskyPost(
+  agent: AtpAgent,
+  did: string,
+  postUri: string,
+  postCid: string
+): Promise<{ uri: string; cid: string }> {
+  const res = await agent.com.atproto.repo.createRecord({
+    repo: did,
+    collection: "app.bsky.feed.like",
+    record: {
+      $type: "app.bsky.feed.like",
+      subject: { uri: postUri, cid: postCid },
+      createdAt: new Date().toISOString()
+    }
+  });
+  return res.data;
+}
+
+export async function unlikeBlueskyPost(agent: AtpAgent, likeUri: string) {
+  const rkey = likeUri.split("/").pop() || "";
+  const repo = likeUri.replace("at://", "").split("/")[0];
+  await agent.com.atproto.repo.deleteRecord({
+    repo,
+    collection: "app.bsky.feed.like",
+    rkey
+  });
+}
+
+export async function fetchBlueskyThread(
+  serviceUrl: string,
+  accessJwt: string,
+  postUri: string,
+  depth = 6
+): Promise<any> {
+  const baseUrl = serviceUrl.replace(/\/+$/, "");
+  const url = `${baseUrl}/xrpc/app.bsky.feed.getPostThread?uri=${encodeURIComponent(postUri)}&depth=${depth}&parentHeight=0`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessJwt}` }
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to fetch thread (${res.status}): ${text}`);
+  }
+  return await res.json();
+}
+
+export async function replyToBlueskyPost(
+  agent: AtpAgent,
+  did: string,
+  text: string,
+  parentUri: string,
+  parentCid: string,
+  rootUri: string,
+  rootCid: string
+): Promise<{ uri: string; cid: string }> {
+  const res = await agent.com.atproto.repo.createRecord({
+    repo: did,
+    collection: "app.bsky.feed.post",
+    record: {
+      $type: "app.bsky.feed.post",
+      text,
+      reply: {
+        root: { uri: rootUri, cid: rootCid },
+        parent: { uri: parentUri, cid: parentCid }
+      },
+      createdAt: new Date().toISOString()
+    }
+  });
+  return res.data;
 }
 
 export async function postTextToBluesky(

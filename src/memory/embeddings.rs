@@ -522,7 +522,7 @@ impl OpenAiEmbedding {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client("memory.embeddings")
+        crate::config::build_runtime_proxy_client_with_timeouts("memory.embeddings", 60, 10)
     }
 
     fn has_explicit_api_path(&self) -> bool {

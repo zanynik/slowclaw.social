@@ -71,25 +71,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
-    if config.cron.enabled {
-        let scheduler_cfg = config.clone();
-        handles.push(spawn_component_supervisor(
-            "scheduler",
-            initial_backoff,
-            max_backoff,
-            move || {
-                let cfg = scheduler_cfg.clone();
-                async move { crate::cron::scheduler::run(cfg).await }
-            },
-        ));
-    } else {
-        crate::health::mark_component_ok("scheduler");
-        tracing::info!("Cron disabled; scheduler supervisor not started");
-    }
-
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
+    println!("   Components: gateway, channels, heartbeat");
     println!("   Ctrl+C to stop");
 
     tokio::signal::ctrl_c().await?;
@@ -215,21 +199,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     } else {
                         output
                     };
-                    if let Some((channel, target)) = &delivery {
-                        if let Err(e) = crate::cron::scheduler::deliver_announcement(
-                            &config,
-                            channel,
-                            target,
-                            &announcement,
-                        )
-                        .await
-                        {
-                            crate::health::mark_component_error(
-                                "heartbeat",
-                                format!("delivery failed: {e}"),
-                            );
-                            tracing::warn!("Heartbeat delivery failed: {e}");
-                        }
+                    if let Some((_channel, _target)) = &delivery {
+                        // Delivery via external channels removed; heartbeat output logged only.
+                        tracing::info!("Heartbeat output: {announcement}");
                     }
                 }
                 Err(e) => {

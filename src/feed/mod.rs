@@ -55,6 +55,7 @@ const RSS_RECENT_SCAN_LIMIT: usize = 256;
 const RSS_CANDIDATE_PER_SOURCE_LIMIT: usize = 6;
 const RSS_CONTENT_REFRESH_TTL_SECS: i64 = 30 * 60;
 const RSS_CONTENT_FETCH_TIMEOUT_SECS: u64 = 8;
+const BLUESKY_FETCH_TIMEOUT_SECS: u64 = 8;
 const NOSTR_RELAY_MATCH_THRESHOLD: f32 = 0.28;
 const NOSTR_SELECTED_RELAY_LIMIT: usize = 4;
 const NOSTR_RECENT_NOTE_LIMIT_PER_RELAY: usize = 20;
@@ -63,7 +64,7 @@ const NOSTR_RELAY_METADATA_TIMEOUT_SECS: u64 = 5;
 const NOSTR_RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 const NOSTR_EVENT_FETCH_TIMEOUT_SECS: u64 = 8;
 const NOSTR_NIP66_DISCOVERY_KIND: u16 = 30166;
-const NOSTR_NIP66_DISCOVERY_EVENT_LIMIT: usize = 64;
+const NOSTR_NIP66_DISCOVERY_EVENT_LIMIT: usize = 75;
 const NOSTR_PRIMAL_FALLBACK_RELAY: &str = "wss://relay.primal.net";
 const WEB_SEARCH_RESULT_LIMIT_PER_QUERY: usize = 4;
 const STAGE1_KEYWORD_LIMIT: usize = 10;
@@ -202,6 +203,8 @@ pub struct FeedProtocolDiagnostics {
     pub shortlisted_count: usize,
     pub candidate_count: usize,
     pub sampled_sources: Vec<SelectedSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -213,6 +216,7 @@ pub struct FeedRankingDiagnostics {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 pub struct FeedRefreshDiagnostics {
     pub rss: FeedProtocolDiagnostics,
     pub nostr: FeedProtocolDiagnostics,
@@ -244,12 +248,12 @@ pub struct FeedCandidate {
     pub original_index: usize,
 }
 
-#[derive(Debug, Clone)]
 struct PreparedWorldFeedData {
     profile: FeedProfile,
     selected_sources: Vec<SelectedSource>,
     diagnostics: FeedRefreshDiagnostics,
     candidates: Vec<FeedCandidate>,
+    embedder: SharedEmbedder,
 }
 
 const WORLD_FEED_SYNTHETIC_INTEREST_PREFIX: &str = "state/world_feed_diagnostics/dummy/";
@@ -560,52 +564,118 @@ async fn build_prepared_world_feed_data(
     bluesky_auth: Option<BlueskyAuth>,
     include_web_search: bool,
 ) -> Result<Option<PreparedWorldFeedData>> {
-    let (embedder, _) = resolve_feed_embedder(config).await?;
+    tracing::info!("World feed: building prepared data (include_web_search={include_web_search})");
+    let (embedder, embedder_error) = resolve_feed_embedder(config).await?;
     let Some(embedder) = embedder else {
+        tracing::warn!(
+            error = embedder_error.as_deref().unwrap_or("unknown"),
+            "World feed: embedder unavailable, cannot build prepared data"
+        );
         return Ok(None);
     };
 
     let profile = rebuild_interest_profile(config, embedder.clone()).await?;
+    tracing::info!(
+        status = %profile.status,
+        interest_count = profile.interests.len(),
+        source_count = profile.stats.source_count,
+        "World feed: interest profile built"
+    );
     if profile.interests.is_empty() || profile.status != "ready" {
         return Ok(Some(PreparedWorldFeedData {
             profile,
             selected_sources: Vec::new(),
             diagnostics: FeedRefreshDiagnostics::default(),
             candidates: Vec::new(),
+            embedder: embedder.clone(),
         }));
     }
 
+    // Each protocol is independent — a failure in one must not kill the others.
+    // Catch errors per-protocol and continue with whatever succeeds.
+
     let rss_source = RssFeedSource::new(config, embedder.clone());
-    let (rss_selected, mut rss_diagnostics) =
-        rss_source.discover_sources_with_diagnostics(&profile).await?;
-    let mut selected_sources = rss_selected.clone();
-    let mut candidates = rss_source
-        .fetch_candidates(&profile, &rss_selected, limit_for_candidates())
-        .await?;
-    rss_diagnostics.candidate_count = candidates.len();
+    let (rss_selected, rss_diagnostics, mut candidates, mut selected_sources) =
+        match rss_source.discover_sources_with_diagnostics(&profile).await {
+            Ok((selected, diagnostics)) => {
+                let cloned = selected.clone();
+                match rss_source.fetch_candidates(&profile, &selected, limit_for_candidates()).await {
+                    Ok(fetched) => {
+                        let mut d = diagnostics;
+                        d.candidate_count = fetched.len();
+                        (cloned, d, fetched, selected)
+                    }
+                    Err(err) => {
+                        tracing::warn!("RSS candidate fetch failed: {err}");
+                        let mut d = diagnostics;
+                        d.candidate_count = 0;
+                        (cloned.clone(), d, Vec::new(), cloned)
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("RSS source discovery failed: {err}");
+                (Vec::new(), FeedProtocolDiagnostics { available: false, error: Some(format!("{err}")), ..Default::default() }, Vec::new(), Vec::new())
+            }
+        };
 
     let nostr_source = NostrFeedSource::new(config);
-    let (nostr_selected, mut nostr_diagnostics) =
-        nostr_source.discover_sources_with_diagnostics(&profile).await?;
-    selected_sources.extend(nostr_selected.iter().cloned());
-    let mut nostr_candidates = nostr_source
-        .fetch_candidates(&profile, &nostr_selected, limit_for_candidates())
-        .await?;
-    nostr_diagnostics.candidate_count = nostr_candidates.len();
-    candidates.append(&mut nostr_candidates);
+    let mut nostr_diagnostics = FeedProtocolDiagnostics::default();
+    match nostr_source.discover_sources_with_diagnostics(&profile).await {
+        Ok((nostr_selected, mut discovered_nostr_diagnostics)) => {
+            selected_sources.extend(nostr_selected.iter().cloned());
+            match nostr_source.fetch_candidates(&profile, &nostr_selected, limit_for_candidates()).await {
+                Ok(mut nostr_candidates) => {
+                    discovered_nostr_diagnostics.candidate_count = nostr_candidates.len();
+                    candidates.append(&mut nostr_candidates);
+                }
+                Err(err) => {
+                    tracing::warn!("Nostr candidate fetch failed: {err}");
+                    discovered_nostr_diagnostics.candidate_count = 0;
+                }
+            }
+            nostr_diagnostics = discovered_nostr_diagnostics;
+        }
+        Err(err) => {
+            tracing::warn!("Nostr source discovery failed: {err}");
+            nostr_diagnostics.available = false;
+            nostr_diagnostics.error = Some(format!("{err}"));
+        }
+    }
 
     let mut bluesky_diagnostics = FeedProtocolDiagnostics::default();
+    if let Some(ref auth) = bluesky_auth {
+        tracing::info!(
+            service_url = %auth.service_url,
+            "World feed: Bluesky auth available, running discovery"
+        );
+    } else {
+        tracing::info!("World feed: Bluesky auth not provided, skipping Bluesky discovery");
+        bluesky_diagnostics.error = Some("Bluesky auth not available".to_string());
+    }
     if let Some(auth) = bluesky_auth {
         let bluesky_source = BlueskyFeedSource::new(auth);
-        let (bluesky_selected, mut discovered_bluesky_diagnostics) =
-            bluesky_source.discover_sources_with_diagnostics(&profile).await?;
-        selected_sources.extend(bluesky_selected.iter().cloned());
-        let mut bluesky_candidates = bluesky_source
-            .fetch_candidates(&profile, &bluesky_selected, limit_for_candidates())
-            .await?;
-        discovered_bluesky_diagnostics.candidate_count = bluesky_candidates.len();
-        bluesky_diagnostics = discovered_bluesky_diagnostics;
-        candidates.append(&mut bluesky_candidates);
+        match bluesky_source.discover_sources_with_diagnostics(&profile).await {
+            Ok((bluesky_selected, mut discovered_bluesky_diagnostics)) => {
+                selected_sources.extend(bluesky_selected.iter().cloned());
+                match bluesky_source.fetch_candidates(&profile, &bluesky_selected, limit_for_candidates()).await {
+                    Ok(mut bluesky_candidates) => {
+                        discovered_bluesky_diagnostics.candidate_count = bluesky_candidates.len();
+                        candidates.append(&mut bluesky_candidates);
+                    }
+                    Err(err) => {
+                        tracing::warn!("Bluesky candidate fetch failed: {err}");
+                        discovered_bluesky_diagnostics.candidate_count = 0;
+                    }
+                }
+                bluesky_diagnostics = discovered_bluesky_diagnostics;
+            }
+            Err(err) => {
+                tracing::warn!("Bluesky source discovery failed: {err}");
+                bluesky_diagnostics.available = false;
+                bluesky_diagnostics.error = Some(format!("{err}"));
+            }
+        }
     }
 
     if include_web_search && config.web_search.enabled {
@@ -620,6 +690,24 @@ async fn build_prepared_world_feed_data(
         candidates.append(&mut web_aug);
     }
 
+    tracing::info!(
+        rss_scanned = rss_diagnostics.scanned_count,
+        rss_shortlisted = rss_diagnostics.shortlisted_count,
+        rss_candidates = rss_diagnostics.candidate_count,
+        rss_error = rss_diagnostics.error.as_deref().unwrap_or("none"),
+        nostr_scanned = nostr_diagnostics.scanned_count,
+        nostr_shortlisted = nostr_diagnostics.shortlisted_count,
+        nostr_candidates = nostr_diagnostics.candidate_count,
+        nostr_error = nostr_diagnostics.error.as_deref().unwrap_or("none"),
+        bluesky_scanned = bluesky_diagnostics.scanned_count,
+        bluesky_shortlisted = bluesky_diagnostics.shortlisted_count,
+        bluesky_candidates = bluesky_diagnostics.candidate_count,
+        bluesky_error = bluesky_diagnostics.error.as_deref().unwrap_or("none"),
+        total_candidates = candidates.len(),
+        selected_sources = selected_sources.len(),
+        "World feed: source discovery complete"
+    );
+
     Ok(Some(PreparedWorldFeedData {
         profile,
         selected_sources,
@@ -633,6 +721,7 @@ async fn build_prepared_world_feed_data(
             },
         },
         candidates,
+        embedder: embedder.clone(),
     }))
 }
 
@@ -656,7 +745,20 @@ pub async fn load_world_feed(
     let mut inflight = world_feed_refresh_inflight().lock().contains(workspace_dir);
     let mut refresh_state = compute_refresh_state(cache_exists, &state, inflight);
 
-    if should_refresh_world_feed(cache_exists, &state, inflight) && !embeddings_disabled {
+    let mut needs_refresh = should_refresh_world_feed(cache_exists, &state, inflight);
+
+    // If Bluesky diagnostics show an ExpiredToken error and the caller is now providing
+    // fresh auth, force a refresh to retry Bluesky discovery with the new token.
+    if !needs_refresh && !inflight && bluesky_auth.is_some() {
+        let prev_diagnostics = parse_refresh_diagnostics(&state.details_json);
+        if let Some(ref bsky_err) = prev_diagnostics.bluesky.error {
+            if bsky_err.contains("ExpiredToken") || bsky_err.contains("token") {
+                needs_refresh = true;
+            }
+        }
+    }
+
+    if needs_refresh && !embeddings_disabled {
         spawn_world_feed_refresh(config.clone(), bluesky_auth.clone());
         inflight = world_feed_refresh_inflight().lock().contains(workspace_dir);
         refresh_state = compute_refresh_state(cache_exists, &state, inflight);
@@ -672,8 +774,8 @@ pub async fn load_world_feed(
         "warming".to_string()
     };
     let profile_stats = parse_profile_stats(&state.profile_stats_json);
-    let selected_sources = parse_selected_sources(&state.details_json);
-    let diagnostics = parse_refresh_diagnostics(&state.details_json);
+    let mut selected_sources = parse_selected_sources(&state.details_json);
+    let mut diagnostics = parse_refresh_diagnostics(&state.details_json);
     let refreshed_at = non_empty_string(state.refreshed_at.clone());
     let last_error = non_empty_string(state.last_error.clone());
     let refresh_status = if state.refresh_status.trim().is_empty() {
@@ -705,32 +807,57 @@ pub async fn load_world_feed(
     }
 
     if !embeddings_disabled {
-        if let Ok(Ok(Some(prepared))) = tokio::time::timeout(
+        match tokio::time::timeout(
             Duration::from_secs(WORLD_FEED_STAGE1_PREVIEW_TIMEOUT_SECS),
             build_prepared_world_feed_data(config, bluesky_auth.clone(), false),
         )
         .await
         {
-            if !prepared.candidates.is_empty() {
-                let preview_items = build_stage1_preview_items(&prepared.profile, prepared.candidates, limit);
-                if !preview_items.is_empty() {
-                    return Ok(PersonalizedFeedResponse {
-                        items: preview_items,
-                        profile_status: prepared.profile.status.clone(),
-                        profile_stats: prepared.profile.stats.clone(),
-                        used_fallback: true,
-                        message: Some(
-                            "Showing stage 1 world feed from keyword-matched sources. Refresh later for ranked ordering."
-                                .to_string(),
-                        ),
-                        refresh_state,
-                        refreshed_at,
-                        refresh_status,
-                        last_error,
-                        selected_sources: prepared.selected_sources,
-                        diagnostics: prepared.diagnostics,
-                    });
+            Ok(Ok(Some(prepared))) => {
+                // Capture live diagnostics so the fallback path shows actual
+                // discovery metrics instead of stale/empty persisted state.
+                diagnostics = prepared.diagnostics.clone();
+                selected_sources = prepared.selected_sources.clone();
+                tracing::info!(
+                    profile_status = %prepared.profile.status,
+                    interest_count = prepared.profile.interests.len(),
+                    candidate_count = prepared.candidates.len(),
+                    selected_source_count = selected_sources.len(),
+                    "World feed stage 1 completed"
+                );
+                if !prepared.candidates.is_empty() {
+                    let preview_items = build_stage1_preview_items(&prepared.profile, prepared.candidates, limit);
+                    if !preview_items.is_empty() {
+                        return Ok(PersonalizedFeedResponse {
+                            items: preview_items,
+                            profile_status: prepared.profile.status.clone(),
+                            profile_stats: prepared.profile.stats.clone(),
+                            used_fallback: true,
+                            message: Some(
+                                "Showing stage 1 world feed from keyword-matched sources. Refresh later for ranked ordering."
+                                    .to_string(),
+                            ),
+                            refresh_state,
+                            refreshed_at,
+                            refresh_status,
+                            last_error,
+                            selected_sources: prepared.selected_sources,
+                            diagnostics: prepared.diagnostics,
+                        });
+                    }
                 }
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!("World feed stage 1: embedder unavailable");
+            }
+            Ok(Err(err)) => {
+                tracing::warn!("World feed stage 1 failed: {err}");
+            }
+            Err(_) => {
+                tracing::debug!(
+                    timeout_secs = WORLD_FEED_STAGE1_PREVIEW_TIMEOUT_SECS,
+                    "World feed stage 1 timed out, diagnostics will come from background refresh"
+                );
             }
         }
     }
@@ -841,7 +968,23 @@ fn finish_world_feed_refresh(workspace_dir: &Path) {
 async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -> Result<()> {
     let workspace_dir = config.workspace_dir.clone();
     let Some(mut prepared) = build_prepared_world_feed_data(&config, bluesky_auth, true).await? else {
+        tracing::warn!("World feed refresh: embedder unavailable, cannot build feed data");
         let now = Utc::now().to_rfc3339();
+        let unavailable_diagnostics = FeedRefreshDiagnostics {
+            rss: FeedProtocolDiagnostics {
+                error: Some("Embedding provider unavailable".to_string()),
+                ..Default::default()
+            },
+            nostr: FeedProtocolDiagnostics {
+                error: Some("Embedding provider unavailable".to_string()),
+                ..Default::default()
+            },
+            bluesky: FeedProtocolDiagnostics {
+                error: Some("Embedding provider unavailable".to_string()),
+                ..Default::default()
+            },
+            ranking: FeedRankingDiagnostics::default(),
+        };
         let _ = local_store::upsert_personalized_feed_state(
             &workspace_dir,
             &local_store::PersonalizedFeedStateUpsert {
@@ -854,7 +997,10 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
                 last_error: "Personalized feed embeddings are unavailable.".to_string(),
                 profile_status: "embeddingUnavailable".to_string(),
                 profile_stats_json: serde_json::json!(InterestProfileStats::default()).to_string(),
-                details_json: "{}".to_string(),
+                details_json: serde_json::json!({
+                    "diagnostics": unavailable_diagnostics,
+                })
+                .to_string(),
             },
         );
         return Ok(());
@@ -913,8 +1059,35 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
         },
     );
 
-    let ranked_items = rank_candidates_stage2(&prepared.profile, prepared.candidates, 30);
+    let ranked_items = if prepared.embedder.dimensions() > 0 {
+        let stage2_fallback_candidates = prepared.candidates.clone();
+        match FeedRanker::rank_candidates(
+            prepared.embedder.clone(),
+            &prepared.profile,
+            prepared.candidates,
+            30,
+        )
+        .await
+        {
+            Ok(items) if !items.is_empty() => items,
+            Ok(_) => {
+                tracing::info!("Stage 3 ranking returned no items, falling back to stage 2");
+                rank_candidates_stage2(&prepared.profile, stage2_fallback_candidates, 30)
+            }
+            Err(err) => {
+                tracing::warn!("Stage 3 ranking failed, falling back to stage 2: {err}");
+                rank_candidates_stage2(&prepared.profile, stage2_fallback_candidates, 30)
+            }
+        }
+    } else {
+        rank_candidates_stage2(&prepared.profile, prepared.candidates, 30)
+    };
     prepared.diagnostics.ranking.ranked_item_count = ranked_items.len();
+    tracing::info!(
+        candidates_before_ranking = prepared.diagnostics.ranking.candidate_count_before_ranking,
+        ranked_items = ranked_items.len(),
+        "World feed: ranking complete"
+    );
     let refreshed_at = Utc::now().to_rfc3339();
     let cache_rows: Vec<local_store::PersonalizedFeedCacheUpsert> = ranked_items
         .iter()
@@ -1039,9 +1212,16 @@ fn compute_refresh_state(
     state: &local_store::PersonalizedFeedStateRecord,
     inflight: bool,
 ) -> String {
-    if inflight || state.refresh_status == "refreshing" {
+    if inflight {
         return if cache_exists {
             "refreshing".to_string()
+        } else {
+            "warming".to_string()
+        };
+    }
+    if state.refresh_status == "refreshing" {
+        return if cache_exists {
+            "stale".to_string()
         } else {
             "warming".to_string()
         };
@@ -1064,8 +1244,11 @@ fn should_refresh_world_feed(
     state: &local_store::PersonalizedFeedStateRecord,
     inflight: bool,
 ) -> bool {
-    if inflight || state.refresh_status == "refreshing" {
+    if inflight {
         return false;
+    }
+    if state.refresh_status == "refreshing" {
+        return true;
     }
     if cache_exists {
         return state.dirty || state_is_stale(&state.refreshed_at);
@@ -1134,7 +1317,7 @@ fn world_feed_message(
         );
     }
     if profile_status.eq_ignore_ascii_case("noInterests") {
-        return Some("Personalized feed starts after text items exist under posts/.".to_string());
+        return Some("Personalized feed starts after text items exist under posts/ or journals/.".to_string());
     }
     if !last_error.trim().is_empty() && used_fallback {
         return Some(format!(
@@ -1395,7 +1578,7 @@ async fn fetch_nip66_relay_candidates(
             Duration::from_secs(NOSTR_EVENT_FETCH_TIMEOUT_SECS),
         )
         .await?;
-    client.shutdown().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), client.shutdown()).await;
 
     let mut selected = Vec::new();
     let mut seen = HashSet::new();
@@ -1566,7 +1749,7 @@ async fn fetch_nostr_text_notes(relay_url: &str, limit: usize) -> Result<Vec<Nos
             Duration::from_secs(NOSTR_EVENT_FETCH_TIMEOUT_SECS),
         )
         .await?;
-    client.shutdown().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), client.shutdown()).await;
     let mut out: Vec<NostrEvent> = events.into_iter().collect();
     out.sort_by(|left, right| right.created_at.cmp(&left.created_at));
     Ok(out)
@@ -1723,11 +1906,11 @@ async fn select_feed_embedder(config: &Config) -> Result<Option<SharedEmbedder>>
         Ok(embedding) if !embedding.is_empty() => Ok(Some(configured)),
         Ok(_) => Ok(None),
         Err(err) => {
-            tracing::debug!(
+            tracing::warn!(
                 provider = config.memory.embedding_provider.trim(),
                 model = config.memory.embedding_model.trim(),
                 error = %err,
-                "Configured feed embedder probe failed"
+                "Feed embedder probe failed — world feed will not be personalized until this is resolved"
             );
             Ok(None)
         }
@@ -1776,6 +1959,11 @@ async fn rebuild_interest_profile(config: &Config, embedder: SharedEmbedder) -> 
         .collect();
 
     let text_sources = collect_post_text_sources(workspace_dir)?;
+    tracing::info!(
+        source_count = text_sources.len(),
+        workspace = %workspace_dir.display(),
+        "World feed: collected text sources from posts/ and journals/"
+    );
     let mut stats = InterestProfileStats {
         source_count: text_sources.len(),
         ..InterestProfileStats::default()
@@ -1932,9 +2120,14 @@ struct PostTextSource {
 }
 
 fn collect_post_text_sources(workspace_dir: &Path) -> Result<Vec<PostTextSource>> {
-    let root = workspace_dir.join("posts");
     let mut out = Vec::new();
-    collect_post_text_sources_recursive(workspace_dir, &root, &mut out)?;
+    // Scan posts/ for AI-extracted/curated interest items.
+    let posts_root = workspace_dir.join("posts");
+    collect_post_text_sources_recursive(workspace_dir, &posts_root, &mut out)?;
+    // Also scan journals/ for raw daily entries which provide broader interest
+    // signals even before AI extraction has run.
+    let journals_root = workspace_dir.join("journals");
+    collect_post_text_sources_recursive(workspace_dir, &journals_root, &mut out)?;
     Ok(out)
 }
 
@@ -2030,13 +2223,58 @@ fn stage1_stopwords() -> &'static HashSet<&'static str> {
 
 fn broaden_stage1_keyword(term: &str) -> &'static [&'static str] {
     match term {
-        "ai" => &["llm", "ml"],
-        "startup" | "startups" => &["founder", "business"],
-        "rust" => &["systems", "compiler"],
-        "bluesky" => &["bsky", "atproto"],
-        "nostr" => &["relay", "relays"],
-        "design" => &["product"],
-        "software" => &["programming"],
+        "ai" => &["llm", "ml", "machine", "learning", "intelligence"],
+        "llm" | "gpt" | "claude" | "model" => &["ai", "machine", "learning"],
+        "ml" | "machine" => &["ai", "learning", "model"],
+        "startup" | "startups" => &["founder", "business", "venture"],
+        "founder" | "venture" => &["startup", "business"],
+        "rust" => &["systems", "compiler", "software", "engineering"],
+        "python" | "javascript" | "typescript" | "golang" => &["software", "programming", "engineering"],
+        "programming" | "coding" | "code" => &["software", "engineering", "technology"],
+        "software" => &["programming", "engineering", "technology"],
+        "engineering" => &["software", "systems", "technology"],
+        "technology" | "tech" => &["software", "engineering"],
+        "bluesky" => &["bsky", "atproto", "social"],
+        "nostr" => &["relay", "relays", "protocol"],
+        "design" => &["product", "frontend", "web"],
+        "web" | "frontend" => &["javascript", "react", "design"],
+        "security" | "infosec" => &["privacy", "security", "hacking"],
+        "privacy" => &["security", "infosec"],
+        "agent" | "agents" => &["ai", "runtime", "autonomous"],
+        "runtime" | "systems" => &["software", "engineering", "compiler"],
+        "protocol" | "protocols" => &["network", "systems", "decentralized"],
+        "hardware" | "embedded" => &["systems", "firmware", "electronics"],
+        "crypto" | "blockchain" => &["decentralized", "protocol", "web3"],
+        "data" | "database" => &["engineering", "analytics", "software"],
+        "science" | "research" => &["analysis", "academic"],
+        "writing" | "blog" => &["content", "publishing"],
+        // Mindfulness, Buddhism, Consciousness
+        "meditation" | "meditate" | "mindfulness" | "mindful" => &["consciousness", "buddhism", "awareness", "psychology", "contemplation"],
+        "buddhism" | "buddhist" | "dharma" | "vipassana" => &["meditation", "mindfulness", "consciousness", "philosophy"],
+        "consciousness" | "awareness" => &["meditation", "mindfulness", "philosophy", "psychology"],
+        "craving" | "attachment" | "aversion" => &["mindfulness", "psychology", "buddhism", "behavior"],
+        "contemplation" | "contemplative" => &["meditation", "mindfulness", "philosophy", "reflection"],
+        // Psychology, Behavior, Learning
+        "reinforcement" => &["learning", "psychology", "behavior", "reward"],
+        "reward" | "punishment" => &["reinforcement", "psychology", "behavior", "learning"],
+        "psychology" | "cognitive" => &["behavior", "consciousness", "mindfulness", "neuroscience"],
+        "behavior" | "behavioral" => &["psychology", "cognitive", "economics", "learning"],
+        "neuroscience" => &["psychology", "consciousness", "cognitive", "brain"],
+        // Philosophy, Ideas
+        "philosophy" | "philosophical" => &["consciousness", "ideas", "ethics", "thinking"],
+        "ethics" | "moral" => &["philosophy", "consciousness", "values"],
+        "ideas" | "thinking" => &["philosophy", "creativity", "innovation"],
+        // Economics, Business, Social
+        "economics" | "economic" | "economy" => &["business", "policy", "markets", "innovation"],
+        "sustainability" | "sustainable" => &["economics", "innovation", "environment"],
+        "innovation" => &["technology", "economics", "ideas", "creativity"],
+        // Workflows, Productivity, Content
+        "workflow" | "automation" | "pipeline" => &["productivity", "tools", "systems"],
+        "productivity" | "habits" => &["workflow", "mindfulness", "psychology"],
+        "podcast" | "content" | "creation" => &["media", "publishing", "writing", "workflow"],
+        "artifact" | "artifacts" => &["workflow", "content", "creation", "digital"],
+        "digital" => &["technology", "workflow", "content"],
+        "feedback" => &["systems", "learning", "improvement"],
         _ => &[],
     }
 }
@@ -2182,11 +2420,18 @@ fn broad_interest_keywords(profile: &FeedProfile) -> Vec<String> {
             .unwrap_or(Ordering::Equal)
             .then_with(|| left.0.cmp(&right.0))
     });
-    ranked
+    let result: Vec<String> = ranked
         .into_iter()
         .map(|(keyword, _)| keyword)
         .take(STAGE1_KEYWORD_LIMIT)
-        .collect()
+        .collect();
+    tracing::debug!(
+        keyword_count = result.len(),
+        keywords = %result.join(", "),
+        interest_count = profile.interests.len(),
+        "World feed: broad interest keywords for source matching"
+    );
+    result
 }
 
 fn keyword_match_score(text: &str, keywords: &[String]) -> f32 {
@@ -2201,7 +2446,7 @@ fn keyword_match_score(text: &str, keywords: &[String]) -> f32 {
     if matched == 0 {
         return 0.0;
     }
-    matched as f32 / keywords.len() as f32
+    (0.65 + (matched as f32 - 1.0) * 0.15).min(1.0)
 }
 
 fn first_matched_keyword<'a>(text: &str, keywords: &'a [String]) -> Option<&'a str> {
@@ -2219,12 +2464,13 @@ fn tokenize_terms(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn passes_lexical_gate(text: &str, terms: &BTreeSet<String>, stage1_score: f32) -> bool {
-    if stage1_score >= FEED_HIGH_CONFIDENCE_STAGE1_SCORE || terms.is_empty() {
-        return true;
-    }
-    let lower = text.to_ascii_lowercase();
-    terms.iter().any(|term| lower.contains(term))
+fn passes_lexical_gate(_text: &str, _terms: &BTreeSet<String>, _stage1_score: f32) -> bool {
+    // Lexical gate disabled: all candidates now reach the semantic ranker
+    // (Stage 3). The old keyword gate was counterproductive — it dropped
+    // items that were semantically relevant but used different vocabulary
+    // (e.g., "autonomous systems" vs "self-driving robotics"). The embedding
+    // similarity in rank_candidates is the right place for quality filtering.
+    true
 }
 
 async fn embed_text_batch(embedder: SharedEmbedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -2421,18 +2667,23 @@ impl NostrFeedSource {
     ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
         let keywords = broad_interest_keywords(profile);
         let relay_urls = configured_nostr_world_feed_relays(&self.config);
+        let fallback_relays = fallback_nostr_world_feed_relays(&self.config);
         let mut diagnostics = FeedProtocolDiagnostics {
             available: true,
-            scanned_count: relay_urls.len(),
+            scanned_count: if relay_urls.is_empty() { fallback_relays.len() } else { relay_urls.len() },
             ..FeedProtocolDiagnostics::default()
         };
-        let mut selected = fetch_nip66_relay_candidates(&fallback_nostr_world_feed_relays(&self.config), &keywords)
+        let mut selected = fetch_nip66_relay_candidates(&fallback_relays, &keywords)
             .await
             .unwrap_or_default();
         if relay_urls.is_empty() {
             if selected.is_empty() {
                 selected = fallback_nostr_selected_sources(&self.config);
             }
+            tracing::info!(
+                nip66_found = selected.len(),
+                "Nostr discovery: no configured relays, using fallback"
+            );
             diagnostics.shortlisted_count = selected.len();
             diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
             return Ok((selected, diagnostics));
@@ -2616,11 +2867,20 @@ impl RssFeedSource {
         profile: &FeedProfile,
     ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
         seed_default_feed_web_sources(&self.config.workspace_dir)?;
-        let sources = ensure_catalog_metadata_embeddings(
+        // Try to enrich sources with embeddings, but fall back to raw sources
+        // if embedding fails (e.g., Ollama model not loaded yet).
+        let sources = match ensure_catalog_metadata_embeddings(
             &self.config.workspace_dir,
             self.embedder.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(enriched) => enriched,
+            Err(err) => {
+                tracing::warn!("RSS source embedding failed, using unenriched sources: {err}");
+                local_store::list_feed_web_sources(&self.config.workspace_dir)?
+            }
+        };
         let mut diagnostics = FeedProtocolDiagnostics {
             available: true,
             scanned_count: sources.len(),
@@ -2628,7 +2888,7 @@ impl RssFeedSource {
         };
         let keywords = broad_interest_keywords(profile);
         let mut ranked = Vec::new();
-        for source in sources {
+        for source in &sources {
             let metadata_text = catalog_metadata_text(
                 &source.title,
                 &source.domain,
@@ -2637,6 +2897,11 @@ impl RssFeedSource {
             );
             let keyword_score = keyword_match_score(&metadata_text, &keywords);
             if keyword_score <= 0.0 {
+                tracing::trace!(
+                    domain = %source.domain,
+                    metadata_snippet = %truncate_with_ellipsis(&metadata_text, 120),
+                    "RSS source: no keyword match"
+                );
                 continue;
             }
             ranked.push(SelectedSource {
@@ -2655,25 +2920,98 @@ impl RssFeedSource {
                 }),
             });
         }
+        tracing::info!(
+            keyword_matched = ranked.len(),
+            total_sources = sources.len(),
+            keyword_count = keywords.len(),
+            "RSS source discovery: keyword matching complete"
+        );
+
+        // Semantic fallback: when keyword matching yields too few sources, use
+        // embedding similarity between interest vectors and source metadata
+        // embeddings to discover relevant sources that keywords missed.
+        if ranked.len() < 3 && !profile.interests.is_empty() {
+            let existing_keys: HashSet<String> = ranked.iter().map(|s| s.key.clone()).collect();
+            let mut semantic_ranked: Vec<(SelectedSource, f32)> = Vec::new();
+            let mut sources_with_embeddings = 0usize;
+            for source in &sources {
+                if existing_keys.contains(&source.xml_url) {
+                    continue;
+                }
+                let source_emb = bytes_to_vec(&source.metadata_embedding);
+                if source_emb.is_empty() {
+                    continue;
+                }
+                sources_with_embeddings += 1;
+                let mut best_sim = 0.0_f32;
+                let mut best_label: Option<String> = None;
+                for interest in &profile.interests {
+                    let sim = cosine_similarity(&source_emb, &interest.embedding);
+                    let weighted = sim * interest.health_score;
+                    if weighted > best_sim {
+                        best_sim = weighted;
+                        best_label = Some(interest.label.clone());
+                    }
+                }
+                if best_sim >= RSS_SOURCE_MATCH_THRESHOLD {
+                    semantic_ranked.push((
+                        SelectedSource {
+                            protocol: FeedProtocol::Rss,
+                            key: source.xml_url.clone(),
+                            label: source.title.clone(),
+                            stage1_score: best_sim,
+                            description: non_empty_string(source.description.clone()),
+                            matched_interest_label: best_label,
+                            matched_interest_score: Some(best_sim),
+                            metadata_json: serde_json::json!({
+                                "domain": source.domain,
+                                "topics": source.topics_csv,
+                                "htmlUrl": source.html_url,
+                            }),
+                        },
+                        best_sim,
+                    ));
+                }
+            }
+            tracing::info!(
+                sources_with_embeddings,
+                semantic_matched = semantic_ranked.len(),
+                threshold = RSS_SOURCE_MATCH_THRESHOLD,
+                "RSS source discovery: semantic fallback"
+            );
+            semantic_ranked.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+            });
+            let slots_available = RSS_SELECTED_SOURCE_LIMIT.saturating_sub(ranked.len());
+            for (source, _) in semantic_ranked.into_iter().take(slots_available) {
+                ranked.push(source);
+            }
+        }
+
         ranked.sort_by(|left, right| {
             right
                 .stage1_score
                 .partial_cmp(&left.stage1_score)
                 .unwrap_or(Ordering::Equal)
         });
+        // When both keyword and semantic matching fail, guarantee at least some
+        // sources are shortlisted so the rest of the pipeline can produce items.
         let selected = if !ranked.is_empty() {
             ranked.truncate(RSS_SELECTED_SOURCE_LIMIT);
             ranked
         } else {
-            local_store::list_feed_web_sources(&self.config.workspace_dir)?
-                .into_iter()
+            tracing::info!(
+                "RSS source discovery: no keyword or semantic matches, using unranked fallback sources"
+            );
+            sources
+                .iter()
                 .take(RSS_SELECTED_SOURCE_LIMIT.min(4))
                 .map(|source| SelectedSource {
                     protocol: FeedProtocol::Rss,
                     key: source.xml_url.clone(),
-                    label: source.title,
+                    label: source.title.clone(),
                     stage1_score: 0.2,
-                    description: non_empty_string(source.description),
+                    description: non_empty_string(source.description.clone()),
                     matched_interest_label: None,
                     matched_interest_score: None,
                     metadata_json: serde_json::json!({
@@ -2873,27 +3211,102 @@ fn infer_default_feed_source_metadata(domain: &str, title: &str) -> (String, Str
         || combined.contains("software")
         || combined.contains("program")
     {
-        topics.extend(["software", "systems", "engineering"]);
+        topics.extend(["software", "systems", "engineering", "programming"]);
     }
     if combined.contains("ai")
         || combined.contains("llm")
         || combined.contains("machine")
         || combined.contains("learning")
+        || combined.contains("model")
     {
-        topics.extend(["ai", "machine-learning"]);
+        topics.extend(["ai", "machine-learning", "llm"]);
     }
     if combined.contains("web") || combined.contains("react") || combined.contains("javascript") {
-        topics.extend(["web", "frontend"]);
+        topics.extend(["web", "frontend", "programming"]);
     }
     if combined.contains("econom") || combined.contains("policy") || combined.contains("construction") {
         topics.extend(["policy", "analysis"]);
     }
     if combined.contains("science") || combined.contains("physics") || combined.contains("math") {
-        topics.extend(["science"]);
+        topics.extend(["science", "research"]);
+    }
+    if combined.contains("startup") || combined.contains("venture") || combined.contains("founder") {
+        topics.extend(["startup", "business", "founder"]);
+    }
+    if combined.contains("open") || combined.contains("protocol") || combined.contains("decentrali") {
+        topics.extend(["protocol", "decentralized", "open-source"]);
+    }
+    if combined.contains("data") || combined.contains("database") || combined.contains("analytics") {
+        topics.extend(["data", "engineering", "analytics"]);
+    }
+    if combined.contains("hardware") || combined.contains("embedded") || combined.contains("gpio") {
+        topics.extend(["hardware", "embedded", "systems"]);
+    }
+    if combined.contains("mindful")
+        || combined.contains("meditation")
+        || combined.contains("zen")
+        || combined.contains("buddhis")
+        || combined.contains("dharma")
+        || combined.contains("vipassana")
+        || combined.contains("contemplat")
+    {
+        topics.extend(["mindfulness", "meditation", "consciousness", "philosophy", "psychology"]);
+    }
+    if combined.contains("psycholog")
+        || combined.contains("psyche")
+        || combined.contains("cogniti")
+        || combined.contains("behavior")
+        || combined.contains("neuroscien")
+    {
+        topics.extend(["psychology", "behavior", "consciousness", "neuroscience"]);
+    }
+    if combined.contains("philosoph")
+        || combined.contains("aeon")
+        || combined.contains("marginalian")
+        || combined.contains("ideas")
+        || combined.contains("ethics")
+    {
+        topics.extend(["philosophy", "ideas", "consciousness", "thinking"]);
+    }
+    if combined.contains("tricycle")
+        || combined.contains("lionsroar")
+        || combined.contains("lion")
+    {
+        topics.extend(["buddhism", "meditation", "mindfulness", "consciousness", "philosophy"]);
+    }
+    if combined.contains("productiv")
+        || combined.contains("nesslabs")
+        || combined.contains("habits")
+        || combined.contains("workflow")
+    {
+        topics.extend(["productivity", "mindfulness", "neuroscience", "workflow"]);
+    }
+    if combined.contains("every.to") || combined.contains("every to") {
+        topics.extend(["ai", "productivity", "content", "workflow", "writing"]);
+    }
+    if combined.contains("oneusefulthing") || combined.contains("useful thing") {
+        topics.extend(["ai", "productivity", "education", "workflow"]);
+    }
+    if combined.contains("astralcodex") || combined.contains("slate star") {
+        topics.extend(["rationality", "ai", "economics", "psychology", "philosophy"]);
+    }
+    if combined.contains("nautil") {
+        topics.extend(["science", "philosophy", "psychology", "ideas"]);
+    }
+    if combined.contains("evonomics") {
+        topics.extend(["economics", "innovation", "behavior", "sustainability"]);
+    }
+    if combined.contains("marginalrevolution") {
+        topics.extend(["economics", "policy", "ideas", "innovation"]);
+    }
+    if combined.contains("farnam") || combined.contains("fs.blog") {
+        topics.extend(["mental-models", "decision-making", "philosophy", "psychology"]);
     }
 
+    // Most tech blogs cover general software/technology even if not keyword-matched.
+    // Add broad coverage topics so semantic matching has more to work with.
     if topics.is_empty() {
-        topics.extend(["technology", "writing"]);
+        topics.extend(["technology", "software", "engineering", "writing"]);
     }
     topics.sort_unstable();
     topics.dedup();
@@ -3534,7 +3947,9 @@ async fn fetch_bluesky_feed_generator_page(
     limit: usize,
 ) -> Result<(Vec<CandidateFeedGenerator>, Option<String>)> {
     let url = build_bluesky_feed_generator_discovery_endpoint(service_url, cursor, limit);
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(BLUESKY_FETCH_TIMEOUT_SECS))
+        .build()?
         .get(url)
         .bearer_auth(access_jwt.trim())
         .send()
@@ -3613,7 +4028,9 @@ async fn fetch_bluesky_candidate_page(
     limit: usize,
 ) -> Result<(Vec<CandidateFeedPost>, Option<String>)> {
     let url = build_bluesky_feed_endpoint(service_url, source, cursor, limit);
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(BLUESKY_FETCH_TIMEOUT_SECS))
+        .build()?
         .get(url)
         .bearer_auth(access_jwt.trim())
         .send()

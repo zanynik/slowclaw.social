@@ -719,7 +719,12 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 0.7rem;
-  transition: background 0.1s;
+  transition: background 0.15s;
+}
+
+.feed-item[style*="cursor: pointer"]:hover {
+  background: color-mix(in srgb, var(--accent-dim) 30%, transparent);
+  border-radius: 8px;
 }
 
 .feed-item-card {
@@ -1104,6 +1109,256 @@ textarea {
     min-height: 7rem;
     font-size: 0.96rem;
   }
+}
+
+/* ─────────────────────────────────────────────
+   BLUESKY POST INTERACTIONS
+   ───────────────────────────────────────────── */
+
+.bsky-actions {
+  display: flex;
+  gap: 1.2rem;
+  margin-top: 0.8rem;
+}
+
+.bsky-action-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.bsky-action-btn:hover {
+  color: var(--ink);
+}
+
+.bsky-action-btn.liked {
+  color: #f91880;
+}
+
+.bsky-action-btn.liked svg {
+  fill: #f91880;
+  stroke: #f91880;
+}
+
+.bsky-action-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Thread view */
+.bsky-thread-panel {
+  margin-top: 0.6rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.6rem;
+}
+
+.bsky-thread-replies {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.bsky-thread-reply {
+  display: flex;
+  gap: 0.6rem;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent);
+}
+
+.bsky-thread-reply:last-child {
+  border-bottom: none;
+}
+
+.bsky-reply-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.bsky-reply-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.bsky-reply-author {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.bsky-reply-handle {
+  font-size: 0.76rem;
+  color: var(--muted);
+  margin-left: 0.3rem;
+}
+
+.bsky-reply-text {
+  font-size: 0.86rem;
+  line-height: 1.5;
+  color: var(--ink-2);
+  margin-top: 0.2rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bsky-reply-time {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-top: 0.25rem;
+}
+
+.bsky-reply-compose {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  align-items: flex-end;
+}
+
+.bsky-reply-input {
+  flex: 1;
+  min-height: 2.2rem;
+  padding: 0.45rem 0.65rem;
+  border: 1.5px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  font: inherit;
+  font-size: 0.86rem;
+  color: var(--ink);
+  resize: none;
+  overflow: hidden;
+}
+
+.bsky-reply-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.bsky-reply-send {
+  padding: 0.4rem 0.75rem;
+  border-radius: 16px;
+  font-size: 0.82rem;
+  flex-shrink: 0;
+}
+
+.bsky-thread-loading {
+  font-size: 0.82rem;
+  color: var(--muted);
+  padding: 0.5rem 0;
+}
+
+/* Profile header for Me feed */
+.me-profile-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0 0.75rem;
+}
+
+.me-profile-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid var(--line);
+}
+
+.me-profile-avatar-placeholder {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--accent-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--accent);
+  border: 2px solid var(--line);
+}
+
+.me-profile-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.me-profile-name {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.me-profile-handle {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.me-profile-stats {
+  display: flex;
+  gap: 1rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-top: 0.15rem;
+}
+
+.me-profile-stats strong {
+  color: var(--ink);
+}
+
+/* World feed sub-tabs */
+.world-feed-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 0.5rem;
+}
+
+.world-feed-tab {
+  padding: 0.4rem 0.8rem;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.world-feed-tab:hover {
+  color: var(--ink);
+}
+
+.world-feed-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* Nostr identity modal */
+.nostr-identity-banner {
+  padding: 0.75rem;
+  border-radius: var(--r-md);
+  border: 1.5px solid var(--accent);
+  background: var(--accent-dim);
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+
+.nostr-identity-banner .npub-display {
+  font-family: ui-monospace, "Cascadia Code", "Fira Code", Menlo, monospace;
+  font-size: 0.72rem;
+  color: var(--ink-2);
+  word-break: break-all;
 }
 
 /* ─────────────────────────────────────────────

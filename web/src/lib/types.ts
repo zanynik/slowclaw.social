@@ -85,3 +85,9 @@ export type OpenAiDeviceCodeStatus = {
   fastLink?: string | null;
   error?: string | null;
 };
+
+export type AnthropicTokenStatus = {
+  isSet: boolean;
+  message: string;
+  error?: string | null;
+};
