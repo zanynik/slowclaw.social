@@ -27,6 +27,7 @@ pub use traits::FeedSource;
 pub const WORLD_FEED_KEY: &str = "world";
 
 const WORLD_FEED_CACHE_TTL_SECS: i64 = 5 * 60;
+const WORLD_FEED_RANK_LIMIT: usize = 50;
 const WORLD_FEED_COLD_START_SYNC_TIMEOUT_SECS: u64 = 8;
 const WORLD_FEED_FALLBACK_MIN_BLUESKY_ITEMS: usize = 6;
 const WORLD_FEED_STAGE1_PREVIEW_TIMEOUT_SECS: u64 = 6;
@@ -154,6 +155,7 @@ pub struct PersonalizedFeedResponse {
     pub last_error: Option<String>,
     pub selected_sources: Vec<SelectedSource>,
     pub diagnostics: FeedRefreshDiagnostics,
+    pub generation: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -591,11 +593,19 @@ async fn build_prepared_world_feed_data(
         }));
     }
 
-    // Each protocol is independent — a failure in one must not kill the others.
-    // Catch errors per-protocol and continue with whatever succeeds.
+    // Each protocol is independent — run all three in parallel.
+    // A failure in one must not kill the others.
 
     let rss_source = RssFeedSource::new(config, embedder.clone());
-    let (rss_selected, rss_diagnostics, mut candidates, mut selected_sources) =
+    let nostr_source = NostrFeedSource::new(config);
+
+    // Use the freshest Bluesky auth: prefer the globally stored latest auth
+    // (which may have been updated by a newer request while this task was running),
+    // falling back to the auth captured at spawn time.
+    let effective_bluesky_auth = take_latest_bluesky_auth(&config.workspace_dir)
+        .or(bluesky_auth);
+
+    let rss_future = async {
         match rss_source.discover_sources_with_diagnostics(&profile).await {
             Ok((selected, diagnostics)) => {
                 let cloned = selected.clone();
@@ -617,66 +627,86 @@ async fn build_prepared_world_feed_data(
                 tracing::warn!("RSS source discovery failed: {err}");
                 (Vec::new(), FeedProtocolDiagnostics { available: false, error: Some(format!("{err}")), ..Default::default() }, Vec::new(), Vec::new())
             }
-        };
-
-    let nostr_source = NostrFeedSource::new(config);
-    let mut nostr_diagnostics = FeedProtocolDiagnostics::default();
-    match nostr_source.discover_sources_with_diagnostics(&profile).await {
-        Ok((nostr_selected, mut discovered_nostr_diagnostics)) => {
-            selected_sources.extend(nostr_selected.iter().cloned());
-            match nostr_source.fetch_candidates(&profile, &nostr_selected, limit_for_candidates()).await {
-                Ok(mut nostr_candidates) => {
-                    discovered_nostr_diagnostics.candidate_count = nostr_candidates.len();
-                    candidates.append(&mut nostr_candidates);
-                }
-                Err(err) => {
-                    tracing::warn!("Nostr candidate fetch failed: {err}");
-                    discovered_nostr_diagnostics.candidate_count = 0;
-                }
-            }
-            nostr_diagnostics = discovered_nostr_diagnostics;
         }
-        Err(err) => {
-            tracing::warn!("Nostr source discovery failed: {err}");
-            nostr_diagnostics.available = false;
-            nostr_diagnostics.error = Some(format!("{err}"));
-        }
-    }
+    };
 
-    let mut bluesky_diagnostics = FeedProtocolDiagnostics::default();
-    if let Some(ref auth) = bluesky_auth {
-        tracing::info!(
-            service_url = %auth.service_url,
-            "World feed: Bluesky auth available, running discovery"
-        );
-    } else {
-        tracing::info!("World feed: Bluesky auth not provided, skipping Bluesky discovery");
-        bluesky_diagnostics.error = Some("Bluesky auth not available".to_string());
-    }
-    if let Some(auth) = bluesky_auth {
-        let bluesky_source = BlueskyFeedSource::new(auth);
-        match bluesky_source.discover_sources_with_diagnostics(&profile).await {
-            Ok((bluesky_selected, mut discovered_bluesky_diagnostics)) => {
-                selected_sources.extend(bluesky_selected.iter().cloned());
-                match bluesky_source.fetch_candidates(&profile, &bluesky_selected, limit_for_candidates()).await {
-                    Ok(mut bluesky_candidates) => {
-                        discovered_bluesky_diagnostics.candidate_count = bluesky_candidates.len();
-                        candidates.append(&mut bluesky_candidates);
+    let nostr_future = async {
+        let mut diagnostics = FeedProtocolDiagnostics::default();
+        let mut selected = Vec::new();
+        let mut candidates = Vec::new();
+        match nostr_source.discover_sources_with_diagnostics(&profile).await {
+            Ok((nostr_selected, mut discovered_diagnostics)) => {
+                match nostr_source.fetch_candidates(&profile, &nostr_selected, limit_for_candidates()).await {
+                    Ok(nostr_candidates) => {
+                        discovered_diagnostics.candidate_count = nostr_candidates.len();
+                        candidates = nostr_candidates;
                     }
                     Err(err) => {
-                        tracing::warn!("Bluesky candidate fetch failed: {err}");
-                        discovered_bluesky_diagnostics.candidate_count = 0;
+                        tracing::warn!("Nostr candidate fetch failed: {err}");
+                        discovered_diagnostics.candidate_count = 0;
                     }
                 }
-                bluesky_diagnostics = discovered_bluesky_diagnostics;
+                selected = nostr_selected;
+                diagnostics = discovered_diagnostics;
             }
             Err(err) => {
-                tracing::warn!("Bluesky source discovery failed: {err}");
-                bluesky_diagnostics.available = false;
-                bluesky_diagnostics.error = Some(format!("{err}"));
+                tracing::warn!("Nostr source discovery failed: {err}");
+                diagnostics.available = false;
+                diagnostics.error = Some(format!("{err}"));
             }
         }
-    }
+        (selected, diagnostics, candidates)
+    };
+
+    let bluesky_future = async {
+        let mut diagnostics = FeedProtocolDiagnostics::default();
+        let mut selected = Vec::new();
+        let mut candidates = Vec::new();
+        match effective_bluesky_auth {
+            Some(auth) => {
+                tracing::info!(service_url = %auth.service_url, "World feed: Bluesky auth available, running discovery");
+                let bluesky_source = BlueskyFeedSource::new(auth);
+                match bluesky_source.discover_sources_with_diagnostics(&profile).await {
+                    Ok((bluesky_selected, mut discovered_diagnostics)) => {
+                        match bluesky_source.fetch_candidates(&profile, &bluesky_selected, limit_for_candidates()).await {
+                            Ok(bluesky_candidates) => {
+                                discovered_diagnostics.candidate_count = bluesky_candidates.len();
+                                candidates = bluesky_candidates;
+                            }
+                            Err(err) => {
+                                tracing::warn!("Bluesky candidate fetch failed: {err}");
+                                discovered_diagnostics.candidate_count = 0;
+                            }
+                        }
+                        selected = bluesky_selected;
+                        diagnostics = discovered_diagnostics;
+                    }
+                    Err(err) => {
+                        tracing::warn!("Bluesky source discovery failed: {err}");
+                        diagnostics.available = false;
+                        diagnostics.error = Some(format!("{err}"));
+                    }
+                }
+            }
+            None => {
+                tracing::info!("World feed: Bluesky auth not provided, skipping Bluesky discovery");
+                diagnostics.error = Some("Bluesky auth not available".to_string());
+            }
+        }
+        (selected, diagnostics, candidates)
+    };
+
+    // Run all three protocol pipelines in parallel
+    let (
+        (rss_selected, rss_diagnostics, mut candidates, mut selected_sources),
+        (nostr_selected, nostr_diagnostics, nostr_candidates),
+        (bluesky_selected, bluesky_diagnostics, bluesky_candidates),
+    ) = tokio::join!(rss_future, nostr_future, bluesky_future);
+
+    selected_sources.extend(nostr_selected);
+    selected_sources.extend(bluesky_selected);
+    candidates.extend(nostr_candidates);
+    candidates.extend(bluesky_candidates);
 
     if include_web_search && config.web_search.enabled {
         let mut web_aug = collect_web_search_augmented_candidates(
@@ -729,8 +759,16 @@ pub async fn load_world_feed(
     config: &Config,
     bluesky_auth: Option<BlueskyAuth>,
     limit: usize,
+    force: bool,
 ) -> Result<PersonalizedFeedResponse> {
     let workspace_dir = &config.workspace_dir;
+
+    // Always store the latest Bluesky auth so background tasks can use the freshest JWT,
+    // even if they were spawned before this request arrived.
+    if let Some(ref auth) = bluesky_auth {
+        store_latest_bluesky_auth(workspace_dir, auth);
+    }
+
     let embeddings_disabled = config
         .memory
         .embedding_provider
@@ -745,7 +783,7 @@ pub async fn load_world_feed(
     let mut inflight = world_feed_refresh_inflight().lock().contains(workspace_dir);
     let mut refresh_state = compute_refresh_state(cache_exists, &state, inflight);
 
-    let mut needs_refresh = should_refresh_world_feed(cache_exists, &state, inflight);
+    let mut needs_refresh = force || should_refresh_world_feed(cache_exists, &state, inflight);
 
     // If Bluesky diagnostics show an ExpiredToken error and the caller is now providing
     // fresh auth, force a refresh to retry Bluesky discovery with the new token.
@@ -758,7 +796,7 @@ pub async fn load_world_feed(
         }
     }
 
-    if needs_refresh && !embeddings_disabled {
+    if needs_refresh && !inflight && !embeddings_disabled {
         spawn_world_feed_refresh(config.clone(), bluesky_auth.clone());
         inflight = world_feed_refresh_inflight().lock().contains(workspace_dir);
         refresh_state = compute_refresh_state(cache_exists, &state, inflight);
@@ -803,6 +841,7 @@ pub async fn load_world_feed(
             last_error,
             selected_sources,
             diagnostics,
+            generation: state.generation,
         });
     }
 
@@ -843,6 +882,7 @@ pub async fn load_world_feed(
                             last_error,
                             selected_sources: prepared.selected_sources,
                             diagnostics: prepared.diagnostics,
+                            generation: state.generation,
                         });
                     }
                 }
@@ -904,6 +944,7 @@ pub async fn load_world_feed(
         last_error,
         selected_sources,
         diagnostics,
+        generation: state.generation,
     })
 }
 
@@ -1035,73 +1076,81 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
         .iter()
         .map(selected_source_summary)
         .collect();
-    let discovery_details_json = serde_json::json!({
-        "selectedSources": selected_sources_json.clone(),
-        "diagnostics": prepared.diagnostics.clone(),
-    }).to_string();
-    let current_state = local_store::get_personalized_feed_state(&workspace_dir, WORLD_FEED_KEY)
-        .ok()
-        .flatten()
-        .unwrap_or_else(default_feed_state_record);
-    let _ = local_store::upsert_personalized_feed_state(
-        &workspace_dir,
-        &local_store::PersonalizedFeedStateUpsert {
-            feed_key: WORLD_FEED_KEY.to_string(),
-            dirty: true,
-            refresh_status: "refreshing".to_string(),
-            refreshed_at: current_state.refreshed_at,
-            refresh_started_at: now.clone(),
-            refresh_finished_at: current_state.refresh_finished_at,
-            last_error: String::new(),
-            profile_status: prepared.profile.status.clone(),
-            profile_stats_json: serde_json::json!(prepared.profile.stats).to_string(),
-            details_json: discovery_details_json,
-        },
-    );
 
-    let ranked_items = if prepared.embedder.dimensions() > 0 {
-        let stage2_fallback_candidates = prepared.candidates.clone();
+    // ── Phase 1 (FAST): Stage 2 keyword ranking ─────────────────────────
+    // Write keyword-ranked results to cache immediately so the frontend
+    // can show fresh content within seconds, before semantic ranking.
+    let stage2_items = rank_candidates_stage2(
+        &prepared.profile,
+        prepared.candidates.clone(),
+        WORLD_FEED_RANK_LIMIT,
+    );
+    if !stage2_items.is_empty() {
+        let phase1_at = Utc::now().to_rfc3339();
+        let cache_rows = build_cache_rows(&stage2_items, &phase1_at);
+        local_store::replace_personalized_feed_cache(&workspace_dir, WORLD_FEED_KEY, &cache_rows)?;
+
+        prepared.diagnostics.ranking.ranked_item_count = stage2_items.len();
+        let discovery_details_json = serde_json::json!({
+            "selectedSources": selected_sources_json.clone(),
+            "diagnostics": prepared.diagnostics.clone(),
+        }).to_string();
+        let _ = local_store::upsert_personalized_feed_state(
+            &workspace_dir,
+            &local_store::PersonalizedFeedStateUpsert {
+                feed_key: WORLD_FEED_KEY.to_string(),
+                dirty: true,
+                refresh_status: "ranking".to_string(),
+                refreshed_at: phase1_at.clone(),
+                refresh_started_at: now.clone(),
+                refresh_finished_at: phase1_at,
+                last_error: String::new(),
+                profile_status: prepared.profile.status.clone(),
+                profile_stats_json: serde_json::json!(prepared.profile.stats).to_string(),
+                details_json: discovery_details_json,
+            },
+        );
+        let _ = local_store::bump_feed_generation(&workspace_dir, WORLD_FEED_KEY);
+        tracing::info!(
+            stage2_items = stage2_items.len(),
+            "World feed: Phase 1 (keyword-ranked) items written to cache"
+        );
+    }
+
+    // ── Phase 2 (SLOW): Stage 3 semantic ranking ────────────────────────
+    // Re-rank all candidates using embeddings for higher quality, then
+    // replace the cache. Bumps generation again so the frontend detects it.
+    let final_items = if prepared.embedder.dimensions() > 0 {
         match FeedRanker::rank_candidates(
             prepared.embedder.clone(),
             &prepared.profile,
             prepared.candidates,
-            30,
+            WORLD_FEED_RANK_LIMIT,
         )
         .await
         {
-            Ok(items) if !items.is_empty() => items,
+            Ok(items) if !items.is_empty() => {
+                tracing::info!(stage3_items = items.len(), "World feed: Stage 3 semantic ranking complete");
+                items
+            }
             Ok(_) => {
-                tracing::info!("Stage 3 ranking returned no items, falling back to stage 2");
-                rank_candidates_stage2(&prepared.profile, stage2_fallback_candidates, 30)
+                tracing::info!("Stage 3 ranking returned no items, keeping Stage 2 results");
+                stage2_items
             }
             Err(err) => {
-                tracing::warn!("Stage 3 ranking failed, falling back to stage 2: {err}");
-                rank_candidates_stage2(&prepared.profile, stage2_fallback_candidates, 30)
+                tracing::warn!("Stage 3 ranking failed, keeping Stage 2 results: {err}");
+                stage2_items
             }
         }
     } else {
-        rank_candidates_stage2(&prepared.profile, prepared.candidates, 30)
+        stage2_items
     };
-    prepared.diagnostics.ranking.ranked_item_count = ranked_items.len();
-    tracing::info!(
-        candidates_before_ranking = prepared.diagnostics.ranking.candidate_count_before_ranking,
-        ranked_items = ranked_items.len(),
-        "World feed: ranking complete"
-    );
+
+    prepared.diagnostics.ranking.ranked_item_count = final_items.len();
     let refreshed_at = Utc::now().to_rfc3339();
-    let cache_rows: Vec<local_store::PersonalizedFeedCacheUpsert> = ranked_items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| local_store::PersonalizedFeedCacheUpsert {
-            feed_key: WORLD_FEED_KEY.to_string(),
-            cache_key: cache_item_key(item, index),
-            payload_json: serde_json::to_string(item).unwrap_or_else(|_| "{}".to_string()),
-            score: f64::from(item.score.unwrap_or(0.0)),
-            sort_order: i64::try_from(index).unwrap_or(0),
-            refreshed_at: refreshed_at.clone(),
-        })
-        .collect();
+    let cache_rows = build_cache_rows(&final_items, &refreshed_at);
     local_store::replace_personalized_feed_cache(&workspace_dir, WORLD_FEED_KEY, &cache_rows)?;
+    let _ = local_store::bump_feed_generation(&workspace_dir, WORLD_FEED_KEY);
     local_store::upsert_personalized_feed_state(
         &workspace_dir,
         &local_store::PersonalizedFeedStateUpsert {
@@ -1122,6 +1171,24 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
         },
     )?;
     Ok(())
+}
+
+fn build_cache_rows(
+    items: &[PersonalizedFeedItem],
+    refreshed_at: &str,
+) -> Vec<local_store::PersonalizedFeedCacheUpsert> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| local_store::PersonalizedFeedCacheUpsert {
+            feed_key: WORLD_FEED_KEY.to_string(),
+            cache_key: cache_item_key(item, index),
+            payload_json: serde_json::to_string(item).unwrap_or_else(|_| "{}".to_string()),
+            score: f64::from(item.score.unwrap_or(0.0)),
+            sort_order: i64::try_from(index).unwrap_or(0),
+            refreshed_at: refreshed_at.to_string(),
+        })
+        .collect()
 }
 
 fn mark_world_feed_refreshing(workspace_dir: &Path) {
@@ -1191,6 +1258,23 @@ fn world_feed_refresh_inflight() -> &'static Mutex<HashSet<PathBuf>> {
     INFLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Stores the most recent Bluesky auth per workspace so that background refresh
+/// tasks always use the freshest JWT, even if they were spawned with an older one.
+fn latest_bluesky_auth_store() -> &'static Mutex<HashMap<PathBuf, BlueskyAuth>> {
+    static STORE: OnceLock<Mutex<HashMap<PathBuf, BlueskyAuth>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_latest_bluesky_auth(workspace_dir: &Path, auth: &BlueskyAuth) {
+    latest_bluesky_auth_store()
+        .lock()
+        .insert(workspace_dir.to_path_buf(), auth.clone());
+}
+
+fn take_latest_bluesky_auth(workspace_dir: &Path) -> Option<BlueskyAuth> {
+    latest_bluesky_auth_store().lock().get(workspace_dir).cloned()
+}
+
 fn default_feed_state_record() -> local_store::PersonalizedFeedStateRecord {
     local_store::PersonalizedFeedStateRecord {
         feed_key: WORLD_FEED_KEY.to_string(),
@@ -1204,6 +1288,7 @@ fn default_feed_state_record() -> local_store::PersonalizedFeedStateRecord {
         profile_stats_json: "{}".to_string(),
         details_json: "{}".to_string(),
         updated_at: String::new(),
+        generation: 0,
     }
 }
 
@@ -4878,7 +4963,7 @@ mod tests {
             &refreshed_at,
         );
 
-        let response = load_world_feed(&test_config(workspace.path()), None, 10)
+        let response = load_world_feed(&test_config(workspace.path()), None, 10, false)
             .await
             .unwrap();
 
@@ -4900,7 +4985,7 @@ mod tests {
         local_store::initialize(workspace.path()).unwrap();
         seed_recent_rss_content(workspace.path());
 
-        let response = load_world_feed(&test_config(workspace.path()), None, 10)
+        let response = load_world_feed(&test_config(workspace.path()), None, 10, false)
             .await
             .unwrap();
 
@@ -4928,7 +5013,7 @@ mod tests {
             &refreshed_at,
         );
 
-        let response = load_world_feed(&test_config(workspace.path()), None, 10)
+        let response = load_world_feed(&test_config(workspace.path()), None, 10, false)
             .await
             .unwrap();
 

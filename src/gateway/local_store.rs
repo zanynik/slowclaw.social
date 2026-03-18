@@ -241,6 +241,7 @@ pub struct PersonalizedFeedStateRecord {
     pub profile_stats_json: String,
     pub details_json: String,
     pub updated_at: String,
+    pub generation: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1540,7 +1541,7 @@ pub fn get_personalized_feed_state(
     let mut stmt = conn.prepare(
         "SELECT feed_key, dirty, refresh_status, refreshed_at, refresh_started_at,
                 refresh_finished_at, last_error, profile_status, profile_stats_json,
-                details_json, updated_at
+                details_json, updated_at, COALESCE(generation, 0)
          FROM personalized_feed_state
          WHERE feed_key = ?1
          LIMIT 1",
@@ -1559,6 +1560,7 @@ pub fn get_personalized_feed_state(
                 profile_stats_json: row.get(8)?,
                 details_json: row.get(9)?,
                 updated_at: row.get(10)?,
+                generation: row.get(11)?,
             })
         })
         .optional()?;
@@ -1616,7 +1618,25 @@ pub fn upsert_personalized_feed_state(
         profile_stats_json: state.profile_stats_json.trim().to_string(),
         details_json: state.details_json.trim().to_string(),
         updated_at: now,
+        generation: 0,
     })
+}
+
+pub fn bump_feed_generation(workspace_dir: &Path, feed_key: &str) -> Result<i64> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let current: i64 = conn
+        .query_row(
+            "SELECT COALESCE(generation, 0) FROM personalized_feed_state WHERE feed_key = ?1",
+            params![feed_key.trim()],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let next = current + 1;
+    conn.execute(
+        "UPDATE personalized_feed_state SET generation = ?1 WHERE feed_key = ?2",
+        params![next, feed_key.trim()],
+    )?;
+    Ok(next)
 }
 
 pub fn mark_personalized_feed_dirty(workspace_dir: &Path, feed_key: &str) -> Result<()> {
@@ -1631,6 +1651,7 @@ pub fn mark_personalized_feed_dirty(workspace_dir: &Path, feed_key: &str) -> Res
         last_error: String::new(),
         profile_status: String::new(),
         profile_stats_json: "{}".to_string(),
+        generation: 0,
         details_json: "{}".to_string(),
         updated_at: String::new(),
     });
@@ -2302,6 +2323,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "feed_web_sources",
         "metadata_embedding",
         "BLOB NOT NULL DEFAULT X''",
+    )?;
+    ensure_column(
+        &conn,
+        "personalized_feed_state",
+        "generation",
+        "INTEGER NOT NULL DEFAULT 0",
     )?;
 
     Ok(())

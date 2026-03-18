@@ -5850,7 +5850,7 @@ async fn handle_feed_personalized(
         }),
         _ => None,
     };
-    match crate::feed::load_world_feed(&config_snapshot, bluesky_auth, limit).await {
+    match crate::feed::load_world_feed(&config_snapshot, bluesky_auth, limit, body.force).await {
         Ok(response) => (
             StatusCode::OK,
             Json(serde_json::to_value(response).unwrap_or_else(|_| serde_json::json!({}))),
@@ -8313,6 +8313,8 @@ struct PersonalizedFeedRequest {
     service_url: Option<String>,
     access_jwt: Option<String>,
     limit: Option<usize>,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
