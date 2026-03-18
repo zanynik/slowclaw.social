@@ -416,6 +416,7 @@ export type PersonalizedFeedRequest = {
   serviceUrl?: string;
   accessJwt?: string;
   limit?: number;
+  force?: boolean;
 };
 
 export type PersonalizedFeedItem = {
@@ -508,6 +509,7 @@ export type PersonalizedFeedResponse = {
       rankedItemCount: number;
     };
   };
+  generation?: number;
 };
 
 export type WorldFeedInterestItem = {
@@ -616,7 +618,8 @@ export async function fetchPersonalizedFeed(
     body: JSON.stringify({
       serviceUrl: payload.serviceUrl,
       accessJwt: payload.accessJwt,
-      limit: payload.limit
+      limit: payload.limit,
+      ...(payload.force ? { force: true } : {})
     })
   });
   const data = await parseJsonOrThrow(res);
@@ -734,7 +737,8 @@ export async function fetchPersonalizedFeed(
         candidateCountBeforeRanking: Number(data?.diagnostics?.ranking?.candidateCountBeforeRanking || 0),
         rankedItemCount: Number(data?.diagnostics?.ranking?.rankedItemCount || 0)
       }
-    }
+    },
+    generation: typeof data.generation === "number" ? data.generation : undefined
   };
 }
 

@@ -1118,6 +1118,12 @@ function App() {
   const [nostrKeys, setNostrKeys] = useState<NostrKeys | null>(null);
   const [nostrKeysBusy, setNostrKeysBusy] = useState(false);
 
+  // Progressive feed: generation-based polling
+  const [feedGeneration, setFeedGeneration] = useState<number | undefined>(undefined);
+  const [feedNewPostsBanner, setFeedNewPostsBanner] = useState(false);
+  const feedPollTimerRef = useRef<number | undefined>(undefined);
+  const pendingFeedItemsRef = useRef<PersonalizedFeedResponse | null>(null);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -3927,7 +3933,49 @@ function App() {
     return undefined;
   }
 
-  async function fetchBlueskyFeed() {
+  function stopFeedPoll() {
+    if (feedPollTimerRef.current !== undefined) {
+      window.clearInterval(feedPollTimerRef.current);
+      feedPollTimerRef.current = undefined;
+    }
+  }
+
+  function startFeedPoll(knownGeneration: number | undefined) {
+    stopFeedPoll();
+    let trackedGen = knownGeneration;
+    feedPollTimerRef.current = window.setInterval(async () => {
+      try {
+        const jwt = session?.accessJwt;
+        const res = await fetchPersonalizedFeed(
+          {
+            serviceUrl: creds.serviceUrl.trim() || undefined,
+            accessJwt: jwt,
+            limit: 50,
+          },
+          chatGatewayToken,
+          gatewayBaseUrl
+        );
+        if (res.generation !== undefined && res.generation !== trackedGen) {
+          // New data available — stash it for the banner
+          pendingFeedItemsRef.current = res;
+          setFeedNewPostsBanner(true);
+          trackedGen = res.generation;
+        }
+        // Stop polling when refresh is complete
+        if (
+          res.refreshState !== "refreshing" &&
+          res.refreshState !== "warming" &&
+          res.refreshStatus !== "ranking"
+        ) {
+          stopFeedPoll();
+        }
+      } catch {
+        // Ignore poll errors
+      }
+    }, 4000);
+  }
+
+  async function fetchBlueskyFeed(options?: { force?: boolean }) {
     setBlueskyFeedLoading(true);
     setBlueskyFeedStatus("");
 
@@ -3936,7 +3984,8 @@ function App() {
         {
           serviceUrl: creds.serviceUrl.trim() || undefined,
           accessJwt: jwt,
-          limit: 30
+          limit: 50,
+          force: options?.force
         },
         chatGatewayToken,
         gatewayBaseUrl
@@ -4000,6 +4049,16 @@ function App() {
 
       setBlueskyFeedSnapshot(res);
       setBlueskyProfileStats(res.profileStats);
+      setFeedGeneration(res.generation);
+
+      // Start polling if a refresh is in progress, stop if done
+      if (res.refreshState === "refreshing" || res.refreshState === "warming" || res.refreshStatus === "ranking") {
+        startFeedPoll(res.generation);
+      } else {
+        stopFeedPoll();
+        setFeedNewPostsBanner(false);
+      }
+
       const refreshedLabel = res.refreshedAt
         ? ` Last refresh ${formatTimestamp(res.refreshedAt)}.`
         : "";
@@ -4289,7 +4348,7 @@ function App() {
   }
 
   async function refreshWorldFeedDiagnostics() {
-    await Promise.all([fetchBlueskyFeed(), loadWorldFeedInterests()]);
+    await Promise.all([fetchBlueskyFeed({ force: true }), loadWorldFeedInterests()]);
   }
 
   function chooseNextWorldFeedSample(protocol: "rss" | "nostr" | "bluesky", sampleCount: number) {
@@ -4316,7 +4375,10 @@ function App() {
     } else {
       setWorldFeedInterests([]);
       setWorldFeedInterestStatus("");
+      stopFeedPoll();
+      setFeedNewPostsBanner(false);
     }
+    return () => { stopFeedPoll(); };
   }, [feedSource, session, creds.serviceUrl, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
@@ -6049,7 +6111,7 @@ function App() {
                     className="ghost"
                     onClick={() => {
                       if (feedSource === "bluesky") {
-                        void fetchBlueskyFeed();
+                        void fetchBlueskyFeed({ force: true });
                       } else {
                         void refreshWorkspaceViews({ runSynthIfPending: true });
                       }
@@ -6925,6 +6987,38 @@ function App() {
                       const visibleItems = worldFeedTab === "videos"
                         ? blueskyFeedItems.filter(isVideoItem)
                         : blueskyFeedItems;
+                      const newPostsBanner = feedNewPostsBanner && pendingFeedItemsRef.current ? (
+                        <button
+                          type="button"
+                          className="feed-new-posts-banner"
+                          onClick={() => {
+                            const pending = pendingFeedItemsRef.current;
+                            if (pending) {
+                              setBlueskyFeedItems(pending.items);
+                              setBlueskyFeedSnapshot(pending);
+                              setBlueskyProfileStats(pending.profileStats);
+                              setFeedGeneration(pending.generation);
+                              pendingFeedItemsRef.current = null;
+                              setFeedNewPostsBanner(false);
+                            }
+                          }}
+                          style={{
+                            width: "100%",
+                            padding: "0.55rem 1rem",
+                            border: "1px solid var(--accent, #4a9eff)",
+                            borderRadius: "8px",
+                            backgroundColor: "var(--accent-bg, #e8f0fe)",
+                            color: "var(--accent, #4a9eff)",
+                            cursor: "pointer",
+                            textAlign: "center",
+                            fontSize: "0.85rem",
+                            fontWeight: 500,
+                            marginBottom: "0.5rem",
+                          }}
+                        >
+                          New posts found — tap to load
+                        </button>
+                      ) : null;
                       if (worldFeedTab === "videos" && visibleItems.length === 0) {
                         // Show fallback video content from Bluesky video feed + Nostr
                         if (videoFallbackLoading) {
@@ -7071,7 +7165,7 @@ function App() {
                           return null;
                         });
                       }
-                      return visibleItems.map((item, idx) => {
+                      return <>{newPostsBanner}{visibleItems.map((item, idx) => {
                       if (item.sourceType === "web" && item.webPreview) {
                         const preview = item.webPreview;
                         const selectedSource = item.feedSource;
@@ -7376,7 +7470,7 @@ function App() {
                           ) : null}
                         </div>
                       );
-                    });
+                    })}</>;
                     })()}
                   </div>
                 )
