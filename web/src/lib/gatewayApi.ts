@@ -426,6 +426,7 @@ export type PersonalizedFeedItem = {
     url: string;
     title: string;
     description: string;
+    contentText: string;
     imageUrl?: string | null;
     domain: string;
     provider: string;
@@ -523,6 +524,8 @@ export type WorldFeedInterestItem = {
   embeddingDimensions: number;
   synthetic: boolean;
   deletable: boolean;
+  keywords: string[];
+  keywordsOverride: string[] | null;
 };
 
 export type WorkspaceSyncFile = {
@@ -590,19 +593,23 @@ export async function getRuntimeConfig(
 }
 
 export async function updateRuntimeConfig(
-  payload: RuntimeConfigSnapshot,
+  payload: RuntimeConfigSnapshot & { apiKey?: string },
   bearerToken?: string,
   gatewayBaseUrl?: string
 ) {
+  const body: Record<string, unknown> = {
+    defaultProvider: payload.defaultProvider,
+    defaultModel: payload.defaultModel,
+    transcriptionEnabled: payload.transcriptionEnabled,
+    transcriptionModel: payload.transcriptionModel
+  };
+  if (payload.apiKey) {
+    body.apiKey = payload.apiKey;
+  }
   const res = await fetch(resolveGatewayEndpoint("/api/config/runtime", gatewayBaseUrl), {
     method: "POST",
     headers: authHeaders(bearerToken, "application/json"),
-    body: JSON.stringify({
-      defaultProvider: payload.defaultProvider,
-      defaultModel: payload.defaultModel,
-      transcriptionEnabled: payload.transcriptionEnabled,
-      transcriptionModel: payload.transcriptionModel
-    })
+    body: JSON.stringify(body)
   });
   return parseJsonOrThrow(res);
 }
@@ -646,6 +653,7 @@ export async function fetchPersonalizedFeed(
                 url: String(item.webPreview.url || ""),
                 title: String(item.webPreview.title || ""),
                 description: String(item.webPreview.description || ""),
+                contentText: String(item.webPreview.contentText || ""),
                 imageUrl: item.webPreview.imageUrl ? String(item.webPreview.imageUrl) : null,
                 domain: String(item.webPreview.domain || ""),
                 provider: String(item.webPreview.provider || ""),
@@ -751,7 +759,11 @@ export async function listWorldFeedInterests(
   });
   const data = await parseJsonOrThrow(res);
   const items = Array.isArray(data?.items) ? data.items : [];
-  return items.map((item: any) => ({
+  return items.map((item: any) => parseWorldFeedInterestItem(item));
+}
+
+function parseWorldFeedInterestItem(item: any): WorldFeedInterestItem {
+  return {
     id: String(item?.id || ""),
     label: String(item?.label || ""),
     sourcePath: String(item?.sourcePath || ""),
@@ -762,7 +774,9 @@ export async function listWorldFeedInterests(
     embeddingDimensions: Number(item?.embeddingDimensions || 0),
     synthetic: Boolean(item?.synthetic),
     deletable: Boolean(item?.deletable),
-  }));
+    keywords: Array.isArray(item?.keywords) ? item.keywords.map(String) : [],
+    keywordsOverride: Array.isArray(item?.keywordsOverride) ? item.keywordsOverride.map(String) : null,
+  };
 }
 
 export async function createWorldFeedDummyInterest(
@@ -776,19 +790,7 @@ export async function createWorldFeedDummyInterest(
     body: JSON.stringify({ label })
   });
   const data = await parseJsonOrThrow(res);
-  const item = data?.item || {};
-  return {
-    id: String(item?.id || ""),
-    label: String(item?.label || ""),
-    sourcePath: String(item?.sourcePath || ""),
-    healthScore: Number(item?.healthScore || 0),
-    lastSeenAt: String(item?.lastSeenAt || ""),
-    createdAt: String(item?.createdAt || ""),
-    updatedAt: String(item?.updatedAt || ""),
-    embeddingDimensions: Number(item?.embeddingDimensions || 0),
-    synthetic: Boolean(item?.synthetic),
-    deletable: Boolean(item?.deletable),
-  };
+  return parseWorldFeedInterestItem(data?.item || {});
 }
 
 export async function deleteWorldFeedInterest(
@@ -808,6 +810,28 @@ export async function deleteWorldFeedInterest(
     }
   );
   return parseJsonOrThrow(res);
+}
+
+export async function updateWorldFeedInterest(
+  interestId: string,
+  update: { label?: string; keywordsOverride?: string[] },
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<WorldFeedInterestItem> {
+  const trimmed = interestId.trim();
+  if (!trimmed) {
+    throw new Error("Interest id is required");
+  }
+  const res = await fetch(
+    resolveGatewayEndpoint(`/api/workspace/world-feed/interests/${encodeURIComponent(trimmed)}`, gatewayBaseUrl),
+    {
+      method: "PATCH",
+      headers: authHeaders(bearerToken, "application/json"),
+      body: JSON.stringify(update)
+    }
+  );
+  const data = await parseJsonOrThrow(res);
+  return parseWorldFeedInterestItem(data?.item || {});
 }
 
 export async function exportWorkspaceSyncSnapshot(
@@ -1707,4 +1731,51 @@ export async function createPostHistory(
     })
   });
   return parseJsonOrThrow(res);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OpenRouter OAuth PKCE
+// ══════════════════════════════════════════════════════════════════════════════
+
+export type OpenRouterOAuthStartResult = {
+  authUrl: string;
+};
+
+export type OpenRouterOAuthStatus = {
+  active: boolean;
+  status: "none" | "pending" | "complete" | "failed";
+  hasKey: boolean;
+  error: string | null;
+};
+
+export async function startOpenRouterOAuth(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<OpenRouterOAuthStartResult> {
+  const res = await fetch(
+    resolveGatewayEndpoint("/api/auth/openrouter/start", gatewayBaseUrl),
+    {
+      method: "POST",
+      headers: authHeaders(bearerToken, "application/json")
+    }
+  );
+  const data = await parseJsonOrThrow(res);
+  return { authUrl: String(data?.authUrl || "") };
+}
+
+export async function getOpenRouterOAuthStatus(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<OpenRouterOAuthStatus> {
+  const res = await fetch(
+    resolveGatewayEndpoint("/api/auth/openrouter/status", gatewayBaseUrl),
+    { headers: authHeaders(bearerToken) }
+  );
+  const data = await parseJsonOrThrow(res);
+  return {
+    active: Boolean(data?.active),
+    status: data?.status || "none",
+    hasKey: Boolean(data?.hasKey),
+    error: data?.error ? String(data.error) : null
+  };
 }

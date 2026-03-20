@@ -131,6 +131,7 @@ pub struct FeedInterestRecord {
     pub last_seen_at: String,
     pub created_at: String,
     pub updated_at: String,
+    pub keywords_override: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1154,7 +1155,8 @@ pub fn create_media_asset_metadata(
 pub fn list_feed_interests(workspace_dir: &Path) -> Result<Vec<FeedInterestRecord>> {
     let conn = open_conn(&db_path(workspace_dir))?;
     let mut stmt = conn.prepare(
-        "SELECT id, label, source_path, embedding, health_score, last_seen_at, created_at, updated_at
+        "SELECT id, label, source_path, embedding, health_score, last_seen_at, created_at, updated_at,
+                COALESCE(keywords_override, '')
          FROM feed_interests
          ORDER BY updated_at DESC, id DESC",
     )?;
@@ -1168,6 +1170,7 @@ pub fn list_feed_interests(workspace_dir: &Path) -> Result<Vec<FeedInterestRecor
             last_seen_at: row.get(5)?,
             created_at: row.get(6)?,
             updated_at: row.get(7)?,
+            keywords_override: row.get(8)?,
         })
     })?;
 
@@ -1223,6 +1226,7 @@ pub fn upsert_feed_interest(
         last_seen_at: interest.last_seen_at.clone(),
         created_at: now.clone(),
         updated_at: now,
+        keywords_override: String::new(),
     })
 }
 
@@ -1236,6 +1240,35 @@ pub fn decay_feed_interests(workspace_dir: &Path, decay_rate: f64) -> Result<usi
         params![decay_rate, now],
     )?;
     Ok(updated)
+}
+
+pub fn update_feed_interest_keywords_override(
+    workspace_dir: &Path,
+    interest_id: &str,
+    keywords_override: &str,
+) -> Result<bool> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    let updated = conn.execute(
+        "UPDATE feed_interests SET keywords_override = ?1, updated_at = ?2 WHERE id = ?3",
+        params![keywords_override, now, interest_id],
+    )?;
+    Ok(updated > 0)
+}
+
+pub fn update_feed_interest_label(
+    workspace_dir: &Path,
+    interest_id: &str,
+    label: &str,
+    embedding: &[u8],
+) -> Result<bool> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    let updated = conn.execute(
+        "UPDATE feed_interests SET label = ?1, embedding = ?2, updated_at = ?3 WHERE id = ?4",
+        params![label, embedding, now, interest_id],
+    )?;
+    Ok(updated > 0)
 }
 
 pub fn delete_feed_interest(workspace_dir: &Path, interest_id: &str) -> Result<bool> {
@@ -2329,6 +2362,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "personalized_feed_state",
         "generation",
         "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "feed_interests",
+        "keywords_override",
+        "TEXT NOT NULL DEFAULT ''",
     )?;
 
     Ok(())

@@ -107,7 +107,10 @@ import {
   updateWorkspaceTodoStatus,
   updateFeedContentAgent,
   updateRuntimeConfig,
+  updateWorldFeedInterest,
   uploadMediaViaGateway,
+  startOpenRouterOAuth,
+  getOpenRouterOAuthStatus,
 } from "./lib/gatewayApi";
 import type {
   FeedContentAgentItem,
@@ -821,6 +824,25 @@ function renderBlueskyEmbed(embed: any) {
   return null;
 }
 
+function normalizeArticleText(text: string) {
+  return text.replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function summarizeArticleText(text: string, maxLength = 360) {
+  const normalized = normalizeArticleText(text).replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength - 3).trimEnd()}...`;
+}
+
+function hasInlineVideoUrl(text: string) {
+  return /(https?:\/\/[^\s]+\.(mp4|webm|mov|m3u8))|video\.|youtu\.?be|vimeo/i.test(text);
+}
+
 function App() {
   const isDesktopClient = isTauriDesktopRuntime();
   const isLargeScreen = useIsLargeScreen();
@@ -970,6 +992,9 @@ function App() {
   const [claudeToken, setClaudeToken] = useState("");
   const [claudeTokenStatus, setClaudeTokenStatus] = useState<AnthropicTokenStatus | null>(null);
   const [claudeTokenBusy, setClaudeTokenBusy] = useState(false);
+  const [openrouterOAuthBusy, setOpenrouterOAuthBusy] = useState(false);
+  const [openrouterOAuthStatus, setOpenrouterOAuthStatus] = useState("");
+  const [openrouterApiKeyInput, setOpenrouterApiKeyInput] = useState("");
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerApiKeyStatus, setProviderApiKeyStatus] = useState("");
   const [settingsProvider, setSettingsProvider] = useState("");
@@ -1068,6 +1093,8 @@ function App() {
   const [worldFeedDummyLabel, setWorldFeedDummyLabel] = useState(
     "Open protocols, developer tools, startups, AI products"
   );
+  const [editingInterestId, setEditingInterestId] = useState<string | null>(null);
+  const [editingInterestKeywords, setEditingInterestKeywords] = useState("");
   const [blueskyProfileStats, setBlueskyProfileStats] = useState<InterestProfileStats>({
     interestCount: 0,
     sourceCount: 0,
@@ -1109,10 +1136,11 @@ function App() {
   const [replyingUri, setReplyingUri] = useState("");
 
   // World feed sub-tabs & Me feed sub-tabs
-  const [worldFeedTab, setWorldFeedTab] = useState<"all" | "videos">("all");
+  const [worldFeedTab, setWorldFeedTab] = useState<"tweets" | "articles" | "videos">("tweets");
   const [videoFallbackItems, setVideoFallbackItems] = useState<any[]>([]);
   const [videoFallbackLoading, setVideoFallbackLoading] = useState(false);
   const [meFeedTab, setMeFeedTab] = useState<"drafts" | "published">("drafts");
+  const [expandedArticleUrl, setExpandedArticleUrl] = useState("");
 
   // Nostr identity
   const [nostrKeys, setNostrKeys] = useState<NostrKeys | null>(null);
@@ -3965,7 +3993,8 @@ function App() {
         if (
           res.refreshState !== "refreshing" &&
           res.refreshState !== "warming" &&
-          res.refreshStatus !== "ranking"
+          res.refreshStatus !== "ranking" &&
+          res.refreshStatus !== "discovering"
         ) {
           stopFeedPoll();
         }
@@ -4052,7 +4081,7 @@ function App() {
       setFeedGeneration(res.generation);
 
       // Start polling if a refresh is in progress, stop if done
-      if (res.refreshState === "refreshing" || res.refreshState === "warming" || res.refreshStatus === "ranking") {
+      if (res.refreshState === "refreshing" || res.refreshState === "warming" || res.refreshStatus === "ranking" || res.refreshStatus === "discovering") {
         startFeedPoll(res.generation);
       } else {
         stopFeedPoll();
@@ -4333,16 +4362,61 @@ function App() {
     }
   }
 
-  async function removeDiagnosticWorldFeedInterest(item: WorldFeedInterestItem) {
+  async function removeWorldFeedInterest(item: WorldFeedInterestItem) {
     setWorldFeedInterestStatus("");
     try {
       await deleteWorldFeedInterest(item.id, chatGatewayToken, gatewayBaseUrl);
-      setWorldFeedInterestStatus(`Removed diagnostic interest: ${item.label}`);
+      setWorldFeedInterestStatus(`Removed interest: ${item.label}${item.synthetic ? "" : " (will regenerate on next profile refresh)"}`);
       await Promise.all([loadWorldFeedInterests(), fetchBlueskyFeed()]);
     } catch (error) {
-      console.error("Failed to delete world-feed diagnostic interest", error);
+      console.error("Failed to delete world-feed interest", error);
       setWorldFeedInterestStatus(
-        error instanceof Error ? error.message : "Failed to delete diagnostic interest."
+        error instanceof Error ? error.message : "Failed to delete interest."
+      );
+    }
+  }
+
+  async function saveInterestKeywords(interestId: string) {
+    setWorldFeedInterestStatus("");
+    try {
+      const keywords = editingInterestKeywords
+        .split(",")
+        .map((kw) => kw.trim())
+        .filter((kw) => kw.length > 0);
+      await updateWorldFeedInterest(
+        interestId,
+        { keywordsOverride: keywords },
+        chatGatewayToken,
+        gatewayBaseUrl
+      );
+      setEditingInterestId(null);
+      setEditingInterestKeywords("");
+      setWorldFeedInterestStatus("Keywords updated.");
+      await Promise.all([loadWorldFeedInterests(), fetchBlueskyFeed()]);
+    } catch (error) {
+      console.error("Failed to update interest keywords", error);
+      setWorldFeedInterestStatus(
+        error instanceof Error ? error.message : "Failed to update keywords."
+      );
+    }
+  }
+
+  async function clearInterestKeywordsOverride(interestId: string) {
+    setWorldFeedInterestStatus("");
+    try {
+      await updateWorldFeedInterest(
+        interestId,
+        { keywordsOverride: [] },
+        chatGatewayToken,
+        gatewayBaseUrl
+      );
+      setEditingInterestId(null);
+      setWorldFeedInterestStatus("Keywords reset to auto-derived.");
+      await Promise.all([loadWorldFeedInterests(), fetchBlueskyFeed()]);
+    } catch (error) {
+      console.error("Failed to clear interest keywords override", error);
+      setWorldFeedInterestStatus(
+        error instanceof Error ? error.message : "Failed to reset keywords."
       );
     }
   }
@@ -4753,6 +4827,15 @@ function App() {
     await invokeDesktopCommandStrict<string>("restart_gateway_daemon");
   }
 
+  async function refreshWorkspaceSynthAfterProviderSetup() {
+    await Promise.all([
+      loadWorkspaceSynthStatus(),
+      loadWorkspaceTodos(),
+      loadWorkspaceEvents(),
+      loadRuntimeMediaCapabilities()
+    ]);
+  }
+
   async function loadOpenAiDeviceCodeStatus() {
     if (!isDesktopClient) {
       return;
@@ -4872,30 +4955,39 @@ function App() {
   }
 
   async function saveOptionalProviderApiKey() {
-    if (!isDesktopClient) {
-      setProviderApiKeyStatus("API key storage is desktop-only.");
-      return;
-    }
     const trimmed = providerApiKey.trim();
     setProviderApiKeyStatus(trimmed ? "Saving API key..." : "Clearing API key...");
     try {
-      if (trimmed) {
-        await invokeDesktopCommandStrict("set_secret", {
-          req: {
-            service: DESKTOP_SECRET_SERVICE,
-            account: PROVIDER_API_KEY_SECRET_ACCOUNT,
-            value: trimmed
-          }
-        });
-      } else {
-        await invokeDesktopCommandStrict("delete_secret", {
-          req: {
-            service: DESKTOP_SECRET_SERVICE,
-            account: PROVIDER_API_KEY_SECRET_ACCOUNT
-          }
+      let token = normalizeGatewayToken(chatGatewayToken);
+      if (!token && isDesktopClient) {
+        token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
+      }
+
+      // Send API key via HTTP so the running gateway sees it immediately
+      await updateRuntimeConfig(
+        {
+          defaultProvider: settingsProvider,
+          defaultModel: settingsModel,
+          transcriptionEnabled: settingsTranscriptionEnabled,
+          transcriptionModel: settingsTranscriptionModel || "",
+          availableTranscriptionModels: settingsAvailableTranscriptionModels,
+          apiKey: trimmed || undefined,
+        },
+        token || undefined,
+        gatewayBaseUrl
+      );
+
+      await refreshWorkspaceSynthAfterProviderSetup();
+
+      if (isDesktopClient) {
+        // Persist to OS keyring and restart gateway
+        invokeDesktopCommandStrict("set_provider_api_key", {
+          value: trimmed
+        }).catch((err: unknown) => {
+          console.warn("Desktop keyring save failed:", err);
         });
       }
-      await restartGatewayDaemonFromDesktop();
+
       setProviderApiKeyStatus(
         trimmed
           ? "API key saved. Gateway restarted."
@@ -4905,6 +4997,132 @@ function App() {
       setProviderApiKeyStatus(
         `Failed to apply API key (${error instanceof Error ? error.message : String(error)})`
       );
+    }
+  }
+
+  async function handleOpenRouterOAuth() {
+    let token = normalizeGatewayToken(chatGatewayToken);
+    if (!token && isDesktopClient) {
+      token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
+    }
+
+    setOpenrouterOAuthBusy(true);
+    setOpenrouterOAuthStatus("Starting OpenRouter login...");
+    try {
+      const result = await startOpenRouterOAuth(token || undefined, gatewayBaseUrl);
+      if (!result.authUrl) {
+        setOpenrouterOAuthStatus("Failed to get auth URL from gateway.");
+        setOpenrouterOAuthBusy(false);
+        return;
+      }
+
+      setOpenrouterOAuthStatus("Opening browser — complete login there, then wait...");
+
+      // Open the auth URL in a browser
+      await openExternalUrlInBrowser(result.authUrl);
+
+      // Poll for completion (90s timeout)
+      const maxAttempts = 90;
+      for (let i = 0; i < maxAttempts; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+          const status = await getOpenRouterOAuthStatus(token || undefined, gatewayBaseUrl);
+          if (status.status === "complete") {
+            setOpenrouterOAuthStatus("OpenRouter connected! AI is ready with a free model.");
+            setSettingsProvider("openrouter");
+            setSettingsModel("google/gemini-2.5-flash:free");
+            window.localStorage.setItem(CHAT_PROVIDER_STORAGE_KEY, "openrouter");
+            window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, "google/gemini-2.5-flash:free");
+            await refreshWorkspaceSynthAfterProviderSetup();
+            setOpenrouterOAuthBusy(false);
+            return;
+          }
+          if (status.status === "failed") {
+            setOpenrouterOAuthStatus(
+              `Login failed: ${status.error || "Unknown error"}. Try pasting an API key instead.`
+            );
+            setOpenrouterOAuthBusy(false);
+            return;
+          }
+        } catch {
+          // Polling error — keep trying
+        }
+      }
+
+      setOpenrouterOAuthStatus(
+        "Auto-login timed out. Create a free API key at openrouter.ai/settings/keys and paste it below."
+      );
+      setOpenrouterOAuthBusy(false);
+    } catch (error) {
+      setOpenrouterOAuthStatus(
+        `Failed: ${error instanceof Error ? error.message : String(error)}. Try pasting an API key instead.`
+      );
+      setOpenrouterOAuthBusy(false);
+    }
+  }
+
+  async function saveOpenRouterApiKey() {
+    const trimmed = openrouterApiKeyInput.trim();
+    if (!trimmed) {
+      setOpenrouterOAuthStatus("Please enter an API key.");
+      return;
+    }
+    if (!trimmed.startsWith("sk-or-")) {
+      setOpenrouterOAuthStatus("OpenRouter API keys start with 'sk-or-'. Please check your key.");
+      return;
+    }
+
+    setOpenrouterOAuthBusy(true);
+    setOpenrouterOAuthStatus("Saving API key...");
+
+    try {
+      let token = normalizeGatewayToken(chatGatewayToken);
+      if (!token && isDesktopClient) {
+        token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
+      }
+
+      // Save via runtime config update — set provider, model, and API key
+      await updateRuntimeConfig(
+        {
+          defaultProvider: "openrouter",
+          defaultModel: "google/gemini-2.5-flash:free",
+          transcriptionEnabled: settingsTranscriptionEnabled,
+          transcriptionModel: settingsTranscriptionModel || "",
+          availableTranscriptionModels: settingsAvailableTranscriptionModels,
+          apiKey: trimmed,
+        },
+        token || undefined,
+        gatewayBaseUrl
+      );
+
+      setSettingsProvider("openrouter");
+      setSettingsModel("google/gemini-2.5-flash:free");
+      setProviderApiKey(trimmed);
+      setProviderApiKeyStatus("API key saved. Gateway restarted.");
+      window.localStorage.setItem(CHAT_PROVIDER_STORAGE_KEY, "openrouter");
+      window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, "google/gemini-2.5-flash:free");
+      setOpenrouterApiKeyInput("");
+      // Refresh synth status before desktop gateway restart so the
+      // readiness check sees the api_key already in the running gateway.
+      await refreshWorkspaceSynthAfterProviderSetup();
+
+      if (isDesktopClient) {
+        // Persist to OS keyring and restart gateway for long-term storage.
+        // This runs after the synth refresh so the UI updates immediately.
+        invokeDesktopCommandStrict("set_provider_api_key", {
+          value: trimmed
+        }).catch((err: unknown) => {
+          console.warn("Desktop keyring save failed:", err);
+        });
+      }
+
+      setOpenrouterOAuthStatus("API key saved! AI is ready with a free model.");
+      setOpenrouterOAuthBusy(false);
+    } catch (error) {
+      setOpenrouterOAuthStatus(
+        `Failed to save key: ${error instanceof Error ? error.message : String(error)}`
+      );
+      setOpenrouterOAuthBusy(false);
     }
   }
 
@@ -5633,6 +5851,533 @@ function App() {
       )}
     </>
   );
+
+  const isWorldNostrItem = (item: PersonalizedFeedItem) =>
+    item.sourceType === "web" && item.webPreview?.provider === "Nostr";
+
+  const isWorldVideoItem = (item: PersonalizedFeedItem) => {
+    if (item.sourceType === "bluesky") {
+      const embed = (item.feedItem as any)?.post?.embed;
+      return (
+        embed?.$type === "app.bsky.embed.video#view" ||
+        (embed?.$type === "app.bsky.embed.recordWithMedia#view" &&
+          embed?.media?.$type === "app.bsky.embed.video#view")
+      );
+    }
+    if (isWorldNostrItem(item)) {
+      const preview = item.webPreview;
+      const candidateText = [
+        preview?.contentText || "",
+        preview?.description || "",
+        preview?.title || "",
+        preview?.url || "",
+      ].join("\n");
+      return hasInlineVideoUrl(candidateText);
+    }
+    return false;
+  };
+
+  const worldTweetItems = blueskyFeedItems.filter(
+    (item) => !isWorldVideoItem(item) && (item.sourceType === "bluesky" || isWorldNostrItem(item))
+  );
+  const worldArticleItems = blueskyFeedItems.filter(
+    (item) => item.sourceType === "web" && item.webPreview && !isWorldNostrItem(item) && !isWorldVideoItem(item)
+  );
+  const worldVideoItems = blueskyFeedItems.filter(isWorldVideoItem);
+
+  const worldFeedNewPostsBanner =
+    feedNewPostsBanner && pendingFeedItemsRef.current ? (
+      <button
+        type="button"
+        className="feed-new-posts-banner"
+        onClick={() => {
+          const pending = pendingFeedItemsRef.current;
+          if (pending) {
+            setBlueskyFeedItems(pending.items);
+            setBlueskyFeedSnapshot(pending);
+            setBlueskyProfileStats(pending.profileStats);
+            setFeedGeneration(pending.generation);
+            pendingFeedItemsRef.current = null;
+            setFeedNewPostsBanner(false);
+          }
+        }}
+        style={{
+          width: "100%",
+          padding: "0.55rem 1rem",
+          border: "1px solid var(--accent, #4a9eff)",
+          borderRadius: "8px",
+          backgroundColor: "var(--accent-bg, #e8f0fe)",
+          color: "var(--accent, #4a9eff)",
+          cursor: "pointer",
+          textAlign: "center",
+          fontSize: "0.85rem",
+          fontWeight: 500,
+          marginBottom: "0.5rem",
+        }}
+      >
+        New posts found — tap to load
+      </button>
+    ) : null;
+
+  const renderWorldVideoFallbackItem = (vItem: any, vi: number) => {
+    if (vItem.source === "bluesky" && vItem.post) {
+      const post = vItem.post;
+      const author = post.author || {};
+      const record = post.record as any;
+      const vText = String(record?.text || "");
+      const embedNode = renderBlueskyEmbed(post.embed as any);
+      return (
+        <div key={`vfb-${post.cid || vi}`} className="feed-item">
+          <div className="feed-header">
+            <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              {author.avatar ? (
+                <img src={author.avatar} alt="" style={{ width: "36px", height: "36px", borderRadius: "50%", objectFit: "cover" }} />
+              ) : null}
+              <div className="stack-sm" style={{ gap: "0.05rem" }}>
+                <strong>{author.displayName || author.handle}</strong>
+                <span className="muted text-sm" style={{ fontWeight: "normal" }}>@{author.handle}</span>
+                <span className="muted text-sm" style={{ fontWeight: "normal" }}>via Bluesky Videos</span>
+              </div>
+            </div>
+            <div className="feed-time">{formatTimestamp(post.indexedAt)}</div>
+          </div>
+          <div className="feed-body" style={{ marginTop: "8px", wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
+            {renderLinkedText(vText)}
+          </div>
+          {embedNode}
+          <div className="bsky-actions">
+            <button
+              type="button"
+              className={`bsky-action-btn ${blueskyLikedUris[post.uri] ? "liked" : ""}`}
+              onClick={() => void handleLikeBlueskyPost(post.uri, post.cid)}
+              disabled={!session}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill={blueskyLikedUris[post.uri] ? "#f91880" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+              {post.likeCount || 0}
+            </button>
+            <button
+              type="button"
+              className={`bsky-action-btn ${expandedThreadUri === post.uri ? "liked" : ""}`}
+              onClick={() => void handleExpandThread(post.uri)}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
+              {post.replyCount || 0}
+            </button>
+            <span className="bsky-action-btn" style={{ cursor: "default" }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 1l4 4-4 4"></path><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><path d="M7 23l-4-4 4-4"></path><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
+              {post.repostCount || 0}
+            </span>
+          </div>
+        </div>
+      );
+    }
+    if (vItem.source === "nostr" && vItem.event) {
+      const ev = vItem.event;
+      const content = String(ev.content || "");
+      const npub = ev.pubkey ? `${ev.pubkey.slice(0, 12)}...` : "anon";
+      const videoUrlMatch = content.match(/(https?:\/\/[^\s]+\.(mp4|webm|mov|m3u8))/i);
+      return (
+        <div key={`vfn-${ev.id || vi}`} className="feed-item">
+          <div className="feed-header">
+            <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <div className="stack-sm" style={{ gap: "0.05rem" }}>
+                <strong>{npub}</strong>
+                <span className="muted text-sm" style={{ fontWeight: "normal" }}>via Nostr (primal)</span>
+              </div>
+            </div>
+            <div className="feed-time">{ev.created_at ? formatTimestamp(ev.created_at * 1000) : ""}</div>
+          </div>
+          <div className="feed-body" style={{ marginTop: "8px", wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
+            {renderLinkedText(content)}
+          </div>
+          {videoUrlMatch ? (
+            <div className="bluesky-embed-video-wrap" style={{ marginTop: "0.5rem" }}>
+              <video className="bluesky-embed-video" controls preload="metadata" src={videoUrlMatch[1]} />
+            </div>
+          ) : null}
+          <div className="bsky-actions">
+            <button type="button" className="bsky-action-btn" onClick={() => void handleNostrReaction(ev.id, vItem.relayUrl)} disabled={nostrKeysBusy}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+              Like
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return null;
+  };
+
+  const renderWorldWebItem = (item: PersonalizedFeedItem, idx: number) => {
+    const preview = item.webPreview;
+    if (!preview) {
+      return null;
+    }
+    const selectedSource = item.feedSource;
+    const isNostr = preview.provider === "Nostr";
+    const articleText = normalizeArticleText(preview.contentText || "");
+    const articlePreview = summarizeArticleText(articleText || preview.description || "");
+    const sourceLabel = selectedSource?.label || (item.feedItem as any)?.sourceTitle || preview.provider;
+    const nostrEventId = isNostr ? (preview.url.split("/").pop() || "") : "";
+    const nostrRelayUrl = isNostr && selectedSource?.label ? `wss://${selectedSource.label}` : "";
+    const isArticleExpanded = expandedArticleUrl === preview.url;
+
+    if (!isNostr) {
+      return (
+        <div key={`${preview.url}-${idx}`} className="feed-item feed-item-card world-article-card">
+          <div className="feed-header">
+            <div className="feed-title stack-sm" style={{ gap: "0.18rem" }}>
+              <strong>{preview.title || preview.domain || preview.url}</strong>
+              <span className="muted text-sm world-feed-source-meta">
+                {sourceLabel ? `from ${sourceLabel}` : preview.provider}
+                {preview.domain ? ` · ${preview.domain}` : ""}
+                {selectedSource?.sourceScore != null ? ` · source relevance ${(selectedSource.sourceScore * 100).toFixed(0)}%` : ""}
+                {selectedSource?.matchedInterestLabel
+                  ? ` · keyword "${selectedSource.matchedInterestLabel}"${
+                      selectedSource.matchedInterestScore != null
+                        ? ` (${(selectedSource.matchedInterestScore * 100).toFixed(0)}%)`
+                        : ""
+                    }`
+                  : ""}
+              </span>
+            </div>
+            <div className="feed-time">{preview.discoveredAt ? formatTimestamp(preview.discoveredAt) : "now"}</div>
+          </div>
+          {preview.imageUrl ? (
+            <div className="bluesky-external-card world-article-media" style={{ marginTop: "0.75rem" }}>
+              <img src={preview.imageUrl} alt={preview.title || "Article preview"} className="bluesky-external-thumb" />
+            </div>
+          ) : null}
+          <div className="world-article-summary">
+            {articlePreview || preview.description || "No article preview available yet."}
+          </div>
+          <div className="world-article-actions">
+            <button type="button" className="ghost text-sm" onClick={() => void openFeedLink(preview.url)}>
+              Open in browser
+            </button>
+            <button
+              type="button"
+              className="secondary text-sm"
+              disabled={!articleText}
+              onClick={() => setExpandedArticleUrl(isArticleExpanded ? "" : preview.url)}
+            >
+              {isArticleExpanded ? "Show less" : "Read more"}
+            </button>
+          </div>
+          {isArticleExpanded ? (
+            <div className="world-article-reader">
+              <div className="world-article-reader-title">Reading in app</div>
+              <div className="world-article-fulltext">
+                {articleText || "Full article text is not available for this feed item yet."}
+              </div>
+            </div>
+          ) : null}
+          {preview.providerSnippet && preview.providerSnippet !== sourceLabel ? (
+            <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
+              Source note: {preview.providerSnippet}
+            </div>
+          ) : null}
+          {item.score != null ? (
+            <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
+              Relevance {(item.score * 100).toFixed(0)}%{item.matchedInterestLabel ? ` · closest interest: "${item.matchedInterestLabel}"` : ""}{item.matchedInterestScore != null
+                ? ` (${(item.matchedInterestScore * 100).toFixed(0)}% similar)`
+                : ""}
+            </div>
+          ) : null}
+        </div>
+      );
+    }
+
+    return (
+      <div key={`${preview.url}-${idx}`} className="feed-item">
+        <div className="feed-header">
+          <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <div className="stack-sm" style={{ gap: "0.05rem" }}>
+              <strong>{preview.title || preview.domain}</strong>
+              <span className="muted text-sm" style={{ fontWeight: "normal" }}>
+                {selectedSource?.label ? `from ${selectedSource.label}` : `Web source via ${preview.provider}`}
+                {selectedSource?.sourceScore != null ? ` · source relevance ${(selectedSource.sourceScore * 100).toFixed(0)}%` : ""}
+                {selectedSource?.matchedInterestLabel
+                  ? ` · keyword "${selectedSource.matchedInterestLabel}"${
+                      selectedSource.matchedInterestScore != null
+                        ? ` (${(selectedSource.matchedInterestScore * 100).toFixed(0)}%)`
+                        : ""
+                    }`
+                  : ""}
+              </span>
+            </div>
+          </div>
+          <div className="feed-time">{preview.discoveredAt ? formatTimestamp(preview.discoveredAt) : "now"}</div>
+        </div>
+        <div className="bluesky-external-card" style={{ marginTop: "0.75rem" }}>
+          {preview.imageUrl ? (
+            <img src={preview.imageUrl} alt={preview.title || "Web preview"} className="bluesky-external-thumb" />
+          ) : null}
+          <div className="bluesky-external-body">
+            <div className="bluesky-external-title">{preview.title || preview.url}</div>
+            {preview.description ? <div className="bluesky-external-desc">{preview.description}</div> : null}
+            <div className="bluesky-external-domain">{preview.domain || preview.url}</div>
+          </div>
+        </div>
+        {preview.providerSnippet ? (
+          <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
+            Search snippet: {preview.providerSnippet}
+          </div>
+        ) : null}
+        {item.score != null ? (
+          <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
+            Matched {item.matchedInterestLabel || "workspace interest"} at {(item.score * 100).toFixed(0)}%
+            {item.matchedInterestScore != null
+              ? ` (similarity ${(item.matchedInterestScore * 100).toFixed(0)}%)`
+              : ""}
+          </div>
+        ) : null}
+        <div className="bsky-actions">
+          <button type="button" className="bsky-action-btn" onClick={() => void handleNostrReaction(nostrEventId, nostrRelayUrl)} disabled={nostrKeysBusy}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+            Like
+          </button>
+          <button
+            type="button"
+            className="bsky-action-btn"
+            onClick={() => setExpandedThreadUri(expandedThreadUri === preview.url ? "" : preview.url)}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
+            Reply
+          </button>
+        </div>
+        {expandedThreadUri === preview.url ? (
+          <div className="bsky-thread-panel">
+            {nostrKeys ? (
+              <div className="text-sm muted" style={{ marginBottom: "0.4rem" }}>Replying as {nostrKeys.npub.slice(0, 16)}...</div>
+            ) : (
+              <div className="nostr-identity-banner">
+                <span className="text-sm"><strong>Nostr Identity</strong></span>
+                <span className="text-sm muted">A new Nostr key pair will be created automatically when you reply.</span>
+              </div>
+            )}
+            <div className="bsky-reply-compose">
+              <textarea
+                className="bsky-reply-input"
+                rows={1}
+                placeholder="Reply to this note..."
+                value={replyDrafts[preview.url] || ""}
+                onChange={(e) => {
+                  e.target.style.height = "0px";
+                  e.target.style.height = `${e.target.scrollHeight}px`;
+                  setReplyDrafts((prev) => ({ ...prev, [preview.url]: e.target.value }));
+                }}
+              />
+              <button
+                type="button"
+                className="primary bsky-reply-send"
+                disabled={!replyDrafts[preview.url]?.trim() || nostrKeysBusy}
+                onClick={() => {
+                  void handleNostrReply(nostrEventId, nostrRelayUrl, replyDrafts[preview.url] || "");
+                  setReplyDrafts((prev) => {
+                    const next = { ...prev };
+                    delete next[preview.url];
+                    return next;
+                  });
+                }}
+              >
+                Send
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
+  const renderWorldBlueskyItem = (item: PersonalizedFeedItem, idx: number) => {
+    const feedItem = item.feedItem as AppBskyFeedDefs.FeedViewPost;
+    const post = feedItem.post;
+    const author = post.author;
+    const record = post.record as any;
+    const text = String(record?.text || "");
+    const feedSource = item.feedSource;
+    const embedNode = renderBlueskyEmbed(post.embed as any);
+    const postUri = post.uri;
+    const postCid = post.cid;
+    const isLiked = Boolean(blueskyLikedUris[postUri] || (post.viewer as any)?.like);
+    const isThreadOpen = expandedThreadUri === postUri;
+    const facetLinks = Array.isArray(record?.facets)
+      ? record.facets
+          .flatMap((facet: any) => (Array.isArray(facet?.features) ? facet.features : []))
+          .map((feature: any) => String(feature?.uri || "").trim())
+          .filter((uri: string) => uri.startsWith("http://") || uri.startsWith("https://"))
+      : [];
+    const textLinks = Array.from(text.matchAll(/https?:\/\/[^\s]+/g)).map((match) => String(match[0] || "").trim());
+    const fallbackLinks = Array.from(new Set([...facetLinks, ...textLinks]));
+    const hasExternalEmbed =
+      Boolean(post.embed && (post.embed as any).$type === "app.bsky.embed.external#view") ||
+      Boolean(
+        post.embed &&
+          (post.embed as any).$type === "app.bsky.embed.recordWithMedia#view" &&
+          (post.embed as any).media?.$type === "app.bsky.embed.external#view"
+      );
+    return (
+      <div key={`${post.cid}-${idx}`} className="feed-item">
+        <div className="feed-header">
+          <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            {author.avatar ? <img src={author.avatar} alt="" style={{ width: "36px", height: "36px", borderRadius: "50%", objectFit: "cover" }} /> : null}
+            <div className="stack-sm" style={{ gap: "0.05rem" }}>
+              <strong>{author.displayName || author.handle}</strong>
+              <span className="muted text-sm" style={{ fontWeight: "normal" }}>@{author.handle}</span>
+              {feedSource?.label ? (
+                <span className="muted text-sm" style={{ fontWeight: "normal" }}>
+                  from {feedSource.label}
+                  {feedSource.sourceScore != null ? ` · source relevance ${(feedSource.sourceScore * 100).toFixed(0)}%` : ""}
+                  {feedSource.matchedInterestLabel
+                    ? ` · keyword "${feedSource.matchedInterestLabel}"${
+                        feedSource.matchedInterestScore != null
+                          ? ` (${(feedSource.matchedInterestScore * 100).toFixed(0)}%)`
+                          : ""
+                      }`
+                    : ""}
+                </span>
+              ) : null}
+            </div>
+          </div>
+          <div className="feed-time">{formatTimestamp(post.indexedAt)}</div>
+        </div>
+        <div className="feed-body" style={{ marginTop: "8px", wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
+          {renderLinkedText(text)}
+        </div>
+        {embedNode}
+        {item.score != null ? (
+          <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
+            Matched {item.matchedInterestLabel || "workspace interest"} at {(item.score * 100).toFixed(0)}%
+            {item.matchedInterestScore != null
+              ? ` (similarity ${(item.matchedInterestScore * 100).toFixed(0)}%)`
+              : ""}
+          </div>
+        ) : null}
+        {!hasExternalEmbed && fallbackLinks.length > 0 ? (
+          <div className="stack" style={{ gap: "0.5rem" }}>
+            {fallbackLinks.map((url) => (
+              <a key={`${post.cid}-${url}`} href={url} target="_blank" rel="noreferrer" className="bluesky-external-card">
+                <div className="bluesky-external-body">
+                  <div className="bluesky-external-title">{url}</div>
+                  <div className="bluesky-external-domain">
+                    {(() => {
+                      try {
+                        return new URL(url).hostname;
+                      } catch {
+                        return url;
+                      }
+                    })()}
+                  </div>
+                </div>
+              </a>
+            ))}
+          </div>
+        ) : null}
+        <div className="bsky-actions">
+          <button type="button" className={`bsky-action-btn ${isLiked ? "liked" : ""}`} onClick={() => void handleLikeBlueskyPost(postUri, postCid)} disabled={!session}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill={isLiked ? "#f91880" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+            {(post.likeCount || 0) + (blueskyLikedUris[postUri] && !(post.viewer as any)?.like ? 1 : 0)}
+          </button>
+          <button type="button" className={`bsky-action-btn ${isThreadOpen ? "liked" : ""}`} onClick={() => void handleExpandThread(postUri)}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
+            {post.replyCount || 0}
+          </button>
+          <span className="bsky-action-btn" style={{ cursor: "default" }}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 1l4 4-4 4"></path><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><path d="M7 23l-4-4 4-4"></path><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
+            {post.repostCount || 0}
+          </span>
+        </div>
+        {isThreadOpen ? (
+          <div className="bsky-thread-panel">
+            {threadLoading ? (
+              <div className="bsky-thread-loading">Loading comments...</div>
+            ) : threadData?.error ? (
+              <div className="text-sm muted">{threadData.error}</div>
+            ) : threadData?.thread?.replies?.length > 0 ? (
+              <div className="bsky-thread-replies">
+                {threadData.thread.replies.slice(0, 20).map((reply: any, ri: number) => {
+                  const rPost = reply?.post;
+                  if (!rPost) return null;
+                  const rAuthor = rPost.author || {};
+                  const rRecord = rPost.record as any;
+                  const rText = String(rRecord?.text || "");
+                  return (
+                    <div key={rPost.cid || ri} className="bsky-thread-reply">
+                      {rAuthor.avatar ? <img src={rAuthor.avatar} alt="" className="bsky-reply-avatar" /> : <div className="bsky-reply-avatar" style={{ background: "var(--line)" }} />}
+                      <div className="bsky-reply-body">
+                        <span className="bsky-reply-author">{rAuthor.displayName || rAuthor.handle}</span>
+                        <span className="bsky-reply-handle">@{rAuthor.handle}</span>
+                        <div className="bsky-reply-text">{renderLinkedText(rText)}</div>
+                        <div className="bsky-reply-time">{formatTimestamp(rPost.indexedAt)}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="text-sm muted">No replies yet.</div>
+            )}
+            {session ? (
+              <div className="bsky-reply-compose">
+                <textarea
+                  className="bsky-reply-input"
+                  rows={1}
+                  placeholder="Write a reply..."
+                  value={replyDrafts[postUri] || ""}
+                  onChange={(e) => {
+                    e.target.style.height = "0px";
+                    e.target.style.height = `${e.target.scrollHeight}px`;
+                    setReplyDrafts((prev) => ({ ...prev, [postUri]: e.target.value }));
+                  }}
+                />
+                <button
+                  type="button"
+                  className="primary bsky-reply-send"
+                  disabled={!replyDrafts[postUri]?.trim() || replyingUri === postUri}
+                  onClick={() => void handleReplyToBlueskyPost(postUri, postCid, postUri, postCid)}
+                >
+                  {replyingUri === postUri ? "..." : "Reply"}
+                </button>
+              </div>
+            ) : (
+              <div className="text-sm muted" style={{ marginTop: "0.5rem" }}>Sign in to Bluesky to reply.</div>
+            )}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
+  const renderWorldFeedItems = () => {
+    if (worldFeedTab === "videos") {
+      if (worldVideoItems.length > 0) {
+        return worldVideoItems.map((item, idx) =>
+          item.sourceType === "bluesky" ? renderWorldBlueskyItem(item, idx) : renderWorldWebItem(item, idx)
+        );
+      }
+      if (videoFallbackLoading) {
+        return <p className="text-center muted" style={{ padding: "1.5rem" }}>Loading videos...</p>;
+      }
+      if (videoFallbackItems.length === 0) {
+        return <p className="text-center muted" style={{ padding: "1.5rem" }}>No video posts found yet. Try refreshing.</p>;
+      }
+      return videoFallbackItems.map(renderWorldVideoFallbackItem);
+    }
+
+    const selectedItems = worldFeedTab === "articles" ? worldArticleItems : worldTweetItems;
+    if (selectedItems.length === 0) {
+      return (
+        <p className="text-center muted" style={{ padding: "1.5rem" }}>
+          {worldFeedTab === "articles"
+            ? "No long-form articles found yet."
+            : "No Bluesky or Nostr posts found yet."}
+        </p>
+      );
+    }
+    return selectedItems.map((item, idx) =>
+      item.sourceType === "bluesky" ? renderWorldBlueskyItem(item, idx) : renderWorldWebItem(item, idx)
+    );
+  };
 
   if (needsMobileQrLogin) {
     return (
@@ -6708,7 +7453,11 @@ function App() {
                           </div>
                           <div>
                             <span className="text-sm muted">Refresh state</span>
-                            <strong>{blueskyFeedSnapshot.refreshState || "warming"}</strong>
+                            <strong>
+                              {blueskyFeedSnapshot.refreshStatus && blueskyFeedSnapshot.refreshStatus !== "idle"
+                                ? blueskyFeedSnapshot.refreshStatus
+                                : blueskyFeedSnapshot.refreshState || "warming"}
+                            </strong>
                           </div>
                           <div>
                             <span className="text-sm muted">Interests</span>
@@ -6870,7 +7619,7 @@ function App() {
                                 <div className="text-sm muted">
                                   {(source.protocol || "source").toUpperCase()}
                                   {source.matchedInterestLabel
-                                    ? ` · matched ${source.matchedInterestLabel}${
+                                    ? ` · keyword "${source.matchedInterestLabel}"${
                                         source.matchedInterestScore != null
                                           ? ` (${(source.matchedInterestScore * 100).toFixed(0)}%)`
                                           : ""
@@ -6950,17 +7699,98 @@ function App() {
                                   updated {formatTimestamp(interest.updatedAt)}
                                   {interest.lastSeenAt ? ` · seen ${formatTimestamp(interest.lastSeenAt)}` : ""}
                                 </div>
-                                {interest.deletable ? (
-                                  <div className="row" style={{ justifyContent: "flex-end" }}>
-                                    <button
-                                      type="button"
-                                      className="secondary danger"
-                                      onClick={() => void removeDiagnosticWorldFeedInterest(interest)}
-                                    >
-                                      Delete dummy
-                                    </button>
+                                <div className="stack-sm" style={{ gap: "0.3rem" }}>
+                                  <div className="row-between" style={{ alignItems: "center" }}>
+                                    <span className="text-sm muted">
+                                      Keywords{interest.keywordsOverride ? " (custom)" : " (auto)"}
+                                    </span>
+                                    {editingInterestId !== interest.id ? (
+                                      <button
+                                        type="button"
+                                        className="ghost text-sm"
+                                        style={{ padding: "0.2rem 0.5rem", borderRadius: "6px" }}
+                                        onClick={() => {
+                                          setEditingInterestId(interest.id);
+                                          setEditingInterestKeywords(interest.keywords.join(", "));
+                                        }}
+                                      >
+                                        Edit
+                                      </button>
+                                    ) : null}
                                   </div>
-                                ) : null}
+                                  {editingInterestId === interest.id ? (
+                                    <div className="stack-sm" style={{ gap: "0.3rem" }}>
+                                      <input
+                                        value={editingInterestKeywords}
+                                        onChange={(e) => setEditingInterestKeywords(e.target.value)}
+                                        placeholder="keyword1, keyword2, keyword3"
+                                        style={{ fontSize: "0.85rem" }}
+                                      />
+                                      <div className="row" style={{ gap: "0.4rem", justifyContent: "flex-end" }}>
+                                        {interest.keywordsOverride ? (
+                                          <button
+                                            type="button"
+                                            className="ghost text-sm"
+                                            style={{ padding: "0.2rem 0.5rem" }}
+                                            onClick={() => void clearInterestKeywordsOverride(interest.id)}
+                                          >
+                                            Reset to auto
+                                          </button>
+                                        ) : null}
+                                        <button
+                                          type="button"
+                                          className="ghost text-sm"
+                                          style={{ padding: "0.2rem 0.5rem" }}
+                                          onClick={() => {
+                                            setEditingInterestId(null);
+                                            setEditingInterestKeywords("");
+                                          }}
+                                        >
+                                          Cancel
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="secondary text-sm"
+                                          style={{ padding: "0.2rem 0.5rem" }}
+                                          onClick={() => void saveInterestKeywords(interest.id)}
+                                        >
+                                          Save
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <div className="row" style={{ gap: "0.3rem", flexWrap: "wrap" }}>
+                                      {interest.keywords.length > 0 ? (
+                                        interest.keywords.map((kw) => (
+                                          <span
+                                            key={kw}
+                                            className="text-sm"
+                                            style={{
+                                              background: "var(--color-surface-hover, #2a2a2a)",
+                                              padding: "0.15rem 0.45rem",
+                                              borderRadius: "4px",
+                                              fontSize: "0.78rem",
+                                            }}
+                                          >
+                                            {kw}
+                                          </span>
+                                        ))
+                                      ) : (
+                                        <span className="text-sm muted">No keywords derived yet.</span>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                                <div className="row" style={{ justifyContent: "flex-end", gap: "0.4rem" }}>
+                                  <button
+                                    type="button"
+                                    className="secondary danger text-sm"
+                                    style={{ padding: "0.25rem 0.55rem" }}
+                                    onClick={() => void removeWorldFeedInterest(interest)}
+                                  >
+                                    {interest.synthetic ? "Delete" : "Remove"}
+                                  </button>
+                                </div>
                               </div>
                             ))
                           ) : (
@@ -6971,507 +7801,37 @@ function App() {
                         </div>
                       </div>
                     ) : null}
-                    <div className="world-feed-tabs">
-                      <button type="button" className={`world-feed-tab ${worldFeedTab === "all" ? "active" : ""}`} onClick={() => setWorldFeedTab("all")}>All</button>
-                      <button type="button" className={`world-feed-tab ${worldFeedTab === "videos" ? "active" : ""}`} onClick={() => { setWorldFeedTab("videos"); void fetchVideoFallback(); }}>Videos</button>
+                    <div className="feed-section-tabs world-feed-tabs">
+                      <button
+                        type="button"
+                        className={`feed-section-tab ${worldFeedTab === "tweets" ? "active" : ""}`}
+                        onClick={() => setWorldFeedTab("tweets")}
+                      >
+                        Tweets
+                        <span className="feed-section-tab-count">{worldTweetItems.length}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={`feed-section-tab ${worldFeedTab === "articles" ? "active" : ""}`}
+                        onClick={() => setWorldFeedTab("articles")}
+                      >
+                        Articles
+                        <span className="feed-section-tab-count">{worldArticleItems.length}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={`feed-section-tab ${worldFeedTab === "videos" ? "active" : ""}`}
+                        onClick={() => {
+                          setWorldFeedTab("videos");
+                          void fetchVideoFallback();
+                        }}
+                      >
+                        Videos
+                        <span className="feed-section-tab-count">{worldVideoItems.length}</span>
+                      </button>
                     </div>
-                    {(() => {
-                      const isVideoItem = (it: PersonalizedFeedItem) => {
-                        if (it.sourceType === "bluesky") {
-                          const embed = (it.feedItem as any)?.post?.embed;
-                          return embed?.$type === "app.bsky.embed.video#view" ||
-                            (embed?.$type === "app.bsky.embed.recordWithMedia#view" && embed?.media?.$type === "app.bsky.embed.video#view");
-                        }
-                        return false;
-                      };
-                      const visibleItems = worldFeedTab === "videos"
-                        ? blueskyFeedItems.filter(isVideoItem)
-                        : blueskyFeedItems;
-                      const newPostsBanner = feedNewPostsBanner && pendingFeedItemsRef.current ? (
-                        <button
-                          type="button"
-                          className="feed-new-posts-banner"
-                          onClick={() => {
-                            const pending = pendingFeedItemsRef.current;
-                            if (pending) {
-                              setBlueskyFeedItems(pending.items);
-                              setBlueskyFeedSnapshot(pending);
-                              setBlueskyProfileStats(pending.profileStats);
-                              setFeedGeneration(pending.generation);
-                              pendingFeedItemsRef.current = null;
-                              setFeedNewPostsBanner(false);
-                            }
-                          }}
-                          style={{
-                            width: "100%",
-                            padding: "0.55rem 1rem",
-                            border: "1px solid var(--accent, #4a9eff)",
-                            borderRadius: "8px",
-                            backgroundColor: "var(--accent-bg, #e8f0fe)",
-                            color: "var(--accent, #4a9eff)",
-                            cursor: "pointer",
-                            textAlign: "center",
-                            fontSize: "0.85rem",
-                            fontWeight: 500,
-                            marginBottom: "0.5rem",
-                          }}
-                        >
-                          New posts found — tap to load
-                        </button>
-                      ) : null;
-                      if (worldFeedTab === "videos" && visibleItems.length === 0) {
-                        // Show fallback video content from Bluesky video feed + Nostr
-                        if (videoFallbackLoading) {
-                          return <p className="text-center muted" style={{ padding: "1.5rem" }}>Loading videos...</p>;
-                        }
-                        if (videoFallbackItems.length === 0) {
-                          return <p className="text-center muted" style={{ padding: "1.5rem" }}>No video posts found yet. Try refreshing.</p>;
-                        }
-                        return videoFallbackItems.map((vItem, vi) => {
-                          if (vItem.source === "bluesky" && vItem.post) {
-                            const post = vItem.post;
-                            const author = post.author || {};
-                            const record = post.record as any;
-                            const vText = String(record?.text || "");
-                            const embedNode = renderBlueskyEmbed(post.embed as any);
-                            return (
-                              <div key={`vfb-${post.cid || vi}`} className="feed-item">
-                                <div className="feed-header">
-                                  <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                                    {author.avatar && <img src={author.avatar} alt="" style={{ width: "36px", height: "36px", borderRadius: "50%", objectFit: "cover" }} />}
-                                    <div className="stack-sm" style={{ gap: "0.05rem" }}>
-                                      <strong>{author.displayName || author.handle}</strong>
-                                      <span className="muted text-sm" style={{ fontWeight: "normal" }}>@{author.handle}</span>
-                                      <span className="muted text-sm" style={{ fontWeight: "normal" }}>via Bluesky Videos</span>
-                                    </div>
-                                  </div>
-                                  <div className="feed-time">{formatTimestamp(post.indexedAt)}</div>
-                                </div>
-                                <div className="feed-body" style={{ marginTop: "8px", wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
-                                  {renderLinkedText(vText)}
-                                </div>
-                                {embedNode}
-                                <div className="bsky-actions">
-                                  <button
-                                    type="button"
-                                    className={`bsky-action-btn ${blueskyLikedUris[post.uri] ? "liked" : ""}`}
-                                    onClick={() => void handleLikeBlueskyPost(post.uri, post.cid)}
-                                    disabled={!session}
-                                  >
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill={blueskyLikedUris[post.uri] ? "#f91880" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
-                                    {post.likeCount || 0}
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className={`bsky-action-btn ${expandedThreadUri === post.uri ? "liked" : ""}`}
-                                    onClick={() => void handleExpandThread(post.uri)}
-                                  >
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
-                                    {post.replyCount || 0}
-                                  </button>
-                                  <span className="bsky-action-btn" style={{ cursor: "default" }}>
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 1l4 4-4 4"></path><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><path d="M7 23l-4-4 4-4"></path><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
-                                    {post.repostCount || 0}
-                                  </span>
-                                </div>
-                                {expandedThreadUri === post.uri ? (
-                                  <div className="bsky-thread-panel">
-                                    {threadLoading ? (
-                                      <div className="bsky-thread-loading">Loading comments...</div>
-                                    ) : threadData?.thread?.replies?.length > 0 ? (
-                                      <div className="bsky-thread-replies">
-                                        {threadData.thread.replies.slice(0, 10).map((reply: any, ri: number) => {
-                                          const rPost = reply?.post;
-                                          if (!rPost) return null;
-                                          const rAuthor = rPost.author || {};
-                                          const rRecord = rPost.record as any;
-                                          return (
-                                            <div key={rPost.cid || ri} className="bsky-thread-reply">
-                                              {rAuthor.avatar ? <img src={rAuthor.avatar} alt="" className="bsky-reply-avatar" /> : <div className="bsky-reply-avatar" style={{ background: "var(--line)" }} />}
-                                              <div className="bsky-reply-body">
-                                                <span className="bsky-reply-author">{rAuthor.displayName || rAuthor.handle}</span>
-                                                <span className="bsky-reply-handle">@{rAuthor.handle}</span>
-                                                <div className="bsky-reply-text">{String(rRecord?.text || "")}</div>
-                                                <div className="bsky-reply-time">{formatTimestamp(rPost.indexedAt)}</div>
-                                              </div>
-                                            </div>
-                                          );
-                                        })}
-                                      </div>
-                                    ) : (
-                                      <div className="text-sm muted">No replies yet.</div>
-                                    )}
-                                    {session ? (
-                                      <div className="bsky-reply-compose">
-                                        <textarea
-                                          className="bsky-reply-input"
-                                          rows={1}
-                                          placeholder="Write a reply..."
-                                          value={replyDrafts[post.uri] || ""}
-                                          onChange={(e) => {
-                                            e.target.style.height = "0px";
-                                            e.target.style.height = `${e.target.scrollHeight}px`;
-                                            setReplyDrafts((prev) => ({ ...prev, [post.uri]: e.target.value }));
-                                          }}
-                                        />
-                                        <button
-                                          type="button"
-                                          className="primary bsky-reply-send"
-                                          disabled={!replyDrafts[post.uri]?.trim() || replyingUri === post.uri}
-                                          onClick={() => void handleReplyToBlueskyPost(post.uri, post.cid, post.uri, post.cid)}
-                                        >
-                                          {replyingUri === post.uri ? "..." : "Reply"}
-                                        </button>
-                                      </div>
-                                    ) : null}
-                                  </div>
-                                ) : null}
-                              </div>
-                            );
-                          }
-                          if (vItem.source === "nostr" && vItem.event) {
-                            const ev = vItem.event;
-                            const content = String(ev.content || "");
-                            const npub = ev.pubkey ? ev.pubkey.slice(0, 12) + "..." : "anon";
-                            const videoUrlMatch = content.match(/(https?:\/\/[^\s]+\.(mp4|webm|mov|m3u8))/i);
-                            return (
-                              <div key={`vfn-${ev.id || vi}`} className="feed-item">
-                                <div className="feed-header">
-                                  <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                                    <div className="stack-sm" style={{ gap: "0.05rem" }}>
-                                      <strong>{npub}</strong>
-                                      <span className="muted text-sm" style={{ fontWeight: "normal" }}>via Nostr (primal)</span>
-                                    </div>
-                                  </div>
-                                  <div className="feed-time">{ev.created_at ? formatTimestamp(ev.created_at * 1000) : ""}</div>
-                                </div>
-                                <div className="feed-body" style={{ marginTop: "8px", wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
-                                  {renderLinkedText(content)}
-                                </div>
-                                {videoUrlMatch ? (
-                                  <div className="bluesky-embed-video-wrap" style={{ marginTop: "0.5rem" }}>
-                                    <video className="bluesky-embed-video" controls preload="metadata" src={videoUrlMatch[1]} />
-                                  </div>
-                                ) : null}
-                                <div className="bsky-actions">
-                                  <button type="button" className="bsky-action-btn" onClick={() => void handleNostrReaction(ev.id, vItem.relayUrl)} disabled={nostrKeysBusy}>
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
-                                    Like
-                                  </button>
-                                </div>
-                              </div>
-                            );
-                          }
-                          return null;
-                        });
-                      }
-                      return <>{newPostsBanner}{visibleItems.map((item, idx) => {
-                      if (item.sourceType === "web" && item.webPreview) {
-                        const preview = item.webPreview;
-                        const selectedSource = item.feedSource;
-                        const isNostr = preview.provider === "Nostr";
-                        const nostrEventId = isNostr ? (preview.url.split("/").pop() || "") : "";
-                        const nostrRelayUrl = isNostr && selectedSource?.label ? `wss://${selectedSource.label}` : "";
-                        return (
-                          <div key={`${preview.url}-${idx}`} className="feed-item" style={{ cursor: isNostr ? undefined : "pointer" }} onClick={() => { if (!isNostr && preview.url) void openFeedLink(preview.url); }}>
-                            <div className="feed-header">
-                              <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                                <div className="stack-sm" style={{ gap: "0.05rem" }}>
-                                  <strong>{preview.title || preview.domain}</strong>
-                                  <span className="muted text-sm" style={{ fontWeight: "normal" }}>
-                                    {selectedSource?.label
-                                      ? `from ${selectedSource.label}`
-                                      : `Web source via ${preview.provider}`}
-                                    {selectedSource?.sourceScore != null
-                                      ? ` · source ${(selectedSource.sourceScore * 100).toFixed(0)}%`
-                                      : ""}
-                                    {selectedSource?.matchedInterestLabel
-                                      ? ` · source matched ${selectedSource.matchedInterestLabel}${
-                                          selectedSource.matchedInterestScore != null
-                                            ? ` (${(selectedSource.matchedInterestScore * 100).toFixed(0)}%)`
-                                            : ""
-                                        }`
-                                      : ""}
-                                  </span>
-                                </div>
-                              </div>
-                              <div className="feed-time">
-                                {preview.discoveredAt ? formatTimestamp(preview.discoveredAt) : "now"}
-                              </div>
-                            </div>
-                            <div
-                              className="bluesky-external-card"
-                              style={{ marginTop: "0.75rem" }}
-                            >
-                              {preview.imageUrl ? (
-                                <img
-                                  src={preview.imageUrl}
-                                  alt={preview.title || "Web preview"}
-                                  className="bluesky-external-thumb"
-                                />
-                              ) : null}
-                              <div className="bluesky-external-body">
-                                <div className="bluesky-external-title">{preview.title || preview.url}</div>
-                                {preview.description ? (
-                                  <div className="bluesky-external-desc">{preview.description}</div>
-                                ) : null}
-                                <div className="bluesky-external-domain">{preview.domain || preview.url}</div>
-                              </div>
-                            </div>
-                            {preview.providerSnippet ? (
-                              <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
-                                Search snippet: {preview.providerSnippet}
-                              </div>
-                            ) : null}
-                            {item.score != null ? (
-                              <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
-                                Matched {item.matchedInterestLabel || "workspace interest"} at{" "}
-                                {(item.score * 100).toFixed(0)}%
-                                {item.matchedInterestScore != null
-                                  ? ` (similarity ${(item.matchedInterestScore * 100).toFixed(0)}%)`
-                                  : ""}
-                              </div>
-                            ) : null}
-                            {isNostr ? (
-                              <div className="bsky-actions">
-                                <button type="button" className="bsky-action-btn" onClick={() => void handleNostrReaction(nostrEventId, nostrRelayUrl)} disabled={nostrKeysBusy}>
-                                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
-                                  Like
-                                </button>
-                                <button
-                                  type="button"
-                                  className="bsky-action-btn"
-                                  onClick={() => setExpandedThreadUri(expandedThreadUri === preview.url ? "" : preview.url)}
-                                >
-                                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
-                                  Reply
-                                </button>
-                              </div>
-                            ) : null}
-                            {isNostr && expandedThreadUri === preview.url ? (
-                              <div className="bsky-thread-panel">
-                                {nostrKeys ? (
-                                  <div className="text-sm muted" style={{ marginBottom: "0.4rem" }}>Replying as {nostrKeys.npub.slice(0, 16)}...</div>
-                                ) : (
-                                  <div className="nostr-identity-banner">
-                                    <span className="text-sm"><strong>Nostr Identity</strong></span>
-                                    <span className="text-sm muted">A new Nostr key pair will be created automatically when you reply.</span>
-                                  </div>
-                                )}
-                                <div className="bsky-reply-compose">
-                                  <textarea
-                                    className="bsky-reply-input"
-                                    rows={1}
-                                    placeholder="Reply to this note..."
-                                    value={replyDrafts[preview.url] || ""}
-                                    onChange={(e) => {
-                                      e.target.style.height = "0px";
-                                      e.target.style.height = `${e.target.scrollHeight}px`;
-                                      setReplyDrafts((prev) => ({ ...prev, [preview.url]: e.target.value }));
-                                    }}
-                                  />
-                                  <button
-                                    type="button"
-                                    className="primary bsky-reply-send"
-                                    disabled={!replyDrafts[preview.url]?.trim() || nostrKeysBusy}
-                                    onClick={() => {
-                                      void handleNostrReply(nostrEventId, nostrRelayUrl, replyDrafts[preview.url] || "");
-                                      setReplyDrafts((prev) => { const n = { ...prev }; delete n[preview.url]; return n; });
-                                    }}
-                                  >
-                                    Send
-                                  </button>
-                                </div>
-                              </div>
-                            ) : null}
-                          </div>
-                        );
-                      }
-                      const feedItem = item.feedItem as AppBskyFeedDefs.FeedViewPost;
-                      const post = feedItem.post;
-                      const author = post.author;
-                      const record = post.record as any;
-                      const text = String(record?.text || "");
-                      const feedSource = item.feedSource;
-                      const embedNode = renderBlueskyEmbed(post.embed as any);
-                      const postUri = post.uri;
-                      const postCid = post.cid;
-                      const isLiked = Boolean(blueskyLikedUris[postUri] || (post.viewer as any)?.like);
-                      const isThreadOpen = expandedThreadUri === postUri;
-                      const facetLinks = Array.isArray(record?.facets)
-                        ? record.facets
-                            .flatMap((facet: any) =>
-                              Array.isArray(facet?.features) ? facet.features : []
-                            )
-                            .map((feature: any) => String(feature?.uri || "").trim())
-                            .filter((uri: string) => uri.startsWith("http://") || uri.startsWith("https://"))
-                        : [];
-                      const textLinks = Array.from(text.matchAll(/https?:\/\/[^\s]+/g)).map((match) =>
-                        String(match[0] || "").trim()
-                      );
-                      const fallbackLinks = Array.from(new Set([...facetLinks, ...textLinks]));
-                      const hasExternalEmbed =
-                        Boolean(post.embed && (post.embed as any).$type === "app.bsky.embed.external#view") ||
-                        Boolean(
-                          post.embed &&
-                            (post.embed as any).$type === "app.bsky.embed.recordWithMedia#view" &&
-                            (post.embed as any).media?.$type === "app.bsky.embed.external#view"
-                        );
-                      // Find root URI/CID for replies (needed for reply threading)
-                      const rootUri = postUri;
-                      const rootCid = postCid;
-                      return (
-                        <div key={`${post.cid}-${idx}`} className="feed-item">
-                          <div className="feed-header">
-                            <div className="feed-title" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                              {author.avatar && <img src={author.avatar} alt="" style={{ width: "36px", height: "36px", borderRadius: "50%", objectFit: "cover" }} />}
-                              <div className="stack-sm" style={{ gap: "0.05rem" }}>
-                                <strong>{author.displayName || author.handle}</strong>
-                                <span className="muted text-sm" style={{ fontWeight: "normal" }}>
-                                  @{author.handle}
-                                </span>
-                                {feedSource?.label ? (
-                                  <span className="muted text-sm" style={{ fontWeight: "normal" }}>
-                                    from {feedSource.label}
-                                    {feedSource.sourceScore != null
-                                      ? ` · source ${(feedSource.sourceScore * 100).toFixed(0)}%`
-                                      : ""}
-                                    {feedSource.matchedInterestLabel
-                                      ? ` · feed matched ${feedSource.matchedInterestLabel}${
-                                          feedSource.matchedInterestScore != null
-                                            ? ` (${(feedSource.matchedInterestScore * 100).toFixed(0)}%)`
-                                            : ""
-                                        }`
-                                      : ""}
-                                  </span>
-                                ) : null}
-                              </div>
-                            </div>
-                            <div className="feed-time">{formatTimestamp(post.indexedAt)}</div>
-                          </div>
-                          <div className="feed-body" style={{ marginTop: "8px", wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
-                            {renderLinkedText(text)}
-                          </div>
-                          {embedNode}
-                          {item.score != null ? (
-                            <div className="text-sm muted" style={{ marginTop: "0.6rem" }}>
-                              Matched {item.matchedInterestLabel || "workspace interest"} at{" "}
-                              {(item.score * 100).toFixed(0)}%
-                              {item.matchedInterestScore != null
-                                ? ` (similarity ${(item.matchedInterestScore * 100).toFixed(0)}%)`
-                                : ""}
-                            </div>
-                          ) : null}
-                          {!hasExternalEmbed && fallbackLinks.length > 0 ? (
-                            <div className="stack" style={{ gap: "0.5rem" }}>
-                              {fallbackLinks.map((url) => (
-                                <a
-                                  key={`${post.cid}-${url}`}
-                                  href={url}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="bluesky-external-card"
-                                >
-                                  <div className="bluesky-external-body">
-                                    <div className="bluesky-external-title">{url}</div>
-                                    <div className="bluesky-external-domain">
-                                      {(() => {
-                                        try {
-                                          return new URL(url).hostname;
-                                        } catch {
-                                          return url;
-                                        }
-                                      })()}
-                                    </div>
-                                  </div>
-                                </a>
-                              ))}
-                            </div>
-                          ) : null}
-                          <div className="bsky-actions">
-                            <button
-                              type="button"
-                              className={`bsky-action-btn ${isLiked ? "liked" : ""}`}
-                              onClick={() => void handleLikeBlueskyPost(postUri, postCid)}
-                              disabled={!session}
-                            >
-                              <svg width="16" height="16" viewBox="0 0 24 24" fill={isLiked ? "#f91880" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
-                              {(post.likeCount || 0) + (blueskyLikedUris[postUri] && !(post.viewer as any)?.like ? 1 : 0)}
-                            </button>
-                            <button
-                              type="button"
-                              className={`bsky-action-btn ${isThreadOpen ? "liked" : ""}`}
-                              onClick={() => void handleExpandThread(postUri)}
-                            >
-                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
-                              {post.replyCount || 0}
-                            </button>
-                            <span className="bsky-action-btn" style={{ cursor: "default" }}>
-                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 1l4 4-4 4"></path><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><path d="M7 23l-4-4 4-4"></path><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
-                              {post.repostCount || 0}
-                            </span>
-                          </div>
-                          {isThreadOpen ? (
-                            <div className="bsky-thread-panel">
-                              {threadLoading ? (
-                                <div className="bsky-thread-loading">Loading comments...</div>
-                              ) : threadData?.error ? (
-                                <div className="text-sm muted">{threadData.error}</div>
-                              ) : threadData?.thread?.replies?.length > 0 ? (
-                                <div className="bsky-thread-replies">
-                                  {threadData.thread.replies.slice(0, 20).map((reply: any, ri: number) => {
-                                    const rPost = reply?.post;
-                                    if (!rPost) return null;
-                                    const rAuthor = rPost.author || {};
-                                    const rRecord = rPost.record as any;
-                                    const rText = String(rRecord?.text || "");
-                                    return (
-                                      <div key={rPost.cid || ri} className="bsky-thread-reply">
-                                        {rAuthor.avatar ? <img src={rAuthor.avatar} alt="" className="bsky-reply-avatar" /> : <div className="bsky-reply-avatar" style={{ background: "var(--line)" }} />}
-                                        <div className="bsky-reply-body">
-                                          <span className="bsky-reply-author">{rAuthor.displayName || rAuthor.handle}</span>
-                                          <span className="bsky-reply-handle">@{rAuthor.handle}</span>
-                                          <div className="bsky-reply-text">{renderLinkedText(rText)}</div>
-                                          <div className="bsky-reply-time">{formatTimestamp(rPost.indexedAt)}</div>
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              ) : (
-                                <div className="text-sm muted">No replies yet.</div>
-                              )}
-                              {session ? (
-                                <div className="bsky-reply-compose">
-                                  <textarea
-                                    className="bsky-reply-input"
-                                    rows={1}
-                                    placeholder="Write a reply..."
-                                    value={replyDrafts[postUri] || ""}
-                                    onChange={(e) => {
-                                      e.target.style.height = "0px";
-                                      e.target.style.height = `${e.target.scrollHeight}px`;
-                                      setReplyDrafts((prev) => ({ ...prev, [postUri]: e.target.value }));
-                                    }}
-                                  />
-                                  <button
-                                    type="button"
-                                    className="primary bsky-reply-send"
-                                    disabled={!replyDrafts[postUri]?.trim() || replyingUri === postUri}
-                                    onClick={() => void handleReplyToBlueskyPost(postUri, postCid, rootUri, rootCid)}
-                                  >
-                                    {replyingUri === postUri ? "..." : "Reply"}
-                                  </button>
-                                </div>
-                              ) : (
-                                <div className="text-sm muted" style={{ marginTop: "0.5rem" }}>Sign in to Bluesky to reply.</div>
-                              )}
-                            </div>
-                          ) : null}
-                        </div>
-                      );
-                    })}</>;
-                    })()}
+                    {worldFeedNewPostsBanner}
+                    {renderWorldFeedItems()}
                   </div>
                 )
               ) : (
@@ -7494,9 +7854,23 @@ function App() {
                   </div>
 
                   {/* Me feed sub-tabs */}
-                  <div className="world-feed-tabs">
-                    <button type="button" className={`world-feed-tab ${meFeedTab === "drafts" ? "active" : ""}`} onClick={() => setMeFeedTab("drafts")}>Drafts</button>
-                    <button type="button" className={`world-feed-tab ${meFeedTab === "published" ? "active" : ""}`} onClick={() => setMeFeedTab("published")}>Published ({postedHistory.length})</button>
+                  <div className="feed-section-tabs me-feed-tabs">
+                    <button
+                      type="button"
+                      className={`feed-section-tab ${meFeedTab === "drafts" ? "active" : ""}`}
+                      onClick={() => setMeFeedTab("drafts")}
+                    >
+                      Drafts
+                      <span className="feed-section-tab-count">{feedItems.length}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`feed-section-tab ${meFeedTab === "published" ? "active" : ""}`}
+                      onClick={() => setMeFeedTab("published")}
+                    >
+                      Published
+                      <span className="feed-section-tab-count">{postedHistory.length}</span>
+                    </button>
                   </div>
 
                   {meFeedTab === "published" ? (
@@ -7922,6 +8296,70 @@ function App() {
                       />
                     ) : null}
                     {syncStatus ? <p className="text-sm muted">{syncStatus}</p> : null}
+                  </div>
+                </div>
+
+                  <div className="card">
+                  <h2>Free AI (OpenRouter)</h2>
+                  <div className="stack">
+                    <p className="text-sm muted">
+                      Connect via OpenRouter for free AI. No credit card needed.
+                      Uses Gemini 2.5 Flash (free) — plenty for daily journal processing.
+                    </p>
+                    <div className="stack" style={{ gap: "0.5rem" }}>
+                      <p className="text-sm"><strong>Option 1: Auto-connect</strong></p>
+                      <button
+                        type="button"
+                        className="primary"
+                        onClick={() => void handleOpenRouterOAuth()}
+                        disabled={openrouterOAuthBusy}
+                        style={{ alignSelf: "flex-start" }}
+                      >
+                        {openrouterOAuthBusy ? "Connecting..." : "Login with OpenRouter"}
+                      </button>
+                    </div>
+                    <div className="stack" style={{ gap: "0.4rem" }}>
+                      <p className="text-sm"><strong>Option 2: Paste API key</strong></p>
+                      <p className="text-sm muted">
+                        Go to{" "}
+                        <span
+                          style={{ textDecoration: "underline", cursor: "pointer" }}
+                          onClick={() => void openExternalUrlInBrowser("https://openrouter.ai/settings/keys")}
+                        >
+                          openrouter.ai/settings/keys
+                        </span>
+                        {" "}to create a free account and API key, then paste it here.
+                      </p>
+                      <input
+                        type="password"
+                        value={openrouterApiKeyInput}
+                        onChange={(e) => setOpenrouterApiKeyInput(e.target.value)}
+                        placeholder="sk-or-..."
+                        disabled={openrouterOAuthBusy}
+                      />
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => void saveOpenRouterApiKey()}
+                        disabled={openrouterOAuthBusy || !openrouterApiKeyInput.trim()}
+                      >
+                        Save API Key
+                      </button>
+                    </div>
+                    {openrouterOAuthStatus ? (
+                      <p
+                        className="text-sm"
+                        style={{
+                          color: openrouterOAuthStatus.includes("ready") || openrouterOAuthStatus.includes("connected")
+                            ? "var(--success)"
+                            : openrouterOAuthStatus.includes("Failed") || openrouterOAuthStatus.includes("failed") || openrouterOAuthStatus.includes("timed out")
+                              ? "var(--danger)"
+                              : undefined
+                        }}
+                      >
+                        {openrouterOAuthStatus}
+                      </p>
+                    ) : null}
                   </div>
                 </div>
 

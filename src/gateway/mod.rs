@@ -363,6 +363,23 @@ pub struct AppState {
     pub pb_chat_collection: String,
     pub pb_chat_token: Option<String>,
     journal_transcription_jobs: Arc<Mutex<HashMap<String, JournalTranscriptionJob>>>,
+    /// In-flight OpenRouter OAuth PKCE session (one at a time).
+    openrouter_oauth: Arc<Mutex<Option<OpenRouterOAuthSession>>>,
+}
+
+#[derive(Clone, Debug)]
+struct OpenRouterOAuthSession {
+    pkce: crate::auth::oauth_common::PkceState,
+    status: OpenRouterOAuthStatus,
+    api_key: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OpenRouterOAuthStatus {
+    Pending,
+    Complete,
+    Failed,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -579,6 +596,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         pb_chat_collection: "chat_messages".to_string(),
         pb_chat_token: None,
         journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+        openrouter_oauth: Arc::new(Mutex::new(None)),
     };
 
     // Core API/UI router (small request bodies)
@@ -636,7 +654,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .route(
             "/api/workspace/world-feed/interests/{interest_id}",
-            delete(handle_world_feed_interest_delete),
+            delete(handle_world_feed_interest_delete)
+                .patch(handle_world_feed_interest_update),
         )
         .route("/api/workspace/todos", get(handle_workspace_todos_list))
         .route(
@@ -648,6 +667,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/post-history",
             get(handle_post_history_list).post(handle_post_history_create),
+        )
+        .route(
+            "/api/auth/openrouter/start",
+            post(handle_openrouter_oauth_start),
+        )
+        .route(
+            "/api/auth/openrouter/callback",
+            get(handle_openrouter_oauth_callback),
+        )
+        .route(
+            "/api/auth/openrouter/status",
+            get(handle_openrouter_oauth_status),
         )
         .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
@@ -949,6 +980,35 @@ async fn handle_runtime_config_update(
     }
 
     let mut next = state.config.lock().clone();
+    let provider_changed = next
+        .default_provider
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        != provider;
+    let model_changed = next
+        .default_model
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        != model;
+    let api_key_changed = if let Some(new_key) = body
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
+        let old_key = next
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
+        let changed = old_key != new_key;
+        next.api_key = Some(new_key.to_string());
+        changed
+    } else {
+        false
+    };
     next.default_provider = Some(provider.to_string());
     next.default_model = Some(model.to_string());
     next.transcription.enabled = body.transcription_enabled;
@@ -970,6 +1030,9 @@ async fn handle_runtime_config_update(
         );
     }
     *state.config.lock() = next.clone();
+    if provider_changed || model_changed || api_key_changed {
+        reset_workspace_synthesizer_status_for_provider_change(&next.workspace_dir);
+    }
 
     let resp = serde_json::json!({
         "ok": true,
@@ -981,6 +1044,170 @@ async fn handle_runtime_config_update(
         "availableTranscriptionModels": available_local_transcription_models(),
     });
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OpenRouter OAuth PKCE handlers
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// POST /api/auth/openrouter/start — begin OpenRouter OAuth PKCE flow.
+///
+/// Returns `{ authUrl }` that the frontend should open in a browser.
+async fn handle_openrouter_oauth_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "OpenRouter OAuth start") {
+        return err.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let port = config.gateway.port;
+    let callback_url = format!("http://localhost:{port}/api/auth/openrouter/callback");
+
+    let pkce = crate::auth::oauth_common::generate_pkce_state();
+    let auth_url = crate::auth::openrouter_oauth::build_authorize_url(&pkce, &callback_url);
+
+    *state.openrouter_oauth.lock() = Some(OpenRouterOAuthSession {
+        pkce,
+        status: OpenRouterOAuthStatus::Pending,
+        api_key: None,
+        error: None,
+    });
+
+    tracing::info!("OpenRouter OAuth PKCE flow started");
+    let body = serde_json::json!({ "authUrl": auth_url });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// GET /api/auth/openrouter/callback — browser redirect from OpenRouter.
+///
+/// This endpoint is called by the browser after the user authorizes on OpenRouter.
+/// It does NOT require bearer auth — PKCE state validates the request.
+async fn handle_openrouter_oauth_callback(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    let code = match params.get("code") {
+        Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+        _ => {
+            let error_html = "<html><body><h2>OpenRouter login failed</h2>\
+                <p>No authorization code received. Please try again.</p></body></html>";
+            return axum::response::Html(error_html).into_response();
+        }
+    };
+
+    let session = state.openrouter_oauth.lock().clone();
+    let session = match session {
+        Some(s) if s.status == OpenRouterOAuthStatus::Pending => s,
+        _ => {
+            let error_html = "<html><body><h2>OpenRouter login failed</h2>\
+                <p>No pending OAuth session. Please start login again from the app.</p></body></html>";
+            return axum::response::Html(error_html).into_response();
+        }
+    };
+
+    let client = reqwest::Client::new();
+    match crate::auth::openrouter_oauth::exchange_code_for_key(&client, &code, &session.pkce).await
+    {
+        Ok(api_key) => {
+            // Store the API key in config and update provider/model
+            {
+                let mut config = state.config.lock();
+                config.api_key = Some(api_key.clone());
+                config.default_provider = Some("openrouter".to_string());
+                if config
+                    .default_model
+                    .as_deref()
+                    .map_or(true, |m| m.is_empty())
+                {
+                    config.default_model = Some(
+                        crate::auth::openrouter_oauth::OPENROUTER_DEFAULT_FREE_MODEL.to_string(),
+                    );
+                }
+            }
+
+            // Persist config to disk
+            let config_snapshot = state.config.lock().clone();
+            if let Err(err) = config_snapshot.save().await {
+                tracing::error!("Failed to save config after OpenRouter OAuth: {err:#}");
+            }
+            reset_workspace_synthesizer_status_for_provider_change(&config_snapshot.workspace_dir);
+
+            // Update OAuth session state
+            *state.openrouter_oauth.lock() = Some(OpenRouterOAuthSession {
+                pkce: session.pkce,
+                status: OpenRouterOAuthStatus::Complete,
+                api_key: Some(api_key),
+                error: None,
+            });
+
+            tracing::info!("OpenRouter OAuth completed — API key stored");
+            let html = "<html><body>\
+                <h2>OpenRouter login complete!</h2>\
+                <p>You can close this tab and return to the app.</p>\
+                <p style=\"color:green\">AI is now enabled with a free model.</p>\
+                </body></html>";
+            axum::response::Html(html).into_response()
+        }
+        Err(err) => {
+            tracing::error!("OpenRouter OAuth key exchange failed: {err:#}");
+            *state.openrouter_oauth.lock() = Some(OpenRouterOAuthSession {
+                pkce: session.pkce,
+                status: OpenRouterOAuthStatus::Failed,
+                api_key: None,
+                error: Some(format!("{err:#}")),
+            });
+
+            let html = format!(
+                "<html><body>\
+                <h2>OpenRouter login failed</h2>\
+                <p>Could not complete login. Please try again.</p>\
+                <p style=\"color:red\">{}</p>\
+                </body></html>",
+                html_escape(&format!("{err:#}"))
+            );
+            axum::response::Html(html).into_response()
+        }
+    }
+}
+
+/// GET /api/auth/openrouter/status — poll OAuth session status.
+async fn handle_openrouter_oauth_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "OpenRouter OAuth status") {
+        return err.into_response();
+    }
+
+    let session = state.openrouter_oauth.lock().clone();
+    let body = match session {
+        Some(s) => serde_json::json!({
+            "active": true,
+            "status": match s.status {
+                OpenRouterOAuthStatus::Pending => "pending",
+                OpenRouterOAuthStatus::Complete => "complete",
+                OpenRouterOAuthStatus::Failed => "failed",
+            },
+            "hasKey": s.api_key.is_some(),
+            "error": s.error,
+        }),
+        None => serde_json::json!({
+            "active": false,
+            "status": "none",
+            "hasKey": false,
+            "error": null,
+        }),
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// POST /pair — exchange one-time code for bearer token
@@ -2285,6 +2512,75 @@ fn save_workspace_synthesizer_status(
     }
     if let Err(err) = workspace_synthesizer::save_status(workspace_dir, &next) {
         tracing::warn!("Failed to persist workspace synthesizer status `{status}`: {err}");
+    }
+}
+
+fn clear_workspace_synth_artifact_error_state(
+    state: &mut workspace_synthesizer::WorkspaceSynthArtifactState,
+) {
+    if state.status.eq_ignore_ascii_case("error") {
+        state.status.clear();
+    }
+    if !state.error.trim().is_empty() {
+        state.error.clear();
+    }
+}
+
+fn reset_workspace_synthesizer_status_for_provider_change(workspace_dir: &StdPath) {
+    let mut next = workspace_synthesizer::load_status(workspace_dir);
+    if matches!(next.status.as_str(), "pending" | "processing") {
+        return;
+    }
+
+    let mut changed = false;
+    if next.status == "error" {
+        next.status = "idle".to_string();
+        changed = true;
+    }
+    if !next.last_error.trim().is_empty() {
+        next.last_error.clear();
+        changed = true;
+    }
+    if !next.skill_runs.is_empty() {
+        next.skill_runs.clear();
+        changed = true;
+    }
+
+    let artifact_states = &mut next.artifact_states;
+    let had_artifact_error = [
+        &artifact_states.insight_posts,
+        &artifact_states.todos,
+        &artifact_states.events,
+        &artifact_states.clip_plans,
+        &artifact_states.primitive_entities,
+        &artifact_states.primitive_events,
+        &artifact_states.primitive_assertions,
+        &artifact_states.primitive_actions,
+        &artifact_states.primitive_segments,
+        &artifact_states.primitive_structures,
+    ]
+    .iter()
+    .any(|state| state.status.eq_ignore_ascii_case("error") || !state.error.trim().is_empty());
+    if had_artifact_error {
+        clear_workspace_synth_artifact_error_state(&mut artifact_states.insight_posts);
+        clear_workspace_synth_artifact_error_state(&mut artifact_states.todos);
+        clear_workspace_synth_artifact_error_state(&mut artifact_states.events);
+        clear_workspace_synth_artifact_error_state(&mut artifact_states.clip_plans);
+        clear_workspace_synth_artifact_error_state(&mut artifact_states.primitive_entities);
+        clear_workspace_synth_artifact_error_state(&mut artifact_states.primitive_events);
+        clear_workspace_synth_artifact_error_state(&mut artifact_states.primitive_assertions);
+        clear_workspace_synth_artifact_error_state(&mut artifact_states.primitive_actions);
+        clear_workspace_synth_artifact_error_state(&mut artifact_states.primitive_segments);
+        clear_workspace_synth_artifact_error_state(&mut artifact_states.primitive_structures);
+        changed = true;
+    }
+
+    if changed {
+        if let Err(err) = workspace_synthesizer::save_status(workspace_dir, &next) {
+            tracing::warn!(
+                "Failed to reset workspace synthesizer status after provider change: {err}"
+            );
+        }
     }
 }
 
@@ -5935,7 +6231,7 @@ async fn handle_world_feed_interest_delete(
         );
     }
     let config_snapshot = state.config.lock().clone();
-    match crate::feed::delete_dummy_world_feed_interest(&config_snapshot, trimmed_interest_id) {
+    match crate::feed::delete_world_feed_interest(&config_snapshot, trimmed_interest_id) {
         Ok(true) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -5952,6 +6248,53 @@ async fn handle_world_feed_interest_delete(
             StatusCode::BAD_REQUEST,
             "world feed interest delete",
             "Failed to delete world-feed interest.",
+            err,
+        ),
+    }
+}
+
+async fn handle_world_feed_interest_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(interest_id): AxumPath<String>,
+    Json(body): Json<WorldFeedInterestUpdateRequest>,
+) -> impl IntoResponse {
+    if let Some(err) = pairing_auth_error(&state, &headers, "World feed interest update") {
+        return err;
+    }
+    let trimmed_interest_id = interest_id.trim();
+    if trimmed_interest_id.is_empty() {
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "WORLD_FEED_INTEREST_ID_REQUIRED",
+            "interest id is required",
+        );
+    }
+    let config_snapshot = state.config.lock().clone();
+    match crate::feed::update_world_feed_interest(
+        &config_snapshot,
+        trimmed_interest_id,
+        body.label.as_deref(),
+        body.keywords_override,
+    )
+    .await
+    {
+        Ok(Some(item)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "updated": true,
+                "item": item,
+            })),
+        ),
+        Ok(None) => frontend_error_response(
+            StatusCode::NOT_FOUND,
+            "WORLD_FEED_INTEREST_NOT_FOUND",
+            "world-feed interest not found",
+        ),
+        Err(err) => frontend_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "world feed interest update",
+            "Failed to update world-feed interest.",
             err,
         ),
     }
@@ -6808,6 +7151,7 @@ struct RuntimeConfigUpdateBody {
     default_model: String,
     transcription_enabled: bool,
     transcription_model: Option<String>,
+    api_key: Option<String>,
 }
 
 fn available_local_transcription_models() -> Vec<String> {
@@ -8321,6 +8665,13 @@ struct PersonalizedFeedRequest {
 #[serde(rename_all = "camelCase")]
 struct WorldFeedInterestCreateRequest {
     label: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorldFeedInterestUpdateRequest {
+    label: Option<String>,
+    keywords_override: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -10929,6 +11280,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            openrouter_oauth: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -11024,6 +11376,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -11067,6 +11420,7 @@ mod tests {
             pb_chat_token: None,
             observer,
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -11534,6 +11888,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
         let mut headers = HeaderMap::new();
@@ -11592,6 +11947,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
         let headers = HeaderMap::new();
@@ -11662,6 +12018,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
         let response = handle_webhook(
@@ -11704,6 +12061,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
         let mut headers = HeaderMap::new();
@@ -11751,6 +12109,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
         let mut headers = HeaderMap::new();
@@ -11984,6 +12343,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
         let Some((status, Json(payload))) = pairing_auth_error(&state, &HeaderMap::new(), "test") else {
@@ -12082,6 +12442,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
         let response = handle_feed_workflow_template_create(
@@ -12129,6 +12490,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
         let response = handle_feed_workflow_template_create(
@@ -12438,6 +12800,36 @@ mod tests {
 
         assert!(ready);
         assert!(reason.trim().is_empty());
+    }
+
+    #[test]
+    fn reset_workspace_synthesizer_status_for_provider_change_clears_stale_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let mut status = workspace_synthesizer::WorkspaceSynthesizerStatus {
+            status: "error".to_string(),
+            last_error: "old provider failure".to_string(),
+            skill_runs: vec![workspace_synthesizer::WorkspaceSynthSkillRunState {
+                skill_key: "workspace_insight_extractor".to_string(),
+                name: "Workspace Insight Extractor".to_string(),
+                status: "error".to_string(),
+                error: "rate limited".to_string(),
+                ..workspace_synthesizer::WorkspaceSynthSkillRunState::default()
+            }],
+            ..workspace_synthesizer::WorkspaceSynthesizerStatus::default()
+        };
+        status.artifact_states.insight_posts.status = "error".to_string();
+        status.artifact_states.insight_posts.error = "split bundle failed".to_string();
+        workspace_synthesizer::save_status(workspace, &status).unwrap();
+
+        reset_workspace_synthesizer_status_for_provider_change(workspace);
+
+        let saved = workspace_synthesizer::load_status(workspace);
+        assert_eq!(saved.status, "idle");
+        assert!(saved.last_error.is_empty());
+        assert!(saved.skill_runs.is_empty());
+        assert!(saved.artifact_states.insight_posts.status.is_empty());
+        assert!(saved.artifact_states.insight_posts.error.is_empty());
     }
 
     #[tokio::test]

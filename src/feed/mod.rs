@@ -14,6 +14,7 @@ use nostr_sdk::prelude::{
 };
 use parking_lot::Mutex;
 use regex::Regex;
+use rust_stemmers::{Algorithm as StemAlgorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -44,9 +45,9 @@ const INTEREST_EMA_NEW_WEIGHT: f32 = 0.2;
 const BLUESKY_TIMELINE_LIMIT_MAX: usize = 100;
 const BLUESKY_DISCOVER_FEED_URI: &str =
     "at://did:plc:qh3lfd7q24h3fn3pejqr25ct/app.bsky.feed.generator/whats-hot";
-const BLUESKY_FEED_GENERATOR_DISCOVERY_PAGE_LIMIT: usize = 2;
+const BLUESKY_FEED_GENERATOR_DISCOVERY_PAGE_LIMIT: usize = 3;
 const BLUESKY_FEED_GENERATOR_DISCOVERY_PAGE_SIZE: usize = 25;
-const BLUESKY_FEED_GENERATOR_MATCH_LIMIT: usize = 4;
+const BLUESKY_FEED_GENERATOR_MATCH_LIMIT: usize = 6;
 const BLUESKY_FEED_SOURCE_MATCH_THRESHOLD: f32 = 0.55;
 const BLUESKY_PERSONALIZED_PAGE_LIMIT_PER_SOURCE: usize = 4;
 const BLUESKY_PERSONALIZED_PAGE_SIZE: usize = 20;
@@ -68,8 +69,8 @@ const NOSTR_NIP66_DISCOVERY_KIND: u16 = 30166;
 const NOSTR_NIP66_DISCOVERY_EVENT_LIMIT: usize = 75;
 const NOSTR_PRIMAL_FALLBACK_RELAY: &str = "wss://relay.primal.net";
 const WEB_SEARCH_RESULT_LIMIT_PER_QUERY: usize = 4;
-const STAGE1_KEYWORD_LIMIT: usize = 10;
-const STAGE1_KEYWORDS_PER_INTEREST_LIMIT: usize = 5;
+const STAGE1_KEYWORD_LIMIT: usize = 15;
+const STAGE1_KEYWORDS_PER_INTEREST_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -121,6 +122,7 @@ pub struct WebFeedPreview {
     pub url: String,
     pub title: String,
     pub description: String,
+    pub content_text: String,
     pub image_url: Option<String>,
     pub domain: String,
     pub provider: String,
@@ -188,6 +190,8 @@ pub struct FeedInterestDiagnosticItem {
     pub embedding_dimensions: usize,
     pub synthetic: bool,
     pub deletable: bool,
+    pub keywords: Vec<String>,
+    pub keywords_override: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -583,6 +587,18 @@ async fn build_prepared_world_feed_data(
         source_count = profile.stats.source_count,
         "World feed: interest profile built"
     );
+
+    // Write progress: profile built, discovery starting
+    write_progress_diagnostics(
+        &config.workspace_dir,
+        "discovering",
+        &profile.status,
+        &profile.stats,
+        &FeedRefreshDiagnostics::default(),
+        &[],
+        &Utc::now().to_rfc3339(),
+    );
+
     if profile.interests.is_empty() || profile.status != "ready" {
         return Ok(Some(PreparedWorldFeedData {
             profile,
@@ -1006,6 +1022,40 @@ fn finish_world_feed_refresh(workspace_dir: &Path) {
         .remove(workspace_dir);
 }
 
+/// Write partial diagnostics to SQLite and bump generation so the frontend poll
+/// picks up rolling progress numbers.
+fn write_progress_diagnostics(
+    workspace_dir: &Path,
+    refresh_status: &str,
+    profile_status: &str,
+    profile_stats: &InterestProfileStats,
+    diagnostics: &FeedRefreshDiagnostics,
+    selected_sources: &[serde_json::Value],
+    refresh_started_at: &str,
+) {
+    let now = Utc::now().to_rfc3339();
+    let _ = local_store::upsert_personalized_feed_state(
+        workspace_dir,
+        &local_store::PersonalizedFeedStateUpsert {
+            feed_key: WORLD_FEED_KEY.to_string(),
+            dirty: true,
+            refresh_status: refresh_status.to_string(),
+            refreshed_at: now.clone(),
+            refresh_started_at: refresh_started_at.to_string(),
+            refresh_finished_at: String::new(),
+            last_error: String::new(),
+            profile_status: profile_status.to_string(),
+            profile_stats_json: serde_json::json!(profile_stats).to_string(),
+            details_json: serde_json::json!({
+                "selectedSources": selected_sources,
+                "diagnostics": diagnostics,
+            })
+            .to_string(),
+        },
+    );
+    let _ = local_store::bump_feed_generation(workspace_dir, WORLD_FEED_KEY);
+}
+
 async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -> Result<()> {
     let workspace_dir = config.workspace_dir.clone();
     let Some(mut prepared) = build_prepared_world_feed_data(&config, bluesky_auth, true).await? else {
@@ -1076,6 +1126,17 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
         .iter()
         .map(selected_source_summary)
         .collect();
+
+    // ── Progress: Write discovery diagnostics so frontend sees live counts ──
+    write_progress_diagnostics(
+        &workspace_dir,
+        "discovering",
+        &prepared.profile.status,
+        &prepared.profile.stats,
+        &prepared.diagnostics,
+        &selected_sources_json,
+        &now,
+    );
 
     // ── Phase 1 (FAST): Stage 2 keyword ranking ─────────────────────────
     // Write keyword-ranked results to cache immediately so the frontend
@@ -1868,6 +1929,7 @@ fn build_content_preview(item: &local_store::ContentItemRecord) -> WebFeedPrevie
             item.title.clone()
         },
         description,
+        content_text: item.content_text.trim().to_string(),
         image_url: None,
         domain: item.domain.clone(),
         provider: "RSS/Atom".to_string(),
@@ -1901,6 +1963,19 @@ fn is_synthetic_interest_source(source_path: &str) -> bool {
 fn feed_interest_to_diagnostic(
     record: local_store::FeedInterestRecord,
 ) -> FeedInterestDiagnosticItem {
+    let keywords_override = if record.keywords_override.trim().is_empty() {
+        None
+    } else {
+        Some(
+            record
+                .keywords_override
+                .split(',')
+                .map(|keyword| keyword.trim().to_string())
+                .filter(|keyword| !keyword.is_empty())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let derived_keywords = derive_interest_keywords(&record.label, "");
     FeedInterestDiagnosticItem {
         id: record.id,
         label: record.label,
@@ -1912,6 +1987,8 @@ fn feed_interest_to_diagnostic(
         embedding_dimensions: bytes_to_vec(&record.embedding).len(),
         synthetic: is_synthetic_interest_source(&record.source_path),
         deletable: is_synthetic_interest_source(&record.source_path),
+        keywords: keywords_override.clone().unwrap_or(derived_keywords),
+        keywords_override,
     }
 }
 
@@ -1964,21 +2041,67 @@ pub async fn create_dummy_world_feed_interest(
     Ok(feed_interest_to_diagnostic(record))
 }
 
-pub fn delete_dummy_world_feed_interest(config: &Config, interest_id: &str) -> Result<bool> {
-    let interest = local_store::list_feed_interests(&config.workspace_dir)?
-        .into_iter()
-        .find(|item| item.id == interest_id);
-    let Some(interest) = interest else {
-        return Ok(false);
-    };
-    if !is_synthetic_interest_source(&interest.source_path) {
-        anyhow::bail!("Only synthetic diagnostic world-feed interests can be deleted.");
-    }
+pub fn delete_world_feed_interest(config: &Config, interest_id: &str) -> Result<bool> {
     let deleted = local_store::delete_feed_interest(&config.workspace_dir, interest_id)?;
     if deleted {
         mark_world_feed_dirty(&config.workspace_dir)?;
     }
     Ok(deleted)
+}
+
+pub async fn update_world_feed_interest(
+    config: &Config,
+    interest_id: &str,
+    label: Option<&str>,
+    keywords_override: Option<Vec<String>>,
+) -> Result<Option<FeedInterestDiagnosticItem>> {
+    let interest = local_store::list_feed_interests(&config.workspace_dir)?
+        .into_iter()
+        .find(|item| item.id == interest_id);
+    let Some(interest) = interest else {
+        return Ok(None);
+    };
+
+    if let Some(new_label) = label {
+        let trimmed = new_label.trim();
+        if !trimmed.is_empty() && trimmed != interest.label {
+            let embedder = resolve_feed_embedder(config)
+                .await?
+                .0
+                .context("Embedding provider is unavailable.")?;
+            let embedding = embedder
+                .embed_one(trimmed)
+                .await
+                .context("Failed to embed updated label.")?;
+            local_store::update_feed_interest_label(
+                &config.workspace_dir,
+                interest_id,
+                trimmed,
+                &vec_to_bytes(&embedding),
+            )?;
+        }
+    }
+
+    if let Some(kw) = keywords_override {
+        let csv = kw
+            .iter()
+            .map(|keyword| keyword.trim())
+            .filter(|keyword| !keyword.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        local_store::update_feed_interest_keywords_override(
+            &config.workspace_dir,
+            interest_id,
+            &csv,
+        )?;
+    }
+
+    mark_world_feed_dirty(&config.workspace_dir)?;
+    let updated = local_store::list_feed_interests(&config.workspace_dir)?
+        .into_iter()
+        .find(|item| item.id == interest_id)
+        .map(feed_interest_to_diagnostic);
+    Ok(updated)
 }
 
 async fn select_feed_embedder(config: &Config) -> Result<Option<SharedEmbedder>> {
@@ -2181,8 +2304,18 @@ async fn rebuild_interest_profile(config: &Config, embedder: SharedEmbedder) -> 
         interests: active_interests
             .into_iter()
             .map(|interest| {
-                let source_text = load_interest_source_text(workspace_dir, &interest.record.source_path);
-                let keywords = derive_interest_keywords(&interest.record.label, &source_text);
+                let keywords = if !interest.record.keywords_override.trim().is_empty() {
+                    interest
+                        .record
+                        .keywords_override
+                        .split(',')
+                        .map(|keyword| keyword.trim().to_string())
+                        .filter(|keyword| !keyword.is_empty())
+                        .collect()
+                } else {
+                    let source_text = load_interest_source_text(workspace_dir, &interest.record.source_path);
+                    derive_interest_keywords(&interest.record.label, &source_text)
+                };
                 InterestVector {
                     id: interest.record.id,
                     label: interest.record.label,
@@ -2278,15 +2411,18 @@ fn is_post_text_file(path: &Path) -> bool {
 }
 
 fn derive_interest_label(default_title: &str, content: &str) -> String {
+    // Prefer the first non-empty content heading/line as the label,
+    // since filenames (especially old ones) are often non-descriptive.
+    // Only fall back to the filename title if content has no useful heading.
+    for line in content.lines() {
+        let trimmed = line.trim().trim_start_matches('#').trim();
+        if !trimmed.is_empty() && trimmed.len() >= 5 {
+            return truncate_with_ellipsis(trimmed, 80);
+        }
+    }
     let normalized_title = default_title.trim();
     if !normalized_title.is_empty() && !normalized_title.eq_ignore_ascii_case("untitled") {
         return truncate_with_ellipsis(normalized_title, 80);
-    }
-    for line in content.lines() {
-        let trimmed = line.trim().trim_start_matches('#').trim();
-        if !trimmed.is_empty() {
-            return truncate_with_ellipsis(trimmed, 80);
-        }
     }
     "Workspace interest".to_string()
 }
@@ -2365,12 +2501,19 @@ fn broaden_stage1_keyword(term: &str) -> &'static [&'static str] {
 }
 
 fn score_terms_from_text(raw: &str, weight: f32, scores: &mut HashMap<String, f32>) {
+    let stopwords = stage1_stopwords();
     for term in tokenize_terms(raw) {
-        if term.len() < 3 || stage1_stopwords().contains(term.as_str()) {
+        if term.len() < 3 || stopwords.contains(term.as_str()) {
             continue;
         }
-        *scores.entry(term.clone()).or_insert(0.0) += weight;
-        for broadened in broaden_stage1_keyword(term.as_str()) {
+        let stemmed = stem_term(&term);
+        let canonical = if stemmed.len() >= 3 { &stemmed } else { &term };
+        *scores.entry(canonical.clone()).or_insert(0.0) += weight;
+        // Also score the original if different from stemmed, to keep specificity
+        if *canonical != term {
+            *scores.entry(term.clone()).or_insert(0.0) += weight * 0.3;
+        }
+        for broadened in broaden_stage1_keyword(&term) {
             *scores.entry((*broadened).to_string()).or_insert(0.0) += weight * 0.6;
         }
     }
@@ -2388,12 +2531,13 @@ fn derive_interest_keywords(label: &str, content: &str) -> Vec<String> {
         if trimmed.starts_with('#') {
             heading_count += 1;
             score_terms_from_text(trimmed.trim_start_matches('#').trim(), 2.0, &mut scores);
-            if heading_count >= 4 {
+            if heading_count >= 8 {
                 break;
             }
         }
     }
-    score_terms_from_text(&truncate_with_ellipsis(content.trim(), 600), 1.0, &mut scores);
+    // Use more content (1200 chars) to extract better keywords from the body
+    score_terms_from_text(&truncate_with_ellipsis(content.trim(), 1_200), 1.0, &mut scores);
 
     let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
     ranked.sort_by(|left, right| {
@@ -2524,9 +2668,13 @@ fn keyword_match_score(text: &str, keywords: &[String]) -> f32 {
         return 0.0;
     }
     let lower = text.to_ascii_lowercase();
+    let stemmed_tokens: Vec<String> = tokenize_and_stem(&lower);
     let matched = keywords
         .iter()
-        .filter(|keyword| lower.contains(keyword.as_str()))
+        .filter(|keyword| {
+            lower.contains(keyword.as_str())
+                || stemmed_tokens.iter().any(|token| token == keyword.as_str())
+        })
         .count();
     if matched == 0 {
         return 0.0;
@@ -2536,16 +2684,43 @@ fn keyword_match_score(text: &str, keywords: &[String]) -> f32 {
 
 fn first_matched_keyword<'a>(text: &str, keywords: &'a [String]) -> Option<&'a str> {
     let lower = text.to_ascii_lowercase();
+    let stemmed_tokens: Vec<String> = tokenize_and_stem(&lower);
     keywords
         .iter()
-        .find(|keyword| lower.contains(keyword.as_str()))
+        .find(|keyword| {
+            lower.contains(keyword.as_str())
+                || stemmed_tokens.iter().any(|token| token == keyword.as_str())
+        })
         .map(|keyword| keyword.as_str())
+}
+
+fn english_stemmer() -> &'static Stemmer {
+    static STEMMER: OnceLock<Stemmer> = OnceLock::new();
+    STEMMER.get_or_init(|| Stemmer::create(StemAlgorithm::English))
+}
+
+fn stem_term(term: &str) -> String {
+    english_stemmer().stem(term).into_owned()
 }
 
 fn tokenize_terms(raw: &str) -> Vec<String> {
     raw.split(|char: char| !char.is_alphanumeric())
         .map(|part| part.trim().to_ascii_lowercase())
         .filter(|part| part.len() >= 3)
+        .collect()
+}
+
+fn tokenize_and_stem(raw: &str) -> Vec<String> {
+    let stemmer = english_stemmer();
+    let mut seen = HashSet::new();
+    raw.split(|char: char| !char.is_alphanumeric())
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| part.len() >= 3)
+        .map(|part| {
+            let stemmed = stemmer.stem(&part).into_owned();
+            if stemmed.len() >= 3 { stemmed } else { part }
+        })
+        .filter(|term| seen.insert(term.clone()))
         .collect()
 }
 
@@ -2904,6 +3079,7 @@ impl FeedSource for NostrFeedSource {
                             url: permalink,
                             title,
                             description,
+                            content_text: event.content.clone(),
                             image_url: None,
                             domain: relay_domain,
                             provider: "Nostr".to_string(),
@@ -3683,6 +3859,7 @@ async fn collect_web_search_augmented_candidates(
                 url: result.url.clone(),
                 title: result.title.clone(),
                 description: result.description.clone(),
+                content_text: String::new(),
                 image_url: None,
                 domain: domain.clone(),
                 provider: result.provider.clone(),
@@ -4494,6 +4671,7 @@ mod tests {
                 url: url.to_string(),
                 title: "Example item".into(),
                 description: "Example description".into(),
+                content_text: "Example article body".into(),
                 image_url: None,
                 domain: "example.com".into(),
                 provider: "RSS/Atom".into(),
@@ -4529,6 +4707,7 @@ mod tests {
                     url: url.to_string(),
                     title: source_label.to_string(),
                     description: "Example description".into(),
+                    content_text: "Example article body".into(),
                     image_url: None,
                     domain: "example.com".into(),
                     provider: "RSS/Atom".into(),
@@ -4768,6 +4947,7 @@ mod tests {
                             url: "https://example.com/a".into(),
                             title: "A".into(),
                             description: "desc".into(),
+                            content_text: "Article A body".into(),
                             image_url: None,
                             domain: "example.com".into(),
                             provider: "RSS/Atom".into(),
@@ -4794,6 +4974,7 @@ mod tests {
                             url: "https://example.com/b".into(),
                             title: "B".into(),
                             description: "desc".into(),
+                            content_text: "Article B body".into(),
                             image_url: None,
                             domain: "example.com".into(),
                             provider: "RSS/Atom".into(),
@@ -4836,6 +5017,7 @@ mod tests {
                         url: "https://example.com/best-effort".into(),
                         title: "Best effort".into(),
                         description: "desc".into(),
+                        content_text: "Best effort article body".into(),
                         image_url: None,
                         domain: "example.com".into(),
                         provider: "RSS/Atom".into(),
