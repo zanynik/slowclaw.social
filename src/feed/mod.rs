@@ -1961,6 +1961,7 @@ fn is_synthetic_interest_source(source_path: &str) -> bool {
 }
 
 fn feed_interest_to_diagnostic(
+    workspace_dir: &Path,
     record: local_store::FeedInterestRecord,
 ) -> FeedInterestDiagnosticItem {
     let keywords_override = if record.keywords_override.trim().is_empty() {
@@ -1975,7 +1976,8 @@ fn feed_interest_to_diagnostic(
                 .collect::<Vec<_>>(),
         )
     };
-    let derived_keywords = derive_interest_keywords(&record.label, "");
+    let source_text = load_interest_source_text(workspace_dir, &record.source_path);
+    let derived_keywords = derive_interest_keywords(&record.label, &source_text);
     FeedInterestDiagnosticItem {
         id: record.id,
         label: record.label,
@@ -1997,7 +1999,7 @@ pub fn list_world_feed_interest_diagnostics(
 ) -> Result<FeedInterestDiagnosticsResponse> {
     let items = local_store::list_feed_interests(&config.workspace_dir)?
         .into_iter()
-        .map(feed_interest_to_diagnostic)
+        .map(|record| feed_interest_to_diagnostic(&config.workspace_dir, record))
         .collect();
     Ok(FeedInterestDiagnosticsResponse { items })
 }
@@ -2038,7 +2040,7 @@ pub async fn create_dummy_world_feed_interest(
         },
     )?;
     mark_world_feed_dirty(&config.workspace_dir)?;
-    Ok(feed_interest_to_diagnostic(record))
+    Ok(feed_interest_to_diagnostic(&config.workspace_dir, record))
 }
 
 pub fn delete_world_feed_interest(config: &Config, interest_id: &str) -> Result<bool> {
@@ -2100,7 +2102,7 @@ pub async fn update_world_feed_interest(
     let updated = local_store::list_feed_interests(&config.workspace_dir)?
         .into_iter()
         .find(|item| item.id == interest_id)
-        .map(feed_interest_to_diagnostic);
+        .map(|record| feed_interest_to_diagnostic(&config.workspace_dir, record));
     Ok(updated)
 }
 
@@ -2165,6 +2167,7 @@ async fn rebuild_interest_profile(config: &Config, embedder: SharedEmbedder) -> 
         })
         .filter(|interest| !interest.embedding.is_empty())
         .collect();
+    refresh_generic_interest_labels(workspace_dir, &mut active_interests)?;
 
     let text_sources = collect_post_text_sources(workspace_dir)?;
     tracing::info!(
@@ -2357,13 +2360,12 @@ fn collect_post_text_sources_recursive(
     if !dir.exists() {
         return Ok(());
     }
-    for entry in std::fs::read_dir(dir)
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("Failed to read {}", dir.display()))?
-    {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
+        .filter_map(|entry| entry.ok())
+        .collect();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
         let path = entry.path();
         let meta = match entry.metadata() {
             Ok(meta) => meta,
@@ -2410,18 +2412,81 @@ fn is_post_text_file(path: &Path) -> bool {
     )
 }
 
+fn label_looks_auto_generated(label: &str) -> bool {
+    let normalized = normalize_label_for_quality_checks(label);
+    if normalized.is_empty() {
+        return true;
+    }
+
+    if normalized.chars().all(|ch| ch.is_ascii_digit() || ch.is_ascii_whitespace()) {
+        return true;
+    }
+
+    let generic_patterns = [
+        "journal entry",
+        "insight ",
+        "workspace interest",
+        "untitled",
+        "note ",
+        "notes ",
+        "entry ",
+    ];
+    if generic_patterns
+        .iter()
+        .any(|pattern| normalized.starts_with(pattern) || normalized == *pattern)
+    {
+        return true;
+    }
+
+    let digit_count = normalized.chars().filter(|ch| ch.is_ascii_digit()).count();
+    digit_count >= 6
+}
+
+fn normalize_label_for_quality_checks(label: &str) -> String {
+    label
+        .trim()
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn is_meaningful_label_candidate(candidate: &str) -> bool {
+    let trimmed = candidate.trim().trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
+    if trimmed.len() < 8 {
+        return false;
+    }
+    if label_looks_auto_generated(trimmed) {
+        return false;
+    }
+    let alpha_count = trimmed.chars().filter(|ch| ch.is_alphabetic()).count();
+    alpha_count >= 5
+}
+
+fn cleaned_line_for_label(line: &str) -> String {
+    line.trim()
+        .trim_start_matches('#')
+        .trim_start_matches('-')
+        .trim_start_matches('*')
+        .trim()
+        .trim_matches('|')
+        .trim()
+        .to_string()
+}
+
 fn derive_interest_label(default_title: &str, content: &str) -> String {
-    // Prefer the first non-empty content heading/line as the label,
-    // since filenames (especially old ones) are often non-descriptive.
-    // Only fall back to the filename title if content has no useful heading.
     for line in content.lines() {
-        let trimmed = line.trim().trim_start_matches('#').trim();
-        if !trimmed.is_empty() && trimmed.len() >= 5 {
-            return truncate_with_ellipsis(trimmed, 80);
+        let cleaned = cleaned_line_for_label(line);
+        if is_meaningful_label_candidate(&cleaned) {
+            return truncate_with_ellipsis(cleaned.trim(), 80);
         }
     }
     let normalized_title = default_title.trim();
-    if !normalized_title.is_empty() && !normalized_title.eq_ignore_ascii_case("untitled") {
+    if !normalized_title.is_empty()
+        && !normalized_title.eq_ignore_ascii_case("untitled")
+        && !label_looks_auto_generated(normalized_title)
+    {
         return truncate_with_ellipsis(normalized_title, 80);
     }
     "Workspace interest".to_string()
@@ -2437,7 +2502,9 @@ fn stage1_stopwords() -> &'static HashSet<&'static str> {
             "those", "through", "very", "what", "when", "where", "which", "with", "would",
             "your", "ours", "ourselves", "the", "and", "for", "are", "was", "were", "you",
             "has", "had", "but", "not", "too", "out", "off", "its", "why", "how", "who",
-            "insight", "post", "notes", "note", "journal", "entry", "entries",
+            "insight", "post", "notes", "note", "journal", "entry", "entries", "work", "thing",
+            "things", "stuff", "really", "just", "dont", "didnt", "doesnt", "cant", "wont",
+            "ive", "im", "youre", "thats", "maybe", "also", "still",
         ])
     })
 }
@@ -2502,8 +2569,12 @@ fn broaden_stage1_keyword(term: &str) -> &'static [&'static str] {
 
 fn score_terms_from_text(raw: &str, weight: f32, scores: &mut HashMap<String, f32>) {
     let stopwords = stage1_stopwords();
-    for term in tokenize_terms(raw) {
+    let cleaned = sanitize_text_for_keyword_extraction(raw);
+    for term in tokenize_terms(&cleaned) {
         if term.len() < 3 || stopwords.contains(term.as_str()) {
+            continue;
+        }
+        if !term.chars().any(|ch| ch.is_alphabetic()) {
             continue;
         }
         let stemmed = stem_term(&term);
@@ -2517,6 +2588,7 @@ fn score_terms_from_text(raw: &str, weight: f32, scores: &mut HashMap<String, f3
             *scores.entry((*broadened).to_string()).or_insert(0.0) += weight * 0.6;
         }
     }
+    score_phrases_from_text(&cleaned, weight, scores);
 }
 
 fn derive_interest_keywords(label: &str, content: &str) -> Vec<String> {
@@ -2536,8 +2608,7 @@ fn derive_interest_keywords(label: &str, content: &str) -> Vec<String> {
             }
         }
     }
-    // Use more content (1200 chars) to extract better keywords from the body
-    score_terms_from_text(&truncate_with_ellipsis(content.trim(), 1_200), 1.0, &mut scores);
+    score_terms_from_text(&truncate_with_ellipsis(content.trim(), 1_600), 1.0, &mut scores);
 
     let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
     ranked.sort_by(|left, right| {
@@ -2549,9 +2620,100 @@ fn derive_interest_keywords(label: &str, content: &str) -> Vec<String> {
     });
     ranked
         .into_iter()
+        .filter(|(term, _)| keyword_is_meaningful(term))
         .map(|(term, _)| term)
         .take(STAGE1_KEYWORDS_PER_INTEREST_LIMIT)
         .collect()
+}
+
+fn sanitize_text_for_keyword_extraction(raw: &str) -> String {
+    raw.lines()
+        .map(|line| {
+            line.trim()
+                .replace("http://", " ")
+                .replace("https://", " ")
+                .replace("www.", " ")
+                .replace("```", " ")
+                .replace('`', " ")
+                .replace('|', " ")
+        })
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.chars().all(|ch| ch == '-' || ch == '_' || ch == '=' || ch == '*')
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn score_phrases_from_text(raw: &str, weight: f32, scores: &mut HashMap<String, f32>) {
+    let stopwords = stage1_stopwords();
+    let tokens: Vec<String> = tokenize_terms(raw)
+        .into_iter()
+        .filter(|term| !stopwords.contains(term.as_str()))
+        .filter(|term| term.chars().any(|ch| ch.is_alphabetic()))
+        .collect();
+    for window_size in [2usize, 3usize] {
+        for window in tokens.windows(window_size) {
+            if window.iter().any(|term| label_looks_auto_generated(term)) {
+                continue;
+            }
+            let phrase = window.join(" ");
+            if keyword_is_meaningful(&phrase) {
+                *scores.entry(phrase).or_insert(0.0) += weight * if window_size == 2 { 1.35 } else { 1.6 };
+            }
+        }
+    }
+}
+
+fn keyword_is_meaningful(term: &str) -> bool {
+    let trimmed = term.trim();
+    if trimmed.len() < 3 || label_looks_auto_generated(trimmed) {
+        return false;
+    }
+    if trimmed.chars().filter(|ch| ch.is_ascii_digit()).count() >= 4 {
+        return false;
+    }
+    let stopwords = stage1_stopwords();
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+    if parts.len() == 1 {
+        let token = parts[0];
+        return token.chars().any(|ch| ch.is_alphabetic()) && !stopwords.contains(token);
+    }
+    parts.iter().all(|part| {
+        part.chars().any(|ch| ch.is_alphabetic()) && !stopwords.contains(*part)
+    })
+}
+
+fn refresh_generic_interest_labels(
+    workspace_dir: &Path,
+    active_interests: &mut [ActiveInterest],
+) -> Result<()> {
+    for interest in active_interests.iter_mut() {
+        if !label_looks_auto_generated(&interest.record.label) {
+            continue;
+        }
+        let source_text = load_interest_source_text(workspace_dir, &interest.record.source_path);
+        if source_text.trim().is_empty() {
+            continue;
+        }
+        let next_label = derive_interest_label(&interest.record.label, &source_text);
+        if next_label == interest.record.label || label_looks_auto_generated(&next_label) {
+            continue;
+        }
+        if local_store::update_feed_interest_label(
+            workspace_dir,
+            &interest.record.id,
+            &next_label,
+            &vec_to_bytes(&interest.embedding),
+        )? {
+            interest.record.label = next_label;
+        }
+    }
+    Ok(())
 }
 
 fn load_interest_source_text(workspace_dir: &Path, source_path: &str) -> String {
@@ -5110,6 +5272,39 @@ mod tests {
                 "wss://nos.lol".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn derive_interest_label_prefers_meaningful_content_over_generated_filename() {
+        let label = derive_interest_label(
+            "103944 Journal entry",
+            "Super duper intelligence sitting in the cloud computing centers.\nThere is a lot of work we dont want to do",
+        );
+        assert_eq!(
+            label,
+            "Super duper intelligence sitting in the cloud computing centers."
+        );
+    }
+
+    #[test]
+    fn derive_interest_keywords_prefers_content_phrases_over_filename_artifacts() {
+        let keywords = derive_interest_keywords(
+            "insight 20260314 03",
+            "A strong AI workflow does most of the production in the background and returns only the minimal questions that need human judgment.",
+        );
+        assert!(keywords.iter().any(|term| term.contains("workflow")));
+        assert!(keywords.iter().any(|term| term.contains("human judgment") || term.contains("judgment")));
+        assert!(!keywords.iter().any(|term| term.contains("20260314")));
+        assert!(!keywords.iter().any(|term| term == "insight"));
+    }
+
+    #[test]
+    fn label_looks_auto_generated_flags_timestamp_and_insight_patterns() {
+        assert!(label_looks_auto_generated("103944 Journal entry"));
+        assert!(label_looks_auto_generated("insight 20260314 03"));
+        assert!(!label_looks_auto_generated(
+            "A strong AI workflow does most of the production in the background"
+        ));
     }
 
     #[test]

@@ -280,6 +280,28 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Introduce new shared abstractions only after repeated use (rule-of-three), with at least one real caller in current scope.
 - For config/schema changes, treat keys as public contract: document defaults, compatibility impact, and migration/rollback path.
 
+### 6.5 Evidence-Driven Execution (Required)
+
+Agents must default to an evidence-first execution loop for any non-trivial task, bug, integration issue, provider issue, or runtime failure.
+
+- Reproduce first when feasible:
+  - Before editing, run the smallest realistic check that exercises the reported behavior.
+  - Prefer real repro over speculation when the issue touches providers, auth, persistence, gateway flows, synthesis, tools, or user-facing runtime behavior.
+- Use the repro to choose scope:
+  - Base the patch on the observed failure mode, not on guessed root causes.
+  - Keep the first patch minimal and targeted to the reproduced break.
+- Re-run the same path after the change:
+  - After implementing, repeat the original repro or the closest practical end-to-end path.
+  - Do not stop at compile-only validation when the task is about runtime behavior.
+- Validate the user-facing path, not only internals:
+  - If the fix changes app behavior, test through the actual entrypoint when practical (CLI command, gateway route, UI-triggered flow, persisted config, stored credentials, workspace artifacts, etc.).
+  - For provider or auth issues, prefer a real credentialed smoke test when safe and available; never print or persist secrets in logs, fixtures, or docs.
+- Convert learnings into the product:
+  - If testing reveals a stale assumption, missing fallback, poor timeout, bad persistence path, or missing error surface, fix the app/runtime so the next run works without operator babysitting.
+  - Prefer automatic recovery, compatibility shims, and clearer persisted errors over “manual workaround only” answers.
+- Document evidence in the handoff:
+  - State what was reproduced, what changed because of that evidence, what was re-tested after the patch, and any remaining gaps.
+
 ## 7) Change Playbooks
 
 ### 7.1 Adding a Provider
@@ -354,6 +376,10 @@ Additional expectations by change type:
     - if touching bootstrap docs/scripts, run `bash -n bootstrap.sh scripts/bootstrap.sh scripts/install.sh`
 - **Workflow changes**: validate YAML syntax; run workflow lint/sanity checks when available.
 - **Security/runtime/gateway/tools**: include at least one boundary/failure-mode validation.
+- **Bug fixes / provider fixes / runtime fixes**:
+    - include one pre-fix reproduction or equivalent observed failure signal when feasible
+    - include one post-fix validation of the same path, preferably end-to-end
+    - if the issue involves persistence, auth, gateway orchestration, or workspace outputs, verify those artifacts directly rather than relying only on in-memory success
 
 If full checks are impractical, run the most relevant subset and document what was skipped and why.
 
@@ -486,9 +512,10 @@ When handing off work, include:
 1. What changed
 2. What did not change
 3. Validation run and results
-4. Vision requirements affected or intentionally unchanged
-5. Remaining risks / unknowns
-6. Next recommended action
+4. What was reproduced before the fix and what was re-tested after the fix
+5. Vision requirements affected or intentionally unchanged
+6. Remaining risks / unknowns
+7. Next recommended action
 
 ## 12) Vibe Coding Guardrails
 

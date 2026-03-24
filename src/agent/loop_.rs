@@ -334,6 +334,9 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
         let tool_call_id = parse_tool_call_id(value, Some(function));
         let name = function
             .get("name")
+            .or_else(|| function.get("tool"))
+            .or_else(|| function.get("tool_name"))
+            .or_else(|| function.get("function_name"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim()
@@ -342,7 +345,9 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
             let arguments = parse_arguments_value(
                 function
                     .get("arguments")
-                    .or_else(|| function.get("parameters")),
+                    .or_else(|| function.get("parameters"))
+                    .or_else(|| function.get("args"))
+                    .or_else(|| function.get("input")),
             );
             return Some(ParsedToolCall {
                 name,
@@ -355,6 +360,9 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     let tool_call_id = parse_tool_call_id(value, None);
     let name = value
         .get("name")
+        .or_else(|| value.get("tool"))
+        .or_else(|| value.get("tool_name"))
+        .or_else(|| value.get("function_name"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
@@ -364,8 +372,13 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
         return None;
     }
 
-    let arguments =
-        parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
+    let arguments = parse_arguments_value(
+        value
+            .get("arguments")
+            .or_else(|| value.get("parameters"))
+            .or_else(|| value.get("args"))
+            .or_else(|| value.get("input")),
+    );
     Some(ParsedToolCall {
         name,
         arguments,
@@ -2053,7 +2066,8 @@ pub(crate) async fn run_tool_call_loop(
         .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
         .map(|tool| tool.spec())
         .collect();
-    let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+    let use_native_tools =
+        should_use_native_tools(provider, provider_name, model, tool_specs.as_slice());
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -2646,6 +2660,31 @@ pub(crate) async fn run_tool_call_loop(
     anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
 }
 
+fn should_use_native_tools(
+    provider: &dyn Provider,
+    provider_name: &str,
+    model: &str,
+    tool_specs: &[crate::tools::ToolSpec],
+) -> bool {
+    if !provider.supports_native_tools() || tool_specs.is_empty() {
+        return false;
+    }
+
+    // OpenRouter free routes can fan out to heterogeneous backend models.
+    // Some of those providers reject native function-calling payloads even
+    // though the OpenRouter adapter supports them generally, so fall back to
+    // prompt-based tool calls for `openrouter/free` and explicit `:free`
+    // model variants.
+    if provider_name.eq_ignore_ascii_case("openrouter") {
+        let normalized_model = model.trim().to_ascii_lowercase();
+        if normalized_model == "openrouter/free" || normalized_model.ends_with(":free") {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
 pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
@@ -3169,6 +3208,42 @@ mod tests {
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
     }
+
+    #[test]
+    fn should_disable_native_tools_for_openrouter_free_models() {
+        let provider = MockProvider {
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            },
+            ..Default::default()
+        };
+        let tool_specs = vec![crate::tools::ToolSpec {
+            name: "file_write".to_string(),
+            description: "Write a file".to_string(),
+            parameters: serde_json::json!({}),
+        }];
+
+        assert!(!should_use_native_tools(
+            &provider,
+            "openrouter",
+            "openrouter/free",
+            &tool_specs
+        ));
+        assert!(!should_use_native_tools(
+            &provider,
+            "openrouter",
+            "google/gemini-2.5-flash:free",
+            &tool_specs
+        ));
+        assert!(should_use_native_tools(
+            &provider,
+            "openrouter",
+            "anthropic/claude-sonnet-4.6",
+            &tool_specs
+        ));
+    }
+
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::traits::ProviderCapabilities;
@@ -4719,11 +4794,41 @@ Done."#;
     }
 
     #[test]
+    fn parse_tool_call_value_accepts_top_level_tool_and_args_aliases() {
+        let value = serde_json::json!({
+            "tool": "shell",
+            "args": {"command": "pwd"}
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(
+            result.arguments.get("command").and_then(|v| v.as_str()),
+            Some("pwd")
+        );
+    }
+
+    #[test]
     fn parse_tool_call_value_accepts_function_parameters_alias() {
         let value = serde_json::json!({
             "function": {
                 "name": "shell",
                 "parameters": {"command": "date"}
+            }
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(
+            result.arguments.get("command").and_then(|v| v.as_str()),
+            Some("date")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_accepts_function_tool_name_and_args_aliases() {
+        let value = serde_json::json!({
+            "function": {
+                "tool_name": "shell",
+                "args": {"command": "date"}
             }
         });
         let result = parse_tool_call_value(&value).expect("tool call should parse");

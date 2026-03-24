@@ -146,9 +146,19 @@ struct NativeResponseMessage {
 }
 
 impl OpenRouterProvider {
+    const DEPRECATED_FREE_MODEL_IDS: [&str; 1] = ["google/gemini-2.5-flash:free"];
+
     pub fn new(credential: Option<&str>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
+        }
+    }
+
+    fn normalize_model_name(model: &str) -> &str {
+        if Self::DEPRECATED_FREE_MODEL_IDS.contains(&model) {
+            "openrouter/free"
+        } else {
+            model
         }
     }
 
@@ -348,7 +358,7 @@ impl Provider for OpenRouterProvider {
         });
 
         let request = ChatRequest {
-            model: model.to_string(),
+            model: Self::normalize_model_name(model).to_string(),
             messages,
             temperature,
         };
@@ -398,7 +408,7 @@ impl Provider for OpenRouterProvider {
             .collect();
 
         let request = ChatRequest {
-            model: model.to_string(),
+            model: Self::normalize_model_name(model).to_string(),
             messages: api_messages,
             temperature,
         };
@@ -444,7 +454,7 @@ impl Provider for OpenRouterProvider {
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
-            model: model.to_string(),
+            model: Self::normalize_model_name(model).to_string(),
             messages: Self::convert_messages(request.messages),
             temperature,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
@@ -538,7 +548,7 @@ impl Provider for OpenRouterProvider {
         let native_messages = Self::convert_messages(messages);
 
         let native_request = NativeChatRequest {
-            model: model.to_string(),
+            model: Self::normalize_model_name(model).to_string(),
             messages: native_messages,
             temperature,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
@@ -605,6 +615,18 @@ mod tests {
     fn creates_without_key() {
         let provider = OpenRouterProvider::new(None);
         assert!(provider.credential.is_none());
+    }
+
+    #[test]
+    fn normalizes_deprecated_free_model_id() {
+        assert_eq!(
+            OpenRouterProvider::normalize_model_name("google/gemini-2.5-flash:free"),
+            "openrouter/free"
+        );
+        assert_eq!(
+            OpenRouterProvider::normalize_model_name("openrouter/free"),
+            "openrouter/free"
+        );
     }
 
     #[tokio::test]

@@ -61,6 +61,7 @@ import type {
   AnthropicTokenStatus,
   BlueskyCredentials,
   ClawChatMessage,
+  DesktopGatewayInfo,
   GatewayQrPayload,
   LibraryItem,
   OpenAiDeviceCodeStatus,
@@ -143,6 +144,7 @@ const UI_TAB_STORAGE_KEY = "slowclaw.ui.tab";
 
 const DESKTOP_SECRET_SERVICE = "social.slowclaw.gateway";
 const PROVIDER_API_KEY_SECRET_ACCOUNT = "provider.api_key";
+const OPENROUTER_API_KEY_SECRET_ACCOUNT = "openrouter.api_key";
 const DEFAULT_RECORDING_HINT = "Ready to add a journal note, audio, or video.";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
@@ -494,6 +496,35 @@ function defaultGatewayBaseUrl() {
 function normalizeGatewayToken(value: string) {
   const token = value.trim();
   return token === "desktop-local" ? "" : token;
+}
+
+function normalizeProviderId(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+  const lowered = trimmed.toLowerCase();
+  if (lowered.startsWith("custom:") || lowered.startsWith("anthropic-custom:")) {
+    return trimmed;
+  }
+  switch (lowered) {
+    case "openai_codex":
+    case "codex":
+    case "openai-codex":
+      return "openai-codex";
+    case "google":
+    case "google-gemini":
+    case "gemini":
+      return "gemini";
+    case "grok":
+    case "xai":
+      return "xai";
+    case "together":
+    case "together-ai":
+      return "together-ai";
+    default:
+      return lowered;
+  }
 }
 
 function isMissingDesktopCommand(error: unknown, commandName?: string) {
@@ -1182,9 +1213,8 @@ function App() {
         const secureGatewayToken = await loadGatewayTokenSecure();
         if (secureGatewayToken) {
           setChatGatewayToken(secureGatewayToken);
-        } else {
-          await syncDesktopGatewayBootstrap();
         }
+        await syncDesktopGatewayBootstrap();
         const secureSyncPeerUrl = await loadSyncPeerUrlSecure();
         const secureSyncPeerToken = await loadSyncPeerTokenSecure();
         if (secureSyncPeerUrl) {
@@ -1196,9 +1226,36 @@ function App() {
         const apiKeySecret = await invokeDesktopCommand<{ value: string | null }>("get_secret", {
           req: { service: DESKTOP_SECRET_SERVICE, account: PROVIDER_API_KEY_SECRET_ACCOUNT }
         });
-        if (apiKeySecret?.value) {
-          setProviderApiKey(apiKeySecret.value);
+        const openrouterKeySecret = await invokeDesktopCommand<{ value: string | null }>("get_secret", {
+          req: { service: DESKTOP_SECRET_SERVICE, account: OPENROUTER_API_KEY_SECRET_ACCOUNT }
+        });
+        let openrouterKey = String(openrouterKeySecret?.value || "").trim();
+        const genericProviderKey = String(apiKeySecret?.value || "").trim();
+        if (!openrouterKey && genericProviderKey.startsWith("sk-or-")) {
+          await invokeDesktopCommandStrict("set_secret", {
+            req: {
+              service: DESKTOP_SECRET_SERVICE,
+              account: OPENROUTER_API_KEY_SECRET_ACCOUNT,
+              value: genericProviderKey,
+            },
+          });
+          await invokeDesktopCommandStrict("delete_secret", {
+            req: {
+              service: DESKTOP_SECRET_SERVICE,
+              account: PROVIDER_API_KEY_SECRET_ACCOUNT,
+            },
+          });
+          openrouterKey = genericProviderKey;
+        }
+        if (genericProviderKey && !genericProviderKey.startsWith("sk-or-")) {
+          setProviderApiKey(genericProviderKey);
           setProviderApiKeyStatus("Loaded saved API key");
+        } else {
+          setProviderApiKey("");
+          setProviderApiKeyStatus("");
+        }
+        if (openrouterKey) {
+          setOpenrouterOAuthStatus("Loaded saved OpenRouter API key.");
         }
       }
       if (!cancelled) {
@@ -4799,6 +4856,10 @@ function App() {
       return null;
     }
     try {
+      const info = await invokeDesktopCommandStrict<DesktopGatewayInfo>("get_embedded_gateway_info");
+      if (!info.running) {
+        await restartGatewayDaemonFromDesktop();
+      }
       const payload = await invokeDesktopCommandStrict<DesktopGatewayBootstrap>(
         "get_desktop_gateway_bootstrap"
       );
@@ -4956,8 +5017,28 @@ function App() {
 
   async function saveOptionalProviderApiKey() {
     const trimmed = providerApiKey.trim();
+    const normalizedProvider = normalizeProviderId(settingsProvider);
     setProviderApiKeyStatus(trimmed ? "Saving API key..." : "Clearing API key...");
     try {
+      if (isDesktopClient) {
+        if (trimmed) {
+          await invokeDesktopCommandStrict("set_secret", {
+            req: {
+              service: DESKTOP_SECRET_SERVICE,
+              account: PROVIDER_API_KEY_SECRET_ACCOUNT,
+              value: trimmed,
+            },
+          });
+        } else {
+          await invokeDesktopCommandStrict("delete_secret", {
+            req: {
+              service: DESKTOP_SECRET_SERVICE,
+              account: PROVIDER_API_KEY_SECRET_ACCOUNT,
+            },
+          });
+        }
+      }
+
       let token = normalizeGatewayToken(chatGatewayToken);
       if (!token && isDesktopClient) {
         token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
@@ -4966,7 +5047,7 @@ function App() {
       // Send API key via HTTP so the running gateway sees it immediately
       await updateRuntimeConfig(
         {
-          defaultProvider: settingsProvider,
+          defaultProvider: normalizedProvider,
           defaultModel: settingsModel,
           transcriptionEnabled: settingsTranscriptionEnabled,
           transcriptionModel: settingsTranscriptionModel || "",
@@ -4980,18 +5061,13 @@ function App() {
       await refreshWorkspaceSynthAfterProviderSetup();
 
       if (isDesktopClient) {
-        // Persist to OS keyring and restart gateway
-        invokeDesktopCommandStrict("set_provider_api_key", {
-          value: trimmed
-        }).catch((err: unknown) => {
-          console.warn("Desktop keyring save failed:", err);
-        });
+        await restartGatewayDaemonFromDesktop();
       }
 
       setProviderApiKeyStatus(
         trimmed
-          ? "API key saved. Gateway restarted."
-          : "API key cleared. Gateway restarted."
+          ? "API key saved."
+          : "API key cleared."
       );
     } catch (error) {
       setProviderApiKeyStatus(
@@ -5030,9 +5106,9 @@ function App() {
           if (status.status === "complete") {
             setOpenrouterOAuthStatus("OpenRouter connected! AI is ready with a free model.");
             setSettingsProvider("openrouter");
-            setSettingsModel("google/gemini-2.5-flash:free");
+            setSettingsModel("openrouter/free");
             window.localStorage.setItem(CHAT_PROVIDER_STORAGE_KEY, "openrouter");
-            window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, "google/gemini-2.5-flash:free");
+            window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, "openrouter/free");
             await refreshWorkspaceSynthAfterProviderSetup();
             setOpenrouterOAuthBusy(false);
             return;
@@ -5076,45 +5152,55 @@ function App() {
     setOpenrouterOAuthStatus("Saving API key...");
 
     try {
+      if (isDesktopClient) {
+        await invokeDesktopCommandStrict("set_secret", {
+          req: {
+            service: DESKTOP_SECRET_SERVICE,
+            account: OPENROUTER_API_KEY_SECRET_ACCOUNT,
+            value: trimmed,
+          },
+        });
+        const existingGenericSecret = await invokeDesktopCommand<{ value: string | null }>("get_secret", {
+          req: { service: DESKTOP_SECRET_SERVICE, account: PROVIDER_API_KEY_SECRET_ACCOUNT }
+        });
+        if (String(existingGenericSecret?.value || "").trim().startsWith("sk-or-")) {
+          await invokeDesktopCommandStrict("delete_secret", {
+            req: {
+              service: DESKTOP_SECRET_SERVICE,
+              account: PROVIDER_API_KEY_SECRET_ACCOUNT,
+            },
+          });
+        }
+      }
+
       let token = normalizeGatewayToken(chatGatewayToken);
       if (!token && isDesktopClient) {
         token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
       }
 
-      // Save via runtime config update — set provider, model, and API key
       await updateRuntimeConfig(
         {
           defaultProvider: "openrouter",
-          defaultModel: "google/gemini-2.5-flash:free",
+          defaultModel: "openrouter/free",
           transcriptionEnabled: settingsTranscriptionEnabled,
           transcriptionModel: settingsTranscriptionModel || "",
           availableTranscriptionModels: settingsAvailableTranscriptionModels,
-          apiKey: trimmed,
         },
         token || undefined,
         gatewayBaseUrl
       );
 
       setSettingsProvider("openrouter");
-      setSettingsModel("google/gemini-2.5-flash:free");
-      setProviderApiKey(trimmed);
-      setProviderApiKeyStatus("API key saved. Gateway restarted.");
+      setSettingsModel("openrouter/free");
+      setProviderApiKey("");
+      setProviderApiKeyStatus("");
       window.localStorage.setItem(CHAT_PROVIDER_STORAGE_KEY, "openrouter");
-      window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, "google/gemini-2.5-flash:free");
+      window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, "openrouter/free");
       setOpenrouterApiKeyInput("");
-      // Refresh synth status before desktop gateway restart so the
-      // readiness check sees the api_key already in the running gateway.
-      await refreshWorkspaceSynthAfterProviderSetup();
-
       if (isDesktopClient) {
-        // Persist to OS keyring and restart gateway for long-term storage.
-        // This runs after the synth refresh so the UI updates immediately.
-        invokeDesktopCommandStrict("set_provider_api_key", {
-          value: trimmed
-        }).catch((err: unknown) => {
-          console.warn("Desktop keyring save failed:", err);
-        });
+        await restartGatewayDaemonFromDesktop();
       }
+      await refreshWorkspaceSynthAfterProviderSetup();
 
       setOpenrouterOAuthStatus("API key saved! AI is ready with a free model.");
       setOpenrouterOAuthBusy(false);
@@ -5157,9 +5243,9 @@ function App() {
       setSettingsConfigStatus("Loading local config...");
       try {
         const cfg = await getConfig();
-        const savedProvider = window.localStorage.getItem(CHAT_PROVIDER_STORAGE_KEY);
+        const savedProvider = normalizeProviderId(window.localStorage.getItem(CHAT_PROVIDER_STORAGE_KEY) || "");
         const savedModel = window.localStorage.getItem(CHAT_MODEL_STORAGE_KEY);
-        setSettingsProvider((savedProvider && savedProvider.trim()) || "ollama");
+        setSettingsProvider(savedProvider || "ollama");
         setSettingsModel((savedModel && savedModel.trim()) || cfg.ollamaModel || "");
         setSettingsTranscriptionEnabled(Boolean(cfg.transcriptionEnabled));
         setSettingsTranscriptionModel(cfg.ollamaModel || "");
@@ -5211,7 +5297,7 @@ function App() {
       const cfg = await getRuntimeConfig(token || undefined, gatewayBaseUrl);
       setRuntimeMediaCapabilities(cfg.mediaCapabilities || null);
       setRuntimeMediaSummary(cfg.mediaSummary || "");
-      setSettingsProvider(cfg.defaultProvider || "");
+      setSettingsProvider(normalizeProviderId(cfg.defaultProvider || ""));
       setSettingsModel(cfg.defaultModel || "");
       setSettingsTranscriptionEnabled(Boolean(cfg.transcriptionEnabled));
       const currentTranscriptionModel = cfg.transcriptionModel || "";
@@ -5237,7 +5323,7 @@ function App() {
   }
 
   async function saveRuntimeConfigFromSettings() {
-    const provider = settingsProvider.trim();
+    const provider = normalizeProviderId(settingsProvider);
     const model = settingsModel.trim();
     if (!provider || !model) {
       setSettingsConfigStatus("Provider and model are required.");
@@ -5266,12 +5352,7 @@ function App() {
           window.localStorage.setItem(CHAT_PROVIDER_STORAGE_KEY, provider);
           window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, model);
           setSettingsConfigLoaded(true);
-          if (provider !== "ollama") {
-            setSettingsConfigStatus("Saved local config. Note: desktop local chat currently uses Ollama.");
-          } else {
-            setSettingsConfigStatus("Config saved (local).");
-          }
-          return;
+          setSettingsConfigStatus("Saved local desktop config. Applying runtime config...");
         } catch (localError) {
           const missingGet = isMissingDesktopCommand(localError, "get_config");
           const missingSave = isMissingDesktopCommand(localError, "save_config");
@@ -5280,7 +5361,8 @@ function App() {
           }
           setSettingsConfigStatus("Local config command unavailable, saving via gateway...");
         }
-      } else if (!token) {
+      }
+      if (!token) {
         setSettingsConfigStatus("Save blocked (gateway token missing).");
         return;
       }

@@ -13,6 +13,7 @@ use tauri::Manager;
 const EMBEDDED_GATEWAY_URL: &str = "http://127.0.0.1:42617";
 const PROVIDER_SECRET_SERVICE: &str = "social.slowclaw.gateway";
 const PROVIDER_API_KEY_SECRET_ACCOUNT: &str = "provider.api_key";
+const OPENROUTER_API_KEY_SECRET_ACCOUNT: &str = "openrouter.api_key";
 const DESKTOP_GATEWAY_TOKEN_SECRET_ACCOUNT: &str = "desktop.gateway.token";
 const OPENAI_DEVICE_LOGIN_PROVIDER: &str = "openai-codex";
 const OPENAI_DEVICE_LOGIN_PROFILE: &str = "default";
@@ -198,6 +199,27 @@ fn provider_api_key_from_keyring() -> Result<Option<String>, String> {
     read_keyring_secret(PROVIDER_SECRET_SERVICE, PROVIDER_API_KEY_SECRET_ACCOUNT)
 }
 
+fn normalize_provider_id(provider: &str) -> String {
+    let trimmed = provider.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    match lowered.as_str() {
+        "openai_codex" | "codex" => "openai-codex".to_string(),
+        _ => lowered,
+    }
+}
+
+fn provider_api_key_from_keyring_for_provider(provider: &str) -> Result<Option<String>, String> {
+    let normalized = normalize_provider_id(provider);
+    if normalized == "openrouter" {
+        if let Some(key) =
+            read_keyring_secret(PROVIDER_SECRET_SERVICE, OPENROUTER_API_KEY_SECRET_ACCOUNT)?
+        {
+            return Ok(Some(key));
+        }
+    }
+    provider_api_key_from_keyring()
+}
+
 fn discover_lan_ipv4() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
@@ -311,12 +333,22 @@ async fn restart_embedded_gateway(
     config.gateway.require_pairing = false;
     config.gateway.allow_public_bind = bind_host != "127.0.0.1";
 
-    let key_from_keyring = provider_api_key_from_keyring()?;
+    let normalized_provider = normalize_provider_id(config.default_provider.as_deref().unwrap_or(""));
+    let key_from_keyring = provider_api_key_from_keyring_for_provider(
+        config.default_provider.as_deref().unwrap_or(""),
+    )?;
     if let Some(key) = key_from_keyring {
-        if let Err(err) = clear_matching_provider_api_key_from_config(&key).await {
-            eprintln!("provider api key migration failed: {err}");
-        }
+        // Prefer keyring key over config key, but do NOT clear the config
+        // value — it serves as a fallback if keyring access fails later.
         config.api_key = Some(key);
+    } else if normalized_provider != "openrouter"
+        && config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| value.starts_with("sk-or-"))
+    {
+        config.api_key = None;
     }
     let provider_api_key_set = config
         .api_key

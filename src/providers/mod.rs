@@ -910,6 +910,15 @@ fn parse_custom_provider_url(
     }
 }
 
+fn normalized_provider_name(name: &str) -> String {
+    let trimmed = name.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.starts_with("custom:") || lowered.starts_with("anthropic-custom:") {
+        return trimmed.to_string();
+    }
+    lowered
+}
+
 /// Factory: create the right provider from config (without custom URL)
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
     create_provider_with_options(name, api_key, &ProviderRuntimeOptions::default())
@@ -921,7 +930,8 @@ pub fn create_provider_with_options(
     api_key: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    match name {
+    let normalized_name = normalized_provider_name(name);
+    match normalized_name.as_str() {
         "openai-codex" | "openai_codex" | "codex" => Ok(Box::new(
             openai_codex::OpenAiCodexProvider::new(options, api_key)?,
         )),
@@ -946,7 +956,10 @@ fn create_provider_with_url_and_options(
     api_url: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    let qwen_oauth_context = is_qwen_oauth_alias(name).then(|| resolve_qwen_oauth_context(api_key));
+    let normalized_name = normalized_provider_name(name);
+    let provider_name = normalized_name.as_str();
+    let qwen_oauth_context =
+        is_qwen_oauth_alias(provider_name).then(|| resolve_qwen_oauth_context(api_key));
 
     // Resolve credential and break static-analysis taint chain from the
     // `api_key` parameter so that downstream provider storage of the value
@@ -954,12 +967,12 @@ fn create_provider_with_url_and_options(
     let resolved_credential = if let Some(context) = qwen_oauth_context.as_ref() {
         context.credential.clone()
     } else {
-        resolve_provider_credential(name, api_key)
+        resolve_provider_credential(provider_name, api_key)
     }
     .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
-    match name {
+    match provider_name {
         "openai-codex" | "openai_codex" | "codex" => {
             let mut codex_options = options.clone();
             codex_options.provider_api_url = api_url
@@ -1259,7 +1272,8 @@ fn create_provider_with_url_and_options(
 /// with `custom:` or `anthropic-custom:` are left untouched because the colon
 /// is part of the URL scheme.
 fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
-    if s.starts_with("custom:") || s.starts_with("anthropic-custom:") {
+    let lowered = s.to_ascii_lowercase();
+    if lowered.starts_with("custom:") || lowered.starts_with("anthropic-custom:") {
         return (s, None);
     }
     match s.split_once(':') {

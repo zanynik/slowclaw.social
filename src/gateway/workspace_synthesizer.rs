@@ -3,6 +3,7 @@ use crate::gateway::local_store;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use schemars::{schema_for, JsonSchema};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -1763,6 +1764,289 @@ pub fn reset_handoff_files(workspace_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn strip_json_markdown_fence(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("```") {
+        return None;
+    }
+
+    let first_newline = trimmed.find('\n')?;
+    let body = &trimmed[first_newline + 1..];
+    let closing = body.rfind("```")?;
+    Some(body[..closing].trim().to_string())
+}
+
+fn extract_json_values(raw: &str) -> Vec<serde_json::Value> {
+    let mut values = Vec::new();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return values;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        values.push(value);
+        return values;
+    }
+
+    let char_positions: Vec<(usize, char)> = trimmed.char_indices().collect();
+    let mut idx = 0;
+    while idx < char_positions.len() {
+        let (byte_idx, ch) = char_positions[idx];
+        if ch == '{' || ch == '[' {
+            let slice = &trimmed[byte_idx..];
+            let mut stream =
+                serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+            if let Some(Ok(value)) = stream.next() {
+                let consumed = stream.byte_offset();
+                if consumed > 0 {
+                    values.push(value);
+                    let next_byte = byte_idx + consumed;
+                    while idx < char_positions.len() && char_positions[idx].0 < next_byte {
+                        idx += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    values
+}
+
+fn parse_extractor_response_json(response_text: &str) -> Result<serde_json::Value> {
+    let trimmed = response_text.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("extractor response was empty");
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Ok(value);
+    }
+
+    if let Some(unfenced) = strip_json_markdown_fence(trimmed) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&unfenced) {
+            return Ok(value);
+        }
+        if let Some(value) = extract_json_values(&unfenced).into_iter().next() {
+            return Ok(value);
+        }
+    }
+
+    if let Some(value) = extract_json_values(trimmed).into_iter().next() {
+        return Ok(value);
+    }
+
+    anyhow::bail!("extractor response did not contain valid JSON")
+}
+
+fn parse_handoff_version(value: &serde_json::Value, artifact_label: &str) -> Result<String> {
+    let mut version = value
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("1")
+        .trim()
+        .to_string();
+    normalize_file_version(&mut version, artifact_label)?;
+    Ok(version)
+}
+
+fn parse_handoff_items<T>(value: &serde_json::Value, artifact_label: &str) -> Result<Vec<T>>
+where
+    T: DeserializeOwned,
+{
+    if value.is_array() {
+        return serde_json::from_value(value.clone())
+            .with_context(|| format!("invalid {artifact_label} item array"));
+    }
+
+    if let Some(items) = value.get("items") {
+        return serde_json::from_value(items.clone())
+            .with_context(|| format!("invalid {artifact_label} items payload"));
+    }
+
+    anyhow::bail!(
+        "extractor response for {artifact_label} must be a JSON object with `items` or a top-level array"
+    )
+}
+
+fn write_pretty_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(value)?;
+    fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+pub fn materialize_extractor_response(
+    workspace_dir: &Path,
+    workflow_key: &str,
+    response_text: &str,
+) -> Result<usize> {
+    let payload = parse_extractor_response_json(response_text)?;
+
+    match workflow_key.trim() {
+        WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY => {
+            let version = parse_handoff_version(&payload, "insight posts")?;
+            let items =
+                normalize_insight_post_items(parse_handoff_items(&payload, "insight posts")?)?;
+            let file = InsightPostFile {
+                version,
+                items: items.clone(),
+            };
+            write_pretty_json_file(&insight_posts_path(workspace_dir), &file)?;
+            Ok(items.len())
+        }
+        WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY => {
+            let version = parse_handoff_version(&payload, "todos")?;
+            let items = normalize_todo_items(parse_handoff_items(&payload, "todos")?)?;
+            let file = TodoFile {
+                version,
+                items: items.clone(),
+            };
+            write_pretty_json_file(&todos_path(workspace_dir), &file)?;
+            Ok(items.len())
+        }
+        WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY => {
+            let version = parse_handoff_version(&payload, "events")?;
+            let items = normalize_event_items(parse_handoff_items(&payload, "events")?)?;
+            let file = EventFile {
+                version,
+                items: items.clone(),
+            };
+            write_pretty_json_file(&events_path(workspace_dir), &file)?;
+            Ok(items.len())
+        }
+        WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => {
+            let version = parse_handoff_version(&payload, "clip plans")?;
+            let items = normalize_clip_plan_items(parse_handoff_items(&payload, "clip plans")?)?;
+            let file = ClipPlanFile {
+                version,
+                items: items.clone(),
+            };
+            write_pretty_json_file(&clip_plans_path(workspace_dir), &file)?;
+            Ok(items.len())
+        }
+        WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => {
+            let version = parse_handoff_version(&payload, "journal titles")?;
+            let items =
+                normalize_journal_title_items(parse_handoff_items(&payload, "journal titles")?)?;
+            let file = JournalTitleFile {
+                version,
+                items: items.clone(),
+            };
+            write_pretty_json_file(&journal_titles_path(workspace_dir), &file)?;
+            Ok(items.len())
+        }
+        WORKSPACE_ENTITY_EXTRACTOR_WORKFLOW_KEY => {
+            let version = parse_handoff_version(&payload, "entities")?;
+            let items = normalize_entity_items(parse_handoff_items(&payload, "entities")?)?;
+            let file = EntityFile {
+                version,
+                items: items.clone(),
+            };
+            write_pretty_json_file(&primitive_entities_path(workspace_dir), &file)?;
+            Ok(items.len())
+        }
+        WORKSPACE_PRIMITIVE_EVENT_EXTRACTOR_WORKFLOW_KEY => {
+            let version = parse_handoff_version(&payload, "primitive events")?;
+            let items =
+                normalize_primitive_event_items(parse_handoff_items(&payload, "primitive events")?)?;
+            let file = PrimitiveEventFile {
+                version,
+                items: items.clone(),
+            };
+            write_pretty_json_file(&primitive_events_path(workspace_dir), &file)?;
+            Ok(items.len())
+        }
+        WORKSPACE_ASSERTION_EXTRACTOR_WORKFLOW_KEY => {
+            let version = parse_handoff_version(&payload, "assertions")?;
+            let items = normalize_assertion_items(parse_handoff_items(&payload, "assertions")?)?;
+            let file = AssertionFile {
+                version,
+                items: items.clone(),
+            };
+            write_pretty_json_file(&primitive_assertions_path(workspace_dir), &file)?;
+            Ok(items.len())
+        }
+        WORKSPACE_ACTION_EXTRACTOR_WORKFLOW_KEY => {
+            let version = parse_handoff_version(&payload, "actions")?;
+            let items = normalize_action_items(parse_handoff_items(&payload, "actions")?)?;
+            let file = ActionFile {
+                version,
+                items: items.clone(),
+            };
+            write_pretty_json_file(&primitive_actions_path(workspace_dir), &file)?;
+            Ok(items.len())
+        }
+        WORKSPACE_SEGMENT_EXTRACTOR_WORKFLOW_KEY => {
+            let version = parse_handoff_version(&payload, "segments")?;
+            let items = normalize_segment_items(parse_handoff_items(&payload, "segments")?)?;
+            let file = SegmentFile {
+                version,
+                items: items.clone(),
+            };
+            write_pretty_json_file(&primitive_segments_path(workspace_dir), &file)?;
+            Ok(items.len())
+        }
+        other => anyhow::bail!("unsupported workspace synth extractor `{other}`"),
+    }
+}
+
+pub fn extractor_schema_json(workflow_key: &str) -> Result<String> {
+    match workflow_key.trim() {
+        WORKSPACE_ENTITY_EXTRACTOR_WORKFLOW_KEY => entities_schema_json(),
+        WORKSPACE_ACTION_EXTRACTOR_WORKFLOW_KEY => actions_schema_json(),
+        WORKSPACE_PRIMITIVE_EVENT_EXTRACTOR_WORKFLOW_KEY => primitive_events_schema_json(),
+        WORKSPACE_ASSERTION_EXTRACTOR_WORKFLOW_KEY => assertions_schema_json(),
+        WORKSPACE_SEGMENT_EXTRACTOR_WORKFLOW_KEY => segments_schema_json(),
+        WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY => insight_posts_schema_json(),
+        WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY => todos_schema_json(),
+        WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY => events_schema_json(),
+        WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => clip_plans_schema_json(),
+        WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => journal_titles_schema_json(),
+        other => anyhow::bail!("unknown workspace synthesizer extractor `{other}`"),
+    }
+}
+
+pub fn extractor_response_template_json(workflow_key: &str) -> Result<&'static str> {
+    match workflow_key.trim() {
+        WORKSPACE_ENTITY_EXTRACTOR_WORKFLOW_KEY => Ok(
+            r#"{"version":"1","items":[{"id":"optional-entity-id","kind":"person|project|org|date|amount","canonicalName":"...","aliases":["..."],"attributes":{},"provenance":{"sourcePath":"journals/text/...","sourceExcerpt":"..."}}]}"#,
+        ),
+        WORKSPACE_ACTION_EXTRACTOR_WORKFLOW_KEY => Ok(
+            r#"{"version":"1","items":[{"id":"optional-action-id","title":"...","details":"...","status":"open","priority":"medium","dueAt":"","owner":"","relatedEntities":[],"relatedAssertionIds":[],"provenance":{"sourcePath":"journals/text/...","sourceExcerpt":"..."}}]}"#,
+        ),
+        WORKSPACE_PRIMITIVE_EVENT_EXTRACTOR_WORKFLOW_KEY => Ok(
+            r#"{"version":"1","items":[{"id":"optional-primitive-event-id","title":"...","kind":"meeting|deadline|milestone|other","status":"confirmed","startAt":"","endAt":"","participants":[],"relatedEntities":[],"details":"...","provenance":{"sourcePath":"journals/text/...","sourceExcerpt":"..."}}]}"#,
+        ),
+        WORKSPACE_ASSERTION_EXTRACTOR_WORKFLOW_KEY => Ok(
+            r#"{"version":"1","items":[{"id":"optional-assertion-id","text":"...","kind":"belief|question|decision|claim","polarity":"positive|negative|neutral","status":"open","speaker":"","relatedEntities":[],"relatedEventIds":[],"provenance":{"sourcePath":"journals/text/...","sourceExcerpt":"..."}}]}"#,
+        ),
+        WORKSPACE_SEGMENT_EXTRACTOR_WORKFLOW_KEY => Ok(
+            r#"{"version":"1","items":[{"id":"optional-segment-id","label":"...","topic":"...","sourcePath":"journals/text/transcriptions/...","startAt":"","endAt":"","speaker":"","transcriptQuote":"...","purpose":"...","provenance":{"sourcePath":"journals/text/transcriptions/...","sourceExcerpt":"..."}}]}"#,
+        ),
+        WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY => Ok(
+            r#"{"version":"1","items":[{"id":"optional-insight-id","text":"...","sourcePath":"journals/text/...","sourceExcerpt":"..."}]}"#,
+        ),
+        WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY => Ok(
+            r#"{"version":"1","items":[{"id":"optional-todo-id","title":"...","details":"...","priority":"low|medium|high","status":"open","dueAt":"","sourcePath":"journals/text/...","sourceExcerpt":"..."}]}"#,
+        ),
+        WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY => Ok(
+            r#"{"version":"1","items":[{"id":"optional-event-id","title":"...","details":"...","location":"","status":"confirmed","startAt":"2026-03-22T09:00:00Z","endAt":"","allDay":false,"sourcePath":"journals/text/...","sourceExcerpt":"..."}]}"#,
+        ),
+        WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => Ok(
+            r#"{"version":"1","items":[{"id":"optional-clip-id","title":"...","sourcePath":"journals/text/transcriptions/...","sourceExcerpt":"...","transcriptQuote":"...","startAt":"00:00:01.000","endAt":"00:00:08.000","notes":"..."}]}"#,
+        ),
+        WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => Ok(
+            r#"{"version":"1","items":[{"sourcePath":"journals/text/...","title":"..."}]}"#,
+        ),
+        other => anyhow::bail!("unknown workspace synthesizer extractor `{other}`"),
+    }
 }
 
 pub fn reset_skill_outputs(
@@ -3857,6 +4141,66 @@ Do something useful.
 ";
 
         assert!(artifact_rules_from_markdown(markdown).is_empty());
+    }
+
+    #[test]
+    fn materialize_extractor_response_accepts_fenced_json_object() {
+        let tmp = tempdir().unwrap();
+        let response = r#"```json
+{
+  "version": "1",
+  "items": [
+    {
+      "text": "Capture the strongest lesson while the note is still fresh.",
+      "sourcePath": "journals/text/2026-03-21.md",
+      "sourceExcerpt": "Capture the strongest lesson while the note is still fresh."
+    }
+  ]
+}
+```"#;
+
+        let written = materialize_extractor_response(
+            tmp.path(),
+            WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY,
+            response,
+        )
+        .unwrap();
+
+        assert_eq!(written, 1);
+        let file = load_optional_insight_posts_file(tmp.path()).unwrap().unwrap();
+        assert_eq!(file.len(), 1);
+        assert_eq!(
+            file[0].source_path,
+            "journals/text/2026-03-21.md"
+        );
+    }
+
+    #[test]
+    fn materialize_extractor_response_accepts_array_payload() {
+        let tmp = tempdir().unwrap();
+        let response = r#"[
+  {
+    "title": "Send the follow-up note",
+    "details": "Share the synthesis test result with the team.",
+    "priority": "high",
+    "status": "open",
+    "dueAt": "2026-03-22",
+    "sourcePath": "journals/text/2026-03-21.md",
+    "sourceExcerpt": "Need to send the follow-up note tomorrow."
+  }
+]"#;
+
+        let written = materialize_extractor_response(
+            tmp.path(),
+            WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY,
+            response,
+        )
+        .unwrap();
+
+        assert_eq!(written, 1);
+        let file = load_optional_todos_file(tmp.path()).unwrap().unwrap();
+        assert_eq!(file.len(), 1);
+        assert_eq!(file[0].title, "Send the follow-up note");
     }
 
     #[test]

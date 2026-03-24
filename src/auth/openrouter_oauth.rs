@@ -10,7 +10,7 @@ use reqwest::Client;
 
 pub const OPENROUTER_AUTH_URL: &str = "https://openrouter.ai/auth";
 pub const OPENROUTER_KEY_EXCHANGE_URL: &str = "https://openrouter.ai/api/v1/auth/keys";
-pub const OPENROUTER_DEFAULT_FREE_MODEL: &str = "google/gemini-2.5-flash:free";
+pub const OPENROUTER_DEFAULT_FREE_MODEL: &str = "openrouter/free";
 
 /// Build the OpenRouter authorization URL for PKCE flow.
 ///
