@@ -1054,6 +1054,32 @@ pub fn rename_media_asset_path(
     Ok(rows)
 }
 
+pub fn rename_source_path_references(
+    workspace_dir: &Path,
+    old_path: &str,
+    new_path: &str,
+) -> Result<()> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    let old_trimmed = old_path.trim();
+    let new_trimmed = new_path.trim();
+
+    let _ = conn.execute(
+        "UPDATE workspace_todos SET source_path = ?2, updated_at = ?3 WHERE source_path = ?1",
+        params![old_trimmed, new_trimmed, now],
+    );
+    let _ = conn.execute(
+        "UPDATE workspace_events SET source_path = ?2, updated_at = ?3 WHERE source_path = ?1",
+        params![old_trimmed, new_trimmed, now],
+    );
+    let _ = conn.execute(
+        "UPDATE feed_interest_sources SET source_path = ?2, updated_at = ?3 WHERE source_path = ?1",
+        params![old_trimmed, new_trimmed, now],
+    );
+
+    Ok(())
+}
+
 pub fn rename_journal_entry_path(
     workspace_dir: &Path,
     old_path: &str,
