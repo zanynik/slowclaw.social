@@ -111,17 +111,22 @@ pub fn parse_triage_response(raw: &str) -> Option<TriageResult> {
     let candidate = &json_str[start..=end];
     let result: TriageResult = serde_json::from_str(candidate).ok()?;
     // Normalize skill keys to lowercase.
+    let mut seen_skills = HashSet::new();
     let relevant_skills = result
         .relevant_skills
         .into_iter()
         .map(|k| k.trim().to_ascii_lowercase())
         .filter(|k| !k.is_empty())
+        .filter(|k| seen_skills.insert(k.clone()))
         .collect();
+    let mut seen_keywords = HashSet::new();
     let keywords = result
         .keywords
         .into_iter()
-        .map(|k| k.trim().to_string())
+        .map(|k| k.trim().to_ascii_lowercase())
         .filter(|k| !k.is_empty())
+        .filter(|k| !matches!(k.as_str(), "journal" | "journals" | "note" | "notes"))
+        .filter(|k| seen_keywords.insert(k.clone()))
         .take(12)
         .collect();
     Some(TriageResult {
@@ -1185,13 +1190,15 @@ Create simple vertical video clips from journal audio recordings.\n\n\
 3. If the transcript is missing, call the built-in `transcribe_media` tool for that recording.\n\
 4. Read the transcript and extract exact insightful lines. Do not rewrite the quoted line if it will appear inside the video card.\n\
 5. Optionally call `clean_audio` when the source recording is noisy.\n\
-6. If you need a precise quote segment, call `extract_audio_segment` with the exact start/end range.\n\
-7. Render the final clip with `compose_simple_clip` or `render_text_card_video` using white text on a black background.\n\
-8. Save the final `.mp4` directly under `{output_dir}` so it appears in the workspace feed.\n\n\
+6. Prefer clips that let the idea breathe: target roughly 35 to 75 seconds when the source supports it, and avoid going under 30 seconds unless the moment is unusually strong or the source is too short.\n\
+7. If you need a precise quote segment, call `extract_audio_segment` with the exact start/end range.\n\
+8. Render the final clip with `compose_simple_clip` or `render_text_card_video` using white text on a black background.\n\
+9. Save the final `.mp4` directly under `{output_dir}` so it appears in the workspace feed.\n\n\
 ## Output Rules\n\n\
 - Use a black background with white text cards.\n\
-- Prefer 1 to 3 exact lines per clip.\n\
-- Keep final clips concise and feed-ready.\n\
+- Prefer 2 to 6 exact lines per clip when needed to support a longer thought.\n\
+- Default to one clip per strong idea, and let the spoken segment run long enough to feel complete.\n\
+- Keep the quote exact, but trim dead air, repeated setup, and weak lead-ins.\n\
 - Put JSON manifests, transcripts, and other machine files only under `{output_dir}/pipeline/`.\n\
 - Prefer built-in runtime tools over shell commands or scripts.\n\
 - Do not overwrite unrelated posts.\n"
@@ -1893,6 +1900,10 @@ fn extract_json_values(raw: &str) -> Vec<serde_json::Value> {
     }
 
     values
+}
+
+pub fn extract_json_values_from_text(raw: &str) -> Vec<serde_json::Value> {
+    extract_json_values(raw)
 }
 
 fn parse_extractor_response_json(response_text: &str) -> Result<serde_json::Value> {
@@ -4556,6 +4567,69 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn parse_triage_response_normalizes_and_filters_keywords() {
+        let raw = r#"
+```json
+{
+  "relevantSkills": [
+    " WORKSPACE_TODO_EXTRACTOR ",
+    "workspace_todo_extractor",
+    "workspace_clip_extractor"
+  ],
+  "keywords": [
+    "Mindfulness",
+    "mindfulness",
+    "Journal",
+    "Nonduality",
+    "Note",
+    "attention training"
+  ]
+}
+```
+"#;
+
+        let parsed = parse_triage_response(raw).expect("triage response should parse");
+
+        assert_eq!(
+            parsed.relevant_skills,
+            vec![
+                "workspace_todo_extractor".to_string(),
+                "workspace_clip_extractor".to_string()
+            ]
+        );
+        assert_eq!(
+            parsed.keywords,
+            vec![
+                "mindfulness".to_string(),
+                "nonduality".to_string(),
+                "attention training".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_json_values_from_text_recovers_multiple_objects_from_mixed_reply() {
+        let raw = r#"
+Bundle summary:
+{"workflowKey":"workspace_insight_extractor","version":"1","items":[{"text":"Ship it","sourcePath":"journals/text/2026-03-11.md","sourceExcerpt":"Ship it"}]}
+Some extra narration in between.
+{"workflowKey":"workspace_todo_extractor","version":"1","items":[{"title":"Email team","details":"Share update","sourcePath":"journals/text/2026-03-11.md","sourceExcerpt":"Email team"}]}
+"#;
+
+        let values = extract_json_values_from_text(raw);
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            values[0]["workflowKey"].as_str(),
+            Some("workspace_insight_extractor")
+        );
+        assert_eq!(
+            values[1]["workflowKey"].as_str(),
+            Some("workspace_todo_extractor")
+        );
     }
 
     #[test]

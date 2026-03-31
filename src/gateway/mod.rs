@@ -2423,7 +2423,7 @@ fn workflow_unsupported_reason(
 
 const CONTENT_AGENT_MIN_TOOL_ITERATIONS: usize = 32;
 const CONTENT_AGENT_MIN_ACTIONS_PER_HOUR: u32 = 200;
-const CONTENT_AGENT_TIMEOUT_SECS: u64 = 420;
+const CONTENT_AGENT_TIMEOUT_SECS: u64 = 600;
 const WORKSPACE_SYNTH_DIRECT_JSON_TIMEOUT_SECS: u64 = 90;
 
 fn content_agent_config_with_headroom(base: &Config) -> Config {
@@ -3459,7 +3459,11 @@ fn render_workspace_synth_triage_prompt(
     prompt.push_str("- `workspace_todo_extractor` is relevant only if the notes contain action items, commitments, plans, or to-dos.\n");
     prompt.push_str("- `workspace_event_extractor` is relevant only if the notes mention specific dates, times, or scheduled events.\n");
     prompt.push_str("- `workspace_clip_extractor` is relevant only if the notes include audio or video transcript content.\n");
-    prompt.push_str("- Extract 3-8 topical keywords that capture the main subjects of the notes.\n");
+    prompt.push_str("- Extract 5-12 topical keywords or short phrases that would be useful for finding related posts, creators, articles, or feeds on social platforms and the open web.\n");
+    prompt.push_str("- Prefer portable discovery terms: concrete topics, schools of thought, named technologies, practices, people, or short 2-3 word phrases.\n");
+    prompt.push_str("- Include a mix of specific terms and a few broader adjacent interests when that would improve discovery.\n");
+    prompt.push_str("- Avoid generic journaling words like `note`, `journal`, `reflection`, `thoughts`, `personal`, or `audio` unless the content is actually about those topics.\n");
+    prompt.push_str("- Return lowercase keywords.\n");
     prompt.push_str("- Return only the JSON object. No prose, no code fences beyond the object itself.\n");
     prompt
 }
@@ -3798,17 +3802,188 @@ fn workspace_synth_split_handoff_written(
         .unwrap_or(false)
 }
 
-fn workspace_synth_any_split_handoff_written(
+fn workspace_synth_written_split_skill_defs(
     workspace_dir: &StdPath,
     split_skills: &[(
         workspace_synthesizer::WorkspaceSynthSkillDefinition,
         workspace_synthesizer::WorkspaceSynthExtractorSpec,
         String,
     )],
+) -> Vec<workspace_synthesizer::WorkspaceSynthSkillDefinition> {
+    split_skills
+        .iter()
+        .filter(|(skill, _, _)| workspace_synth_split_handoff_written(workspace_dir, &skill.key))
+        .map(|(skill, _, _)| skill.clone())
+        .collect()
+}
+
+fn extend_workspace_synth_split_skill_defs(
+    target: &mut Vec<workspace_synthesizer::WorkspaceSynthSkillDefinition>,
+    additions: Vec<workspace_synthesizer::WorkspaceSynthSkillDefinition>,
+) {
+    let mut seen = target
+        .iter()
+        .map(|skill| skill.key.clone())
+        .collect::<HashSet<_>>();
+    for skill in additions {
+        if seen.insert(skill.key.clone()) {
+            target.push(skill);
+        }
+    }
+}
+
+fn workspace_synth_bundle_payload_item_keys(
+    payload: &serde_json::Value,
+) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    let Some(items) = payload
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| payload.as_array())
+    else {
+        return keys;
+    };
+    for item in items.iter().take(3) {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        keys.extend(object.keys().cloned());
+    }
+    keys
+}
+
+fn workspace_synth_bundle_payload_matches_skill(
+    payload: &serde_json::Value,
+    skill_key: &str,
 ) -> bool {
-    split_skills.iter().any(|(skill, _, _)| {
-        workspace_synth_split_handoff_written(workspace_dir, &skill.key)
-    })
+    if payload
+        .get("workflowKey")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case(skill_key))
+    {
+        return true;
+    }
+
+    let keys = workspace_synth_bundle_payload_item_keys(payload);
+    if keys.is_empty() {
+        return false;
+    }
+
+    let has = |key: &str| keys.contains(key);
+    match skill_key {
+        workspace_synthesizer::WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY => {
+            has("text") && has("sourcePath")
+        }
+        workspace_synthesizer::WORKSPACE_TODO_EXTRACTOR_WORKFLOW_KEY => {
+            has("title")
+                && has("sourcePath")
+                && (has("details") || has("priority") || has("status") || has("dueAt"))
+                && !has("startAt")
+                && !has("transcriptQuote")
+                && !has("provenance")
+        }
+        workspace_synthesizer::WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY => {
+            has("title")
+                && has("sourcePath")
+                && (has("startAt") || has("endAt") || has("allDay") || has("location"))
+                && !has("transcriptQuote")
+                && !has("provenance")
+        }
+        workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => {
+            has("title")
+                && has("sourcePath")
+                && has("startAt")
+                && has("endAt")
+                && has("transcriptQuote")
+        }
+        workspace_synthesizer::WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => {
+            has("title")
+                && has("sourcePath")
+                && !has("details")
+                && !has("priority")
+                && !has("status")
+                && !has("dueAt")
+                && !has("startAt")
+                && !has("endAt")
+                && !has("allDay")
+                && !has("location")
+                && !has("transcriptQuote")
+                && !has("provenance")
+                && !has("canonicalName")
+                && !has("body")
+        }
+        workspace_synthesizer::WORKSPACE_ENTITY_EXTRACTOR_WORKFLOW_KEY => {
+            has("canonicalName") || has("aliases")
+        }
+        workspace_synthesizer::WORKSPACE_ACTION_EXTRACTOR_WORKFLOW_KEY => {
+            has("title")
+                && has("provenance")
+                && (has("priority") || has("status") || has("owner") || has("dueAt"))
+        }
+        workspace_synthesizer::WORKSPACE_PRIMITIVE_EVENT_EXTRACTOR_WORKFLOW_KEY => {
+            has("title")
+                && has("provenance")
+                && (has("kind") || has("startAt") || has("participants"))
+        }
+        workspace_synthesizer::WORKSPACE_ASSERTION_EXTRACTOR_WORKFLOW_KEY => {
+            has("text") && has("provenance") && has("kind")
+        }
+        workspace_synthesizer::WORKSPACE_SEGMENT_EXTRACTOR_WORKFLOW_KEY => {
+            has("sourcePath")
+                && has("provenance")
+                && (has("label") || has("topic") || has("transcriptQuote") || has("startAt") || has("endAt"))
+        }
+        _ => has("body") || has("formatHint"),
+    }
+}
+
+fn workspace_synth_salvage_split_bundle_reply(
+    workspace_dir: &StdPath,
+    split_skills: &[(
+        workspace_synthesizer::WorkspaceSynthSkillDefinition,
+        workspace_synthesizer::WorkspaceSynthExtractorSpec,
+        String,
+    )],
+    reply: &str,
+    skill_replies: &mut Vec<String>,
+) -> usize {
+    let payloads = workspace_synthesizer::extract_json_values_from_text(reply);
+    if payloads.is_empty() {
+        return 0;
+    }
+
+    let mut used_payloads = HashSet::new();
+    let mut salvaged = 0usize;
+    for (skill, _, _) in split_skills {
+        if workspace_synth_split_handoff_written(workspace_dir, &skill.key) {
+            continue;
+        }
+        for (index, payload) in payloads.iter().enumerate() {
+            if used_payloads.contains(&index)
+                || !workspace_synth_bundle_payload_matches_skill(payload, &skill.key)
+            {
+                continue;
+            }
+            let Ok(payload_text) = serde_json::to_string(payload) else {
+                continue;
+            };
+            let Ok(item_count) = workspace_synthesizer::materialize_extractor_response(
+                workspace_dir,
+                &skill.key,
+                &payload_text,
+            ) else {
+                continue;
+            };
+            used_payloads.insert(index);
+            salvaged += 1;
+            skill_replies.push(format!(
+                "{}: salvaged {} item(s) from the extraction bundle reply.",
+                skill.name, item_count
+            ));
+            break;
+        }
+    }
+    salvaged
 }
 
 fn workspace_synth_prefers_sequential_split_skills(config: &Config) -> bool {
@@ -4039,14 +4214,26 @@ async fn run_workspace_synthesizer_orchestrator(
         .map(|s| (s.key.clone(), s.goal.clone()))
         .collect();
 
-    let triage_result = if !target_sources.is_empty() && enabled_skill_list.len() > 1 {
+    let mut triage_result = if !target_sources.is_empty() && enabled_skill_list.len() > 1 {
         run_workspace_synth_triage(state, workspace_dir, &enabled_skill_list, target_sources).await
     } else {
         None
     };
 
-    let triage_relevant: Option<HashSet<String>> = triage_result.as_ref().map(|t| {
-        t.relevant_skills.iter().cloned().collect()
+    if let Some(result) = triage_result.as_mut() {
+        if !result
+            .relevant_skills
+            .iter()
+            .any(|key| key == workspace_synthesizer::WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY)
+        {
+            result.relevant_skills.push(
+                workspace_synthesizer::WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY.to_string(),
+            );
+        }
+    }
+
+    let triage_relevant: Option<HashSet<String>> = triage_result.as_ref().and_then(|t| {
+        (!t.relevant_skills.is_empty()).then(|| t.relevant_skills.iter().cloned().collect())
     });
     let triage_keywords: Vec<String> = triage_result
         .as_ref()
@@ -4201,59 +4388,129 @@ async fn run_workspace_synthesizer_orchestrator(
                         if !trimmed.is_empty() {
                             skill_replies.push(format!("Fast extraction bundle: {}", trimmed));
                         }
-                        if workspace_synth_any_split_handoff_written(
+                        let salvaged_count = workspace_synth_salvage_split_bundle_reply(
                             workspace_dir,
                             &pending_split_skills,
-                        ) {
-                            split_skill_defs.extend(
-                                pending_split_skills
-                                    .iter()
-                                    .map(|(split_skill, _, _)| split_skill.clone()),
-                            );
-                        } else if let Some((fallback_started_at, fallback_finished_at)) =
-                            run_workspace_synth_split_skills_individually(
-                                state,
-                                workspace_dir,
-                                orchestrator_workflow,
-                                orchestrator_skill_markdown,
-                                &pending_split_skills,
-                                media_tool_summary,
-                                target_sources,
-                                &mut split_artifact_states,
-                                &mut split_skill_defs,
-                                &mut skill_replies,
-                                &mut skill_runs,
-                                &mut skill_errors,
-                                Some("Fast extraction bundle returned without writing handoff files. Retrying extractor skills one by one."),
-                                false,
-                            )
-                            .await
-                        {
-                            split_batch_started_at = Some(fallback_started_at);
-                            split_batch_finished_at = Some(fallback_finished_at);
+                            &reply,
+                            &mut skill_replies,
+                        );
+                        let written_defs = workspace_synth_written_split_skill_defs(
+                            workspace_dir,
+                            &pending_split_skills,
+                        );
+                        extend_workspace_synth_split_skill_defs(
+                            &mut split_skill_defs,
+                            written_defs.clone(),
+                        );
+                        let written_keys = written_defs
+                            .iter()
+                            .map(|skill| skill.key.clone())
+                            .collect::<HashSet<_>>();
+                        let remaining_split_skills = pending_split_skills
+                            .iter()
+                            .filter(|(split_skill, _, _)| !written_keys.contains(&split_skill.key))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if !remaining_split_skills.is_empty() {
+                            let intro = if written_keys.is_empty() && salvaged_count == 0 {
+                                "Fast extraction bundle returned without complete handoff coverage. Retrying extractor skills one by one with direct JSON fallback."
+                            } else {
+                                "Fast extraction bundle partially landed. Retrying the remaining extractor skills one by one with direct JSON fallback."
+                            };
+                            if let Some((fallback_started_at, fallback_finished_at)) =
+                                run_workspace_synth_split_skills_individually(
+                                    state,
+                                    workspace_dir,
+                                    orchestrator_workflow,
+                                    orchestrator_skill_markdown,
+                                    &remaining_split_skills,
+                                    media_tool_summary,
+                                    target_sources,
+                                    &mut split_artifact_states,
+                                    &mut split_skill_defs,
+                                    &mut skill_replies,
+                                    &mut skill_runs,
+                                    &mut skill_errors,
+                                    Some(intro),
+                                    true,
+                                )
+                                .await
+                            {
+                                split_batch_started_at = Some(fallback_started_at);
+                                split_batch_finished_at = Some(fallback_finished_at);
+                            }
                         }
                     }
                     Err(err) => {
                         let finished_at = Utc::now();
                         let message = truncate_with_ellipsis(&format!("{err:#}"), 800);
-                        for (split_skill, _, _) in &pending_split_skills {
-                            if let Some(state) = workspace_synth_artifact_state_mut(
-                                &mut split_artifact_states,
-                                &split_skill.key,
-                            ) {
-                                state.status = "error".to_string();
-                                state.error = message.clone();
-                            }
-                            skill_runs.push(workspace_synth_skill_run_state_timed(
-                                split_skill,
-                                "error",
-                                String::new(),
-                                message.clone(),
-                                0,
-                                started_at,
-                                finished_at,
+                        let written_defs = workspace_synth_written_split_skill_defs(
+                            workspace_dir,
+                            &pending_split_skills,
+                        );
+                        extend_workspace_synth_split_skill_defs(
+                            &mut split_skill_defs,
+                            written_defs.clone(),
+                        );
+                        let written_keys = written_defs
+                            .iter()
+                            .map(|skill| skill.key.clone())
+                            .collect::<HashSet<_>>();
+                        let remaining_split_skills = pending_split_skills
+                            .iter()
+                            .filter(|(split_skill, _, _)| !written_keys.contains(&split_skill.key))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if !remaining_split_skills.is_empty() {
+                            skill_replies.push(format!(
+                                "Fast extraction bundle failed: {}. Retrying the remaining extractor skills one by one with direct JSON fallback.",
+                                message
                             ));
-                            skill_errors.push(format!("{} failed: {}", split_skill.name, message));
+                            if let Some((fallback_started_at, fallback_finished_at)) =
+                                run_workspace_synth_split_skills_individually(
+                                    state,
+                                    workspace_dir,
+                                    orchestrator_workflow,
+                                    orchestrator_skill_markdown,
+                                    &remaining_split_skills,
+                                    media_tool_summary,
+                                    target_sources,
+                                    &mut split_artifact_states,
+                                    &mut split_skill_defs,
+                                    &mut skill_replies,
+                                    &mut skill_runs,
+                                    &mut skill_errors,
+                                    Some("Fast extraction bundle failed. Retrying the remaining extractor skills one by one with direct JSON fallback."),
+                                    true,
+                                )
+                                .await
+                            {
+                                split_batch_started_at = Some(fallback_started_at);
+                                split_batch_finished_at = Some(fallback_finished_at);
+                            }
+                        } else if !written_defs.is_empty() {
+                            split_batch_started_at = Some(started_at);
+                            split_batch_finished_at = Some(finished_at);
+                        } else {
+                            for (split_skill, _, _) in &pending_split_skills {
+                                if let Some(state) = workspace_synth_artifact_state_mut(
+                                    &mut split_artifact_states,
+                                    &split_skill.key,
+                                ) {
+                                    state.status = "error".to_string();
+                                    state.error = message.clone();
+                                }
+                                skill_runs.push(workspace_synth_skill_run_state_timed(
+                                    split_skill,
+                                    "error",
+                                    String::new(),
+                                    message.clone(),
+                                    0,
+                                    started_at,
+                                    finished_at,
+                                ));
+                                skill_errors.push(format!("{} failed: {}", split_skill.name, message));
+                            }
                         }
                     }
                 }
@@ -4527,58 +4784,128 @@ async fn run_workspace_synthesizer_orchestrator(
                     if !trimmed.is_empty() {
                         skill_replies.push(format!("Fast extraction bundle: {}", trimmed));
                     }
-                    if workspace_synth_any_split_handoff_written(
+                    let salvaged_count = workspace_synth_salvage_split_bundle_reply(
                         workspace_dir,
                         &pending_split_skills,
-                    ) {
-                        split_skill_defs.extend(
-                            pending_split_skills
-                                .iter()
-                                .map(|(split_skill, _, _)| split_skill.clone()),
-                        );
-                    } else if let Some((fallback_started_at, fallback_finished_at)) =
-                        run_workspace_synth_split_skills_individually(
-                            state,
-                            workspace_dir,
-                            orchestrator_workflow,
-                            orchestrator_skill_markdown,
-                            &pending_split_skills,
-                            media_tool_summary,
-                            target_sources,
-                            &mut split_artifact_states,
-                            &mut split_skill_defs,
-                            &mut skill_replies,
-                            &mut skill_runs,
-                            &mut skill_errors,
-                            Some("Fast extraction bundle returned without writing handoff files. Retrying extractor skills one by one."),
-                            false,
-                        )
-                        .await
-                    {
-                        split_batch_started_at = Some(fallback_started_at);
-                        split_batch_finished_at = Some(fallback_finished_at);
+                        &reply,
+                        &mut skill_replies,
+                    );
+                    let written_defs = workspace_synth_written_split_skill_defs(
+                        workspace_dir,
+                        &pending_split_skills,
+                    );
+                    extend_workspace_synth_split_skill_defs(
+                        &mut split_skill_defs,
+                        written_defs.clone(),
+                    );
+                    let written_keys = written_defs
+                        .iter()
+                        .map(|skill| skill.key.clone())
+                        .collect::<HashSet<_>>();
+                    let remaining_split_skills = pending_split_skills
+                        .iter()
+                        .filter(|(split_skill, _, _)| !written_keys.contains(&split_skill.key))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !remaining_split_skills.is_empty() {
+                        let intro = if written_keys.is_empty() && salvaged_count == 0 {
+                            "Fast extraction bundle returned without complete handoff coverage. Retrying extractor skills one by one with direct JSON fallback."
+                        } else {
+                            "Fast extraction bundle partially landed. Retrying the remaining extractor skills one by one with direct JSON fallback."
+                        };
+                        if let Some((fallback_started_at, fallback_finished_at)) =
+                            run_workspace_synth_split_skills_individually(
+                                state,
+                                workspace_dir,
+                                orchestrator_workflow,
+                                orchestrator_skill_markdown,
+                                &remaining_split_skills,
+                                media_tool_summary,
+                                target_sources,
+                                &mut split_artifact_states,
+                                &mut split_skill_defs,
+                                &mut skill_replies,
+                                &mut skill_runs,
+                                &mut skill_errors,
+                                Some(intro),
+                                true,
+                            )
+                            .await
+                        {
+                            split_batch_started_at = Some(fallback_started_at);
+                            split_batch_finished_at = Some(fallback_finished_at);
+                        }
                     }
                 }
                 Err(err) => {
                     let finished_at = Utc::now();
                     let message = truncate_with_ellipsis(&format!("{err:#}"), 800);
-                    for (split_skill, _, _) in &pending_split_skills {
-                        if let Some(state) =
-                            workspace_synth_artifact_state_mut(&mut split_artifact_states, &split_skill.key)
-                        {
-                            state.status = "error".to_string();
-                            state.error = message.clone();
-                        }
-                        skill_runs.push(workspace_synth_skill_run_state_timed(
-                            split_skill,
-                            "error",
-                            String::new(),
-                            message.clone(),
-                            0,
-                            started_at,
-                            finished_at,
+                    let written_defs = workspace_synth_written_split_skill_defs(
+                        workspace_dir,
+                        &pending_split_skills,
+                    );
+                    extend_workspace_synth_split_skill_defs(
+                        &mut split_skill_defs,
+                        written_defs.clone(),
+                    );
+                    let written_keys = written_defs
+                        .iter()
+                        .map(|skill| skill.key.clone())
+                        .collect::<HashSet<_>>();
+                    let remaining_split_skills = pending_split_skills
+                        .iter()
+                        .filter(|(split_skill, _, _)| !written_keys.contains(&split_skill.key))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !remaining_split_skills.is_empty() {
+                        skill_replies.push(format!(
+                            "Fast extraction bundle failed: {}. Retrying the remaining extractor skills one by one with direct JSON fallback.",
+                            message
                         ));
-                        skill_errors.push(format!("{} failed: {}", split_skill.name, message));
+                        if let Some((fallback_started_at, fallback_finished_at)) =
+                            run_workspace_synth_split_skills_individually(
+                                state,
+                                workspace_dir,
+                                orchestrator_workflow,
+                                orchestrator_skill_markdown,
+                                &remaining_split_skills,
+                                media_tool_summary,
+                                target_sources,
+                                &mut split_artifact_states,
+                                &mut split_skill_defs,
+                                &mut skill_replies,
+                                &mut skill_runs,
+                                &mut skill_errors,
+                                Some("Fast extraction bundle failed. Retrying the remaining extractor skills one by one with direct JSON fallback."),
+                                true,
+                            )
+                            .await
+                        {
+                            split_batch_started_at = Some(fallback_started_at);
+                            split_batch_finished_at = Some(fallback_finished_at);
+                        }
+                    } else if !written_defs.is_empty() {
+                        split_batch_started_at = Some(started_at);
+                        split_batch_finished_at = Some(finished_at);
+                    } else {
+                        for (split_skill, _, _) in &pending_split_skills {
+                            if let Some(state) =
+                                workspace_synth_artifact_state_mut(&mut split_artifact_states, &split_skill.key)
+                            {
+                                state.status = "error".to_string();
+                                state.error = message.clone();
+                            }
+                            skill_runs.push(workspace_synth_skill_run_state_timed(
+                                split_skill,
+                                "error",
+                                String::new(),
+                                message.clone(),
+                                0,
+                                started_at,
+                                finished_at,
+                            ));
+                            skill_errors.push(format!("{} failed: {}", split_skill.name, message));
+                        }
                     }
                 }
             }
@@ -5705,13 +6032,15 @@ Create simple vertical video clips from journal audio recordings.\n\n\
 3. If the transcript is missing, call the built-in `transcribe_media` tool for that recording.\n\
 4. Read the transcript and extract exact insightful lines. Do not rewrite the quoted line if it will appear inside the video card.\n\
 5. Optionally call `clean_audio` when the source recording is noisy.\n\
-6. If you need a precise quote segment, call `extract_audio_segment` with the exact start/end range.\n\
-7. Render the final clip with `compose_simple_clip` or `render_text_card_video` using white text on a black background.\n\
-8. Save the final `.mp4` directly under `{output_dir}` so it appears in the workspace feed.\n\n\
+6. Prefer clips that let the idea breathe: target roughly 35 to 75 seconds when the source supports it, and avoid going under 30 seconds unless the moment is unusually strong or the source is too short.\n\
+7. If you need a precise quote segment, call `extract_audio_segment` with the exact start/end range.\n\
+8. Render the final clip with `compose_simple_clip` or `render_text_card_video` using white text on a black background.\n\
+9. Save the final `.mp4` directly under `{output_dir}` so it appears in the workspace feed.\n\n\
 ## Output Rules\n\n\
 - Use a black background with white text cards.\n\
-- Prefer 1 to 3 exact lines per clip.\n\
-- Keep final clips concise and feed-ready.\n\
+- Prefer 2 to 6 exact lines per clip when needed to support a longer thought.\n\
+- Default to one clip per strong idea, and let the spoken segment run long enough to feel complete.\n\
+- Keep the quote exact, but trim dead air, repeated setup, and weak lead-ins.\n\
 - Put JSON manifests, transcripts, and other machine files only under `{output_dir}/pipeline/`.\n\
 - Prefer built-in runtime tools over shell commands or scripts.\n\
 - Do not overwrite unrelated posts.\n"
