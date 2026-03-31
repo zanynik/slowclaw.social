@@ -2,6 +2,7 @@ use crate::gateway::article_synthesizer;
 use crate::gateway::local_store;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Datelike, Utc};
 use schemars::{schema_for, JsonSchema};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,70 @@ const MAX_ASSERTIONS: usize = 60;
 const MAX_ACTIONS: usize = 30;
 const MAX_SEGMENTS: usize = 40;
 const MAX_STRUCTURES: usize = 24;
+
+/// Timeout for the triage classification call (seconds).
+pub const WORKSPACE_SYNTH_TRIAGE_TIMEOUT_SECS: u64 = 60;
+
+/// Result of the triage classification step.
+/// The triage call inspects a batch of journal notes and returns which
+/// extraction skills are relevant, plus topical keywords extracted from the
+/// content. This avoids running every enabled skill on every batch.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TriageResult {
+    /// Skill keys that should run for this batch.
+    #[serde(default, alias = "relevant_skills")]
+    pub relevant_skills: Vec<String>,
+    /// Topical keywords extracted from the batch for interest profile feeding.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+}
+
+/// Parse a triage JSON response from the LLM.
+///
+/// Accepts both raw JSON and markdown-fenced JSON. Returns `None` on any
+/// parse failure so the caller can fall through to the default (run all
+/// enabled skills).
+pub fn parse_triage_response(raw: &str) -> Option<TriageResult> {
+    let trimmed = raw.trim();
+    // Strip optional markdown code fences.
+    let json_str = if trimmed.starts_with("```") {
+        let inner = trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        inner
+    } else {
+        trimmed
+    };
+    // Try to find a JSON object in the text.
+    let start = json_str.find('{')?;
+    let end = json_str.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let candidate = &json_str[start..=end];
+    let result: TriageResult = serde_json::from_str(candidate).ok()?;
+    // Normalize skill keys to lowercase.
+    let relevant_skills = result
+        .relevant_skills
+        .into_iter()
+        .map(|k| k.trim().to_ascii_lowercase())
+        .filter(|k| !k.is_empty())
+        .collect();
+    let keywords = result
+        .keywords
+        .into_iter()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .take(12)
+        .collect();
+    Some(TriageResult {
+        relevant_skills,
+        keywords,
+    })
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkspaceSynthExtractorSpec {
@@ -854,6 +919,8 @@ pub struct WorkspaceSynthArtifactStates {
     #[serde(default)]
     pub clip_plans: WorkspaceSynthArtifactState,
     #[serde(default)]
+    pub journal_titles: WorkspaceSynthArtifactState,
+    #[serde(default)]
     pub primitive_entities: WorkspaceSynthArtifactState,
     #[serde(default)]
     pub primitive_events: WorkspaceSynthArtifactState,
@@ -888,6 +955,9 @@ pub struct WorkspaceSynthesisApplyResult {
     pub had_errors: bool,
     #[serde(default)]
     pub skill_runs: Vec<WorkspaceSynthSkillRunState>,
+    /// Keywords extracted by the triage step (if triage ran).
+    #[serde(default)]
+    pub triage_keywords: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1198,15 +1268,23 @@ pub fn effective_artifact_rules(markdown: &str, override_text: &str) -> String {
     }
 }
 
-pub fn skill_definitions(store: &WorkspaceSynthSkillStore) -> Vec<WorkspaceSynthSkillDefinition> {
+pub fn all_skill_definitions(
+    store: &WorkspaceSynthSkillStore,
+) -> Vec<WorkspaceSynthSkillDefinition> {
     let mut defs = store
         .skills
         .values()
         .map(skill_definition_from_record)
-        .filter(|skill| skill.visible_in_ui)
         .collect::<Vec<_>>();
     defs.sort_by(|a, b| a.key.cmp(&b.key));
     defs
+}
+
+pub fn skill_definitions(store: &WorkspaceSynthSkillStore) -> Vec<WorkspaceSynthSkillDefinition> {
+    all_skill_definitions(store)
+        .into_iter()
+        .filter(|skill| skill.visible_in_ui)
+        .collect()
 }
 
 pub fn skill_definition_by_key(
@@ -2773,18 +2851,89 @@ fn normalize_title_stem(raw: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+fn is_inbox_text_journal_source_path(path: &str) -> bool {
+    let normalized = path.trim().trim_start_matches('/').replace('\\', "/");
+    normalized == super::JOURNAL_TEXT_INBOX_DIR
+        || normalized.starts_with(&format!("{}/", super::JOURNAL_TEXT_INBOX_DIR))
+}
+
+fn journal_source_observed_at(path: &Path) -> Option<DateTime<Utc>> {
+    let metadata = fs::metadata(path).ok()?;
+    let timestamp = metadata.created().or_else(|_| metadata.modified()).ok()?;
+    Some(timestamp.into())
+}
+
+fn canonical_journal_target_rel_path(
+    workspace_dir: &Path,
+    old_abs: &Path,
+    old_rel: &str,
+    stem: &str,
+    extension: &str,
+) -> Result<String> {
+    if is_inbox_text_journal_source_path(old_rel) {
+        let observed_at = journal_source_observed_at(old_abs).unwrap_or_else(Utc::now);
+        return Ok(format!(
+            "{}/{:04}/{:02}/{:02}/{}.{}",
+            super::JOURNAL_TEXT_DIR,
+            observed_at.year(),
+            observed_at.month(),
+            observed_at.day(),
+            stem,
+            extension
+        ));
+    }
+
+    let parent = old_abs
+        .parent()
+        .with_context(|| format!("missing parent for {}", old_abs.display()))?;
+    Ok(format!(
+        "{}/{}.{}",
+        parent
+            .strip_prefix(workspace_dir)
+            .unwrap_or(parent)
+            .to_string_lossy()
+            .replace('\\', "/"),
+        stem,
+        extension
+    ))
+}
+
 fn apply_source_path_renames(
+    processed_source_paths: &[String],
     journal_titles: &[JournalTitleCandidate],
     workspace_dir: &Path,
 ) -> Result<HashMap<String, String>> {
-    let mut rename_map = HashMap::new();
-    let mut reserved_targets = HashSet::new();
+    let mut title_map = HashMap::new();
     for item in journal_titles {
-        let old_rel = item.source_path.trim();
+        let old_rel = item.source_path.trim().trim_start_matches('/').replace('\\', "/");
         if old_rel.is_empty() {
             continue;
         }
-        let old_abs = workspace_dir.join(old_rel);
+        title_map.insert(old_rel, item.title.trim().to_string());
+    }
+
+    let mut target_paths = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for path in processed_source_paths {
+        let normalized = path.trim().trim_start_matches('/').replace('\\', "/");
+        if normalized.is_empty() || !seen_paths.insert(normalized.clone()) {
+            continue;
+        }
+        target_paths.push(normalized);
+    }
+    for path in title_map.keys() {
+        if seen_paths.insert(path.clone()) {
+            target_paths.push(path.clone());
+        }
+    }
+
+    let mut rename_map = HashMap::new();
+    let mut reserved_targets = HashSet::new();
+    for old_rel in target_paths {
+        if old_rel.is_empty() || is_transcript_source_path(&old_rel) {
+            continue;
+        }
+        let old_abs = workspace_dir.join(&old_rel);
         if !old_abs.is_file() {
             continue;
         }
@@ -2793,70 +2942,74 @@ fn apply_source_path_renames(
             .and_then(|value| value.to_str())
             .unwrap_or("md")
             .to_string();
-        let parent = old_abs
-            .parent()
-            .with_context(|| format!("missing parent for {}", old_abs.display()))?;
-        let mut stem = normalize_title_stem(&item.title);
-        if stem.is_empty() {
-            stem = format!("journal-{}", short_hash(old_rel));
-        }
-        let old_stem = old_abs
+        let current_stem = old_abs
             .file_stem()
             .and_then(|value| value.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if stem == old_stem {
-            continue;
+            .unwrap_or("");
+        let mut stem = title_map
+            .get(&old_rel)
+            .map(|title| normalize_title_stem(title))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| normalize_title_stem(current_stem));
+        if stem.is_empty() {
+            stem = format!("journal-{}", short_hash(&old_rel));
         }
-
-        let mut candidate_rel = format!(
-            "{}/{}.{}",
-            parent
-                .strip_prefix(workspace_dir)
-                .unwrap_or(parent)
-                .to_string_lossy()
-                .replace('\\', "/"),
-            stem,
-            extension
-        );
+        let mut candidate_rel =
+            canonical_journal_target_rel_path(workspace_dir, &old_abs, &old_rel, &stem, &extension)?;
         let mut candidate_abs = workspace_dir.join(&candidate_rel);
         if reserved_targets.contains(&candidate_rel)
             || (candidate_abs.exists() && candidate_abs != old_abs)
         {
-            let suffix = short_hash(&format!("{}|{}", old_rel, item.title));
-            candidate_rel = format!(
-                "{}/{}-{}.{}",
-                parent
-                    .strip_prefix(workspace_dir)
-                    .unwrap_or(parent)
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-                stem,
-                suffix,
-                extension
-            );
+            let suffix = short_hash(&format!(
+                "{}|{}",
+                old_rel,
+                title_map.get(&old_rel).cloned().unwrap_or_else(|| stem.clone())
+            ));
+            let candidate_seed = format!("{stem}-{suffix}");
+            candidate_rel = canonical_journal_target_rel_path(
+                workspace_dir,
+                &old_abs,
+                &old_rel,
+                &candidate_seed,
+                &extension,
+            )?;
             candidate_abs = workspace_dir.join(&candidate_rel);
         }
 
-        if candidate_abs != old_abs {
-            fs::rename(&old_abs, &candidate_abs).with_context(|| {
-                format!("failed to rename {} -> {}", old_abs.display(), candidate_abs.display())
-            })?;
-            if let Err(e) = local_store::rename_workspace_synth_source_path(
-                workspace_dir,
-                old_rel,
-                &candidate_rel,
-            ) {
-                tracing::warn!(old = old_rel, new = %candidate_rel, err = %e, "synth source path rename failed");
-            }
-            match local_store::rename_journal_entry_path(workspace_dir, old_rel, &candidate_rel, &item.title) {
-                Ok(0) => tracing::warn!(old = old_rel, new = %candidate_rel, "journal rename: no DB rows matched"),
-                Err(e) => tracing::warn!(old = old_rel, new = %candidate_rel, err = %e, "journal rename failed"),
-                _ => {}
-            }
-            reserved_targets.insert(candidate_rel.clone());
-            rename_map.insert(old_rel.to_string(), candidate_rel);
+        if candidate_abs == old_abs {
+            continue;
         }
+
+        if let Some(parent) = candidate_abs.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::rename(&old_abs, &candidate_abs).with_context(|| {
+            format!("failed to rename {} -> {}", old_abs.display(), candidate_abs.display())
+        })?;
+        if let Err(e) = local_store::rename_workspace_synth_source_path(
+            workspace_dir,
+            &old_rel,
+            &candidate_rel,
+        ) {
+            tracing::warn!(old = old_rel, new = %candidate_rel, err = %e, "synth source path rename failed");
+        }
+        let title_for_record = title_map
+            .get(&old_rel)
+            .cloned()
+            .unwrap_or_else(|| current_stem.replace(['_', '-'], " "));
+        match local_store::rename_journal_entry_path(
+            workspace_dir,
+            &old_rel,
+            &candidate_rel,
+            &title_for_record,
+        ) {
+            Ok(0) => tracing::warn!(old = old_rel, new = %candidate_rel, "journal rename: no DB rows matched"),
+            Err(e) => tracing::warn!(old = old_rel, new = %candidate_rel, err = %e, "journal rename failed"),
+            _ => {}
+        }
+        reserved_targets.insert(candidate_rel.clone());
+        rename_map.insert(old_rel.to_string(), candidate_rel);
     }
     Ok(rename_map)
 }
@@ -2883,6 +3036,7 @@ fn primitive_artifact_states_default() -> WorkspaceSynthArtifactStates {
         todos: skipped_artifact_state(WORKSPACE_SYNTHESIZER_TODOS_PATH),
         events: skipped_artifact_state(WORKSPACE_SYNTHESIZER_EVENTS_PATH),
         clip_plans: skipped_artifact_state(WORKSPACE_SYNTHESIZER_CLIP_PLANS_PATH),
+        journal_titles: skipped_artifact_state(WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH),
         primitive_entities: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH),
         primitive_events: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH),
         primitive_assertions: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH),
@@ -3037,16 +3191,17 @@ fn apply_primitive_handoff_files(
     result: &mut WorkspaceSynthesisApplyResult,
     error_messages: &mut Vec<String>,
 ) -> Result<()> {
-    let rename_map = match journal_title_items.as_deref() {
-        Some(items) if !items.is_empty() => match apply_source_path_renames(items, workspace_dir) {
-            Ok(map) => map,
-            Err(err) => {
-                result.had_errors = true;
-                error_messages.push(format!("journal titles: {err}"));
-                HashMap::new()
-            }
-        },
-        _ => HashMap::new(),
+    let rename_map = match apply_source_path_renames(
+        processed_source_paths,
+        journal_title_items.as_deref().unwrap_or(&[]),
+        workspace_dir,
+    ) {
+        Ok(map) => map,
+        Err(err) => {
+            result.had_errors = true;
+            error_messages.push(format!("journal titles: {err}"));
+            HashMap::new()
+        }
     };
 
     if !rename_map.is_empty() {
@@ -3284,6 +3439,7 @@ pub fn apply_manifest(
         applied_any: true,
         had_errors: false,
         skill_runs: Vec::new(),
+        triage_keywords: Vec::new(),
     })
 }
 
@@ -3522,6 +3678,8 @@ pub fn apply_handoff_files(
             Ok(None) => {}
             Err(err) => {
                 result.had_errors = true;
+                result.artifact_states.journal_titles =
+                    error_artifact_state(WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH, &err);
                 error_messages.push(format!("journal titles: {err}"));
             }
         }
@@ -3544,16 +3702,17 @@ pub fn apply_handoff_files(
         return Ok(result);
     }
 
-    let rename_map = match journal_title_items.as_deref() {
-        Some(items) if !items.is_empty() => match apply_source_path_renames(items, workspace_dir) {
-            Ok(map) => map,
-            Err(err) => {
-                result.had_errors = true;
-                error_messages.push(format!("journal titles: {err}"));
-                HashMap::new()
-            }
-        },
-        _ => HashMap::new(),
+    let rename_map = match apply_source_path_renames(
+        processed_source_paths,
+        journal_title_items.as_deref().unwrap_or(&[]),
+        workspace_dir,
+    ) {
+        Ok(map) => map,
+        Err(err) => {
+            result.had_errors = true;
+            error_messages.push(format!("journal titles: {err}"));
+            HashMap::new()
+        }
     };
     if !rename_map.is_empty() {
         result.renamed_sources = rename_map
@@ -3585,6 +3744,16 @@ pub fn apply_handoff_files(
             }
         }
     }
+    result.artifact_states.journal_titles = if !result.renamed_sources.is_empty() {
+        applied_artifact_state(
+            WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH,
+            result.renamed_sources.len(),
+        )
+    } else if result.artifact_states.journal_titles.error.trim().is_empty() {
+        skipped_artifact_state(WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH)
+    } else {
+        result.artifact_states.journal_titles.clone()
+    };
 
     let primitive_entities = primitive_handoffs.entities.unwrap_or_default();
     let primitive_events = primitive_handoffs.events.unwrap_or_default();
@@ -4254,6 +4423,64 @@ Do something useful.
     }
 
     #[test]
+    fn apply_handoff_files_marks_journal_titles_applied_when_rename_succeeds() {
+        let tmp = tempdir().unwrap();
+        let journal_rel = "journals/text/2026/03/15/103944_Journal_entry.md";
+        let journal_abs = tmp.path().join(journal_rel);
+        fs::create_dir_all(journal_abs.parent().unwrap()).unwrap();
+        fs::write(&journal_abs, "A note about work and life.").unwrap();
+
+        let titles = JournalTitleFile {
+            version: "1".to_string(),
+            items: vec![JournalTitleCandidate {
+                source_path: journal_rel.to_string(),
+                title: "Work and Life Reflections".to_string(),
+            }],
+        };
+        write_json_file(&journal_titles_path(tmp.path()), &titles);
+
+        let processed_source_paths = vec![journal_rel.to_string()];
+        let applied = apply_handoff_files(tmp.path(), "run-title", &processed_source_paths).unwrap();
+
+        assert_eq!(applied.artifact_states.journal_titles.status, "applied");
+        assert_eq!(applied.artifact_states.journal_titles.item_count, 1);
+        assert_eq!(applied.renamed_sources.len(), 1);
+        assert_eq!(
+            applied.renamed_sources[0].to_path,
+            "journals/text/2026/03/15/work-and-life-reflections.md"
+        );
+        assert!(
+            tmp.path()
+                .join("journals/text/2026/03/15/work-and-life-reflections.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn apply_handoff_files_moves_processed_inbox_note_into_dated_folder_without_title_handoff() {
+        let tmp = tempdir().unwrap();
+        let journal_rel = "journals/text/inbox/raw-note.md";
+        let journal_abs = tmp.path().join(journal_rel);
+        fs::create_dir_all(journal_abs.parent().unwrap()).unwrap();
+        fs::write(&journal_abs, "Inbox note waiting for synthesis.").unwrap();
+        let observed_at = journal_source_observed_at(&journal_abs).unwrap();
+
+        let processed_source_paths = vec![journal_rel.to_string()];
+        let applied = apply_handoff_files(tmp.path(), "run-inbox", &processed_source_paths).unwrap();
+
+        assert_eq!(applied.renamed_sources.len(), 1);
+        let expected_rel = format!(
+            "journals/text/{:04}/{:02}/{:02}/raw-note.md",
+            observed_at.year(),
+            observed_at.month(),
+            observed_at.day()
+        );
+        assert_eq!(applied.renamed_sources[0].to_path, expected_rel);
+        assert!(tmp.path().join(&applied.renamed_sources[0].to_path).exists());
+        assert!(!tmp.path().join(journal_rel).exists());
+    }
+
+    #[test]
     fn apply_handoff_files_keeps_valid_outputs_when_one_type_fails() {
         let tmp = tempdir().unwrap();
         let insight_posts = InsightPostFile {
@@ -4436,5 +4663,23 @@ Do something useful.
             .path()
             .join("posts/workspace_synthesizer/pipeline/clips/product-demo.json")
             .exists());
+    }
+
+    #[test]
+    fn all_skill_definitions_include_hidden_audio_clip_skill() {
+        let tmp = tempdir().unwrap();
+        let store = load_or_seed_skill_store(tmp.path()).unwrap();
+
+        let visible_keys: Vec<String> = skill_definitions(&store)
+            .into_iter()
+            .map(|item| item.key)
+            .collect();
+        let all_keys: Vec<String> = all_skill_definitions(&store)
+            .into_iter()
+            .map(|item| item.key)
+            .collect();
+
+        assert!(!visible_keys.iter().any(|key| key == "audio_insight_clips"));
+        assert!(all_keys.iter().any(|key| key == "audio_insight_clips"));
     }
 }

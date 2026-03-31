@@ -74,10 +74,14 @@ pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
 const JOURNAL_TEXT_DIR: &str = "journals/text";
 const JOURNAL_MEDIA_DIR: &str = "journals/media";
+const JOURNAL_TEXT_INBOX_DIR: &str = "journals/text/inbox";
+const JOURNAL_AUDIO_INBOX_DIR: &str = "journals/media/audio/inbox";
 const SYNC_ALLOWED_ROOTS: &[&str] = &["journals", "posts", "skills"];
 const CONTENT_AGENT_APP_OPEN_STALE_SECS: i64 = 15 * 60;
 const WORKSPACE_SYNTHESIZER_WORKFLOW_KEY: &str = "workspace_synthesizer";
 const WORKSPACE_SYNTH_JOURNAL_SAVE_COOLDOWN_SECS: i64 = 60;
+const WORKSPACE_SYNTH_ERROR_RETRY_DELAY_SECS: i64 = 60 * 60;
+const JOURNAL_INBOX_MAINTENANCE_INTERVAL_SECS: u64 = 60;
 const LEGACY_AUDIO_INSIGHT_CLIPS_GOAL: &str =
     "Use my journal notes and available audio/video transcripts to identify practical insights and turn them into concise feed-ready posts, with each post saved as a separate file in posts/.";
 
@@ -90,6 +94,58 @@ fn hash_webhook_secret(value: &str) -> String {
 
     let digest = Sha256::digest(value.as_bytes());
     hex::encode(digest)
+}
+
+fn ensure_workspace_journal_drop_folders(workspace_dir: &StdPath) -> Result<()> {
+    for rel in [JOURNAL_TEXT_INBOX_DIR, JOURNAL_AUDIO_INBOX_DIR] {
+        std::fs::create_dir_all(workspace_dir.join(rel))
+            .with_context(|| format!("failed to create {}", workspace_dir.join(rel).display()))?;
+    }
+    Ok(())
+}
+
+fn is_supported_journal_audio_file(path: &StdPath) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "mp3" | "wav" | "m4a" | "aac" | "flac")
+}
+
+fn collect_journal_audio_inbox_rel_paths(workspace_dir: &StdPath) -> Vec<String> {
+    let root = workspace_dir.join(JOURNAL_AUDIO_INBOX_DIR);
+    if !root.exists() || !root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() || !is_supported_journal_audio_file(&path) {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(workspace_dir) else {
+                continue;
+            };
+            out.push(workspace_relative_display_path(rel));
+        }
+    }
+    out.sort();
+    out
 }
 
 /// How often the rate limiter sweeps stale IP entries from its map.
@@ -451,6 +507,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if let Err(err) = ensure_workflow_bot_creation_skill(&config.workspace_dir) {
         tracing::warn!("Failed to ensure workflow bot creation skill: {err}");
     }
+    if let Err(err) = ensure_workspace_journal_drop_folders(&config.workspace_dir) {
+        tracing::warn!("Failed to ensure workspace journal inbox folders: {err}");
+    }
 
     // ── Hooks ──────────────────────────────────────────────────────
     let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
@@ -598,6 +657,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
         openrouter_oauth: Arc::new(Mutex::new(None)),
     };
+
+    start_journal_inbox_maintenance(state.clone());
 
     // Core API/UI router (small request bodies)
     let core_router = Router::new()
@@ -2394,12 +2455,18 @@ fn source_file_modified_at_secs(path: &StdPath) -> i64 {
 }
 
 fn is_content_agent_source_file(path: &StdPath) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/");
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(extension.as_str(), "md" | "txt" | "json" | "srt")
+    if normalized.contains("/journals/text/transcriptions/")
+        || normalized.starts_with("journals/text/transcriptions/")
+    {
+        return matches!(extension.as_str(), "md" | "txt");
+    }
+    matches!(extension.as_str(), "md" | "txt" | "json")
 }
 
 fn latest_content_agent_source_updated_at(workspace_dir: &StdPath) -> i64 {
@@ -2655,6 +2722,90 @@ fn workspace_synth_cooldown_wait_duration(cooldown_until: &str) -> Duration {
         .unwrap_or_default()
 }
 
+fn workspace_synth_error_retry_due(
+    status: &workspace_synthesizer::WorkspaceSynthesizerStatus,
+    latest_source_updated_at: i64,
+) -> bool {
+    if !matches!(status.status.as_str(), "error") {
+        return false;
+    }
+
+    if latest_source_updated_at > status.last_source_updated_at {
+        return true;
+    }
+
+    let lower = status.last_error.to_ascii_lowercase();
+    let looks_retryable = [
+        "429",
+        "too many requests",
+        "rate limit",
+        "rate limited",
+        "quota",
+        "insufficient balance",
+        "insufficient quota",
+        "retry-after",
+        "retry_after",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if !looks_retryable {
+        return false;
+    }
+
+    let last_run_secs = parse_rfc3339_timestamp_secs(&status.last_run_at).unwrap_or(0);
+    last_run_secs <= 0 || Utc::now().timestamp() - last_run_secs >= WORKSPACE_SYNTH_ERROR_RETRY_DELAY_SECS
+}
+
+async fn enqueue_pending_journal_inbox_audio_transcriptions(state: &AppState) -> usize {
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let mut queued = 0usize;
+    for rel_path in collect_journal_audio_inbox_rel_paths(&workspace_dir) {
+        let Some(payload) = enqueue_journal_transcription(state, rel_path).await else {
+            continue;
+        };
+        let status = payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if matches!(status, "queued" | "running") {
+            queued += 1;
+        }
+    }
+    queued
+}
+
+fn start_journal_inbox_maintenance(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(JOURNAL_INBOX_MAINTENANCE_INTERVAL_SECS));
+        loop {
+            interval.tick().await;
+
+            let workspace_dir = state.config.lock().workspace_dir.clone();
+            if let Err(err) = ensure_workspace_journal_drop_folders(&workspace_dir) {
+                tracing::warn!("Failed to ensure journal inbox folders during maintenance: {err}");
+            }
+
+            let queued_audio = enqueue_pending_journal_inbox_audio_transcriptions(&state).await;
+            if queued_audio > 0 {
+                tracing::info!(
+                    queued_audio,
+                    "Queued pending journal inbox audio transcription jobs"
+                );
+            }
+
+            let (provider_ready, _) = workspace_synth_provider_readiness(&state).await;
+            if !provider_ready {
+                continue;
+            }
+
+            if let Err(err) = queue_workspace_synthesizer_for_trigger(&state, "app-open") {
+                tracing::warn!("Failed to queue workspace synth from inbox maintenance: {err}");
+            }
+        }
+    });
+}
+
 fn schedule_workspace_synth_after_journal_save_cooldown(
     state: AppState,
     cooldown_until: String,
@@ -2852,8 +3003,9 @@ fn queue_workspace_synthesizer_for_trigger(
         return Ok(None);
     }
     if reason.eq_ignore_ascii_case("app-open")
-        && status.last_source_updated_at > 0
         && status.last_source_updated_at >= latest_source_updated_at
+        && matches!(status.status.as_str(), "error")
+        && !workspace_synth_error_retry_due(&status, latest_source_updated_at)
     {
         return Ok(None);
     }
@@ -3007,6 +3159,12 @@ fn workspace_synth_default_artifact_states() -> workspace_synthesizer::Workspace
             item_count: 0,
             error: String::new(),
         },
+        journal_titles: workspace_synthesizer::WorkspaceSynthArtifactState {
+            status: "skipped".to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH.to_string(),
+            item_count: 0,
+            error: String::new(),
+        },
         primitive_entities: workspace_synthesizer::WorkspaceSynthArtifactState {
             status: "skipped".to_string(),
             path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH.to_string(),
@@ -3073,6 +3231,9 @@ fn workspace_synth_artifact_state_mut<'a>(
         workspace_synthesizer::WORKSPACE_EVENT_EXTRACTOR_WORKFLOW_KEY => Some(&mut states.events),
         workspace_synthesizer::WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => {
             Some(&mut states.clip_plans)
+        }
+        workspace_synthesizer::WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => {
+            Some(&mut states.journal_titles)
         }
         _ => None,
     }
@@ -3267,6 +3428,101 @@ async fn workspace_synth_provider_readiness(state: &AppState) -> (bool, String) 
         )
     };
     (false, reason)
+}
+
+/// Build the prompt for the triage classification call.
+///
+/// Lists every enabled skill with a one-line goal, inlines the source notes,
+/// and asks the model to return a JSON object with `relevant_skills` and
+/// `keywords`.
+fn render_workspace_synth_triage_prompt(
+    enabled_skills: &[(String, String)], // (key, goal)
+    inline_source_bundle: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Classify this journal note batch. Decide which extraction skills should run and extract topical keywords.\n\n");
+    prompt.push_str("## Available Skills\n");
+    for (key, goal) in enabled_skills {
+        prompt.push_str(&format!("- `{}`: {}\n", key, goal));
+    }
+    prompt.push_str("\n## Source Notes\n");
+    prompt.push_str(inline_source_bundle);
+    prompt.push_str("\n\n## Instructions\n");
+    prompt.push_str("Return a single JSON object and nothing else.\n");
+    prompt.push_str("```json\n");
+    prompt.push_str(r#"{"relevant_skills": ["skill_key_1", "skill_key_2"], "keywords": ["kw1", "kw2"]}"#);
+    prompt.push_str("\n```\n\n");
+    prompt.push_str("Rules:\n");
+    prompt.push_str("- Include a skill only if the notes contain content that matches that skill's goal.\n");
+    prompt.push_str("- `workspace_journal_title_extractor` is always relevant when notes exist.\n");
+    prompt.push_str("- `workspace_insight_extractor` is relevant for most non-trivial notes with ideas, reflections, or observations.\n");
+    prompt.push_str("- `workspace_todo_extractor` is relevant only if the notes contain action items, commitments, plans, or to-dos.\n");
+    prompt.push_str("- `workspace_event_extractor` is relevant only if the notes mention specific dates, times, or scheduled events.\n");
+    prompt.push_str("- `workspace_clip_extractor` is relevant only if the notes include audio or video transcript content.\n");
+    prompt.push_str("- Extract 3-8 topical keywords that capture the main subjects of the notes.\n");
+    prompt.push_str("- Return only the JSON object. No prose, no code fences beyond the object itself.\n");
+    prompt
+}
+
+/// Run the triage classification call against the current provider.
+///
+/// Returns `Some(TriageResult)` on success or `None` if the call fails or
+/// the response cannot be parsed. The caller should fall through to the
+/// default behavior (run all enabled skills) when `None` is returned.
+async fn run_workspace_synth_triage(
+    state: &AppState,
+    workspace_dir: &StdPath,
+    enabled_skills: &[(String, String)],
+    target_sources: &[WorkspaceSynthSourceCandidate],
+) -> Option<workspace_synthesizer::TriageResult> {
+    if target_sources.is_empty() || enabled_skills.is_empty() {
+        return None;
+    }
+    let inline_bundle = match render_workspace_synth_inline_source_bundle(workspace_dir, target_sources)
+    {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!("workspace synth triage: failed to inline sources: {err}");
+            return None;
+        }
+    };
+    let prompt = render_workspace_synth_triage_prompt(enabled_skills, &inline_bundle);
+    let system = "You are a strict JSON classification engine for ZeroClaw workspace synthesis. Return exactly one valid JSON object and no prose, code fences, or tool calls.";
+
+    let reply = match tokio::time::timeout(
+        Duration::from_secs(workspace_synthesizer::WORKSPACE_SYNTH_TRIAGE_TIMEOUT_SECS),
+        run_local_provider_prompt_without_tools(state, system, &prompt),
+    )
+    .await
+    {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(err)) => {
+            tracing::warn!("workspace synth triage call failed: {err}");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                "workspace synth triage timed out after {}s",
+                workspace_synthesizer::WORKSPACE_SYNTH_TRIAGE_TIMEOUT_SECS
+            );
+            return None;
+        }
+    };
+
+    match workspace_synthesizer::parse_triage_response(&reply) {
+        Some(result) => {
+            tracing::info!(
+                "workspace synth triage: relevant_skills={:?}, keywords={:?}",
+                result.relevant_skills,
+                result.keywords
+            );
+            Some(result)
+        }
+        None => {
+            tracing::warn!("workspace synth triage: failed to parse response: {}", reply.chars().take(200).collect::<String>());
+            None
+        }
+    }
 }
 
 fn render_workspace_synth_split_batch_prompt(
@@ -3763,7 +4019,50 @@ async fn run_workspace_synthesizer_orchestrator(
     let mut split_batch_started_at = None;
     let mut split_batch_finished_at = None;
 
-    for skill in workspace_synthesizer::skill_definitions(&skill_store) {
+    // --- Triage: classify the note batch to decide which skills to run ---
+    let all_skill_defs = workspace_synthesizer::all_skill_definitions(&skill_store);
+    let enabled_skill_list: Vec<(String, String)> = all_skill_defs
+        .iter()
+        .filter(|s| {
+            skill_store
+                .skills
+                .get(&s.key)
+                .map(|r| r.enabled)
+                .unwrap_or(false)
+        })
+        .filter(|s| {
+            // Skip skills that would be filtered anyway on free routes.
+            !(sequential_split_skills
+                && workspace_synth_skip_primitive_extractors_for_free_route(&s.key))
+        })
+        .filter(|s| workspace_synth_skill_unsupported_reason(s, media_capabilities).is_none())
+        .map(|s| (s.key.clone(), s.goal.clone()))
+        .collect();
+
+    let triage_result = if !target_sources.is_empty() && enabled_skill_list.len() > 1 {
+        run_workspace_synth_triage(state, workspace_dir, &enabled_skill_list, target_sources).await
+    } else {
+        None
+    };
+
+    let triage_relevant: Option<HashSet<String>> = triage_result.as_ref().map(|t| {
+        t.relevant_skills.iter().cloned().collect()
+    });
+    let triage_keywords: Vec<String> = triage_result
+        .as_ref()
+        .map(|t| t.keywords.clone())
+        .unwrap_or_default();
+
+    if let Some(ref relevant) = triage_relevant {
+        tracing::info!(
+            "workspace synth triage active: {}/{} skills relevant for this batch",
+            relevant.len(),
+            enabled_skill_list.len()
+        );
+    }
+    // --- End triage ---
+
+    for skill in all_skill_defs {
         let enabled = skill_store
             .skills
             .get(&skill.key)
@@ -3778,6 +4077,19 @@ async fn run_workspace_synthesizer_orchestrator(
                 0,
             ));
             continue;
+        }
+        // If triage ran and this skill was not deemed relevant, skip it.
+        if let Some(ref relevant) = triage_relevant {
+            if !relevant.contains(&skill.key) {
+                skill_runs.push(workspace_synth_skill_run_state(
+                    &skill,
+                    "skipped",
+                    "Triage: not relevant for this note batch.".to_string(),
+                    String::new(),
+                    0,
+                ));
+                continue;
+            }
         }
         if sequential_split_skills
             && workspace_synth_skip_primitive_extractors_for_free_route(&skill.key)
@@ -4309,6 +4621,9 @@ async fn run_workspace_synthesizer_orchestrator(
     if !split_artifact_states.clip_plans.error.trim().is_empty() {
         applied.artifact_states.clip_plans = split_artifact_states.clip_plans.clone();
     }
+    if !split_artifact_states.journal_titles.error.trim().is_empty() {
+        applied.artifact_states.journal_titles = split_artifact_states.journal_titles.clone();
+    }
     if !split_artifact_states.primitive_entities.error.trim().is_empty() {
         applied.artifact_states.primitive_entities = split_artifact_states.primitive_entities.clone();
     }
@@ -4378,6 +4693,8 @@ async fn run_workspace_synthesizer_orchestrator(
         applied.applied_any = true;
     }
     applied.skill_runs = skill_runs;
+    persist_workspace_synth_triage_keywords(workspace_dir, target_sources, &triage_keywords);
+    applied.triage_keywords = triage_keywords;
 
     let reply = if skill_replies.is_empty() {
         applied.summary.clone()
@@ -4390,6 +4707,66 @@ async fn run_workspace_synthesizer_orchestrator(
     };
 
     Ok((reply, applied))
+}
+
+fn persist_workspace_synth_triage_keywords(
+    workspace_dir: &StdPath,
+    target_sources: &[WorkspaceSynthSourceCandidate],
+    triage_keywords: &[String],
+) {
+    if triage_keywords.is_empty() {
+        return;
+    }
+
+    let triage_keywords_json = match serde_json::to_string(triage_keywords) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("workspace synth triage: failed to serialize keywords: {err}");
+            return;
+        }
+    };
+    let now = Utc::now().to_rfc3339();
+
+    for source in target_sources {
+        let existing = match local_store::get_feed_interest_source(workspace_dir, &source.source_path) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    source_path = %source.source_path,
+                    "workspace synth triage: failed to load existing source record: {err}"
+                );
+                None
+            }
+        };
+        let title = existing
+            .as_ref()
+            .map(|record| record.title.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                StdPath::new(&source.source_path)
+                    .file_stem()
+                    .map(|value| value.to_string_lossy().replace(['_', '-'], " "))
+                    .unwrap_or_else(|| "Workspace interest".to_string())
+            });
+        let record = local_store::FeedInterestSourceRecord {
+            source_path: source.source_path.clone(),
+            content_hash: source.content_hash.clone(),
+            profile_input_hash: existing
+                .as_ref()
+                .map(|record| record.profile_input_hash.clone())
+                .unwrap_or_default(),
+            interest_id: existing.and_then(|record| record.interest_id),
+            title,
+            triage_keywords_json: triage_keywords_json.clone(),
+            updated_at: now.clone(),
+        };
+        if let Err(err) = local_store::upsert_feed_interest_source(workspace_dir, &record) {
+            tracing::warn!(
+                source_path = %record.source_path,
+                "workspace synth triage: failed to persist source keywords: {err}"
+            );
+        }
+    }
 }
 
 fn queue_workflow_run(
@@ -8375,12 +8752,16 @@ async fn journal_transcribe_status_payload(
 
     let jobs = state.journal_transcription_jobs.lock();
     if let Some(job) = jobs.get(requested) {
+        let resolved_transcript_path = job
+            .transcript_path
+            .clone()
+            .unwrap_or_else(|| transcript_rel_path.clone());
         return Ok(serde_json::json!({
             "ok": true,
             "mediaPath": requested,
-            "path": transcript_rel_path,
-            "jsonPath": transcript_json_path,
-            "srtPath": transcript_srt_path,
+            "path": resolved_transcript_path,
+            "jsonPath": transcript_json_rel_path(&resolved_transcript_path),
+            "srtPath": transcript_srt_rel_path(&resolved_transcript_path),
             "status": job.status,
             "error": job.error,
             "updatedAt": job.updated_at,
@@ -8525,6 +8906,191 @@ fn legacy_transcript_rel_path_for_media(media_rel_path: &str) -> Option<String> 
     Some(format!("journals/text/transcript/{stem}.txt"))
 }
 
+fn source_file_created_or_modified_at(path: &StdPath) -> Option<chrono::DateTime<Utc>> {
+    let metadata = path.metadata().ok()?;
+    let timestamp = metadata.created().or_else(|_| metadata.modified()).ok()?;
+    Some(timestamp.into())
+}
+
+fn rewrite_transcript_json_sidecar_paths(
+    json_abs_path: &StdPath,
+    media_abs_path: &StdPath,
+    transcript_abs_path: &StdPath,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(json_abs_path)
+        .with_context(|| format!("failed to read {}", json_abs_path.display()))?;
+    let mut payload: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", json_abs_path.display()))?;
+    let Some(object) = payload.as_object_mut() else {
+        anyhow::bail!(
+            "transcript json sidecar must be a JSON object: {}",
+            json_abs_path.display()
+        );
+    };
+    object.insert(
+        "source".to_string(),
+        serde_json::Value::String(media_abs_path.to_string_lossy().into_owned()),
+    );
+    object.insert(
+        "transcriptPath".to_string(),
+        serde_json::Value::String(transcript_abs_path.to_string_lossy().into_owned()),
+    );
+    let serialized = serde_json::to_string_pretty(&payload)
+        .with_context(|| format!("failed to serialize {}", json_abs_path.display()))?;
+    std::fs::write(json_abs_path, format!("{serialized}\n"))
+        .with_context(|| format!("failed to write {}", json_abs_path.display()))
+}
+
+fn relocate_inbox_audio_after_transcription(
+    workspace_dir: &StdPath,
+    media_rel_path: &str,
+    transcript_rel_path: &str,
+) -> Result<(String, String)> {
+    let media_rel = normalize_workspace_relative_path(media_rel_path);
+    let transcript_rel = normalize_workspace_relative_path(transcript_rel_path);
+    if !media_rel.starts_with(&format!("{JOURNAL_AUDIO_INBOX_DIR}/")) {
+        return Ok((media_rel, transcript_rel));
+    }
+
+    let Some(media_abs) = resolve_workspace_media_path(workspace_dir, &media_rel) else {
+        return Ok((media_rel, transcript_rel));
+    };
+    let observed_at = source_file_created_or_modified_at(&media_abs).unwrap_or_else(Utc::now);
+    let original_name = media_abs
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("audio-note.m4a");
+
+    let safe_name = safe_file_name(original_name);
+    let mut candidate_rel = format!(
+        "{}/audio/{:04}/{:02}/{:02}/{}_{}",
+        JOURNAL_MEDIA_DIR,
+        observed_at.year(),
+        observed_at.month(),
+        observed_at.day(),
+        observed_at.format("%H%M%S"),
+        safe_name
+    );
+    let mut candidate_abs = workspace_dir.join(&candidate_rel);
+    if candidate_abs.exists() && candidate_abs != media_abs {
+        let suffix = &Uuid::new_v4().simple().to_string()[..8];
+        let file_stem = StdPath::new(&safe_name)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("audio-note");
+        let extension = StdPath::new(&safe_name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("m4a");
+        candidate_rel = format!(
+            "{}/audio/{:04}/{:02}/{:02}/{}_{}-{}.{}",
+            JOURNAL_MEDIA_DIR,
+            observed_at.year(),
+            observed_at.month(),
+            observed_at.day(),
+            observed_at.format("%H%M%S"),
+            file_stem,
+            suffix,
+            extension
+        );
+        candidate_abs = workspace_dir.join(&candidate_rel);
+    }
+
+    if candidate_abs == media_abs {
+        return Ok((media_rel, transcript_rel));
+    }
+
+    if let Some(parent) = candidate_abs.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::rename(&media_abs, &candidate_abs).with_context(|| {
+        format!(
+            "failed to relocate inbox audio {} -> {}",
+            media_abs.display(),
+            candidate_abs.display()
+        )
+    })?;
+
+    let Some(new_transcript_rel) = transcript_rel_path_for_media(&candidate_rel) else {
+        return Ok((candidate_rel, transcript_rel));
+    };
+    let new_transcript_abs = workspace_dir.join(&new_transcript_rel);
+    let new_transcript_json_rel = transcript_json_rel_path(&new_transcript_rel);
+    let transcript_pairs = [
+        (transcript_rel.clone(), new_transcript_rel.clone()),
+        (
+            transcript_json_rel_path(&transcript_rel),
+            new_transcript_json_rel.clone(),
+        ),
+        (
+            transcript_srt_rel_path(&transcript_rel),
+            transcript_srt_rel_path(&new_transcript_rel),
+        ),
+    ];
+    for (old_rel, new_rel) in transcript_pairs {
+        if old_rel == new_rel {
+            continue;
+        }
+        let old_abs = workspace_dir.join(&old_rel);
+        if !old_abs.exists() {
+            continue;
+        }
+        let new_abs = workspace_dir.join(&new_rel);
+        if let Some(parent) = new_abs.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        std::fs::rename(&old_abs, &new_abs).with_context(|| {
+            format!(
+                "failed to relocate transcript sidecar {} -> {}",
+                old_abs.display(),
+                new_abs.display()
+            )
+        })?;
+        if let Err(err) =
+            local_store::rename_workspace_synth_source_path(workspace_dir, &old_rel, &new_rel)
+        {
+            tracing::warn!(
+                old = old_rel,
+                new = %new_rel,
+                err = %err,
+                "transcript source path rename failed"
+            );
+        }
+        if new_rel == new_transcript_json_rel {
+            if let Err(err) = rewrite_transcript_json_sidecar_paths(
+                &new_abs,
+                &candidate_abs,
+                &new_transcript_abs,
+            ) {
+                tracing::warn!(
+                    path = %new_rel,
+                    err = %err,
+                    "failed to rewrite relocated transcript json metadata"
+                );
+            }
+        }
+    }
+
+    match local_store::rename_media_asset_path(workspace_dir, &media_rel, &candidate_rel) {
+        Ok(0) => tracing::warn!(
+            old = media_rel,
+            new = %candidate_rel,
+            "audio relocation: no media asset rows matched"
+        ),
+        Err(err) => tracing::warn!(
+            old = media_rel,
+            new = %candidate_rel,
+            err = %err,
+            "audio relocation failed to update media metadata"
+        ),
+        _ => {}
+    }
+
+    Ok((candidate_rel, new_transcript_rel))
+}
+
 fn enqueue_transcription_job(
     state: AppState,
     media_rel_path: String,
@@ -8560,7 +9126,7 @@ fn enqueue_transcription_job(
             );
         }
 
-        let final_state = match run_local_faster_whisper(
+        let (final_media_rel_path, final_state) = match run_local_faster_whisper(
             &state_for_task,
             &media_abs_path,
             &transcript_abs_path,
@@ -8568,26 +9134,58 @@ fn enqueue_transcription_job(
         )
         .await
         {
-            Ok(_) => JournalTranscriptionJob {
-                status: "done".to_string(),
-                transcript_path: Some(task_transcript_rel_path.clone()),
-                error: None,
-                updated_at: chrono::Utc::now().to_rfc3339(),
-            },
-            Err(error) => JournalTranscriptionJob {
-                status: "error".to_string(),
-                transcript_path: Some(task_transcript_rel_path.clone()),
-                error: Some(frontend_background_error(
-                    "journal transcription",
-                    "Transcription failed.",
-                    &error,
-                )),
-                updated_at: chrono::Utc::now().to_rfc3339(),
-            },
+            Ok(_) => {
+                let workspace_dir = state_for_task.config.lock().workspace_dir.clone();
+                let (final_media_rel, final_transcript_rel) =
+                    match relocate_inbox_audio_after_transcription(
+                        &workspace_dir,
+                        &media_rel_path,
+                        &task_transcript_rel_path,
+                    ) {
+                        Ok(paths) => paths,
+                        Err(err) => {
+                            tracing::warn!(
+                                media_path = %media_rel_path,
+                                transcript_path = %task_transcript_rel_path,
+                                err = %err,
+                                "Failed to relocate processed inbox audio; keeping original paths"
+                            );
+                            (media_rel_path.clone(), task_transcript_rel_path.clone())
+                        }
+                    };
+                (
+                    final_media_rel,
+                    JournalTranscriptionJob {
+                        status: "done".to_string(),
+                        transcript_path: Some(final_transcript_rel),
+                        error: None,
+                        updated_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                )
+            }
+            Err(error) => (
+                media_rel_path.clone(),
+                JournalTranscriptionJob {
+                    status: "error".to_string(),
+                    transcript_path: Some(task_transcript_rel_path.clone()),
+                    error: Some(frontend_background_error(
+                        "journal transcription",
+                        "Transcription failed.",
+                        &error,
+                    )),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                },
+            ),
         };
 
-        let mut jobs = state_for_task.journal_transcription_jobs.lock();
-        jobs.insert(media_rel_path, final_state);
+        {
+            let mut jobs = state_for_task.journal_transcription_jobs.lock();
+            jobs.insert(media_rel_path.clone(), final_state.clone());
+            if final_media_rel_path != media_rel_path {
+                jobs.insert(final_media_rel_path.clone(), final_state.clone());
+            }
+        }
+
     });
 
     JournalTranscriptionJob {
@@ -11131,8 +11729,10 @@ async fn rebuild_interest_profile(
             &local_store::FeedInterestSourceRecord {
                 source_path: path.to_string(),
                 content_hash,
+                profile_input_hash: String::new(),
                 interest_id: mapped_interest_id,
                 title: label,
+                triage_keywords_json: String::new(),
                 updated_at: now,
             },
         )?;
@@ -13366,6 +13966,208 @@ mod tests {
     }
 
     #[test]
+    fn collect_journal_audio_inbox_rel_paths_returns_supported_audio_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let audio_dir = workspace.join(JOURNAL_AUDIO_INBOX_DIR);
+        std::fs::create_dir_all(audio_dir.join("nested")).unwrap();
+        std::fs::write(audio_dir.join("voice.m4a"), b"audio").unwrap();
+        std::fs::write(audio_dir.join("nested/voice.mp3"), b"audio").unwrap();
+        std::fs::write(audio_dir.join("ignore.txt"), b"text").unwrap();
+
+        let paths = collect_journal_audio_inbox_rel_paths(workspace);
+        assert_eq!(
+            paths,
+            vec![
+                "journals/media/audio/inbox/nested/voice.mp3",
+                "journals/media/audio/inbox/voice.m4a"
+            ]
+        );
+    }
+
+    #[test]
+    fn relocate_inbox_audio_after_transcription_moves_media_and_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        local_store::initialize(workspace).unwrap();
+
+        let media_rel = "journals/media/audio/inbox/voice-note.m4a";
+        let transcript_rel = "journals/text/transcriptions/audio/inbox/voice-note.txt";
+        let media_abs = workspace.join(media_rel);
+        let transcript_abs = workspace.join(transcript_rel);
+        std::fs::create_dir_all(media_abs.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(transcript_abs.parent().unwrap()).unwrap();
+        std::fs::write(&media_abs, b"audio").unwrap();
+        std::fs::write(&transcript_abs, "hello world").unwrap();
+        let transcript_json_abs = workspace.join(transcript_json_rel_path(transcript_rel));
+        std::fs::write(
+            &transcript_json_abs,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "source": media_abs.to_string_lossy(),
+                    "transcriptPath": transcript_abs.to_string_lossy(),
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join(transcript_srt_rel_path(transcript_rel)),
+            "1\n00:00:00,000 --> 00:00:01,000\nhello world\n",
+        )
+        .unwrap();
+
+        let (new_media_rel, new_transcript_rel) =
+            relocate_inbox_audio_after_transcription(workspace, media_rel, transcript_rel).unwrap();
+
+        assert!(new_media_rel.starts_with("journals/media/audio/"));
+        assert!(!new_media_rel.contains("/inbox/"));
+        assert!(new_transcript_rel.starts_with("journals/text/transcriptions/audio/"));
+        assert!(!new_transcript_rel.contains("/inbox/"));
+        assert!(workspace.join(&new_media_rel).exists());
+        assert!(workspace.join(&new_transcript_rel).exists());
+        assert!(workspace
+            .join(transcript_json_rel_path(&new_transcript_rel))
+            .exists());
+        assert!(workspace
+            .join(transcript_srt_rel_path(&new_transcript_rel))
+            .exists());
+        assert!(!workspace.join(media_rel).exists());
+        assert!(!workspace.join(transcript_rel).exists());
+
+        let relocated_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(workspace.join(transcript_json_rel_path(&new_transcript_rel)))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            relocated_json["source"].as_str(),
+            Some(workspace.join(&new_media_rel).to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            relocated_json["transcriptPath"].as_str(),
+            Some(workspace.join(&new_transcript_rel).to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_synth_app_open_queues_older_pending_backlog_after_recent_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let journal_dir = workspace.join("journals/text");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        local_store::initialize(workspace).unwrap();
+
+        let older_body = "older backlog note";
+        let recent_body = "recent processed note";
+        std::fs::write(journal_dir.join("older.md"), older_body).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(journal_dir.join("recent.md"), recent_body).unwrap();
+
+        let recent_hash = content_hash_16(recent_body);
+        local_store::upsert_workspace_synth_sources(
+            workspace,
+            &[local_store::WorkspaceSynthSourceUpsert {
+                source_path: "journals/text/recent.md".to_string(),
+                content_hash: recent_hash.clone(),
+                word_count: 3,
+                last_processed_hash: recent_hash,
+                last_processed_at: Utc::now().to_rfc3339(),
+                last_batch_id: "batch-recent".to_string(),
+            }],
+        )
+        .unwrap();
+
+        workspace_synthesizer::save_status(
+            workspace,
+            &workspace_synthesizer::WorkspaceSynthesizerStatus {
+                status: "done".to_string(),
+                last_run_at: Utc::now().to_rfc3339(),
+                last_source_updated_at: source_file_modified_at_secs(&journal_dir.join("recent.md")),
+                ..workspace_synthesizer::WorkspaceSynthesizerStatus::default()
+            },
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        let state = test_app_state_with_config(config);
+        let mut store = load_or_seed_feed_workflow_settings_store(workspace).unwrap();
+        store
+            .workflows
+            .get_mut(WORKSPACE_SYNTHESIZER_WORKFLOW_KEY)
+            .expect("workspace synthesizer workflow should exist")
+            .enabled = true;
+        save_feed_workflow_settings_store(workspace, &store).unwrap();
+
+        let thread_id = queue_workspace_synthesizer_for_trigger(&state, "app-open").unwrap();
+        assert!(thread_id.is_some(), "older pending backlog should still queue");
+    }
+
+    #[tokio::test]
+    async fn workspace_synth_app_open_retries_rate_limited_batches_only_after_backoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let journal_dir = workspace.join("journals/text");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        std::fs::write(journal_dir.join("entry.md"), "pending note").unwrap();
+        local_store::initialize(workspace).unwrap();
+
+        let latest = source_file_modified_at_secs(&journal_dir.join("entry.md"));
+
+        let mut config = Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        let state = test_app_state_with_config(config);
+        let mut store = load_or_seed_feed_workflow_settings_store(workspace).unwrap();
+        store
+            .workflows
+            .get_mut(WORKSPACE_SYNTHESIZER_WORKFLOW_KEY)
+            .expect("workspace synthesizer workflow should exist")
+            .enabled = true;
+        save_feed_workflow_settings_store(workspace, &store).unwrap();
+
+        workspace_synthesizer::save_status(
+            workspace,
+            &workspace_synthesizer::WorkspaceSynthesizerStatus {
+                status: "error".to_string(),
+                last_run_at: Utc::now().to_rfc3339(),
+                last_source_updated_at: latest,
+                last_error: "429 Too Many Requests".to_string(),
+                ..workspace_synthesizer::WorkspaceSynthesizerStatus::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            queue_workspace_synthesizer_for_trigger(&state, "app-open")
+                .unwrap()
+                .is_none(),
+            "recent rate-limit errors should respect retry backoff"
+        );
+
+        workspace_synthesizer::save_status(
+            workspace,
+            &workspace_synthesizer::WorkspaceSynthesizerStatus {
+                status: "error".to_string(),
+                last_run_at: (Utc::now()
+                    - chrono::Duration::seconds(WORKSPACE_SYNTH_ERROR_RETRY_DELAY_SECS + 5))
+                .to_rfc3339(),
+                last_source_updated_at: latest,
+                last_error: "429 Too Many Requests".to_string(),
+                ..workspace_synthesizer::WorkspaceSynthesizerStatus::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            queue_workspace_synthesizer_for_trigger(&state, "app-open")
+                .unwrap()
+                .is_some(),
+            "rate-limited batches should retry once backoff has elapsed"
+        );
+    }
+
+    #[test]
     fn latest_content_agent_source_updated_at_reads_nested_transcripts() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path();
@@ -13425,6 +14227,45 @@ mod tests {
         assert_eq!(
             selected_paths,
             vec!["journals/text/recent.md", "journals/text/older.md"]
+        );
+    }
+
+    #[test]
+    fn select_workspace_synth_sources_ignores_transcript_json_and_srt_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let transcript_dir = workspace.join("journals/text/transcriptions/audio");
+        std::fs::create_dir_all(workspace.join("state")).unwrap();
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        local_store::initialize(workspace).unwrap();
+
+        let transcript_rel = "journals/text/transcriptions/audio/clip.txt";
+        let transcript_abs = workspace.join(transcript_rel);
+        std::fs::write(&transcript_abs, "mindful observation").unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(
+            workspace.join(transcript_json_rel_path(transcript_rel)),
+            "{\"segments\":[]}\n",
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(
+            workspace.join(transcript_srt_rel_path(transcript_rel)),
+            "1\n00:00:00,000 --> 00:00:01,000\nmindful observation\n",
+        )
+        .unwrap();
+
+        let selection = select_workspace_synth_sources(workspace, &[], false).unwrap();
+        let selected_paths: Vec<&str> = selection
+            .selected
+            .iter()
+            .map(|item| item.source_path.as_str())
+            .collect();
+
+        assert_eq!(selection.pending.len(), 1);
+        assert_eq!(
+            selected_paths,
+            vec!["journals/text/transcriptions/audio/clip.txt"]
         );
     }
 

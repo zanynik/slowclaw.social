@@ -1,0 +1,172 @@
+{
+  "skills": {
+    "workspace_primitive_event_extractor": {
+      "skillKey": "workspace_primitive_event_extractor",
+      "name": "Workspace Primitive Event Extractor",
+      "skillPath": "skills/workspace_synthesizer/workspace_primitive_event_extractor/SKILL.md",
+      "outputPrefix": "posts/workspace_synthesizer/",
+      "enabled": false,
+      "goal": "Extract scheduled or notable events from recent journals and transcripts. Write only the primitive events handoff JSON for Rust to compile into planner outputs and timelines.",
+      "builtInSkillFingerprint": "4ae613ac3284d09c29e0ef0df5fabd61e505f6a3eb707557b8cb04c691ab8c90",
+      "visibleInUi": false,
+      "handlerKind": "split_handoff",
+      "artifactRulesOverride": ""
+    },
+    "workspace_todo_extractor": {
+      "skillKey": "workspace_todo_extractor",
+      "name": "Workspace Todo Extractor",
+      "skillPath": "skills/workspace_synthesizer/workspace_todo_extractor/SKILL.md",
+      "outputPrefix": "posts/workspace_synthesizer/",
+      "enabled": true,
+      "goal": "Extract concrete action items and commitments from recent journals and transcripts. Write only the todos handoff JSON for Rust to store in the planner.",
+      "builtInSkillFingerprint": "c6181bfbd113d9d65c7535340835e869850176cdc863f639aec799335b644157",
+      "visibleInUi": true,
+      "handlerKind": "split_handoff",
+      "artifactRulesOverride": ""
+    },
+    "article_synthesizer": {
+      "skillKey": "article_synthesizer",
+      "name": "Long-Form Articles",
+      "skillPath": "skills/workspace_synthesizer/article_synthesizer/SKILL.md",
+      "outputPrefix": "posts/articles/",
+      "enabled": false,
+      "goal": "Build clean long-form articles from journal notes over time. Decide whether to refine an existing article or create a new one, then hand off JSON for Rust to materialize markdown under posts/articles/.",
+      "builtInSkillFingerprint": "e1716915bd6626d16a5d7eea6dbc8709020066a4b9d728a74d02f7d61b0a67bf",
+      "visibleInUi": false,
+      "handlerKind": "article_handoff",
+      "artifactRulesOverride": ""
+    },
+    "weekly_highlights": {
+      "skillKey": "weekly_highlights",
+      "name": "Weekly Highlights",
+      "skillPath": "skills/workspace_synthesizer/weekly_highlights/SKILL.md",
+      "outputPrefix": "posts/weekly_highlights/",
+      "enabled": false,
+      "goal": "Turn my recent journal notes into polished weekly highlight posts for the workspace feed. Save each highlight as a separate file in posts/.",
+      "builtInSkillFingerprint": "7adc5ed969a9b03a7d346a90fb6c1a30763ad1e54efa176415a42036ae35ceda",
+      "visibleInUi": false,
+      "handlerKind": "direct_post_output",
+      "artifactRulesOverride": ""
+    },
+    "workspace_entity_extractor": {
+      "skillKey": "workspace_entity_extractor",
+      "name": "Workspace Entity Extractor",
+      "skillPath": "skills/workspace_synthesizer/workspace_entity_extractor/SKILL.md",
+      "outputPrefix": "posts/workspace_synthesizer/",
+      "enabled": false,
+      "goal": "Extract canonical entities from recent journals and transcripts. Write only the primitive entities handoff JSON for Rust to compile into downstream outputs.",
+      "builtInSkillFingerprint": "48f2c350f4558e3a4209298f22063bd5371ad265673e6230083696fb11bae60f",
+      "visibleInUi": false,
+      "handlerKind": "split_handoff",
+      "artifactRulesOverride": ""
+    },
+    "audio_insight_clips": {
+      "skillKey": "audio_insight_clips",
+      "name": "Audio Insight Clips",
+      "skillPath": "skills/workspace_synthesizer/audio_insight_clips/SKILL.md",
+      "outputPrefix": "posts/audio_insight_clips/",
+      "enabled": false,
+      "goal": "Create simple vertical video clips from my journal audio recordings. If a transcript is missing, generate it first, extract exact insightful lines, build black-background text cards, and render a feed-ready mp4 into posts/.",
+      "builtInSkillFingerprint": "9721366c133d1189c7d5d42d9293a035104ba8fcd607799bb3a55edc20a54856",
+      "visibleInUi": false,
+      "handlerKind": "direct_media_output",
+      "artifactRulesOverride": ""
+    },
+    "workspace_action_extractor": {
+      "skillKey": "workspace_action_extractor",
+      "name": "Workspace Action Extractor",
+      "skillPath": "skills/workspace_synthesizer/workspace_action_extractor/SKILL.md",
+      "outputPrefix": "posts/workspace_synthesizer/",
+      "enabled": false,
+      "goal": "Extract explicit actions, commitments, and follow-ups from recent journals and transcripts. Write only the primitive actions handoff JSON for Rust to compile into planner outputs.",
+      "builtInSkillFingerprint": "dd935217f61b1d573ae887646e3b2d90e31ed85119e3928e1289435b04d5bcfe",
+      "visibleInUi": false,
+      "handlerKind": "split_handoff",
+      "artifactRulesOverride": ""
+    },
+    "workspace_insight_extractor": {
+      "skillKey": "workspace_insight_extractor",
+      "name": "Workspace Insight Extractor",
+      "skillPath": "skills/workspace_synthesizer/workspace_insight_extractor/SKILL.md",
+      "outputPrefix": "posts/workspace_synthesizer/",
+      "enabled": true,
+      "goal": "Extract concise workspace feed posts from recent journals and transcripts. Write only the insight_posts handoff JSON for Rust to materialize into feed posts.",
+      "builtInSkillFingerprint": "93ed6960f8539417c0011b1ccdf4c6140808cc892db50a2c44f0ff8d9aaeab1b",
+      "visibleInUi": true,
+      "handlerKind": "split_handoff",
+      "artifactRulesOverride": ""
+    },
+    "workspace_journal_title_extractor": {
+      "skillKey": "workspace_journal_title_extractor",
+      "name": "Workspace Journal Title Extractor",
+      "skillPath": "skills/workspace_synthesizer/workspace_journal_title_extractor/SKILL.md",
+      "outputPrefix": "posts/workspace_synthesizer/",
+      "enabled": false,
+      "goal": "Propose concise durable titles for the current journal note batch. Write only the journal_titles handoff JSON for Rust to rename journal note files.",
+      "builtInSkillFingerprint": "04fc8909caac8ab50500aa3b832ed1566b3586f365c8a90a32753133949eae40",
+      "visibleInUi": true,
+      "handlerKind": "split_handoff",
+      "artifactRulesOverride": ""
+    },
+    "workspace_clip_extractor": {
+      "skillKey": "workspace_clip_extractor",
+      "name": "Workspace Clip Extractor",
+      "skillPath": "skills/workspace_synthesizer/workspace_clip_extractor/SKILL.md",
+      "outputPrefix": "posts/workspace_synthesizer/",
+      "enabled": false,
+      "goal": "Extract transcript-backed clip plans from recent journals and transcript text. Write only the clip_plans handoff JSON for Rust to keep as pipeline artifacts.",
+      "builtInSkillFingerprint": "5cf8f1d2ce760ec647886549252a23e0dc6adeab456d0a39b26a2efbeb3daf86",
+      "visibleInUi": true,
+      "handlerKind": "split_handoff",
+      "artifactRulesOverride": ""
+    },
+    "workspace_event_extractor": {
+      "skillKey": "workspace_event_extractor",
+      "name": "Workspace Event Extractor",
+      "skillPath": "skills/workspace_synthesizer/workspace_event_extractor/SKILL.md",
+      "outputPrefix": "posts/workspace_synthesizer/",
+      "enabled": true,
+      "goal": "Extract scheduled events with clear timing from recent journals and transcripts. Write only the events handoff JSON for Rust to store in the planner.",
+      "builtInSkillFingerprint": "80acd90b6ae5f89c5df717907feba1610b09324dd07a66a838cf7e118ecd6ded",
+      "visibleInUi": true,
+      "handlerKind": "split_handoff",
+      "artifactRulesOverride": ""
+    },
+    "bluesky_insight_posts": {
+      "skillKey": "bluesky_insight_posts",
+      "name": "Bluesky Insight Posts",
+      "skillPath": "skills/workspace_synthesizer/bluesky_insight_posts/SKILL.md",
+      "outputPrefix": "posts/bluesky_insight_posts/",
+      "enabled": false,
+      "goal": "Create interesting Bluesky post drafts from my recent journal notes. Extract standout insights and save each post as a separate file in posts/ so it appears in the workspace feed.",
+      "builtInSkillFingerprint": "94342cc270d482f0f0b23e24cd11c3d35b15073a62ef53b30e6e5101c19b56bf",
+      "visibleInUi": false,
+      "handlerKind": "direct_post_output",
+      "artifactRulesOverride": ""
+    },
+    "workspace_segment_extractor": {
+      "skillKey": "workspace_segment_extractor",
+      "name": "Workspace Segment Extractor",
+      "skillPath": "skills/workspace_synthesizer/workspace_segment_extractor/SKILL.md",
+      "outputPrefix": "posts/workspace_synthesizer/",
+      "enabled": false,
+      "goal": "Extract named spans from recent journals and transcripts. Use timestamps when transcript timing is available and write only the primitive segments handoff JSON for Rust to compile into clip plans and navigation structures.",
+      "builtInSkillFingerprint": "0164bed7b7514ff5218ab05e61d7249bce19af1ecc644ecbfb75936bf0976274",
+      "visibleInUi": false,
+      "handlerKind": "split_handoff",
+      "artifactRulesOverride": ""
+    },
+    "workspace_assertion_extractor": {
+      "skillKey": "workspace_assertion_extractor",
+      "name": "Workspace Assertion Extractor",
+      "skillPath": "skills/workspace_synthesizer/workspace_assertion_extractor/SKILL.md",
+      "outputPrefix": "posts/workspace_synthesizer/",
+      "enabled": false,
+      "goal": "Extract explicit claims, beliefs, questions, and decisions from recent journals and transcripts. Write only the primitive assertions handoff JSON for Rust to compile into downstream outputs.",
+      "builtInSkillFingerprint": "71931d9114077cfa8947450e6a9ede8abd8fc7054d4d5455ae1d8a289fb76288",
+      "visibleInUi": false,
+      "handlerKind": "split_handoff",
+      "artifactRulesOverride": ""
+    }
+  }
+}
