@@ -1,0 +1,100 @@
+{
+  "status": "processing",
+  "providerReady": false,
+  "providerBlockedReason": "",
+  "triggerReason": "workspace-synthesizer",
+  "journalSaveCooldownUntil": "",
+  "threadId": "workflow:workspace_synthesizer",
+  "lastRunAt": "2026-03-30T19:19:26.963411+00:00",
+  "lastSourceUpdatedAt": 1774897622,
+  "lastSummary": "",
+  "lastError": "",
+  "lastManifestPath": "posts/workspace_synthesizer/pipeline",
+  "pendingSourceCount": 1,
+  "pendingWordCount": 578,
+  "selectedSourcePaths": [
+    "journals/text/transcriptions/audio/2026/03/30/190553_Audio_20260208_123857.txt"
+  ],
+  "artifactCounts": {
+    "insightPosts": 0,
+    "todos": 0,
+    "events": 0,
+    "clipPlans": 0,
+    "primitiveEntities": 0,
+    "primitiveEvents": 0,
+    "primitiveAssertions": 0,
+    "primitiveActions": 0,
+    "primitiveSegments": 0,
+    "primitiveStructures": 0
+  },
+  "artifactStates": {
+    "insightPosts": {
+      "status": "",
+      "path": "",
+      "itemCount": 0,
+      "error": ""
+    },
+    "todos": {
+      "status": "",
+      "path": "",
+      "itemCount": 0,
+      "error": ""
+    },
+    "events": {
+      "status": "",
+      "path": "",
+      "itemCount": 0,
+      "error": ""
+    },
+    "clipPlans": {
+      "status": "",
+      "path": "",
+      "itemCount": 0,
+      "error": ""
+    },
+    "journalTitles": {
+      "status": "",
+      "path": "",
+      "itemCount": 0,
+      "error": ""
+    },
+    "primitiveEntities": {
+      "status": "",
+      "path": "",
+      "itemCount": 0,
+      "error": ""
+    },
+    "primitiveEvents": {
+      "status": "",
+      "path": "",
+      "itemCount": 0,
+      "error": ""
+    },
+    "primitiveAssertions": {
+      "status": "",
+      "path": "",
+      "itemCount": 0,
+      "error": ""
+    },
+    "primitiveActions": {
+      "status": "",
+      "path": "",
+      "itemCount": 0,
+      "error": ""
+    },
+    "primitiveSegments": {
+      "status": "",
+      "path": "",
+      "itemCount": 0,
+      "error": ""
+    },
+    "primitiveStructures": {
+      "status": "",
+      "path": "",
+      "itemCount": 0,
+      "error": ""
+    }
+  },
+  "renamedSources": [],
+  "skillRuns": []
+}

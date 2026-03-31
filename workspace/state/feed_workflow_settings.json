@@ -1,0 +1,30 @@
+{
+  "workflows": {
+    "workspace_synthesizer": {
+      "workflow_key": "workspace_synthesizer",
+      "workflow_bot": "Workspace Synthesizer",
+      "skill_path": "skills/workspace_synthesizer/SKILL.md",
+      "output_prefix": "posts/workspace_synthesizer/",
+      "enabled": true,
+      "editable_files": [
+        "skills/workspace_synthesizer/SKILL.md"
+      ],
+      "goal": "Use the workspace synthesizer index skill as shared guidance for specialized extractor skills. The runtime will run those extractors, validate their typed JSON handoffs, and turn them into feed posts, todos, events, and clip plans.",
+      "last_triggered_at": null,
+      "last_run_at": null,
+      "last_triggered_source_updated_at": null,
+      "built_in_skill_fingerprint": "bbc643571e7f219bddba36e520284f8bf87f51604f2a05e102bec52c7162d765",
+      "visible_in_ui": true,
+      "settings": {
+        "mode": "date_range",
+        "days": 7,
+        "random_count": 1,
+        "schedule_enabled": false,
+        "schedule_cron": "0 9 * * *",
+        "schedule_tz": null,
+        "goal": "Use the workspace synthesizer index skill as shared guidance for specialized extractor skills. The runtime will run those extractors, validate their typed JSON handoffs, and turn them into feed posts, todos, events, and clip plans.",
+        "prompt": "Use the workspace synthesizer index skill as shared guidance for specialized extractor skills. The runtime will run those extractors, validate their typed JSON handoffs, and turn them into feed posts, todos, events, and clip plans."
+      }
+    }
+  }
+}

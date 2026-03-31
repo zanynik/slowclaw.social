@@ -5267,7 +5267,15 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
     ];
 
     // Create subdirectories
-    let subdirs = ["sessions", "memory", "state", "cron", "skills"];
+    let subdirs = [
+        "sessions",
+        "memory",
+        "state",
+        "cron",
+        "skills",
+        "journals/text/inbox",
+        "journals/media/audio/inbox",
+    ];
     for dir in &subdirs {
         fs::create_dir_all(workspace_dir.join(dir)).await?;
     }

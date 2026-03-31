@@ -148,9 +148,32 @@ pub struct FeedInterestUpsert {
 pub struct FeedInterestSourceRecord {
     pub source_path: String,
     pub content_hash: String,
+    pub profile_input_hash: String,
     pub interest_id: Option<String>,
     pub title: String,
+    pub triage_keywords_json: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedKeywordRecord {
+    pub id: String,
+    pub term: String,
+    pub weight: f64,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub source_count: i64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedKeywordUpsert {
+    pub id: Option<String>,
+    pub term: String,
+    pub weight: f64,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub source_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1009,6 +1032,28 @@ pub fn rename_workspace_synth_source_path(
     Ok(())
 }
 
+pub fn rename_media_asset_path(
+    workspace_dir: &Path,
+    old_path: &str,
+    new_path: &str,
+) -> Result<usize> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let rows = conn
+        .execute(
+            "UPDATE media_assets
+             SET workspace_path = ?2
+             WHERE workspace_path = ?1",
+            params![old_path.trim(), new_path.trim()],
+        )
+        .with_context(|| {
+            format!(
+                "Failed to rename media asset path {} -> {}",
+                old_path, new_path
+            )
+        })?;
+    Ok(rows)
+}
+
 pub fn rename_journal_entry_path(
     workspace_dir: &Path,
     old_path: &str,
@@ -1016,12 +1061,14 @@ pub fn rename_journal_entry_path(
     title: &str,
 ) -> Result<usize> {
     let conn = open_conn(&db_path(workspace_dir))?;
+    let mut conn = conn;
+    let tx = conn.transaction()?;
     let old_trimmed = old_path.trim();
     let new_trimmed = new_path.trim();
     let title_trimmed = title.trim();
     let now = Utc::now().to_rfc3339();
 
-    let rows = conn
+    let rows = tx
         .execute(
             "UPDATE journal_entries
              SET workspace_path = ?2, title = ?3
@@ -1035,25 +1082,69 @@ pub fn rename_journal_entry_path(
             )
         })?;
 
-    if rows == 0 {
-        tracing::warn!(
-            old_path = old_trimmed,
-            new_path = new_trimmed,
-            "rename_journal_entry_path: no rows matched old_path, DB may be out of sync"
-        );
-    }
+    let repaired_rows = if rows == 0 {
+        if let Some((preview_text, text_body)) =
+            journal_preview_and_body_from_workspace(workspace_dir, new_trimmed)
+        {
+            let created = now.clone();
+            tx.execute(
+                "INSERT INTO journal_entries (
+                    id, title, entry_type, source, status, workspace_path, preview_text, text_body,
+                    tags_csv, created_at_client, created
+                 ) VALUES (?1, ?2, 'text', 'workspace-synth', 'raw', ?3, ?4, ?5, '', ?6, ?6)",
+                params![
+                    format!("lc_{}", Uuid::new_v4().simple()),
+                    title_trimmed,
+                    new_trimmed,
+                    preview_text,
+                    text_body,
+                    created
+                ],
+            )
+            .unwrap_or(0)
+        } else {
+            tracing::warn!(
+                old_path = old_trimmed,
+                new_path = new_trimmed,
+                "rename_journal_entry_path: no rows matched old_path and no journal file was available for repair"
+            );
+            0
+        }
+    } else {
+        0
+    };
 
     // Cascade rename to todos and events that reference this source
-    let _ = conn.execute(
+    let _ = tx.execute(
         "UPDATE workspace_todos SET source_path = ?2, updated_at = ?3 WHERE source_path = ?1",
         params![old_trimmed, new_trimmed, now],
     );
-    let _ = conn.execute(
+    let _ = tx.execute(
         "UPDATE workspace_events SET source_path = ?2, updated_at = ?3 WHERE source_path = ?1",
         params![old_trimmed, new_trimmed, now],
     );
+    let _ = tx.execute(
+        "UPDATE feed_interest_sources SET source_path = ?2, updated_at = ?3 WHERE source_path = ?1",
+        params![old_trimmed, new_trimmed, now],
+    );
 
-    Ok(rows)
+    tx.commit()?;
+
+    Ok(rows + repaired_rows)
+}
+
+fn journal_preview_and_body_from_workspace(
+    workspace_dir: &Path,
+    rel_path: &str,
+) -> Option<(String, String)> {
+    let path = workspace_dir.join(rel_path.trim().trim_start_matches('/'));
+    let body = std::fs::read_to_string(path).ok()?;
+    let trimmed = body.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let preview = trimmed.chars().take(240).collect::<String>();
+    Some((preview, trimmed))
 }
 
 pub fn create_journal_entry_metadata(
@@ -1181,6 +1272,146 @@ pub fn list_feed_interests(workspace_dir: &Path) -> Result<Vec<FeedInterestRecor
     Ok(out)
 }
 
+pub fn list_feed_keywords(workspace_dir: &Path) -> Result<Vec<FeedKeywordRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, term, weight, first_seen_at, last_seen_at, source_count, updated_at
+         FROM feed_profile_keywords
+         ORDER BY weight DESC, last_seen_at DESC, term ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(FeedKeywordRecord {
+            id: row.get(0)?,
+            term: row.get(1)?,
+            weight: row.get(2)?,
+            first_seen_at: row.get(3)?,
+            last_seen_at: row.get(4)?,
+            source_count: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn upsert_feed_keyword(
+    workspace_dir: &Path,
+    keyword: &FeedKeywordUpsert,
+) -> Result<FeedKeywordRecord> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    let id = keyword
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("lc_{}", Uuid::new_v4().simple()));
+    conn.execute(
+        "INSERT INTO feed_profile_keywords (
+            id, term, weight, first_seen_at, last_seen_at, source_count, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(term) DO UPDATE SET
+            weight = excluded.weight,
+            first_seen_at = excluded.first_seen_at,
+            last_seen_at = excluded.last_seen_at,
+            source_count = excluded.source_count,
+            updated_at = excluded.updated_at",
+        params![
+            id,
+            keyword.term.trim(),
+            keyword.weight,
+            keyword.first_seen_at.trim(),
+            keyword.last_seen_at.trim(),
+            keyword.source_count,
+            now,
+        ],
+    )
+    .context("Failed to upsert feed profile keyword")?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, term, weight, first_seen_at, last_seen_at, source_count, updated_at
+         FROM feed_profile_keywords
+         WHERE term = ?1
+         LIMIT 1",
+    )?;
+    let record = stmt.query_row(params![keyword.term.trim()], |row| {
+        Ok(FeedKeywordRecord {
+            id: row.get(0)?,
+            term: row.get(1)?,
+            weight: row.get(2)?,
+            first_seen_at: row.get(3)?,
+            last_seen_at: row.get(4)?,
+            source_count: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    })?;
+    Ok(record)
+}
+
+pub fn decay_feed_keywords(workspace_dir: &Path, decay_rate: f64) -> Result<usize> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    let updated = conn.execute(
+        "UPDATE feed_profile_keywords
+         SET weight = MAX(0.0, weight * ?1),
+             updated_at = ?2",
+        params![decay_rate, now],
+    )?;
+    Ok(updated)
+}
+
+pub fn prune_feed_keywords(
+    workspace_dir: &Path,
+    min_weight: f64,
+    keep_limit: usize,
+) -> Result<usize> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut removed = conn.execute(
+        "DELETE FROM feed_profile_keywords WHERE weight < ?1",
+        params![min_weight],
+    )?;
+    let keep_limit = i64::try_from(keep_limit.max(1)).unwrap_or(300);
+    removed += conn.execute(
+        "DELETE FROM feed_profile_keywords
+         WHERE id IN (
+             SELECT id
+             FROM feed_profile_keywords
+             ORDER BY weight DESC, last_seen_at DESC, term ASC
+             LIMIT -1 OFFSET ?1
+         )",
+        params![keep_limit],
+    )?;
+    Ok(removed)
+}
+
+pub fn delete_feed_keyword(workspace_dir: &Path, keyword_id: &str) -> Result<bool> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let deleted = conn.execute(
+        "DELETE FROM feed_profile_keywords WHERE id = ?1",
+        params![keyword_id.trim()],
+    )?;
+    Ok(deleted > 0)
+}
+
+pub fn update_feed_keyword_term(
+    workspace_dir: &Path,
+    keyword_id: &str,
+    term: &str,
+) -> Result<bool> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    let updated = conn.execute(
+        "UPDATE feed_profile_keywords SET term = ?1, updated_at = ?2 WHERE id = ?3",
+        params![term.trim(), now, keyword_id.trim()],
+    )?;
+    Ok(updated > 0)
+}
+
 pub fn upsert_feed_interest(
     workspace_dir: &Path,
     interest: &FeedInterestUpsert,
@@ -1286,20 +1517,23 @@ pub fn get_feed_interest_source(
 ) -> Result<Option<FeedInterestSourceRecord>> {
     let conn = open_conn(&db_path(workspace_dir))?;
     let mut stmt = conn.prepare(
-        "SELECT source_path, content_hash, interest_id, title, updated_at
+        "SELECT source_path, content_hash, COALESCE(profile_input_hash, ''), interest_id, title,
+                COALESCE(triage_keywords_json, ''), updated_at
          FROM feed_interest_sources
          WHERE source_path = ?1
          LIMIT 1",
     )?;
     let row = stmt
         .query_row(params![source_path], |row| {
-            let interest_id: String = row.get(2)?;
+            let interest_id: String = row.get(3)?;
             Ok(FeedInterestSourceRecord {
                 source_path: row.get(0)?,
                 content_hash: row.get(1)?,
+                profile_input_hash: row.get(2)?,
                 interest_id: non_empty_opt(interest_id),
-                title: row.get(3)?,
-                updated_at: row.get(4)?,
+                title: row.get(4)?,
+                triage_keywords_json: row.get(5)?,
+                updated_at: row.get(6)?,
             })
         })
         .optional()?;
@@ -1313,18 +1547,22 @@ pub fn upsert_feed_interest_source(
     let conn = open_conn(&db_path(workspace_dir))?;
     conn.execute(
         "INSERT INTO feed_interest_sources (
-            source_path, content_hash, interest_id, title, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5)
+            source_path, content_hash, profile_input_hash, interest_id, title, triage_keywords_json, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(source_path) DO UPDATE SET
             content_hash = excluded.content_hash,
+            profile_input_hash = excluded.profile_input_hash,
             interest_id = excluded.interest_id,
             title = excluded.title,
+            triage_keywords_json = excluded.triage_keywords_json,
             updated_at = excluded.updated_at",
         params![
             source.source_path,
             source.content_hash,
+            source.profile_input_hash,
             source.interest_id.clone().unwrap_or_default(),
             source.title,
+            source.triage_keywords_json,
             source.updated_at
         ],
     )
@@ -1872,12 +2110,11 @@ pub fn upsert_content_item(
             title, author, summary, content_text, content_hash, embedding, published_at,
             discovered_at, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)
-         ON CONFLICT(id) DO UPDATE SET
+         ON CONFLICT(canonical_url) DO UPDATE SET
             source_key = excluded.source_key,
             source_title = excluded.source_title,
             source_kind = excluded.source_kind,
             domain = excluded.domain,
-            canonical_url = excluded.canonical_url,
             external_id = excluded.external_id,
             title = excluded.title,
             author = excluded.author,
@@ -2217,12 +2454,26 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS feed_interest_sources (
             source_path TEXT PRIMARY KEY,
             content_hash TEXT NOT NULL DEFAULT '',
+            profile_input_hash TEXT NOT NULL DEFAULT '',
             interest_id TEXT NOT NULL DEFAULT '',
             title TEXT NOT NULL DEFAULT '',
+            triage_keywords_json TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_feed_interest_sources_interest_id
             ON feed_interest_sources(interest_id);
+
+        CREATE TABLE IF NOT EXISTS feed_profile_keywords (
+            id TEXT PRIMARY KEY,
+            term TEXT NOT NULL UNIQUE,
+            weight REAL NOT NULL DEFAULT 0.0,
+            first_seen_at TEXT NOT NULL DEFAULT '',
+            last_seen_at TEXT NOT NULL DEFAULT '',
+            source_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_feed_profile_keywords_weight
+            ON feed_profile_keywords(weight DESC, last_seen_at DESC, updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS feed_web_sources (
             domain TEXT PRIMARY KEY,
@@ -2369,6 +2620,18 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "keywords_override",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    ensure_column(
+        &conn,
+        "feed_interest_sources",
+        "profile_input_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &conn,
+        "feed_interest_sources",
+        "triage_keywords_json",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
 
     Ok(())
 }
@@ -2452,6 +2715,7 @@ mod tests {
         assert!(table_exists(&conn, "artifacts").unwrap());
         assert!(table_exists(&conn, "feed_interests").unwrap());
         assert!(table_exists(&conn, "feed_interest_sources").unwrap());
+        assert!(table_exists(&conn, "feed_profile_keywords").unwrap());
         assert!(table_exists(&conn, "feed_web_sources").unwrap());
         assert!(table_exists(&conn, "feed_web_cache").unwrap());
         assert!(table_exists(&conn, "personalized_feed_cache").unwrap());
@@ -3155,8 +3419,10 @@ mod tests {
             &FeedInterestSourceRecord {
                 source_path: "posts/ml/one.md".into(),
                 content_hash: "abc123".into(),
+                profile_input_hash: "profile123".into(),
                 interest_id: Some("interest-1".into()),
                 title: "Machine Learning".into(),
+                triage_keywords_json: "[\"machine learning\",\"ranking\"]".into(),
                 updated_at: "2026-03-09T12:00:00Z".into(),
             },
         )
@@ -3165,7 +3431,9 @@ mod tests {
         let source = get_feed_interest_source(tmp.path(), "posts/ml/one.md").unwrap();
         let source = source.expect("source record should exist");
         assert_eq!(source.content_hash, "abc123");
+        assert_eq!(source.profile_input_hash, "profile123");
         assert_eq!(source.interest_id.as_deref(), Some("interest-1"));
+        assert_eq!(source.triage_keywords_json, "[\"machine learning\",\"ranking\"]");
     }
 
     #[test]

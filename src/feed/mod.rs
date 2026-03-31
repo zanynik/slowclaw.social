@@ -2,7 +2,7 @@ pub mod traits;
 
 use crate::config::Config;
 use crate::gateway::{feed_web_sources::DEFAULT_FEED_WEB_SOURCES, local_store};
-use crate::memory::{self, vector::{bytes_to_vec, cosine_similarity, vec_to_bytes}};
+use crate::memory::{self, vector::{cosine_similarity, vec_to_bytes}};
 use crate::tools::web_search_tool::WebSearchTool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -21,7 +21,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use uuid::Uuid;
 
 pub use traits::FeedSource;
 
@@ -71,6 +70,13 @@ const NOSTR_PRIMAL_FALLBACK_RELAY: &str = "wss://relay.primal.net";
 const WEB_SEARCH_RESULT_LIMIT_PER_QUERY: usize = 4;
 const STAGE1_KEYWORD_LIMIT: usize = 15;
 const STAGE1_KEYWORDS_PER_INTEREST_LIMIT: usize = 8;
+const KEYWORD_PROFILE_LIMIT: usize = 200;
+const KEYWORD_PROFILE_BATCH_LIMIT: usize = 15;
+const KEYWORD_PROFILE_DECAY_RATE: f64 = 0.94;
+const KEYWORD_PROFILE_MIN_WEIGHT: f64 = 0.12;
+const KEYWORD_PROFILE_MAX_WEIGHT: f64 = 4.5;
+const KEYWORD_PROFILE_SOURCE_BONUS: f32 = 0.15;
+const KEYWORD_PROFILE_FRESHNESS_BONUS_MAX: f32 = 0.18;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -259,15 +265,6 @@ struct PreparedWorldFeedData {
     selected_sources: Vec<SelectedSource>,
     diagnostics: FeedRefreshDiagnostics,
     candidates: Vec<FeedCandidate>,
-    embedder: SharedEmbedder,
-}
-
-const WORLD_FEED_SYNTHETIC_INTEREST_PREFIX: &str = "state/world_feed_diagnostics/dummy/";
-
-#[derive(Debug, Clone)]
-struct ActiveInterest {
-    record: local_store::FeedInterestRecord,
-    embedding: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -472,18 +469,19 @@ fn rank_candidates_stage2(
     candidates: Vec<FeedCandidate>,
     limit: usize,
 ) -> Vec<PersonalizedFeedItem> {
-    let keywords = broad_interest_keywords(profile);
+    let keyword_weights = weighted_interest_keywords(profile);
     let mut ranked = Vec::new();
     for candidate in candidates {
-        let metadata_score = keyword_match_score(&candidate.rank_text, &keywords);
-        let final_score = (candidate.stage1_score * 0.7) + (metadata_score * 0.3);
-        let matched_keyword = first_matched_keyword(&candidate.rank_text, &keywords)
-            .map(|keyword| keyword.to_string());
+        let (keyword_score, matched_keyword) =
+            keyword_weight_sum(&candidate.rank_text, &keyword_weights);
+        let freshness_bonus = candidate_freshness_bonus(&candidate.item);
+        let final_score =
+            keyword_score + freshness_bonus + (candidate.stage1_score * KEYWORD_PROFILE_SOURCE_BONUS);
         let mut item = candidate.item;
         item.score = Some(final_score);
         item.matched_interest_label = matched_keyword;
-        item.matched_interest_score = if metadata_score > 0.0 {
-            Some(metadata_score)
+        item.matched_interest_score = if keyword_score > 0.0 {
+            Some(keyword_score)
         } else {
             None
         };
@@ -571,16 +569,7 @@ async fn build_prepared_world_feed_data(
     include_web_search: bool,
 ) -> Result<Option<PreparedWorldFeedData>> {
     tracing::info!("World feed: building prepared data (include_web_search={include_web_search})");
-    let (embedder, embedder_error) = resolve_feed_embedder(config).await?;
-    let Some(embedder) = embedder else {
-        tracing::warn!(
-            error = embedder_error.as_deref().unwrap_or("unknown"),
-            "World feed: embedder unavailable, cannot build prepared data"
-        );
-        return Ok(None);
-    };
-
-    let profile = rebuild_interest_profile(config, embedder.clone()).await?;
+    let profile = rebuild_interest_profile(config).await?;
     tracing::info!(
         status = %profile.status,
         interest_count = profile.interests.len(),
@@ -605,14 +594,13 @@ async fn build_prepared_world_feed_data(
             selected_sources: Vec::new(),
             diagnostics: FeedRefreshDiagnostics::default(),
             candidates: Vec::new(),
-            embedder: embedder.clone(),
         }));
     }
 
     // Each protocol is independent — run all three in parallel.
     // A failure in one must not kill the others.
 
-    let rss_source = RssFeedSource::new(config, embedder.clone());
+    let rss_source = RssFeedSource::new(config);
     let nostr_source = NostrFeedSource::new(config);
 
     // Use the freshest Bluesky auth: prefer the globally stored latest auth
@@ -767,7 +755,6 @@ async fn build_prepared_world_feed_data(
             },
         },
         candidates,
-        embedder: embedder.clone(),
     }))
 }
 
@@ -785,11 +772,6 @@ pub async fn load_world_feed(
         store_latest_bluesky_auth(workspace_dir, auth);
     }
 
-    let embeddings_disabled = config
-        .memory
-        .embedding_provider
-        .trim()
-        .eq_ignore_ascii_case("none");
     let state = local_store::get_personalized_feed_state(workspace_dir, WORLD_FEED_KEY)?
         .unwrap_or_else(default_feed_state_record);
     let cache_records =
@@ -812,7 +794,7 @@ pub async fn load_world_feed(
         }
     }
 
-    if needs_refresh && !inflight && !embeddings_disabled {
+    if needs_refresh && !inflight {
         spawn_world_feed_refresh(config.clone(), bluesky_auth.clone());
         inflight = world_feed_refresh_inflight().lock().contains(workspace_dir);
         refresh_state = compute_refresh_state(cache_exists, &state, inflight);
@@ -820,8 +802,6 @@ pub async fn load_world_feed(
 
     let profile_status = if !state.profile_status.trim().is_empty() {
         state.profile_status.clone()
-    } else if embeddings_disabled {
-        "embeddingUnavailable".to_string()
     } else if cache_exists {
         "ready".to_string()
     } else {
@@ -861,60 +841,55 @@ pub async fn load_world_feed(
         });
     }
 
-    if !embeddings_disabled {
-        match tokio::time::timeout(
-            Duration::from_secs(WORLD_FEED_STAGE1_PREVIEW_TIMEOUT_SECS),
-            build_prepared_world_feed_data(config, bluesky_auth.clone(), false),
-        )
-        .await
-        {
-            Ok(Ok(Some(prepared))) => {
-                // Capture live diagnostics so the fallback path shows actual
-                // discovery metrics instead of stale/empty persisted state.
-                diagnostics = prepared.diagnostics.clone();
-                selected_sources = prepared.selected_sources.clone();
-                tracing::info!(
-                    profile_status = %prepared.profile.status,
-                    interest_count = prepared.profile.interests.len(),
-                    candidate_count = prepared.candidates.len(),
-                    selected_source_count = selected_sources.len(),
-                    "World feed stage 1 completed"
-                );
-                if !prepared.candidates.is_empty() {
-                    let preview_items = build_stage1_preview_items(&prepared.profile, prepared.candidates, limit);
-                    if !preview_items.is_empty() {
-                        return Ok(PersonalizedFeedResponse {
-                            items: preview_items,
-                            profile_status: prepared.profile.status.clone(),
-                            profile_stats: prepared.profile.stats.clone(),
-                            used_fallback: true,
-                            message: Some(
-                                "Showing stage 1 world feed from keyword-matched sources. Refresh later for ranked ordering."
-                                    .to_string(),
-                            ),
-                            refresh_state,
-                            refreshed_at,
-                            refresh_status,
-                            last_error,
-                            selected_sources: prepared.selected_sources,
-                            diagnostics: prepared.diagnostics,
-                            generation: state.generation,
-                        });
-                    }
+    match tokio::time::timeout(
+        Duration::from_secs(WORLD_FEED_STAGE1_PREVIEW_TIMEOUT_SECS),
+        build_prepared_world_feed_data(config, bluesky_auth.clone(), false),
+    )
+    .await
+    {
+        Ok(Ok(Some(prepared))) => {
+            diagnostics = prepared.diagnostics.clone();
+            selected_sources = prepared.selected_sources.clone();
+            tracing::info!(
+                profile_status = %prepared.profile.status,
+                interest_count = prepared.profile.interests.len(),
+                candidate_count = prepared.candidates.len(),
+                selected_source_count = selected_sources.len(),
+                "World feed keyword preview completed"
+            );
+            if !prepared.candidates.is_empty() {
+                let preview_items =
+                    build_stage1_preview_items(&prepared.profile, prepared.candidates, limit);
+                if !preview_items.is_empty() {
+                    return Ok(PersonalizedFeedResponse {
+                        items: preview_items,
+                        profile_status: prepared.profile.status.clone(),
+                        profile_stats: prepared.profile.stats.clone(),
+                        used_fallback: true,
+                        message: Some(
+                            "Showing a keyword-ranked world feed while the background refresh finishes."
+                                .to_string(),
+                        ),
+                        refresh_state,
+                        refreshed_at,
+                        refresh_status,
+                        last_error,
+                        selected_sources: prepared.selected_sources,
+                        diagnostics: prepared.diagnostics,
+                        generation: state.generation,
+                    });
                 }
             }
-            Ok(Ok(None)) => {
-                tracing::debug!("World feed stage 1: embedder unavailable");
-            }
-            Ok(Err(err)) => {
-                tracing::warn!("World feed stage 1 failed: {err}");
-            }
-            Err(_) => {
-                tracing::debug!(
-                    timeout_secs = WORLD_FEED_STAGE1_PREVIEW_TIMEOUT_SECS,
-                    "World feed stage 1 timed out, diagnostics will come from background refresh"
-                );
-            }
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(err)) => {
+            tracing::warn!("World feed keyword preview failed: {err}");
+        }
+        Err(_) => {
+            tracing::debug!(
+                timeout_secs = WORLD_FEED_STAGE1_PREVIEW_TIMEOUT_SECS,
+                "World feed keyword preview timed out, diagnostics will come from background refresh"
+            );
         }
     }
 
@@ -942,9 +917,7 @@ pub async fn load_world_feed(
         profile_stats,
         used_fallback: true,
         message: world_feed_message(
-            if embeddings_disabled {
-                "embeddingUnavailable"
-            } else if state.profile_status.trim().is_empty() {
+            if state.profile_status.trim().is_empty() {
                 "warming"
             } else {
                 state.profile_status.trim()
@@ -1059,41 +1032,6 @@ fn write_progress_diagnostics(
 async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -> Result<()> {
     let workspace_dir = config.workspace_dir.clone();
     let Some(mut prepared) = build_prepared_world_feed_data(&config, bluesky_auth, true).await? else {
-        tracing::warn!("World feed refresh: embedder unavailable, cannot build feed data");
-        let now = Utc::now().to_rfc3339();
-        let unavailable_diagnostics = FeedRefreshDiagnostics {
-            rss: FeedProtocolDiagnostics {
-                error: Some("Embedding provider unavailable".to_string()),
-                ..Default::default()
-            },
-            nostr: FeedProtocolDiagnostics {
-                error: Some("Embedding provider unavailable".to_string()),
-                ..Default::default()
-            },
-            bluesky: FeedProtocolDiagnostics {
-                error: Some("Embedding provider unavailable".to_string()),
-                ..Default::default()
-            },
-            ranking: FeedRankingDiagnostics::default(),
-        };
-        let _ = local_store::upsert_personalized_feed_state(
-            &workspace_dir,
-            &local_store::PersonalizedFeedStateUpsert {
-                feed_key: WORLD_FEED_KEY.to_string(),
-                dirty: true,
-                refresh_status: "error".to_string(),
-                refreshed_at: String::new(),
-                refresh_started_at: now.clone(),
-                refresh_finished_at: now,
-                last_error: "Personalized feed embeddings are unavailable.".to_string(),
-                profile_status: "embeddingUnavailable".to_string(),
-                profile_stats_json: serde_json::json!(InterestProfileStats::default()).to_string(),
-                details_json: serde_json::json!({
-                    "diagnostics": unavailable_diagnostics,
-                })
-                .to_string(),
-            },
-        );
         return Ok(());
     };
 
@@ -1138,74 +1076,11 @@ async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -
         &now,
     );
 
-    // ── Phase 1 (FAST): Stage 2 keyword ranking ─────────────────────────
-    // Write keyword-ranked results to cache immediately so the frontend
-    // can show fresh content within seconds, before semantic ranking.
-    let stage2_items = rank_candidates_stage2(
+    let final_items = rank_candidates_stage2(
         &prepared.profile,
-        prepared.candidates.clone(),
+        prepared.candidates,
         WORLD_FEED_RANK_LIMIT,
     );
-    if !stage2_items.is_empty() {
-        let phase1_at = Utc::now().to_rfc3339();
-        let cache_rows = build_cache_rows(&stage2_items, &phase1_at);
-        local_store::replace_personalized_feed_cache(&workspace_dir, WORLD_FEED_KEY, &cache_rows)?;
-
-        prepared.diagnostics.ranking.ranked_item_count = stage2_items.len();
-        let discovery_details_json = serde_json::json!({
-            "selectedSources": selected_sources_json.clone(),
-            "diagnostics": prepared.diagnostics.clone(),
-        }).to_string();
-        let _ = local_store::upsert_personalized_feed_state(
-            &workspace_dir,
-            &local_store::PersonalizedFeedStateUpsert {
-                feed_key: WORLD_FEED_KEY.to_string(),
-                dirty: true,
-                refresh_status: "ranking".to_string(),
-                refreshed_at: phase1_at.clone(),
-                refresh_started_at: now.clone(),
-                refresh_finished_at: phase1_at,
-                last_error: String::new(),
-                profile_status: prepared.profile.status.clone(),
-                profile_stats_json: serde_json::json!(prepared.profile.stats).to_string(),
-                details_json: discovery_details_json,
-            },
-        );
-        let _ = local_store::bump_feed_generation(&workspace_dir, WORLD_FEED_KEY);
-        tracing::info!(
-            stage2_items = stage2_items.len(),
-            "World feed: Phase 1 (keyword-ranked) items written to cache"
-        );
-    }
-
-    // ── Phase 2 (SLOW): Stage 3 semantic ranking ────────────────────────
-    // Re-rank all candidates using embeddings for higher quality, then
-    // replace the cache. Bumps generation again so the frontend detects it.
-    let final_items = if prepared.embedder.dimensions() > 0 {
-        match FeedRanker::rank_candidates(
-            prepared.embedder.clone(),
-            &prepared.profile,
-            prepared.candidates,
-            WORLD_FEED_RANK_LIMIT,
-        )
-        .await
-        {
-            Ok(items) if !items.is_empty() => {
-                tracing::info!(stage3_items = items.len(), "World feed: Stage 3 semantic ranking complete");
-                items
-            }
-            Ok(_) => {
-                tracing::info!("Stage 3 ranking returned no items, keeping Stage 2 results");
-                stage2_items
-            }
-            Err(err) => {
-                tracing::warn!("Stage 3 ranking failed, keeping Stage 2 results: {err}");
-                stage2_items
-            }
-        }
-    } else {
-        stage2_items
-    };
 
     prepared.diagnostics.ranking.ranked_item_count = final_items.len();
     let refreshed_at = Utc::now().to_rfc3339();
@@ -1456,12 +1331,6 @@ fn world_feed_message(
     used_fallback: bool,
     last_error: &str,
 ) -> Option<String> {
-    if profile_status.eq_ignore_ascii_case("embeddingUnavailable") {
-        return Some(
-            "Personalized feed embeddings are unavailable. Showing recent cached sources and raw fallback items."
-                .to_string(),
-        );
-    }
     if profile_status.eq_ignore_ascii_case("noInterests") {
         return Some("Personalized feed starts after text items exist under posts/ or journals/.".to_string());
     }
@@ -1477,15 +1346,15 @@ fn world_feed_message(
     if used_fallback {
         if profile_status.eq_ignore_ascii_case("ready") && refresh_state == "fresh" {
             return Some(
-                "No ranked world-feed matches landed yet. Showing recent sources while the next refresh widens the search."
+                "No keyword-ranked world-feed matches landed yet. Showing recent sources while the next refresh widens the search."
                     .to_string(),
             );
         }
-        return Some("Building your world feed. Showing recent cached sources while ranking catches up.".to_string());
+        return Some("Building your world feed. Showing recent cached sources while keyword ranking catches up.".to_string());
     }
     if profile_stats.interest_count > 0 {
         return Some(format!(
-            "Personalized by {} workspace interests.",
+            "Personalized by {} weighted keywords.",
             profile_stats.interest_count
         ));
     }
@@ -1689,9 +1558,9 @@ fn fallback_nostr_selected_sources(config: &Config) -> Vec<SelectedSource> {
 
 async fn fetch_nip66_relay_candidates(
     seed_relays: &[String],
-    keywords: &[String],
+    keyword_weights: &[(String, f32)],
 ) -> Result<Vec<SelectedSource>> {
-    if seed_relays.is_empty() || keywords.is_empty() {
+    if seed_relays.is_empty() || keyword_weights.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -1754,7 +1623,8 @@ async fn fetch_nip66_relay_candidates(
             event.content.trim(),
             relay_tags.join(" ")
         );
-        let keyword_score = keyword_match_score(&search_text, keywords);
+        let (keyword_score, matched_keyword) =
+            keyword_weight_sum(&search_text, keyword_weights);
         if keyword_score <= 0.0 {
             continue;
         }
@@ -1764,8 +1634,7 @@ async fn fetch_nip66_relay_candidates(
             label,
             stage1_score: keyword_score,
             description: non_empty_string(event.content.trim().to_string()),
-            matched_interest_label: first_matched_keyword(&search_text, keywords)
-                .map(|value| value.to_string()),
+            matched_interest_label: matched_keyword,
             matched_interest_score: Some(keyword_score),
             metadata_json: serde_json::json!({
                 "relayUrl": relay_url,
@@ -1954,50 +1823,30 @@ fn non_empty_string(value: String) -> Option<String> {
     }
 }
 
-fn is_synthetic_interest_source(source_path: &str) -> bool {
-    source_path
-        .trim()
-        .starts_with(WORLD_FEED_SYNTHETIC_INTEREST_PREFIX)
-}
-
 fn feed_interest_to_diagnostic(
-    workspace_dir: &Path,
-    record: local_store::FeedInterestRecord,
+    _workspace_dir: &Path,
+    record: local_store::FeedKeywordRecord,
 ) -> FeedInterestDiagnosticItem {
-    let keywords_override = if record.keywords_override.trim().is_empty() {
-        None
-    } else {
-        Some(
-            record
-                .keywords_override
-                .split(',')
-                .map(|keyword| keyword.trim().to_string())
-                .filter(|keyword| !keyword.is_empty())
-                .collect::<Vec<_>>(),
-        )
-    };
-    let source_text = load_interest_source_text(workspace_dir, &record.source_path);
-    let derived_keywords = derive_interest_keywords(&record.label, &source_text);
     FeedInterestDiagnosticItem {
         id: record.id,
-        label: record.label,
-        source_path: record.source_path.clone(),
-        health_score: record.health_score,
+        label: record.term.clone(),
+        source_path: String::new(),
+        health_score: record.weight,
         last_seen_at: record.last_seen_at,
-        created_at: record.created_at,
+        created_at: record.first_seen_at,
         updated_at: record.updated_at,
-        embedding_dimensions: bytes_to_vec(&record.embedding).len(),
-        synthetic: is_synthetic_interest_source(&record.source_path),
-        deletable: is_synthetic_interest_source(&record.source_path),
-        keywords: keywords_override.clone().unwrap_or(derived_keywords),
-        keywords_override,
+        embedding_dimensions: 0,
+        synthetic: false,
+        deletable: true,
+        keywords: vec![record.term],
+        keywords_override: None,
     }
 }
 
 pub fn list_world_feed_interest_diagnostics(
     config: &Config,
 ) -> Result<FeedInterestDiagnosticsResponse> {
-    let items = local_store::list_feed_interests(&config.workspace_dir)?
+    let items = local_store::list_feed_keywords(&config.workspace_dir)?
         .into_iter()
         .map(|record| feed_interest_to_diagnostic(&config.workspace_dir, record))
         .collect();
@@ -2012,31 +1861,16 @@ pub async fn create_dummy_world_feed_interest(
     if normalized_label.is_empty() {
         anyhow::bail!("Interest label is required");
     }
-    let embedder = resolve_feed_embedder(config)
-        .await?
-        .0
-        .context("Configured embedding provider is unavailable.")?;
-    let embedding = embedder
-        .embed_one(normalized_label)
-        .await
-        .context("Failed to embed dummy world-feed interest.")?;
-    if embedding.is_empty() {
-        anyhow::bail!("Dummy world-feed interest embedding was empty.");
-    }
     let now = Utc::now().to_rfc3339();
-    let source_path = format!(
-        "{WORLD_FEED_SYNTHETIC_INTEREST_PREFIX}{}.md",
-        Uuid::new_v4().simple()
-    );
-    let record = local_store::upsert_feed_interest(
+    let record = local_store::upsert_feed_keyword(
         &config.workspace_dir,
-        &local_store::FeedInterestUpsert {
+        &local_store::FeedKeywordUpsert {
             id: None,
-            label: normalized_label.to_string(),
-            source_path,
-            embedding: vec_to_bytes(&embedding),
-            health_score: 0.72,
+            term: normalized_label.to_ascii_lowercase(),
+            weight: 1.0,
+            first_seen_at: now.clone(),
             last_seen_at: now,
+            source_count: 1,
         },
     )?;
     mark_world_feed_dirty(&config.workspace_dir)?;
@@ -2044,7 +1878,7 @@ pub async fn create_dummy_world_feed_interest(
 }
 
 pub fn delete_world_feed_interest(config: &Config, interest_id: &str) -> Result<bool> {
-    let deleted = local_store::delete_feed_interest(&config.workspace_dir, interest_id)?;
+    let deleted = local_store::delete_feed_keyword(&config.workspace_dir, interest_id)?;
     if deleted {
         mark_world_feed_dirty(&config.workspace_dir)?;
     }
@@ -2057,7 +1891,7 @@ pub async fn update_world_feed_interest(
     label: Option<&str>,
     keywords_override: Option<Vec<String>>,
 ) -> Result<Option<FeedInterestDiagnosticItem>> {
-    let interest = local_store::list_feed_interests(&config.workspace_dir)?
+    let interest = local_store::list_feed_keywords(&config.workspace_dir)?
         .into_iter()
         .find(|item| item.id == interest_id);
     let Some(interest) = interest else {
@@ -2066,40 +1900,32 @@ pub async fn update_world_feed_interest(
 
     if let Some(new_label) = label {
         let trimmed = new_label.trim();
-        if !trimmed.is_empty() && trimmed != interest.label {
-            let embedder = resolve_feed_embedder(config)
-                .await?
-                .0
-                .context("Embedding provider is unavailable.")?;
-            let embedding = embedder
-                .embed_one(trimmed)
-                .await
-                .context("Failed to embed updated label.")?;
-            local_store::update_feed_interest_label(
+        if !trimmed.is_empty() && trimmed != interest.term {
+            local_store::update_feed_keyword_term(
                 &config.workspace_dir,
                 interest_id,
-                trimmed,
-                &vec_to_bytes(&embedding),
+                &trimmed.to_ascii_lowercase(),
             )?;
         }
     }
 
     if let Some(kw) = keywords_override {
-        let csv = kw
+        let first = kw
             .iter()
             .map(|keyword| keyword.trim())
-            .filter(|keyword| !keyword.is_empty())
-            .collect::<Vec<_>>()
-            .join(",");
-        local_store::update_feed_interest_keywords_override(
-            &config.workspace_dir,
-            interest_id,
-            &csv,
-        )?;
+            .find(|keyword| !keyword.is_empty())
+            .unwrap_or("");
+        if !first.is_empty() {
+            local_store::update_feed_keyword_term(
+                &config.workspace_dir,
+                interest_id,
+                &first.to_ascii_lowercase(),
+            )?;
+        }
     }
 
     mark_world_feed_dirty(&config.workspace_dir)?;
-    let updated = local_store::list_feed_interests(&config.workspace_dir)?
+    let updated = local_store::list_feed_keywords(&config.workspace_dir)?
         .into_iter()
         .find(|item| item.id == interest_id)
         .map(|record| feed_interest_to_diagnostic(&config.workspace_dir, record));
@@ -2149,25 +1975,13 @@ async fn resolve_feed_embedder(
     ))
 }
 
-async fn rebuild_interest_profile(config: &Config, embedder: SharedEmbedder) -> Result<FeedProfile> {
-    if embedder.dimensions() == 0 {
-        return Ok(FeedProfile {
-            status: "embeddingUnavailable".to_string(),
-            ..FeedProfile::default()
-        });
-    }
-
+async fn rebuild_interest_profile(config: &Config) -> Result<FeedProfile> {
     let workspace_dir = &config.workspace_dir;
-    let _ = local_store::decay_feed_interests(workspace_dir, INTEREST_DECAY_RATE)?;
-    let mut active_interests: Vec<ActiveInterest> = local_store::list_feed_interests(workspace_dir)?
+    let _ = local_store::decay_feed_keywords(workspace_dir, KEYWORD_PROFILE_DECAY_RATE)?;
+    let mut active_keywords: HashMap<String, local_store::FeedKeywordRecord> = local_store::list_feed_keywords(workspace_dir)?
         .into_iter()
-        .map(|record| ActiveInterest {
-            embedding: bytes_to_vec(&record.embedding),
-            record,
-        })
-        .filter(|interest| !interest.embedding.is_empty())
+        .map(|record| (record.term.clone(), record))
         .collect();
-    refresh_generic_interest_labels(workspace_dir, &mut active_interests)?;
 
     let text_sources = collect_post_text_sources(workspace_dir)?;
     tracing::info!(
@@ -2182,151 +1996,103 @@ async fn rebuild_interest_profile(config: &Config, embedder: SharedEmbedder) -> 
 
     let mut changed_sources = Vec::new();
     for source in text_sources {
-        if let Some(previous) =
-            local_store::get_feed_interest_source(workspace_dir, &source.source_path)?
-        {
-            if previous.content_hash == source.content_hash {
+        let previous = local_store::get_feed_interest_source(workspace_dir, &source.source_path)?;
+        let triage_keywords = previous
+            .as_ref()
+            .map(|record| normalize_stored_triage_keywords(&record.triage_keywords_json))
+            .unwrap_or_default();
+        let (extracted_keywords, keyword_mode) = if triage_keywords.is_empty() {
+            (
+                extract_weighted_profile_keywords(&source.title, &source.content),
+                "local",
+            )
+        } else {
+            (triage_keywords, "triage")
+        };
+        let profile_input_hash =
+            profile_keyword_input_hash(&source.content_hash, keyword_mode, &extracted_keywords);
+        if let Some(previous) = previous.as_ref() {
+            if previous.profile_input_hash == profile_input_hash {
                 continue;
             }
         }
-        changed_sources.push(source);
+        changed_sources.push((source, previous, extracted_keywords, profile_input_hash));
     }
 
-    let source_texts: Vec<String> = changed_sources
-        .iter()
-        .map(|source| truncate_with_ellipsis(source.content.trim(), FEED_PROFILE_MAX_CHARS))
-        .collect();
-    let embeddings = embed_text_batch(embedder, &source_texts).await?;
-
-    for (source, embedding) in changed_sources.into_iter().zip(embeddings.into_iter()) {
-        let label = derive_interest_label(&source.title, &source.content);
+    for (source, previous, extracted_keywords, profile_input_hash) in changed_sources {
         let now = Utc::now().to_rfc3339();
-        let mut best_match: Option<(usize, f32)> = None;
-        for (index, interest) in active_interests.iter().enumerate() {
-            let similarity = cosine_similarity(&embedding, &interest.embedding);
-            if best_match
-                .as_ref()
-                .map(|(_, current_best)| similarity > *current_best)
-                .unwrap_or(true)
-            {
-                best_match = Some((index, similarity));
-            }
-        }
-
-        let mapped_interest_id = if let Some((index, similarity)) = best_match {
-            if similarity >= INTEREST_MERGE_THRESHOLD {
-                let current = active_interests[index].clone();
-                let merged_embedding = ema_merge_vectors(&embedding, &current.embedding);
-                let next_label = if current.record.label.trim().is_empty() {
-                    label.clone()
-                } else {
-                    current.record.label.clone()
-                };
-                let updated = local_store::upsert_feed_interest(
-                    workspace_dir,
-                    &local_store::FeedInterestUpsert {
-                        id: Some(current.record.id.clone()),
-                        label: next_label,
-                        source_path: source.source_path.clone(),
-                        embedding: vec_to_bytes(&merged_embedding),
-                        health_score: 1.0,
-                        last_seen_at: now.clone(),
-                    },
-                )?;
-                active_interests[index] = ActiveInterest {
-                    embedding: merged_embedding,
-                    record: updated.clone(),
-                };
-                stats.refreshed_sources += 1;
-                stats.merged_count += 1;
-                Some(updated.id)
-            } else if similarity >= INTEREST_SPAWN_THRESHOLD {
-                let created = local_store::upsert_feed_interest(
-                    workspace_dir,
-                    &local_store::FeedInterestUpsert {
-                        id: None,
-                        label: label.clone(),
-                        source_path: source.source_path.clone(),
-                        embedding: vec_to_bytes(&embedding),
-                        health_score: 1.0,
-                        last_seen_at: now.clone(),
-                    },
-                )?;
-                active_interests.push(ActiveInterest {
-                    embedding,
-                    record: created.clone(),
-                });
-                stats.refreshed_sources += 1;
-                stats.spawned_count += 1;
-                Some(created.id)
-            } else {
-                stats.ignored_count += 1;
-                None
-            }
+        if extracted_keywords.is_empty() {
+            stats.ignored_count += 1;
         } else {
-            let created = local_store::upsert_feed_interest(
+            stats.refreshed_sources += 1;
+        }
+        for (term, increment) in extracted_keywords {
+            let existing = active_keywords.get(&term);
+            let weight = existing
+                .map(|record| record.weight)
+                .unwrap_or(0.0)
+                .min(KEYWORD_PROFILE_MAX_WEIGHT);
+            let next_weight = (weight + increment).min(KEYWORD_PROFILE_MAX_WEIGHT);
+            let first_seen_at = existing
+                .map(|record| record.first_seen_at.clone())
+                .unwrap_or_else(|| now.clone());
+            let source_count = existing
+                .map(|record| record.source_count + 1)
+                .unwrap_or(1);
+            let saved = local_store::upsert_feed_keyword(
                 workspace_dir,
-                &local_store::FeedInterestUpsert {
-                    id: None,
-                    label: label.clone(),
-                    source_path: source.source_path.clone(),
-                    embedding: vec_to_bytes(&embedding),
-                    health_score: 1.0,
+                &local_store::FeedKeywordUpsert {
+                    id: existing.map(|record| record.id.clone()),
+                    term: term.clone(),
+                    weight: next_weight,
+                    first_seen_at,
                     last_seen_at: now.clone(),
+                    source_count,
                 },
             )?;
-            active_interests.push(ActiveInterest {
-                embedding,
-                record: created.clone(),
-            });
-            stats.refreshed_sources += 1;
-            stats.spawned_count += 1;
-            Some(created.id)
-        };
+            active_keywords.insert(term, saved);
+        }
 
         local_store::upsert_feed_interest_source(
             workspace_dir,
             &local_store::FeedInterestSourceRecord {
                 source_path: source.source_path,
                 content_hash: source.content_hash,
-                interest_id: mapped_interest_id,
-                title: label,
+                profile_input_hash,
+                interest_id: None,
+                title: derive_interest_label(&source.title, &source.content),
+                triage_keywords_json: previous
+                    .as_ref()
+                    .map(|record| record.triage_keywords_json.clone())
+                    .unwrap_or_default(),
                 updated_at: now,
             },
         )?;
     }
 
-    stats.interest_count = active_interests.len();
+    let _ = local_store::prune_feed_keywords(
+        workspace_dir,
+        KEYWORD_PROFILE_MIN_WEIGHT,
+        KEYWORD_PROFILE_LIMIT,
+    )?;
+    let active_keywords = local_store::list_feed_keywords(workspace_dir)?;
+    stats.interest_count = active_keywords.len();
     Ok(FeedProfile {
-        status: if active_interests.is_empty() {
+        status: if active_keywords.is_empty() {
             "noInterests".to_string()
         } else {
             "ready".to_string()
         },
         stats,
-        interests: active_interests
+        interests: active_keywords
             .into_iter()
-            .map(|interest| {
-                let keywords = if !interest.record.keywords_override.trim().is_empty() {
-                    interest
-                        .record
-                        .keywords_override
-                        .split(',')
-                        .map(|keyword| keyword.trim().to_string())
-                        .filter(|keyword| !keyword.is_empty())
-                        .collect()
-                } else {
-                    let source_text = load_interest_source_text(workspace_dir, &interest.record.source_path);
-                    derive_interest_keywords(&interest.record.label, &source_text)
-                };
-                InterestVector {
-                    id: interest.record.id,
-                    label: interest.record.label,
-                    embedding: interest.embedding,
-                    health_score: interest.record.health_score as f32,
-                    source_path: interest.record.source_path,
-                    keywords,
-                }
+            .map(|keyword| InterestVector {
+                id: keyword.id,
+                label: keyword.term.clone(),
+                embedding: Vec::new(),
+                health_score: keyword.weight as f32,
+                source_path: String::new(),
+                keywords: vec![keyword.term],
             })
             .collect(),
     })
@@ -2504,7 +2270,10 @@ fn stage1_stopwords() -> &'static HashSet<&'static str> {
             "has", "had", "but", "not", "too", "out", "off", "its", "why", "how", "who",
             "insight", "post", "notes", "note", "journal", "entry", "entries", "work", "thing",
             "things", "stuff", "really", "just", "dont", "didnt", "doesnt", "cant", "wont",
-            "ive", "im", "youre", "thats", "maybe", "also", "still",
+            "ive", "im", "youre", "thats", "maybe", "also", "still", "feel", "kind", "lot",
+            "can", "should", "did", "done", "her", "his", "our", "lack", "start", "write",
+            "need", "needs", "want", "wants", "think", "thinking", "good", "bad", "better",
+            "best", "worse", "life", "people", "person", "someone", "something",
         ])
     })
 }
@@ -2592,6 +2361,47 @@ fn score_terms_from_text(raw: &str, weight: f32, scores: &mut HashMap<String, f3
 }
 
 fn derive_interest_keywords(label: &str, content: &str) -> Vec<String> {
+    extract_weighted_profile_keywords(label, content)
+        .into_iter()
+        .map(|(term, _)| term)
+        .collect()
+}
+
+fn useful_single_keyword(term: &str) -> bool {
+    matches!(
+        term,
+        "ai"
+            | "rust"
+            | "python"
+            | "javascript"
+            | "typescript"
+            | "golang"
+            | "bluesky"
+            | "nostr"
+            | "rss"
+            | "workflow"
+            | "automation"
+            | "ranking"
+            | "video"
+            | "audio"
+            | "design"
+            | "frontend"
+            | "backend"
+            | "productivity"
+            | "protocol"
+            | "meditation"
+            | "mindfulness"
+            | "buddhism"
+            | "psychology"
+            | "philosophy"
+            | "economics"
+            | "startup"
+            | "writing"
+            | "podcast"
+    )
+}
+
+fn extract_weighted_profile_keywords(label: &str, content: &str) -> Vec<(String, f64)> {
     let mut scores: HashMap<String, f32> = HashMap::new();
     score_terms_from_text(label, 3.0, &mut scores);
     let mut heading_count = 0;
@@ -2618,12 +2428,89 @@ fn derive_interest_keywords(label: &str, content: &str) -> Vec<String> {
             .unwrap_or(Ordering::Equal)
             .then_with(|| left.0.cmp(&right.0))
     });
-    ranked
+    let mut phrase_terms = Vec::new();
+    let mut single_terms = Vec::new();
+    for (term, score) in ranked.into_iter().filter(|(term, _)| keyword_is_meaningful(term)) {
+        if term.split_whitespace().count() >= 2 {
+            phrase_terms.push((term, score));
+        } else if useful_single_keyword(&term) {
+            single_terms.push((term, score));
+        }
+    }
+    phrase_terms
         .into_iter()
-        .filter(|(term, _)| keyword_is_meaningful(term))
-        .map(|(term, _)| term)
-        .take(STAGE1_KEYWORDS_PER_INTEREST_LIMIT)
+        .chain(single_terms)
+        .take(KEYWORD_PROFILE_BATCH_LIMIT)
+        .enumerate()
+        .map(|(index, (term, score))| {
+            let normalized = (score / 6.0).clamp(0.2, 1.0) as f64;
+            let rank_bonus = (KEYWORD_PROFILE_BATCH_LIMIT.saturating_sub(index) as f64)
+                / (KEYWORD_PROFILE_BATCH_LIMIT as f64)
+                * 0.08;
+            let increment = (0.18 + normalized * 0.24 + rank_bonus).min(0.55);
+            (term, increment)
+        })
         .collect()
+}
+
+fn normalize_stored_triage_keywords(raw_json: &str) -> Vec<(String, f64)> {
+    let raw_terms: Vec<String> = serde_json::from_str(raw_json.trim()).unwrap_or_default();
+    if raw_terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    for (idx, raw) in raw_terms.into_iter().enumerate() {
+        let Some(term) = normalize_profile_keyword_seed(&raw) else {
+            continue;
+        };
+        let rank_bonus = (1.1 - ((idx as f64) * 0.06)).max(0.55);
+        *scores.entry(term).or_insert(0.0) += rank_bonus;
+    }
+
+    let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked.truncate(KEYWORD_PROFILE_BATCH_LIMIT);
+    ranked
+}
+
+fn normalize_profile_keyword_seed(raw: &str) -> Option<String> {
+    let cleaned = sanitize_text_for_keyword_extraction(raw);
+    if cleaned.is_empty() {
+        return None;
+    }
+    let normalized = cleaned
+        .split_whitespace()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    if keyword_is_meaningful(&normalized) || useful_single_keyword(&normalized) {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn profile_keyword_input_hash(
+    content_hash: &str,
+    keyword_mode: &str,
+    keywords: &[(String, f64)],
+) -> String {
+    let terms: Vec<&str> = keywords.iter().map(|(term, _)| term.as_str()).collect();
+    content_hash_16(&format!(
+        "{}::{keyword_mode}::{}",
+        content_hash.trim(),
+        terms.join("|")
+    ))
 }
 
 fn sanitize_text_for_keyword_extraction(raw: &str) -> String {
@@ -2686,34 +2573,6 @@ fn keyword_is_meaningful(term: &str) -> bool {
     parts.iter().all(|part| {
         part.chars().any(|ch| ch.is_alphabetic()) && !stopwords.contains(*part)
     })
-}
-
-fn refresh_generic_interest_labels(
-    workspace_dir: &Path,
-    active_interests: &mut [ActiveInterest],
-) -> Result<()> {
-    for interest in active_interests.iter_mut() {
-        if !label_looks_auto_generated(&interest.record.label) {
-            continue;
-        }
-        let source_text = load_interest_source_text(workspace_dir, &interest.record.source_path);
-        if source_text.trim().is_empty() {
-            continue;
-        }
-        let next_label = derive_interest_label(&interest.record.label, &source_text);
-        if next_label == interest.record.label || label_looks_auto_generated(&next_label) {
-            continue;
-        }
-        if local_store::update_feed_interest_label(
-            workspace_dir,
-            &interest.record.id,
-            &next_label,
-            &vec_to_bytes(&interest.embedding),
-        )? {
-            interest.record.label = next_label;
-        }
-    }
-    Ok(())
 }
 
 fn load_interest_source_text(workspace_dir: &Path, source_path: &str) -> String {
@@ -2825,6 +2684,78 @@ fn broad_interest_keywords(profile: &FeedProfile) -> Vec<String> {
     result
 }
 
+fn weighted_interest_keywords(profile: &FeedProfile) -> Vec<(String, f32)> {
+    let mut scores: HashMap<String, f32> = HashMap::new();
+    for interest in &profile.interests {
+        let keywords = if interest.keywords.is_empty() {
+            vec![interest.label.clone()]
+        } else {
+            interest.keywords.clone()
+        };
+        for keyword in keywords {
+            if keyword.len() < 3 || stage1_stopwords().contains(keyword.as_str()) {
+                continue;
+            }
+            *scores.entry(keyword).or_insert(0.0) += interest.health_score.max(0.05);
+        }
+    }
+    let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked.truncate(STAGE1_KEYWORD_LIMIT);
+    ranked
+}
+
+fn keyword_weight_sum(text: &str, keyword_weights: &[(String, f32)]) -> (f32, Option<String>) {
+    if keyword_weights.is_empty() {
+        return (0.0, None);
+    }
+    let lower = text.to_ascii_lowercase();
+    let stemmed_tokens: Vec<String> = tokenize_and_stem(&lower);
+    let mut matched_weight = 0.0_f32;
+    let mut best_match: Option<(String, f32)> = None;
+    for (keyword, weight) in keyword_weights {
+        let matched = lower.contains(keyword.as_str())
+            || stemmed_tokens.iter().any(|token| token == keyword.as_str());
+        if !matched {
+            continue;
+        }
+        matched_weight += *weight;
+        if best_match
+            .as_ref()
+            .map(|(_, best)| *weight > *best)
+            .unwrap_or(true)
+        {
+            best_match = Some((keyword.clone(), *weight));
+        }
+    }
+    (matched_weight, best_match.map(|(keyword, _)| keyword))
+}
+
+fn candidate_freshness_bonus(item: &PersonalizedFeedItem) -> f32 {
+    let timestamp = item_sort_timestamp(item);
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+        return 0.0;
+    };
+    let age_hours = (Utc::now() - parsed.with_timezone(&Utc))
+        .num_hours()
+        .max(0) as f32;
+    if age_hours <= 24.0 {
+        KEYWORD_PROFILE_FRESHNESS_BONUS_MAX
+    } else if age_hours <= 72.0 {
+        KEYWORD_PROFILE_FRESHNESS_BONUS_MAX * 0.5
+    } else if age_hours <= 168.0 {
+        KEYWORD_PROFILE_FRESHNESS_BONUS_MAX * 0.2
+    } else {
+        0.0
+    }
+}
+
 fn keyword_match_score(text: &str, keywords: &[String]) -> f32 {
     if keywords.is_empty() {
         return 0.0;
@@ -2919,7 +2850,7 @@ impl BlueskyFeedSource {
         &self,
         profile: &FeedProfile,
     ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
-        let keywords = broad_interest_keywords(profile);
+        let keyword_weights = weighted_interest_keywords(profile);
         let mut diagnostics = FeedProtocolDiagnostics {
             available: true,
             ..FeedProtocolDiagnostics::default()
@@ -2953,7 +2884,8 @@ impl BlueskyFeedSource {
         let mut ranked = Vec::new();
         for generator in generators {
             let search_text = bluesky_feed_generator_search_text(&generator);
-            let keyword_score = keyword_match_score(&search_text, &keywords);
+            let (keyword_score, matched_keyword) =
+                keyword_weight_sum(&search_text, &keyword_weights);
             if keyword_score <= 0.0 {
                 continue;
             }
@@ -2964,8 +2896,7 @@ impl BlueskyFeedSource {
                 label: label.clone(),
                 stage1_score: keyword_score,
                 description: non_empty_string(generator.description.clone()),
-                matched_interest_label: first_matched_keyword(&search_text, &keywords)
-                    .map(|value| value.to_string()),
+                matched_interest_label: matched_keyword,
                 matched_interest_score: Some(keyword_score),
                 metadata_json: serde_json::json!({
                     "uri": generator.uri,
@@ -3087,7 +3018,7 @@ impl NostrFeedSource {
         &self,
         profile: &FeedProfile,
     ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
-        let keywords = broad_interest_keywords(profile);
+        let keyword_weights = weighted_interest_keywords(profile);
         let relay_urls = configured_nostr_world_feed_relays(&self.config);
         let fallback_relays = fallback_nostr_world_feed_relays(&self.config);
         let mut diagnostics = FeedProtocolDiagnostics {
@@ -3095,7 +3026,7 @@ impl NostrFeedSource {
             scanned_count: if relay_urls.is_empty() { fallback_relays.len() } else { relay_urls.len() },
             ..FeedProtocolDiagnostics::default()
         };
-        let mut selected = fetch_nip66_relay_candidates(&fallback_relays, &keywords)
+        let mut selected = fetch_nip66_relay_candidates(&fallback_relays, &keyword_weights)
             .await
             .unwrap_or_default();
         if relay_urls.is_empty() {
@@ -3124,7 +3055,8 @@ impl NostrFeedSource {
         let mut ranked = Vec::new();
         for (relay_url, metadata) in relay_metadata {
             let search_text = nostr_relay_search_text(&relay_url, metadata.as_ref());
-            let keyword_score = keyword_match_score(&search_text, &keywords);
+            let (keyword_score, matched_keyword) =
+                keyword_weight_sum(&search_text, &keyword_weights);
             if keyword_score <= 0.0 {
                 continue;
             }
@@ -3135,8 +3067,7 @@ impl NostrFeedSource {
                 label: nostr_relay_label(&relay_url, metadata.as_ref()),
                 stage1_score: keyword_score,
                 description: nostr_relay_description(metadata.as_ref()),
-                matched_interest_label: first_matched_keyword(&search_text, &keywords)
-                    .map(|value| value.to_string()),
+                matched_interest_label: matched_keyword,
                 matched_interest_score: Some(keyword_score),
                 metadata_json: serde_json::json!({
                     "relayUrl": relay_url,
@@ -3274,14 +3205,12 @@ impl FeedSource for NostrFeedSource {
 #[derive(Clone)]
 struct RssFeedSource {
     config: Config,
-    embedder: SharedEmbedder,
 }
 
 impl RssFeedSource {
-    fn new(config: &Config, embedder: SharedEmbedder) -> Self {
+    fn new(config: &Config) -> Self {
         Self {
             config: config.clone(),
-            embedder,
         }
     }
 
@@ -3290,26 +3219,13 @@ impl RssFeedSource {
         profile: &FeedProfile,
     ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
         seed_default_feed_web_sources(&self.config.workspace_dir)?;
-        // Try to enrich sources with embeddings, but fall back to raw sources
-        // if embedding fails (e.g., Ollama model not loaded yet).
-        let sources = match ensure_catalog_metadata_embeddings(
-            &self.config.workspace_dir,
-            self.embedder.clone(),
-        )
-        .await
-        {
-            Ok(enriched) => enriched,
-            Err(err) => {
-                tracing::warn!("RSS source embedding failed, using unenriched sources: {err}");
-                local_store::list_feed_web_sources(&self.config.workspace_dir)?
-            }
-        };
+        let sources = local_store::list_feed_web_sources(&self.config.workspace_dir)?;
         let mut diagnostics = FeedProtocolDiagnostics {
             available: true,
             scanned_count: sources.len(),
             ..FeedProtocolDiagnostics::default()
         };
-        let keywords = broad_interest_keywords(profile);
+        let keyword_weights = weighted_interest_keywords(profile);
         let mut ranked = Vec::new();
         for source in &sources {
             let metadata_text = catalog_metadata_text(
@@ -3318,7 +3234,8 @@ impl RssFeedSource {
                 &source.description,
                 &source.topics_csv,
             );
-            let keyword_score = keyword_match_score(&metadata_text, &keywords);
+            let (keyword_score, matched_keyword) =
+                keyword_weight_sum(&metadata_text, &keyword_weights);
             if keyword_score <= 0.0 {
                 tracing::trace!(
                     domain = %source.domain,
@@ -3333,8 +3250,7 @@ impl RssFeedSource {
                 label: source.title.clone(),
                 stage1_score: keyword_score,
                 description: non_empty_string(source.description.clone()),
-                matched_interest_label: first_matched_keyword(&metadata_text, &keywords)
-                    .map(|value| value.to_string()),
+                matched_interest_label: matched_keyword,
                 matched_interest_score: Some(keyword_score),
                 metadata_json: serde_json::json!({
                     "domain": source.domain,
@@ -3346,70 +3262,9 @@ impl RssFeedSource {
         tracing::info!(
             keyword_matched = ranked.len(),
             total_sources = sources.len(),
-            keyword_count = keywords.len(),
+            keyword_count = keyword_weights.len(),
             "RSS source discovery: keyword matching complete"
         );
-
-        // Semantic fallback: when keyword matching yields too few sources, use
-        // embedding similarity between interest vectors and source metadata
-        // embeddings to discover relevant sources that keywords missed.
-        if ranked.len() < 3 && !profile.interests.is_empty() {
-            let existing_keys: HashSet<String> = ranked.iter().map(|s| s.key.clone()).collect();
-            let mut semantic_ranked: Vec<(SelectedSource, f32)> = Vec::new();
-            let mut sources_with_embeddings = 0usize;
-            for source in &sources {
-                if existing_keys.contains(&source.xml_url) {
-                    continue;
-                }
-                let source_emb = bytes_to_vec(&source.metadata_embedding);
-                if source_emb.is_empty() {
-                    continue;
-                }
-                sources_with_embeddings += 1;
-                let mut best_sim = 0.0_f32;
-                let mut best_label: Option<String> = None;
-                for interest in &profile.interests {
-                    let sim = cosine_similarity(&source_emb, &interest.embedding);
-                    let weighted = sim * interest.health_score;
-                    if weighted > best_sim {
-                        best_sim = weighted;
-                        best_label = Some(interest.label.clone());
-                    }
-                }
-                if best_sim >= RSS_SOURCE_MATCH_THRESHOLD {
-                    semantic_ranked.push((
-                        SelectedSource {
-                            protocol: FeedProtocol::Rss,
-                            key: source.xml_url.clone(),
-                            label: source.title.clone(),
-                            stage1_score: best_sim,
-                            description: non_empty_string(source.description.clone()),
-                            matched_interest_label: best_label,
-                            matched_interest_score: Some(best_sim),
-                            metadata_json: serde_json::json!({
-                                "domain": source.domain,
-                                "topics": source.topics_csv,
-                                "htmlUrl": source.html_url,
-                            }),
-                        },
-                        best_sim,
-                    ));
-                }
-            }
-            tracing::info!(
-                sources_with_embeddings,
-                semantic_matched = semantic_ranked.len(),
-                threshold = RSS_SOURCE_MATCH_THRESHOLD,
-                "RSS source discovery: semantic fallback"
-            );
-            semantic_ranked.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
-            });
-            let slots_available = RSS_SELECTED_SOURCE_LIMIT.saturating_sub(ranked.len());
-            for (source, _) in semantic_ranked.into_iter().take(slots_available) {
-                ranked.push(source);
-            }
-        }
 
         ranked.sort_by(|left, right| {
             right
@@ -3464,12 +3319,7 @@ impl FeedSource for RssFeedSource {
         limit: usize,
     ) -> Result<Vec<FeedCandidate>> {
         sync_content_sources_from_selected_sources(&self.config.workspace_dir, selected_sources)?;
-        refresh_selected_content_sources(
-            &self.config.workspace_dir,
-            selected_sources,
-            self.embedder.clone(),
-        )
-        .await?;
+        refresh_selected_content_sources(&self.config.workspace_dir, selected_sources).await?;
 
         let selected_keys: HashMap<String, &SelectedSource> = selected_sources
             .iter()
@@ -3782,7 +3632,6 @@ fn sync_content_sources_from_selected_sources(
 async fn refresh_selected_content_sources(
     workspace_dir: &Path,
     selected_sources: &[SelectedSource],
-    embedder: SharedEmbedder,
 ) -> Result<()> {
     for selected in selected_sources {
         let Some(source) = local_store::get_content_source(workspace_dir, &selected.key)? else {
@@ -3796,8 +3645,7 @@ async fn refresh_selected_content_sources(
         match fetch_remote_feed(&source).await {
             Ok(result) => {
                 if !result.not_modified {
-                    upsert_feed_entries(workspace_dir, &source, result.entries, embedder.clone(), &fetched_at)
-                        .await?;
+                    upsert_feed_entries(workspace_dir, &source, result.entries, &fetched_at).await?;
                 }
                 local_store::update_content_source_fetch(
                     workspace_dir,
@@ -3830,22 +3678,13 @@ async fn upsert_feed_entries(
     workspace_dir: &Path,
     source: &local_store::ContentSourceRecord,
     entries: Vec<ParsedFeedEntry>,
-    embedder: SharedEmbedder,
     discovered_at: &str,
 ) -> Result<()> {
-    let entry_texts: Vec<String> = entries.iter().map(content_item_embedding_text).collect();
-    let embeddings = embed_text_batch(embedder, &entry_texts).await.unwrap_or_default();
-    let mut embeddings_iter = embeddings.into_iter();
-
     for entry in entries.into_iter() {
         let embedding_text = content_item_embedding_text(&entry);
         if embedding_text.trim().is_empty() {
             continue;
         }
-        let embedding = embeddings_iter
-            .next()
-            .map(|value| vec_to_bytes(&value))
-            .unwrap_or_default();
         let canonical_url = if entry.canonical_url.trim().is_empty() {
             source.html_url.clone()
         } else {
@@ -3868,7 +3707,7 @@ async fn upsert_feed_entries(
                 summary: truncate_with_ellipsis(entry.summary.trim(), 280),
                 content_text: embedding_text,
                 content_hash,
-                embedding,
+                embedding: Vec::new(),
                 published_at: entry.published_at,
                 discovered_at: discovered_at.to_string(),
             },
@@ -5008,7 +4847,7 @@ mod tests {
 
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
-        let source = RssFeedSource::new(&config, Arc::new(MockEmbedder));
+        let source = RssFeedSource::new(&config);
         let ranked = source.discover_sources(&test_profile()).await.unwrap();
         assert!(!ranked.is_empty());
         assert_eq!(ranked[0].label, "Systems");
@@ -5051,7 +4890,7 @@ mod tests {
 
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
-        let source = RssFeedSource::new(&config, Arc::new(MockEmbedder));
+        let source = RssFeedSource::new(&config);
         let ranked = source.discover_sources(&weak_test_profile()).await.unwrap();
 
         assert!(!ranked.is_empty());
@@ -5296,6 +5135,45 @@ mod tests {
         assert!(keywords.iter().any(|term| term.contains("human judgment") || term.contains("judgment")));
         assert!(!keywords.iter().any(|term| term.contains("20260314")));
         assert!(!keywords.iter().any(|term| term == "insight"));
+    }
+
+    #[tokio::test]
+    async fn rebuild_interest_profile_prefers_persisted_triage_keywords() {
+        let workspace = tempdir().unwrap();
+        local_store::initialize(workspace.path()).unwrap();
+        let journal_dir = workspace.path().join("journals/text/2026/03/28");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        let rel_path = "journals/text/2026/03/28/sample_note.md";
+        let content = "I spent the day reflecting on product direction, parenting, and a lot of scattered emotions.";
+        std::fs::write(workspace.path().join(rel_path), content).unwrap();
+
+        local_store::upsert_feed_interest_source(
+            workspace.path(),
+            &local_store::FeedInterestSourceRecord {
+                source_path: rel_path.to_string(),
+                content_hash: content_hash_16(content),
+                profile_input_hash: String::new(),
+                interest_id: None,
+                title: "sample note".into(),
+                triage_keywords_json: serde_json::json!([
+                    "local first",
+                    "video workflow",
+                    "feed ranking"
+                ])
+                .to_string(),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .unwrap();
+
+        let profile = rebuild_interest_profile(&test_config(workspace.path()))
+            .await
+            .unwrap();
+        let labels: Vec<String> = profile.interests.iter().map(|item| item.label.clone()).collect();
+
+        assert!(labels.iter().any(|term| term == "local first"));
+        assert!(labels.iter().any(|term| term == "video workflow"));
+        assert!(labels.iter().any(|term| term == "feed ranking"));
     }
 
     #[test]

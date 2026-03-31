@@ -9,6 +9,8 @@ import tempfile
 import textwrap
 from pathlib import Path
 
+from PIL import Image, ImageDraw, ImageFont
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -31,6 +33,19 @@ def resolve_path(raw: str) -> Path:
 def require_binary(name: str) -> None:
     if shutil.which(name) is None:
         raise RuntimeError(f"Required binary not found on PATH: {name}")
+
+
+def ffmpeg_supports_filter(ffmpeg_bin: str, filter_name: str) -> bool:
+    result = subprocess.run(
+        [ffmpeg_bin, "-hide_banner", "-filters"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    combined = "\n".join(
+        part for part in (result.stdout, result.stderr) if part.strip()
+    ).lower()
+    return filter_name.strip().lower() in combined
 
 
 def load_plan(path: Path) -> dict:
@@ -100,6 +115,10 @@ def escape_drawtext_path(path: Path) -> str:
     return str(path).replace("\\", "\\\\").replace(":", "\\:")
 
 
+def ffconcat_quote(path: Path) -> str:
+    return str(path).replace("'", "'\\''")
+
+
 def build_filter_complex(card_files: list[Path], cards: list[dict], width: int, height: int) -> str:
     font_size = max(42, int(min(width, height) * 0.065))
     box_border = max(18, int(font_size * 0.4))
@@ -122,6 +141,117 @@ def build_filter_complex(card_files: list[Path], cards: list[dict], width: int, 
         current = next_label
     filters.append(f"[{current}]copy[vout]")
     return ";".join(filters)
+
+
+def load_font(font_size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    font_candidates = [
+        "DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+    ]
+    for candidate in font_candidates:
+        try:
+            return ImageFont.truetype(candidate, font_size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def render_card_image(path: Path, text: str, width: int, height: int) -> None:
+    image = Image.new("RGB", (width, height), color="black")
+    draw = ImageDraw.Draw(image)
+    font_size = max(42, int(min(width, height) * 0.065))
+    font = load_font(font_size)
+    wrapped = wrap_card_text(text)
+
+    try:
+        left, top, right, bottom = draw.multiline_textbbox(
+            (0, 0),
+            wrapped,
+            font=font,
+            spacing=18,
+            align="center",
+        )
+        text_width = right - left
+        text_height = bottom - top
+    except AttributeError:
+        text_width, text_height = draw.multiline_textsize(
+            wrapped,
+            font=font,
+            spacing=18,
+        )
+
+    x = max(0, int((width - text_width) / 2))
+    y = max(0, int((height - text_height) / 2))
+    draw.multiline_text(
+        (x, y),
+        wrapped,
+        font=font,
+        fill="white",
+        spacing=18,
+        align="center",
+    )
+    image.save(path, format="PNG")
+
+
+def render_with_concat_images(
+    ffmpeg_bin: str,
+    tmp_root: Path,
+    cards: list[dict],
+    width: int,
+    height: int,
+    fps: int,
+    audio_path: Path,
+    audio_start: float,
+    duration: float,
+    output_path: Path,
+) -> None:
+    image_paths: list[Path] = []
+    durations: list[float] = []
+    for index, card in enumerate(cards, start=1):
+        image_path = tmp_root / f"card_{index:02d}.png"
+        render_card_image(image_path, card["text"], width, height)
+        image_paths.append(image_path)
+        durations.append(max(0.05, float(card["end"]) - float(card["start"])))
+
+    concat_path = tmp_root / "cards.ffconcat"
+    lines = ["ffconcat version 1.0"]
+    for image_path, card_duration in zip(image_paths, durations, strict=True):
+        lines.append(f"file '{ffconcat_quote(image_path)}'")
+        lines.append(f"duration {card_duration:.3f}")
+    lines.append(f"file '{ffconcat_quote(image_paths[-1])}'")
+    concat_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat_path),
+        "-ss",
+        f"{audio_start:.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(audio_path),
+        "-vf",
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps={fps}",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "aac",
+        "-shortest",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "ffmpeg failed")
 
 
 def main() -> int:
@@ -164,38 +294,52 @@ def main() -> int:
             card_path.write_text(wrap_card_text(card["text"]) + "\n", encoding="utf-8")
             card_files.append(card_path)
 
-        filter_complex = build_filter_complex(card_files, cards, width, height)
-        cmd = [
-            args.ffmpeg,
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            f"color=c=black:s={width}x{height}:r={fps}:d={duration:.3f}",
-            "-ss",
-            f"{audio_start:.3f}",
-            "-t",
-            f"{duration:.3f}",
-            "-i",
-            str(audio_path),
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[vout]",
-            "-map",
-            "1:a:0",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-shortest",
-            str(output_path),
-        ]
-        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "ffmpeg failed")
+        if ffmpeg_supports_filter(args.ffmpeg, "drawtext"):
+            filter_complex = build_filter_complex(card_files, cards, width, height)
+            cmd = [
+                args.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=black:s={width}x{height}:r={fps}:d={duration:.3f}",
+                "-ss",
+                f"{audio_start:.3f}",
+                "-t",
+                f"{duration:.3f}",
+                "-i",
+                str(audio_path),
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "[vout]",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(output_path),
+            ]
+            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "ffmpeg failed")
+        else:
+            render_with_concat_images(
+                args.ffmpeg,
+                tmp_root,
+                cards,
+                width,
+                height,
+                fps,
+                audio_path,
+                audio_start,
+                duration,
+                output_path,
+            )
 
     print(
         json.dumps(

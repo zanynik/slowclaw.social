@@ -915,13 +915,20 @@ async fn open_workspace_journals_folder() -> Result<String, String> {
         .await
         .map_err(|e| ui_command_error("journals folder config load failed", "Failed to load the workspace configuration.", e))?;
     let journals_dir = config.workspace_dir.join("journals");
-    std::fs::create_dir_all(&journals_dir).map_err(|e| {
-        ui_command_error(
-            "journals folder create failed",
-            "Failed to prepare the journals folder.",
-            e,
-        )
-    })?;
+    for rel in ["", "text/inbox", "media/audio/inbox"] {
+        let target = if rel.is_empty() {
+            journals_dir.clone()
+        } else {
+            journals_dir.join(rel)
+        };
+        std::fs::create_dir_all(&target).map_err(|e| {
+            ui_command_error(
+                "journals folder create failed",
+                "Failed to prepare the journals folder.",
+                e,
+            )
+        })?;
+    }
     open_path_with_system_handler(&journals_dir).map_err(|e| {
         ui_command_error(
             "journals folder open failed",
