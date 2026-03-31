@@ -1493,8 +1493,9 @@ pub fn render_extractor_skill_markdown(workflow_key: &str) -> Result<String> {
         WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => (
             "journalTitles",
             journal_titles_schema_json()?,
-            "- Emit titles only for real journal note files under `journals/text/`.\n\
-- Do not retitle transcript sidecars under `journals/text/transcriptions/**`.\n\
+            "- Emit titles for real journal note files under `journals/text/` and for transcript-backed media families using the transcript `.txt` path under `journals/text/transcriptions/**` or `journals/text/transcript/**`.\n\
+- When titling transcript-backed media, point `sourcePath` at the transcript `.txt` file; Rust will rename the linked media file and transcript sidecars together.\n\
+- Do not point `journalTitles` at transcript `.json` or `.srt` sidecars.\n\
 - Titles should be concise, durable, and free of dates, numbering, markdown markers, or file extensions.\n",
         ),
         _ => unreachable!(),
@@ -2455,10 +2456,21 @@ fn normalize_journal_title_items(
     let mut out = Vec::new();
     for mut item in items {
         item.source_path = normalize_source_path(&item.source_path)?;
-        if item.source_path.starts_with("journals/text/transcriptions/")
-            || item.source_path.starts_with("journals/text/transcript/")
-        {
-            anyhow::bail!("journalTitles items must point to journal note files, not transcript sidecars");
+        if is_transcript_source_path(&item.source_path) {
+            let extension = Path::new(&item.source_path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if extension != "txt" {
+                anyhow::bail!(
+                    "journalTitles transcript-backed media items must point to transcript text files, not sidecars"
+                );
+            }
+        } else if !item.source_path.starts_with("journals/text/") {
+            anyhow::bail!(
+                "journalTitles items must point to journal note files or transcript-backed media transcript text files"
+            );
         }
         item.title = truncate_with_ellipsis(item.title.trim(), 120);
         if item.title.is_empty() {
@@ -2473,6 +2485,402 @@ fn normalize_journal_title_items(
 
 fn is_transcript_source_path(path: &str) -> bool {
     path.starts_with("journals/text/transcriptions/") || path.starts_with("journals/text/transcript/")
+}
+
+fn workspace_relative_path_from_metadata_value(
+    workspace_dir: &Path,
+    raw: &str,
+) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = Path::new(trimmed);
+    let rel = if candidate.is_absolute() {
+        candidate.strip_prefix(workspace_dir).ok()?.to_path_buf()
+    } else {
+        PathBuf::from(trimmed.trim_start_matches('/'))
+    };
+    let normalized = rel.to_string_lossy().replace('\\', "/");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn linked_media_rel_path_from_transcript_metadata(
+    workspace_dir: &Path,
+    transcript_rel: &str,
+) -> Option<String> {
+    let json_rel = super::transcript_json_rel_path(transcript_rel);
+    let json_abs = workspace_dir.join(&json_rel);
+    let raw = fs::read_to_string(json_abs).ok()?;
+    let payload: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let source = payload.get("source")?.as_str()?;
+    let media_rel = workspace_relative_path_from_metadata_value(workspace_dir, source)?;
+    media_rel
+        .starts_with(&format!("{}/", super::JOURNAL_MEDIA_DIR))
+        .then_some(media_rel)
+}
+
+fn linked_media_rel_path_from_transcript_path(
+    workspace_dir: &Path,
+    transcript_rel: &str,
+) -> Option<String> {
+    let normalized = transcript_rel.trim().trim_start_matches('/').replace('\\', "/");
+    if let Some(relative) = normalized.strip_prefix("journals/text/transcriptions/") {
+        let relative_path = Path::new(relative);
+        let stem = relative_path.file_stem()?.to_str()?.trim();
+        if stem.is_empty() {
+            return None;
+        }
+        let mut media_dir = workspace_dir.join(super::JOURNAL_MEDIA_DIR);
+        if let Some(parent) = relative_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                media_dir.push(parent);
+            }
+        }
+        let entries = fs::read_dir(media_dir).ok()?;
+        let mut matches = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_file() {
+                    return None;
+                }
+                let entry_stem = path.file_stem()?.to_str()?.trim();
+                if entry_stem != stem {
+                    return None;
+                }
+                path.strip_prefix(workspace_dir)
+                    .ok()
+                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            })
+            .collect::<Vec<_>>();
+        matches.sort();
+        return (matches.len() == 1).then(|| matches.remove(0));
+    }
+
+    if let Some(stem) = Path::new(&normalized)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let root = workspace_dir.join(super::JOURNAL_MEDIA_DIR);
+        let mut stack = vec![root];
+        let mut matches = Vec::new();
+        while let Some(dir) = stack.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Some(entry_stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                if entry_stem.trim() != stem {
+                    continue;
+                }
+                if let Ok(rel) = path.strip_prefix(workspace_dir) {
+                    matches.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        matches.sort();
+        return (matches.len() == 1).then(|| matches.remove(0));
+    }
+
+    None
+}
+
+fn linked_media_rel_path_for_transcript(
+    workspace_dir: &Path,
+    transcript_rel: &str,
+) -> Option<String> {
+    linked_media_rel_path_from_transcript_metadata(workspace_dir, transcript_rel)
+        .or_else(|| linked_media_rel_path_from_transcript_path(workspace_dir, transcript_rel))
+}
+
+fn rename_workspace_file_if_exists(
+    workspace_dir: &Path,
+    old_rel: &str,
+    new_rel: &str,
+) -> Result<()> {
+    if old_rel == new_rel {
+        return Ok(());
+    }
+    let old_abs = workspace_dir.join(old_rel);
+    if !old_abs.exists() {
+        return Ok(());
+    }
+    let new_abs = workspace_dir.join(new_rel);
+    if let Some(parent) = new_abs.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::rename(&old_abs, &new_abs)
+        .with_context(|| format!("failed to rename {} -> {}", old_abs.display(), new_abs.display()))
+}
+
+fn path_rename_conflicts(
+    workspace_dir: &Path,
+    reserved_targets: &HashSet<String>,
+    candidate_rel: &str,
+    old_rel: &str,
+) -> bool {
+    if candidate_rel == old_rel {
+        return false;
+    }
+    if reserved_targets.contains(candidate_rel) {
+        return true;
+    }
+    workspace_dir.join(candidate_rel).exists()
+}
+
+fn rewrite_transcript_json_sidecar_after_family_rename(
+    workspace_dir: &Path,
+    transcript_json_rel: &str,
+    media_rel: Option<&str>,
+    transcript_rel: &str,
+) -> Result<()> {
+    let json_abs = workspace_dir.join(transcript_json_rel);
+    if !json_abs.is_file() {
+        return Ok(());
+    }
+
+    let raw = fs::read_to_string(&json_abs)
+        .with_context(|| format!("failed to read {}", json_abs.display()))?;
+    let mut payload: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", json_abs.display()))?;
+    let Some(object) = payload.as_object_mut() else {
+        anyhow::bail!(
+            "transcript json sidecar must be a JSON object: {}",
+            json_abs.display()
+        );
+    };
+    object.insert(
+        "transcriptPath".to_string(),
+        serde_json::Value::String(
+            workspace_dir
+                .join(transcript_rel)
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    if let Some(media_rel) = media_rel {
+        object.insert(
+            "source".to_string(),
+            serde_json::Value::String(
+                workspace_dir.join(media_rel).to_string_lossy().into_owned(),
+            ),
+        );
+    }
+
+    let serialized = serde_json::to_string_pretty(&payload)
+        .with_context(|| format!("failed to serialize {}", json_abs.display()))?;
+    fs::write(&json_abs, format!("{serialized}\n"))
+        .with_context(|| format!("failed to write {}", json_abs.display()))
+}
+
+fn rename_transcript_backed_media_family(
+    workspace_dir: &Path,
+    transcript_rel: &str,
+    stem: &str,
+    reserved_targets: &mut HashSet<String>,
+    rename_map: &mut HashMap<String, String>,
+) -> Result<()> {
+    let old_transcript_abs = workspace_dir.join(transcript_rel);
+    if !old_transcript_abs.is_file() {
+        return Ok(());
+    }
+
+    let transcript_parent_rel = old_transcript_abs
+        .parent()
+        .and_then(|parent| parent.strip_prefix(workspace_dir).ok())
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .with_context(|| format!("missing transcript parent for {}", old_transcript_abs.display()))?;
+    let transcript_ext = old_transcript_abs
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("txt");
+    let old_transcript_json_rel = super::transcript_json_rel_path(transcript_rel);
+    let old_transcript_srt_rel = super::transcript_srt_rel_path(transcript_rel);
+
+    let media_rel = linked_media_rel_path_for_transcript(workspace_dir, transcript_rel);
+    let media_spec = media_rel.as_ref().and_then(|rel| {
+        let media_abs = workspace_dir.join(rel);
+        let parent_rel = media_abs
+            .parent()?
+            .strip_prefix(workspace_dir)
+            .ok()?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let extension = media_abs
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_string();
+        Some((rel.clone(), parent_rel, extension))
+    });
+
+    let mut selected = None;
+    for attempt in 0..=32usize {
+        let candidate_seed = if attempt == 0 {
+            stem.to_string()
+        } else {
+            format!(
+                "{}-{}",
+                stem,
+                short_hash(&format!("{transcript_rel}|{stem}|{attempt}"))
+            )
+        };
+        let candidate_transcript_rel =
+            format!("{}/{}.{}", transcript_parent_rel, candidate_seed, transcript_ext);
+        let candidate_transcript_json_rel =
+            super::transcript_json_rel_path(&candidate_transcript_rel);
+        let candidate_transcript_srt_rel =
+            super::transcript_srt_rel_path(&candidate_transcript_rel);
+        let candidate_media_rel = media_spec.as_ref().map(|(_, parent_rel, extension)| {
+            format!("{}/{}.{}", parent_rel, candidate_seed, extension)
+        });
+
+        let transcript_conflict = path_rename_conflicts(
+            workspace_dir,
+            reserved_targets,
+            &candidate_transcript_rel,
+            transcript_rel,
+        ) || path_rename_conflicts(
+            workspace_dir,
+            reserved_targets,
+            &candidate_transcript_json_rel,
+            &old_transcript_json_rel,
+        ) || path_rename_conflicts(
+            workspace_dir,
+            reserved_targets,
+            &candidate_transcript_srt_rel,
+            &old_transcript_srt_rel,
+        );
+        let media_conflict = match (media_spec.as_ref(), candidate_media_rel.as_ref()) {
+            (Some((old_media_rel, _, _)), Some(candidate_media_rel)) => path_rename_conflicts(
+                workspace_dir,
+                reserved_targets,
+                candidate_media_rel,
+                old_media_rel,
+            ),
+            _ => false,
+        };
+
+        if transcript_conflict || media_conflict {
+            continue;
+        }
+
+        selected = Some((
+            candidate_transcript_rel,
+            candidate_transcript_json_rel,
+            candidate_transcript_srt_rel,
+            candidate_media_rel,
+        ));
+        break;
+    }
+
+    let Some((
+        new_transcript_rel,
+        new_transcript_json_rel,
+        new_transcript_srt_rel,
+        new_media_rel,
+    )) = selected
+    else {
+        anyhow::bail!(
+            "failed to choose a non-conflicting target name for transcript-backed media family {}",
+            transcript_rel
+        );
+    };
+
+    if let (Some((old_media_rel, _, _)), Some(new_media_rel)) = (media_spec.as_ref(), new_media_rel.as_ref()) {
+        rename_workspace_file_if_exists(workspace_dir, old_media_rel, new_media_rel)?;
+        if let Err(err) = local_store::rename_media_asset_path(workspace_dir, old_media_rel, new_media_rel) {
+            tracing::warn!(
+                old = old_media_rel,
+                new = %new_media_rel,
+                err = %err,
+                "media asset path rename failed"
+            );
+        }
+    }
+
+    rename_workspace_file_if_exists(workspace_dir, transcript_rel, &new_transcript_rel)?;
+    rename_workspace_file_if_exists(
+        workspace_dir,
+        &old_transcript_json_rel,
+        &new_transcript_json_rel,
+    )?;
+    rename_workspace_file_if_exists(
+        workspace_dir,
+        &old_transcript_srt_rel,
+        &new_transcript_srt_rel,
+    )?;
+
+    for (old_rel, new_rel) in [
+        (transcript_rel, new_transcript_rel.as_str()),
+        (old_transcript_json_rel.as_str(), new_transcript_json_rel.as_str()),
+        (old_transcript_srt_rel.as_str(), new_transcript_srt_rel.as_str()),
+    ] {
+        if old_rel == new_rel {
+            continue;
+        }
+        if let Err(err) = local_store::rename_workspace_synth_source_path(workspace_dir, old_rel, new_rel) {
+            tracing::warn!(
+                old = old_rel,
+                new = %new_rel,
+                err = %err,
+                "transcript family source path rename failed"
+            );
+        }
+    }
+    if let Err(err) = local_store::rename_source_path_references(
+        workspace_dir,
+        transcript_rel,
+        &new_transcript_rel,
+    ) {
+        tracing::warn!(
+            old = transcript_rel,
+            new = %new_transcript_rel,
+            err = %err,
+            "transcript family reference rename failed"
+        );
+    }
+    if let Err(err) = rewrite_transcript_json_sidecar_after_family_rename(
+        workspace_dir,
+        &new_transcript_json_rel,
+        new_media_rel.as_deref(),
+        &new_transcript_rel,
+    ) {
+        tracing::warn!(
+            path = %new_transcript_json_rel,
+            err = %err,
+            "failed to rewrite transcript json metadata after family rename"
+        );
+    }
+
+    reserved_targets.insert(new_transcript_rel.clone());
+    reserved_targets.insert(new_transcript_json_rel);
+    reserved_targets.insert(new_transcript_srt_rel);
+    if let Some(new_media_rel) = new_media_rel {
+        reserved_targets.insert(new_media_rel);
+    }
+    rename_map.insert(transcript_rel.to_string(), new_transcript_rel);
+    Ok(())
 }
 
 fn normalize_optional_id_list(values: &mut Vec<String>) {
@@ -2784,7 +3192,52 @@ fn apply_source_path_renames(
         if old_rel.is_empty() {
             continue;
         }
+<<<<<<< HEAD
         let old_abs = workspace_dir.join(old_rel);
+=======
+        title_map.insert(old_rel, item.title.trim().to_string());
+    }
+
+    let mut target_paths = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for path in processed_source_paths {
+        let normalized = path.trim().trim_start_matches('/').replace('\\', "/");
+        if normalized.is_empty() || !seen_paths.insert(normalized.clone()) {
+            continue;
+        }
+        target_paths.push(normalized);
+    }
+    for path in title_map.keys() {
+        if seen_paths.insert(path.clone()) {
+            target_paths.push(path.clone());
+        }
+    }
+
+    let mut rename_map = HashMap::new();
+    let mut reserved_targets = HashSet::new();
+    for old_rel in target_paths {
+        if old_rel.is_empty() {
+            continue;
+        }
+        if is_transcript_source_path(&old_rel) {
+            let Some(title) = title_map.get(&old_rel) else {
+                continue;
+            };
+            let mut stem = normalize_title_stem(title);
+            if stem.is_empty() {
+                stem = format!("recording-{}", short_hash(&format!("{}|{}", old_rel, title)));
+            }
+            rename_transcript_backed_media_family(
+                workspace_dir,
+                &old_rel,
+                &stem,
+                &mut reserved_targets,
+                &mut rename_map,
+            )?;
+            continue;
+        }
+        let old_abs = workspace_dir.join(&old_rel);
+>>>>>>> 78fb632 (Enable semantic renaming for linked audio transcript families)
         if !old_abs.is_file() {
             continue;
         }
@@ -4254,6 +4707,218 @@ Do something useful.
     }
 
     #[test]
+<<<<<<< HEAD
+=======
+    fn apply_handoff_files_marks_journal_titles_applied_when_rename_succeeds() {
+        let tmp = tempdir().unwrap();
+        let journal_rel = "journals/text/2026/03/15/103944_Journal_entry.md";
+        let journal_abs = tmp.path().join(journal_rel);
+        fs::create_dir_all(journal_abs.parent().unwrap()).unwrap();
+        fs::write(&journal_abs, "A note about work and life.").unwrap();
+
+        let titles = JournalTitleFile {
+            version: "1".to_string(),
+            items: vec![JournalTitleCandidate {
+                source_path: journal_rel.to_string(),
+                title: "Work and Life Reflections".to_string(),
+            }],
+        };
+        write_json_file(&journal_titles_path(tmp.path()), &titles);
+
+        let processed_source_paths = vec![journal_rel.to_string()];
+        let applied = apply_handoff_files(tmp.path(), "run-title", &processed_source_paths).unwrap();
+
+        assert_eq!(applied.artifact_states.journal_titles.status, "applied");
+        assert_eq!(applied.artifact_states.journal_titles.item_count, 1);
+        assert_eq!(applied.renamed_sources.len(), 1);
+        assert_eq!(
+            applied.renamed_sources[0].to_path,
+            "journals/text/2026/03/15/work-and-life-reflections.md"
+        );
+        assert!(
+            tmp.path()
+                .join("journals/text/2026/03/15/work-and-life-reflections.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn apply_handoff_files_moves_processed_inbox_note_into_dated_folder_without_title_handoff() {
+        let tmp = tempdir().unwrap();
+        let journal_rel = "journals/text/inbox/raw-note.md";
+        let journal_abs = tmp.path().join(journal_rel);
+        fs::create_dir_all(journal_abs.parent().unwrap()).unwrap();
+        fs::write(&journal_abs, "Inbox note waiting for synthesis.").unwrap();
+        let observed_at = journal_source_observed_at(&journal_abs).unwrap();
+
+        let processed_source_paths = vec![journal_rel.to_string()];
+        let applied = apply_handoff_files(tmp.path(), "run-inbox", &processed_source_paths).unwrap();
+
+        assert_eq!(applied.renamed_sources.len(), 1);
+        let expected_rel = format!(
+            "journals/text/{:04}/{:02}/{:02}/raw-note.md",
+            observed_at.year(),
+            observed_at.month(),
+            observed_at.day()
+        );
+        assert_eq!(applied.renamed_sources[0].to_path, expected_rel);
+        assert!(tmp.path().join(&applied.renamed_sources[0].to_path).exists());
+        assert!(!tmp.path().join(journal_rel).exists());
+    }
+
+    #[test]
+    fn apply_handoff_files_renames_transcript_backed_media_family_from_title_handoff() {
+        let tmp = tempdir().unwrap();
+        local_store::initialize(tmp.path()).unwrap();
+
+        let media_rel = "journals/media/audio/2026/03/30/190553_Audio_20260208_123857.mp3";
+        let transcript_rel =
+            "journals/text/transcriptions/audio/2026/03/30/190553_Audio_20260208_123857.txt";
+        let media_abs = tmp.path().join(media_rel);
+        let transcript_abs = tmp.path().join(transcript_rel);
+        fs::create_dir_all(media_abs.parent().unwrap()).unwrap();
+        fs::create_dir_all(transcript_abs.parent().unwrap()).unwrap();
+        fs::write(&media_abs, b"audio").unwrap();
+        fs::write(&transcript_abs, "mindful observation").unwrap();
+        fs::write(
+            tmp.path().join(super::super::transcript_json_rel_path(transcript_rel)),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "source": media_abs.to_string_lossy(),
+                    "transcriptPath": transcript_abs.to_string_lossy(),
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(super::super::transcript_srt_rel_path(transcript_rel)),
+            "1\n00:00:00,000 --> 00:00:01,000\nmindful observation\n",
+        )
+        .unwrap();
+
+        local_store::create_media_asset_metadata(
+            tmp.path(),
+            &local_store::MediaAssetInput {
+                title: "Audio 20260208 123857".to_string(),
+                entry_id: String::new(),
+                asset_type: "audio".to_string(),
+                mime_type: "audio/mpeg".to_string(),
+                source: "workspace".to_string(),
+                status: "ready".to_string(),
+                workspace_path: media_rel.to_string(),
+                size_bytes: 5,
+                created_at_client: None,
+            },
+        )
+        .unwrap();
+        local_store::upsert_workspace_synth_sources(
+            tmp.path(),
+            &[local_store::WorkspaceSynthSourceUpsert {
+                source_path: transcript_rel.to_string(),
+                content_hash: "hash-1".to_string(),
+                word_count: 12,
+                last_processed_hash: String::new(),
+                last_processed_at: String::new(),
+                last_batch_id: String::new(),
+            }],
+        )
+        .unwrap();
+        local_store::upsert_feed_interest_source(
+            tmp.path(),
+            &local_store::FeedInterestSourceRecord {
+                source_path: transcript_rel.to_string(),
+                content_hash: "hash-1".to_string(),
+                profile_input_hash: String::new(),
+                interest_id: None,
+                title: "Audio 20260208 123857".to_string(),
+                triage_keywords_json: "[\"mindfulness\"]".to_string(),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .unwrap();
+
+        write_json_file(
+            &journal_titles_path(tmp.path()),
+            &JournalTitleFile {
+                version: "1".to_string(),
+                items: vec![JournalTitleCandidate {
+                    source_path: transcript_rel.to_string(),
+                    title: "Mindful Observation Beyond Judgment".to_string(),
+                }],
+            },
+        );
+
+        let processed_source_paths = vec![transcript_rel.to_string()];
+        let applied = apply_handoff_files(tmp.path(), "run-audio-title", &processed_source_paths)
+            .unwrap();
+
+        let expected_media_rel =
+            "journals/media/audio/2026/03/30/mindful-observation-beyond-judgment.mp3";
+        let expected_transcript_rel =
+            "journals/text/transcriptions/audio/2026/03/30/mindful-observation-beyond-judgment.txt";
+
+        assert_eq!(applied.artifact_states.journal_titles.status, "applied");
+        assert_eq!(applied.artifact_states.journal_titles.item_count, 1);
+        assert_eq!(applied.renamed_sources.len(), 1);
+        assert_eq!(applied.renamed_sources[0].from_path, transcript_rel);
+        assert_eq!(applied.renamed_sources[0].to_path, expected_transcript_rel);
+        assert!(tmp.path().join(expected_media_rel).exists());
+        assert!(tmp.path().join(expected_transcript_rel).exists());
+        assert!(tmp
+            .path()
+            .join(super::super::transcript_json_rel_path(expected_transcript_rel))
+            .exists());
+        assert!(tmp
+            .path()
+            .join(super::super::transcript_srt_rel_path(expected_transcript_rel))
+            .exists());
+        assert!(!tmp.path().join(media_rel).exists());
+        assert!(!tmp.path().join(transcript_rel).exists());
+
+        let relocated_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(
+                tmp.path()
+                    .join(super::super::transcript_json_rel_path(expected_transcript_rel)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            relocated_json["source"].as_str(),
+            Some(tmp.path().join(expected_media_rel).to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            relocated_json["transcriptPath"].as_str(),
+            Some(
+                tmp.path()
+                    .join(expected_transcript_rel)
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+
+        let synth_sources = local_store::list_workspace_synth_sources(tmp.path()).unwrap();
+        assert_eq!(synth_sources.len(), 1);
+        assert_eq!(synth_sources[0].source_path, expected_transcript_rel);
+        assert!(local_store::get_feed_interest_source(tmp.path(), expected_transcript_rel)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            local_store::rename_media_asset_path(
+                tmp.path(),
+                expected_media_rel,
+                "journals/media/audio/2026/03/30/final-check.mp3",
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+>>>>>>> 78fb632 (Enable semantic renaming for linked audio transcript families)
     fn apply_handoff_files_keeps_valid_outputs_when_one_type_fails() {
         let tmp = tempdir().unwrap();
         let insight_posts = InsightPostFile {
