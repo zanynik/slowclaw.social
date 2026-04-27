@@ -3250,6 +3250,28 @@ mod tests {
     use crate::providers::ChatResponse;
     use tempfile::TempDir;
 
+    #[derive(Default)]
+    struct MockProvider {
+        capabilities: ProviderCapabilities,
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.capabilities.clone()
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
     struct NonVisionProvider {
         calls: Arc<AtomicUsize>,
     }
