@@ -92,6 +92,7 @@ body {
   min-height: 100dvh;
   padding-bottom: 90px;
   background-color: var(--bg);
+  overflow-x: hidden;
 }
 
 /* ── Base form elements ── */
@@ -242,6 +243,8 @@ textarea {
 .app-shell {
   max-width: 700px;
   margin: 0 auto;
+  width: 100%;
+  overflow-x: clip;
 }
 
 @media (min-width: 1024px) {
@@ -252,7 +255,7 @@ textarea {
 
 /* ── Top bar ── */
 .topbar {
-  padding: 2.25rem 1.5rem 1rem;
+  padding: calc(2.25rem + env(safe-area-inset-top, 0px)) max(1.5rem, env(safe-area-inset-right, 0px)) 1rem max(1.5rem, env(safe-area-inset-left, 0px));
   position: sticky;
   top: 0;
   background: rgba(250, 250, 249, 0.85);
@@ -262,6 +265,7 @@ textarea {
   display: flex;
   justify-content: space-between;
   align-items: flex-end;
+  gap: 0.75rem;
   border-bottom: 1px solid transparent;
   transition: border-color 0.2s;
 }
@@ -282,6 +286,7 @@ textarea {
   display: flex;
   gap: 0.35rem;
   align-items: center;
+  flex-shrink: 0;
 }
 
 .topbar-action-group {
@@ -306,7 +311,7 @@ textarea {
   bottom: 0;
   left: 0;
   right: 0;
-  height: 80px;
+  min-height: 80px;
   background: rgba(255, 255, 255, 0.88);
   backdrop-filter: blur(24px) saturate(1.5);
   -webkit-backdrop-filter: blur(24px) saturate(1.5);
@@ -314,7 +319,7 @@ textarea {
   display: flex;
   justify-content: space-around;
   align-items: center;
-  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding: 0 max(0.5rem, env(safe-area-inset-right, 0px)) env(safe-area-inset-bottom, 0px) max(0.5rem, env(safe-area-inset-left, 0px));
   z-index: 50;
 }
 
@@ -370,6 +375,10 @@ textarea {
   min-width: 0;
 }
 
+.bottom-nav-label-short {
+  display: none;
+}
+
 .bottom-nav-badge {
   display: inline-flex;
   align-items: center;
@@ -393,6 +402,65 @@ textarea {
   gap: 1.25rem;
 }
 
+@media (max-width: 640px) {
+  .topbar {
+    padding-right: max(0.8rem, env(safe-area-inset-right, 0px));
+    padding-left: max(0.8rem, env(safe-area-inset-left, 0px));
+  }
+
+  .topbar > .row {
+    min-width: 0;
+    gap: 0.65rem !important;
+  }
+
+  .topbar h1 {
+    font-size: 1.25rem;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .topbar-actions button.ghost {
+    padding: 0.42rem;
+  }
+
+  .page-content {
+    padding-right: max(1rem, env(safe-area-inset-right, 0px));
+    padding-left: max(1rem, env(safe-area-inset-left, 0px));
+  }
+
+  .card {
+    padding-right: 1.1rem;
+    padding-left: 1.1rem;
+  }
+
+  .card p,
+  .text-sm {
+    overflow-wrap: anywhere;
+  }
+
+  .record-btn-group {
+    gap: clamp(1rem, 10vw, 2rem);
+  }
+
+  .bottom-nav {
+    height: calc(76px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .bottom-nav button {
+    font-size: 0.58rem;
+    padding: 8px 4px;
+  }
+
+  .bottom-nav-label-full {
+    display: none;
+  }
+
+  .bottom-nav-label-short {
+    display: inline;
+  }
+}
+
 /* ─────────────────────────────────────────────
    CARDS
    ───────────────────────────────────────────── */
@@ -407,6 +475,8 @@ textarea {
   flex-direction: column;
   gap: 1.1rem;
   transition: box-shadow 0.2s, border-color 0.2s;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .card:hover {
@@ -433,10 +503,10 @@ textarea {
    LAYOUT UTILITIES
    ───────────────────────────────────────────── */
 
-.stack { display: flex; flex-direction: column; gap: 0.75rem; }
-.stack-sm { display: flex; flex-direction: column; gap: 0.35rem; }
+.stack { display: flex; flex-direction: column; gap: 0.75rem; min-width: 0; }
+.stack-sm { display: flex; flex-direction: column; gap: 0.35rem; min-width: 0; }
 
-.row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+.row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; min-width: 0; }
 .row-center { display: flex; gap: 0.75rem; align-items: center; justify-content: center; flex-wrap: wrap; }
 .row-between { display: flex; justify-content: space-between; align-items: center; }
 
@@ -588,6 +658,7 @@ textarea {
   justify-content: center;
   gap: 2.5rem;
   padding: 1.25rem 0;
+  flex-wrap: wrap;
 }
 
 .record-btn {

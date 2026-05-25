@@ -883,6 +883,7 @@ function hasInlineVideoUrl(text: string) {
 
 function App() {
   const isDesktopClient = isTauriDesktopRuntime();
+  const isNativeClient = isDesktopClient || isTauriMobileRuntime();
   const isLargeScreen = useIsLargeScreen();
   const isDesktopLayout = isDesktopClient || isLargeScreen;
   const [gatewayBaseUrl, setGatewayBaseUrl] = useState(defaultGatewayBaseUrl);
@@ -1333,7 +1334,7 @@ function App() {
   }, [gatewayBaseUrl]);
 
   useEffect(() => {
-    if (!isDesktopClient || chatGatewayToken.trim()) {
+    if (!isNativeClient || chatGatewayToken.trim()) {
       return;
     }
     let cancelled = false;
@@ -1351,7 +1352,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [isDesktopClient, chatGatewayToken]);
+  }, [isNativeClient, chatGatewayToken]);
 
   useEffect(() => {
     if (typeof document !== "undefined") {
@@ -1464,12 +1465,12 @@ function App() {
     };
 
     let token = normalizeGatewayToken(chatGatewayToken);
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
     }
     try {
       if (scope === "journal" || scope === "all") {
-        if (isDesktopClient) {
+        if (isNativeClient) {
           try {
             await refreshGatewayJournalLibrary(token);
           } catch (gatewayError) {
@@ -1513,11 +1514,11 @@ function App() {
       setRecordingHint("Upload blocked (gateway URL missing). Pair mobile with desktop QR.");
       return;
     }
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
     if (!token) {
-      if (isDesktopClient) {
+      if (isNativeClient) {
         token = "desktop-local";
       } else {
         setRecordingHint("Upload blocked (gateway token missing). Pair mobile with desktop QR.");
@@ -1556,7 +1557,7 @@ function App() {
           }
         }
       } catch (gatewayError) {
-        if (!isDesktopClient) {
+        if (!isNativeClient) {
           throw gatewayError;
         }
         try {
@@ -1592,10 +1593,10 @@ function App() {
     }
 
     let token = normalizeGatewayToken(chatGatewayToken);
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       setJournalSaveStatus("Save blocked (gateway token missing).");
       return;
     }
@@ -1631,7 +1632,7 @@ function App() {
             resultPath = selectedJournalItem.path;
             nextSelectedPath = selectedJournalItem.path;
           } catch (gatewayError) {
-            if (!isDesktopClient) {
+            if (!isNativeClient) {
               throw gatewayError;
             }
             try {
@@ -1663,7 +1664,7 @@ function App() {
           resultPath = String(result.path || "");
           nextSelectedPath = resultPath;
         } catch (gatewayError) {
-          if (!isDesktopClient) {
+          if (!isNativeClient) {
             throw gatewayError;
           }
           try {
@@ -1883,10 +1884,10 @@ function App() {
       return;
     }
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       setJournalSaveStatus("Transcription blocked (gateway token missing).");
       return;
     }
@@ -4859,7 +4860,7 @@ function App() {
   }
 
   async function syncDesktopGatewayBootstrap(): Promise<string | null> {
-    if (!isDesktopClient) {
+    if (!isNativeClient) {
       return null;
     }
     try {
@@ -4889,7 +4890,7 @@ function App() {
   }
 
   async function restartGatewayDaemonFromDesktop() {
-    if (!isDesktopClient) {
+    if (!isNativeClient) {
       return;
     }
     await invokeDesktopCommandStrict<string>("restart_gateway_daemon");
@@ -5770,7 +5771,7 @@ function App() {
     : journalList;
   const feedList = feedItems;
   const postedHistory = history.filter((item) => item.status === "success");
-  const needsMobileQrLogin = !isDesktopClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
+  const needsMobileQrLogin = !isNativeClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
   const isCaptureZenMode = mobileTab === "journal" && (isRecording || captureMode !== null);
   const hideChrome = isWritingNote || isCaptureZenMode;
   const showDesktopJournalLayout = isDesktopLayout && mobileTab === "journal";
@@ -8660,7 +8661,8 @@ function App() {
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path><path d="M7 7h6"></path><path d="M7 15h8"></path></svg>
             <span className="bottom-nav-label">
-              Productivity
+              <span className="bottom-nav-label-full">Productivity</span>
+              <span className="bottom-nav-label-short" aria-hidden="true">Tasks</span>
               {openTodos.length + todayEventItems.length + upcomingEventItems.length > 0 ? (
                 <span className="bottom-nav-badge">
                   {openTodos.length + todayEventItems.length + upcomingEventItems.length}
