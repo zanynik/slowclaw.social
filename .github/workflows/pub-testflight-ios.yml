@@ -111,57 +111,30 @@ jobs:
                   : "${ASC_KEY_DIR:?ASC_KEY_DIR was not initialized}"
                   : "${APPLE_DEVELOPMENT_TEAM:?Set the APPLE_DEVELOPMENT_TEAM repository variable or provide the apple_development_team workflow input.}"
                   ASC_KEY_PATH="${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
-                  ARCHIVE_PATH="${RUNNER_TEMP}/SlowClaw.xcarchive"
-                  EXPORT_PATH="${RUNNER_TEMP}/testflight-export"
-                  EXPORT_OPTIONS_PATH="${RUNNER_TEMP}/ExportOptions.plist"
+                  XCODEBUILD_WRAPPER_DIR="${RUNNER_TEMP}/xcodebuild-wrapper"
+                  mkdir -p "${XCODEBUILD_WRAPPER_DIR}"
+                  cat >"${XCODEBUILD_WRAPPER_DIR}/xcodebuild" <<'SH'
+                  #!/usr/bin/env bash
+                  set -euo pipefail
 
-                  npm run build:tauri
-                  rm -rf src-tauri/gen/apple/assets
-                  mkdir -p src-tauri/gen/apple/assets
-                  cp -R dist/. src-tauri/gen/apple/assets/
-
-                  xcodebuild \
-                    -workspace src-tauri/gen/apple/slowclaw_mobile.xcodeproj/project.xcworkspace \
-                    -scheme slowclaw_mobile_iOS \
-                    -configuration release \
-                    -sdk iphoneos \
-                    -destination generic/platform=iOS \
-                    -archivePath "${ARCHIVE_PATH}" \
-                    DEVELOPMENT_TEAM="${APPLE_DEVELOPMENT_TEAM}" \
+                  REAL_XCODEBUILD="$(xcode-select -p)/usr/bin/xcodebuild"
+                  exec "${REAL_XCODEBUILD}" \
+                    -allowProvisioningUpdates \
+                    -authenticationKeyPath "${ASC_KEY_PATH:?}" \
+                    -authenticationKeyID "${APP_STORE_CONNECT_KEY_ID:?}" \
+                    -authenticationKeyIssuerID "${APP_STORE_CONNECT_ISSUER_ID:?}" \
+                    DEVELOPMENT_TEAM="${APPLE_DEVELOPMENT_TEAM:?}" \
                     CODE_SIGN_STYLE=Automatic \
-                    CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
-                    -allowProvisioningUpdates \
-                    -authenticationKeyPath "${ASC_KEY_PATH}" \
-                    -authenticationKeyID "${APP_STORE_CONNECT_KEY_ID}" \
-                    -authenticationKeyIssuerID "${APP_STORE_CONNECT_ISSUER_ID}" \
-                    clean archive
+                    "$@"
+                  SH
+                  chmod 700 "${XCODEBUILD_WRAPPER_DIR}/xcodebuild"
 
-                  cat >"${EXPORT_OPTIONS_PATH}" <<PLIST
-                  <?xml version="1.0" encoding="UTF-8"?>
-                  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-                  <plist version="1.0">
-                  <dict>
-                      <key>method</key>
-                      <string>release-testing</string>
-                      <key>signingStyle</key>
-                      <string>automatic</string>
-                      <key>teamID</key>
-                      <string>${APPLE_DEVELOPMENT_TEAM}</string>
-                  </dict>
-                  </plist>
-                  PLIST
+                  PATH="${XCODEBUILD_WRAPPER_DIR}:${PATH}" npm run tauri -- ios build \
+                    --ci \
+                    --export-method release-testing \
+                    --build-number "${BUILD_NUMBER}"
 
-                  xcodebuild \
-                    -exportArchive \
-                    -archivePath "${ARCHIVE_PATH}" \
-                    -exportPath "${EXPORT_PATH}" \
-                    -exportOptionsPlist "${EXPORT_OPTIONS_PATH}" \
-                    -allowProvisioningUpdates \
-                    -authenticationKeyPath "${ASC_KEY_PATH}" \
-                    -authenticationKeyID "${APP_STORE_CONNECT_KEY_ID}" \
-                    -authenticationKeyIssuerID "${APP_STORE_CONNECT_ISSUER_ID}"
-
-                  printf 'IPA_DIR=%s\n' "${EXPORT_PATH}" >>"${GITHUB_ENV}"
+                  printf 'IPA_DIR=%s\n' "src-tauri/gen/apple" >>"${GITHUB_ENV}"
 
             - name: Upload IPA to TestFlight
               env:
