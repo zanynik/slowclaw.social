@@ -104,7 +104,7 @@ jobs:
               env:
                   APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
                   APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-                  APPLE_DEVELOPMENT_TEAM: ${{ inputs.apple_development_team || vars.APPLE_DEVELOPMENT_TEAM }}
+                  APPLE_DEVELOPMENT_TEAM: ${{ inputs.apple_development_team || vars.APPLE_DEVELOPMENT_TEAM || secrets.APPLE_DEVELOPMENT_TEAM }}
                   BUILD_NUMBER: ${{ inputs.build_number || github.run_number }}
               run: |
                   set -euo pipefail
