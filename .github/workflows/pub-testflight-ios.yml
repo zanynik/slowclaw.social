@@ -118,6 +118,19 @@ jobs:
                   set -euo pipefail
 
                   REAL_XCODEBUILD="$(xcode-select -p)/usr/bin/xcodebuild"
+                  SHOULD_INJECT_SIGNING_ARGS=0
+                  for arg in "$@"; do
+                    case "${arg}" in
+                      -workspace|-project|-exportArchive)
+                        SHOULD_INJECT_SIGNING_ARGS=1
+                        ;;
+                    esac
+                  done
+
+                  if [[ "${SHOULD_INJECT_SIGNING_ARGS}" != 1 ]]; then
+                    exec "${REAL_XCODEBUILD}" "$@"
+                  fi
+
                   exec "${REAL_XCODEBUILD}" \
                     -allowProvisioningUpdates \
                     -authenticationKeyPath "${ASC_KEY_PATH:?}" \
