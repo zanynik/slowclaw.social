@@ -111,14 +111,19 @@ jobs:
                   : "${ASC_KEY_DIR:?ASC_KEY_DIR was not initialized}"
                   : "${APPLE_DEVELOPMENT_TEAM:?Set the APPLE_DEVELOPMENT_TEAM repository variable or provide the apple_development_team workflow input.}"
                   ASC_KEY_PATH="${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
-                  export ASC_KEY_PATH
                   XCODEBUILD_WRAPPER_DIR="${RUNNER_TEMP}/xcodebuild-wrapper"
                   mkdir -p "${XCODEBUILD_WRAPPER_DIR}"
+                  printf '%s' "${ASC_KEY_PATH}" >"${XCODEBUILD_WRAPPER_DIR}/asc_key_path"
+                  printf '%s' "${APP_STORE_CONNECT_KEY_ID}" >"${XCODEBUILD_WRAPPER_DIR}/key_id"
+                  printf '%s' "${APP_STORE_CONNECT_ISSUER_ID}" >"${XCODEBUILD_WRAPPER_DIR}/issuer_id"
+                  printf '%s' "${APPLE_DEVELOPMENT_TEAM}" >"${XCODEBUILD_WRAPPER_DIR}/team_id"
+                  chmod 600 "${XCODEBUILD_WRAPPER_DIR}/asc_key_path" "${XCODEBUILD_WRAPPER_DIR}/key_id" "${XCODEBUILD_WRAPPER_DIR}/issuer_id" "${XCODEBUILD_WRAPPER_DIR}/team_id"
                   cat >"${XCODEBUILD_WRAPPER_DIR}/xcodebuild" <<'SH'
                   #!/usr/bin/env bash
                   set -euo pipefail
 
                   REAL_XCODEBUILD="$(xcode-select -p)/usr/bin/xcodebuild"
+                  WRAPPER_DIR="$(cd "$(dirname "$0")" && pwd)"
                   SHOULD_INJECT_SIGNING_ARGS=0
                   for arg in "$@"; do
                     case "${arg}" in
@@ -131,6 +136,11 @@ jobs:
                   if [[ "${SHOULD_INJECT_SIGNING_ARGS}" != 1 ]]; then
                     exec "${REAL_XCODEBUILD}" "$@"
                   fi
+
+                  ASC_KEY_PATH="$(cat "${WRAPPER_DIR}/asc_key_path")"
+                  APP_STORE_CONNECT_KEY_ID="$(cat "${WRAPPER_DIR}/key_id")"
+                  APP_STORE_CONNECT_ISSUER_ID="$(cat "${WRAPPER_DIR}/issuer_id")"
+                  APPLE_DEVELOPMENT_TEAM="$(cat "${WRAPPER_DIR}/team_id")"
 
                   exec "${REAL_XCODEBUILD}" \
                     -allowProvisioningUpdates \
