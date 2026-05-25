@@ -111,6 +111,7 @@ jobs:
                   : "${ASC_KEY_DIR:?ASC_KEY_DIR was not initialized}"
                   : "${APPLE_DEVELOPMENT_TEAM:?Set the APPLE_DEVELOPMENT_TEAM repository variable or provide the apple_development_team workflow input.}"
                   ASC_KEY_PATH="${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+                  export ASC_KEY_PATH
                   XCODEBUILD_WRAPPER_DIR="${RUNNER_TEMP}/xcodebuild-wrapper"
                   mkdir -p "${XCODEBUILD_WRAPPER_DIR}"
                   cat >"${XCODEBUILD_WRAPPER_DIR}/xcodebuild" <<'SH'
