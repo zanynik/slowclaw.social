@@ -463,11 +463,18 @@ function createThreadId() {
   return `thread-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function isMobileUserAgent() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return /iphone|ipad|ipod|android/i.test(window.navigator.userAgent || "");
+}
+
 function isTauriDesktopRuntime() {
   if (typeof window === "undefined") {
     return false;
   }
-  return Boolean((window as any).__TAURI_INTERNALS__);
+  return Boolean((window as any).__TAURI_INTERNALS__) && !isMobileUserAgent();
 }
 
 function isTauriMobileRuntime() {
@@ -476,7 +483,7 @@ function isTauriMobileRuntime() {
   }
   return (
     Boolean((window as any).__TAURI_MOBILE__) ||
-    /iphone|ipad|android/i.test(window.navigator.userAgent || "")
+    (Boolean((window as any).__TAURI_INTERNALS__) && isMobileUserAgent())
   );
 }
 
