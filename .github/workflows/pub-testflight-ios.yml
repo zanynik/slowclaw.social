@@ -11,7 +11,7 @@ on:
                 required: false
                 type: string
             apple_development_team:
-                description: "Optional Apple Developer Team ID. Defaults to the APPLE_DEVELOPMENT_TEAM repository variable."
+                description: "Optional Apple Developer Team ID. Defaults to the APPLE_DEVELOPMENT_TEAM repository variable or secret."
                 required: false
                 type: string
 
@@ -158,7 +158,7 @@ jobs:
                     --export-method release-testing \
                     --build-number "${BUILD_NUMBER}"
 
-                  printf 'IPA_DIR=%s\n' "src-tauri/gen/apple" >>"${GITHUB_ENV}"
+                  printf 'IPA_DIR=%s\n' "${GITHUB_WORKSPACE}/web/src-tauri/gen/apple" >>"${GITHUB_ENV}"
 
             - name: Upload IPA to TestFlight
               env:
