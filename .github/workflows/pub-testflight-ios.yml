@@ -129,7 +129,6 @@ jobs:
                     -archivePath "${ARCHIVE_PATH}" \
                     DEVELOPMENT_TEAM="${APPLE_DEVELOPMENT_TEAM}" \
                     CODE_SIGN_STYLE=Automatic \
-                    CODE_SIGN_IDENTITY="Apple Distribution" \
                     CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
                     -allowProvisioningUpdates \
                     -authenticationKeyPath "${ASC_KEY_PATH}" \
