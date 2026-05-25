@@ -141,6 +141,8 @@ jobs:
                   APP_STORE_CONNECT_KEY_ID="$(cat "${WRAPPER_DIR}/key_id")"
                   APP_STORE_CONNECT_ISSUER_ID="$(cat "${WRAPPER_DIR}/issuer_id")"
                   APPLE_DEVELOPMENT_TEAM="$(cat "${WRAPPER_DIR}/team_id")"
+                  DEVELOPER_DIR="$(xcode-select -p)"
+                  SWIFT_LINKER_FLAGS="\$(inherited) -L${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos -L${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/iphoneos -L/usr/lib/swift"
 
                   exec "${REAL_XCODEBUILD}" \
                     -allowProvisioningUpdates \
@@ -149,6 +151,7 @@ jobs:
                     -authenticationKeyIssuerID "${APP_STORE_CONNECT_ISSUER_ID:?}" \
                     DEVELOPMENT_TEAM="${APPLE_DEVELOPMENT_TEAM:?}" \
                     CODE_SIGN_STYLE=Automatic \
+                    OTHER_LDFLAGS="${SWIFT_LINKER_FLAGS}" \
                     "$@"
                   SH
                   chmod 700 "${XCODEBUILD_WRAPPER_DIR}/xcodebuild"
