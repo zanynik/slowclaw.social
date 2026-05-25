@@ -1,6 +1,9 @@
 name: Publish iOS TestFlight
 
 on:
+    push:
+        branches:
+            - codex/modular-red-green-refactor
     workflow_dispatch:
         inputs:
             build_number:
