@@ -1075,8 +1075,16 @@ async fn clear_anthropic_token(
 
 #[tauri::command]
 fn show_main_window(window: tauri::Window) {
-    if let Err(e) = window.show() {
-        eprintln!("failed to show main window: {e}");
+    #[cfg(not(mobile))]
+    {
+        if let Err(e) = window.show() {
+            eprintln!("failed to show main window: {e}");
+        }
+    }
+
+    #[cfg(mobile)]
+    {
+        let _ = window;
     }
 }
 
