@@ -1,0 +1,146 @@
+name: Publish iOS TestFlight
+
+on:
+    workflow_dispatch:
+        inputs:
+            build_number:
+                description: "Optional App Store build number. Defaults to the GitHub run number."
+                required: false
+                type: string
+            apple_development_team:
+                description: "Optional Apple Developer Team ID. Defaults to the APPLE_DEVELOPMENT_TEAM repository variable."
+                required: false
+                type: string
+
+concurrency:
+    group: testflight-ios-${{ github.ref }}
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+jobs:
+    build-and-upload:
+        name: Build and Upload iOS App
+        runs-on: macos-15
+        timeout-minutes: 90
+        env:
+            CARGO_TERM_COLOR: always
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: npm
+                  cache-dependency-path: web/package-lock.json
+
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+                  targets: aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim
+
+            - name: Restore Rust cache
+              uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+              with:
+                  workspaces: |
+                      web/src-tauri -> target
+                  cache-targets: true
+
+            - name: Install JavaScript dependencies
+              working-directory: web
+              run: npm ci
+
+            - name: Ensure CocoaPods is available
+              run: |
+                  set -euo pipefail
+                  if ! command -v pod >/dev/null 2>&1; then
+                    brew install cocoapods
+                  fi
+
+            - name: Show Apple build tool versions
+              run: |
+                  set -euo pipefail
+                  xcodebuild -version
+                  xcrun --find altool
+
+            - name: Prepare App Store Connect API key
+              env:
+                  APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+                  APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+                  APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+              run: |
+                  set -euo pipefail
+                  : "${APP_STORE_CONNECT_ISSUER_ID:?APP_STORE_CONNECT_ISSUER_ID secret is required}"
+                  : "${APP_STORE_CONNECT_KEY_ID:?APP_STORE_CONNECT_KEY_ID secret is required}"
+                  : "${APP_STORE_CONNECT_PRIVATE_KEY:?APP_STORE_CONNECT_PRIVATE_KEY secret is required}"
+
+                  printf '::add-mask::%s\n' "${APP_STORE_CONNECT_ISSUER_ID}"
+                  printf '::add-mask::%s\n' "${APP_STORE_CONNECT_KEY_ID}"
+
+                  ASC_KEY_DIR="${HOME}/.appstoreconnect/private_keys"
+                  printf 'ASC_KEY_DIR=%s\n' "${ASC_KEY_DIR}" >>"${GITHUB_ENV}"
+                  mkdir -p "${ASC_KEY_DIR}"
+                  chmod 700 "${ASC_KEY_DIR}"
+                  perl -pe 's/\\n/\n/g' <<<"${APP_STORE_CONNECT_PRIVATE_KEY}" >"${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+                  chmod 600 "${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+
+            - name: Initialize Tauri iOS project
+              working-directory: web
+              run: |
+                  set -euo pipefail
+                  if [[ ! -d src-tauri/gen/apple ]]; then
+                    npm run tauri -- ios init --ci --skip-targets-install
+                  fi
+
+            - name: Build signed iOS IPA
+              working-directory: web
+              env:
+                  APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+                  APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+                  APPLE_DEVELOPMENT_TEAM: ${{ inputs.apple_development_team || vars.APPLE_DEVELOPMENT_TEAM }}
+                  BUILD_NUMBER: ${{ inputs.build_number || github.run_number }}
+              run: |
+                  set -euo pipefail
+                  : "${ASC_KEY_DIR:?ASC_KEY_DIR was not initialized}"
+                  ASC_KEY_PATH="${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+
+                  npm run tauri -- ios build \
+                    --ci \
+                    --export-method release-testing \
+                    --build-number "${BUILD_NUMBER}" \
+                    -- \
+                    -allowProvisioningUpdates \
+                    -authenticationKeyPath "${ASC_KEY_PATH}" \
+                    -authenticationKeyID "${APP_STORE_CONNECT_KEY_ID}" \
+                    -authenticationKeyIssuerID "${APP_STORE_CONNECT_ISSUER_ID}"
+
+            - name: Upload IPA to TestFlight
+              env:
+                  APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+                  APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+              run: |
+                  set -euo pipefail
+                  IPA_PATH="$(find web/src-tauri/gen/apple -type f -name '*.ipa' -print -quit)"
+                  if [[ -z "${IPA_PATH}" ]]; then
+                    echo "No IPA found under web/src-tauri/gen/apple."
+                    exit 1
+                  fi
+
+                  xcrun altool --upload-app \
+                    --type ios \
+                    --file "${IPA_PATH}" \
+                    --apiKey "${APP_STORE_CONNECT_KEY_ID}" \
+                    --apiIssuer "${APP_STORE_CONNECT_ISSUER_ID}"
+
+            - name: Clean up App Store Connect API key
+              if: always()
+              env:
+                  APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+              run: |
+                  set -euo pipefail
+                  ASC_KEY_DIR="${ASC_KEY_DIR:-${HOME}/.appstoreconnect/private_keys}"
+                  rm -f "${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"

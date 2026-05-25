@@ -27,5 +27,6 @@ venv/
 .secret_key
 *.key
 *.pem
+AuthKey_*.p8
 credentials.json
 .worktrees/
