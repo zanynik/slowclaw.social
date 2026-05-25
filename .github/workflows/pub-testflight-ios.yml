@@ -111,16 +111,58 @@ jobs:
                   : "${ASC_KEY_DIR:?ASC_KEY_DIR was not initialized}"
                   : "${APPLE_DEVELOPMENT_TEAM:?Set the APPLE_DEVELOPMENT_TEAM repository variable or provide the apple_development_team workflow input.}"
                   ASC_KEY_PATH="${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+                  ARCHIVE_PATH="${RUNNER_TEMP}/SlowClaw.xcarchive"
+                  EXPORT_PATH="${RUNNER_TEMP}/testflight-export"
+                  EXPORT_OPTIONS_PATH="${RUNNER_TEMP}/ExportOptions.plist"
 
-                  npm run tauri -- ios build \
-                    --ci \
-                    --export-method release-testing \
-                    --build-number "${BUILD_NUMBER}" \
-                    -- \
+                  npm run build:tauri
+                  rm -rf src-tauri/gen/apple/assets
+                  mkdir -p src-tauri/gen/apple/assets
+                  cp -R dist/. src-tauri/gen/apple/assets/
+
+                  xcodebuild \
+                    -workspace src-tauri/gen/apple/slowclaw_mobile.xcodeproj/project.xcworkspace \
+                    -scheme slowclaw_mobile_iOS \
+                    -configuration release \
+                    -sdk iphoneos \
+                    -destination generic/platform=iOS \
+                    -archivePath "${ARCHIVE_PATH}" \
+                    DEVELOPMENT_TEAM="${APPLE_DEVELOPMENT_TEAM}" \
+                    CODE_SIGN_STYLE=Automatic \
+                    CODE_SIGN_IDENTITY="Apple Distribution" \
+                    CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
+                    -allowProvisioningUpdates \
+                    -authenticationKeyPath "${ASC_KEY_PATH}" \
+                    -authenticationKeyID "${APP_STORE_CONNECT_KEY_ID}" \
+                    -authenticationKeyIssuerID "${APP_STORE_CONNECT_ISSUER_ID}" \
+                    clean archive
+
+                  cat >"${EXPORT_OPTIONS_PATH}" <<PLIST
+                  <?xml version="1.0" encoding="UTF-8"?>
+                  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                  <plist version="1.0">
+                  <dict>
+                      <key>method</key>
+                      <string>release-testing</string>
+                      <key>signingStyle</key>
+                      <string>automatic</string>
+                      <key>teamID</key>
+                      <string>${APPLE_DEVELOPMENT_TEAM}</string>
+                  </dict>
+                  </plist>
+                  PLIST
+
+                  xcodebuild \
+                    -exportArchive \
+                    -archivePath "${ARCHIVE_PATH}" \
+                    -exportPath "${EXPORT_PATH}" \
+                    -exportOptionsPlist "${EXPORT_OPTIONS_PATH}" \
                     -allowProvisioningUpdates \
                     -authenticationKeyPath "${ASC_KEY_PATH}" \
                     -authenticationKeyID "${APP_STORE_CONNECT_KEY_ID}" \
                     -authenticationKeyIssuerID "${APP_STORE_CONNECT_ISSUER_ID}"
+
+                  printf 'IPA_DIR=%s\n' "${EXPORT_PATH}" >>"${GITHUB_ENV}"
 
             - name: Upload IPA to TestFlight
               env:
@@ -128,9 +170,9 @@ jobs:
                   APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
               run: |
                   set -euo pipefail
-                  IPA_PATH="$(find web/src-tauri/gen/apple -type f -name '*.ipa' -print -quit)"
+                  IPA_PATH="$(find "${IPA_DIR:?IPA_DIR was not initialized}" -type f -name '*.ipa' -print -quit)"
                   if [[ -z "${IPA_PATH}" ]]; then
-                    echo "No IPA found under web/src-tauri/gen/apple."
+                    echo "No IPA found under ${IPA_DIR}."
                     exit 1
                   fi
 
