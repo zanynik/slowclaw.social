@@ -77,6 +77,19 @@ export type OllamaStatus = {
   models: string[];
 };
 
+export type NativeLocalAiStatus = {
+  provider: string;
+  configured: boolean;
+  available: boolean;
+  running: boolean;
+  state: string;
+  modelId?: string | null;
+  modelPath?: string | null;
+  apiUrl: string;
+  message: string;
+  error?: string | null;
+};
+
 // ─────────────────────────────────────────────
 // Journal commands
 // ─────────────────────────────────────────────
@@ -221,6 +234,17 @@ export async function chatWithOllama(prompt: string): Promise<string> {
 
 export async function chatWithGeminiCli(prompt: string, model?: string): Promise<string> {
   return invoke("chat_with_gemini_cli", { prompt, model });
+}
+
+export async function getNativeLocalAiStatus(): Promise<NativeLocalAiStatus> {
+  return invoke("get_native_local_ai_status");
+}
+
+export async function configureNativeLocalAi(
+  modelId: string,
+  modelPath: string
+): Promise<NativeLocalAiStatus> {
+  return invoke("configure_native_local_ai", { req: { modelId, modelPath } });
 }
 
 // ─────────────────────────────────────────────

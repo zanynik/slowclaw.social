@@ -130,6 +130,67 @@ struct AnthropicTokenStatus {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeLocalAiStatus {
+    provider: String,
+    configured: bool,
+    available: bool,
+    running: bool,
+    state: String,
+    model_id: Option<String>,
+    model_path: Option<String>,
+    api_url: String,
+    message: String,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+struct NativeLocalAiRuntimeState {
+    status: NativeLocalAiStatus,
+}
+
+impl Default for NativeLocalAiRuntimeState {
+    fn default() -> Self {
+        Self {
+            status: default_native_local_ai_status(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct NativeLocalAiState {
+    inner: Arc<Mutex<NativeLocalAiRuntimeState>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeLocalAiConfigureRequest {
+    model_id: String,
+    model_path: String,
+}
+
+fn default_native_local_ai_status() -> NativeLocalAiStatus {
+    NativeLocalAiStatus {
+        provider: "slowclaw-local".to_string(),
+        configured: false,
+        available: false,
+        running: false,
+        state: "engine_missing".to_string(),
+        model_id: None,
+        model_path: None,
+        api_url: "slowclaw-native://local".to_string(),
+        message: if cfg!(mobile) {
+            "SlowClaw is wired for a native iOS local AI engine, but the llama.cpp/TurboQuant engine is not bundled yet."
+                .to_string()
+        } else {
+            "SlowClaw native local AI is intended for iOS. Desktop can use the llama.cpp server runtime."
+                .to_string()
+        },
+        error: Some("Native local inference engine is not bundled yet.".to_string()),
+    }
+}
+
 fn validate_secret_locator(service: &str, account: &str) -> Result<(), String> {
     if service.trim().is_empty() {
         return Err("service is required".to_string());
@@ -161,6 +222,14 @@ fn lock_openai_state<'a>(
         .map_err(|_| "openai device-code state lock poisoned".to_string())
 }
 
+fn lock_native_local_ai_state<'a>(
+    state: &'a Arc<Mutex<NativeLocalAiRuntimeState>>,
+) -> Result<std::sync::MutexGuard<'a, NativeLocalAiRuntimeState>, String> {
+    state
+        .lock()
+        .map_err(|_| "native local AI state lock poisoned".to_string())
+}
+
 fn snapshot_gateway_state(state: &Arc<Mutex<GatewayRuntimeState>>) -> Result<EmbeddedGatewayInfo, String> {
     let guard = lock_gateway_state(state)?;
     Ok(EmbeddedGatewayInfo {
@@ -175,6 +244,13 @@ fn snapshot_openai_status(
     state: &Arc<Mutex<OpenAiDeviceCodeRuntimeState>>,
 ) -> Result<OpenAiDeviceCodeStatus, String> {
     let guard = lock_openai_state(state)?;
+    Ok(guard.status.clone())
+}
+
+fn snapshot_native_local_ai_status(
+    state: &Arc<Mutex<NativeLocalAiRuntimeState>>,
+) -> Result<NativeLocalAiStatus, String> {
+    let guard = lock_native_local_ai_state(state)?;
     Ok(guard.status.clone())
 }
 
@@ -1074,6 +1150,64 @@ async fn clear_anthropic_token(
 }
 
 #[tauri::command]
+async fn get_native_local_ai_status(
+    state: tauri::State<'_, NativeLocalAiState>,
+) -> Result<NativeLocalAiStatus, String> {
+    snapshot_native_local_ai_status(&state.inner)
+}
+
+#[tauri::command]
+async fn configure_native_local_ai(
+    state: tauri::State<'_, NativeLocalAiState>,
+    gateway_state: tauri::State<'_, GatewayState>,
+    req: NativeLocalAiConfigureRequest,
+) -> Result<NativeLocalAiStatus, String> {
+    let model_id = req.model_id.trim().to_string();
+    let model_path = req.model_path.trim().to_string();
+    if model_id.is_empty() {
+        return Err("model_id is required".to_string());
+    }
+    if model_path.is_empty() {
+        return Err("model_path is required".to_string());
+    }
+    if !std::path::Path::new(&model_path).is_file() {
+        return Err("Downloaded model file was not found on this device.".to_string());
+    }
+
+    let mut config = zeroclaw::Config::load_or_init()
+        .await
+        .map_err(|e| ui_command_error("native local AI config load failed", "Failed to load local AI config.", e))?;
+    config.default_provider = Some("slowclaw-local".to_string());
+    config.default_model = Some(model_id.clone());
+    config.api_url = None;
+    config
+        .save()
+        .await
+        .map_err(|e| ui_command_error("native local AI config save failed", "Failed to save local AI config.", e))?;
+
+    let status = NativeLocalAiStatus {
+        provider: "slowclaw-local".to_string(),
+        configured: true,
+        available: false,
+        running: false,
+        state: "configured_engine_missing".to_string(),
+        model_id: Some(model_id),
+        model_path: Some(model_path),
+        api_url: "slowclaw-native://local".to_string(),
+        message: "SlowClaw saved this model for the native iOS local AI provider. The remaining engine slice is to link llama.cpp/TurboQuant and execute prompts through this bridge.".to_string(),
+        error: Some("Native local inference engine is not bundled yet.".to_string()),
+    };
+
+    {
+        let mut guard = lock_native_local_ai_state(&state.inner)?;
+        guard.status = status.clone();
+    }
+
+    let _ = restart_embedded_gateway(gateway_state.inner.clone()).await;
+    Ok(status)
+}
+
+#[tauri::command]
 fn show_main_window(window: tauri::Window) {
     #[cfg(not(mobile))]
     {
@@ -1092,9 +1226,11 @@ fn show_main_window(window: tauri::Window) {
 pub fn run() {
     let gateway_state = GatewayState::default();
     let openai_state = OpenAiDeviceCodeState::default();
+    let native_local_ai_state = NativeLocalAiState::default();
     tauri::Builder::default()
         .manage(gateway_state)
         .manage(openai_state)
+        .manage(native_local_ai_state)
         .setup(|app| {
             let shared = app.state::<GatewayState>().inner.clone();
             tauri::async_runtime::spawn(async move {
@@ -1120,6 +1256,8 @@ pub fn run() {
             get_anthropic_token_status,
             save_anthropic_token,
             clear_anthropic_token,
+            get_native_local_ai_status,
+            configure_native_local_ai,
             show_main_window
         ])
         .run(tauri::generate_context!())

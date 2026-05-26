@@ -26,6 +26,8 @@ import {
   runJobNow,
   checkOllama,
   listOllamaModels,
+  configureNativeLocalAi,
+  getNativeLocalAiStatus,
   startRecording as startNativeAudioRecording,
   stopRecording as stopNativeAudioRecording,
   blobToBase64,
@@ -36,6 +38,7 @@ import type {
   Draft,
   PostRecord,
   AppConfig,
+  NativeLocalAiStatus,
   SchedulerJob,
   OllamaStatus,
 } from "./lib/tauriApi";
@@ -1085,6 +1088,7 @@ function App() {
   const [localModelsStatus, setLocalModelsStatus] = useState("");
   const [localModelsEngineStatus, setLocalModelsEngineStatus] = useState("");
   const [localModelRuntime, setLocalModelRuntime] = useState<LocalModelRuntimeStatus | null>(null);
+  const [nativeLocalAiStatus, setNativeLocalAiStatus] = useState<NativeLocalAiStatus | null>(null);
   const [localModelBusyId, setLocalModelBusyId] = useState("");
   const [mobileScannerActive, setMobileScannerActive] = useState(() => {
     if (typeof window === "undefined") {
@@ -5308,11 +5312,19 @@ function App() {
       setLocalModels(response.models);
       setLocalModelsEngineStatus(response.engineStatus || "");
       setLocalModelRuntime(response.runtime || null);
+      if (isTauriMobileRuntime()) {
+        try {
+          setNativeLocalAiStatus(await getNativeLocalAiStatus());
+        } catch {
+          setNativeLocalAiStatus(null);
+        }
+      }
       setLocalModelsStatus(response.models.length ? "" : "No local models are available yet.");
     } catch (error) {
       setLocalModels([]);
       setLocalModelsEngineStatus("");
       setLocalModelRuntime(null);
+      setNativeLocalAiStatus(null);
       setLocalModelsStatus(
         `Local models unavailable (${error instanceof Error ? error.message : String(error)})`
       );
@@ -5378,6 +5390,21 @@ function App() {
     setLocalModelBusyId(modelId);
     setLocalModelsStatus("Starting local model runtime...");
     try {
+      if (isTauriMobileRuntime()) {
+        const model = localModels.find((item) => item.id === modelId);
+        if (!model?.path) {
+          throw new Error("Downloaded model path is missing. Refresh the model list and try again.");
+        }
+        const status = await configureNativeLocalAi(modelId, model.path);
+        setNativeLocalAiStatus(status);
+        setSettingsProvider(status.provider || "slowclaw-local");
+        setSettingsModel(status.modelId || modelId);
+        setSettingsApiUrl(status.apiUrl || "slowclaw-native://local");
+        setLocalModelsStatus(status.message || "Native local AI bridge configured.");
+        await loadLocalModels();
+        return;
+      }
+
       const token = await resolveRuntimeGatewayToken();
       const runtime = await startLocalModelRuntime(modelId, token || undefined, gatewayBaseUrl);
       setLocalModelRuntime(runtime);
@@ -8442,6 +8469,36 @@ function App() {
                     </div>
                   </div>
                 ) : null}
+                {nativeLocalAiStatus ? (
+                  <div className="local-runtime-panel">
+                    <div>
+                      <p className="text-sm muted">iPhone Native AI</p>
+                      <strong>{nativeLocalAiStatus.configured ? "Configured" : "Bridge Ready"}</strong>
+                      {nativeLocalAiStatus.modelId ? (
+                        <p className="text-sm muted">{nativeLocalAiStatus.modelId}</p>
+                      ) : null}
+                      <p className="text-sm muted">{nativeLocalAiStatus.message}</p>
+                      {nativeLocalAiStatus.error ? (
+                        <p className="text-sm local-model-error">{nativeLocalAiStatus.error}</p>
+                      ) : null}
+                    </div>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={async () => {
+                        try {
+                          setNativeLocalAiStatus(await getNativeLocalAiStatus());
+                        } catch (error) {
+                          setLocalModelsStatus(
+                            `Native status unavailable (${error instanceof Error ? error.message : String(error)})`
+                          );
+                        }
+                      }}
+                    >
+                      Native Status
+                    </button>
+                  </div>
+                ) : null}
                 <div className="local-model-grid">
                   {localModels.map((model) => {
                     const download = model.download;
@@ -8480,7 +8537,11 @@ function App() {
                                 onClick={() => void startDownloadedLocalModel(model.id)}
                                 disabled={Boolean(localModelBusyId)}
                               >
-                                {localModelRuntime?.running && localModelRuntime.modelId === model.id
+                                {isTauriMobileRuntime()
+                                  ? nativeLocalAiStatus?.modelId === model.id
+                                    ? "Configured"
+                                    : "Use On iPhone"
+                                  : localModelRuntime?.running && localModelRuntime.modelId === model.id
                                   ? "Restart Runtime"
                                   : "Start Runtime"}
                               </button>
