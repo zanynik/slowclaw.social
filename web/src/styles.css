@@ -510,6 +510,19 @@ textarea {
 .row-center { display: flex; gap: 0.75rem; align-items: center; justify-content: center; flex-wrap: wrap; }
 .row-between { display: flex; justify-content: space-between; align-items: center; }
 
+.local-ai-presets {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  gap: 0.5rem;
+}
+
+button.local-ai-preset {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink);
+  justify-content: center;
+}
+
 .muted { color: var(--muted); }
 .text-center { text-align: center; }
 .text-sm { font-size: 0.84rem; }

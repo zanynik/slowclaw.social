@@ -146,6 +146,10 @@ const DESKTOP_SECRET_SERVICE = "social.slowclaw.gateway";
 const PROVIDER_API_KEY_SECRET_ACCOUNT = "provider.api_key";
 const OPENROUTER_API_KEY_SECRET_ACCOUNT = "openrouter.api_key";
 const DEFAULT_RECORDING_HINT = "Ready to add a journal note, audio, or video.";
+const NATIVE_GATEWAY_BASE_URL = "http://127.0.0.1:42617";
+const ATOMIC_LOCAL_PROVIDER = "osaurus";
+const ATOMIC_LOCAL_API_URL = "http://127.0.0.1:1337/v1";
+const ATOMIC_LOCAL_MODEL = "gemma-3n-e4b-it";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
@@ -487,13 +491,35 @@ function isTauriMobileRuntime() {
   );
 }
 
+function isLoopbackUrl(value: string) {
+  try {
+    const parsed = new URL(value);
+    return ["127.0.0.1", "localhost", "::1", "[::1]"].includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function hasNativeAudioRecorderPlugin() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return Boolean((window as any).__SLOWCLAW_NATIVE_AUDIO_RECORDER__);
+}
+
 function defaultGatewayBaseUrl() {
   if (typeof window === "undefined") {
-    return "http://127.0.0.1:42617";
+    return NATIVE_GATEWAY_BASE_URL;
   }
   const saved = window.localStorage.getItem(CHAT_GATEWAY_BASE_URL_STORAGE_KEY);
   if (saved && saved.trim()) {
-    return saved.trim().replace(/\/+$/, "");
+    const normalized = saved.trim().replace(/\/+$/, "");
+    if (!isTauriMobileRuntime() || isLoopbackUrl(normalized)) {
+      return normalized;
+    }
+  }
+  if (isTauriDesktopRuntime() || isTauriMobileRuntime()) {
+    return NATIVE_GATEWAY_BASE_URL;
   }
   const protocol = window.location.protocol === "https:" ? "https:" : "http:";
   const host = window.location.hostname || "127.0.0.1";
@@ -1038,6 +1064,7 @@ function App() {
   const [providerApiKeyStatus, setProviderApiKeyStatus] = useState("");
   const [settingsProvider, setSettingsProvider] = useState("");
   const [settingsModel, setSettingsModel] = useState("");
+  const [settingsApiUrl, setSettingsApiUrl] = useState("");
   const [settingsTranscriptionEnabled, setSettingsTranscriptionEnabled] = useState(false);
   const [settingsTranscriptionModel, setSettingsTranscriptionModel] = useState("");
   const [settingsAvailableTranscriptionModels, setSettingsAvailableTranscriptionModels] = useState<string[]>([]);
@@ -3649,7 +3676,7 @@ function App() {
         window.location.hostname !== "localhost" &&
         window.location.hostname !== "127.0.0.1";
 
-      if (type === "audio" && isMobileRuntime) {
+      if (type === "audio" && isMobileRuntime && hasNativeAudioRecorderPlugin()) {
         setRecordingHint("Starting audio recording...");
         setRecordingType("audio");
         setIsRecording(true);
@@ -3813,12 +3840,16 @@ function App() {
 
       // TypeError: navigator.mediaDevices is undefined / getUserMedia is not a function
       if (err instanceof TypeError) {
-        hint = `${device} API is unavailable. On macOS, open System Settings → Privacy & Security → ${device} and ensure this app is allowed.`;
+        hint = isTauriMobileRuntime()
+          ? `${device} API is unavailable in this iOS WebView. A native recorder plugin is needed for reliable mobile recording.`
+          : `${device} API is unavailable. On macOS, open System Settings → Privacy & Security → ${device} and ensure this app is allowed.`;
       } else if (err instanceof DOMException) {
         switch (err.name) {
           case "NotAllowedError":
           case "PermissionDeniedError":
-            hint = `${device} access was denied. Please allow ${device.toLowerCase()} permission in System Settings → Privacy & Security.`;
+            hint = isTauriMobileRuntime()
+              ? `${device} access was denied. Open iPhone Settings → SlowClaw and allow ${device.toLowerCase()} access.`
+              : `${device} access was denied. Please allow ${device.toLowerCase()} permission in System Settings → Privacy & Security.`;
             break;
           case "NotFoundError":
           case "DevicesNotFoundError":
@@ -3859,7 +3890,7 @@ function App() {
       recordingTimerRef.current = null;
     }
     setRecordingHint("Processing recording...");
-    if (recordingType === "audio" && isTauriMobileRuntime() && !mediaRecorderRef.current) {
+    if (recordingType === "audio" && isTauriMobileRuntime() && hasNativeAudioRecorderPlugin() && !mediaRecorderRef.current) {
       try {
         const blob = await stopNativeAudioRecording();
         const file = new File([blob], `audio-${Date.now()}.m4a`, {
@@ -3908,7 +3939,7 @@ function App() {
       clearInterval(recordingTimerRef.current);
       recordingTimerRef.current = null;
     }
-    if (recordingType === "audio" && isTauriMobileRuntime() && !mediaRecorderRef.current) {
+    if (recordingType === "audio" && isTauriMobileRuntime() && hasNativeAudioRecorderPlugin() && !mediaRecorderRef.current) {
       try {
         await stopNativeAudioRecording();
       } catch {
@@ -5057,6 +5088,7 @@ function App() {
         {
           defaultProvider: normalizedProvider,
           defaultModel: settingsModel,
+          apiUrl: settingsApiUrl.trim(),
           transcriptionEnabled: settingsTranscriptionEnabled,
           transcriptionModel: settingsTranscriptionModel || "",
           availableTranscriptionModels: settingsAvailableTranscriptionModels,
@@ -5115,6 +5147,7 @@ function App() {
             setOpenrouterOAuthStatus("OpenRouter connected! AI is ready with a free model.");
             setSettingsProvider("openrouter");
             setSettingsModel("openrouter/free");
+            setSettingsApiUrl("");
             window.localStorage.setItem(CHAT_PROVIDER_STORAGE_KEY, "openrouter");
             window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, "openrouter/free");
             await refreshWorkspaceSynthAfterProviderSetup();
@@ -5190,6 +5223,7 @@ function App() {
         {
           defaultProvider: "openrouter",
           defaultModel: "openrouter/free",
+          apiUrl: "",
           transcriptionEnabled: settingsTranscriptionEnabled,
           transcriptionModel: settingsTranscriptionModel || "",
           availableTranscriptionModels: settingsAvailableTranscriptionModels,
@@ -5253,26 +5287,30 @@ function App() {
         const cfg = await getConfig();
         const savedProvider = normalizeProviderId(window.localStorage.getItem(CHAT_PROVIDER_STORAGE_KEY) || "");
         const savedModel = window.localStorage.getItem(CHAT_MODEL_STORAGE_KEY);
-        setSettingsProvider(savedProvider || "ollama");
-        setSettingsModel((savedModel && savedModel.trim()) || cfg.ollamaModel || "");
+        let runtimeCfg: Awaited<ReturnType<typeof getRuntimeConfig>> | null = null;
+        if (gatewayBaseUrl.trim()) {
+          runtimeCfg = await getRuntimeConfig(token || undefined, gatewayBaseUrl).catch(() => null);
+        }
+        setSettingsProvider(
+          normalizeProviderId(runtimeCfg?.defaultProvider || "") || savedProvider || "ollama"
+        );
+        setSettingsModel(runtimeCfg?.defaultModel || (savedModel && savedModel.trim()) || cfg.ollamaModel || "");
+        setSettingsApiUrl(runtimeCfg?.apiUrl || "");
         setSettingsTranscriptionEnabled(Boolean(cfg.transcriptionEnabled));
-        setSettingsTranscriptionModel(cfg.ollamaModel || "");
+        setSettingsTranscriptionModel(runtimeCfg?.transcriptionModel || cfg.ollamaModel || "");
         let models = await listOllamaModels().catch(() => [] as string[]);
-        if (!models.length && gatewayBaseUrl.trim()) {
-          try {
-            const runtimeCfg = await getRuntimeConfig(token || undefined, gatewayBaseUrl);
-            setRuntimeMediaCapabilities(runtimeCfg.mediaCapabilities || null);
-            setRuntimeMediaSummary(runtimeCfg.mediaSummary || "");
-            models =
-              runtimeCfg.availableTranscriptionModels && runtimeCfg.availableTranscriptionModels.length > 0
-                ? [...runtimeCfg.availableTranscriptionModels]
-                : [];
-            const runtimeModel = runtimeCfg.transcriptionModel || "";
-            if (runtimeModel && !models.includes(runtimeModel)) {
-              models.unshift(runtimeModel);
-            }
-          } catch {
-            // Keep local model-only list when gateway runtime config is unavailable.
+        if (runtimeCfg) {
+          setRuntimeMediaCapabilities(runtimeCfg.mediaCapabilities || null);
+          setRuntimeMediaSummary(runtimeCfg.mediaSummary || "");
+        }
+        if (!models.length && runtimeCfg) {
+          models =
+            runtimeCfg.availableTranscriptionModels && runtimeCfg.availableTranscriptionModels.length > 0
+              ? [...runtimeCfg.availableTranscriptionModels]
+              : [];
+          const runtimeModel = runtimeCfg.transcriptionModel || "";
+          if (runtimeModel && !models.includes(runtimeModel)) {
+            models.unshift(runtimeModel);
           }
         }
         if (cfg.ollamaModel && !models.includes(cfg.ollamaModel)) {
@@ -5307,6 +5345,7 @@ function App() {
       setRuntimeMediaSummary(cfg.mediaSummary || "");
       setSettingsProvider(normalizeProviderId(cfg.defaultProvider || ""));
       setSettingsModel(cfg.defaultModel || "");
+      setSettingsApiUrl(cfg.apiUrl || "");
       setSettingsTranscriptionEnabled(Boolean(cfg.transcriptionEnabled));
       const currentTranscriptionModel = cfg.transcriptionModel || "";
       setSettingsTranscriptionModel(currentTranscriptionModel);
@@ -5328,6 +5367,14 @@ function App() {
       );
       setSettingsConfigLoaded(true);
     }
+  }
+
+  function applyLocalAiPreset(provider: string, model: string, apiUrl: string) {
+    setSettingsProvider(provider);
+    setSettingsModel(model);
+    setSettingsApiUrl(apiUrl);
+    setProviderApiKey("");
+    setSettingsConfigStatus(`Selected ${provider} local runtime. Save configuration to apply it.`);
   }
 
   async function saveRuntimeConfigFromSettings() {
@@ -5379,6 +5426,7 @@ function App() {
         {
           defaultProvider: provider,
           defaultModel: model,
+          apiUrl: settingsApiUrl.trim(),
           transcriptionEnabled: settingsTranscriptionEnabled,
           transcriptionModel: settingsTranscriptionModel.trim(),
           availableTranscriptionModels: settingsAvailableTranscriptionModels
@@ -8195,7 +8243,7 @@ function App() {
                 <input
                   value={settingsProvider}
                   onChange={(e) => setSettingsProvider(e.target.value)}
-                  placeholder="Default provider (e.g. openrouter, ollama, openai)"
+                  placeholder="Default provider (e.g. osaurus, ollama, openrouter)"
                   disabled={settingsConfigBusy}
                 />
                 <input
@@ -8204,6 +8252,41 @@ function App() {
                   placeholder="Default model"
                   disabled={settingsConfigBusy}
                 />
+                <input
+                  value={settingsApiUrl}
+                  onChange={(e) => setSettingsApiUrl(e.target.value)}
+                  placeholder="Local/OpenAI-compatible API URL (optional)"
+                  disabled={settingsConfigBusy}
+                />
+                <div className="local-ai-presets" aria-label="Local AI presets">
+                  <button
+                    type="button"
+                    className="ghost local-ai-preset"
+                    onClick={() => applyLocalAiPreset(ATOMIC_LOCAL_PROVIDER, ATOMIC_LOCAL_MODEL, ATOMIC_LOCAL_API_URL)}
+                    disabled={settingsConfigBusy}
+                  >
+                    Atomic Local
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost local-ai-preset"
+                    onClick={() => applyLocalAiPreset("llamacpp", "local-model", "http://127.0.0.1:8080/v1")}
+                    disabled={settingsConfigBusy}
+                  >
+                    llama.cpp
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost local-ai-preset"
+                    onClick={() => applyLocalAiPreset("ollama", settingsModel.trim() || "llama3.2", "http://127.0.0.1:11434")}
+                    disabled={settingsConfigBusy}
+                  >
+                    Ollama
+                  </button>
+                </div>
+                <p className="text-sm muted">
+                  Atomic Local expects AtomicChat or another OpenAI-compatible local server at {ATOMIC_LOCAL_API_URL}.
+                </p>
                 <label className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
                   <input
                     type="checkbox"

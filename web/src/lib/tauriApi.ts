@@ -240,7 +240,7 @@ export async function deleteSecret(service: string, account: string): Promise<vo
 }
 
 // ─────────────────────────────────────────────
-// Audio recording helper (desktop uses Web API; mobile uses native plugin)
+// Audio recording helper. Mobile uses the Web API until a native plugin is bundled.
 // See: audioRecorder.ts
 // ─────────────────────────────────────────────
 

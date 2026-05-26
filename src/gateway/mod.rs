@@ -859,6 +859,7 @@ async fn handle_runtime_config(
     let body = serde_json::json!({
         "defaultProvider": config.default_provider.unwrap_or_default(),
         "defaultModel": config.default_model.unwrap_or_default(),
+        "apiUrl": config.api_url.unwrap_or_default(),
         "transcriptionEnabled": config.transcription.enabled,
         "transcriptionModel": config.transcription.model,
         "availableTranscriptionModels": transcription_models,
@@ -1039,6 +1040,20 @@ async fn handle_runtime_config_update(
         )
         .into_response();
     }
+    let api_url = body.api_url.as_deref().map(str::trim).unwrap_or_default();
+    if !api_url.is_empty() {
+        match reqwest::Url::parse(api_url) {
+            Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {}
+            _ => {
+                return frontend_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "RUNTIME_CONFIG_API_URL_INVALID",
+                    "apiUrl must be an http(s) URL",
+                )
+                .into_response();
+            }
+        }
+    }
 
     let mut next = state.config.lock().clone();
     let provider_changed = next
@@ -1053,6 +1068,12 @@ async fn handle_runtime_config_update(
         .map(str::trim)
         .unwrap_or_default()
         != model;
+    let api_url_changed = next
+        .api_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        != api_url;
     let api_key_changed = if let Some(new_key) = body
         .api_key
         .as_deref()
@@ -1083,6 +1104,11 @@ async fn handle_runtime_config_update(
     };
     next.default_provider = Some(provider.to_string());
     next.default_model = Some(model.to_string());
+    next.api_url = if api_url.is_empty() {
+        None
+    } else {
+        Some(api_url.to_string())
+    };
     next.transcription.enabled = body.transcription_enabled;
     if let Some(transcription_model) = body
         .transcription_model
@@ -1102,7 +1128,7 @@ async fn handle_runtime_config_update(
         );
     }
     *state.config.lock() = next.clone();
-    if provider_changed || model_changed || api_key_changed {
+    if provider_changed || model_changed || api_url_changed || api_key_changed {
         reset_workspace_synthesizer_status_for_provider_change(&next.workspace_dir);
     }
 
@@ -1111,6 +1137,7 @@ async fn handle_runtime_config_update(
         "restartRequired": true,
         "defaultProvider": next.default_provider.unwrap_or_default(),
         "defaultModel": next.default_model.unwrap_or_default(),
+        "apiUrl": next.api_url.unwrap_or_default(),
         "transcriptionEnabled": next.transcription.enabled,
         "transcriptionModel": next.transcription.model,
         "availableTranscriptionModels": available_local_transcription_models(),
@@ -8361,6 +8388,7 @@ struct JournalTranscribeBody {
 struct RuntimeConfigUpdateBody {
     default_provider: String,
     default_model: String,
+    api_url: Option<String>,
     transcription_enabled: bool,
     transcription_model: Option<String>,
     api_key: Option<String>,

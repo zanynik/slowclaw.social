@@ -328,10 +328,10 @@ async fn restart_embedded_gateway(
     let mut config = zeroclaw::Config::load_or_init()
         .await
         .map_err(|e| format!("failed to load config for embedded gateway: {e}"))?;
-    let bind_host = discover_lan_ipv4().unwrap_or_else(|| "127.0.0.1".to_string());
+    let bind_host = "127.0.0.1".to_string();
     config.gateway.host = bind_host.clone();
     config.gateway.require_pairing = false;
-    config.gateway.allow_public_bind = bind_host != "127.0.0.1";
+    config.gateway.allow_public_bind = false;
 
     let normalized_provider = normalize_provider_id(config.default_provider.as_deref().unwrap_or(""));
     let key_from_keyring = provider_api_key_from_keyring_for_provider(

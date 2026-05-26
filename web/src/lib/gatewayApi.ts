@@ -218,6 +218,7 @@ function openGatewayEventStream(
 export type RuntimeConfigSnapshot = {
   defaultProvider: string;
   defaultModel: string;
+  apiUrl: string;
   transcriptionEnabled: boolean;
   transcriptionModel: string;
   availableTranscriptionModels: string[];
@@ -575,6 +576,7 @@ export async function getRuntimeConfig(
   return {
     defaultProvider: String(data?.defaultProvider || ""),
     defaultModel: String(data?.defaultModel || ""),
+    apiUrl: String(data?.apiUrl || ""),
     transcriptionEnabled: Boolean(data?.transcriptionEnabled),
     transcriptionModel: String(data?.transcriptionModel || ""),
     availableTranscriptionModels: Array.isArray(data?.availableTranscriptionModels)
@@ -600,6 +602,7 @@ export async function updateRuntimeConfig(
   const body: Record<string, unknown> = {
     defaultProvider: payload.defaultProvider,
     defaultModel: payload.defaultModel,
+    apiUrl: payload.apiUrl,
     transcriptionEnabled: payload.transcriptionEnabled,
     transcriptionModel: payload.transcriptionModel
   };
