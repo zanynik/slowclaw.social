@@ -6006,6 +6006,22 @@ function App() {
     : journalList;
   const feedList = feedItems;
   const postedHistory = history.filter((item) => item.status === "success");
+  const installedLocalModelCount = localModels.filter((model) => model.installed).length;
+  const activeLocalModel =
+    localModels.find((model) => model.active) ||
+    localModels.find((model) => nativeLocalAiStatus?.modelId === model.id) ||
+    localModels.find((model) => localModelRuntime?.modelId === model.id) ||
+    null;
+  const localAiReady = Boolean(
+    localModelRuntime?.running || nativeLocalAiStatus?.configured || activeLocalModel
+  );
+  const localAiStateLabel = localModelRuntime?.running
+    ? "Running"
+    : nativeLocalAiStatus?.configured
+    ? "Configured"
+    : installedLocalModelCount > 0
+    ? "Downloaded"
+    : "Setup needed";
   const needsMobileQrLogin = !isNativeClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
   const isCaptureZenMode = mobileTab === "journal" && (isRecording || captureMode !== null);
   const hideChrome = isWritingNote || isCaptureZenMode;
@@ -8415,23 +8431,52 @@ function App() {
           <ViewErrorBoundary title="Profile">
             <div className="stack">
               <div className="card local-models-card">
-                <div className="row-between">
+                <div className="model-hub-hero">
                   <div>
                     <p className="eyebrow">Local AI</p>
-                    <h2>Model Hub</h2>
+                    <h2>Choose Your On-Device Brain</h2>
+                    <p className="text-sm muted">
+                      Download one private model, then use it to turn journal notes into tasks,
+                      insights, and your personalized Me feed.
+                    </p>
+                    <div className="model-hub-chips">
+                      <span>Journal notes</span>
+                      <span>Task extraction</span>
+                      <span>Me feed insights</span>
+                    </div>
                   </div>
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => void loadLocalModels()}
-                    disabled={Boolean(localModelBusyId)}
-                  >
-                    Refresh
-                  </button>
+                  <div className="model-hub-status-card">
+                    <span className={localAiReady ? "model-hub-orb ready" : "model-hub-orb"} />
+                    <p className="text-sm muted">Local AI status</p>
+                    <strong>{localAiStateLabel}</strong>
+                    <span className="text-sm muted">
+                      {installedLocalModelCount} downloaded
+                    </span>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void loadLocalModels()}
+                      disabled={Boolean(localModelBusyId)}
+                    >
+                      Refresh
+                    </button>
+                  </div>
                 </div>
-                <p className="text-sm muted">
-                  Download a GGUF model into SlowClaw, then select it as the active local model.
-                </p>
+                <div className="model-hub-selected">
+                  <div>
+                    <p className="text-sm muted">Selected model</p>
+                    <strong>{activeLocalModel?.title || "No model selected yet"}</strong>
+                    <p className="text-sm muted">
+                      {activeLocalModel
+                        ? `${activeLocalModel.family} · ${activeLocalModel.engine}`
+                        : "Pick a compact model below to keep SlowClaw private and phone-first."}
+                    </p>
+                  </div>
+                  <div className="model-hub-selected-meta">
+                    <span>{activeLocalModel?.sizeLabel || "GGUF"}</span>
+                    <span>{isTauriMobileRuntime() ? "iPhone bridge" : "Desktop server"}</span>
+                  </div>
+                </div>
                 {localModelsEngineStatus ? (
                   <div className="local-model-engine-note text-sm">
                     {localModelsEngineStatus}
@@ -8516,7 +8561,11 @@ function App() {
                         </div>
                         <h3>{model.title}</h3>
                         <p className="text-sm muted">{model.description}</p>
-                        <p className="text-sm muted">{model.engine}</p>
+                        <div className="model-card-meta">
+                          <span>{model.engine}</span>
+                          <span>{model.sizeLabel}</span>
+                          <span>{model.installed ? "On device" : "Not downloaded"}</span>
+                        </div>
                         {isDownloading ? (
                           <div className="local-model-progress">
                             <div className="local-model-progress-track">
@@ -8528,7 +8577,7 @@ function App() {
                         {download?.status === "failed" && download.error ? (
                           <p className="text-sm local-model-error">{download.error}</p>
                         ) : null}
-                        <div className="row">
+                        <div className="model-card-actions">
                           {model.installed ? (
                             <>
                               <button
@@ -8551,7 +8600,7 @@ function App() {
                                 onClick={() => void selectLocalModel(model.id)}
                                 disabled={Boolean(localModelBusyId) || model.active}
                               >
-                                {model.active ? "Selected" : "Use Only"}
+                                {model.active ? "Selected" : "Set Default"}
                               </button>
                             </>
                           ) : (
