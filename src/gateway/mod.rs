@@ -36,6 +36,7 @@ use axum::{
     routing::{delete, get, patch, post},
     Router,
 };
+use futures_util::StreamExt;
 use http_body_util::BodyExt as _;
 use parking_lot::Mutex;
 use regex::Regex;
@@ -76,6 +77,7 @@ const JOURNAL_TEXT_DIR: &str = "journals/text";
 const JOURNAL_MEDIA_DIR: &str = "journals/media";
 const JOURNAL_TEXT_INBOX_DIR: &str = "journals/text/inbox";
 const JOURNAL_AUDIO_INBOX_DIR: &str = "journals/media/audio/inbox";
+const LOCAL_MODEL_DIR: &str = "local-models/llamacpp";
 const SYNC_ALLOWED_ROOTS: &[&str] = &["journals", "posts", "skills"];
 const CONTENT_AGENT_APP_OPEN_STALE_SECS: i64 = 15 * 60;
 const WORKSPACE_SYNTHESIZER_WORKFLOW_KEY: &str = "workspace_synthesizer";
@@ -419,8 +421,20 @@ pub struct AppState {
     pub pb_chat_collection: String,
     pub pb_chat_token: Option<String>,
     journal_transcription_jobs: Arc<Mutex<HashMap<String, JournalTranscriptionJob>>>,
+    local_model_downloads: Arc<Mutex<HashMap<String, LocalModelDownloadJob>>>,
     /// In-flight OpenRouter OAuth PKCE session (one at a time).
     openrouter_oauth: Arc<Mutex<Option<OpenRouterOAuthSession>>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalModelDownloadJob {
+    model_id: String,
+    status: String,
+    transferred_bytes: u64,
+    total_bytes: Option<u64>,
+    error: Option<String>,
+    path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -655,6 +669,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         pb_chat_collection: "chat_messages".to_string(),
         pb_chat_token: None,
         journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+        local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
         openrouter_oauth: Arc::new(Mutex::new(None)),
     };
 
@@ -670,6 +685,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/config/runtime",
             get(handle_runtime_config).post(handle_runtime_config_update),
         )
+        .route("/api/local-models", get(handle_local_models))
+        .route("/api/local-models/download", post(handle_local_model_download))
+        .route("/api/local-models/use", post(handle_local_model_use))
         .route("/api/media/capabilities", get(handle_media_capabilities))
         .route("/webhook", post(handle_webhook))
         .route("/api/chat/messages", get(handle_chat_list).post(handle_chat_send))
@@ -1141,6 +1159,360 @@ async fn handle_runtime_config_update(
         "transcriptionEnabled": next.transcription.enabled,
         "transcriptionModel": next.transcription.model,
         "availableTranscriptionModels": available_local_transcription_models(),
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LocalModelSpec {
+    id: &'static str,
+    title: &'static str,
+    family: &'static str,
+    description: &'static str,
+    engine: &'static str,
+    provider: &'static str,
+    download_url: &'static str,
+    file_name: &'static str,
+    size_label: &'static str,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalModelCatalogItem {
+    id: String,
+    title: String,
+    family: String,
+    description: String,
+    engine: String,
+    provider: String,
+    download_url: String,
+    file_name: String,
+    size_label: String,
+    size_bytes: u64,
+    installed: bool,
+    active: bool,
+    path: Option<String>,
+    download: Option<LocalModelDownloadJob>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalModelIdBody {
+    model_id: String,
+}
+
+fn local_model_specs() -> &'static [LocalModelSpec] {
+    &[
+        LocalModelSpec {
+            id: "unsloth/gemma-4-E4B-it-IQ4_XS",
+            title: "Gemma 4 E4B IQ4 XS",
+            family: "Gemma",
+            description: "AtomicChat-style recommended GGUF model for everyday local chat. Smaller 4-bit-ish quant for phone-first experiments.",
+            engine: "llama.cpp GGUF",
+            provider: "llamacpp",
+            download_url: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-IQ4_XS.gguf",
+            file_name: "gemma-4-E4B-it-IQ4_XS.gguf",
+            size_label: "4.7 GB",
+            size_bytes: 4_700_000_000,
+        },
+        LocalModelSpec {
+            id: "unsloth/gemma-4-E4B-it-UD-IQ2_XXS",
+            title: "Gemma 4 E4B IQ2 XXS",
+            family: "Gemma",
+            description: "Smallest listed Gemma 4 E4B GGUF quant from the AtomicChat baseline. Lower quality, but friendlier for constrained storage.",
+            engine: "llama.cpp GGUF",
+            provider: "llamacpp",
+            download_url: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-UD-IQ2_XXS.gguf",
+            file_name: "gemma-4-E4B-it-UD-IQ2_XXS.gguf",
+            size_label: "3.3 GB",
+            size_bytes: 3_300_000_000,
+        },
+    ]
+}
+
+fn find_local_model_spec(model_id: &str) -> Option<LocalModelSpec> {
+    let normalized = model_id.trim();
+    local_model_specs()
+        .iter()
+        .copied()
+        .find(|spec| spec.id == normalized)
+}
+
+fn safe_local_model_dir_name(model_id: &str) -> String {
+    model_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn local_model_file_path(workspace_dir: &StdPath, spec: LocalModelSpec) -> PathBuf {
+    workspace_dir
+        .join(LOCAL_MODEL_DIR)
+        .join(safe_local_model_dir_name(spec.id))
+        .join(spec.file_name)
+}
+
+fn local_model_catalog_items(state: &AppState) -> Vec<LocalModelCatalogItem> {
+    let config = state.config.lock().clone();
+    let active_provider = config
+        .default_provider
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let active_model = config
+        .default_model
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let downloads = state.local_model_downloads.lock().clone();
+
+    local_model_specs()
+        .iter()
+        .copied()
+        .map(|spec| {
+            let path = local_model_file_path(&config.workspace_dir, spec);
+            let installed = path.is_file();
+            LocalModelCatalogItem {
+                id: spec.id.to_string(),
+                title: spec.title.to_string(),
+                family: spec.family.to_string(),
+                description: spec.description.to_string(),
+                engine: spec.engine.to_string(),
+                provider: spec.provider.to_string(),
+                download_url: spec.download_url.to_string(),
+                file_name: spec.file_name.to_string(),
+                size_label: spec.size_label.to_string(),
+                size_bytes: spec.size_bytes,
+                installed,
+                active: installed && active_provider == spec.provider && active_model == spec.id,
+                path: installed.then(|| path.display().to_string()),
+                download: downloads.get(spec.id).cloned(),
+            }
+        })
+        .collect()
+}
+
+async fn handle_local_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Local models") {
+        return err.into_response();
+    }
+    let body = serde_json::json!({
+        "models": local_model_catalog_items(&state),
+        "engineReady": false,
+        "engineStatus": "Model download/selection is ready. Embedded llama.cpp runtime is the next integration slice.",
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+async fn handle_local_model_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LocalModelIdBody>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Local model download") {
+        return err.into_response();
+    }
+    let Some(spec) = find_local_model_spec(&body.model_id) else {
+        return frontend_error_response(
+            StatusCode::NOT_FOUND,
+            "LOCAL_MODEL_NOT_FOUND",
+            "Unknown local model.",
+        )
+        .into_response();
+    };
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let final_path = local_model_file_path(&workspace_dir, spec);
+    if final_path.is_file() {
+        state.local_model_downloads.lock().insert(
+            spec.id.to_string(),
+            LocalModelDownloadJob {
+                model_id: spec.id.to_string(),
+                status: "complete".to_string(),
+                transferred_bytes: spec.size_bytes,
+                total_bytes: Some(spec.size_bytes),
+                error: None,
+                path: Some(final_path.display().to_string()),
+            },
+        );
+        return (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response();
+    }
+
+    {
+        let mut jobs = state.local_model_downloads.lock();
+        if let Some(job) = jobs.get(spec.id) {
+            if job.status == "downloading" {
+                return (StatusCode::ACCEPTED, Json(serde_json::json!({ "ok": true }))).into_response();
+            }
+        }
+        jobs.insert(
+            spec.id.to_string(),
+            LocalModelDownloadJob {
+                model_id: spec.id.to_string(),
+                status: "downloading".to_string(),
+                transferred_bytes: 0,
+                total_bytes: Some(spec.size_bytes),
+                error: None,
+                path: None,
+            },
+        );
+    }
+
+    let jobs = state.local_model_downloads.clone();
+    tokio::spawn(async move {
+        download_local_model(spec, workspace_dir, jobs).await;
+    });
+
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+async fn download_local_model(
+    spec: LocalModelSpec,
+    workspace_dir: PathBuf,
+    jobs: Arc<Mutex<HashMap<String, LocalModelDownloadJob>>>,
+) {
+    let final_path = local_model_file_path(&workspace_dir, spec);
+    let tmp_path = final_path.with_extension("download");
+    let result: Result<()> = async {
+        let parent = final_path
+            .parent()
+            .context("local model path has no parent directory")?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("failed to create local model directory")?;
+
+        let response = reqwest::Client::new()
+            .get(spec.download_url)
+            .send()
+            .await
+            .context("failed to start model download")?
+            .error_for_status()
+            .context("model download returned an error")?;
+        let total = response.content_length().or(Some(spec.size_bytes));
+        {
+            let mut guard = jobs.lock();
+            if let Some(job) = guard.get_mut(spec.id) {
+                job.total_bytes = total;
+            }
+        }
+
+        let mut file = tokio::fs::File::create(&tmp_path)
+            .await
+            .context("failed to create temporary model file")?;
+        let mut transferred = 0u64;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("failed while reading model download stream")?;
+            file.write_all(&chunk)
+                .await
+                .context("failed to write model download chunk")?;
+            transferred = transferred.saturating_add(chunk.len() as u64);
+            let mut guard = jobs.lock();
+            if let Some(job) = guard.get_mut(spec.id) {
+                job.transferred_bytes = transferred;
+                job.total_bytes = total;
+            }
+        }
+        file.flush().await.context("failed to flush model download")?;
+        if final_path.exists() {
+            let _ = tokio::fs::remove_file(&final_path).await;
+        }
+        tokio::fs::rename(&tmp_path, &final_path)
+            .await
+            .context("failed to finalize model download")?;
+        Ok(())
+    }
+    .await;
+
+    let mut guard = jobs.lock();
+    match result {
+        Ok(()) => {
+            guard.insert(
+                spec.id.to_string(),
+                LocalModelDownloadJob {
+                    model_id: spec.id.to_string(),
+                    status: "complete".to_string(),
+                    transferred_bytes: spec.size_bytes,
+                    total_bytes: Some(spec.size_bytes),
+                    error: None,
+                    path: Some(final_path.display().to_string()),
+                },
+            );
+        }
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            guard.insert(
+                spec.id.to_string(),
+                LocalModelDownloadJob {
+                    model_id: spec.id.to_string(),
+                    status: "failed".to_string(),
+                    transferred_bytes: 0,
+                    total_bytes: Some(spec.size_bytes),
+                    error: Some(err.to_string()),
+                    path: None,
+                },
+            );
+        }
+    }
+}
+
+async fn handle_local_model_use(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LocalModelIdBody>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Local model use") {
+        return err.into_response();
+    }
+    let Some(spec) = find_local_model_spec(&body.model_id) else {
+        return frontend_error_response(
+            StatusCode::NOT_FOUND,
+            "LOCAL_MODEL_NOT_FOUND",
+            "Unknown local model.",
+        )
+        .into_response();
+    };
+
+    let mut next = state.config.lock().clone();
+    let path = local_model_file_path(&next.workspace_dir, spec);
+    if !path.is_file() {
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "LOCAL_MODEL_NOT_INSTALLED",
+            "Download the model before selecting it.",
+        )
+        .into_response();
+    }
+
+    next.default_provider = Some(spec.provider.to_string());
+    next.default_model = Some(spec.id.to_string());
+    next.api_url = Some("http://127.0.0.1:8080/v1".to_string());
+    if let Err(err) = next.save().await {
+        return frontend_internal_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "local model config save",
+            "Failed to save local model settings.",
+            err,
+        );
+    }
+    *state.config.lock() = next.clone();
+    reset_workspace_synthesizer_status_for_provider_change(&next.workspace_dir);
+
+    let resp = serde_json::json!({
+        "ok": true,
+        "defaultProvider": spec.provider,
+        "defaultModel": spec.id,
+        "apiUrl": "http://127.0.0.1:8080/v1",
     });
     (StatusCode::OK, Json(resp)).into_response()
 }
@@ -12743,6 +13115,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         }
     }
@@ -12839,6 +13212,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -12883,6 +13257,7 @@ mod tests {
             pb_chat_token: None,
             observer,
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13351,6 +13726,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13410,6 +13786,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13481,6 +13858,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13524,6 +13902,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13572,6 +13951,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13806,6 +14186,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13905,6 +14286,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13953,6 +14335,7 @@ mod tests {
             pb_chat_token: None,
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
+            local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 

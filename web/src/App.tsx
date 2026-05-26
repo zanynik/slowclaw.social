@@ -81,6 +81,7 @@ import {
   fetchPersonalizedFeed,
   fetchMediaAsFile,
   getJournalTranscriptionStatus,
+  getLocalModels,
   importWorkspaceSyncSnapshot,
   getRuntimeConfig,
   getWorkspaceSynthesizerStatus,
@@ -111,13 +112,16 @@ import {
   updateWorldFeedInterest,
   uploadMediaViaGateway,
   startOpenRouterOAuth,
+  downloadLocalModel,
   getOpenRouterOAuthStatus,
+  useLocalModel,
 } from "./lib/gatewayApi";
 import type {
   FeedContentAgentItem,
   GatewayEventStreamHandle,
   JournalTranscriptionStatus,
   InterestProfileStats,
+  LocalModelCatalogItem,
   MediaCapabilities,
   PersonalizedFeedItem,
   PersonalizedFeedResponse,
@@ -1073,6 +1077,10 @@ function App() {
   const [settingsConfigBusy, setSettingsConfigBusy] = useState(false);
   const [settingsConfigStatus, setSettingsConfigStatus] = useState("");
   const [settingsConfigLoaded, setSettingsConfigLoaded] = useState(false);
+  const [localModels, setLocalModels] = useState<LocalModelCatalogItem[]>([]);
+  const [localModelsStatus, setLocalModelsStatus] = useState("");
+  const [localModelsEngineStatus, setLocalModelsEngineStatus] = useState("");
+  const [localModelBusyId, setLocalModelBusyId] = useState("");
   const [mobileScannerActive, setMobileScannerActive] = useState(() => {
     if (typeof window === "undefined") {
       return false;
@@ -5274,6 +5282,76 @@ function App() {
     }
   }
 
+  async function resolveRuntimeGatewayToken() {
+    let token = normalizeGatewayToken(chatGatewayToken);
+    if (!token && isDesktopClient) {
+      token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
+    }
+    return token;
+  }
+
+  async function loadLocalModels() {
+    if (!gatewayBaseUrl.trim()) {
+      setLocalModels([]);
+      setLocalModelsStatus("Local model catalog unavailable (gateway URL missing).");
+      setLocalModelsEngineStatus("");
+      return;
+    }
+    try {
+      const token = await resolveRuntimeGatewayToken();
+      const response = await getLocalModels(token || undefined, gatewayBaseUrl);
+      setLocalModels(response.models);
+      setLocalModelsEngineStatus(response.engineStatus || "");
+      setLocalModelsStatus(response.models.length ? "" : "No local models are available yet.");
+    } catch (error) {
+      setLocalModels([]);
+      setLocalModelsEngineStatus("");
+      setLocalModelsStatus(
+        `Local models unavailable (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function startLocalModelDownload(modelId: string) {
+    setLocalModelBusyId(modelId);
+    setLocalModelsStatus("Starting model download...");
+    try {
+      const token = await resolveRuntimeGatewayToken();
+      await downloadLocalModel(modelId, token || undefined, gatewayBaseUrl);
+      setLocalModelsStatus("Download started. Keep the app open while the model downloads.");
+      await loadLocalModels();
+    } catch (error) {
+      setLocalModelsStatus(
+        `Download failed to start (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setLocalModelBusyId("");
+    }
+  }
+
+  async function selectLocalModel(modelId: string) {
+    setLocalModelBusyId(modelId);
+    setLocalModelsStatus("Selecting local model...");
+    try {
+      const token = await resolveRuntimeGatewayToken();
+      const result = await useLocalModel(modelId, token || undefined, gatewayBaseUrl);
+      setSettingsProvider(String(result.defaultProvider || "llamacpp"));
+      setSettingsModel(String(result.defaultModel || modelId));
+      setSettingsApiUrl(String(result.apiUrl || "http://127.0.0.1:8080/v1"));
+      if (isNativeClient) {
+        await restartGatewayDaemonFromDesktop();
+      }
+      setLocalModelsStatus("Local model selected. Runtime engine integration is the next step.");
+      await loadLocalModels();
+    } catch (error) {
+      setLocalModelsStatus(
+        `Could not select model (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setLocalModelBusyId("");
+    }
+  }
+
   async function loadRuntimeConfigForSettings() {
     let token = normalizeGatewayToken(chatGatewayToken);
     if (!token && isDesktopClient) {
@@ -5619,7 +5697,22 @@ function App() {
       return;
     }
     void loadRuntimeConfigForSettings();
+    void loadLocalModels();
   }, [mobileTab, chatGatewayToken, gatewayBaseUrl]);
+
+  useEffect(() => {
+    if (mobileTab !== "profile") {
+      return;
+    }
+    const hasActiveDownload = localModels.some((model) => model.download?.status === "downloading");
+    if (!hasActiveDownload) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void loadLocalModels();
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [mobileTab, localModels]);
 
   useEffect(() => {
     if (mobileTab !== "feed" && mobileTab !== "profile" && mobileTab !== "journal") {
@@ -8227,6 +8320,88 @@ function App() {
         {mobileTab === "profile" ? (
           <ViewErrorBoundary title="Profile">
             <div className="stack">
+              <div className="card local-models-card">
+                <div className="row-between">
+                  <div>
+                    <p className="eyebrow">Local AI</p>
+                    <h2>Model Hub</h2>
+                  </div>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => void loadLocalModels()}
+                    disabled={Boolean(localModelBusyId)}
+                  >
+                    Refresh
+                  </button>
+                </div>
+                <p className="text-sm muted">
+                  Download a GGUF model into SlowClaw, then select it as the active local model.
+                </p>
+                {localModelsEngineStatus ? (
+                  <div className="local-model-engine-note text-sm">
+                    {localModelsEngineStatus}
+                  </div>
+                ) : null}
+                <div className="local-model-grid">
+                  {localModels.map((model) => {
+                    const download = model.download;
+                    const isDownloading = download?.status === "downloading";
+                    const transferred = download?.transferredBytes || 0;
+                    const total = download?.totalBytes || model.sizeBytes || 0;
+                    const progress = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 0;
+                    return (
+                      <article className="local-model-card" key={model.id}>
+                        <div className="row-between">
+                          <span className="local-model-family">{model.family}</span>
+                          <span className={model.installed ? "local-model-pill installed" : "local-model-pill"}>
+                            {model.active ? "Active" : model.installed ? "Downloaded" : model.sizeLabel}
+                          </span>
+                        </div>
+                        <h3>{model.title}</h3>
+                        <p className="text-sm muted">{model.description}</p>
+                        <p className="text-sm muted">{model.engine}</p>
+                        {isDownloading ? (
+                          <div className="local-model-progress">
+                            <div className="local-model-progress-track">
+                              <div className="local-model-progress-fill" style={{ width: `${progress}%` }} />
+                            </div>
+                            <span className="text-sm muted">{progress}%</span>
+                          </div>
+                        ) : null}
+                        {download?.status === "failed" && download.error ? (
+                          <p className="text-sm local-model-error">{download.error}</p>
+                        ) : null}
+                        <div className="row">
+                          {model.installed ? (
+                            <button
+                              type="button"
+                              className={model.active ? "ghost" : "primary"}
+                              onClick={() => void selectLocalModel(model.id)}
+                              disabled={Boolean(localModelBusyId) || model.active}
+                            >
+                              {model.active ? "Selected" : "Use Model"}
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              className="primary"
+                              onClick={() => void startLocalModelDownload(model.id)}
+                              disabled={Boolean(localModelBusyId) || isDownloading}
+                            >
+                              {isDownloading ? "Downloading..." : "Download"}
+                            </button>
+                          )}
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+                {localModelsStatus ? (
+                  <p className="text-sm muted">{localModelsStatus}</p>
+                ) : null}
+              </div>
+
               <div className="card">
               <div className="row-between">
                 <h2>Configuration</h2>

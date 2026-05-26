@@ -235,6 +235,38 @@ export type MediaCapabilities = {
   composeSimpleClip: boolean;
 };
 
+export type LocalModelDownload = {
+  modelId: string;
+  status: string;
+  transferredBytes: number;
+  totalBytes?: number | null;
+  error?: string | null;
+  path?: string | null;
+};
+
+export type LocalModelCatalogItem = {
+  id: string;
+  title: string;
+  family: string;
+  description: string;
+  engine: string;
+  provider: string;
+  downloadUrl: string;
+  fileName: string;
+  sizeLabel: string;
+  sizeBytes: number;
+  installed: boolean;
+  active: boolean;
+  path?: string | null;
+  download?: LocalModelDownload | null;
+};
+
+export type LocalModelsResponse = {
+  models: LocalModelCatalogItem[];
+  engineReady: boolean;
+  engineStatus: string;
+};
+
 export type FeedContentAgentCommentResult = {
   queued: boolean;
   threadId: string;
@@ -613,6 +645,78 @@ export async function updateRuntimeConfig(
     method: "POST",
     headers: authHeaders(bearerToken, "application/json"),
     body: JSON.stringify(body)
+  });
+  return parseJsonOrThrow(res);
+}
+
+function parseLocalModelDownload(value: any): LocalModelDownload | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  return {
+    modelId: String(value.modelId || ""),
+    status: String(value.status || ""),
+    transferredBytes: Number(value.transferredBytes || 0),
+    totalBytes: value.totalBytes == null ? null : Number(value.totalBytes),
+    error: value.error == null ? null : String(value.error),
+    path: value.path == null ? null : String(value.path)
+  };
+}
+
+export async function getLocalModels(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<LocalModelsResponse> {
+  const res = await fetch(resolveGatewayEndpoint("/api/local-models", gatewayBaseUrl), {
+    headers: authHeaders(bearerToken)
+  });
+  const data = await parseJsonOrThrow(res);
+  return {
+    models: Array.isArray(data?.models)
+      ? data.models.map((item: any) => ({
+          id: String(item.id || ""),
+          title: String(item.title || ""),
+          family: String(item.family || ""),
+          description: String(item.description || ""),
+          engine: String(item.engine || ""),
+          provider: String(item.provider || ""),
+          downloadUrl: String(item.downloadUrl || ""),
+          fileName: String(item.fileName || ""),
+          sizeLabel: String(item.sizeLabel || ""),
+          sizeBytes: Number(item.sizeBytes || 0),
+          installed: Boolean(item.installed),
+          active: Boolean(item.active),
+          path: item.path == null ? null : String(item.path),
+          download: parseLocalModelDownload(item.download)
+        }))
+      : [],
+    engineReady: Boolean(data?.engineReady),
+    engineStatus: String(data?.engineStatus || "")
+  };
+}
+
+export async function downloadLocalModel(
+  modelId: string,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+) {
+  const res = await fetch(resolveGatewayEndpoint("/api/local-models/download", gatewayBaseUrl), {
+    method: "POST",
+    headers: authHeaders(bearerToken, "application/json"),
+    body: JSON.stringify({ modelId })
+  });
+  return parseJsonOrThrow(res);
+}
+
+export async function useLocalModel(
+  modelId: string,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+) {
+  const res = await fetch(resolveGatewayEndpoint("/api/local-models/use", gatewayBaseUrl), {
+    method: "POST",
+    headers: authHeaders(bearerToken, "application/json"),
+    body: JSON.stringify({ modelId })
   });
   return parseJsonOrThrow(res);
 }
