@@ -17,6 +17,8 @@ const OPENROUTER_API_KEY_SECRET_ACCOUNT: &str = "openrouter.api_key";
 const DESKTOP_GATEWAY_TOKEN_SECRET_ACCOUNT: &str = "desktop.gateway.token";
 const OPENAI_DEVICE_LOGIN_PROVIDER: &str = "openai-codex";
 const OPENAI_DEVICE_LOGIN_PROFILE: &str = "default";
+const NATIVE_LOCAL_AI_PROVIDER: &str = "slowclaw-local";
+const NATIVE_LOCAL_AI_URL: &str = "slowclaw-native://local";
 
 #[derive(Debug, Deserialize)]
 struct SecretGetRequest {
@@ -170,16 +172,23 @@ struct NativeLocalAiConfigureRequest {
     model_path: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeLocalAiPersistedState {
+    model_id: String,
+    model_path: String,
+}
+
 fn default_native_local_ai_status() -> NativeLocalAiStatus {
     NativeLocalAiStatus {
-        provider: "slowclaw-local".to_string(),
+        provider: NATIVE_LOCAL_AI_PROVIDER.to_string(),
         configured: false,
         available: false,
         running: false,
         state: "engine_missing".to_string(),
         model_id: None,
         model_path: None,
-        api_url: "slowclaw-native://local".to_string(),
+        api_url: NATIVE_LOCAL_AI_URL.to_string(),
         message: if cfg!(mobile) {
             "SlowClaw is wired for a native iOS local AI engine, but the llama.cpp/TurboQuant engine is not bundled yet."
                 .to_string()
@@ -188,6 +197,77 @@ fn default_native_local_ai_status() -> NativeLocalAiStatus {
                 .to_string()
         },
         error: Some("Native local inference engine is not bundled yet.".to_string()),
+    }
+}
+
+fn sync_native_local_ai_env(model_id: &str, model_path: &str) {
+    std::env::set_var(zeroclaw::providers::local_native::ENV_NATIVE_MODEL_ID, model_id);
+    std::env::set_var(zeroclaw::providers::local_native::ENV_NATIVE_MODEL_PATH, model_path);
+}
+
+fn native_local_ai_state_path(config: &zeroclaw::Config) -> PathBuf {
+    config
+        .workspace_dir
+        .join("state")
+        .join("native_local_ai.json")
+}
+
+async fn save_native_local_ai_state(
+    config: &zeroclaw::Config,
+    state: &NativeLocalAiPersistedState,
+) -> Result<(), String> {
+    let path = native_local_ai_state_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create native local AI state dir: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| format!("failed to encode native local AI state: {e}"))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("failed to write native local AI state: {e}"))
+}
+
+async fn load_native_local_ai_state(
+    config: &zeroclaw::Config,
+) -> Result<Option<NativeLocalAiPersistedState>, String> {
+    let path = native_local_ai_state_path(config);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read native local AI state: {e}"))?;
+    let state = serde_json::from_str(&raw)
+        .map_err(|e| format!("failed to parse native local AI state: {e}"))?;
+    Ok(Some(state))
+}
+
+fn status_from_native_local_ai_state(saved: NativeLocalAiPersistedState) -> NativeLocalAiStatus {
+    let model_exists = std::path::Path::new(&saved.model_path).is_file();
+    NativeLocalAiStatus {
+        provider: NATIVE_LOCAL_AI_PROVIDER.to_string(),
+        configured: true,
+        available: false,
+        running: false,
+        state: if model_exists {
+            "configured_engine_missing".to_string()
+        } else {
+            "model_missing".to_string()
+        },
+        model_id: Some(saved.model_id),
+        model_path: Some(saved.model_path),
+        api_url: NATIVE_LOCAL_AI_URL.to_string(),
+        message: if model_exists {
+            "SlowClaw restored the selected native local AI model. The remaining engine slice is to link llama.cpp/TurboQuant behind this bridge."
+                .to_string()
+        } else {
+            "SlowClaw found a saved native local AI model selection, but the GGUF file is missing. Re-download the model."
+                .to_string()
+        },
+        error: Some(if model_exists {
+            "Native local inference engine is not bundled yet.".to_string()
+        } else {
+            "Downloaded model file was not found on this device.".to_string()
+        }),
     }
 }
 
@@ -430,6 +510,14 @@ async fn restart_embedded_gateway(
         .api_key
         .as_ref()
         .is_some_and(|value| !value.trim().is_empty());
+
+    if normalized_provider == NATIVE_LOCAL_AI_PROVIDER {
+        match load_native_local_ai_state(&config).await {
+            Ok(Some(saved)) => sync_native_local_ai_env(&saved.model_id, &saved.model_path),
+            Ok(None) => {}
+            Err(err) => eprintln!("native local AI state restore failed: {err}"),
+        }
+    }
 
     let host = config.gateway.host.clone();
     let port = config.gateway.port;
@@ -1153,7 +1241,31 @@ async fn clear_anthropic_token(
 async fn get_native_local_ai_status(
     state: tauri::State<'_, NativeLocalAiState>,
 ) -> Result<NativeLocalAiStatus, String> {
-    snapshot_native_local_ai_status(&state.inner)
+    let current = snapshot_native_local_ai_status(&state.inner)?;
+    if current.configured {
+        return Ok(current);
+    }
+
+    let config = zeroclaw::Config::load_or_init()
+        .await
+        .map_err(|e| ui_command_error("native local AI config load failed", "Failed to load local AI config.", e))?;
+    if let Some(saved) = load_native_local_ai_state(&config).await.map_err(|e| {
+        ui_command_error(
+            "native local AI state load failed",
+            "Failed to load native local AI state.",
+            e,
+        )
+    })? {
+        sync_native_local_ai_env(&saved.model_id, &saved.model_path);
+        let restored = status_from_native_local_ai_state(saved);
+        {
+            let mut guard = lock_native_local_ai_state(&state.inner)?;
+            guard.status = restored.clone();
+        }
+        return Ok(restored);
+    }
+
+    Ok(current)
 }
 
 #[tauri::command]
@@ -1177,24 +1289,41 @@ async fn configure_native_local_ai(
     let mut config = zeroclaw::Config::load_or_init()
         .await
         .map_err(|e| ui_command_error("native local AI config load failed", "Failed to load local AI config.", e))?;
-    config.default_provider = Some("slowclaw-local".to_string());
+    config.default_provider = Some(NATIVE_LOCAL_AI_PROVIDER.to_string());
     config.default_model = Some(model_id.clone());
     config.api_url = None;
     config
         .save()
         .await
         .map_err(|e| ui_command_error("native local AI config save failed", "Failed to save local AI config.", e))?;
+    save_native_local_ai_state(
+        &config,
+        &NativeLocalAiPersistedState {
+            model_id: model_id.clone(),
+            model_path: model_path.clone(),
+        },
+    )
+    .await
+    .map_err(|e| {
+        ui_command_error(
+            "native local AI state save failed",
+            "Failed to save native local AI state.",
+            e,
+        )
+    })?;
+
+    sync_native_local_ai_env(&model_id, &model_path);
 
     let status = NativeLocalAiStatus {
-        provider: "slowclaw-local".to_string(),
+        provider: NATIVE_LOCAL_AI_PROVIDER.to_string(),
         configured: true,
         available: false,
         running: false,
         state: "configured_engine_missing".to_string(),
         model_id: Some(model_id),
         model_path: Some(model_path),
-        api_url: "slowclaw-native://local".to_string(),
-        message: "SlowClaw saved this model for the native iOS local AI provider. The remaining engine slice is to link llama.cpp/TurboQuant and execute prompts through this bridge.".to_string(),
+        api_url: NATIVE_LOCAL_AI_URL.to_string(),
+        message: "SlowClaw saved this model for the native iOS local AI provider and passed the GGUF path to the embedded gateway. The remaining engine slice is to link llama.cpp/TurboQuant behind this bridge.".to_string(),
         error: Some("Native local inference engine is not bundled yet.".to_string()),
     };
 
