@@ -1,7 +1,8 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 use std::net::{IpAddr, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,7 @@ const OPENAI_DEVICE_LOGIN_PROVIDER: &str = "openai-codex";
 const OPENAI_DEVICE_LOGIN_PROFILE: &str = "default";
 const NATIVE_LOCAL_AI_PROVIDER: &str = "slowclaw-local";
 const NATIVE_LOCAL_AI_URL: &str = "slowclaw-native://local";
+const NATIVE_JOURNAL_INDEX_DIR: &str = "native_journals";
 
 #[derive(Debug, Deserialize)]
 struct SecretGetRequest {
@@ -36,6 +38,44 @@ struct SecretSetRequest {
 #[derive(Debug, Serialize)]
 struct SecretGetResponse {
     value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalEntry {
+    id: String,
+    title: String,
+    content: String,
+    kind: String,
+    file_path: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeJournalRecord {
+    id: String,
+    title: String,
+    content: String,
+    kind: String,
+    file_path: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<NativeJournalRecord> for JournalEntry {
+    fn from(record: NativeJournalRecord) -> Self {
+        Self {
+            id: record.id,
+            title: record.title,
+            content: record.content,
+            kind: record.kind,
+            file_path: record.file_path,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -201,8 +241,14 @@ fn default_native_local_ai_status() -> NativeLocalAiStatus {
 }
 
 fn sync_native_local_ai_env(model_id: &str, model_path: &str) {
-    std::env::set_var(zeroclaw::providers::local_native::ENV_NATIVE_MODEL_ID, model_id);
-    std::env::set_var(zeroclaw::providers::local_native::ENV_NATIVE_MODEL_PATH, model_path);
+    std::env::set_var(
+        zeroclaw::providers::local_native::ENV_NATIVE_MODEL_ID,
+        model_id,
+    );
+    std::env::set_var(
+        zeroclaw::providers::local_native::ENV_NATIVE_MODEL_PATH,
+        model_path,
+    );
 }
 
 fn native_local_ai_state_path(config: &zeroclaw::Config) -> PathBuf {
@@ -223,8 +269,7 @@ async fn save_native_local_ai_state(
     }
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| format!("failed to encode native local AI state: {e}"))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("failed to write native local AI state: {e}"))
+    std::fs::write(&path, json).map_err(|e| format!("failed to write native local AI state: {e}"))
 }
 
 async fn load_native_local_ai_state(
@@ -286,6 +331,208 @@ fn ui_command_error(context: &str, user_message: &str, err: impl std::fmt::Displ
     user_message.to_string()
 }
 
+fn now_unix_millis_string() -> Result<String, String> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("system clock is before UNIX epoch: {e}"))?
+        .as_millis()
+        .to_string())
+}
+
+fn sanitize_journal_component(value: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else if ch.is_whitespace() {
+            out.push('-');
+        }
+        if out.len() >= 80 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches(['-', '_', '.']);
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn native_journal_index_dir(config: &zeroclaw::Config) -> PathBuf {
+    config
+        .workspace_dir
+        .join("state")
+        .join(NATIVE_JOURNAL_INDEX_DIR)
+}
+
+fn native_journal_record_path(config: &zeroclaw::Config, id: &str) -> PathBuf {
+    native_journal_index_dir(config).join(format!("{id}.json"))
+}
+
+fn native_journal_text_path(config: &zeroclaw::Config, id: &str) -> PathBuf {
+    config
+        .workspace_dir
+        .join("journals")
+        .join("text")
+        .join("mobile")
+        .join(format!("{id}.md"))
+}
+
+fn native_journal_media_path(
+    config: &zeroclaw::Config,
+    kind: &str,
+    id: &str,
+    filename: &str,
+) -> PathBuf {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| sanitize_journal_component(value, "bin"))
+        .unwrap_or_else(|| "bin".to_string());
+    config
+        .workspace_dir
+        .join("journals")
+        .join("media")
+        .join(kind)
+        .join("mobile")
+        .join(format!("{id}.{extension}"))
+}
+
+fn persist_native_journal_record(
+    config: &zeroclaw::Config,
+    record: &NativeJournalRecord,
+) -> Result<(), String> {
+    let path = native_journal_record_path(config, &record.id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ui_command_error(
+                "native journal index create failed",
+                "Failed to prepare local journal storage.",
+                e,
+            )
+        })?;
+    }
+    let body = serde_json::to_vec_pretty(record).map_err(|e| {
+        ui_command_error(
+            "native journal record encode failed",
+            "Failed to save the journal entry metadata.",
+            e,
+        )
+    })?;
+    std::fs::write(path, body).map_err(|e| {
+        ui_command_error(
+            "native journal record write failed",
+            "Failed to save the journal entry metadata.",
+            e,
+        )
+    })
+}
+
+fn load_native_journal_record(
+    config: &zeroclaw::Config,
+    id: &str,
+) -> Result<NativeJournalRecord, String> {
+    let safe_id = sanitize_journal_component(id, "");
+    if safe_id.is_empty() || safe_id != id {
+        return Err("Invalid journal entry id.".to_string());
+    }
+    let path = native_journal_record_path(config, id);
+    let body = std::fs::read_to_string(path).map_err(|e| {
+        ui_command_error(
+            "native journal record read failed",
+            "Failed to load the journal entry.",
+            e,
+        )
+    })?;
+    let mut record: NativeJournalRecord = serde_json::from_str(&body).map_err(|e| {
+        ui_command_error(
+            "native journal record decode failed",
+            "Failed to load the journal entry.",
+            e,
+        )
+    })?;
+    if record.kind == "text" {
+        if let Some(file_path) = record.file_path.as_deref() {
+            if let Ok(content) = std::fs::read_to_string(file_path) {
+                record.content = content;
+            }
+        }
+    }
+    Ok(record)
+}
+
+fn list_native_journal_records(
+    config: &zeroclaw::Config,
+) -> Result<Vec<NativeJournalRecord>, String> {
+    let index_dir = native_journal_index_dir(config);
+    if !index_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    let entries = std::fs::read_dir(index_dir).map_err(|e| {
+        ui_command_error(
+            "native journal index read failed",
+            "Failed to load local journal entries.",
+            e,
+        )
+    })?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut record) = serde_json::from_str::<NativeJournalRecord>(&body) else {
+            continue;
+        };
+        if record.kind == "text" {
+            if let Some(file_path) = record.file_path.as_deref() {
+                if let Ok(content) = std::fs::read_to_string(file_path) {
+                    record.content = content;
+                }
+            }
+        }
+        records.push(record);
+    }
+    records.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    Ok(records)
+}
+
+fn validate_journal_media_kind(kind: &str) -> Result<&'static str, String> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "audio" => Ok("audio"),
+        "video" => Ok("video"),
+        "image" => Ok("image"),
+        _ => Err("Unsupported journal media type.".to_string()),
+    }
+}
+
+fn decode_journal_media_base64(data_b64: &str) -> Result<Vec<u8>, String> {
+    let payload = data_b64
+        .rsplit_once(',')
+        .map(|(_, suffix)| suffix)
+        .unwrap_or(data_b64)
+        .trim();
+    base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|e| {
+            ui_command_error(
+                "journal media base64 decode failed",
+                "Failed to save the media recording.",
+                e,
+            )
+        })
+}
+
 fn lock_gateway_state<'a>(
     state: &'a Arc<Mutex<GatewayRuntimeState>>,
 ) -> Result<std::sync::MutexGuard<'a, GatewayRuntimeState>, String> {
@@ -310,7 +557,9 @@ fn lock_native_local_ai_state<'a>(
         .map_err(|_| "native local AI state lock poisoned".to_string())
 }
 
-fn snapshot_gateway_state(state: &Arc<Mutex<GatewayRuntimeState>>) -> Result<EmbeddedGatewayInfo, String> {
+fn snapshot_gateway_state(
+    state: &Arc<Mutex<GatewayRuntimeState>>,
+) -> Result<EmbeddedGatewayInfo, String> {
     let guard = lock_gateway_state(state)?;
     Ok(EmbeddedGatewayInfo {
         gateway_url: guard.gateway_url.clone(),
@@ -391,10 +640,7 @@ fn parse_gateway_port(gateway_url: &str) -> u16 {
         .trim()
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    let host_and_port = without_scheme
-        .split('/')
-        .next()
-        .unwrap_or(without_scheme);
+    let host_and_port = without_scheme.split('/').next().unwrap_or(without_scheme);
     host_and_port
         .rsplit_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok())
@@ -410,7 +656,10 @@ fn resolve_mobile_gateway_url(desktop_gateway_url: &str) -> String {
 }
 
 fn ensure_desktop_gateway_token() -> Result<String, String> {
-    if let Some(token) = read_keyring_secret(PROVIDER_SECRET_SERVICE, DESKTOP_GATEWAY_TOKEN_SECRET_ACCOUNT)? {
+    if let Some(token) = read_keyring_secret(
+        PROVIDER_SECRET_SERVICE,
+        DESKTOP_GATEWAY_TOKEN_SECRET_ACCOUNT,
+    )? {
         return Ok(token);
     }
 
@@ -420,8 +669,11 @@ fn ensure_desktop_gateway_token() -> Result<String, String> {
         .as_nanos();
     let generated = format!("desktop-local-{nanos}");
 
-    let entry = keyring::Entry::new(PROVIDER_SECRET_SERVICE, DESKTOP_GATEWAY_TOKEN_SECRET_ACCOUNT)
-        .map_err(|e| format!("failed to open desktop token key entry: {e}"))?;
+    let entry = keyring::Entry::new(
+        PROVIDER_SECRET_SERVICE,
+        DESKTOP_GATEWAY_TOKEN_SECRET_ACCOUNT,
+    )
+    .map_err(|e| format!("failed to open desktop token key entry: {e}"))?;
     entry
         .set_password(&generated)
         .map_err(|e| format!("failed to persist desktop token: {e}"))?;
@@ -489,7 +741,8 @@ async fn restart_embedded_gateway(
     config.gateway.require_pairing = false;
     config.gateway.allow_public_bind = false;
 
-    let normalized_provider = normalize_provider_id(config.default_provider.as_deref().unwrap_or(""));
+    let normalized_provider =
+        normalize_provider_id(config.default_provider.as_deref().unwrap_or(""));
     let key_from_keyring = provider_api_key_from_keyring_for_provider(
         config.default_provider.as_deref().unwrap_or(""),
     )?;
@@ -871,12 +1124,14 @@ fn run_openai_device_login_worker(
                         guard.status.completed = true;
                         guard.status.state = "completed".to_string();
                         guard.status.error = None;
-                        guard.status.message = "OpenAI setup completed. Restarting gateway...".to_string();
+                        guard.status.message =
+                            "OpenAI setup completed. Restarting gateway...".to_string();
                     }
 
                     let gateway_state_for_restart = gateway_state.clone();
                     tauri::async_runtime::spawn(async move {
-                        if let Err(err) = restart_embedded_gateway(gateway_state_for_restart).await {
+                        if let Err(err) = restart_embedded_gateway(gateway_state_for_restart).await
+                        {
                             eprintln!("failed to restart gateway after OpenAI setup: {err}");
                         }
                     });
@@ -898,8 +1153,10 @@ fn run_openai_device_login_worker(
                     guard.status.running = false;
                     guard.status.completed = false;
                     guard.status.state = "error".to_string();
-                    guard.status.message = "Failed while waiting for OpenAI setup command.".to_string();
-                    guard.status.error = Some("Unable to monitor the OpenAI setup command.".to_string());
+                    guard.status.message =
+                        "Failed while waiting for OpenAI setup command.".to_string();
+                    guard.status.error =
+                        Some("Unable to monitor the OpenAI setup command.".to_string());
                 }
                 eprintln!("openai setup wait failed: {err}");
                 break;
@@ -911,8 +1168,13 @@ fn run_openai_device_login_worker(
 #[tauri::command]
 fn get_secret(req: SecretGetRequest) -> Result<SecretGetResponse, String> {
     validate_secret_locator(&req.service, &req.account)?;
-    let entry = keyring::Entry::new(req.service.trim(), req.account.trim())
-        .map_err(|e| ui_command_error("secure storage open failed", "Failed to access secure storage.", e))?;
+    let entry = keyring::Entry::new(req.service.trim(), req.account.trim()).map_err(|e| {
+        ui_command_error(
+            "secure storage open failed",
+            "Failed to access secure storage.",
+            e,
+        )
+    })?;
 
     match entry.get_password() {
         Ok(value) => Ok(SecretGetResponse { value: Some(value) }),
@@ -931,22 +1193,32 @@ fn set_secret(req: SecretSetRequest) -> Result<(), String> {
     if req.value.is_empty() {
         return Err("value is required".to_string());
     }
-    let entry = keyring::Entry::new(req.service.trim(), req.account.trim())
-        .map_err(|e| ui_command_error("secure storage open failed", "Failed to access secure storage.", e))?;
-    entry
-        .set_password(&req.value)
-        .map_err(|e| ui_command_error(
+    let entry = keyring::Entry::new(req.service.trim(), req.account.trim()).map_err(|e| {
+        ui_command_error(
+            "secure storage open failed",
+            "Failed to access secure storage.",
+            e,
+        )
+    })?;
+    entry.set_password(&req.value).map_err(|e| {
+        ui_command_error(
             "secure storage write failed",
             "Failed to save the secure value.",
             e,
-        ))
+        )
+    })
 }
 
 #[tauri::command]
 fn delete_secret(req: SecretGetRequest) -> Result<(), String> {
     validate_secret_locator(&req.service, &req.account)?;
-    let entry = keyring::Entry::new(req.service.trim(), req.account.trim())
-        .map_err(|e| ui_command_error("secure storage open failed", "Failed to access secure storage.", e))?;
+    let entry = keyring::Entry::new(req.service.trim(), req.account.trim()).map_err(|e| {
+        ui_command_error(
+            "secure storage open failed",
+            "Failed to access secure storage.",
+            e,
+        )
+    })?;
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(ui_command_error(
@@ -958,7 +1230,9 @@ fn delete_secret(req: SecretGetRequest) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_embedded_gateway_info(state: tauri::State<'_, GatewayState>) -> Result<EmbeddedGatewayInfo, String> {
+fn get_embedded_gateway_info(
+    state: tauri::State<'_, GatewayState>,
+) -> Result<EmbeddedGatewayInfo, String> {
     snapshot_gateway_state(&state.inner)
 }
 
@@ -1024,7 +1298,13 @@ async fn restart_gateway_daemon(state: tauri::State<'_, GatewayState>) -> Result
     })?;
     let info = restart_embedded_gateway(state.inner.clone())
         .await
-        .map_err(|e| ui_command_error("gateway restart failed", "Failed to restart the desktop gateway.", e))?;
+        .map_err(|e| {
+            ui_command_error(
+                "gateway restart failed",
+                "Failed to restart the desktop gateway.",
+                e,
+            )
+        })?;
     Ok(info.gateway_url)
 }
 
@@ -1035,7 +1315,13 @@ async fn set_provider_api_key(
 ) -> Result<EmbeddedGatewayInfo, String> {
     let normalized = value.trim().to_string();
     let entry = keyring::Entry::new(PROVIDER_SECRET_SERVICE, PROVIDER_API_KEY_SECRET_ACCOUNT)
-        .map_err(|e| ui_command_error("provider keyring open failed", "Failed to access the provider key store.", e))?;
+        .map_err(|e| {
+            ui_command_error(
+                "provider keyring open failed",
+                "Failed to access the provider key store.",
+                e,
+            )
+        })?;
 
     if normalized.is_empty() {
         match entry.delete_credential() {
@@ -1049,15 +1335,13 @@ async fn set_provider_api_key(
             }
         }
     } else {
-        entry
-            .set_password(&normalized)
-            .map_err(|e| {
-                ui_command_error(
-                    "provider keyring write failed",
-                    "Failed to save the provider API key.",
-                    e,
-                )
-            })?;
+        entry.set_password(&normalized).map_err(|e| {
+            ui_command_error(
+                "provider keyring write failed",
+                "Failed to save the provider API key.",
+                e,
+            )
+        })?;
     }
 
     clear_provider_api_key_from_config().await.map_err(|e| {
@@ -1070,14 +1354,230 @@ async fn set_provider_api_key(
 
     restart_embedded_gateway(state.inner.clone())
         .await
-        .map_err(|e| ui_command_error("gateway restart failed", "Failed to restart the desktop gateway.", e))
+        .map_err(|e| {
+            ui_command_error(
+                "gateway restart failed",
+                "Failed to restart the desktop gateway.",
+                e,
+            )
+        })
+}
+
+#[tauri::command]
+async fn save_journal_text(title: String, content: String) -> Result<JournalEntry, String> {
+    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+        ui_command_error(
+            "journal config load failed",
+            "Failed to load the workspace configuration.",
+            e,
+        )
+    })?;
+    let now = now_unix_millis_string()?;
+    let title = title.trim();
+    let title = if title.is_empty() {
+        "Journal entry"
+    } else {
+        title
+    };
+    let id = format!(
+        "note-{now}-{}",
+        sanitize_journal_component(title, "journal-entry")
+    );
+    let path = native_journal_text_path(&config, &id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ui_command_error(
+                "native text journal dir create failed",
+                "Failed to prepare local journal storage.",
+                e,
+            )
+        })?;
+    }
+    std::fs::write(&path, content.as_bytes()).map_err(|e| {
+        ui_command_error(
+            "native text journal write failed",
+            "Failed to save the journal note.",
+            e,
+        )
+    })?;
+    let record = NativeJournalRecord {
+        id,
+        title: title.to_string(),
+        content,
+        kind: "text".to_string(),
+        file_path: Some(path.display().to_string()),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    persist_native_journal_record(&config, &record)?;
+    Ok(record.into())
+}
+
+#[tauri::command]
+async fn save_journal_media(
+    kind: String,
+    filename: String,
+    data_b64: String,
+    title: Option<String>,
+) -> Result<JournalEntry, String> {
+    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+        ui_command_error(
+            "journal config load failed",
+            "Failed to load the workspace configuration.",
+            e,
+        )
+    })?;
+    let kind = validate_journal_media_kind(&kind)?;
+    let bytes = decode_journal_media_base64(&data_b64)?;
+    if bytes.is_empty() {
+        return Err("Recording was empty.".to_string());
+    }
+    let now = now_unix_millis_string()?;
+    let safe_filename = sanitize_journal_component(&filename, kind);
+    let id = format!("media-{now}-{safe_filename}");
+    let path = native_journal_media_path(&config, kind, &id, &filename);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ui_command_error(
+                "native media journal dir create failed",
+                "Failed to prepare local media storage.",
+                e,
+            )
+        })?;
+    }
+    std::fs::write(&path, bytes).map_err(|e| {
+        ui_command_error(
+            "native media journal write failed",
+            "Failed to save the media recording.",
+            e,
+        )
+    })?;
+    let title = title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Journal entry")
+        .to_string();
+    let record = NativeJournalRecord {
+        id,
+        title,
+        content: String::new(),
+        kind: kind.to_string(),
+        file_path: Some(path.display().to_string()),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    persist_native_journal_record(&config, &record)?;
+    Ok(record.into())
+}
+
+#[tauri::command]
+async fn list_journals(
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<JournalEntry>, String> {
+    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+        ui_command_error(
+            "journal config load failed",
+            "Failed to load the workspace configuration.",
+            e,
+        )
+    })?;
+    let records = list_native_journal_records(&config)?;
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(300).min(500);
+    Ok(records
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(JournalEntry::from)
+        .collect())
+}
+
+#[tauri::command]
+async fn get_journal(id: String) -> Result<JournalEntry, String> {
+    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+        ui_command_error(
+            "journal config load failed",
+            "Failed to load the workspace configuration.",
+            e,
+        )
+    })?;
+    Ok(load_native_journal_record(&config, &id)?.into())
+}
+
+#[tauri::command]
+async fn update_journal_text(id: String, content: String) -> Result<JournalEntry, String> {
+    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+        ui_command_error(
+            "journal config load failed",
+            "Failed to load the workspace configuration.",
+            e,
+        )
+    })?;
+    let mut record = load_native_journal_record(&config, &id)?;
+    if record.kind != "text" {
+        return Err("Only text journal entries can be edited directly.".to_string());
+    }
+    let path = record
+        .file_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_journal_text_path(&config, &record.id));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ui_command_error(
+                "native text journal dir create failed",
+                "Failed to prepare local journal storage.",
+                e,
+            )
+        })?;
+    }
+    std::fs::write(&path, content.as_bytes()).map_err(|e| {
+        ui_command_error(
+            "native text journal update failed",
+            "Failed to update the journal note.",
+            e,
+        )
+    })?;
+    record.content = content;
+    record.file_path = Some(path.display().to_string());
+    record.updated_at = now_unix_millis_string()?;
+    persist_native_journal_record(&config, &record)?;
+    Ok(record.into())
+}
+
+#[tauri::command]
+async fn delete_journal(id: String) -> Result<(), String> {
+    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+        ui_command_error(
+            "journal config load failed",
+            "Failed to load the workspace configuration.",
+            e,
+        )
+    })?;
+    let record = load_native_journal_record(&config, &id)?;
+    if let Some(file_path) = record.file_path.as_deref() {
+        match std::fs::remove_file(file_path) {
+            Ok(()) | Err(_) => {}
+        }
+    }
+    let metadata_path = native_journal_record_path(&config, &id);
+    match std::fs::remove_file(metadata_path) {
+        Ok(()) | Err(_) => {}
+    }
+    Ok(())
 }
 
 #[tauri::command]
 async fn open_workspace_journals_folder() -> Result<String, String> {
-    let config = zeroclaw::Config::load_or_init()
-        .await
-        .map_err(|e| ui_command_error("journals folder config load failed", "Failed to load the workspace configuration.", e))?;
+    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+        ui_command_error(
+            "journals folder config load failed",
+            "Failed to load the workspace configuration.",
+            e,
+        )
+    })?;
     let journals_dir = config.workspace_dir.join("journals");
     for rel in ["", "text/inbox", "media/audio/inbox"] {
         let target = if rel.is_empty() {
@@ -1219,9 +1719,13 @@ async fn save_anthropic_token(
     if trimmed.is_empty() {
         return Err("Token cannot be empty.".to_string());
     }
-    zeroclaw::save_anthropic_token(trimmed)
-        .await
-        .map_err(|e| ui_command_error("anthropic token save failed", "Failed to save Claude token.", e))?;
+    zeroclaw::save_anthropic_token(trimmed).await.map_err(|e| {
+        ui_command_error(
+            "anthropic token save failed",
+            "Failed to save Claude token.",
+            e,
+        )
+    })?;
     let _ = restart_embedded_gateway(state.inner.clone()).await;
     get_anthropic_token_status().await
 }
@@ -1230,9 +1734,13 @@ async fn save_anthropic_token(
 async fn clear_anthropic_token(
     state: tauri::State<'_, GatewayState>,
 ) -> Result<AnthropicTokenStatus, String> {
-    zeroclaw::clear_anthropic_token()
-        .await
-        .map_err(|e| ui_command_error("anthropic token clear failed", "Failed to clear Claude token.", e))?;
+    zeroclaw::clear_anthropic_token().await.map_err(|e| {
+        ui_command_error(
+            "anthropic token clear failed",
+            "Failed to clear Claude token.",
+            e,
+        )
+    })?;
     let _ = restart_embedded_gateway(state.inner.clone()).await;
     get_anthropic_token_status().await
 }
@@ -1246,9 +1754,13 @@ async fn get_native_local_ai_status(
         return Ok(current);
     }
 
-    let config = zeroclaw::Config::load_or_init()
-        .await
-        .map_err(|e| ui_command_error("native local AI config load failed", "Failed to load local AI config.", e))?;
+    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+        ui_command_error(
+            "native local AI config load failed",
+            "Failed to load local AI config.",
+            e,
+        )
+    })?;
     if let Some(saved) = load_native_local_ai_state(&config).await.map_err(|e| {
         ui_command_error(
             "native local AI state load failed",
@@ -1286,16 +1798,23 @@ async fn configure_native_local_ai(
         return Err("Downloaded model file was not found on this device.".to_string());
     }
 
-    let mut config = zeroclaw::Config::load_or_init()
-        .await
-        .map_err(|e| ui_command_error("native local AI config load failed", "Failed to load local AI config.", e))?;
+    let mut config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+        ui_command_error(
+            "native local AI config load failed",
+            "Failed to load local AI config.",
+            e,
+        )
+    })?;
     config.default_provider = Some(NATIVE_LOCAL_AI_PROVIDER.to_string());
     config.default_model = Some(model_id.clone());
     config.api_url = None;
-    config
-        .save()
-        .await
-        .map_err(|e| ui_command_error("native local AI config save failed", "Failed to save local AI config.", e))?;
+    config.save().await.map_err(|e| {
+        ui_command_error(
+            "native local AI config save failed",
+            "Failed to save local AI config.",
+            e,
+        )
+    })?;
     save_native_local_ai_state(
         &config,
         &NativeLocalAiPersistedState {
@@ -1378,6 +1897,12 @@ pub fn run() {
             get_desktop_gateway_bootstrap,
             restart_gateway_daemon,
             set_provider_api_key,
+            save_journal_text,
+            save_journal_media,
+            list_journals,
+            get_journal,
+            update_journal_text,
+            delete_journal,
             open_workspace_journals_folder,
             open_external_url,
             get_openai_device_code_status,

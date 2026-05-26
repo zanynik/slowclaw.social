@@ -1742,6 +1742,32 @@ function App() {
   }
 
   async function deleteJournalItem(item: LibraryItem) {
+    const localId = localJournalIdFromPath(item.path);
+    if (localId && isNativeClient) {
+      setJournalSaveStatus(`Deleting ${item.title}...`);
+      try {
+        await deleteJournal(localId);
+        setPendingDeleteJournalItem(null);
+        if (selectedJournalPath === item.path) {
+          journalLoadRequestRef.current += 1;
+          openedJournalPathRef.current = "";
+          selectedJournalPathRef.current = "";
+          setSelectedJournalPath("");
+          setSelectedJournalItem(null);
+          setSelectedJournalText("");
+          setJournalDraftText("");
+          loadedTextPathRef.current = "";
+        }
+        await refreshLibrary("journal");
+        setJournalSaveStatus("Deleted");
+      } catch (error) {
+        setJournalSaveStatus(
+          `Delete failed (${error instanceof Error ? error.message : String(error)})`
+        );
+      }
+      return;
+    }
+
     let token = chatGatewayToken.trim();
     if (!token && isDesktopClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
