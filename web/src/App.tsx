@@ -82,6 +82,7 @@ import {
   fetchMediaAsFile,
   getJournalTranscriptionStatus,
   getLocalModels,
+  getLocalModelRuntime,
   importWorkspaceSyncSnapshot,
   getRuntimeConfig,
   getWorkspaceSynthesizerStatus,
@@ -99,6 +100,7 @@ import {
   runFeedContentAgentNow,
   saveDraft as saveDraftViaGateway,
   saveLibraryText,
+  startLocalModelRuntime,
   streamClawChatMessages,
   streamClawChatResult,
   streamJournalTranscriptionStatus,
@@ -114,6 +116,7 @@ import {
   startOpenRouterOAuth,
   downloadLocalModel,
   getOpenRouterOAuthStatus,
+  stopLocalModelRuntime,
   useLocalModel,
 } from "./lib/gatewayApi";
 import type {
@@ -122,6 +125,7 @@ import type {
   JournalTranscriptionStatus,
   InterestProfileStats,
   LocalModelCatalogItem,
+  LocalModelRuntimeStatus,
   MediaCapabilities,
   PersonalizedFeedItem,
   PersonalizedFeedResponse,
@@ -1080,6 +1084,7 @@ function App() {
   const [localModels, setLocalModels] = useState<LocalModelCatalogItem[]>([]);
   const [localModelsStatus, setLocalModelsStatus] = useState("");
   const [localModelsEngineStatus, setLocalModelsEngineStatus] = useState("");
+  const [localModelRuntime, setLocalModelRuntime] = useState<LocalModelRuntimeStatus | null>(null);
   const [localModelBusyId, setLocalModelBusyId] = useState("");
   const [mobileScannerActive, setMobileScannerActive] = useState(() => {
     if (typeof window === "undefined") {
@@ -5302,10 +5307,12 @@ function App() {
       const response = await getLocalModels(token || undefined, gatewayBaseUrl);
       setLocalModels(response.models);
       setLocalModelsEngineStatus(response.engineStatus || "");
+      setLocalModelRuntime(response.runtime || null);
       setLocalModelsStatus(response.models.length ? "" : "No local models are available yet.");
     } catch (error) {
       setLocalModels([]);
       setLocalModelsEngineStatus("");
+      setLocalModelRuntime(null);
       setLocalModelsStatus(
         `Local models unavailable (${error instanceof Error ? error.message : String(error)})`
       );
@@ -5349,6 +5356,61 @@ function App() {
       );
     } finally {
       setLocalModelBusyId("");
+    }
+  }
+
+  async function refreshLocalModelRuntime() {
+    try {
+      const token = await resolveRuntimeGatewayToken();
+      const runtime = await getLocalModelRuntime(token || undefined, gatewayBaseUrl);
+      setLocalModelRuntime(runtime);
+      if (runtime.error) {
+        setLocalModelsStatus(runtime.error);
+      }
+    } catch (error) {
+      setLocalModelsStatus(
+        `Runtime status unavailable (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function startDownloadedLocalModel(modelId: string) {
+    setLocalModelBusyId(modelId);
+    setLocalModelsStatus("Starting local model runtime...");
+    try {
+      const token = await resolveRuntimeGatewayToken();
+      const runtime = await startLocalModelRuntime(modelId, token || undefined, gatewayBaseUrl);
+      setLocalModelRuntime(runtime);
+      setSettingsProvider("llamacpp");
+      setSettingsModel(runtime.modelId || modelId);
+      setSettingsApiUrl(runtime.apiUrl || "http://127.0.0.1:8080/v1");
+      setLocalModelsStatus(
+        runtime.running
+          ? "Local model runtime is running. SlowClaw saved it as the active local model."
+          : runtime.error || "Runtime is not available yet."
+      );
+      await loadLocalModels();
+    } catch (error) {
+      setLocalModelsStatus(
+        `Could not start runtime (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setLocalModelBusyId("");
+    }
+  }
+
+  async function stopDownloadedLocalModel() {
+    setLocalModelsStatus("Stopping local model runtime...");
+    try {
+      const token = await resolveRuntimeGatewayToken();
+      const runtime = await stopLocalModelRuntime(token || undefined, gatewayBaseUrl);
+      setLocalModelRuntime(runtime);
+      setLocalModelsStatus("Local model runtime stopped.");
+      await loadLocalModels();
+    } catch (error) {
+      setLocalModelsStatus(
+        `Could not stop runtime (${error instanceof Error ? error.message : String(error)})`
+      );
     }
   }
 
@@ -5705,14 +5767,19 @@ function App() {
       return;
     }
     const hasActiveDownload = localModels.some((model) => model.download?.status === "downloading");
-    if (!hasActiveDownload) {
+    if (!hasActiveDownload && !localModelRuntime?.running) {
       return;
     }
     const timer = window.setInterval(() => {
-      void loadLocalModels();
+      if (hasActiveDownload) {
+        void loadLocalModels();
+      }
+      if (localModelRuntime?.running) {
+        void refreshLocalModelRuntime();
+      }
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [mobileTab, localModels]);
+  }, [mobileTab, localModels, localModelRuntime?.running]);
 
   useEffect(() => {
     if (mobileTab !== "feed" && mobileTab !== "profile" && mobileTab !== "journal") {
@@ -8343,6 +8410,38 @@ function App() {
                     {localModelsEngineStatus}
                   </div>
                 ) : null}
+                {localModelRuntime ? (
+                  <div className="local-runtime-panel">
+                    <div>
+                      <p className="text-sm muted">Runtime</p>
+                      <strong>{localModelRuntime.running ? "Running" : localModelRuntime.status || "Stopped"}</strong>
+                      {localModelRuntime.modelId ? (
+                        <p className="text-sm muted">{localModelRuntime.modelId}</p>
+                      ) : null}
+                      {localModelRuntime.error ? (
+                        <p className="text-sm local-model-error">{localModelRuntime.error}</p>
+                      ) : null}
+                    </div>
+                    <div className="row">
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => void refreshLocalModelRuntime()}
+                      >
+                        Runtime Status
+                      </button>
+                      {localModelRuntime.running ? (
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() => void stopDownloadedLocalModel()}
+                        >
+                          Stop Runtime
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
                 <div className="local-model-grid">
                   {localModels.map((model) => {
                     const download = model.download;
@@ -8374,14 +8473,26 @@ function App() {
                         ) : null}
                         <div className="row">
                           {model.installed ? (
-                            <button
-                              type="button"
-                              className={model.active ? "ghost" : "primary"}
-                              onClick={() => void selectLocalModel(model.id)}
-                              disabled={Boolean(localModelBusyId) || model.active}
-                            >
-                              {model.active ? "Selected" : "Use Model"}
-                            </button>
+                            <>
+                              <button
+                                type="button"
+                                className="primary"
+                                onClick={() => void startDownloadedLocalModel(model.id)}
+                                disabled={Boolean(localModelBusyId)}
+                              >
+                                {localModelRuntime?.running && localModelRuntime.modelId === model.id
+                                  ? "Restart Runtime"
+                                  : "Start Runtime"}
+                              </button>
+                              <button
+                                type="button"
+                                className={model.active ? "ghost" : "ghost"}
+                                onClick={() => void selectLocalModel(model.id)}
+                                disabled={Boolean(localModelBusyId) || model.active}
+                              >
+                                {model.active ? "Selected" : "Use Only"}
+                              </button>
+                            </>
                           ) : (
                             <button
                               type="button"

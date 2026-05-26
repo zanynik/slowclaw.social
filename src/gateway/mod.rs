@@ -45,7 +45,7 @@ use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -422,6 +422,7 @@ pub struct AppState {
     pub pb_chat_token: Option<String>,
     journal_transcription_jobs: Arc<Mutex<HashMap<String, JournalTranscriptionJob>>>,
     local_model_downloads: Arc<Mutex<HashMap<String, LocalModelDownloadJob>>>,
+    local_model_runtime: Arc<tokio::sync::Mutex<LocalModelRuntimeState>>,
     /// In-flight OpenRouter OAuth PKCE session (one at a time).
     openrouter_oauth: Arc<Mutex<Option<OpenRouterOAuthSession>>>,
 }
@@ -435,6 +436,32 @@ struct LocalModelDownloadJob {
     total_bytes: Option<u64>,
     error: Option<String>,
     path: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct LocalModelRuntimeState {
+    child: Option<tokio::process::Child>,
+    model_id: Option<String>,
+    status: String,
+    binary: Option<String>,
+    pid: Option<u32>,
+    port: u16,
+    error: Option<String>,
+    started_at_unix: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalModelRuntimeSnapshot {
+    status: String,
+    running: bool,
+    model_id: Option<String>,
+    binary: Option<String>,
+    pid: Option<u32>,
+    port: u16,
+    api_url: String,
+    error: Option<String>,
+    started_at_unix: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -670,6 +697,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         pb_chat_token: None,
         journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
         local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+        local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
         openrouter_oauth: Arc::new(Mutex::new(None)),
     };
 
@@ -688,6 +716,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/local-models", get(handle_local_models))
         .route("/api/local-models/download", post(handle_local_model_download))
         .route("/api/local-models/use", post(handle_local_model_use))
+        .route(
+            "/api/local-models/runtime",
+            get(handle_local_model_runtime_status)
+                .post(handle_local_model_runtime_start)
+                .delete(handle_local_model_runtime_stop),
+        )
         .route("/api/media/capabilities", get(handle_media_capabilities))
         .route("/webhook", post(handle_webhook))
         .route("/api/chat/messages", get(handle_chat_list).post(handle_chat_send))
@@ -1259,6 +1293,84 @@ fn local_model_file_path(workspace_dir: &StdPath, spec: LocalModelSpec) -> PathB
         .join(spec.file_name)
 }
 
+fn local_model_runtime_api_url() -> String {
+    "http://127.0.0.1:8080/v1".to_string()
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn candidate_llama_server_binaries(workspace_dir: &StdPath) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("SLOWCLAW_LLAMA_SERVER") {
+        if !path.trim().is_empty() {
+            candidates.push(PathBuf::from(path.trim()));
+        }
+    }
+    candidates.push(workspace_dir.join("local-models/bin/llama-server"));
+    candidates.push(workspace_dir.join("local-models/bin/llama-server-turbo"));
+    candidates.push(PathBuf::from("llama-server"));
+    candidates.push(PathBuf::from("llama-server-turbo"));
+    candidates
+}
+
+fn resolve_llama_server_binary(workspace_dir: &StdPath) -> Option<PathBuf> {
+    for candidate in candidate_llama_server_binaries(workspace_dir) {
+        let path_str = candidate.to_string_lossy();
+        if candidate.components().count() > 1 || path_str.contains(std::path::MAIN_SEPARATOR) {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            continue;
+        }
+        if let Ok(found) = which::which(path_str.as_ref()) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+async fn local_model_runtime_snapshot(
+    runtime: &Arc<tokio::sync::Mutex<LocalModelRuntimeState>>,
+) -> LocalModelRuntimeSnapshot {
+    let mut guard = runtime.lock().await;
+    if let Some(child) = guard.child.as_mut() {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                guard.child = None;
+                guard.status = "stopped".to_string();
+                guard.pid = None;
+                guard.error = Some(format!("llama-server exited with {status}"));
+            }
+            Ok(None) => {
+                guard.status = "running".to_string();
+            }
+            Err(err) => {
+                guard.status = "error".to_string();
+                guard.error = Some(format!("failed to inspect llama-server: {err}"));
+            }
+        }
+    } else if guard.status.is_empty() {
+        guard.status = "stopped".to_string();
+    }
+
+    LocalModelRuntimeSnapshot {
+        status: guard.status.clone(),
+        running: guard.child.is_some() && guard.status == "running",
+        model_id: guard.model_id.clone(),
+        binary: guard.binary.clone(),
+        pid: guard.pid,
+        port: if guard.port == 0 { 8080 } else { guard.port },
+        api_url: local_model_runtime_api_url(),
+        error: guard.error.clone(),
+        started_at_unix: guard.started_at_unix,
+    }
+}
+
 fn local_model_catalog_items(state: &AppState) -> Vec<LocalModelCatalogItem> {
     let config = state.config.lock().clone();
     let active_provider = config
@@ -1306,10 +1418,16 @@ async fn handle_local_models(
     if let Some(err) = pairing_auth_error(&state, &headers, "Local models") {
         return err.into_response();
     }
+    let runtime = local_model_runtime_snapshot(&state.local_model_runtime).await;
     let body = serde_json::json!({
         "models": local_model_catalog_items(&state),
-        "engineReady": false,
-        "engineStatus": "Model download/selection is ready. Embedded llama.cpp runtime is the next integration slice.",
+        "runtime": runtime,
+        "engineReady": runtime.running,
+        "engineStatus": if runtime.running {
+            "Local llama.cpp runtime is running."
+        } else {
+            "Download/select is ready. Runtime starts when a llama-server binary is bundled or available on PATH."
+        },
     });
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -1496,7 +1614,7 @@ async fn handle_local_model_use(
 
     next.default_provider = Some(spec.provider.to_string());
     next.default_model = Some(spec.id.to_string());
-    next.api_url = Some("http://127.0.0.1:8080/v1".to_string());
+    next.api_url = Some(local_model_runtime_api_url());
     if let Err(err) = next.save().await {
         return frontend_internal_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1512,9 +1630,172 @@ async fn handle_local_model_use(
         "ok": true,
         "defaultProvider": spec.provider,
         "defaultModel": spec.id,
-        "apiUrl": "http://127.0.0.1:8080/v1",
+        "apiUrl": local_model_runtime_api_url(),
     });
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+async fn handle_local_model_runtime_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Local model runtime status") {
+        return err.into_response();
+    }
+    let runtime = local_model_runtime_snapshot(&state.local_model_runtime).await;
+    (StatusCode::OK, Json(runtime)).into_response()
+}
+
+async fn handle_local_model_runtime_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LocalModelIdBody>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Local model runtime start") {
+        return err.into_response();
+    }
+    let Some(spec) = find_local_model_spec(&body.model_id) else {
+        return frontend_error_response(
+            StatusCode::NOT_FOUND,
+            "LOCAL_MODEL_NOT_FOUND",
+            "Unknown local model.",
+        )
+        .into_response();
+    };
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let model_path = local_model_file_path(&workspace_dir, spec);
+    if !model_path.is_file() {
+        return frontend_error_response(
+            StatusCode::BAD_REQUEST,
+            "LOCAL_MODEL_NOT_INSTALLED",
+            "Download the model before starting it.",
+        )
+        .into_response();
+    }
+    let Some(binary) = resolve_llama_server_binary(&workspace_dir) else {
+        let mut runtime = state.local_model_runtime.lock().await;
+        runtime.status = "unavailable".to_string();
+        runtime.model_id = Some(spec.id.to_string());
+        runtime.error = Some(
+            "No llama-server binary is bundled yet. Add one at local-models/bin/llama-server or set SLOWCLAW_LLAMA_SERVER."
+                .to_string(),
+        );
+        let snapshot = LocalModelRuntimeSnapshot {
+            status: runtime.status.clone(),
+            running: false,
+            model_id: runtime.model_id.clone(),
+            binary: None,
+            pid: None,
+            port: 8080,
+            api_url: local_model_runtime_api_url(),
+            error: runtime.error.clone(),
+            started_at_unix: None,
+        };
+        return (StatusCode::OK, Json(snapshot)).into_response();
+    };
+
+    let old_child = {
+        let mut runtime = state.local_model_runtime.lock().await;
+        runtime.child.take()
+    };
+    if let Some(mut child) = old_child {
+        let _ = child.kill().await;
+    }
+
+    let mut cmd = Command::new(&binary);
+    cmd.arg("--model")
+        .arg(&model_path)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg("8080")
+        .arg("--ctx-size")
+        .arg("4096")
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    match cmd.spawn() {
+        Ok(child) => {
+            let pid = child.id();
+            {
+                let mut runtime = state.local_model_runtime.lock().await;
+                runtime.child = Some(child);
+                runtime.status = "running".to_string();
+                runtime.model_id = Some(spec.id.to_string());
+                runtime.binary = Some(binary.display().to_string());
+                runtime.pid = pid;
+                runtime.port = 8080;
+                runtime.error = None;
+                runtime.started_at_unix = Some(now_unix_secs());
+            }
+
+            let mut next = state.config.lock().clone();
+            next.default_provider = Some(spec.provider.to_string());
+            next.default_model = Some(spec.id.to_string());
+            next.api_url = Some(local_model_runtime_api_url());
+            if let Err(err) = next.save().await {
+                return frontend_internal_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "local model runtime config save",
+                    "Started the local model runtime, but failed to save runtime settings.",
+                    err,
+                );
+            }
+            *state.config.lock() = next.clone();
+            reset_workspace_synthesizer_status_for_provider_change(&next.workspace_dir);
+
+            let snapshot = local_model_runtime_snapshot(&state.local_model_runtime).await;
+            (StatusCode::OK, Json(snapshot)).into_response()
+        }
+        Err(err) => {
+            let mut runtime = state.local_model_runtime.lock().await;
+            runtime.status = "error".to_string();
+            runtime.model_id = Some(spec.id.to_string());
+            runtime.binary = Some(binary.display().to_string());
+            runtime.pid = None;
+            runtime.port = 8080;
+            runtime.error = Some(format!("failed to start llama-server: {err}"));
+            let snapshot = LocalModelRuntimeSnapshot {
+                status: runtime.status.clone(),
+                running: false,
+                model_id: runtime.model_id.clone(),
+                binary: runtime.binary.clone(),
+                pid: None,
+                port: 8080,
+                api_url: local_model_runtime_api_url(),
+                error: runtime.error.clone(),
+                started_at_unix: runtime.started_at_unix,
+            };
+            (StatusCode::OK, Json(snapshot)).into_response()
+        }
+    }
+}
+
+async fn handle_local_model_runtime_stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Local model runtime stop") {
+        return err.into_response();
+    }
+    let old_child = {
+        let mut runtime = state.local_model_runtime.lock().await;
+        runtime.child.take()
+    };
+    if let Some(mut child) = old_child {
+        let _ = child.kill().await;
+    }
+    {
+        let mut runtime = state.local_model_runtime.lock().await;
+        runtime.status = "stopped".to_string();
+        runtime.pid = None;
+        runtime.error = None;
+    }
+    let snapshot = local_model_runtime_snapshot(&state.local_model_runtime).await;
+    (StatusCode::OK, Json(snapshot)).into_response()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -13116,6 +13397,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         }
     }
@@ -13213,6 +13495,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13258,6 +13541,7 @@ mod tests {
             observer,
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13727,6 +14011,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13787,6 +14072,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13859,6 +14145,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13903,6 +14190,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13952,6 +14240,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -14187,6 +14476,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -14287,6 +14577,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -14336,6 +14627,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 

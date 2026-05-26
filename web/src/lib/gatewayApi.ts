@@ -265,6 +265,19 @@ export type LocalModelsResponse = {
   models: LocalModelCatalogItem[];
   engineReady: boolean;
   engineStatus: string;
+  runtime?: LocalModelRuntimeStatus;
+};
+
+export type LocalModelRuntimeStatus = {
+  status: string;
+  running: boolean;
+  modelId?: string | null;
+  binary?: string | null;
+  pid?: number | null;
+  port: number;
+  apiUrl: string;
+  error?: string | null;
+  startedAtUnix?: number | null;
 };
 
 export type FeedContentAgentCommentResult = {
@@ -663,6 +676,23 @@ function parseLocalModelDownload(value: any): LocalModelDownload | null {
   };
 }
 
+function parseLocalModelRuntime(value: any): LocalModelRuntimeStatus | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  return {
+    status: String(value.status || ""),
+    running: Boolean(value.running),
+    modelId: value.modelId == null ? null : String(value.modelId),
+    binary: value.binary == null ? null : String(value.binary),
+    pid: value.pid == null ? null : Number(value.pid),
+    port: Number(value.port || 8080),
+    apiUrl: String(value.apiUrl || "http://127.0.0.1:8080/v1"),
+    error: value.error == null ? null : String(value.error),
+    startedAtUnix: value.startedAtUnix == null ? null : Number(value.startedAtUnix)
+  };
+}
+
 export async function getLocalModels(
   bearerToken?: string,
   gatewayBaseUrl?: string
@@ -691,7 +721,8 @@ export async function getLocalModels(
         }))
       : [],
     engineReady: Boolean(data?.engineReady),
-    engineStatus: String(data?.engineStatus || "")
+    engineStatus: String(data?.engineStatus || ""),
+    runtime: parseLocalModelRuntime(data?.runtime)
   };
 }
 
@@ -719,6 +750,58 @@ export async function useLocalModel(
     body: JSON.stringify({ modelId })
   });
   return parseJsonOrThrow(res);
+}
+
+export async function getLocalModelRuntime(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<LocalModelRuntimeStatus> {
+  const res = await fetch(resolveGatewayEndpoint("/api/local-models/runtime", gatewayBaseUrl), {
+    headers: authHeaders(bearerToken)
+  });
+  const data = await parseJsonOrThrow(res);
+  return parseLocalModelRuntime(data) || {
+    status: "unknown",
+    running: false,
+    port: 8080,
+    apiUrl: "http://127.0.0.1:8080/v1"
+  };
+}
+
+export async function startLocalModelRuntime(
+  modelId: string,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<LocalModelRuntimeStatus> {
+  const res = await fetch(resolveGatewayEndpoint("/api/local-models/runtime", gatewayBaseUrl), {
+    method: "POST",
+    headers: authHeaders(bearerToken, "application/json"),
+    body: JSON.stringify({ modelId })
+  });
+  const data = await parseJsonOrThrow(res);
+  return parseLocalModelRuntime(data) || {
+    status: "unknown",
+    running: false,
+    port: 8080,
+    apiUrl: "http://127.0.0.1:8080/v1"
+  };
+}
+
+export async function stopLocalModelRuntime(
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<LocalModelRuntimeStatus> {
+  const res = await fetch(resolveGatewayEndpoint("/api/local-models/runtime", gatewayBaseUrl), {
+    method: "DELETE",
+    headers: authHeaders(bearerToken)
+  });
+  const data = await parseJsonOrThrow(res);
+  return parseLocalModelRuntime(data) || {
+    status: "unknown",
+    running: false,
+    port: 8080,
+    apiUrl: "http://127.0.0.1:8080/v1"
+  };
 }
 
 export async function fetchPersonalizedFeed(
