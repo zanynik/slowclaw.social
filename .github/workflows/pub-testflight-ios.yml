@@ -1,6 +1,15 @@
 name: Publish iOS TestFlight
 
 on:
+    push:
+        branches:
+            - codex/modular-red-green-refactor
+        paths:
+            - ".github/workflows/pub-testflight-ios.yml"
+            - "Cargo.lock"
+            - "Cargo.toml"
+            - "src/**"
+            - "web/**"
     workflow_dispatch:
         inputs:
             build_number:
