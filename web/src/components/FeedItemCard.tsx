@@ -59,7 +59,6 @@ export function FeedItemCard({
 }: FeedItemCardProps) {
   const [commentOpen, setCommentOpen] = useState(false);
   const [commentDraft, setCommentDraft] = useState("");
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const canEditInline = item.kind === "text" || item.kind === "audio" || item.kind === "video";
 

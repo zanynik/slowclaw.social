@@ -8,7 +8,7 @@
  * Inspired by Atomic Chat's clean component decomposition pattern.
  */
 
-import type { MobileTab } from "../../stores/useAppStore";
+type MobileTab = "journal" | "feed" | "productivity" | "profile";
 
 type BottomNavProps = {
   activeTab: MobileTab;
