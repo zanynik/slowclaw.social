@@ -499,6 +499,48 @@ textarea {
   line-height: 1.55;
 }
 
+.local-ai-card {
+  gap: 1rem;
+}
+
+.local-model-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 0.75rem;
+}
+
+.local-model-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+
+.local-model-card.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+.local-model-card h3 {
+  font-size: 0.96rem;
+}
+
+.local-model-dot {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 999px;
+  background: var(--muted-light);
+  flex: 0 0 auto;
+}
+
+.local-model-dot.ready {
+  background: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-dim);
+}
+
 /* ─────────────────────────────────────────────
    LAYOUT UTILITIES
    ───────────────────────────────────────────── */

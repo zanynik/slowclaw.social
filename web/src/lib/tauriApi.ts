@@ -76,7 +76,6 @@ export type OllamaStatus = {
   model: string;
   models: string[];
 };
-
 export type NativeLocalAiStatus = {
   provider: string;
   configured: boolean;
@@ -88,6 +87,12 @@ export type NativeLocalAiStatus = {
   apiUrl: string;
   message: string;
   error?: string | null;
+};
+
+export type LocalModelDownloadStatus = {
+  model: string;
+  available: boolean;
+  message: string;
 };
 
 // ─────────────────────────────────────────────
@@ -226,6 +231,10 @@ export async function checkOllama(): Promise<OllamaStatus> {
 
 export async function listOllamaModels(): Promise<string[]> {
   return invoke("list_ollama_models");
+}
+
+export async function downloadOllamaModel(model: string): Promise<LocalModelDownloadStatus> {
+  return invoke("download_ollama_model", { model });
 }
 
 export async function chatWithOllama(prompt: string): Promise<string> {

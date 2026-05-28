@@ -316,6 +316,33 @@ fn status_from_native_local_ai_state(saved: NativeLocalAiPersistedState) -> Nati
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppConfig {
+    ollama_base_url: String,
+    ollama_model: String,
+    bluesky_handle: String,
+    bluesky_service_url: String,
+    transcription_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OllamaStatus {
+    available: bool,
+    base_url: String,
+    model: String,
+    models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalModelDownloadStatus {
+    model: String,
+    available: bool,
+    message: String,
+}
+
 fn validate_secret_locator(service: &str, account: &str) -> Result<(), String> {
     if service.trim().is_empty() {
         return Err("service is required".to_string());
@@ -556,7 +583,6 @@ fn lock_native_local_ai_state<'a>(
         .lock()
         .map_err(|_| "native local AI state lock poisoned".to_string())
 }
-
 fn snapshot_gateway_state(
     state: &Arc<Mutex<GatewayRuntimeState>>,
 ) -> Result<EmbeddedGatewayInfo, String> {
@@ -687,31 +713,6 @@ async fn clear_provider_api_key_from_config() -> Result<(), String> {
     if config.api_key.is_none() {
         return Ok(());
     }
-    config.api_key = None;
-    config
-        .save()
-        .await
-        .map_err(|e| format!("failed to save config: {e}"))
-}
-
-async fn clear_matching_provider_api_key_from_config(expected: &str) -> Result<(), String> {
-    let expected = expected.trim();
-    if expected.is_empty() {
-        return Ok(());
-    }
-
-    let mut config = zeroclaw::Config::load_or_init()
-        .await
-        .map_err(|e| format!("failed to load config: {e}"))?;
-    if config
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .is_none_or(|value| value != expected)
-    {
-        return Ok(());
-    }
-
     config.api_key = None;
     config
         .save()
@@ -903,6 +904,149 @@ fn workspace_root_dir() -> PathBuf {
         .and_then(|path| path.parent())
         .map(PathBuf::from)
         .unwrap_or(tauri_manifest_dir)
+}
+
+fn configure_app_owned_workspace(app: &tauri::App) {
+    if std::env::var_os("ZEROCLAW_CONFIG_DIR").is_some() {
+        return;
+    }
+    match app.path().app_data_dir() {
+        Ok(app_data_dir) => {
+            let config_dir = app_data_dir.join("zeroclaw");
+            if let Err(err) = std::fs::create_dir_all(&config_dir) {
+                eprintln!(
+                    "failed to create app config directory {}: {err}",
+                    config_dir.display()
+                );
+                return;
+            }
+            std::env::set_var("ZEROCLAW_CONFIG_DIR", &config_dir);
+        }
+        Err(err) => {
+            eprintln!("failed to resolve app data directory: {err}");
+        }
+    }
+}
+
+async fn load_workspace_config_for_ui(context: &str) -> Result<zeroclaw::Config, String> {
+    zeroclaw::Config::load_or_init()
+        .await
+        .map_err(|e| ui_command_error(context, "Failed to load the workspace configuration.", e))
+}
+
+fn unix_time_label() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn safe_filename(value: &str, fallback: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-').trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn title_from_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.replace(['-', '_'], " "))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Journal entry".to_string())
+}
+
+fn media_kind_from_extension(path: &Path) -> Option<&'static str> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "mp3" | "m4a" | "aac" | "ogg" | "wav" | "flac" | "webm" => Some("audio"),
+        "mp4" | "m4v" | "mov" | "mkv" => Some("video"),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" => Some("image"),
+        _ => None,
+    }
+}
+
+fn rel_path_to_id(workspace_dir: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(workspace_dir)
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn resolve_journal_id(workspace_dir: &Path, id: &str) -> Result<PathBuf, String> {
+    let trimmed = id.trim().trim_start_matches('/');
+    if trimmed.is_empty() || trimmed.contains("..") {
+        return Err("Invalid journal id.".to_string());
+    }
+    let path = workspace_dir.join(trimmed);
+    if !path.starts_with(workspace_dir) {
+        return Err("Invalid journal id.".to_string());
+    }
+    Ok(path)
+}
+
+fn journal_entry_from_path(workspace_dir: &Path, path: &Path) -> Option<JournalEntry> {
+    let id = rel_path_to_id(workspace_dir, path)?;
+    if id.starts_with("journals/text/transcript/")
+        || id.starts_with("journals/text/transcriptions/")
+    {
+        return None;
+    }
+    let kind = if id.starts_with("journals/media/") {
+        media_kind_from_extension(path)?.to_string()
+    } else {
+        "text".to_string()
+    };
+    let metadata = std::fs::metadata(path).ok();
+    let updated_at = metadata
+        .and_then(|m| m.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(unix_time_label);
+    let content = if kind == "text" {
+        std::fs::read_to_string(path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    Some(JournalEntry {
+        id,
+        title: title_from_path(path),
+        content,
+        kind,
+        file_path: Some(path.display().to_string()),
+        created_at: updated_at.clone(),
+        updated_at,
+    })
+}
+
+fn collect_journal_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_journal_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
 }
 
 fn open_path_with_system_handler(path: &std::path::Path) -> Result<(), String> {
@@ -1364,212 +1508,6 @@ async fn set_provider_api_key(
 }
 
 #[tauri::command]
-async fn save_journal_text(title: String, content: String) -> Result<JournalEntry, String> {
-    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
-        ui_command_error(
-            "journal config load failed",
-            "Failed to load the workspace configuration.",
-            e,
-        )
-    })?;
-    let now = now_unix_millis_string()?;
-    let title = title.trim();
-    let title = if title.is_empty() {
-        "Journal entry"
-    } else {
-        title
-    };
-    let id = format!(
-        "note-{now}-{}",
-        sanitize_journal_component(title, "journal-entry")
-    );
-    let path = native_journal_text_path(&config, &id);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            ui_command_error(
-                "native text journal dir create failed",
-                "Failed to prepare local journal storage.",
-                e,
-            )
-        })?;
-    }
-    std::fs::write(&path, content.as_bytes()).map_err(|e| {
-        ui_command_error(
-            "native text journal write failed",
-            "Failed to save the journal note.",
-            e,
-        )
-    })?;
-    let record = NativeJournalRecord {
-        id,
-        title: title.to_string(),
-        content,
-        kind: "text".to_string(),
-        file_path: Some(path.display().to_string()),
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    persist_native_journal_record(&config, &record)?;
-    Ok(record.into())
-}
-
-#[tauri::command]
-async fn save_journal_media(
-    kind: String,
-    filename: String,
-    data_b64: String,
-    title: Option<String>,
-) -> Result<JournalEntry, String> {
-    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
-        ui_command_error(
-            "journal config load failed",
-            "Failed to load the workspace configuration.",
-            e,
-        )
-    })?;
-    let kind = validate_journal_media_kind(&kind)?;
-    let bytes = decode_journal_media_base64(&data_b64)?;
-    if bytes.is_empty() {
-        return Err("Recording was empty.".to_string());
-    }
-    let now = now_unix_millis_string()?;
-    let safe_filename = sanitize_journal_component(&filename, kind);
-    let id = format!("media-{now}-{safe_filename}");
-    let path = native_journal_media_path(&config, kind, &id, &filename);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            ui_command_error(
-                "native media journal dir create failed",
-                "Failed to prepare local media storage.",
-                e,
-            )
-        })?;
-    }
-    std::fs::write(&path, bytes).map_err(|e| {
-        ui_command_error(
-            "native media journal write failed",
-            "Failed to save the media recording.",
-            e,
-        )
-    })?;
-    let title = title
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Journal entry")
-        .to_string();
-    let record = NativeJournalRecord {
-        id,
-        title,
-        content: String::new(),
-        kind: kind.to_string(),
-        file_path: Some(path.display().to_string()),
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    persist_native_journal_record(&config, &record)?;
-    Ok(record.into())
-}
-
-#[tauri::command]
-async fn list_journals(
-    limit: Option<usize>,
-    offset: Option<usize>,
-) -> Result<Vec<JournalEntry>, String> {
-    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
-        ui_command_error(
-            "journal config load failed",
-            "Failed to load the workspace configuration.",
-            e,
-        )
-    })?;
-    let records = list_native_journal_records(&config)?;
-    let offset = offset.unwrap_or(0);
-    let limit = limit.unwrap_or(300).min(500);
-    Ok(records
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(JournalEntry::from)
-        .collect())
-}
-
-#[tauri::command]
-async fn get_journal(id: String) -> Result<JournalEntry, String> {
-    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
-        ui_command_error(
-            "journal config load failed",
-            "Failed to load the workspace configuration.",
-            e,
-        )
-    })?;
-    Ok(load_native_journal_record(&config, &id)?.into())
-}
-
-#[tauri::command]
-async fn update_journal_text(id: String, content: String) -> Result<JournalEntry, String> {
-    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
-        ui_command_error(
-            "journal config load failed",
-            "Failed to load the workspace configuration.",
-            e,
-        )
-    })?;
-    let mut record = load_native_journal_record(&config, &id)?;
-    if record.kind != "text" {
-        return Err("Only text journal entries can be edited directly.".to_string());
-    }
-    let path = record
-        .file_path
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| native_journal_text_path(&config, &record.id));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            ui_command_error(
-                "native text journal dir create failed",
-                "Failed to prepare local journal storage.",
-                e,
-            )
-        })?;
-    }
-    std::fs::write(&path, content.as_bytes()).map_err(|e| {
-        ui_command_error(
-            "native text journal update failed",
-            "Failed to update the journal note.",
-            e,
-        )
-    })?;
-    record.content = content;
-    record.file_path = Some(path.display().to_string());
-    record.updated_at = now_unix_millis_string()?;
-    persist_native_journal_record(&config, &record)?;
-    Ok(record.into())
-}
-
-#[tauri::command]
-async fn delete_journal(id: String) -> Result<(), String> {
-    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
-        ui_command_error(
-            "journal config load failed",
-            "Failed to load the workspace configuration.",
-            e,
-        )
-    })?;
-    let record = load_native_journal_record(&config, &id)?;
-    if let Some(file_path) = record.file_path.as_deref() {
-        match std::fs::remove_file(file_path) {
-            Ok(()) | Err(_) => {}
-        }
-    }
-    let metadata_path = native_journal_record_path(&config, &id);
-    match std::fs::remove_file(metadata_path) {
-        Ok(()) | Err(_) => {}
-    }
-    Ok(())
-}
-
-#[tauri::command]
 async fn open_workspace_journals_folder() -> Result<String, String> {
     let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
         ui_command_error(
@@ -1601,6 +1539,276 @@ async fn open_workspace_journals_folder() -> Result<String, String> {
         )
     })?;
     Ok(journals_dir.display().to_string())
+}
+
+#[tauri::command]
+async fn save_journal_text(title: String, content: String) -> Result<JournalEntry, String> {
+    let config = load_workspace_config_for_ui("journal text config load failed").await?;
+    let body = content.trim();
+    if body.is_empty() {
+        return Err("Write something first.".to_string());
+    }
+    let timestamp = unix_time_label();
+    let filename = format!(
+        "{}-{}.txt",
+        timestamp,
+        safe_filename(&title, "journal-entry")
+    );
+    let path = config
+        .workspace_dir
+        .join("journals")
+        .join("text")
+        .join("inbox")
+        .join(filename);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ui_command_error(
+                "journal text dir create failed",
+                "Failed to prepare journal storage.",
+                e,
+            )
+        })?;
+    }
+    std::fs::write(&path, format!("{body}\n")).map_err(|e| {
+        ui_command_error(
+            "journal text write failed",
+            "Failed to save the journal note.",
+            e,
+        )
+    })?;
+    journal_entry_from_path(&config.workspace_dir, &path)
+        .ok_or_else(|| "Failed to read saved journal note.".to_string())
+}
+
+#[tauri::command]
+async fn save_journal_media(
+    kind: String,
+    filename: String,
+    data_b64: String,
+    title: Option<String>,
+) -> Result<JournalEntry, String> {
+    let config = load_workspace_config_for_ui("journal media config load failed").await?;
+    let normalized_kind = match kind.trim().to_ascii_lowercase().as_str() {
+        "audio" => "audio",
+        "video" => "video",
+        "image" => "image",
+        _ => return Err("Unsupported media kind.".to_string()),
+    };
+    let timestamp = unix_time_label();
+    let safe_name = safe_filename(&filename, &format!("{normalized_kind}-{timestamp}"));
+    let path = config
+        .workspace_dir
+        .join("journals")
+        .join("media")
+        .join(normalized_kind)
+        .join("inbox")
+        .join(format!("{timestamp}-{safe_name}"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ui_command_error(
+                "journal media dir create failed",
+                "Failed to prepare media storage.",
+                e,
+            )
+        })?;
+    }
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.trim())
+        .map_err(|e| {
+            ui_command_error(
+                "journal media decode failed",
+                "Failed to read the recorded media.",
+                e,
+            )
+        })?;
+    std::fs::write(&path, bytes).map_err(|e| {
+        ui_command_error(
+            "journal media write failed",
+            "Failed to save the media file.",
+            e,
+        )
+    })?;
+    let mut entry = journal_entry_from_path(&config.workspace_dir, &path)
+        .ok_or_else(|| "Failed to read saved media.".to_string())?;
+    if let Some(title) = title
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        entry.title = title;
+    }
+    Ok(entry)
+}
+
+#[tauri::command]
+async fn list_journals(
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<JournalEntry>, String> {
+    let config = load_workspace_config_for_ui("journal list config load failed").await?;
+    let mut paths = Vec::new();
+    collect_journal_files(
+        &config.workspace_dir.join("journals").join("text"),
+        &mut paths,
+    );
+    collect_journal_files(
+        &config.workspace_dir.join("journals").join("media"),
+        &mut paths,
+    );
+    paths.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| std::cmp::Reverse(duration.as_secs()))
+            .unwrap_or(std::cmp::Reverse(0))
+    });
+    let start = offset.unwrap_or(0);
+    let take = limit.unwrap_or(300);
+    Ok(paths
+        .into_iter()
+        .skip(start)
+        .take(take)
+        .filter_map(|path| journal_entry_from_path(&config.workspace_dir, &path))
+        .collect())
+}
+
+#[tauri::command]
+async fn get_journal(id: String) -> Result<JournalEntry, String> {
+    let config = load_workspace_config_for_ui("journal read config load failed").await?;
+    let path = resolve_journal_id(&config.workspace_dir, &id)?;
+    journal_entry_from_path(&config.workspace_dir, &path)
+        .ok_or_else(|| "Journal entry not found.".to_string())
+}
+
+#[tauri::command]
+async fn update_journal_text(id: String, content: String) -> Result<JournalEntry, String> {
+    let config = load_workspace_config_for_ui("journal update config load failed").await?;
+    let path = resolve_journal_id(&config.workspace_dir, &id)?;
+    if media_kind_from_extension(&path).is_some() {
+        return Err("Only text journal entries can be edited directly.".to_string());
+    }
+    let body = content.trim();
+    if body.is_empty() {
+        return Err("Write something first.".to_string());
+    }
+    std::fs::write(&path, format!("{body}\n")).map_err(|e| {
+        ui_command_error(
+            "journal update write failed",
+            "Failed to update the journal note.",
+            e,
+        )
+    })?;
+    journal_entry_from_path(&config.workspace_dir, &path)
+        .ok_or_else(|| "Failed to read updated journal note.".to_string())
+}
+
+#[tauri::command]
+async fn delete_journal(id: String) -> Result<(), String> {
+    let config = load_workspace_config_for_ui("journal delete config load failed").await?;
+    let path = resolve_journal_id(&config.workspace_dir, &id)?;
+    std::fs::remove_file(&path).map_err(|e| {
+        ui_command_error(
+            "journal delete failed",
+            "Failed to delete the journal entry.",
+            e,
+        )
+    })
+}
+
+#[tauri::command]
+async fn get_config() -> Result<AppConfig, String> {
+    let config = load_workspace_config_for_ui("app config load failed").await?;
+    Ok(AppConfig {
+        ollama_base_url: config
+            .api_url
+            .unwrap_or_else(|| "http://127.0.0.1:11434".to_string()),
+        ollama_model: config
+            .default_model
+            .unwrap_or_else(|| "llama3.2".to_string()),
+        bluesky_handle: String::new(),
+        bluesky_service_url: "https://bsky.social".to_string(),
+        transcription_enabled: config.transcription.enabled,
+    })
+}
+
+#[tauri::command]
+async fn save_config(config: AppConfig) -> Result<(), String> {
+    let mut current = load_workspace_config_for_ui("app config save load failed").await?;
+    current.default_provider = Some("ollama".to_string());
+    current.default_model = Some(config.ollama_model.trim().to_string());
+    current.api_url = Some(config.ollama_base_url.trim().to_string());
+    current.transcription.enabled = config.transcription_enabled;
+    current.save().await.map_err(|e| {
+        ui_command_error(
+            "app config save failed",
+            "Failed to save the workspace configuration.",
+            e,
+        )
+    })
+}
+
+fn installed_ollama_models() -> Vec<String> {
+    let output = Command::new("ollama").arg("list").output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[tauri::command]
+async fn list_ollama_models() -> Result<Vec<String>, String> {
+    Ok(installed_ollama_models())
+}
+
+#[tauri::command]
+async fn check_ollama() -> Result<OllamaStatus, String> {
+    let config = load_workspace_config_for_ui("ollama config load failed").await?;
+    let models = installed_ollama_models();
+    Ok(OllamaStatus {
+        available: !models.is_empty() || Command::new("ollama").arg("--version").output().is_ok(),
+        base_url: config
+            .api_url
+            .unwrap_or_else(|| "http://127.0.0.1:11434".to_string()),
+        model: config
+            .default_model
+            .unwrap_or_else(|| "llama3.2".to_string()),
+        models,
+    })
+}
+
+#[tauri::command]
+async fn download_ollama_model(model: String) -> Result<LocalModelDownloadStatus, String> {
+    let model = model.trim();
+    if model.is_empty() || model.contains(char::is_whitespace) {
+        return Err("Pick a valid model name.".to_string());
+    }
+    let status = Command::new("ollama")
+        .args(["pull", model])
+        .status()
+        .map_err(|e| {
+            ui_command_error(
+                "ollama pull start failed",
+                "Failed to start the local model download.",
+                e,
+            )
+        })?;
+    if !status.success() {
+        return Err("Local model download failed.".to_string());
+    }
+    Ok(LocalModelDownloadStatus {
+        model: model.to_string(),
+        available: true,
+        message: format!("{model} is ready."),
+    })
 }
 
 #[tauri::command]
@@ -1880,6 +2088,7 @@ pub fn run() {
         .manage(openai_state)
         .manage(native_local_ai_state)
         .setup(|app| {
+            configure_app_owned_workspace(app);
             let shared = app.state::<GatewayState>().inner.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(err) = ensure_embedded_gateway_started(shared).await {
@@ -1912,6 +2121,11 @@ pub fn run() {
             clear_anthropic_token,
             get_native_local_ai_status,
             configure_native_local_ai,
+            get_config,
+            save_config,
+            list_ollama_models,
+            check_ollama,
+            download_ollama_model,
             show_main_window
         ])
         .run(tauri::generate_context!())
