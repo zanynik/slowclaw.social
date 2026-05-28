@@ -134,6 +134,8 @@ jobs:
                   CERT_CSR_PATH="${SIGNING_DIR}/signing.csr" \
                   CERT_OUT_PATH="${SIGNING_DIR}/distribution.cer" \
                   PROFILE_OUT_PATH="${SIGNING_DIR}/profile.mobileprovision" \
+                  PROFILE_ID_OUT_PATH="${SIGNING_DIR}/profile.id" \
+                  PROFILE_NAME_OUT_PATH="${SIGNING_DIR}/profile.name" \
                   PROFILE_NAME="${PROFILE_NAME}" \
                   node <<'NODE'
                   const crypto = require("crypto");
@@ -252,6 +254,8 @@ jobs:
                     });
                     const profileRecord = profile.data;
                     fs.writeFileSync(process.env.PROFILE_OUT_PATH, Buffer.from(profileRecord.attributes.profileContent, "base64"));
+                    fs.writeFileSync(process.env.PROFILE_NAME_OUT_PATH, profileRecord.attributes.name);
+                    fs.writeFileSync(process.env.PROFILE_ID_OUT_PATH, profileRecord.attributes.uuid);
                     fs.appendFileSync(process.env.GITHUB_ENV, `APPLE_PROVISIONING_PROFILE_NAME=${profileRecord.attributes.name}\n`);
                     fs.appendFileSync(process.env.GITHUB_ENV, `APPLE_PROVISIONING_PROFILE_ID=${profileRecord.attributes.uuid}\n`);
                   })().catch((error) => {
@@ -269,6 +273,8 @@ jobs:
                   security default-keychain -s "${KEYCHAIN_PATH}"
                   security import "${SIGNING_DIR}/signing.p12" -k "${KEYCHAIN_PATH}" -P "${P12_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
                   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+                  APPLE_PROVISIONING_PROFILE_ID="$(cat "${SIGNING_DIR}/profile.id")"
+                  APPLE_PROVISIONING_PROFILE_NAME="$(cat "${SIGNING_DIR}/profile.name")"
                   cp "${SIGNING_DIR}/profile.mobileprovision" "${HOME}/Library/MobileDevice/Provisioning Profiles/${APPLE_PROVISIONING_PROFILE_ID}.mobileprovision"
 
             - name: Initialize Tauri iOS project
