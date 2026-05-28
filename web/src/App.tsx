@@ -2,6 +2,12 @@ import { lazy, Suspense, FormEvent, useEffect, useRef, useState } from "react";
 import type { AtpAgent, AppBskyFeedDefs } from "@atproto/api";
 import type { BlueskySession } from "./lib/bluesky";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
+import { BottomNav } from "./components/BottomNav";
+import { SwipeableView } from "./components/SwipeableView";
+import { PullToRefresh } from "./components/PullToRefresh";
+import { ToastContainer } from "./components/ui/ToastContainer";
+import { appActions } from "./stores/useAppStore";
+import { useIsKeyboardOpen } from "./hooks/useKeyboardHeight";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
   saveJournalText,
@@ -165,6 +171,7 @@ let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
 type MobileTab = "journal" | "feed" | "productivity" | "profile";
+const TAB_ORDER: MobileTab[] = ["journal", "feed", "productivity", "profile"];
 type ThemeMode = "light" | "dark";
 type DesktopGatewayBootstrap = {
   token?: string | null;
@@ -6060,6 +6067,17 @@ function App() {
   const isMediaTranscriptMode =
     !!selectedJournalItem &&
     (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video");
+
+  // Swipe navigation between tabs
+  const swipeToNextTab = () => {
+    const idx = TAB_ORDER.indexOf(mobileTab);
+    if (idx < TAB_ORDER.length - 1) setMobileTab(TAB_ORDER[idx + 1]);
+  };
+  const swipeToPrevTab = () => {
+    const idx = TAB_ORDER.indexOf(mobileTab);
+    if (idx > 0) setMobileTab(TAB_ORDER[idx - 1]);
+  };
+  const enableSwipe = !isDesktopLayout && !isRecording && !isWritingNote;
   const selectedJournalSynthSourcePath =
     selectedJournalItem?.kind === "text" ? selectedJournalItem.path : "";
   const selectedJournalWasProcessed = Boolean(selectedJournalItem?.workspaceSynthProcessed);
@@ -6931,6 +6949,11 @@ function App() {
         </div>
       ) : null}
 
+      <SwipeableView
+        onSwipeLeft={swipeToNextTab}
+        onSwipeRight={swipeToPrevTab}
+        enabled={enableSwipe}
+      >
       <main className="page-content">
         {mobileTab === "journal" ? (
           <ViewErrorBoundary title="Journal">
@@ -8790,43 +8813,16 @@ function App() {
           </ViewErrorBoundary>
         ) : null}
       </main>
+      </SwipeableView>
 
       {!hideChrome && (
-        <nav className="bottom-nav">
-          <button
-            type="button"
-            className={mobileTab === "journal" ? "active" : ""}
-            onClick={() => setMobileTab("journal")}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
-            Journal
-          </button>
-          <button
-            type="button"
-            className={mobileTab === "feed" ? "active" : ""}
-            onClick={() => setMobileTab("feed")}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-            Feed
-          </button>
-          <button
-            type="button"
-            className={mobileTab === "productivity" ? "active" : ""}
-            onClick={() => setMobileTab("productivity")}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path><path d="M7 7h6"></path><path d="M7 15h8"></path></svg>
-            <span className="bottom-nav-label">
-              <span className="bottom-nav-label-full">Productivity</span>
-              <span className="bottom-nav-label-short" aria-hidden="true">Tasks</span>
-              {openTodos.length + todayEventItems.length + upcomingEventItems.length > 0 ? (
-                <span className="bottom-nav-badge">
-                  {openTodos.length + todayEventItems.length + upcomingEventItems.length}
-                </span>
-              ) : null}
-            </span>
-          </button>
-        </nav>
+        <BottomNav
+          activeTab={mobileTab}
+          onTabChange={setMobileTab}
+          productivityBadgeCount={openTodos.length + todayEventItems.length + upcomingEventItems.length}
+        />
       )}
+      <ToastContainer />
     </div>
   );
 }
