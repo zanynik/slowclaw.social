@@ -205,7 +205,7 @@ jobs:
                       throw new Error(`Bundle ID ${bundleId} was not found in App Store Connect.`);
                     }
 
-                    const csrContent = fs.readFileSync(process.env.CERT_CSR_PATH).toString("base64");
+                    const csrContent = fs.readFileSync(process.env.CERT_CSR_PATH, "utf8");
                     let cert;
                     try {
                       cert = await request(token, "POST", "/v1/certificates", {
