@@ -114,8 +114,8 @@ jobs:
                   mkdir -p "${SIGNING_DIR}" "${HOME}/Library/MobileDevice/Provisioning Profiles"
                   chmod 700 "${SIGNING_DIR}"
 
-                  KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
-                  P12_PASSWORD="$(openssl rand -base64 32)"
+                  KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+                  P12_PASSWORD="$(openssl rand -hex 32)"
                   KEYCHAIN_PATH="${RUNNER_TEMP}/slowclaw-signing.keychain-db"
                   printf '::add-mask::%s\n' "${KEYCHAIN_PASSWORD}"
                   printf '::add-mask::%s\n' "${P12_PASSWORD}"
