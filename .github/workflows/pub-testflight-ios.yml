@@ -122,7 +122,7 @@ jobs:
                   printf 'KEYCHAIN_PASSWORD=%s\n' "${KEYCHAIN_PASSWORD}" >>"${GITHUB_ENV}"
                   printf 'APPLE_SIGNING_KEYCHAIN=%s\n' "${KEYCHAIN_PATH}" >>"${GITHUB_ENV}"
 
-                  openssl ecparam -name prime256v1 -genkey -noout -out "${SIGNING_DIR}/signing.key"
+                  openssl genrsa -out "${SIGNING_DIR}/signing.key" 2048
                   openssl req -new -key "${SIGNING_DIR}/signing.key" -out "${SIGNING_DIR}/signing.csr" -subj "/CN=SlowClaw CI/"
 
                   ASC_KEY_PATH="${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
