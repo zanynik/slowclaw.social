@@ -27,11 +27,12 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod media_tools;
 pub mod model_routing_config;
+pub(crate) mod registry;
 pub mod schema;
 pub mod shell;
+pub mod task_plan;
 pub mod traits;
 pub mod web_search_tool;
-pub mod task_plan;
 
 pub use content_search::ContentSearchTool;
 pub use file_edit::FileEditTool;
@@ -47,78 +48,23 @@ pub use media_tools::{
     StitchImagesWithAudioTool, TranscribeMediaTool,
 };
 pub use model_routing_config::ModelRoutingConfigTool;
+pub use registry::ToolProfile;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use shell::ShellTool;
+pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use web_search_tool::WebSearchTool;
-pub use task_plan::TaskPlanTool;
 
 use crate::config::Config;
-use crate::media::command_media_backend;
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
-use async_trait::async_trait;
+use registry::FullToolRegistryConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolProfile {
-    Full,
-    UiRestricted,
-}
-
-#[derive(Clone)]
-struct ArcDelegatingTool {
-    inner: Arc<dyn Tool>,
-}
-
-impl ArcDelegatingTool {
-    fn boxed(inner: Arc<dyn Tool>) -> Box<dyn Tool> {
-        Box::new(Self { inner })
-    }
-}
-
-#[async_trait]
-impl Tool for ArcDelegatingTool {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn description(&self) -> &str {
-        self.inner.description()
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        self.inner.parameters_schema()
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        self.inner.execute(args).await
-    }
-}
-
-fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
-    tools.into_iter().map(ArcDelegatingTool::boxed).collect()
-}
-
-fn tool_allowed_in_profile(name: &str, profile: ToolProfile) -> bool {
-    match profile {
-        ToolProfile::Full => true,
-        ToolProfile::UiRestricted => !matches!(
-            name,
-            "shell" | "git_operations"
-        ),
-    }
-}
-
-fn filter_tools_for_profile(mut tools: Vec<Arc<dyn Tool>>, profile: ToolProfile) -> Vec<Arc<dyn Tool>> {
-    tools.retain(|tool| tool_allowed_in_profile(tool.name(), profile));
-    tools
-}
 
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
@@ -130,14 +76,7 @@ pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
-    vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
-        Box::new(FileReadTool::new(security.clone())),
-        Box::new(FileWriteTool::new(security.clone())),
-        Box::new(FileEditTool::new(security.clone())),
-        Box::new(GlobSearchTool::new(security.clone())),
-        Box::new(ContentSearchTool::new(security)),
-    ]
+    registry::build_default_tools(security, runtime)
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -226,86 +165,23 @@ pub fn all_tools_with_runtime_and_profile(
     _fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
-    let media_backend = command_media_backend(
-        config.workspace_dir.clone(),
-        config.transcription.clone(),
-    );
-    let media_capabilities = media_backend.capabilities();
-    let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime)),
-        Arc::new(FileReadTool::new(security.clone())),
-        Arc::new(FileWriteTool::new(security.clone())),
-        Arc::new(FileEditTool::new(security.clone())),
-        Arc::new(GlobSearchTool::new(security.clone())),
-        Arc::new(ContentSearchTool::new(security.clone())),
-        Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory, security.clone())),
-        Arc::new(ModelRoutingConfigTool::new(
-            config.clone(),
-            security.clone(),
-        )),
-        Arc::new(TaskPlanTool::new(security.clone())),
-        Arc::new(GitOperationsTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
-    ];
-
-    if media_capabilities.transcribe_media {
-        tool_arcs.push(Arc::new(TranscribeMediaTool::new(
-            media_backend.clone(),
-            security.clone(),
-        )));
-    }
-    if media_capabilities.clean_audio {
-        tool_arcs.push(Arc::new(CleanAudioTool::new(
-            media_backend.clone(),
-            security.clone(),
-        )));
-    }
-    if media_capabilities.extract_audio_segment {
-        tool_arcs.push(Arc::new(ExtractAudioSegmentTool::new(
-            media_backend.clone(),
-            security.clone(),
-        )));
-    }
-    if media_capabilities.render_text_card_video {
-        tool_arcs.push(Arc::new(RenderTextCardVideoTool::new(
-            media_backend.clone(),
-            security.clone(),
-        )));
-    }
-    if media_capabilities.stitch_images_with_audio {
-        tool_arcs.push(Arc::new(StitchImagesWithAudioTool::new(
-            media_backend.clone(),
-            security.clone(),
-        )));
-    }
-    if media_capabilities.compose_simple_clip {
-        tool_arcs.push(Arc::new(ComposeSimpleClipTool::new(
-            media_backend,
-            security.clone(),
-        )));
-    }
-
-    // Web search tool (enabled by default for GLM and other models)
-    if root_config.web_search.enabled {
-        tool_arcs.push(Arc::new(WebSearchTool::new(
-            root_config.web_search.provider.clone(),
-            root_config.web_search.brave_api_key.clone(),
-            root_config.web_search.max_results,
-            root_config.web_search.timeout_secs,
-        )));
-    }
-
-    boxed_registry_from_arcs(filter_tools_for_profile(tool_arcs, profile))
+    registry::build_full_tools(FullToolRegistryConfig {
+        config,
+        security,
+        runtime,
+        profile,
+        memory,
+        workspace_dir,
+        root_config,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{BrowserConfig, Config, MemoryConfig};
+    use crate::tools::registry::ToolRegistryBuilder;
+    use async_trait::async_trait;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -321,6 +197,54 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    #[test]
+    fn registry_builder_filters_tools_by_profile_before_boxing() {
+        let tools = ToolRegistryBuilder::new()
+            .with_tool(Arc::new(TestTool::new("shell")))
+            .with_tool(Arc::new(TestTool::new("file_read")))
+            .with_tool(Arc::new(TestTool::new("git_operations")))
+            .build(ToolProfile::UiRestricted);
+
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+        assert_eq!(names, vec!["file_read"]);
+    }
+
+    struct TestTool {
+        name: &'static str,
+    }
+
+    impl TestTool {
+        fn new(name: &'static str) -> Self {
+            Self { name }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TestTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
     }
 
     #[test]

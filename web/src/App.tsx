@@ -26,6 +26,8 @@ import {
   runJobNow,
   checkOllama,
   listOllamaModels,
+  configureNativeLocalAi,
+  getNativeLocalAiStatus,
   startRecording as startNativeAudioRecording,
   stopRecording as stopNativeAudioRecording,
   blobToBase64,
@@ -36,6 +38,7 @@ import type {
   Draft,
   PostRecord,
   AppConfig,
+  NativeLocalAiStatus,
   SchedulerJob,
   OllamaStatus,
 } from "./lib/tauriApi";
@@ -81,6 +84,8 @@ import {
   fetchPersonalizedFeed,
   fetchMediaAsFile,
   getJournalTranscriptionStatus,
+  getLocalModels,
+  getLocalModelRuntime,
   importWorkspaceSyncSnapshot,
   getRuntimeConfig,
   getWorkspaceSynthesizerStatus,
@@ -98,6 +103,7 @@ import {
   runFeedContentAgentNow,
   saveDraft as saveDraftViaGateway,
   saveLibraryText,
+  startLocalModelRuntime,
   streamClawChatMessages,
   streamClawChatResult,
   streamJournalTranscriptionStatus,
@@ -111,13 +117,18 @@ import {
   updateWorldFeedInterest,
   uploadMediaViaGateway,
   startOpenRouterOAuth,
+  downloadLocalModel,
   getOpenRouterOAuthStatus,
+  stopLocalModelRuntime,
+  useLocalModel,
 } from "./lib/gatewayApi";
 import type {
   FeedContentAgentItem,
   GatewayEventStreamHandle,
   JournalTranscriptionStatus,
   InterestProfileStats,
+  LocalModelCatalogItem,
+  LocalModelRuntimeStatus,
   MediaCapabilities,
   PersonalizedFeedItem,
   PersonalizedFeedResponse,
@@ -146,6 +157,10 @@ const DESKTOP_SECRET_SERVICE = "social.slowclaw.gateway";
 const PROVIDER_API_KEY_SECRET_ACCOUNT = "provider.api_key";
 const OPENROUTER_API_KEY_SECRET_ACCOUNT = "openrouter.api_key";
 const DEFAULT_RECORDING_HINT = "Ready to add a journal note, audio, or video.";
+const NATIVE_GATEWAY_BASE_URL = "http://127.0.0.1:42617";
+const ATOMIC_LOCAL_PROVIDER = "osaurus";
+const ATOMIC_LOCAL_API_URL = "http://127.0.0.1:1337/v1";
+const ATOMIC_LOCAL_MODEL = "gemma-3n-e4b-it";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
@@ -463,11 +478,18 @@ function createThreadId() {
   return `thread-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function isMobileUserAgent() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return /iphone|ipad|ipod|android/i.test(window.navigator.userAgent || "");
+}
+
 function isTauriDesktopRuntime() {
   if (typeof window === "undefined") {
     return false;
   }
-  return Boolean((window as any).__TAURI_INTERNALS__);
+  return Boolean((window as any).__TAURI_INTERNALS__) && !isMobileUserAgent();
 }
 
 function isTauriMobileRuntime() {
@@ -476,17 +498,39 @@ function isTauriMobileRuntime() {
   }
   return (
     Boolean((window as any).__TAURI_MOBILE__) ||
-    /iphone|ipad|android/i.test(window.navigator.userAgent || "")
+    (Boolean((window as any).__TAURI_INTERNALS__) && isMobileUserAgent())
   );
+}
+
+function isLoopbackUrl(value: string) {
+  try {
+    const parsed = new URL(value);
+    return ["127.0.0.1", "localhost", "::1", "[::1]"].includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function hasNativeAudioRecorderPlugin() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return Boolean((window as any).__SLOWCLAW_NATIVE_AUDIO_RECORDER__);
 }
 
 function defaultGatewayBaseUrl() {
   if (typeof window === "undefined") {
-    return "http://127.0.0.1:42617";
+    return NATIVE_GATEWAY_BASE_URL;
   }
   const saved = window.localStorage.getItem(CHAT_GATEWAY_BASE_URL_STORAGE_KEY);
   if (saved && saved.trim()) {
-    return saved.trim().replace(/\/+$/, "");
+    const normalized = saved.trim().replace(/\/+$/, "");
+    if (!isTauriMobileRuntime() || isLoopbackUrl(normalized)) {
+      return normalized;
+    }
+  }
+  if (isTauriDesktopRuntime() || isTauriMobileRuntime()) {
+    return NATIVE_GATEWAY_BASE_URL;
   }
   const protocol = window.location.protocol === "https:" ? "https:" : "http:";
   const host = window.location.hostname || "127.0.0.1";
@@ -876,6 +920,7 @@ function hasInlineVideoUrl(text: string) {
 
 function App() {
   const isDesktopClient = isTauriDesktopRuntime();
+  const isNativeClient = isDesktopClient || isTauriMobileRuntime();
   const isLargeScreen = useIsLargeScreen();
   const isDesktopLayout = isDesktopClient || isLargeScreen;
   const [gatewayBaseUrl, setGatewayBaseUrl] = useState(defaultGatewayBaseUrl);
@@ -1030,6 +1075,7 @@ function App() {
   const [providerApiKeyStatus, setProviderApiKeyStatus] = useState("");
   const [settingsProvider, setSettingsProvider] = useState("");
   const [settingsModel, setSettingsModel] = useState("");
+  const [settingsApiUrl, setSettingsApiUrl] = useState("");
   const [settingsTranscriptionEnabled, setSettingsTranscriptionEnabled] = useState(false);
   const [settingsTranscriptionModel, setSettingsTranscriptionModel] = useState("");
   const [settingsAvailableTranscriptionModels, setSettingsAvailableTranscriptionModels] = useState<string[]>([]);
@@ -1038,6 +1084,12 @@ function App() {
   const [settingsConfigBusy, setSettingsConfigBusy] = useState(false);
   const [settingsConfigStatus, setSettingsConfigStatus] = useState("");
   const [settingsConfigLoaded, setSettingsConfigLoaded] = useState(false);
+  const [localModels, setLocalModels] = useState<LocalModelCatalogItem[]>([]);
+  const [localModelsStatus, setLocalModelsStatus] = useState("");
+  const [localModelsEngineStatus, setLocalModelsEngineStatus] = useState("");
+  const [localModelRuntime, setLocalModelRuntime] = useState<LocalModelRuntimeStatus | null>(null);
+  const [nativeLocalAiStatus, setNativeLocalAiStatus] = useState<NativeLocalAiStatus | null>(null);
+  const [localModelBusyId, setLocalModelBusyId] = useState("");
   const [mobileScannerActive, setMobileScannerActive] = useState(() => {
     if (typeof window === "undefined") {
       return false;
@@ -1326,7 +1378,7 @@ function App() {
   }, [gatewayBaseUrl]);
 
   useEffect(() => {
-    if (!isDesktopClient || chatGatewayToken.trim()) {
+    if (!isNativeClient || chatGatewayToken.trim()) {
       return;
     }
     let cancelled = false;
@@ -1344,7 +1396,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [isDesktopClient, chatGatewayToken]);
+  }, [isNativeClient, chatGatewayToken]);
 
   useEffect(() => {
     if (typeof document !== "undefined") {
@@ -1457,12 +1509,12 @@ function App() {
     };
 
     let token = normalizeGatewayToken(chatGatewayToken);
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
     }
     try {
       if (scope === "journal" || scope === "all") {
-        if (isDesktopClient) {
+        if (isNativeClient) {
           try {
             await refreshGatewayJournalLibrary(token);
           } catch (gatewayError) {
@@ -1506,11 +1558,11 @@ function App() {
       setRecordingHint("Upload blocked (gateway URL missing). Pair mobile with desktop QR.");
       return;
     }
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
     if (!token) {
-      if (isDesktopClient) {
+      if (isNativeClient) {
         token = "desktop-local";
       } else {
         setRecordingHint("Upload blocked (gateway token missing). Pair mobile with desktop QR.");
@@ -1549,7 +1601,7 @@ function App() {
           }
         }
       } catch (gatewayError) {
-        if (!isDesktopClient) {
+        if (!isNativeClient) {
           throw gatewayError;
         }
         try {
@@ -1585,10 +1637,10 @@ function App() {
     }
 
     let token = normalizeGatewayToken(chatGatewayToken);
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       setJournalSaveStatus("Save blocked (gateway token missing).");
       return;
     }
@@ -1624,7 +1676,7 @@ function App() {
             resultPath = selectedJournalItem.path;
             nextSelectedPath = selectedJournalItem.path;
           } catch (gatewayError) {
-            if (!isDesktopClient) {
+            if (!isNativeClient) {
               throw gatewayError;
             }
             try {
@@ -1656,7 +1708,7 @@ function App() {
           resultPath = String(result.path || "");
           nextSelectedPath = resultPath;
         } catch (gatewayError) {
-          if (!isDesktopClient) {
+          if (!isNativeClient) {
             throw gatewayError;
           }
           try {
@@ -1690,6 +1742,32 @@ function App() {
   }
 
   async function deleteJournalItem(item: LibraryItem) {
+    const localId = localJournalIdFromPath(item.path);
+    if (localId && isNativeClient) {
+      setJournalSaveStatus(`Deleting ${item.title}...`);
+      try {
+        await deleteJournal(localId);
+        setPendingDeleteJournalItem(null);
+        if (selectedJournalPath === item.path) {
+          journalLoadRequestRef.current += 1;
+          openedJournalPathRef.current = "";
+          selectedJournalPathRef.current = "";
+          setSelectedJournalPath("");
+          setSelectedJournalItem(null);
+          setSelectedJournalText("");
+          setJournalDraftText("");
+          loadedTextPathRef.current = "";
+        }
+        await refreshLibrary("journal");
+        setJournalSaveStatus("Deleted");
+      } catch (error) {
+        setJournalSaveStatus(
+          `Delete failed (${error instanceof Error ? error.message : String(error)})`
+        );
+      }
+      return;
+    }
+
     let token = chatGatewayToken.trim();
     if (!token && isDesktopClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
@@ -1876,10 +1954,10 @@ function App() {
       return;
     }
     let token = chatGatewayToken.trim();
-    if (!token && isDesktopClient) {
+    if (!token && isNativeClient) {
       token = (await syncDesktopGatewayBootstrap())?.trim() || "";
     }
-    if (!token && !isDesktopClient) {
+    if (!token && !isNativeClient) {
       setJournalSaveStatus("Transcription blocked (gateway token missing).");
       return;
     }
@@ -3641,7 +3719,7 @@ function App() {
         window.location.hostname !== "localhost" &&
         window.location.hostname !== "127.0.0.1";
 
-      if (type === "audio" && isMobileRuntime) {
+      if (type === "audio" && isMobileRuntime && hasNativeAudioRecorderPlugin()) {
         setRecordingHint("Starting audio recording...");
         setRecordingType("audio");
         setIsRecording(true);
@@ -3805,12 +3883,16 @@ function App() {
 
       // TypeError: navigator.mediaDevices is undefined / getUserMedia is not a function
       if (err instanceof TypeError) {
-        hint = `${device} API is unavailable. On macOS, open System Settings → Privacy & Security → ${device} and ensure this app is allowed.`;
+        hint = isTauriMobileRuntime()
+          ? `${device} API is unavailable in this iOS WebView. A native recorder plugin is needed for reliable mobile recording.`
+          : `${device} API is unavailable. On macOS, open System Settings → Privacy & Security → ${device} and ensure this app is allowed.`;
       } else if (err instanceof DOMException) {
         switch (err.name) {
           case "NotAllowedError":
           case "PermissionDeniedError":
-            hint = `${device} access was denied. Please allow ${device.toLowerCase()} permission in System Settings → Privacy & Security.`;
+            hint = isTauriMobileRuntime()
+              ? `${device} access was denied. Open iPhone Settings → SlowClaw and allow ${device.toLowerCase()} access.`
+              : `${device} access was denied. Please allow ${device.toLowerCase()} permission in System Settings → Privacy & Security.`;
             break;
           case "NotFoundError":
           case "DevicesNotFoundError":
@@ -3851,7 +3933,7 @@ function App() {
       recordingTimerRef.current = null;
     }
     setRecordingHint("Processing recording...");
-    if (recordingType === "audio" && isTauriMobileRuntime() && !mediaRecorderRef.current) {
+    if (recordingType === "audio" && isTauriMobileRuntime() && hasNativeAudioRecorderPlugin() && !mediaRecorderRef.current) {
       try {
         const blob = await stopNativeAudioRecording();
         const file = new File([blob], `audio-${Date.now()}.m4a`, {
@@ -3900,7 +3982,7 @@ function App() {
       clearInterval(recordingTimerRef.current);
       recordingTimerRef.current = null;
     }
-    if (recordingType === "audio" && isTauriMobileRuntime() && !mediaRecorderRef.current) {
+    if (recordingType === "audio" && isTauriMobileRuntime() && hasNativeAudioRecorderPlugin() && !mediaRecorderRef.current) {
       try {
         await stopNativeAudioRecording();
       } catch {
@@ -4852,7 +4934,7 @@ function App() {
   }
 
   async function syncDesktopGatewayBootstrap(): Promise<string | null> {
-    if (!isDesktopClient) {
+    if (!isNativeClient) {
       return null;
     }
     try {
@@ -4882,7 +4964,7 @@ function App() {
   }
 
   async function restartGatewayDaemonFromDesktop() {
-    if (!isDesktopClient) {
+    if (!isNativeClient) {
       return;
     }
     await invokeDesktopCommandStrict<string>("restart_gateway_daemon");
@@ -5049,6 +5131,7 @@ function App() {
         {
           defaultProvider: normalizedProvider,
           defaultModel: settingsModel,
+          apiUrl: settingsApiUrl.trim(),
           transcriptionEnabled: settingsTranscriptionEnabled,
           transcriptionModel: settingsTranscriptionModel || "",
           availableTranscriptionModels: settingsAvailableTranscriptionModels,
@@ -5107,6 +5190,7 @@ function App() {
             setOpenrouterOAuthStatus("OpenRouter connected! AI is ready with a free model.");
             setSettingsProvider("openrouter");
             setSettingsModel("openrouter/free");
+            setSettingsApiUrl("");
             window.localStorage.setItem(CHAT_PROVIDER_STORAGE_KEY, "openrouter");
             window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, "openrouter/free");
             await refreshWorkspaceSynthAfterProviderSetup();
@@ -5182,6 +5266,7 @@ function App() {
         {
           defaultProvider: "openrouter",
           defaultModel: "openrouter/free",
+          apiUrl: "",
           transcriptionEnabled: settingsTranscriptionEnabled,
           transcriptionModel: settingsTranscriptionModel || "",
           availableTranscriptionModels: settingsAvailableTranscriptionModels,
@@ -5232,6 +5317,156 @@ function App() {
     }
   }
 
+  async function resolveRuntimeGatewayToken() {
+    let token = normalizeGatewayToken(chatGatewayToken);
+    if (!token && isDesktopClient) {
+      token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
+    }
+    return token;
+  }
+
+  async function loadLocalModels() {
+    if (!gatewayBaseUrl.trim()) {
+      setLocalModels([]);
+      setLocalModelsStatus("Local model catalog unavailable (gateway URL missing).");
+      setLocalModelsEngineStatus("");
+      return;
+    }
+    try {
+      const token = await resolveRuntimeGatewayToken();
+      const response = await getLocalModels(token || undefined, gatewayBaseUrl);
+      setLocalModels(response.models);
+      setLocalModelsEngineStatus(response.engineStatus || "");
+      setLocalModelRuntime(response.runtime || null);
+      if (isTauriMobileRuntime()) {
+        try {
+          setNativeLocalAiStatus(await getNativeLocalAiStatus());
+        } catch {
+          setNativeLocalAiStatus(null);
+        }
+      }
+      setLocalModelsStatus(response.models.length ? "" : "No local models are available yet.");
+    } catch (error) {
+      setLocalModels([]);
+      setLocalModelsEngineStatus("");
+      setLocalModelRuntime(null);
+      setNativeLocalAiStatus(null);
+      setLocalModelsStatus(
+        `Local models unavailable (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function startLocalModelDownload(modelId: string) {
+    setLocalModelBusyId(modelId);
+    setLocalModelsStatus("Starting model download...");
+    try {
+      const token = await resolveRuntimeGatewayToken();
+      await downloadLocalModel(modelId, token || undefined, gatewayBaseUrl);
+      setLocalModelsStatus("Download started. Keep the app open while the model downloads.");
+      await loadLocalModels();
+    } catch (error) {
+      setLocalModelsStatus(
+        `Download failed to start (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setLocalModelBusyId("");
+    }
+  }
+
+  async function selectLocalModel(modelId: string) {
+    setLocalModelBusyId(modelId);
+    setLocalModelsStatus("Selecting local model...");
+    try {
+      const token = await resolveRuntimeGatewayToken();
+      const result = await useLocalModel(modelId, token || undefined, gatewayBaseUrl);
+      setSettingsProvider(String(result.defaultProvider || "llamacpp"));
+      setSettingsModel(String(result.defaultModel || modelId));
+      setSettingsApiUrl(String(result.apiUrl || "http://127.0.0.1:8080/v1"));
+      if (isNativeClient) {
+        await restartGatewayDaemonFromDesktop();
+      }
+      setLocalModelsStatus("Local model selected. Runtime engine integration is the next step.");
+      await loadLocalModels();
+    } catch (error) {
+      setLocalModelsStatus(
+        `Could not select model (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setLocalModelBusyId("");
+    }
+  }
+
+  async function refreshLocalModelRuntime() {
+    try {
+      const token = await resolveRuntimeGatewayToken();
+      const runtime = await getLocalModelRuntime(token || undefined, gatewayBaseUrl);
+      setLocalModelRuntime(runtime);
+      if (runtime.error) {
+        setLocalModelsStatus(runtime.error);
+      }
+    } catch (error) {
+      setLocalModelsStatus(
+        `Runtime status unavailable (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
+  async function startDownloadedLocalModel(modelId: string) {
+    setLocalModelBusyId(modelId);
+    setLocalModelsStatus("Starting local model runtime...");
+    try {
+      if (isTauriMobileRuntime()) {
+        const model = localModels.find((item) => item.id === modelId);
+        if (!model?.path) {
+          throw new Error("Downloaded model path is missing. Refresh the model list and try again.");
+        }
+        const status = await configureNativeLocalAi(modelId, model.path);
+        setNativeLocalAiStatus(status);
+        setSettingsProvider(status.provider || "slowclaw-local");
+        setSettingsModel(status.modelId || modelId);
+        setSettingsApiUrl(status.apiUrl || "slowclaw-native://local");
+        setLocalModelsStatus(status.message || "Native local AI bridge configured.");
+        await loadLocalModels();
+        return;
+      }
+
+      const token = await resolveRuntimeGatewayToken();
+      const runtime = await startLocalModelRuntime(modelId, token || undefined, gatewayBaseUrl);
+      setLocalModelRuntime(runtime);
+      setSettingsProvider("llamacpp");
+      setSettingsModel(runtime.modelId || modelId);
+      setSettingsApiUrl(runtime.apiUrl || "http://127.0.0.1:8080/v1");
+      setLocalModelsStatus(
+        runtime.running
+          ? "Local model runtime is running. SlowClaw saved it as the active local model."
+          : runtime.error || "Runtime is not available yet."
+      );
+      await loadLocalModels();
+    } catch (error) {
+      setLocalModelsStatus(
+        `Could not start runtime (${error instanceof Error ? error.message : String(error)})`
+      );
+    } finally {
+      setLocalModelBusyId("");
+    }
+  }
+
+  async function stopDownloadedLocalModel() {
+    setLocalModelsStatus("Stopping local model runtime...");
+    try {
+      const token = await resolveRuntimeGatewayToken();
+      const runtime = await stopLocalModelRuntime(token || undefined, gatewayBaseUrl);
+      setLocalModelRuntime(runtime);
+      setLocalModelsStatus("Local model runtime stopped.");
+      await loadLocalModels();
+    } catch (error) {
+      setLocalModelsStatus(
+        `Could not stop runtime (${error instanceof Error ? error.message : String(error)})`
+      );
+    }
+  }
+
   async function loadRuntimeConfigForSettings() {
     let token = normalizeGatewayToken(chatGatewayToken);
     if (!token && isDesktopClient) {
@@ -5245,26 +5480,30 @@ function App() {
         const cfg = await getConfig();
         const savedProvider = normalizeProviderId(window.localStorage.getItem(CHAT_PROVIDER_STORAGE_KEY) || "");
         const savedModel = window.localStorage.getItem(CHAT_MODEL_STORAGE_KEY);
-        setSettingsProvider(savedProvider || "ollama");
-        setSettingsModel((savedModel && savedModel.trim()) || cfg.ollamaModel || "");
+        let runtimeCfg: Awaited<ReturnType<typeof getRuntimeConfig>> | null = null;
+        if (gatewayBaseUrl.trim()) {
+          runtimeCfg = await getRuntimeConfig(token || undefined, gatewayBaseUrl).catch(() => null);
+        }
+        setSettingsProvider(
+          normalizeProviderId(runtimeCfg?.defaultProvider || "") || savedProvider || "ollama"
+        );
+        setSettingsModel(runtimeCfg?.defaultModel || (savedModel && savedModel.trim()) || cfg.ollamaModel || "");
+        setSettingsApiUrl(runtimeCfg?.apiUrl || "");
         setSettingsTranscriptionEnabled(Boolean(cfg.transcriptionEnabled));
-        setSettingsTranscriptionModel(cfg.ollamaModel || "");
+        setSettingsTranscriptionModel(runtimeCfg?.transcriptionModel || cfg.ollamaModel || "");
         let models = await listOllamaModels().catch(() => [] as string[]);
-        if (!models.length && gatewayBaseUrl.trim()) {
-          try {
-            const runtimeCfg = await getRuntimeConfig(token || undefined, gatewayBaseUrl);
-            setRuntimeMediaCapabilities(runtimeCfg.mediaCapabilities || null);
-            setRuntimeMediaSummary(runtimeCfg.mediaSummary || "");
-            models =
-              runtimeCfg.availableTranscriptionModels && runtimeCfg.availableTranscriptionModels.length > 0
-                ? [...runtimeCfg.availableTranscriptionModels]
-                : [];
-            const runtimeModel = runtimeCfg.transcriptionModel || "";
-            if (runtimeModel && !models.includes(runtimeModel)) {
-              models.unshift(runtimeModel);
-            }
-          } catch {
-            // Keep local model-only list when gateway runtime config is unavailable.
+        if (runtimeCfg) {
+          setRuntimeMediaCapabilities(runtimeCfg.mediaCapabilities || null);
+          setRuntimeMediaSummary(runtimeCfg.mediaSummary || "");
+        }
+        if (!models.length && runtimeCfg) {
+          models =
+            runtimeCfg.availableTranscriptionModels && runtimeCfg.availableTranscriptionModels.length > 0
+              ? [...runtimeCfg.availableTranscriptionModels]
+              : [];
+          const runtimeModel = runtimeCfg.transcriptionModel || "";
+          if (runtimeModel && !models.includes(runtimeModel)) {
+            models.unshift(runtimeModel);
           }
         }
         if (cfg.ollamaModel && !models.includes(cfg.ollamaModel)) {
@@ -5299,6 +5538,7 @@ function App() {
       setRuntimeMediaSummary(cfg.mediaSummary || "");
       setSettingsProvider(normalizeProviderId(cfg.defaultProvider || ""));
       setSettingsModel(cfg.defaultModel || "");
+      setSettingsApiUrl(cfg.apiUrl || "");
       setSettingsTranscriptionEnabled(Boolean(cfg.transcriptionEnabled));
       const currentTranscriptionModel = cfg.transcriptionModel || "";
       setSettingsTranscriptionModel(currentTranscriptionModel);
@@ -5320,6 +5560,14 @@ function App() {
       );
       setSettingsConfigLoaded(true);
     }
+  }
+
+  function applyLocalAiPreset(provider: string, model: string, apiUrl: string) {
+    setSettingsProvider(provider);
+    setSettingsModel(model);
+    setSettingsApiUrl(apiUrl);
+    setProviderApiKey("");
+    setSettingsConfigStatus(`Selected ${provider} local runtime. Save configuration to apply it.`);
   }
 
   async function saveRuntimeConfigFromSettings() {
@@ -5371,6 +5619,7 @@ function App() {
         {
           defaultProvider: provider,
           defaultModel: model,
+          apiUrl: settingsApiUrl.trim(),
           transcriptionEnabled: settingsTranscriptionEnabled,
           transcriptionModel: settingsTranscriptionModel.trim(),
           availableTranscriptionModels: settingsAvailableTranscriptionModels
@@ -5563,7 +5812,27 @@ function App() {
       return;
     }
     void loadRuntimeConfigForSettings();
+    void loadLocalModels();
   }, [mobileTab, chatGatewayToken, gatewayBaseUrl]);
+
+  useEffect(() => {
+    if (mobileTab !== "profile") {
+      return;
+    }
+    const hasActiveDownload = localModels.some((model) => model.download?.status === "downloading");
+    if (!hasActiveDownload && !localModelRuntime?.running) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      if (hasActiveDownload) {
+        void loadLocalModels();
+      }
+      if (localModelRuntime?.running) {
+        void refreshLocalModelRuntime();
+      }
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [mobileTab, localModels, localModelRuntime?.running]);
 
   useEffect(() => {
     if (mobileTab !== "feed" && mobileTab !== "profile" && mobileTab !== "journal") {
@@ -5763,7 +6032,23 @@ function App() {
     : journalList;
   const feedList = feedItems;
   const postedHistory = history.filter((item) => item.status === "success");
-  const needsMobileQrLogin = !isDesktopClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
+  const installedLocalModelCount = localModels.filter((model) => model.installed).length;
+  const activeLocalModel =
+    localModels.find((model) => model.active) ||
+    localModels.find((model) => nativeLocalAiStatus?.modelId === model.id) ||
+    localModels.find((model) => localModelRuntime?.modelId === model.id) ||
+    null;
+  const localAiReady = Boolean(
+    localModelRuntime?.running || nativeLocalAiStatus?.configured || activeLocalModel
+  );
+  const localAiStateLabel = localModelRuntime?.running
+    ? "Running"
+    : nativeLocalAiStatus?.configured
+    ? "Configured"
+    : installedLocalModelCount > 0
+    ? "Downloaded"
+    : "Setup needed";
+  const needsMobileQrLogin = !isNativeClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
   const isCaptureZenMode = mobileTab === "journal" && (isRecording || captureMode !== null);
   const hideChrome = isWritingNote || isCaptureZenMode;
   const showDesktopJournalLayout = isDesktopLayout && mobileTab === "journal";
@@ -8171,6 +8456,199 @@ function App() {
         {mobileTab === "profile" ? (
           <ViewErrorBoundary title="Profile">
             <div className="stack">
+              <div className="card local-models-card">
+                <div className="model-hub-hero">
+                  <div>
+                    <p className="eyebrow">Local AI</p>
+                    <h2>Choose Your On-Device Brain</h2>
+                    <p className="text-sm muted">
+                      Download one private model, then use it to turn journal notes into tasks,
+                      insights, and your personalized Me feed.
+                    </p>
+                    <div className="model-hub-chips">
+                      <span>Journal notes</span>
+                      <span>Task extraction</span>
+                      <span>Me feed insights</span>
+                    </div>
+                  </div>
+                  <div className="model-hub-status-card">
+                    <span className={localAiReady ? "model-hub-orb ready" : "model-hub-orb"} />
+                    <p className="text-sm muted">Local AI status</p>
+                    <strong>{localAiStateLabel}</strong>
+                    <span className="text-sm muted">
+                      {installedLocalModelCount} downloaded
+                    </span>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void loadLocalModels()}
+                      disabled={Boolean(localModelBusyId)}
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                </div>
+                <div className="model-hub-selected">
+                  <div>
+                    <p className="text-sm muted">Selected model</p>
+                    <strong>{activeLocalModel?.title || "No model selected yet"}</strong>
+                    <p className="text-sm muted">
+                      {activeLocalModel
+                        ? `${activeLocalModel.family} · ${activeLocalModel.engine}`
+                        : "Pick a compact model below to keep SlowClaw private and phone-first."}
+                    </p>
+                  </div>
+                  <div className="model-hub-selected-meta">
+                    <span>{activeLocalModel?.sizeLabel || "GGUF"}</span>
+                    <span>{isTauriMobileRuntime() ? "iPhone bridge" : "Desktop server"}</span>
+                  </div>
+                </div>
+                {localModelsEngineStatus ? (
+                  <div className="local-model-engine-note text-sm">
+                    {localModelsEngineStatus}
+                  </div>
+                ) : null}
+                {localModelRuntime ? (
+                  <div className="local-runtime-panel">
+                    <div>
+                      <p className="text-sm muted">Runtime</p>
+                      <strong>{localModelRuntime.running ? "Running" : localModelRuntime.status || "Stopped"}</strong>
+                      {localModelRuntime.modelId ? (
+                        <p className="text-sm muted">{localModelRuntime.modelId}</p>
+                      ) : null}
+                      {localModelRuntime.error ? (
+                        <p className="text-sm local-model-error">{localModelRuntime.error}</p>
+                      ) : null}
+                    </div>
+                    <div className="row">
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => void refreshLocalModelRuntime()}
+                      >
+                        Runtime Status
+                      </button>
+                      {localModelRuntime.running ? (
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() => void stopDownloadedLocalModel()}
+                        >
+                          Stop Runtime
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+                {nativeLocalAiStatus ? (
+                  <div className="local-runtime-panel">
+                    <div>
+                      <p className="text-sm muted">iPhone Native AI</p>
+                      <strong>{nativeLocalAiStatus.configured ? "Configured" : "Bridge Ready"}</strong>
+                      {nativeLocalAiStatus.modelId ? (
+                        <p className="text-sm muted">{nativeLocalAiStatus.modelId}</p>
+                      ) : null}
+                      <p className="text-sm muted">{nativeLocalAiStatus.message}</p>
+                      {nativeLocalAiStatus.error ? (
+                        <p className="text-sm local-model-error">{nativeLocalAiStatus.error}</p>
+                      ) : null}
+                    </div>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={async () => {
+                        try {
+                          setNativeLocalAiStatus(await getNativeLocalAiStatus());
+                        } catch (error) {
+                          setLocalModelsStatus(
+                            `Native status unavailable (${error instanceof Error ? error.message : String(error)})`
+                          );
+                        }
+                      }}
+                    >
+                      Native Status
+                    </button>
+                  </div>
+                ) : null}
+                <div className="local-model-grid">
+                  {localModels.map((model) => {
+                    const download = model.download;
+                    const isDownloading = download?.status === "downloading";
+                    const transferred = download?.transferredBytes || 0;
+                    const total = download?.totalBytes || model.sizeBytes || 0;
+                    const progress = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 0;
+                    return (
+                      <article className="local-model-card" key={model.id}>
+                        <div className="row-between">
+                          <span className="local-model-family">{model.family}</span>
+                          <span className={model.installed ? "local-model-pill installed" : "local-model-pill"}>
+                            {model.active ? "Active" : model.installed ? "Downloaded" : model.sizeLabel}
+                          </span>
+                        </div>
+                        <h3>{model.title}</h3>
+                        <p className="text-sm muted">{model.description}</p>
+                        <div className="model-card-meta">
+                          <span>{model.engine}</span>
+                          <span>{model.sizeLabel}</span>
+                          <span>{model.installed ? "On device" : "Not downloaded"}</span>
+                        </div>
+                        {isDownloading ? (
+                          <div className="local-model-progress">
+                            <div className="local-model-progress-track">
+                              <div className="local-model-progress-fill" style={{ width: `${progress}%` }} />
+                            </div>
+                            <span className="text-sm muted">{progress}%</span>
+                          </div>
+                        ) : null}
+                        {download?.status === "failed" && download.error ? (
+                          <p className="text-sm local-model-error">{download.error}</p>
+                        ) : null}
+                        <div className="model-card-actions">
+                          {model.installed ? (
+                            <>
+                              <button
+                                type="button"
+                                className="primary"
+                                onClick={() => void startDownloadedLocalModel(model.id)}
+                                disabled={Boolean(localModelBusyId)}
+                              >
+                                {isTauriMobileRuntime()
+                                  ? nativeLocalAiStatus?.modelId === model.id
+                                    ? "Configured"
+                                    : "Use On iPhone"
+                                  : localModelRuntime?.running && localModelRuntime.modelId === model.id
+                                  ? "Restart Runtime"
+                                  : "Start Runtime"}
+                              </button>
+                              <button
+                                type="button"
+                                className={model.active ? "ghost" : "ghost"}
+                                onClick={() => void selectLocalModel(model.id)}
+                                disabled={Boolean(localModelBusyId) || model.active}
+                              >
+                                {model.active ? "Selected" : "Set Default"}
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              className="primary"
+                              onClick={() => void startLocalModelDownload(model.id)}
+                              disabled={Boolean(localModelBusyId) || isDownloading}
+                            >
+                              {isDownloading ? "Downloading..." : "Download"}
+                            </button>
+                          )}
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+                {localModelsStatus ? (
+                  <p className="text-sm muted">{localModelsStatus}</p>
+                ) : null}
+              </div>
+
               <div className="card">
               <div className="row-between">
                 <h2>Configuration</h2>
@@ -8187,7 +8665,7 @@ function App() {
                 <input
                   value={settingsProvider}
                   onChange={(e) => setSettingsProvider(e.target.value)}
-                  placeholder="Default provider (e.g. openrouter, ollama, openai)"
+                  placeholder="Default provider (e.g. osaurus, ollama, openrouter)"
                   disabled={settingsConfigBusy}
                 />
                 <input
@@ -8196,6 +8674,41 @@ function App() {
                   placeholder="Default model"
                   disabled={settingsConfigBusy}
                 />
+                <input
+                  value={settingsApiUrl}
+                  onChange={(e) => setSettingsApiUrl(e.target.value)}
+                  placeholder="Local/OpenAI-compatible API URL (optional)"
+                  disabled={settingsConfigBusy}
+                />
+                <div className="local-ai-presets" aria-label="Local AI presets">
+                  <button
+                    type="button"
+                    className="ghost local-ai-preset"
+                    onClick={() => applyLocalAiPreset(ATOMIC_LOCAL_PROVIDER, ATOMIC_LOCAL_MODEL, ATOMIC_LOCAL_API_URL)}
+                    disabled={settingsConfigBusy}
+                  >
+                    Atomic Local
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost local-ai-preset"
+                    onClick={() => applyLocalAiPreset("llamacpp", "local-model", "http://127.0.0.1:8080/v1")}
+                    disabled={settingsConfigBusy}
+                  >
+                    llama.cpp
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost local-ai-preset"
+                    onClick={() => applyLocalAiPreset("ollama", settingsModel.trim() || "llama3.2", "http://127.0.0.1:11434")}
+                    disabled={settingsConfigBusy}
+                  >
+                    Ollama
+                  </button>
+                </div>
+                <p className="text-sm muted">
+                  Atomic Local expects AtomicChat or another OpenAI-compatible local server at {ATOMIC_LOCAL_API_URL}.
+                </p>
                 <label className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
                   <input
                     type="checkbox"
@@ -8653,7 +9166,8 @@ function App() {
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path><path d="M7 7h6"></path><path d="M7 15h8"></path></svg>
             <span className="bottom-nav-label">
-              Productivity
+              <span className="bottom-nav-label-full">Productivity</span>
+              <span className="bottom-nav-label-short" aria-hidden="true">Tasks</span>
               {openTodos.length + todayEventItems.length + upcomingEventItems.length > 0 ? (
                 <span className="bottom-nav-badge">
                   {openTodos.length + todayEventItems.length + upcomingEventItems.length}

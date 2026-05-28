@@ -77,6 +77,19 @@ export type OllamaStatus = {
   models: string[];
 };
 
+export type NativeLocalAiStatus = {
+  provider: string;
+  configured: boolean;
+  available: boolean;
+  running: boolean;
+  state: string;
+  modelId?: string | null;
+  modelPath?: string | null;
+  apiUrl: string;
+  message: string;
+  error?: string | null;
+};
+
 // ─────────────────────────────────────────────
 // Journal commands
 // ─────────────────────────────────────────────
@@ -223,6 +236,17 @@ export async function chatWithGeminiCli(prompt: string, model?: string): Promise
   return invoke("chat_with_gemini_cli", { prompt, model });
 }
 
+export async function getNativeLocalAiStatus(): Promise<NativeLocalAiStatus> {
+  return invoke("get_native_local_ai_status");
+}
+
+export async function configureNativeLocalAi(
+  modelId: string,
+  modelPath: string
+): Promise<NativeLocalAiStatus> {
+  return invoke("configure_native_local_ai", { req: { modelId, modelPath } });
+}
+
 // ─────────────────────────────────────────────
 // Keyring / secrets (existing commands, kept for Bluesky credentials)
 // ─────────────────────────────────────────────
@@ -240,7 +264,7 @@ export async function deleteSecret(service: string, account: string): Promise<vo
 }
 
 // ─────────────────────────────────────────────
-// Audio recording helper (desktop uses Web API; mobile uses native plugin)
+// Audio recording helper. Mobile uses the Web API until a native plugin is bundled.
 // See: audioRecorder.ts
 // ─────────────────────────────────────────────
 

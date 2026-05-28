@@ -21,6 +21,7 @@ pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
+pub mod local_native;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
@@ -849,6 +850,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
+        "slowclaw-local" | "local-native" | "native-local" => vec![],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
         "osaurus" => vec!["OSAURUS_API_KEY"],
@@ -1165,6 +1167,9 @@ fn create_provider_with_url_and_options(
                 Some(llama_cpp_key),
                 AuthStyle::Bearer,
             )))
+        }
+        "slowclaw-local" | "local-native" | "native-local" => {
+            Ok(Box::new(local_native::LocalNativeProvider::new()))
         }
         "sglang" => {
             let base_url = api_url
@@ -1695,6 +1700,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: true,
         },
         ProviderInfo {
+            name: "slowclaw-local",
+            display_name: "SlowClaw native local AI",
+            aliases: &["local-native", "native-local"],
+            local: true,
+        },
+        ProviderInfo {
             name: "sglang",
             display_name: "SGLang",
             aliases: &[],
@@ -2199,6 +2210,13 @@ mod tests {
         assert!(create_provider("llamacpp", Some("key")).is_ok());
         assert!(create_provider("llama.cpp", Some("key")).is_ok());
         assert!(create_provider("llamacpp", None).is_ok());
+    }
+
+    #[test]
+    fn factory_slowclaw_local_native() {
+        assert!(create_provider("slowclaw-local", None).is_ok());
+        assert!(create_provider("local-native", None).is_ok());
+        assert!(create_provider("native-local", Some("ignored")).is_ok());
     }
 
     #[test]

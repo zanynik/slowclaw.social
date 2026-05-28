@@ -2,9 +2,8 @@
  * audioRecorder.ts — cross-platform audio recording abstraction.
  *
  * Desktop (macOS/Windows via Tauri): uses the browser's MediaRecorder API.
- * Mobile (iOS/Android via Tauri): invokes native Tauri plugin commands
- *   that use AVAudioSession (iOS) / ForegroundService + MediaRecorder (Android).
- *   The native plugin keeps recording alive when the screen locks.
+ * Mobile: uses MediaRecorder unless a native recorder plugin is explicitly
+ *   bundled and exposes __SLOWCLAW_NATIVE_AUDIO_RECORDER__.
  *
  * Usage:
  *   const state = await startRecording();
@@ -22,6 +21,11 @@ function isMobile(): boolean {
     (window as any).__TAURI_MOBILE__ === true ||
     /iphone|ipad|android/i.test(navigator.userAgent)
   );
+}
+
+function hasNativeAudioRecorderPlugin(): boolean {
+  if (typeof window === "undefined") return false;
+  return Boolean((window as any).__SLOWCLAW_NATIVE_AUDIO_RECORDER__);
 }
 
 // ─────────────────────────────────────────────
@@ -81,7 +85,7 @@ async function stopDesktop(): Promise<Blob> {
 }
 
 // ─────────────────────────────────────────────
-// Mobile implementation (native Tauri plugin)
+// Optional mobile implementation (native Tauri plugin)
 //
 // The native plugin is implemented in:
 //   iOS:     src-tauri/ios/Sources/AudioRecorderPlugin/AudioRecorderPlugin.swift
@@ -113,14 +117,14 @@ async function stopMobile(): Promise<Blob> {
 
 export async function startRecording(): Promise<RecordingState> {
   if (_state === "recording") return "recording";
-  if (isMobile()) {
+  if (isMobile() && hasNativeAudioRecorderPlugin()) {
     return startMobile();
   }
   return startDesktop();
 }
 
 export async function stopRecording(): Promise<Blob> {
-  if (isMobile()) {
+  if (isMobile() && hasNativeAudioRecorderPlugin()) {
     return stopMobile();
   }
   return stopDesktop();
