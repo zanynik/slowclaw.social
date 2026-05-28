@@ -307,13 +307,12 @@ export const appActions: AppActions = {
 
 export function useAppStore(): AppState;
 export function useAppStore<T>(selector: (s: AppState) => T): T;
-export function useAppStore<T>(selector?: (s: AppState) => T): T | AppState {
-  const slice = useSyncExternalStore(
+export function useAppStore(selector?: (s: AppState) => unknown): unknown {
+  return useSyncExternalStore(
     subscribe,
     selector ? () => selector(getState()) : getState,
     selector ? () => selector(getState()) : getState,
   );
-  return slice;
 }
 
 /**
