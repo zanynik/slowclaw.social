@@ -8,5 +8,26 @@
   <string>SlowClaw needs camera access when you record video journal entries.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>SlowClaw needs microphone access when you record audio or video journal entries.</string>
+  <key>NSPhotoLibraryUsageDescription</key>
+  <string>SlowClaw needs photo library access to import images into your journal.</string>
+  <key>NSPhotoLibraryAddUsageDescription</key>
+  <string>SlowClaw needs photo library access to save exported media.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>SlowClaw uses on-device speech recognition to transcribe your audio journal entries.</string>
+  <key>UIRequiresFullScreen</key>
+  <true/>
+  <key>UIStatusBarStyle</key>
+  <string>UIStatusBarStyleDefault</string>
+  <key>UIViewControllerBasedStatusBarAppearance</key>
+  <true/>
+  <key>UIBackgroundModes</key>
+  <array>
+    <string>audio</string>
+  </array>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
 </dict>
 </plist>
