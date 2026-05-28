@@ -97,6 +97,166 @@ jobs:
                   perl -pe 's/\\n/\n/g' <<<"${APP_STORE_CONNECT_PRIVATE_KEY}" >"${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
                   chmod 600 "${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
 
+            - name: Prepare Apple distribution signing assets
+              env:
+                  APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+                  APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+                  APPLE_DEVELOPMENT_TEAM: ${{ inputs.apple_development_team || vars.APPLE_DEVELOPMENT_TEAM || secrets.APPLE_DEVELOPMENT_TEAM }}
+                  APP_BUNDLE_ID: com.slowclaw.app
+              run: |
+                  set -euo pipefail
+                  : "${ASC_KEY_DIR:?ASC_KEY_DIR was not initialized}"
+                  : "${APP_STORE_CONNECT_ISSUER_ID:?APP_STORE_CONNECT_ISSUER_ID secret is required}"
+                  : "${APP_STORE_CONNECT_KEY_ID:?APP_STORE_CONNECT_KEY_ID secret is required}"
+                  : "${APPLE_DEVELOPMENT_TEAM:?Set the APPLE_DEVELOPMENT_TEAM repository variable or provide the apple_development_team workflow input.}"
+
+                  SIGNING_DIR="${RUNNER_TEMP}/apple-signing"
+                  mkdir -p "${SIGNING_DIR}" "${HOME}/Library/MobileDevice/Provisioning Profiles"
+                  chmod 700 "${SIGNING_DIR}"
+
+                  KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+                  P12_PASSWORD="$(openssl rand -base64 32)"
+                  KEYCHAIN_PATH="${RUNNER_TEMP}/slowclaw-signing.keychain-db"
+                  printf '::add-mask::%s\n' "${KEYCHAIN_PASSWORD}"
+                  printf '::add-mask::%s\n' "${P12_PASSWORD}"
+                  printf 'KEYCHAIN_PASSWORD=%s\n' "${KEYCHAIN_PASSWORD}" >>"${GITHUB_ENV}"
+                  printf 'APPLE_SIGNING_KEYCHAIN=%s\n' "${KEYCHAIN_PATH}" >>"${GITHUB_ENV}"
+
+                  openssl ecparam -name prime256v1 -genkey -noout -out "${SIGNING_DIR}/signing.key"
+                  openssl req -new -key "${SIGNING_DIR}/signing.key" -out "${SIGNING_DIR}/signing.csr" -subj "/CN=SlowClaw CI/"
+
+                  ASC_KEY_PATH="${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+                  PROFILE_NAME="SlowClaw CI App Store ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+                  ASC_KEY_PATH="${ASC_KEY_PATH}" \
+                  ASC_ISSUER_ID="${APP_STORE_CONNECT_ISSUER_ID}" \
+                  ASC_KEY_ID="${APP_STORE_CONNECT_KEY_ID}" \
+                  APP_BUNDLE_ID="${APP_BUNDLE_ID}" \
+                  CERT_CSR_PATH="${SIGNING_DIR}/signing.csr" \
+                  CERT_OUT_PATH="${SIGNING_DIR}/distribution.cer" \
+                  PROFILE_OUT_PATH="${SIGNING_DIR}/profile.mobileprovision" \
+                  PROFILE_NAME="${PROFILE_NAME}" \
+                  node <<'NODE'
+                  const crypto = require("crypto");
+                  const fs = require("fs");
+                  const https = require("https");
+
+                  function base64Url(input) {
+                    return Buffer.from(input).toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+                  }
+
+                  function jwt() {
+                    const header = { alg: "ES256", kid: process.env.ASC_KEY_ID, typ: "JWT" };
+                    const now = Math.floor(Date.now() / 1000);
+                    const payload = {
+                      iss: process.env.ASC_ISSUER_ID,
+                      iat: now,
+                      exp: now + 900,
+                      aud: "appstoreconnect-v1"
+                    };
+                    const body = `${base64Url(JSON.stringify(header))}.${base64Url(JSON.stringify(payload))}`;
+                    const privateKey = fs.readFileSync(process.env.ASC_KEY_PATH, "utf8");
+                    const signature = crypto.sign("sha256", Buffer.from(body), {
+                      key: privateKey,
+                      dsaEncoding: "ieee-p1363"
+                    });
+                    return `${body}.${base64Url(signature)}`;
+                  }
+
+                  async function request(token, method, path, body) {
+                    const payload = body ? JSON.stringify(body) : undefined;
+                    const response = await new Promise((resolve, reject) => {
+                      const req = https.request({
+                        hostname: "api.appstoreconnect.apple.com",
+                        method,
+                        path,
+                        headers: {
+                          Authorization: `Bearer ${token}`,
+                          Accept: "application/json",
+                          "Content-Type": "application/json",
+                          ...(payload ? { "Content-Length": Buffer.byteLength(payload) } : {})
+                        }
+                      }, (res) => {
+                        let raw = "";
+                        res.setEncoding("utf8");
+                        res.on("data", (chunk) => raw += chunk);
+                        res.on("end", () => resolve({ status: res.statusCode, raw }));
+                      });
+                      req.on("error", reject);
+                      if (payload) req.write(payload);
+                      req.end();
+                    });
+                    let parsed = {};
+                    if (response.raw.trim()) {
+                      parsed = JSON.parse(response.raw);
+                    }
+                    if (response.status < 200 || response.status >= 300) {
+                      const detail = parsed?.errors?.[0]?.detail || parsed?.errors?.[0]?.title || `HTTP ${response.status}`;
+                      throw new Error(detail);
+                    }
+                    return parsed;
+                  }
+
+                  (async () => {
+                    const token = jwt();
+                    const bundleId = process.env.APP_BUNDLE_ID;
+                    const bundle = await request(token, "GET", `/v1/bundleIds?filter[identifier]=${encodeURIComponent(bundleId)}`);
+                    const bundleRecord = bundle.data?.[0];
+                    if (!bundleRecord?.id) {
+                      throw new Error(`Bundle ID ${bundleId} was not found in App Store Connect.`);
+                    }
+
+                    const csrContent = fs.readFileSync(process.env.CERT_CSR_PATH).toString("base64");
+                    let cert;
+                    try {
+                      cert = await request(token, "POST", "/v1/certificates", {
+                        data: {
+                          type: "certificates",
+                          attributes: {
+                            certificateType: "IOS_DISTRIBUTION",
+                            csrContent
+                          }
+                        }
+                      });
+                    } catch (error) {
+                      throw new Error(`Could not create Apple Distribution certificate. If the certificate limit is full, revoke an unused Distribution certificate in Apple Developer Certificates, Identifiers & Profiles, then rerun. Apple said: ${error.message}`);
+                    }
+                    const certRecord = cert.data;
+                    fs.writeFileSync(process.env.CERT_OUT_PATH, Buffer.from(certRecord.attributes.certificateContent, "base64"));
+
+                    const profile = await request(token, "POST", "/v1/profiles", {
+                      data: {
+                        type: "profiles",
+                        attributes: {
+                          name: process.env.PROFILE_NAME,
+                          profileType: "IOS_APP_STORE"
+                        },
+                        relationships: {
+                          bundleId: { data: { type: "bundleIds", id: bundleRecord.id } },
+                          certificates: { data: [{ type: "certificates", id: certRecord.id }] }
+                        }
+                      }
+                    });
+                    const profileRecord = profile.data;
+                    fs.writeFileSync(process.env.PROFILE_OUT_PATH, Buffer.from(profileRecord.attributes.profileContent, "base64"));
+                    fs.appendFileSync(process.env.GITHUB_ENV, `APPLE_PROVISIONING_PROFILE_NAME=${profileRecord.attributes.name}\n`);
+                    fs.appendFileSync(process.env.GITHUB_ENV, `APPLE_PROVISIONING_PROFILE_ID=${profileRecord.attributes.uuid}\n`);
+                  })().catch((error) => {
+                    console.error(error.message);
+                    process.exit(1);
+                  });
+                  NODE
+
+                  openssl x509 -inform DER -in "${SIGNING_DIR}/distribution.cer" -out "${SIGNING_DIR}/distribution.pem"
+                  openssl pkcs12 -export -inkey "${SIGNING_DIR}/signing.key" -in "${SIGNING_DIR}/distribution.pem" -out "${SIGNING_DIR}/signing.p12" -passout "pass:${P12_PASSWORD}"
+                  security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+                  security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+                  security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+                  security list-keychains -d user -s "${KEYCHAIN_PATH}" login.keychain-db
+                  security default-keychain -s "${KEYCHAIN_PATH}"
+                  security import "${SIGNING_DIR}/signing.p12" -k "${KEYCHAIN_PATH}" -P "${P12_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
+                  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+                  cp "${SIGNING_DIR}/profile.mobileprovision" "${HOME}/Library/MobileDevice/Provisioning Profiles/${APPLE_PROVISIONING_PROFILE_ID}.mobileprovision"
+
             - name: Initialize Tauri iOS project
               working-directory: web
               run: |
@@ -123,7 +283,8 @@ jobs:
                   printf '%s' "${APP_STORE_CONNECT_KEY_ID}" >"${XCODEBUILD_WRAPPER_DIR}/key_id"
                   printf '%s' "${APP_STORE_CONNECT_ISSUER_ID}" >"${XCODEBUILD_WRAPPER_DIR}/issuer_id"
                   printf '%s' "${APPLE_DEVELOPMENT_TEAM}" >"${XCODEBUILD_WRAPPER_DIR}/team_id"
-                  chmod 600 "${XCODEBUILD_WRAPPER_DIR}/asc_key_path" "${XCODEBUILD_WRAPPER_DIR}/key_id" "${XCODEBUILD_WRAPPER_DIR}/issuer_id" "${XCODEBUILD_WRAPPER_DIR}/team_id"
+                  printf '%s' "${APPLE_PROVISIONING_PROFILE_NAME:?Apple provisioning profile was not initialized}" >"${XCODEBUILD_WRAPPER_DIR}/profile_name"
+                  chmod 600 "${XCODEBUILD_WRAPPER_DIR}/asc_key_path" "${XCODEBUILD_WRAPPER_DIR}/key_id" "${XCODEBUILD_WRAPPER_DIR}/issuer_id" "${XCODEBUILD_WRAPPER_DIR}/team_id" "${XCODEBUILD_WRAPPER_DIR}/profile_name"
                   cat >"${XCODEBUILD_WRAPPER_DIR}/xcodebuild" <<'SH'
                   #!/usr/bin/env bash
                   set -euo pipefail
@@ -147,16 +308,18 @@ jobs:
                   APP_STORE_CONNECT_KEY_ID="$(cat "${WRAPPER_DIR}/key_id")"
                   APP_STORE_CONNECT_ISSUER_ID="$(cat "${WRAPPER_DIR}/issuer_id")"
                   APPLE_DEVELOPMENT_TEAM="$(cat "${WRAPPER_DIR}/team_id")"
+                  APPLE_PROVISIONING_PROFILE_NAME="$(cat "${WRAPPER_DIR}/profile_name")"
                   DEVELOPER_DIR="$(xcode-select -p)"
                   SWIFT_LINKER_FLAGS="\$(inherited) -L${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos -L${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/iphoneos -L/usr/lib/swift"
 
                   exec "${REAL_XCODEBUILD}" \
-                    -allowProvisioningUpdates \
                     -authenticationKeyPath "${ASC_KEY_PATH:?}" \
                     -authenticationKeyID "${APP_STORE_CONNECT_KEY_ID:?}" \
                     -authenticationKeyIssuerID "${APP_STORE_CONNECT_ISSUER_ID:?}" \
                     DEVELOPMENT_TEAM="${APPLE_DEVELOPMENT_TEAM:?}" \
-                    CODE_SIGN_STYLE=Automatic \
+                    CODE_SIGN_STYLE=Manual \
+                    CODE_SIGN_IDENTITY="Apple Distribution" \
+                    PROVISIONING_PROFILE_SPECIFIER="${APPLE_PROVISIONING_PROFILE_NAME:?}" \
                     OTHER_LDFLAGS="${SWIFT_LINKER_FLAGS}" \
                     "$@"
                   SH
@@ -164,7 +327,7 @@ jobs:
 
                   PATH="${XCODEBUILD_WRAPPER_DIR}:${PATH}" npm run tauri -- ios build \
                     --ci \
-                    --export-method release-testing \
+                    --export-method app-store-connect \
                     --build-number "${BUILD_NUMBER}"
 
                   printf 'IPA_DIR=%s\n' "${GITHUB_WORKSPACE}/web/src-tauri/gen/apple" >>"${GITHUB_ENV}"
@@ -195,3 +358,6 @@ jobs:
                   set -euo pipefail
                   ASC_KEY_DIR="${ASC_KEY_DIR:-${HOME}/.appstoreconnect/private_keys}"
                   rm -f "${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+                  if [[ -n "${APPLE_SIGNING_KEYCHAIN:-}" ]]; then
+                    security delete-keychain "${APPLE_SIGNING_KEYCHAIN}" || true
+                  fi
