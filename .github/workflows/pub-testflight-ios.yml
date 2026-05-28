@@ -205,6 +205,20 @@ jobs:
                       throw new Error(`Bundle ID ${bundleId} was not found in App Store Connect.`);
                     }
 
+                    const staleProfiles = await request(token, "GET", "/v1/profiles?filter[profileType]=IOS_APP_STORE&limit=200");
+                    for (const staleProfile of staleProfiles.data || []) {
+                      if (!String(staleProfile.attributes?.name || "").startsWith("SlowClaw CI App Store ")) {
+                        continue;
+                      }
+                      const relatedCerts = await request(token, "GET", `/v1/profiles/${staleProfile.id}/certificates?fields[certificates]=certificateType&limit=20`);
+                      await request(token, "DELETE", `/v1/profiles/${staleProfile.id}`);
+                      for (const relatedCert of relatedCerts.data || []) {
+                        if (relatedCert.attributes?.certificateType === "IOS_DISTRIBUTION") {
+                          await request(token, "DELETE", `/v1/certificates/${relatedCert.id}`);
+                        }
+                      }
+                    }
+
                     const csrContent = fs.readFileSync(process.env.CERT_CSR_PATH, "utf8");
                     let cert;
                     try {
@@ -247,7 +261,7 @@ jobs:
                   NODE
 
                   openssl x509 -inform DER -in "${SIGNING_DIR}/distribution.cer" -out "${SIGNING_DIR}/distribution.pem"
-                  openssl pkcs12 -export -inkey "${SIGNING_DIR}/signing.key" -in "${SIGNING_DIR}/distribution.pem" -out "${SIGNING_DIR}/signing.p12" -passout "pass:${P12_PASSWORD}"
+                  openssl pkcs12 -legacy -export -inkey "${SIGNING_DIR}/signing.key" -in "${SIGNING_DIR}/distribution.pem" -out "${SIGNING_DIR}/signing.p12" -passout "pass:${P12_PASSWORD}"
                   security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
                   security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
                   security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
