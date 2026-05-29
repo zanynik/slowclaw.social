@@ -70,6 +70,14 @@ jobs:
                     brew install cocoapods
                   fi
 
+            - name: Ensure CMake is available (needed for llama.cpp native inference)
+              run: |
+                  set -euo pipefail
+                  if ! command -v cmake >/dev/null 2>&1; then
+                    brew install cmake
+                  fi
+                  cmake --version
+
             - name: Show Apple build tool versions
               run: |
                   set -euo pipefail
@@ -347,6 +355,7 @@ jobs:
 
                   PATH="${XCODEBUILD_WRAPPER_DIR}:${PATH}" npm run tauri -- ios build \
                     --ci \
+                    --features native-inference \
                     --export-method app-store-connect \
                     --build-number "${BUILD_NUMBER}"
 
