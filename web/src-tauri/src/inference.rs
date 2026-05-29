@@ -120,12 +120,15 @@ mod engine {
             .lock()
             .map_err(|e| format!("engine lock poisoned: {e}"))?;
 
-        // Skip if already loaded
+        // Skip if already loaded AND Metal setting hasn't changed
+        let metal_changed = std::env::var("SLOWCLAW_METAL_CHANGED").is_ok();
         if let Some(loaded) = &state.model {
-            if loaded.model_path == path {
+            if loaded.model_path == path && !metal_changed {
                 return Ok(format!("Model already loaded: {model_id}"));
             }
         }
+        // Clear the change flag
+        std::env::remove_var("SLOWCLAW_METAL_CHANGED");
 
         // Drop previous model before loading new one (frees GPU/RAM)
         state.model = None;
@@ -134,12 +137,18 @@ mod engine {
         // Prefer mmap for large models so pages stay file-backed, and fall back
         // through CPU/offload modes when Metal allocation fails.
         let is_ios = cfg!(target_os = "ios");
+        let use_metal = std::env::var("SLOWCLAW_USE_METAL")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
         let load_attempts: Vec<(u32, bool)> = if is_ios {
-            // iOS TestFlight crashes showed Metal allocator faults during
-            // context creation when the model was loaded with full GPU offload.
-            // Prefer CPU/file-backed mmap for stability. This is slower, but it
-            // avoids uncatchable ggml/Metal SIGSEGV/SIGABRT failures.
-            vec![(0, true), (0, false)]
+            if use_metal {
+                // User opted in to Metal acceleration — try limited GPU offload first
+                eprintln!("[inference] Metal mode ENABLED by user preference");
+                vec![(16, true), (8, true), (0, true), (0, false)]
+            } else {
+                // Default stable: CPU-first, no Metal offload (avoids uncatchable crashes)
+                vec![(0, true), (0, false)]
+            }
         } else {
             vec![(99, true)]
         };

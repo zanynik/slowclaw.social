@@ -2295,13 +2295,29 @@ fn native_ai_engine_status() -> serde_json::Value {
 }
 
 #[tauri::command]
+fn set_metal_mode(enabled: bool) {
+    if enabled {
+        std::env::set_var("SLOWCLAW_USE_METAL", "1");
+    } else {
+        std::env::remove_var("SLOWCLAW_USE_METAL");
+    }
+    eprintln!("[settings] Metal GPU mode set to: {enabled}");
+    // Force model to reload on next inference to pick up the change
+    // (dropping loaded model so it reloads with new gpu_layers)
+    if enabled || !enabled {
+        // Clear loaded model so next call to load_model uses new settings
+        let _ = std::env::set_var("SLOWCLAW_METAL_CHANGED", "1");
+    }
+}
+
+#[tauri::command]
 async fn transcribe_audio(audio_path: String) -> Result<transcription::TranscriptionResult, String> {
     let path = audio_path.trim().to_string();
     if path.is_empty() {
         return Err("audio_path is required".to_string());
     }
     // Run on a blocking thread since the iOS API uses a sync wait
-    tokio::task::spawn_blocking(move || transcription::transcribe_audio_file(&path))
+    tauri::async_runtime::spawn_blocking(move || transcription::transcribe_audio_file(&path))
         .await
         .map_err(|e| format!("transcription task failed: {e}"))?
 }
@@ -2358,6 +2374,7 @@ pub fn run() {
             native_ai_load_model,
             native_ai_chat,
             native_ai_engine_status,
+            set_metal_mode,
             transcribe_audio
         ])
         .run(tauri::generate_context!())
