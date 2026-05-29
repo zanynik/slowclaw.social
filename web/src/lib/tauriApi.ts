@@ -305,6 +305,10 @@ export async function transcribeAudio(audioPath: string): Promise<TranscriptionR
   return invoke("transcribe_audio", { audioPath });
 }
 
+export async function setMetalMode(enabled: boolean): Promise<void> {
+  return invoke("set_metal_mode", { enabled });
+}
+
 // ─────────────────────────────────────────────
 // Keyring / secrets (existing commands, kept for Bluesky credentials)
 // ─────────────────────────────────────────────
