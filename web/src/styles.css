@@ -933,6 +933,33 @@ button.local-ai-preset {
   margin-bottom: 0.3rem;
 }
 
+/* ─────────────────────────────────────────────────
+   FEED CREATE HERO
+   ───────────────────────────────────────────────── */
+
+.feed-create-hero {
+  text-align: center;
+  padding: 2rem 1rem;
+}
+
+.feed-create-hero-icon {
+  font-size: 2.5rem;
+  margin-bottom: 0.75rem;
+  animation: float 3s ease-in-out infinite;
+}
+
+.feed-create-hero h3 {
+  margin: 0 0 0.4rem;
+  font-size: 1.15rem;
+}
+
+.feed-create-hero p {
+  margin: 0 0 1rem;
+  max-width: 280px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
 @media (max-width: 900px) {
   .journal-desktop-layout { display: block; }
   .sidebar.sidebar-desktop { display: none; }

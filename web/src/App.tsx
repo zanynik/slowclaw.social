@@ -7437,19 +7437,6 @@ function App() {
               <div className="row-between">
                 <h2>Your Feed</h2>
                 <div className="row" style={{ gap: "0.35rem", alignItems: "center" }}>
-                  {feedSource === "local" ? (
-                    <button
-                      type="button"
-                      className={`feed-plus-btn ${feedSidebarOpen ? "active" : ""}`}
-                      onClick={() => {
-                        setFeedSidebarOpen((prev) => !prev);
-                        setFeedCreateWorkflowOpen(false);
-                      }}
-                      title="Open content agent drawer"
-                    >
-                      +
-                    </button>
-                  ) : null}
                   <button
                     type="button"
                     className="ghost"
@@ -7472,16 +7459,60 @@ function App() {
                   className={feedSource === "local" ? "active" : ""}
                   onClick={() => setFeedSource("local")}
                 >
-                  Me
+                  Create
                 </button>
                 <button
                   type="button"
                   className={feedSource === "bluesky" ? "active" : ""}
                   onClick={() => setFeedSource("bluesky")}
                 >
-                  World
+                  Discover
                 </button>
               </div>
+
+              {feedSource === "local" && !feedSidebarOpen && feedItems.length === 0 && (
+                <div className="feed-create-hero">
+                  <div className="feed-create-hero-icon">✨</div>
+                  <h3>Turn journals into posts</h3>
+                  <p className="text-sm muted">Write in your journal, then use on-device AI to generate tweet-ready posts, threads, and insights.</p>
+                  <div className="row" style={{ gap: '0.5rem', flexWrap: 'wrap', justifyContent: 'center' }}>
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => setMobileTab("journal")}
+                    >
+                      Open Journal
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => {
+                        setFeedSidebarOpen(true);
+                        setFeedCreateWorkflowOpen(false);
+                      }}
+                    >
+                      Run AI Extractor
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {feedSource === "local" && !feedSidebarOpen && feedItems.length > 0 && (
+                <div className="row" style={{ gap: '0.5rem', marginBottom: '0.5rem' }}>
+                  <button
+                    type="button"
+                    className="primary text-sm"
+                    style={{ flex: 1, borderRadius: '10px' }}
+                    onClick={() => {
+                      setFeedSidebarOpen(true);
+                      setFeedCreateWorkflowOpen(false);
+                    }}
+                    disabled={workspaceSynthBusy || workspaceSynthRunning}
+                  >
+                    {workspaceSynthBusy || workspaceSynthRunning ? "AI Running..." : `✨ Generate More (${workspaceSynthPendingCount} pending)`}
+                  </button>
+                </div>
+              )}
 
               {feedSource === "local" && feedSidebarOpen ? (
                 <div className="feed-workflow-drawer">
@@ -8681,6 +8712,8 @@ function App() {
               formatEventTiming={formatEventTiming}
               formatTimestamp={formatTimestamp}
               onToggleTodo={(item) => void toggleWorkspaceTodo(item)}
+              onExtractTasks={() => void runWorkspaceSynthesizerManual()}
+              extractingTasks={workspaceSynthBusy || workspaceSynthRunning}
             />
           </ViewErrorBoundary>
         ) : null}
