@@ -52,7 +52,7 @@ mod engine {
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
-    use llama_cpp_2::model::LlamaModel;
+    use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
     use llama_cpp_2::sampling::LlamaSampler;
 
     /// Singleton inference engine state.
@@ -88,6 +88,31 @@ mod engine {
             ));
         }
 
+        // Pre-check: validate file is readable and has reasonable size
+        let file_meta = std::fs::metadata(&path)
+            .map_err(|e| format!("Cannot read model file metadata: {e} — path: {}", path.display()))?;
+        let file_size = file_meta.len();
+        if file_size < 1024 {
+            return Err(format!(
+                "Model file is too small ({file_size} bytes). File may be corrupted. Re-download the model."
+            ));
+        }
+
+        // Pre-check: validate GGUF magic number (first 4 bytes = "GGUF")
+        let mut magic = [0u8; 4];
+        std::fs::File::open(&path)
+            .and_then(|mut f| {
+                use std::io::Read;
+                f.read_exact(&mut magic)
+            })
+            .map_err(|e| format!("Cannot read model file header: {e}"))?;
+        if &magic != b"GGUF" {
+            return Err(format!(
+                "File is not a valid GGUF model (magic: {:?}). Re-download the model.",
+                magic
+            ));
+        }
+
         let engine = get_engine();
         let mut state = engine
             .lock()
@@ -100,14 +125,43 @@ mod engine {
             }
         }
 
-        // Drop previous model
+        // Drop previous model before loading new one (frees GPU/RAM)
         state.model = None;
 
-        // Load with Metal GPU layers (use 99 to offload all layers to GPU)
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(99);
+        // On iOS, disable mmap — iOS sandbox restricts mmap on large files
+        // and it can cause the OS to kill the app for memory pressure.
+        // Also use fewer GPU layers initially for stability.
+        let is_ios = cfg!(target_os = "ios");
+        let model_params = {
+            let params = LlamaModelParams::default()
+                .with_n_gpu_layers(99);
+            if is_ios {
+                params.with_use_mmap(false)
+            } else {
+                params
+            }
+        };
+
+        eprintln!(
+            "[inference] Loading model '{}' ({:.1} GB) mmap={} gpu_layers=99 path={}",
+            model_id,
+            file_size as f64 / 1_073_741_824.0,
+            !is_ios,
+            path.display()
+        );
 
         let model = LlamaModel::load_from_file(&state.backend, &path, &model_params)
-            .map_err(|e| format!("Failed to load GGUF model: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to load GGUF model '{}' ({:.1} GB): {e}. \
+                     This may happen if the model is too large for this device's available memory, \
+                     or if the model format is not supported by this build.",
+                    model_id,
+                    file_size as f64 / 1_073_741_824.0
+                )
+            })?;
+
+        eprintln!("[inference] Model loaded successfully: {model_id}");
 
         state.model = Some(LoadedModel {
             model,
@@ -131,17 +185,38 @@ mod engine {
 
         let model = &loaded.model;
 
-        // Build the prompt with optional system prompt
-        let full_prompt = if let Some(sys) = &req.system_prompt {
-            format!(
-                "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-                req.prompt
-            )
-        } else {
-            format!(
-                "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-                req.prompt
-            )
+        // Build the prompt using the model's built-in chat template.
+        // This handles Gemma (<start_of_turn>), Llama, ChatML, etc. automatically.
+        let mut messages: Vec<LlamaChatMessage> = Vec::new();
+        if let Some(sys) = &req.system_prompt {
+            messages.push(
+                LlamaChatMessage::new("system".to_string(), sys.clone())
+                    .map_err(|e| format!("system message error: {e}"))?,
+            );
+        }
+        messages.push(
+            LlamaChatMessage::new("user".to_string(), req.prompt.clone())
+                .map_err(|e| format!("user message error: {e}"))?,
+        );
+
+        let full_prompt = match model.chat_template(None) {
+            Ok(tmpl) => model
+                .apply_chat_template(&tmpl, &messages, true)
+                .map_err(|e| format!("chat template failed: {e}"))?,
+            Err(_) => {
+                // Fallback to ChatML if model has no embedded template
+                if let Some(sys) = &req.system_prompt {
+                    format!(
+                        "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                        req.prompt
+                    )
+                } else {
+                    format!(
+                        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                        req.prompt
+                    )
+                }
+            }
         };
 
         // Tokenize the prompt
@@ -216,17 +291,21 @@ mod engine {
         };
 
         // Detokenize output
-        let text = output_tokens
+        let text: String = output_tokens
             .iter()
-            .map(|&t| model.token_to_str(t, llama_cpp_2::model::Special::Tokenize))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("detokenization failed: {e}"))?
-            .join("");
+            .map(|&t| {
+                match model.token_to_piece_bytes(t, 128, true, None) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(_) => String::new(),
+                }
+            })
+            .collect();
 
-        // Clean up ChatML end tokens from output
+        // Clean up chat template end tokens from output
         let cleaned = text
             .trim_end_matches("<|im_end|>")
             .trim_end_matches("<|endoftext|>")
+            .trim_end_matches("<end_of_turn>")
             .trim()
             .to_string();
 
