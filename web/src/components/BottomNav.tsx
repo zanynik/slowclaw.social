@@ -76,7 +76,7 @@ export function BottomNav({
           <path d="M7 15h8" />
         </svg>
         <span className="bottom-nav-label">
-          <span className="bottom-nav-label-full">Productivity</span>
+          <span className="bottom-nav-label-full">Tasks</span>
           <span className="bottom-nav-label-short" aria-hidden="true">Tasks</span>
           {productivityBadgeCount > 0 ? (
             <span className="bottom-nav-badge">{productivityBadgeCount}</span>
