@@ -246,7 +246,36 @@ mod engine {
             .str_to_token(&full_prompt, llama_cpp_2::model::AddBos::Always)
             .map_err(|e| format!("tokenization failed: {e}"))?;
 
-        let n_ctx = 2048u32.min(req.max_tokens + tokens.len() as u32 + 64);
+        // ── Context sizing & prompt truncation ─────────────────────────
+        // iOS has limited RAM; cap the KV-cache to a safe ceiling.
+        // The context must fit: prompt_tokens + generation headroom.
+        // If the prompt is too long, truncate it (keep start + end).
+        let max_ctx: u32 = if cfg!(target_os = "ios") { 2048 } else { 4096 };
+        let gen_headroom = req.max_tokens.min(max_ctx / 2);
+        let max_prompt_tokens = (max_ctx - gen_headroom - 8) as usize; // 8 for safety margin
+
+        let tokens = if tokens.len() > max_prompt_tokens {
+            eprintln!(
+                "[inference] Prompt too long ({} tokens), truncating to {} (ctx={})",
+                tokens.len(), max_prompt_tokens, max_ctx
+            );
+            // Keep the first 80% and last 20% of the budget so the model
+            // sees both the instruction/system prompt and the tail of the content.
+            let keep_start = max_prompt_tokens * 4 / 5;
+            let keep_end = max_prompt_tokens - keep_start;
+            let mut truncated = tokens[..keep_start].to_vec();
+            truncated.extend_from_slice(&tokens[tokens.len() - keep_end..]);
+            truncated
+        } else {
+            tokens
+        };
+
+        let n_ctx = (tokens.len() as u32 + gen_headroom + 8).min(max_ctx);
+        eprintln!(
+            "[inference] Context: n_ctx={} prompt_tokens={} gen_headroom={}",
+            n_ctx, tokens.len(), gen_headroom
+        );
+
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
             .with_n_batch(512);
@@ -279,15 +308,22 @@ mod engine {
         let mut output_tokens = Vec::new();
         let mut n_cur = tokens.len() as i32;
         let start_time = std::time::Instant::now();
-        let max_tokens = req.max_tokens as usize;
+        // Limit generation to what fits in the context window
+        let max_gen = (gen_headroom as usize).min(req.max_tokens as usize);
         let mut stop_reason = "max_tokens".to_string();
 
-        for _ in 0..max_tokens {
+        for _ in 0..max_gen {
             let new_token = sampler.sample(&ctx, batch.n_tokens() - 1);
 
             // Check for EOS
             if model.is_eog_token(new_token) {
                 stop_reason = "eos".to_string();
+                break;
+            }
+
+            // Guard against overflowing the context window
+            if (n_cur + 1) as u32 >= n_ctx {
+                stop_reason = "context_full".to_string();
                 break;
             }
 
