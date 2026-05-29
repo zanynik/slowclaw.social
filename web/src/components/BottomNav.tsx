@@ -1,11 +1,8 @@
 /**
  * BottomNav.tsx — Mobile tab bar component.
  *
- * Extracted from the 8800-line App.tsx monolith. Fixes the missing Profile tab
- * that existed in state but was never rendered. Adds haptic feedback for iOS,
- * smoother active state transitions, and proper accessibility attributes.
- *
- * Inspired by Atomic Chat's clean component decomposition pattern.
+ * Four tabs: Journal, Feed, Tasks, Profile.
+ * Settings is accessed via the gear icon in the top-right header.
  */
 
 type MobileTab = "journal" | "feed" | "productivity" | "profile";
@@ -72,12 +69,9 @@ export function BottomNav({
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M9 11l3 3L22 4" />
           <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-          <path d="M7 7h6" />
-          <path d="M7 15h8" />
         </svg>
         <span className="bottom-nav-label">
-          <span className="bottom-nav-label-full">Tasks</span>
-          <span className="bottom-nav-label-short" aria-hidden="true">Tasks</span>
+          Tasks
           {productivityBadgeCount > 0 ? (
             <span className="bottom-nav-badge">{productivityBadgeCount}</span>
           ) : null}
