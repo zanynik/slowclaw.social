@@ -37,6 +37,7 @@ import {
   nativeAiChat,
   nativeAiEngineStatus,
   transcribeAudio,
+  setMetalMode as setMetalModeBackend,
   startRecording as startNativeAudioRecording,
   stopRecording as stopNativeAudioRecording,
   blobToBase64,
@@ -200,6 +201,7 @@ function savePersistedTodos(todos: PersistedTodo[]) {
 const LOCAL_JOURNAL_PATH_PREFIX = "journal://";
 const UI_THEME_STORAGE_KEY = "slowclaw.ui.theme";
 const UI_TAB_STORAGE_KEY = "slowclaw.ui.tab";
+const AI_METAL_MODE_KEY = "slowclaw.settings.metalMode";
 
 const DESKTOP_SECRET_SERVICE = "social.slowclaw.gateway";
 const PROVIDER_API_KEY_SECRET_ACCOUNT = "provider.api_key";
@@ -1130,6 +1132,9 @@ function App() {
   const [settingsTranscriptionModel, setSettingsTranscriptionModel] = useState("");
   const [settingsAvailableTranscriptionModels, setSettingsAvailableTranscriptionModels] = useState<string[]>([]);
   const [localModelNames, setLocalModelNames] = useState<string[]>([]);
+  const [metalMode, setMetalMode] = useState<boolean>(() => {
+    try { return localStorage.getItem(AI_METAL_MODE_KEY) === "true"; } catch { return false; }
+  });
   const [runtimeMediaCapabilities, setRuntimeMediaCapabilities] = useState<MediaCapabilities | null>(null);
   const [runtimeMediaSummary, setRuntimeMediaSummary] = useState("");
   const [settingsConfigBusy, setSettingsConfigBusy] = useState(false);
@@ -6151,6 +6156,10 @@ function App() {
   // Load local model catalog on app startup
   useEffect(() => {
     void loadLocalModels();
+    // Sync Metal mode preference to backend on startup
+    if (metalMode && isTauriMobileRuntime()) {
+      void setMetalModeBackend(true).catch(() => {});
+    }
   }, [chatGatewayToken, gatewayBaseUrl]);
 
   // Re-check model status when app comes back to foreground (after screen lock/unlock)
@@ -8611,7 +8620,7 @@ function App() {
                   const total = download?.totalBytes || model.sizeBytes || 0;
                   const progress = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 0;
                   const isConfigured = nativeLocalAiStatus?.modelId === model.id;
-                  const isInCatalog = ["unsloth/gemma-4-E2B-it-Q4_K_M"].includes(model.id);
+                  const isInCatalog = ["unsloth/gemma-4-E2B-it-Q3_K_M", "unsloth/gemma-4-E2B-it-Q4_K_M"].includes(model.id);
                   return (
                     <div key={model.id} className="card" style={{ margin: '0.5rem 0' }}>
                       <div className="row-between">
@@ -8688,6 +8697,45 @@ function App() {
                 {localModelsStatus ? (
                   <p className="text-sm muted" style={{ margin: '0.5rem 0 0' }}>{localModelsStatus}</p>
                 ) : null}
+
+                {/* Metal GPU toggle */}
+                <div style={{ marginTop: '1rem', padding: '0.75rem', borderRadius: '10px', background: 'var(--surface-2, #f5f5f5)' }}>
+                  <div className="row-between" style={{ alignItems: 'center' }}>
+                    <div>
+                      <strong className="text-sm">⚡ Fast Mode (Metal GPU)</strong>
+                      <p className="text-sm muted" style={{ margin: '0.15rem 0 0' }}>
+                        Faster generation, may be unstable on some devices.
+                      </p>
+                    </div>
+                    <label style={{ position: 'relative', display: 'inline-block', width: '50px', height: '28px' }}>
+                      <input
+                        type="checkbox"
+                        checked={metalMode}
+                        onChange={async (e) => {
+                          const enabled = e.target.checked;
+                          setMetalMode(enabled);
+                          localStorage.setItem(AI_METAL_MODE_KEY, String(enabled));
+                          try {
+                            await setMetalModeBackend(enabled);
+                            setLocalModelsStatus(enabled ? "Metal GPU enabled. Model will reload on next generation." : "Metal GPU disabled. Using stable CPU mode.");
+                          } catch { /* non-native env */ }
+                        }}
+                        style={{ opacity: 0, width: 0, height: 0 }}
+                      />
+                      <span style={{
+                        position: 'absolute', cursor: 'pointer', inset: 0,
+                        background: metalMode ? 'var(--accent, #007aff)' : '#ccc',
+                        borderRadius: '28px', transition: 'background 0.2s',
+                      }}>
+                        <span style={{
+                          position: 'absolute', height: '22px', width: '22px',
+                          left: metalMode ? '25px' : '3px', bottom: '3px',
+                          background: '#fff', borderRadius: '50%', transition: 'left 0.2s',
+                        }} />
+                      </span>
+                    </label>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
