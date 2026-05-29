@@ -11,6 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::async_runtime::JoinHandle;
 use tauri::Manager;
 
+mod inference;
+
 const EMBEDDED_GATEWAY_URL: &str = "http://127.0.0.1:42617";
 const PROVIDER_SECRET_SERVICE: &str = "social.slowclaw.gateway";
 const PROVIDER_API_KEY_SECRET_ACCOUNT: &str = "provider.api_key";
@@ -220,23 +222,35 @@ struct NativeLocalAiPersistedState {
 }
 
 fn default_native_local_ai_status() -> NativeLocalAiStatus {
+    let engine_compiled = cfg!(feature = "native-inference");
     NativeLocalAiStatus {
         provider: NATIVE_LOCAL_AI_PROVIDER.to_string(),
         configured: false,
-        available: false,
+        available: engine_compiled,
         running: false,
-        state: "engine_missing".to_string(),
+        state: if engine_compiled {
+            "ready".to_string()
+        } else {
+            "engine_missing".to_string()
+        },
         model_id: None,
         model_path: None,
         api_url: NATIVE_LOCAL_AI_URL.to_string(),
-        message: if cfg!(mobile) {
-            "SlowClaw is wired for a native iOS local AI engine, but the llama.cpp/TurboQuant engine is not bundled yet."
+        message: if engine_compiled {
+            "Native local AI engine is available. Download and select a model to get started."
+                .to_string()
+        } else if cfg!(mobile) {
+            "SlowClaw is wired for a native iOS local AI engine, but the llama.cpp engine is not compiled into this build."
                 .to_string()
         } else {
             "SlowClaw native local AI is intended for iOS. Desktop can use the llama.cpp server runtime."
                 .to_string()
         },
-        error: Some("Native local inference engine is not bundled yet.".to_string()),
+        error: if engine_compiled {
+            None
+        } else {
+            Some("Native local inference engine is not compiled into this build.".to_string())
+        },
     }
 }
 
@@ -288,31 +302,39 @@ async fn load_native_local_ai_state(
 
 fn status_from_native_local_ai_state(saved: NativeLocalAiPersistedState) -> NativeLocalAiStatus {
     let model_exists = std::path::Path::new(&saved.model_path).is_file();
+    let engine_compiled = cfg!(feature = "native-inference");
     NativeLocalAiStatus {
         provider: NATIVE_LOCAL_AI_PROVIDER.to_string(),
         configured: true,
-        available: false,
+        available: engine_compiled && model_exists,
         running: false,
-        state: if model_exists {
-            "configured_engine_missing".to_string()
-        } else {
+        state: if !model_exists {
             "model_missing".to_string()
+        } else if engine_compiled {
+            "configured".to_string()
+        } else {
+            "configured_engine_missing".to_string()
         },
         model_id: Some(saved.model_id),
         model_path: Some(saved.model_path),
         api_url: NATIVE_LOCAL_AI_URL.to_string(),
-        message: if model_exists {
-            "SlowClaw restored the selected native local AI model. The remaining engine slice is to link llama.cpp/TurboQuant behind this bridge."
-                .to_string()
-        } else {
+        message: if !model_exists {
             "SlowClaw found a saved native local AI model selection, but the GGUF file is missing. Re-download the model."
                 .to_string()
-        },
-        error: Some(if model_exists {
-            "Native local inference engine is not bundled yet.".to_string()
+        } else if engine_compiled {
+            "Model is ready for on-device inference. Tap 'Generate' on a journal entry to use local AI."
+                .to_string()
         } else {
-            "Downloaded model file was not found on this device.".to_string()
-        }),
+            "SlowClaw restored the selected native local AI model. The inference engine must be compiled with the native-inference feature."
+                .to_string()
+        },
+        error: if model_exists && engine_compiled {
+            None
+        } else if !model_exists {
+            Some("Downloaded model file was not found on this device.".to_string())
+        } else {
+            Some("Native local inference engine is not compiled into this build.".to_string())
+        },
     }
 }
 
@@ -2041,17 +2063,30 @@ async fn configure_native_local_ai(
 
     sync_native_local_ai_env(&model_id, &model_path);
 
+    let engine_compiled = cfg!(feature = "native-inference");
     let status = NativeLocalAiStatus {
         provider: NATIVE_LOCAL_AI_PROVIDER.to_string(),
         configured: true,
-        available: false,
+        available: engine_compiled,
         running: false,
-        state: "configured_engine_missing".to_string(),
+        state: if engine_compiled {
+            "configured".to_string()
+        } else {
+            "configured_engine_missing".to_string()
+        },
         model_id: Some(model_id),
         model_path: Some(model_path),
         api_url: NATIVE_LOCAL_AI_URL.to_string(),
-        message: "SlowClaw saved this model for the native iOS local AI provider and passed the GGUF path to the embedded gateway. The remaining engine slice is to link llama.cpp/TurboQuant behind this bridge.".to_string(),
-        error: Some("Native local inference engine is not bundled yet.".to_string()),
+        message: if engine_compiled {
+            "Model configured. Tap 'Generate' on a journal entry to use on-device AI.".to_string()
+        } else {
+            "SlowClaw saved this model for the native iOS local AI provider. The inference engine must be compiled with the native-inference feature.".to_string()
+        },
+        error: if engine_compiled {
+            None
+        } else {
+            Some("Native local inference engine is not compiled into this build.".to_string())
+        },
     };
 
     {
@@ -2076,6 +2111,71 @@ fn show_main_window(window: tauri::Window) {
     {
         let _ = window;
     }
+}
+
+#[tauri::command]
+async fn native_ai_load_model(
+    state: tauri::State<'_, NativeLocalAiState>,
+) -> Result<String, String> {
+    let status = snapshot_native_local_ai_status(&state.inner)?;
+    let model_id = status.model_id.ok_or(
+        "No model configured. Download and select a model from the Profile tab.",
+    )?;
+    let model_path = status.model_path.ok_or(
+        "No model path configured. Download and select a model from the Profile tab.",
+    )?;
+    // Run model loading on a blocking thread to avoid blocking the async runtime
+    tauri::async_runtime::spawn_blocking(move || {
+        inference::load_model(&model_id, &model_path)
+    })
+    .await
+    .map_err(|e| format!("Model load task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn native_ai_chat(
+    state: tauri::State<'_, NativeLocalAiState>,
+    prompt: String,
+    system_prompt: Option<String>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+) -> Result<inference::InferenceResponse, String> {
+    // Auto-load the model if not loaded yet
+    if !inference::is_model_loaded() {
+        let status = snapshot_native_local_ai_status(&state.inner)?;
+        if let (Some(model_id), Some(model_path)) = (status.model_id, status.model_path) {
+            tauri::async_runtime::spawn_blocking(move || {
+                inference::load_model(&model_id, &model_path)
+            })
+            .await
+            .map_err(|e| format!("Model load task failed: {e}"))??;
+        } else {
+            return Err(
+                "No model configured. Download and select a model from the Profile tab."
+                    .to_string(),
+            );
+        }
+    }
+
+    let req = inference::InferenceRequest {
+        prompt,
+        max_tokens: max_tokens.unwrap_or(512),
+        temperature: temperature.unwrap_or(0.7),
+        system_prompt,
+    };
+
+    tauri::async_runtime::spawn_blocking(move || inference::run_inference(&req))
+        .await
+        .map_err(|e| format!("Inference task failed: {e}"))?
+}
+
+#[tauri::command]
+fn native_ai_engine_status() -> serde_json::Value {
+    serde_json::json!({
+        "engineAvailable": cfg!(feature = "native-inference"),
+        "modelLoaded": inference::is_model_loaded(),
+        "loadedModelId": inference::loaded_model_id(),
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2126,7 +2226,10 @@ pub fn run() {
             list_ollama_models,
             check_ollama,
             download_ollama_model,
-            show_main_window
+            show_main_window,
+            native_ai_load_model,
+            native_ai_chat,
+            native_ai_engine_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");
