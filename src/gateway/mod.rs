@@ -1497,25 +1497,82 @@ async fn download_local_model(
             .await
             .context("failed to create local model directory")?;
 
-        let response = reqwest::Client::new()
-            .get(spec.download_url)
+        // ── Resume support ──────────────────────────────────────────
+        // If a previous download was interrupted (screen lock, crash,
+        // network loss), resume from the last byte written to the temp
+        // file instead of starting over.
+        let mut existing_bytes: u64 = 0;
+        if tmp_path.exists() {
+            existing_bytes = tokio::fs::metadata(&tmp_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+        }
+
+        // Build request with Range header for resume
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3600)) // 1h timeout for large files
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("failed to create HTTP client")?;
+
+        let mut request = client.get(spec.download_url);
+        if existing_bytes > 0 {
+            // Request remaining bytes from where we left off
+            request = request.header("Range", format!("bytes={existing_bytes}-"));
+            eprintln!(
+                "[model-download] resuming {} from byte {existing_bytes}",
+                spec.id
+            );
+        }
+
+        let response = request
             .send()
             .await
-            .context("failed to start model download")?
-            .error_for_status()
-            .context("model download returned an error")?;
-        let total = response.content_length().or(Some(spec.size_bytes));
+            .context("failed to start model download")?;
+
+        let status = response.status();
+        // 206 = Partial Content (resume worked), 200 = full download
+        if !status.is_success() && status.as_u16() != 206 {
+            anyhow::bail!("model download returned HTTP {status}");
+        }
+
+        // If server doesn't support Range (returns 200 instead of 206),
+        // start from scratch.
+        let actually_resuming = status.as_u16() == 206 && existing_bytes > 0;
+        let mut transferred = if actually_resuming { existing_bytes } else { 0u64 };
+
+        let total = if actually_resuming {
+            // Server told us content-length of remaining bytes
+            response
+                .content_length()
+                .map(|remaining| existing_bytes + remaining)
+                .or(Some(spec.size_bytes))
+        } else {
+            response.content_length().or(Some(spec.size_bytes))
+        };
+
         {
             let mut guard = jobs.lock();
             if let Some(job) = guard.get_mut(spec.id) {
                 job.total_bytes = total;
+                job.transferred_bytes = transferred;
             }
         }
 
-        let mut file = tokio::fs::File::create(&tmp_path)
-            .await
-            .context("failed to create temporary model file")?;
-        let mut transferred = 0u64;
+        // Open file: append if resuming, create if fresh
+        let mut file = if actually_resuming {
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&tmp_path)
+                .await
+                .context("failed to open temp file for resume")?  
+        } else {
+            tokio::fs::File::create(&tmp_path)
+                .await
+                .context("failed to create temporary model file")?
+        };
+
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("failed while reading model download stream")?;
@@ -1530,6 +1587,17 @@ async fn download_local_model(
             }
         }
         file.flush().await.context("failed to flush model download")?;
+
+        // Verify we got enough data (at least 90% of expected size)
+        let min_expected = (spec.size_bytes as f64 * 0.9) as u64;
+        if transferred < min_expected {
+            anyhow::bail!(
+                "download appears incomplete: got {} bytes, expected ~{}",
+                transferred,
+                spec.size_bytes
+            );
+        }
+
         if final_path.exists() {
             let _ = tokio::fs::remove_file(&final_path).await;
         }
@@ -1556,15 +1624,27 @@ async fn download_local_model(
             );
         }
         Err(err) => {
-            let _ = std::fs::remove_file(&tmp_path);
+            // Keep the temp file for resume — don't delete it!
+            // Only delete if the error indicates corruption (verification failure).
+            let err_msg = err.to_string();
+            if err_msg.contains("incomplete") {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            let resumed_bytes = std::fs::metadata(&tmp_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
             guard.insert(
                 spec.id.to_string(),
                 LocalModelDownloadJob {
                     model_id: spec.id.to_string(),
                     status: "failed".to_string(),
-                    transferred_bytes: 0,
+                    transferred_bytes: resumed_bytes,
                     total_bytes: Some(spec.size_bytes),
-                    error: Some(err.to_string()),
+                    error: Some(if resumed_bytes > 0 {
+                        format!("{err_msg} — tap Download to resume from {:.0}%", (resumed_bytes as f64 / spec.size_bytes as f64) * 100.0)
+                    } else {
+                        err_msg
+                    }),
                     path: None,
                 },
             );
