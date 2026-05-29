@@ -293,6 +293,19 @@ export async function nativeAiEngineStatus(): Promise<NativeAiEngineStatus> {
 }
 
 // ─────────────────────────────────────────────
+// Audio transcription (iOS Speech.framework)
+// ─────────────────────────────────────────────
+
+export type TranscriptionResult = {
+  text: string;
+  durationSeconds: number;
+};
+
+export async function transcribeAudio(audioPath: string): Promise<TranscriptionResult> {
+  return invoke("transcribe_audio", { audioPath });
+}
+
+// ─────────────────────────────────────────────
 // Keyring / secrets (existing commands, kept for Bluesky credentials)
 // ─────────────────────────────────────────────
 
