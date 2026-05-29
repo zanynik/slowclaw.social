@@ -339,7 +339,7 @@ jobs:
                   APPLE_PROVISIONING_PROFILE_NAME="$(cat "${WRAPPER_DIR}/profile_name")"
                   DEVELOPER_DIR="$(xcode-select -p)"
                   SWIFT_LINKER_FLAGS="\$(inherited) -L${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos -L${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/iphoneos -L/usr/lib/swift"
-                  FRAMEWORK_FLAGS="-framework Accelerate -framework Metal -framework MetalKit -framework Foundation"
+                  FRAMEWORK_FLAGS="-framework Accelerate -framework Metal -framework MetalKit -framework Foundation -framework Speech -framework AVFoundation"
 
                   exec "${REAL_XCODEBUILD}" \
                     -authenticationKeyPath "${ASC_KEY_PATH:?}" \
