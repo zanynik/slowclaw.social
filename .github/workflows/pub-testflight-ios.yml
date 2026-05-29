@@ -339,6 +339,7 @@ jobs:
                   APPLE_PROVISIONING_PROFILE_NAME="$(cat "${WRAPPER_DIR}/profile_name")"
                   DEVELOPER_DIR="$(xcode-select -p)"
                   SWIFT_LINKER_FLAGS="\$(inherited) -L${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos -L${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/iphoneos -L/usr/lib/swift"
+                  FRAMEWORK_FLAGS="-framework Accelerate -framework Metal -framework MetalKit -framework Foundation"
 
                   exec "${REAL_XCODEBUILD}" \
                     -authenticationKeyPath "${ASC_KEY_PATH:?}" \
@@ -348,7 +349,7 @@ jobs:
                     CODE_SIGN_STYLE=Manual \
                     CODE_SIGN_IDENTITY="Apple Distribution" \
                     PROVISIONING_PROFILE_SPECIFIER="${APPLE_PROVISIONING_PROFILE_NAME:?}" \
-                    OTHER_LDFLAGS="${SWIFT_LINKER_FLAGS}" \
+                    OTHER_LDFLAGS="${SWIFT_LINKER_FLAGS} ${FRAMEWORK_FLAGS}" \
                     "$@"
                   SH
                   chmod 700 "${XCODEBUILD_WRAPPER_DIR}/xcodebuild"
