@@ -1239,10 +1239,22 @@ struct LocalModelIdBody {
 fn local_model_specs() -> &'static [LocalModelSpec] {
     &[
         LocalModelSpec {
-            id: "unsloth/gemma-4-E2B-it-Q4_K_M",
-            title: "Gemma 4 E2B Q4",
+            id: "unsloth/gemma-4-E2B-it-Q3_K_M",
+            title: "Gemma 4 E2B Q3 (Recommended)",
             family: "Gemma",
-            description: "Google's latest 2B model, ~1.5 GB. Great quality for posts and tasks on iPhone.",
+            description: "Smaller & more stable on iPhone. ~1.1 GB, good quality for posts and tasks.",
+            engine: "llama.cpp GGUF",
+            provider: "llamacpp",
+            download_url: "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q3_K_M.gguf",
+            file_name: "gemma-4-E2B-it-Q3_K_M.gguf",
+            size_label: "1.1 GB",
+            size_bytes: 1_100_000_000,
+        },
+        LocalModelSpec {
+            id: "unsloth/gemma-4-E2B-it-Q4_K_M",
+            title: "Gemma 4 E2B Q4 (Higher Quality)",
+            family: "Gemma",
+            description: "Best quality, larger model. ~1.5 GB. Use if Q3 works well and you want better output.",
             engine: "llama.cpp GGUF",
             provider: "llamacpp",
             download_url: "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf",
