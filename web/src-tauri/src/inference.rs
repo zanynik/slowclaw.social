@@ -194,6 +194,68 @@ mod engine {
         Ok(format!("Model loaded: {model_id}"))
     }
 
+    /// Build a prompt string manually when the model's embedded Jinja2 template
+    /// fails (common with Gemma 4's complex multimodal/tool-calling template).
+    /// Detects model family from the model_id and uses the correct format.
+    fn build_fallback_prompt(system_prompt: &Option<String>, user_prompt: &str, model_id: &str) -> String {
+        let id_lower = model_id.to_lowercase();
+        if id_lower.contains("gemma-4") || id_lower.contains("gemma4") {
+            // Gemma 4 format uses <|turn>role / <turn|> delimiters
+            // (NOT <start_of_turn>/<end_of_turn> which was Gemma 3)
+            let mut prompt = String::new();
+            if let Some(sys) = system_prompt {
+                prompt.push_str("<|turn>system\n");
+                prompt.push_str(sys);
+                prompt.push_str("\n<turn|>\n");
+            }
+            prompt.push_str("<|turn>user\n");
+            prompt.push_str(user_prompt);
+            prompt.push_str("<turn|>\n");
+            prompt.push_str("<|turn>model\n");
+            prompt
+        } else if id_lower.contains("gemma") {
+            // Gemma 2/3 format
+            let mut prompt = String::new();
+            if let Some(sys) = system_prompt {
+                prompt.push_str("<start_of_turn>user\n");
+                prompt.push_str(sys);
+                prompt.push_str("\n\n");
+                prompt.push_str(user_prompt);
+                prompt.push_str("<end_of_turn>\n");
+            } else {
+                prompt.push_str("<start_of_turn>user\n");
+                prompt.push_str(user_prompt);
+                prompt.push_str("<end_of_turn>\n");
+            }
+            prompt.push_str("<start_of_turn>model\n");
+            prompt
+        } else if id_lower.contains("llama") {
+            // Llama 3 format
+            let mut prompt = String::new();
+            if let Some(sys) = system_prompt {
+                prompt.push_str("<|start_header_id|>system<|end_header_id|>\n\n");
+                prompt.push_str(sys);
+                prompt.push_str("<|eot_id|>");
+            }
+            prompt.push_str("<|start_header_id|>user<|end_header_id|>\n\n");
+            prompt.push_str(user_prompt);
+            prompt.push_str("<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n");
+            prompt
+        } else {
+            // ChatML fallback (Qwen, Mistral, generic)
+            let mut prompt = String::new();
+            if let Some(sys) = system_prompt {
+                prompt.push_str("<|im_start|>system\n");
+                prompt.push_str(sys);
+                prompt.push_str("<|im_end|>\n");
+            }
+            prompt.push_str("<|im_start|>user\n");
+            prompt.push_str(user_prompt);
+            prompt.push_str("<|im_end|>\n<|im_start|>assistant\n");
+            prompt
+        }
+    }
+
     pub fn run_inference(req: &InferenceRequest) -> Result<InferenceResponse, String> {
         let engine = get_engine();
         let state = engine
@@ -208,7 +270,9 @@ mod engine {
         let model = &loaded.model;
 
         // Build the prompt using the model's built-in chat template.
-        // This handles Gemma (<start_of_turn>), Llama, ChatML, etc. automatically.
+        // Gemma 4 models have complex Jinja2 templates (multimodal, thinking,
+        // tool-calling) that can fail in llama.cpp's limited template engine.
+        // We try the embedded template first, then fall back to known formats.
         let mut messages: Vec<LlamaChatMessage> = Vec::new();
         if let Some(sys) = &req.system_prompt {
             messages.push(
@@ -222,22 +286,16 @@ mod engine {
         );
 
         let full_prompt = match model.chat_template(None) {
-            Ok(tmpl) => model
-                .apply_chat_template(&tmpl, &messages, true)
-                .map_err(|e| format!("chat template failed: {e}"))?,
-            Err(_) => {
-                // Fallback to ChatML if model has no embedded template
-                if let Some(sys) = &req.system_prompt {
-                    format!(
-                        "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-                        req.prompt
-                    )
-                } else {
-                    format!(
-                        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-                        req.prompt
-                    )
+            Ok(tmpl) => match model.apply_chat_template(&tmpl, &messages, true) {
+                Ok(prompt) => prompt,
+                Err(e) => {
+                    eprintln!("[inference] Embedded chat template failed ({e}), using Gemma/manual fallback");
+                    build_fallback_prompt(&req.system_prompt, &req.prompt, &loaded.model_id)
                 }
+            },
+            Err(_) => {
+                eprintln!("[inference] No embedded chat template, using manual fallback");
+                build_fallback_prompt(&req.system_prompt, &req.prompt, &loaded.model_id)
             }
         };
 
@@ -364,6 +422,7 @@ mod engine {
             .trim_end_matches("<|im_end|>")
             .trim_end_matches("<|endoftext|>")
             .trim_end_matches("<end_of_turn>")
+            .trim_end_matches("<turn|>")
             .trim()
             .to_string();
 
