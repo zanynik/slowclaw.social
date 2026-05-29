@@ -1239,10 +1239,22 @@ struct LocalModelIdBody {
 fn local_model_specs() -> &'static [LocalModelSpec] {
     &[
         LocalModelSpec {
+            id: "Qwen/Qwen2.5-1.5B-Instruct-Q4_K_M",
+            title: "Qwen 2.5 1.5B Q4 (Recommended for iPhone)",
+            family: "Qwen",
+            description: "Compact 1.5B model that runs fast on iPhone with ~1 GB RAM. Best starting point for on-device AI.",
+            engine: "llama.cpp GGUF",
+            provider: "llamacpp",
+            download_url: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+            file_name: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+            size_label: "1.0 GB",
+            size_bytes: 1_050_000_000,
+        },
+        LocalModelSpec {
             id: "unsloth/gemma-4-E4B-it-IQ4_XS",
             title: "Gemma 4 E4B IQ4 XS",
             family: "Gemma",
-            description: "AtomicChat-style recommended GGUF model for everyday local chat. Smaller 4-bit-ish quant for phone-first experiments.",
+            description: "Larger 4-bit model for higher quality. Needs ~5 GB RAM — may not load on all iPhones.",
             engine: "llama.cpp GGUF",
             provider: "llamacpp",
             download_url: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-IQ4_XS.gguf",
@@ -1254,7 +1266,7 @@ fn local_model_specs() -> &'static [LocalModelSpec] {
             id: "unsloth/gemma-4-E4B-it-UD-IQ2_XXS",
             title: "Gemma 4 E4B IQ2 XXS",
             family: "Gemma",
-            description: "Smallest listed Gemma 4 E4B GGUF quant from the AtomicChat baseline. Lower quality, but friendlier for constrained storage.",
+            description: "Smallest Gemma 4 quant. Lower quality but fits more devices.",
             engine: "llama.cpp GGUF",
             provider: "llamacpp",
             download_url: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-UD-IQ2_XXS.gguf",
