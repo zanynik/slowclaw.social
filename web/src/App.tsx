@@ -148,7 +148,7 @@ import type {
   WorkspaceSynthesizerStatus,
   WorkspaceTodoItem,
 } from "./lib/gatewayApi";
-import { ProductivityView } from "./views/ProductivityView";
+// ProductivityView removed — tasks now rendered inline with local persistence
 
 const CHAT_THREAD_STORAGE_KEY = "slowclaw.chat.thread_id";
 const CHAT_GATEWAY_BASE_URL_STORAGE_KEY = "slowclaw.chat.gateway_base_url";
@@ -157,6 +157,45 @@ const SYNC_PEER_GATEWAY_BASE_URL_STORAGE_KEY = "slowclaw.sync.peer.gateway_base_
 const SYNC_PEER_GATEWAY_TOKEN_STORAGE_KEY = "slowclaw.sync.peer.gateway_token";
 const CHAT_PROVIDER_STORAGE_KEY = "slowclaw.settings.provider";
 const CHAT_MODEL_STORAGE_KEY = "slowclaw.settings.model";
+const PERSISTED_POSTS_KEY = "slowclaw.generated_posts";
+const PERSISTED_TODOS_KEY = "slowclaw.extracted_todos";
+
+type PersistedPost = {
+  id: string;
+  text: string;
+  sourceExcerpt: string;
+  createdAt: number;
+};
+
+type PersistedTodo = {
+  id: string;
+  title: string;
+  details: string;
+  done: boolean;
+  createdAt: number;
+};
+
+function loadPersistedPosts(): PersistedPost[] {
+  try {
+    const raw = localStorage.getItem(PERSISTED_POSTS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+function savePersistedPosts(posts: PersistedPost[]) {
+  try { localStorage.setItem(PERSISTED_POSTS_KEY, JSON.stringify(posts)); } catch {}
+}
+
+function loadPersistedTodos(): PersistedTodo[] {
+  try {
+    const raw = localStorage.getItem(PERSISTED_TODOS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+function savePersistedTodos(todos: PersistedTodo[]) {
+  try { localStorage.setItem(PERSISTED_TODOS_KEY, JSON.stringify(todos)); } catch {}
+}
 const LOCAL_JOURNAL_PATH_PREFIX = "journal://";
 const UI_THEME_STORAGE_KEY = "slowclaw.ui.theme";
 const UI_TAB_STORAGE_KEY = "slowclaw.ui.tab";
@@ -988,6 +1027,7 @@ function App() {
   const [desktopQrStatus, setDesktopQrStatus] = useState("");
   const [themeMode, setThemeMode] = useState<ThemeMode>(defaultThemeMode);
   const [mobileTab, setMobileTab] = useState<MobileTab>(defaultMobileTab);
+  const [showSettings, setShowSettings] = useState(false);
   const [journalSidebarOpen, setJournalSidebarOpen] = useState(false);
   const [journalDesktopSidebarCollapsed, setJournalDesktopSidebarCollapsed] = useState(false);
   const [feedSidebarOpen, setFeedSidebarOpen] = useState(false);
@@ -1103,6 +1143,9 @@ function App() {
   const [generatedPost, setGeneratedPost] = useState("");
   const [generatePostBusy, setGeneratePostBusy] = useState(false);
   const [generatePostStatus, setGeneratePostStatus] = useState("");
+  const [persistedPosts, setPersistedPosts] = useState<PersistedPost[]>(loadPersistedPosts);
+  const [persistedTodos, setPersistedTodos] = useState<PersistedTodo[]>(loadPersistedTodos);
+  const [extractingLocalTasks, setExtractingLocalTasks] = useState(false);
   const [mobileScannerActive, setMobileScannerActive] = useState(() => {
     if (typeof window === "undefined") {
       return false;
@@ -5535,6 +5578,33 @@ function App() {
     }
   }
 
+  // ── Chunked inference helpers ──────────────────────────────────────────────
+  // The Qwen 1.5B model on iPhone has a 2048-token context. The system prompt
+  // + chat template overhead consume ~150 tokens, generation needs ~256-512.
+  // That leaves ~1300 tokens for user content (~5200 chars).
+  // For longer notes, we chunk and process each chunk separately.
+  const CHUNK_CHAR_LIMIT = 4800; // conservative chars-per-chunk
+
+  function splitIntoChunks(text: string, limit: number): string[] {
+    if (text.length <= limit) return [text];
+    const chunks: string[] = [];
+    let remaining = text;
+    while (remaining.length > 0) {
+      if (remaining.length <= limit) {
+        chunks.push(remaining);
+        break;
+      }
+      // Try to split at a paragraph or sentence boundary
+      let splitAt = remaining.lastIndexOf('\n\n', limit);
+      if (splitAt < limit * 0.3) splitAt = remaining.lastIndexOf('. ', limit);
+      if (splitAt < limit * 0.3) splitAt = remaining.lastIndexOf(' ', limit);
+      if (splitAt < limit * 0.3) splitAt = limit;
+      chunks.push(remaining.slice(0, splitAt + 1).trim());
+      remaining = remaining.slice(splitAt + 1).trim();
+    }
+    return chunks;
+  }
+
   async function generatePostFromJournal() {
     const content = journalDraftText.trim();
     if (!content) {
@@ -5545,17 +5615,49 @@ function App() {
     setGeneratePostStatus("Generating post with local AI...");
     setGeneratedPost("");
     try {
+      let postText = "";
       if (isTauriMobileRuntime()) {
-        const result = await nativeAiChat(
-          content,
-          "You are a social media content writer. Turn the following journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text, no hashtags unless they add value.",
-          256,
-          0.8
-        );
-        setGeneratedPost(result.text);
-        setGeneratePostStatus(
-          `Generated in ${result.tokensGenerated} tokens (${result.tokensPerSecond.toFixed(1)} tok/s)`
-        );
+        const chunks = splitIntoChunks(content, CHUNK_CHAR_LIMIT);
+        if (chunks.length === 1) {
+          // Single chunk — direct generation
+          const result = await nativeAiChat(
+            content,
+            "You are a social media content writer. Turn the following journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text, no hashtags unless they add value.",
+            256,
+            0.8
+          );
+          postText = result.text;
+          setGeneratePostStatus(
+            `Generated in ${result.tokensGenerated} tokens (${result.tokensPerSecond.toFixed(1)} tok/s)`
+          );
+        } else {
+          // Multi-chunk — summarize each chunk, then compose
+          setGeneratePostStatus(`Processing ${chunks.length} chunks...`);
+          const summaries: string[] = [];
+          for (let i = 0; i < chunks.length; i++) {
+            setGeneratePostStatus(`Summarizing chunk ${i + 1}/${chunks.length}...`);
+            const result = await nativeAiChat(
+              chunks[i],
+              "Summarize the following journal text in 2-3 bullet points. Keep key facts, actions, and feelings. Output ONLY the bullet points.",
+              200,
+              0.4
+            );
+            summaries.push(result.text);
+          }
+          // Final pass: compose a post from the summaries
+          setGeneratePostStatus("Composing final post...");
+          const combined = summaries.join("\n");
+          const finalResult = await nativeAiChat(
+            combined,
+            "You are a social media content writer. Turn these journal summary notes into ONE concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text.",
+            256,
+            0.8
+          );
+          postText = finalResult.text;
+          setGeneratePostStatus(
+            `Generated from ${chunks.length} chunks (${finalResult.tokensPerSecond.toFixed(1)} tok/s)`
+          );
+        }
       } else {
         // Desktop: use the gateway chat endpoint
         const token = await resolveRuntimeGatewayToken();
@@ -5574,8 +5676,23 @@ function App() {
           throw new Error(`Gateway returned ${response.status}`);
         }
         const data = await response.json();
-        setGeneratedPost(data.content || data.text || JSON.stringify(data));
+        postText = data.content || data.text || JSON.stringify(data);
         setGeneratePostStatus("Generated via gateway.");
+      }
+      setGeneratedPost(postText);
+      // Persist to Feed > Create tab
+      if (postText.trim()) {
+        const newPost: PersistedPost = {
+          id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          text: postText.trim(),
+          sourceExcerpt: content.slice(0, 120),
+          createdAt: Date.now(),
+        };
+        setPersistedPosts((prev) => {
+          const next = [newPost, ...prev];
+          savePersistedPosts(next);
+          return next;
+        });
       }
     } catch (error) {
       setGeneratePostStatus(
@@ -5583,6 +5700,70 @@ function App() {
       );
     } finally {
       setGeneratePostBusy(false);
+    }
+  }
+
+  async function extractTasksFromJournals() {
+    // Gather all journal text for task extraction
+    const allJournalText = journalItems
+      .slice(0, 20)
+      .map((item) => item.previewText || item.title || "")
+      .filter((t) => t.trim().length > 10)
+      .join("\n---\n")
+      .trim();
+    if (!allJournalText) {
+      setGeneratePostStatus("No journal entries to extract tasks from.");
+      return;
+    }
+    setExtractingLocalTasks(true);
+    try {
+      const taskSystemPrompt = `You extract action items and tasks from journal entries. Output a JSON array of objects, each with "title" and "details" fields. Only include real actionable tasks. Output ONLY valid JSON, no markdown fences, no commentary. Example: [{"title":"Buy groceries","details":"Need milk and eggs"}]`;
+
+      const chunks = splitIntoChunks(allJournalText, CHUNK_CHAR_LIMIT);
+      const allParsed: Array<{ title: string; details?: string }> = [];
+
+      for (let i = 0; i < chunks.length; i++) {
+        if (chunks.length > 1) {
+          setGeneratePostStatus(`Extracting tasks from chunk ${i + 1}/${chunks.length}...`);
+        }
+        const result = await nativeAiChat(chunks[i], taskSystemPrompt, 512, 0.3);
+        try {
+          const cleaned = result.text.replace(/^```json?\n?/i, "").replace(/```$/, "").trim();
+          const parsed = JSON.parse(cleaned);
+          if (Array.isArray(parsed)) allParsed.push(...parsed);
+        } catch {
+          const lines = result.text.split("\n").filter((l) => l.trim().startsWith("-") || l.trim().startsWith("*"));
+          allParsed.push(...lines.map((l) => ({ title: l.replace(/^[-*]\s*/, "").trim() })));
+        }
+      }
+
+      if (allParsed.length > 0) {
+        const newTodos: PersistedTodo[] = allParsed
+          .filter((t) => t.title?.trim())
+          .map((t) => ({
+            id: `todo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            title: t.title.trim(),
+            details: (t.details || "").trim(),
+            done: false,
+            createdAt: Date.now(),
+          }));
+        setPersistedTodos((prev) => {
+          const existingTitles = new Set(prev.map((t) => t.title.toLowerCase()));
+          const unique = newTodos.filter((t) => !existingTitles.has(t.title.toLowerCase()));
+          const next = [...unique, ...prev];
+          savePersistedTodos(next);
+          return next;
+        });
+        setGeneratePostStatus(`Extracted ${allParsed.length} tasks from ${chunks.length} chunk${chunks.length > 1 ? 's' : ''}`);
+      } else {
+        setGeneratePostStatus("No tasks found in journal entries.");
+      }
+    } catch (error) {
+      setGeneratePostStatus(
+        `Task extraction failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setExtractingLocalTasks(false);
     }
   }
 
@@ -5927,15 +6108,15 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (mobileTab !== "profile") {
+    if (!showSettings) {
       return;
     }
     void loadRuntimeConfigForSettings();
     void loadLocalModels();
-  }, [mobileTab, chatGatewayToken, gatewayBaseUrl]);
+  }, [showSettings, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
-    if (mobileTab !== "profile") {
+    if (!showSettings) {
       return;
     }
     const hasActiveDownload = localModels.some((model) => model.download?.status === "downloading");
@@ -5952,6 +6133,21 @@ function App() {
     }, 2000);
     return () => window.clearInterval(timer);
   }, [mobileTab, localModels, localModelRuntime?.running]);
+
+  // Auto-show onboarding/settings when no model is downloaded on first load
+  useEffect(() => {
+    // Wait until models have been loaded at least once
+    if (localModels.length === 0) return;
+    const hasInstalledModel = localModels.some((m) => m.installed);
+    if (!hasInstalledModel) {
+      setShowSettings(true);
+    }
+  }, [localModels.length > 0 && localModels.some((m) => m.installed)]);
+
+  // Load models on app startup so onboarding can detect whether to show
+  useEffect(() => {
+    void loadLocalModels();
+  }, [chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     if (mobileTab !== "feed" && mobileTab !== "profile" && mobileTab !== "journal") {
@@ -7015,8 +7211,8 @@ function App() {
             </button>
             <button
               type="button"
-              className={`ghost ${mobileTab === "profile" ? "active-icon-btn" : ""}`}
-              onClick={() => setMobileTab("profile")}
+              className={`ghost ${showSettings ? "active-icon-btn" : ""}`}
+              onClick={() => setShowSettings((prev) => !prev)}
               title="Settings"
             >
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82L4.21 7.1a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
@@ -7471,575 +7667,62 @@ function App() {
                 </button>
               </div>
 
-              {feedSource === "local" && !feedSidebarOpen && feedItems.length === 0 && (
+              {feedSource === "local" && persistedPosts.length === 0 && (
                 <div className="feed-create-hero">
                   <div className="feed-create-hero-icon">✨</div>
                   <h3>Turn journals into posts</h3>
-                  <p className="text-sm muted">Write in your journal, then use on-device AI to generate tweet-ready posts, threads, and insights.</p>
-                  <div className="row" style={{ gap: '0.5rem', flexWrap: 'wrap', justifyContent: 'center' }}>
-                    <button
-                      type="button"
-                      className="primary"
-                      onClick={() => setMobileTab("journal")}
-                    >
-                      Open Journal
-                    </button>
-                    <button
-                      type="button"
-                      className="ghost"
-                      onClick={() => {
-                        setFeedSidebarOpen(true);
-                        setFeedCreateWorkflowOpen(false);
-                      }}
-                    >
-                      Run AI Extractor
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {feedSource === "local" && !feedSidebarOpen && feedItems.length > 0 && (
-                <div className="row" style={{ gap: '0.5rem', marginBottom: '0.5rem' }}>
+                  <p className="text-sm muted">Write in your journal, then use on-device AI to generate tweet-ready posts.</p>
                   <button
                     type="button"
-                    className="primary text-sm"
-                    style={{ flex: 1, borderRadius: '10px' }}
-                    onClick={() => {
-                      setFeedSidebarOpen(true);
-                      setFeedCreateWorkflowOpen(false);
-                    }}
-                    disabled={workspaceSynthBusy || workspaceSynthRunning}
+                    className="primary"
+                    onClick={() => setMobileTab("journal")}
                   >
-                    {workspaceSynthBusy || workspaceSynthRunning ? "AI Running..." : `✨ Generate More (${workspaceSynthPendingCount} pending)`}
+                    Open Journal
                   </button>
                 </div>
               )}
 
-              {feedSource === "local" && feedSidebarOpen ? (
-                <div className="feed-workflow-drawer">
-                  <div className="row-between">
-                    <h3 style={{ margin: 0 }}>Workspace Synthesizer</h3>
-                    <button
-                      type="button"
-                      className="ghost text-sm"
-                      onClick={() => setFeedSidebarOpen(false)}
-                    >
-                      Close
-                    </button>
-                  </div>
-                  <p className="text-sm muted" style={{ margin: 0 }}>
-                    The synthesizer is the main journal extraction agent. Check the skills you want applied regularly, then run the synthesizer to process pending journal entries.
-                  </p>
-                  <div className="feed-agent-facts">
-                    <div>
-                      <span className="text-sm muted">Pending journal entries</span>
-                      <strong>{workspaceSynthPendingCount}</strong>
-                    </div>
-                    <div>
-                      <span className="text-sm muted">Selected this run</span>
-                      <strong>{workspaceSynthSelectedCount}</strong>
-                    </div>
-                  </div>
-                  {runtimeMediaSummary ? (
-                    <p className="text-sm muted" style={{ margin: 0 }}>
-                      {runtimeMediaSummary}
-                    </p>
-                  ) : null}
-                  {!workspaceSynthProviderReady && workspaceSynthProviderBlockedReason ? (
-                    <div className="feed-comment-status">{workspaceSynthProviderBlockedReason}</div>
-                  ) : null}
-                  <button
-                    type="button"
-                    className="primary text-sm"
-                    style={{ width: "100%", borderRadius: "10px" }}
-                    onClick={() => void runWorkspaceSynthesizerManual()}
-                    disabled={
-                      workspaceSynthBusy || workspaceSynthRunning || !workspaceSynthProviderReady
-                    }
-                    title={!workspaceSynthProviderReady ? workspaceSynthProviderBlockedReason : undefined}
-                  >
-                    {workspaceSynthBusy || workspaceSynthRunning ? "Running..." : "Run Workspace Synthesizer"}
-                  </button>
-                  <div className="row-between" style={{ alignItems: "center", marginTop: "0.2rem" }}>
-                    <span className="text-sm muted">Journal skills</span>
-                    <span className="text-sm muted">
-                      {workspaceSynthSkillItems.filter((item) => item.enabled).length}/{workspaceSynthSkillItems.length} enabled
-                    </span>
-                  </div>
-                  <div className="feed-workflow-bot-list">
-                    {workspaceSynthSkillBots.map((bot) => {
-                      const saved = workspaceSynthSkillsByKey[bot.key];
-                      const isBusy = workspaceSynthSkillToggleBusyKey === bot.key;
-                      const enableBlocked = saved?.enabled === false && saved?.supported === false;
-                      const isActive = activeWorkspaceSynthSkillKey === bot.key;
-                      return (
-                        <div key={bot.key} className="feed-workflow-bot-row">
-                          <button
-                            type="button"
-                            className="feed-workflow-bot-open"
-                            onClick={() => setActiveWorkspaceSynthSkillKey(bot.key)}
-                          >
-                            <span className="stack" style={{ gap: "0.2rem", width: "100%" }}>
-                              <span className="feed-bot-chip">
-                                <span className="feed-bot-avatar">{bot.avatar}</span>
-                                <span>{bot.name}</span>
-                              </span>
-                              {bot.goal ? (
-                                <span className="feed-bot-goal text-sm muted">{bot.goal}</span>
-                              ) : null}
-                              {saved?.unsupportedReason ? (
-                                <span className="feed-bot-goal text-sm muted">
-                                  {saved.unsupportedReason}
-                                </span>
-                              ) : null}
-                              {isActive ? (
-                                <span className="feed-bot-goal text-sm muted">
-                                  Editing artifact rules
-                                </span>
-                              ) : null}
-                            </span>
-                          </button>
-                          <button
-                            type="button"
-                            className={saved?.enabled === false ? "ghost text-sm" : "primary text-sm"}
-                            style={{ minWidth: "72px", borderRadius: "999px" }}
-                            onClick={() => void toggleWorkspaceSynthSkillEnabled(bot.key)}
-                            disabled={isBusy || enableBlocked}
-                            title={enableBlocked ? saved?.unsupportedReason : undefined}
-                          >
-                            {isBusy ? "..." : saved?.enabled === false ? "Off" : "On"}
-                          </button>
-                        </div>
-                      );
-                    })}
-                    {!workspaceSynthSkillBots.length ? (
-                      <p className="text-sm muted" style={{ margin: 0 }}>
-                        No workspace synth skills are available yet.
-                      </p>
-                    ) : null}
-                  </div>
-                  {activeWorkspaceSynthSkillKey
-                    ? (() => {
-                        const activeSkill = workspaceSynthSkillsByKey[activeWorkspaceSynthSkillKey];
-                        if (!activeSkill) {
-                          return null;
-                        }
-                        const draft =
-                          workspaceSynthSkillDraftByKey[activeWorkspaceSynthSkillKey] ??
-                          activeSkill.artifactRulesOverride ??
-                          activeSkill.artifactRules ??
-                          "";
-                        const saveStatus =
-                          workspaceSynthSkillSaveStatusByKey[activeWorkspaceSynthSkillKey] || "";
-                        const isSaving =
-                          workspaceSynthSkillSavingKey === activeWorkspaceSynthSkillKey;
-                        const usingOverride = Boolean(
-                          activeSkill.artifactRulesOverride &&
-                            activeSkill.artifactRulesOverride.trim()
-                        );
-                        return (
-                          <div className="workflow-settings-panel stack">
-                            <div className="row-between">
-                              <h3 style={{ margin: 0 }}>{activeSkill.name}</h3>
-                              <button
-                                type="button"
-                                className="ghost text-sm"
-                                onClick={() => setActiveWorkspaceSynthSkillKey("")}
-                              >
-                                Close
-                              </button>
-                            </div>
-                            <p className="text-sm muted" style={{ margin: 0 }}>
-                              Customize the Artifact Rules section for this skill. These rules are injected into the bundled workspace synthesis prompt.
-                            </p>
-                            {activeSkill.artifactRules ? (
-                              <div className="stack" style={{ gap: "0.3rem" }}>
-                                <span className="text-sm muted">Built-in rules</span>
-                                <pre className="workflow-run-detail">{activeSkill.artifactRules}</pre>
-                              </div>
-                            ) : null}
-                            <label className="stack" style={{ gap: "0.35rem" }}>
-                              <span className="text-sm">
-                                {usingOverride ? "Custom artifact rules" : "Artifact rules"}
-                              </span>
-                              <textarea
-                                rows={8}
-                                value={draft}
-                                onChange={(e) =>
-                                  setWorkspaceSynthSkillDraftByKey((prev) => ({
-                                    ...prev,
-                                    [activeWorkspaceSynthSkillKey]: e.target.value
-                                  }))
-                                }
-                              />
-                            </label>
-                            <div className="feed-comment-actions">
-                              <button
-                                type="button"
-                                className="primary text-sm"
-                                style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
-                                onClick={() =>
-                                  void saveWorkspaceSynthSkillArtifactRules(activeWorkspaceSynthSkillKey)
-                                }
-                                disabled={isSaving}
-                              >
-                                {isSaving ? "Saving..." : "Save Rules"}
-                              </button>
-                              <button
-                                type="button"
-                                className="ghost text-sm"
-                                style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
-                                onClick={() =>
-                                  setWorkspaceSynthSkillDraftByKey((prev) => ({
-                                    ...prev,
-                                    [activeWorkspaceSynthSkillKey]:
-                                      activeSkill.artifactRulesOverride ||
-                                      activeSkill.artifactRules ||
-                                      ""
-                                  }))
-                                }
-                                disabled={isSaving}
-                              >
-                                Revert Draft
-                              </button>
-                              <button
-                                type="button"
-                                className="ghost text-sm"
-                                style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
-                                onClick={() =>
-                                  void saveWorkspaceSynthSkillArtifactRules(
-                                    activeWorkspaceSynthSkillKey,
-                                    true
-                                  )
-                                }
-                                disabled={isSaving || !usingOverride}
-                              >
-                                Use Built-in
-                              </button>
-                            </div>
-                            {saveStatus ? <div className="feed-comment-status">{saveStatus}</div> : null}
-                          </div>
-                        );
-                      })()
-                    : null}
-                  {workspaceSynthStatus.skillRuns?.length ? (
-                    <div className="stack" style={{ gap: "0.45rem" }}>
-                      <span className="text-sm muted">Recent skill activity</span>
-                      {workspaceSynthStatus.skillRuns.slice(0, 6).map((run: WorkspaceSynthSkillRunState) => (
-                        <div key={`synth-run-${run.skillKey}`} className="workflow-run-card">
-                          <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
-                            <span className="feed-bot-chip">
-                              <span className="feed-bot-avatar">
-                                {(run.name || run.skillKey || "S").slice(0, 1).toUpperCase()}
-                              </span>
-                              <span>{run.name || run.skillKey}</span>
-                            </span>
-                            <span className="text-sm muted">{run.status || "idle"}</span>
-                          </div>
-                          {run.summary ? (
-                            <div className="text-sm muted">{run.summary}</div>
-                          ) : null}
-                          {typeof run.durationMs === "number" && run.durationMs > 0 ? (
-                            <div className="text-sm muted">
-                              Duration: {(run.durationMs / 1000).toFixed(run.durationMs >= 10_000 ? 0 : 1)}s
-                            </div>
-                          ) : null}
-                          {run.error ? (
-                            <div className="feed-comment-status">{run.error}</div>
-                          ) : null}
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-                  {workflowBots.length ? (
-                    <div className="stack" style={{ gap: "0.5rem" }}>
-                      <div className="row-between" style={{ alignItems: "center" }}>
-                        <span className="text-sm muted">Advanced: custom agents</span>
-                        <button
-                          type="button"
-                          className="ghost text-sm"
-                          onClick={openWorkflowTemplateForm}
-                        >
-                          Create
-                        </button>
-                      </div>
-                      <div className="feed-workflow-bot-list">
-                        {workflowBots.map((bot) => {
-                          const saved = workflowSettingsByKey[bot.key];
-                          const isBusy = workflowToggleBusyKey === bot.key;
-                          const enableBlocked = saved?.enabled === false && saved?.supported === false;
-                          return (
-                            <div key={bot.key} className="feed-workflow-bot-row">
-                              <button
-                                type="button"
-                                className="feed-workflow-bot-open"
-                                onClick={() => openWorkflowSettingsForBot(bot.key)}
-                              >
-                                <span className="stack" style={{ gap: "0.2rem", width: "100%" }}>
-                                  <span className="feed-bot-chip">
-                                    <span className="feed-bot-avatar">{bot.avatar}</span>
-                                    <span>{bot.name}</span>
-                                  </span>
-                                  {bot.goal ? (
-                                    <span className="feed-bot-goal text-sm muted">{bot.goal}</span>
-                                  ) : null}
-                                </span>
-                              </button>
-                              <button
-                                type="button"
-                                className={saved?.enabled === false ? "ghost text-sm" : "primary text-sm"}
-                                style={{ minWidth: "72px", borderRadius: "999px" }}
-                                onClick={() => void toggleContentAgentEnabled(bot.key)}
-                                disabled={isBusy || enableBlocked}
-                                title={enableBlocked ? saved?.unsupportedReason : undefined}
-                              >
-                                {isBusy ? "..." : saved?.enabled === false ? "Off" : "On"}
-                              </button>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      className="primary text-sm"
-                      style={{ width: "100%", borderRadius: "10px" }}
-                      onClick={openWorkflowTemplateForm}
-                    >
-                      Create Custom Agent
-                    </button>
-                  )}
-                </div>
-              ) : null}
-
-              {feedSource === "local" && feedCreateWorkflowOpen ? (
-                <form className="workflow-settings-panel stack" onSubmit={submitWorkflowTemplateCreate}>
-                  <div className="row-between">
-                    <h3 style={{ margin: 0 }}>Create Content Agent</h3>
-                    <button
-                      type="button"
-                      className="ghost text-sm"
-                      onClick={() => setFeedCreateWorkflowOpen(false)}
-                    >
-                      Close
-                    </button>
-                  </div>
-                  <label className="stack" style={{ gap: "0.35rem" }}>
-                    <span className="text-sm">Agent name</span>
-                    <input
-                      type="text"
-                      value={workflowTemplateDraft.name}
-                      onChange={(e) =>
-                        setWorkflowTemplateDraft((prev) => ({ ...prev, name: e.target.value }))
-                      }
-                      placeholder="Bluesky Scout"
-                    />
-                  </label>
-                  <label className="stack" style={{ gap: "0.35rem" }}>
-                    <span className="text-sm">What should this agent make?</span>
-                    <textarea
-                      rows={5}
-                      value={workflowTemplateDraft.goal}
-                      onChange={(e) =>
-                        setWorkflowTemplateDraft((prev) => ({ ...prev, goal: e.target.value }))
-                      }
-                      placeholder="Create interesting Bluesky post drafts from my recent journal notes. Extract standout insights and save each post as a separate file so it appears in the workspace feed."
-                    />
-                  </label>
-                  <div className="feed-agent-facts">
-                    <div>
-                      <span className="text-sm muted">Source</span>
-                      <strong>Text journal notes and available audio/video transcripts</strong>
-                    </div>
-                    <div>
-                      <span className="text-sm muted">Destination</span>
-                      <strong>`posts/&lt;agent&gt;/` in Workspace Feed</strong>
-                    </div>
-                  </div>
-                  {runtimeMediaSummary ? (
-                    <p className="text-sm muted" style={{ margin: 0 }}>
-                      {runtimeMediaSummary}
-                    </p>
-                  ) : null}
-                  <label className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
-                    <input
-                      type="checkbox"
-                      checked={workflowTemplateDraft.runNow}
-                      onChange={(e) =>
-                        setWorkflowTemplateDraft((prev) => ({ ...prev, runNow: e.target.checked }))
-                      }
-                    />
-                    <span className="text-sm">Run immediately after create</span>
-                  </label>
-                  <div className="feed-comment-actions">
-                    <button
-                      type="submit"
-                      className="primary text-sm"
-                      style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
-                      disabled={workflowTemplateSubmitting}
-                    >
-                      {workflowTemplateSubmitting ? "Creating..." : "Create Agent"}
-                    </button>
-                    <button
-                      type="button"
-                      className="ghost text-sm"
-                      style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
-                      onClick={() => setFeedCreateWorkflowOpen(false)}
-                      disabled={workflowTemplateSubmitting}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                  {workflowTemplateStatus ? (
-                    <div className="feed-comment-status">{workflowTemplateStatus}</div>
-                  ) : null}
-                </form>
-              ) : null}
-
-              {feedSource === "local" && feedEditStatus !== "Feed idle" ? (
-                <p className="text-sm muted">{feedEditStatus}</p>
-              ) : null}
-
-              {feedSource === "local" ? (
+              {feedSource === "local" && persistedPosts.length > 0 && (
                 <div className="stack">
-                  {workflowBots.map((bot) => {
-                    const run = workflowRunStatusByKey[bot.key];
-                    const saved = workflowSettingsByKey[bot.key];
-                    if (!run) {
-                      return null;
-                    }
-                    if (run.status === "done") {
-                      return null;
-                    }
-                    return (
-                      <div key={`run-${bot.key}`} className="workflow-run-card">
-                        <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
-                          <div className="row" style={{ gap: "0.5rem", alignItems: "center" }}>
-                            <span className="feed-bot-chip">
-                              <span className="feed-bot-avatar">{bot.avatar}</span>
-                              <span>{bot.name}</span>
-                            </span>
-                            {run.status === "pending" || run.status === "processing" ? (
-                              <span className="workflow-run-spinner" aria-hidden />
-                            ) : null}
-                            <span className="text-sm">{run.summary}</span>
-                          </div>
-                          {run.status === "error" ? (
-                            <button
-                              type="button"
-                              className="ghost text-sm"
-                              onClick={() => void triggerManualWorkflowRun(bot.key)}
-                              disabled={saved?.supported === false}
-                              title={saved?.unsupportedReason}
-                            >
-                              Retry
-                            </button>
-                          ) : null}
-                        </div>
-                        {run.detail ? (
-                          <pre className="workflow-run-detail">{run.detail}</pre>
-                        ) : null}
-                        <div className="text-sm muted">
-                          Updated: {run.updatedAt ? formatTimestamp(run.updatedAt) : "just now"}
+                  {persistedPosts.map((post) => (
+                    <div key={post.id} className="generated-post-card">
+                      <p style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{post.text}</p>
+                      <div className="row-between" style={{ marginTop: '0.5rem' }}>
+                        <span className="text-sm muted">
+                          {new Date(post.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                        <div className="row" style={{ gap: '0.35rem' }}>
+                          <button
+                            type="button"
+                            className="ghost text-sm"
+                            onClick={() => { navigator.clipboard?.writeText(post.text); }}
+                          >
+                            Copy
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost text-sm"
+                            onClick={() => {
+                              setPersistedPosts((prev) => {
+                                const next = prev.filter((p) => p.id !== post.id);
+                                savePersistedPosts(next);
+                                return next;
+                              });
+                            }}
+                          >
+                            Delete
+                          </button>
                         </div>
                       </div>
-                    );
-                  })}
-                </div>
-              ) : null}
-
-              {feedSource === "local" && activeWorkflowBotKey
-                ? (() => {
-                  const bot = workflowBotByKey(activeWorkflowBotKey);
-                  const saved = workflowSettingsByKey[activeWorkflowBotKey];
-                  const draft =
-                    workflowSettingsDraftByKey[activeWorkflowBotKey] ||
-                    (saved ? workflowSettingsDraftFromItem(saved) : undefined);
-                  const status = workflowSettingsStatusByKey[activeWorkflowBotKey] || "";
-                  const isSaving = workflowSettingsSavingKey === activeWorkflowBotKey;
-                  const unsupportedReason = saved?.unsupportedReason || "";
-
-                  return (
-                    <div className="workflow-settings-panel">
-                      <div className="row-between">
-                        <h3 style={{ margin: 0 }}>{bot.name}</h3>
-                        <button
-                          type="button"
-                          className="ghost text-sm"
-                          onClick={() => setActiveWorkflowBotKey("")}
-                        >
-                          Close
-                        </button>
-                      </div>
-
-                      {!draft ? (
-                        <p className="text-sm muted" style={{ marginTop: "0.6rem" }}>
-                          {workflowSettingsLoading
-                            ? "Loading content agent..."
-                            : "Content agent details are not available yet."}
+                      {post.sourceExcerpt ? (
+                        <p className="text-sm muted" style={{ margin: '0.25rem 0 0', fontStyle: 'italic' }}>
+                          From: {post.sourceExcerpt}...
                         </p>
-                      ) : (
-                        <div className="stack" style={{ marginTop: "0.6rem" }}>
-                          <label className="stack" style={{ gap: "0.35rem" }}>
-                            <span className="text-sm">Agent goal</span>
-                            <textarea
-                              rows={5}
-                              value={draft.goal}
-                              onChange={(e) =>
-                                setWorkflowSettingsDraftByKey((prev) => ({
-                                  ...prev,
-                                  [activeWorkflowBotKey]: {
-                                    ...draft,
-                                    goal: e.target.value
-                                  }
-                                }))
-                              }
-                              placeholder="Describe what this agent should create from your journal notes."
-                            />
-                          </label>
-                          <div className="feed-agent-facts">
-                            <div>
-                              <span className="text-sm muted">Source</span>
-                              <strong>Text journal notes and available transcripts</strong>
-                            </div>
-                            <div>
-                              <span className="text-sm muted">Destination</span>
-                              <strong>{saved?.outputPrefix || `posts/${activeWorkflowBotKey}/`}</strong>
-                            </div>
-                          </div>
-                          {unsupportedReason ? (
-                            <div className="feed-comment-status">{unsupportedReason}</div>
-                          ) : null}
-
-                          <div className="feed-comment-actions">
-                            <button
-                              type="button"
-                              className="primary text-sm"
-                              style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
-                              onClick={() => void saveWorkflowSettings(activeWorkflowBotKey)}
-                              disabled={isSaving}
-                            >
-                              {isSaving ? "Saving..." : "Save Goal & Run"}
-                            </button>
-                            <button
-                              type="button"
-                              className="ghost text-sm"
-                              style={{ padding: "0.35rem 0.75rem", borderRadius: "8px" }}
-                              onClick={() => void loadFeedWorkflowSettings()}
-                              disabled={workflowSettingsLoading || isSaving}
-                            >
-                              Reload
-                            </button>
-                          </div>
-
-                          {status ? <div className="feed-comment-status">{status}</div> : null}
-                        </div>
-                      )}
+                      ) : null}
                     </div>
-                  );
-                })()
-                : null}
+                  ))}
+                </div>
+              )}
 
               {feedSource === "bluesky" ? (
                 blueskyFeedLoading ? (
@@ -8699,360 +8382,277 @@ function App() {
         ) : null}
 
         {mobileTab === "productivity" ? (
-          <ViewErrorBoundary title="Productivity">
-            <ProductivityView
-              openTodos={openTodos}
-              doneTodos={doneTodos}
-              overdueTodoCount={overdueTodoCount}
-              todayEventItems={todayEventItems}
-              upcomingEventItems={upcomingEventItems}
-              pastEventItems={pastEventItems}
-              workspaceSynthStatus={workspaceSynthStatus}
-              workspaceSynthArtifactBadges={workspaceSynthArtifactBadges}
-              formatTodoDueLabel={formatTodoDueLabel}
-              formatEventTiming={formatEventTiming}
-              formatTimestamp={formatTimestamp}
-              onToggleTodo={(item) => void toggleWorkspaceTodo(item)}
-              onExtractTasks={() => void runWorkspaceSynthesizerManual()}
-              extractingTasks={workspaceSynthBusy || workspaceSynthRunning}
-            />
+          <ViewErrorBoundary title="Tasks">
+            <div className="stack">
+              <div className="card">
+                <h2 style={{ margin: 0 }}>Tasks</h2>
+                <p className="text-sm muted" style={{ margin: '0.25rem 0 0.75rem' }}>
+                  Extracted from your journal entries by on-device AI.
+                </p>
+                <button
+                  type="button"
+                  className="primary"
+                  style={{ width: '100%', borderRadius: '10px' }}
+                  onClick={() => void extractTasksFromJournals()}
+                  disabled={extractingLocalTasks}
+                >
+                  {extractingLocalTasks ? (
+                    <span className="row" style={{ gap: '0.4rem', alignItems: 'center', justifyContent: 'center' }}>
+                      <span className="btn-spinner" aria-hidden />
+                      Extracting...
+                    </span>
+                  ) : (
+                    `\uD83E\uDDE0 Extract Tasks from Journals`
+                  )}
+                </button>
+                {generatePostStatus && mobileTab === "productivity" ? (
+                  <p className="text-sm muted" style={{ margin: '0.5rem 0 0' }}>{generatePostStatus}</p>
+                ) : null}
+              </div>
+
+              {persistedTodos.filter((t) => !t.done).length > 0 ? (
+                <div className="card">
+                  <h3 style={{ margin: 0 }}>Open ({persistedTodos.filter((t) => !t.done).length})</h3>
+                  <div className="stack" style={{ marginTop: '0.5rem' }}>
+                    {persistedTodos.filter((t) => !t.done).map((todo) => (
+                      <div key={todo.id} className="planner-item-card">
+                        <div className="row-between" style={{ gap: '0.8rem', alignItems: 'flex-start' }}>
+                          <div className="stack-sm" style={{ gap: '0.25rem', flex: 1 }}>
+                            <strong>{todo.title}</strong>
+                            {todo.details ? <p className="text-sm muted" style={{ margin: 0 }}>{todo.details}</p> : null}
+                            <span className="text-sm muted">
+                              {new Date(todo.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric' })}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            className="primary text-sm"
+                            style={{ padding: '0.35rem 0.75rem', borderRadius: '999px' }}
+                            onClick={() => {
+                              setPersistedTodos((prev) => {
+                                const next = prev.map((t) => t.id === todo.id ? { ...t, done: true } : t);
+                                savePersistedTodos(next);
+                                return next;
+                              });
+                            }}
+                          >
+                            Done
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {persistedTodos.filter((t) => t.done).length > 0 ? (
+                <div className="card">
+                  <h3 style={{ margin: 0 }}>Completed ({persistedTodos.filter((t) => t.done).length})</h3>
+                  <div className="stack" style={{ marginTop: '0.5rem' }}>
+                    {persistedTodos.filter((t) => t.done).map((todo) => (
+                      <div key={todo.id} className="planner-item-card planner-item-card-done">
+                        <div className="row-between" style={{ gap: '0.8rem', alignItems: 'flex-start' }}>
+                          <div className="stack-sm" style={{ gap: '0.25rem', flex: 1 }}>
+                            <strong style={{ textDecoration: 'line-through' }}>{todo.title}</strong>
+                          </div>
+                          <div className="row" style={{ gap: '0.35rem' }}>
+                            <button
+                              type="button"
+                              className="ghost text-sm"
+                              style={{ padding: '0.35rem 0.75rem', borderRadius: '999px' }}
+                              onClick={() => {
+                                setPersistedTodos((prev) => {
+                                  const next = prev.map((t) => t.id === todo.id ? { ...t, done: false } : t);
+                                  savePersistedTodos(next);
+                                  return next;
+                                });
+                              }}
+                            >
+                              Reopen
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost text-sm"
+                              style={{ padding: '0.35rem 0.75rem', borderRadius: '999px' }}
+                              onClick={() => {
+                                setPersistedTodos((prev) => {
+                                  const next = prev.filter((t) => t.id !== todo.id);
+                                  savePersistedTodos(next);
+                                  return next;
+                                });
+                              }}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {persistedTodos.length === 0 ? (
+                <div className="card">
+                  <div className="planner-empty-state">
+                    <p className="text-center muted" style={{ margin: 0 }}>
+                      No tasks yet. Write journal entries, then tap "Extract Tasks" to pull out action items.
+                    </p>
+                  </div>
+                </div>
+              ) : null}
+            </div>
           </ViewErrorBoundary>
         ) : null}
 
         {mobileTab === "profile" ? (
           <ViewErrorBoundary title="Profile">
             <div className="stack">
-              <div className="card local-models-card">
-                <div className="model-hub-hero">
-                  <div>
-                    <p className="eyebrow">Local AI</p>
-                    <h2>Choose Your On-Device Brain</h2>
-                    <p className="text-sm muted">
-                      Download one private model, then use it to turn journal notes into tasks,
-                      insights, and your personalized Me feed.
-                    </p>
-                    <div className="model-hub-chips">
-                      <span>Journal notes</span>
-                      <span>Task extraction</span>
-                      <span>Me feed insights</span>
-                    </div>
-                  </div>
-                  <div className="model-hub-status-card">
-                    <span className={localAiReady ? "model-hub-orb ready" : "model-hub-orb"} />
-                    <p className="text-sm muted">Local AI status</p>
-                    <strong>{localAiStateLabel}</strong>
-                    <span className="text-sm muted">
-                      {installedLocalModelCount} downloaded
-                    </span>
-                    <button
-                      type="button"
-                      className="ghost"
-                      onClick={() => void loadLocalModels()}
-                      disabled={Boolean(localModelBusyId)}
-                    >
-                      Refresh
-                    </button>
-                  </div>
-                </div>
-                <div className="model-hub-selected">
-                  <div>
-                    <p className="text-sm muted">Selected model</p>
-                    <strong>{activeLocalModel?.title || "No model selected yet"}</strong>
-                    <p className="text-sm muted">
-                      {activeLocalModel
-                        ? `${activeLocalModel.family} · ${activeLocalModel.engine}`
-                        : "Pick a compact model below to keep SlowClaw private and phone-first."}
-                    </p>
-                  </div>
-                  <div className="model-hub-selected-meta">
-                    <span>{activeLocalModel?.sizeLabel || "GGUF"}</span>
-                    <span>{isTauriMobileRuntime() ? "iPhone bridge" : "Desktop server"}</span>
-                  </div>
-                </div>
-                {localModelsEngineStatus ? (
-                  <div className="local-model-engine-note text-sm">
-                    {localModelsEngineStatus}
-                  </div>
-                ) : null}
-                {localModelRuntime ? (
-                  <div className="local-runtime-panel">
-                    <div>
-                      <p className="text-sm muted">Runtime</p>
-                      <strong>{localModelRuntime.running ? "Running" : localModelRuntime.status || "Stopped"}</strong>
-                      {localModelRuntime.modelId ? (
-                        <p className="text-sm muted">{localModelRuntime.modelId}</p>
-                      ) : null}
-                      {localModelRuntime.error ? (
-                        <p className="text-sm local-model-error">{localModelRuntime.error}</p>
-                      ) : null}
-                    </div>
-                    <div className="row">
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={() => void refreshLocalModelRuntime()}
-                      >
-                        Runtime Status
-                      </button>
-                      {localModelRuntime.running ? (
-                        <button
-                          type="button"
-                          className="ghost"
-                          onClick={() => void stopDownloadedLocalModel()}
-                        >
-                          Stop Runtime
-                        </button>
-                      ) : null}
-                    </div>
-                  </div>
-                ) : null}
-                {nativeLocalAiStatus ? (
-                  <div className="local-runtime-panel">
-                    <div>
-                      <p className="text-sm muted">iPhone Native AI</p>
-                      <strong>{nativeLocalAiStatus.configured ? "Configured" : "Bridge Ready"}</strong>
-                      {nativeLocalAiStatus.modelId ? (
-                        <p className="text-sm muted">{nativeLocalAiStatus.modelId}</p>
-                      ) : null}
-                      <p className="text-sm muted">{nativeLocalAiStatus.message}</p>
-                      {nativeLocalAiStatus.error ? (
-                        <p className="text-sm local-model-error">{nativeLocalAiStatus.error}</p>
-                      ) : null}
+              <div className="card">
+                <h2>Bluesky</h2>
+                {session ? (
+                  <div className="stack-sm">
+                    <div className="badge success text-center" style={{ alignSelf: 'center' }}>
+                      Signed in as @{session.handle}
                     </div>
                     <button
                       type="button"
                       className="ghost"
+                      style={{ alignSelf: 'center' }}
                       onClick={async () => {
-                        try {
-                          setNativeLocalAiStatus(await getNativeLocalAiStatus());
-                        } catch (error) {
-                          setLocalModelsStatus(
-                            `Native status unavailable (${error instanceof Error ? error.message : String(error)})`
-                          );
-                        }
+                        await deleteCredentialsSecure();
+                        setCreds({ serviceUrl: "https://bsky.social", handle: "", appPassword: "" });
+                        setSession(null);
+                        setAgent(null);
+                        setAuthMessage("Signed out");
                       }}
                     >
-                      Native Status
+                      Sign Out
                     </button>
                   </div>
-                ) : null}
-                <div className="local-model-grid">
-                  {localModels.map((model) => {
-                    const download = model.download;
-                    const isDownloading = download?.status === "downloading";
-                    const transferred = download?.transferredBytes || 0;
-                    const total = download?.totalBytes || model.sizeBytes || 0;
-                    const progress = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 0;
-                    return (
-                      <article className="local-model-card" key={model.id}>
-                        <div className="row-between">
-                          <span className="local-model-family">{model.family}</span>
-                          <span className={model.installed ? "local-model-pill installed" : "local-model-pill"}>
-                            {model.active ? "Active" : model.installed ? "Downloaded" : model.sizeLabel}
-                          </span>
-                        </div>
-                        <h3>{model.title}</h3>
-                        <p className="text-sm muted">{model.description}</p>
-                        <div className="model-card-meta">
-                          <span>{model.engine}</span>
-                          <span>{model.sizeLabel}</span>
-                          <span>{model.installed ? "On device" : "Not downloaded"}</span>
-                        </div>
-                        {isDownloading ? (
-                          <div className="local-model-progress">
-                            <div className="local-model-progress-track">
-                              <div className="local-model-progress-fill" style={{ width: `${progress}%` }} />
-                            </div>
-                            <span className="text-sm muted">{progress}%</span>
-                          </div>
-                        ) : null}
-                        {download?.status === "failed" && download.error ? (
-                          <p className="text-sm local-model-error">{download.error}</p>
-                        ) : null}
-                        <div className="model-card-actions">
-                          {model.installed ? (
-                            <>
-                              <button
-                                type="button"
-                                className="primary"
-                                onClick={() => void startDownloadedLocalModel(model.id)}
-                                disabled={Boolean(localModelBusyId)}
-                              >
-                                {isTauriMobileRuntime()
-                                  ? nativeLocalAiStatus?.modelId === model.id
-                                    ? "Configured"
-                                    : "Use On iPhone"
-                                  : localModelRuntime?.running && localModelRuntime.modelId === model.id
-                                  ? "Restart Runtime"
-                                  : "Start Runtime"}
-                              </button>
-                              <button
-                                type="button"
-                                className={model.active ? "ghost" : "ghost"}
-                                onClick={() => void selectLocalModel(model.id)}
-                                disabled={Boolean(localModelBusyId) || model.active}
-                              >
-                                {model.active ? "Selected" : "Set Default"}
-                              </button>
-                            </>
-                          ) : (
-                            <button
-                              type="button"
-                              className="primary"
-                              onClick={() => void startLocalModelDownload(model.id)}
-                              disabled={Boolean(localModelBusyId) || isDownloading}
-                            >
-                              {isDownloading ? "Downloading..." : "Download"}
-                            </button>
-                          )}
-                        </div>
-                      </article>
-                    );
-                  })}
-                </div>
-                {localModelsStatus ? (
-                  <p className="text-sm muted">{localModelsStatus}</p>
-                ) : null}
-              </div>
-
-            <div className="card">
-              <h2>Bluesky Login</h2>
-              <form className="stack" onSubmit={handleLogin}>
-                <p className="text-sm muted">Service: {creds.serviceUrl || "https://bsky.social"}</p>
-                <input
-                  value={creds.handle}
-                  onChange={(e) => setCreds(prev => ({ ...prev, handle: e.target.value }))}
-                  placeholder="Bluesky Handle or Email"
-                />
-                <input
-                  type="password"
-                  value={creds.appPassword}
-                  onChange={(e) => setCreds(prev => ({ ...prev, appPassword: e.target.value }))}
-                  placeholder="Bluesky App Password"
-                />
-                <div className="row">
-                  <button type="submit" className="primary" style={{ flex: 1 }}>Sign In</button>
-                  <button
-                    type="button"
-                    className="danger"
-                    onClick={async () => {
-                      await deleteCredentialsSecure();
-                      setCreds({ serviceUrl: "https://bsky.social", handle: "", appPassword: "" });
-                      setSession(null);
-                      setAgent(null);
-                      setAuthMessage("Credentials cleared");
-                    }}
-                  >
-                    Clear
-                  </button>
-                </div>
-                {authMessage && <p className="text-sm text-center muted mt-2">{authMessage}</p>}
-                {session && <div className="badge success text-center" style={{ alignSelf: 'center' }}>Signed in as @{session.handle}</div>}
-              </form>
-            </div>
-
-              {isDesktopClient && (
-                <>
-                  <div className="card">
-                  <h2>Local Runtime & Pairing</h2>
-                  <div className="stack">
-                    <p className="text-sm muted">
-                      This app uses its embedded local gateway automatically. Pairing is used for device sync.
-                    </p>
-
-                    <p className="text-sm muted">
-                      {chatGatewayToken
-                        ? "Local runtime is ready."
-                        : "Waiting for local runtime bootstrap."}
-                    </p>
-
-                    <div className="stack" style={{ gap: "0.8rem" }}>
-                      <div className="row-between">
-                        <p><strong>Generate Sync QR</strong></p>
-                        <button
-                          type="button"
-                          onClick={() => void generateDesktopPairingQr()}
-                          disabled={desktopQrLoading}
-                        >
-                          {desktopQrLoading ? "Generating..." : "Generate QR"}
-                        </button>
-                      </div>
-                      {desktopQrPayload && (
-                        <div className="stack" style={{ alignItems: "center", gap: "0.6rem" }}>
-                          <Suspense fallback={<div className="text-sm muted text-center" style={{ width: 220, height: 220, display: "flex", alignItems: "center", justifyContent: "center" }}>Loading...</div>}>
-                            <QRCodeCanvas value={desktopQrPayload.qr_value} size={220} includeMargin />
-                          </Suspense>
-                          <p className="text-sm muted text-center">
-                            Sync peer gateway: {desktopQrPayload.gateway_url}
-                          </p>
-                        </div>
-                      )}
-                      {desktopQrStatus ? <p className="text-sm muted">{desktopQrStatus}</p> : null}
-                    </div>
-                  </div>
-                </div>
-
-                  <div className="card">
-                  <h2>Sync Peer</h2>
-                  <div className="stack">
-                    <p className="text-sm muted">
-                      Optional remote peer used only for workspace sync. Local journal, feed, and content-agent runtime stay local.
-                    </p>
+                ) : (
+                  <form className="stack" onSubmit={handleLogin}>
+                    <p className="text-sm muted">Connect your Bluesky account to publish posts and browse the Discover feed.</p>
                     <input
-                      value={syncPeerGatewayUrl}
-                      onChange={(e) => setSyncPeerGatewayUrl(e.target.value)}
-                      placeholder="Peer gateway URL"
+                      value={creds.handle}
+                      onChange={(e) => setCreds(prev => ({ ...prev, handle: e.target.value }))}
+                      placeholder="Bluesky Handle or Email"
                     />
                     <input
                       type="password"
-                      value={syncPeerToken}
-                      onChange={(e) => setSyncPeerToken(e.target.value)}
-                      placeholder="Peer sync token"
+                      value={creds.appPassword}
+                      onChange={(e) => setCreds(prev => ({ ...prev, appPassword: e.target.value }))}
+                      placeholder="Bluesky App Password"
                     />
-                    <div className="row">
-                      <button type="button" className="primary" onClick={() => void syncWithPeerNow()} disabled={syncBusy}>
-                        {syncBusy ? "Syncing..." : "Sync Now"}
-                      </button>
-                      {isTauriMobileRuntime() ? (
-                        <button
-                          type="button"
-                          className="ghost"
-                          onClick={() => {
-                            setSyncScannerActive(true);
-                            setMobileScannerActive(true);
-                            setSyncStatus("Scanning sync QR...");
-                          }}
-                          disabled={syncScannerActive}
-                        >
-                          {syncScannerActive ? "Scanner Active" : "Scan Sync QR"}
-                        </button>
-                      ) : null}
-                      <button type="button" className="ghost" onClick={() => void clearSyncPeerConnection()}>
-                        Clear Peer
-                      </button>
-                    </div>
-                    {syncScannerActive ? (
-                      <video
-                        ref={mobileScannerVideoRef}
-                        style={{
-                          width: "100%",
-                          maxWidth: "360px",
-                          borderRadius: "14px",
-                          background: "#000",
-                          minHeight: "240px"
-                        }}
-                        playsInline
-                        muted
-                      />
-                    ) : null}
-                    {syncStatus ? <p className="text-sm muted">{syncStatus}</p> : null}
-                  </div>
-                </div>
-
-                </>
-              )}
+                    <button type="submit" className="primary">Sign In</button>
+                    {authMessage && <p className="text-sm text-center muted">{authMessage}</p>}
+                  </form>
+                )}
+              </div>
             </div>
           </ViewErrorBoundary>
+        ) : null}
+
+        {showSettings ? (
+          <div className="settings-overlay view-enter">
+            <div className="stack">
+              <div className="card">
+                <div className="row-between" style={{ alignItems: 'center' }}>
+                  <h2 style={{ margin: 0 }}>
+                    {localModels.some((m) => m.installed) ? 'Settings' : 'Welcome to SlowClaw'}
+                  </h2>
+                  <button type="button" className="ghost" onClick={() => setShowSettings(false)}>
+                    ✕
+                  </button>
+                </div>
+
+                {!localModels.some((m) => m.installed) ? (
+                  <div className="stack-sm" style={{ margin: '0.5rem 0' }}>
+                    <p className="text-sm" style={{ margin: 0 }}>
+                      SlowClaw runs a private AI model on your iPhone to turn journal entries into posts and tasks. No data leaves your device.
+                    </p>
+                    <p className="text-sm muted" style={{ margin: 0 }}>
+                      Download the model below to get started (~1 GB, needs Wi-Fi).
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-sm muted" style={{ margin: '0.25rem 0 0.5rem' }}>
+                    On-device AI — all processing stays on your iPhone.
+                  </p>
+                )}
+
+                {localModels.map((model) => {
+                  const download = model.download;
+                  const isDownloading = download?.status === "downloading";
+                  const transferred = download?.transferredBytes || 0;
+                  const total = download?.totalBytes || model.sizeBytes || 0;
+                  const progress = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 0;
+                  const isConfigured = nativeLocalAiStatus?.modelId === model.id;
+                  return (
+                    <div key={model.id} className="stack-sm" style={{ gap: '0.5rem' }}>
+                      <div className="row-between">
+                        <strong>{model.title}</strong>
+                        <span className={model.installed ? "local-model-pill installed" : "local-model-pill"}>
+                          {isConfigured ? "Ready" : model.installed ? "Downloaded" : model.sizeLabel}
+                        </span>
+                      </div>
+                      <p className="text-sm muted" style={{ margin: 0 }}>{model.description}</p>
+                      {isDownloading ? (
+                        <div className="local-model-progress">
+                          <div className="local-model-progress-track">
+                            <div className="local-model-progress-fill" style={{ width: `${progress}%` }} />
+                          </div>
+                          <span className="text-sm muted">{progress}%</span>
+                        </div>
+                      ) : null}
+                      {download?.status === "failed" && download.error ? (
+                        <p className="text-sm local-model-error">{download.error}</p>
+                      ) : null}
+                      {!model.installed ? (
+                        <button
+                          type="button"
+                          className="primary"
+                          style={{ width: '100%', borderRadius: '10px', padding: '0.75rem' }}
+                          onClick={() => void startLocalModelDownload(model.id)}
+                          disabled={Boolean(localModelBusyId) || isDownloading}
+                        >
+                          {isDownloading ? "Downloading..." : "Download Model (1.0 GB)"}
+                        </button>
+                      ) : !isConfigured ? (
+                        <button
+                          type="button"
+                          className="primary"
+                          style={{ width: '100%', borderRadius: '10px', padding: '0.75rem' }}
+                          onClick={() => void startDownloadedLocalModel(model.id)}
+                          disabled={Boolean(localModelBusyId)}
+                        >
+                          Activate Model
+                        </button>
+                      ) : (
+                        <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+                          <span className="model-hub-orb ready" />
+                          <span className="text-sm">AI is ready. Close settings and start journaling!</span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {localModels.length === 0 ? (
+                  <div className="stack-sm" style={{ textAlign: 'center', padding: '1rem 0' }}>
+                    <p className="text-sm muted">Loading model info...</p>
+                    <button type="button" className="ghost" onClick={() => void loadLocalModels()}>
+                      Refresh
+                    </button>
+                  </div>
+                ) : null}
+
+                {localModelsStatus ? (
+                  <p className="text-sm muted" style={{ margin: '0.5rem 0 0' }}>{localModelsStatus}</p>
+                ) : null}
+              </div>
+            </div>
+          </div>
         ) : null}
       </main>
       </SwipeableView>

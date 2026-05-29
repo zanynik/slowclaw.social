@@ -2847,6 +2847,16 @@ button.local-ai-preset {
   animation: view-fade-in 0.28s var(--ease-out) both;
 }
 
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: var(--bg, #111);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: env(safe-area-inset-top, 20px) 1rem calc(env(safe-area-inset-bottom, 20px) + 80px) 1rem;
+}
+
 /* ─────────────────────────────────────────────
    IOS KEYBOARD-AWARE BOTTOM NAV
    ───────────────────────────────────────────── */
