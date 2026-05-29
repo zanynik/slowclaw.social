@@ -128,40 +128,62 @@ mod engine {
         // Drop previous model before loading new one (frees GPU/RAM)
         state.model = None;
 
-        // On iOS, disable mmap — iOS sandbox restricts mmap on large files
-        // and it can cause the OS to kill the app for memory pressure.
-        // Also use fewer GPU layers initially for stability.
+        // iOS has tight per-app RAM limits even when device storage is large.
+        // Prefer mmap for large models so pages stay file-backed, and fall back
+        // through CPU/offload modes when Metal allocation fails.
         let is_ios = cfg!(target_os = "ios");
-        let model_params = {
-            let params = LlamaModelParams::default()
-                .with_n_gpu_layers(99);
-            if is_ios {
-                params.with_use_mmap(false)
+        let load_attempts: Vec<(u32, bool)> = if is_ios {
+            if file_size > 2_500_000_000 {
+                vec![(0, true), (16, true), (0, false)]
             } else {
-                params
+                vec![(99, true), (0, true), (99, false), (0, false)]
             }
+        } else {
+            vec![(99, true)]
         };
 
-        eprintln!(
-            "[inference] Loading model '{}' ({:.1} GB) mmap={} gpu_layers=99 path={}",
-            model_id,
-            file_size as f64 / 1_073_741_824.0,
-            !is_ios,
-            path.display()
-        );
+        let mut last_error = String::new();
+        let mut loaded_model = None;
+        for (gpu_layers, use_mmap) in load_attempts {
+            eprintln!(
+                "[inference] Loading model '{}' ({:.1} GB) mmap={} gpu_layers={} path={}",
+                model_id,
+                file_size as f64 / 1_073_741_824.0,
+                use_mmap,
+                gpu_layers,
+                path.display()
+            );
 
-        let model = LlamaModel::load_from_file(&state.backend, &path, &model_params)
-            .map_err(|e| {
-                format!(
-                    "Failed to load GGUF model '{}' ({:.1} GB): {e}. \
-                     This may happen if the model is too large for this device's available memory, \
-                     or if the model format is not supported by this build.",
-                    model_id,
-                    file_size as f64 / 1_073_741_824.0
-                )
-            })?;
+            let model_params = LlamaModelParams::default()
+                .with_n_gpu_layers(gpu_layers)
+                .with_use_mmap(use_mmap);
 
-        eprintln!("[inference] Model loaded successfully: {model_id}");
+            match LlamaModel::load_from_file(&state.backend, &path, &model_params) {
+                Ok(model) => {
+                    eprintln!(
+                        "[inference] Model loaded successfully: {} mmap={} gpu_layers={}",
+                        model_id, use_mmap, gpu_layers
+                    );
+                    loaded_model = Some(model);
+                    break;
+                }
+                Err(err) => {
+                    last_error = format!("mmap={use_mmap} gpu_layers={gpu_layers}: {err}");
+                    eprintln!("[inference] Model load attempt failed: {last_error}");
+                }
+            }
+        }
+
+        let model = loaded_model.ok_or_else(|| {
+            format!(
+                "Failed to load GGUF model '{}' ({:.1} GB): {last_error}. \
+                 This usually means the model is too large for this iPhone's available RAM, \
+                 or the GGUF architecture is not supported by this build. \
+                 Try the recommended 1.5B iPhone model first.",
+                model_id,
+                file_size as f64 / 1_073_741_824.0
+            )
+        })?;
 
         state.model = Some(LoadedModel {
             model,
