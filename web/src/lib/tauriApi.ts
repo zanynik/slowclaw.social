@@ -256,6 +256,42 @@ export async function configureNativeLocalAi(
   return invoke("configure_native_local_ai", { req: { modelId, modelPath } });
 }
 
+export type NativeAiEngineStatus = {
+  engineAvailable: boolean;
+  modelLoaded: boolean;
+  loadedModelId: string | null;
+};
+
+export type NativeAiChatResponse = {
+  text: string;
+  modelId: string;
+  tokensGenerated: number;
+  tokensPerSecond: number;
+  stopReason: string;
+};
+
+export async function nativeAiLoadModel(): Promise<string> {
+  return invoke("native_ai_load_model");
+}
+
+export async function nativeAiChat(
+  prompt: string,
+  systemPrompt?: string,
+  maxTokens?: number,
+  temperature?: number
+): Promise<NativeAiChatResponse> {
+  return invoke("native_ai_chat", {
+    prompt,
+    systemPrompt: systemPrompt ?? null,
+    maxTokens: maxTokens ?? null,
+    temperature: temperature ?? null,
+  });
+}
+
+export async function nativeAiEngineStatus(): Promise<NativeAiEngineStatus> {
+  return invoke("native_ai_engine_status");
+}
+
 // ─────────────────────────────────────────────
 // Keyring / secrets (existing commands, kept for Bluesky credentials)
 // ─────────────────────────────────────────────
