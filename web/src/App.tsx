@@ -34,6 +34,8 @@ import {
   listOllamaModels,
   configureNativeLocalAi,
   getNativeLocalAiStatus,
+  nativeAiChat,
+  nativeAiEngineStatus,
   startRecording as startNativeAudioRecording,
   stopRecording as stopNativeAudioRecording,
   blobToBase64,
@@ -1098,6 +1100,9 @@ function App() {
   const [localModelRuntime, setLocalModelRuntime] = useState<LocalModelRuntimeStatus | null>(null);
   const [nativeLocalAiStatus, setNativeLocalAiStatus] = useState<NativeLocalAiStatus | null>(null);
   const [localModelBusyId, setLocalModelBusyId] = useState("");
+  const [generatedPost, setGeneratedPost] = useState("");
+  const [generatePostBusy, setGeneratePostBusy] = useState(false);
+  const [generatePostStatus, setGeneratePostStatus] = useState("");
   const [mobileScannerActive, setMobileScannerActive] = useState(() => {
     if (typeof window === "undefined") {
       return false;
@@ -3704,6 +3709,61 @@ function App() {
     draw();
   }
 
+  async function importFromGallery() {
+    try {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "image/*,video/*";
+      input.multiple = false;
+      input.style.display = "none";
+      document.body.appendChild(input);
+
+      const file = await new Promise<File | null>((resolve) => {
+        input.onchange = () => resolve(input.files?.[0] ?? null);
+        input.oncancel = () => resolve(null);
+        input.click();
+        // Fallback timeout for when oncancel doesn't fire
+        setTimeout(() => {
+          if (!input.files?.length) resolve(null);
+        }, 120_000);
+      });
+      document.body.removeChild(input);
+
+      if (!file) return;
+
+      const kind = file.type.startsWith("video/") ? "video"
+        : file.type.startsWith("image/") ? "image"
+        : file.type.startsWith("audio/") ? "audio"
+        : null;
+      if (!kind) {
+        setRecordingHint("Unsupported file type. Choose a photo or video.");
+        return;
+      }
+
+      setRecordingHint("Importing from gallery...");
+      const reader = new FileReader();
+      const dataUrl: string = await new Promise((resolve, reject) => {
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+
+      const base64 = dataUrl.split(",")[1] || "";
+      const saved = await saveJournalMedia(
+        kind as "audio" | "video" | "image",
+        file.name,
+        base64,
+        file.name.replace(/\.[^.]+$/, "")
+      );
+      setRecordingHint(`Imported ${saved.title || file.name}`);
+      await refreshLibrary("journal");
+    } catch (error) {
+      setRecordingHint(
+        `Import failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
   async function startLiveRecording(type: "audio" | "video") {
     if (isRecording) {
       return;
@@ -5475,6 +5535,57 @@ function App() {
     }
   }
 
+  async function generatePostFromJournal() {
+    const content = journalDraftText.trim();
+    if (!content) {
+      setGeneratePostStatus("Write or select a journal entry first.");
+      return;
+    }
+    setGeneratePostBusy(true);
+    setGeneratePostStatus("Generating post with local AI...");
+    setGeneratedPost("");
+    try {
+      if (isTauriMobileRuntime()) {
+        const result = await nativeAiChat(
+          content,
+          "You are a social media content writer. Turn the following journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text, no hashtags unless they add value.",
+          256,
+          0.8
+        );
+        setGeneratedPost(result.text);
+        setGeneratePostStatus(
+          `Generated in ${result.tokensGenerated} tokens (${result.tokensPerSecond.toFixed(1)} tok/s)`
+        );
+      } else {
+        // Desktop: use the gateway chat endpoint
+        const token = await resolveRuntimeGatewayToken();
+        const response = await fetch(`${gatewayBaseUrl || ""}/api/chat/messages`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            threadId: createThreadId(),
+            content: `Turn this journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text:\n\n${content}`,
+          }),
+        });
+        if (!response.ok) {
+          throw new Error(`Gateway returned ${response.status}`);
+        }
+        const data = await response.json();
+        setGeneratedPost(data.content || data.text || JSON.stringify(data));
+        setGeneratePostStatus("Generated via gateway.");
+      }
+    } catch (error) {
+      setGeneratePostStatus(
+        `Generation failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setGeneratePostBusy(false);
+    }
+  }
+
   async function loadRuntimeConfigForSettings() {
     let token = normalizeGatewayToken(chatGatewayToken);
     if (!token && isDesktopClient) {
@@ -5903,6 +6014,30 @@ function App() {
     void refreshLibrary("all");
   }, [chatGatewayToken, gatewayBaseUrl]);
 
+  // Seed a welcome journal entry on first launch
+  useEffect(() => {
+    const SEED_KEY = "slowclaw_welcome_seeded";
+    if (window.localStorage.getItem(SEED_KEY)) return;
+    const seed = async () => {
+      try {
+        const journals = await listJournals(1, 0);
+        if (journals.length > 0) {
+          window.localStorage.setItem(SEED_KEY, "1");
+          return;
+        }
+        await saveJournalText(
+          "What is SlowClaw",
+          `SlowClaw is a private, phone-first journaling app that runs AI entirely on your device.\n\nCapture thoughts as text or voice memos, and let a compact on-device language model turn them into tweet-ready posts, task lists, and weekly insights — all without your data ever leaving your phone.\n\nKey ideas:\n- Journal privately in text or audio\n- On-device AI transforms notes into social posts\n- No cloud required — your words stay yours\n- Publish to Bluesky, Nostr, or keep it personal\n- Built with Rust + Tauri for speed and tiny footprint\n\nSlowClaw is for people who think before they post.`
+        );
+        window.localStorage.setItem(SEED_KEY, "1");
+        void refreshLibrary("journal");
+      } catch {
+        // Seeding is best-effort; don't block the app
+      }
+    };
+    void seed();
+  }, []);
+
   useEffect(() => {
     void refreshPostHistory();
   }, [chatGatewayToken, gatewayBaseUrl]);
@@ -6067,6 +6202,13 @@ function App() {
   const isMediaTranscriptMode =
     !!selectedJournalItem &&
     (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video");
+  const isTextEntrySelected =
+    !!selectedJournalItem && selectedJournalItem.kind === "text";
+  const isFreshNoteMode = !selectedJournalItem;
+  const showCaptureCard =
+    !isWritingNote && !isCaptureZenMode && !isTextEntrySelected;
+  const expandSession =
+    isWritingNote || isMediaTranscriptMode || isFreshNoteMode || isTextEntrySelected;
 
   // Swipe navigation between tabs
   const swipeToNextTab = () => {
@@ -6149,7 +6291,6 @@ function App() {
       (a, b) =>
         (parseDateValue(b.startAt)?.getTime() || 0) - (parseDateValue(a.startAt)?.getTime() || 0)
     );
-  const isFreshNoteMode = !selectedJournalItem;
   const selectedJournalTranscriptionStatus =
     selectedJournalItem?.kind === "audio"
       ? journalTranscriptionStatusByPath[selectedJournalItem.path] || "idle"
@@ -6964,7 +7105,7 @@ function App() {
                 </aside>
               ) : null}
               <div className={`stack journal-main ${isWritingNote ? "journal-main-writing" : ""}`}>
-              {!isWritingNote && !isCaptureZenMode && (
+              {showCaptureCard && (
                 <div className="card">
                   <div className="text-center">
                     <h2>Capture</h2>
@@ -7017,14 +7158,11 @@ function App() {
                         </button>
                         <button
                           type="button"
-                          className="record-btn video"
-                          onClick={() => {
-                            setCaptureMode("video");
-                            setRecordingHint("Choose orientation and start recording.");
-                          }}
-                          title="Record Video"
+                          className="record-btn gallery"
+                          onClick={() => void importFromGallery()}
+                          title="Import from Gallery"
                         >
-                          <svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
                         </button>
                       </div>
 
@@ -7132,11 +7270,28 @@ function App() {
 
               {!isCaptureZenMode && (
                 <div
-                  className={`card ${isWritingNote || isMediaTranscriptMode || isFreshNoteMode ? "note-card-expanded" : ""}`}
-                  style={{ flex: isWritingNote || isMediaTranscriptMode || isFreshNoteMode ? 1 : undefined }}
+                  className={`card ${expandSession ? "note-card-expanded" : ""}`}
+                  style={{ flex: expandSession ? 1 : undefined }}
                 >
-                  <div className="row-between">
-                    <h2 style={{ margin: 0 }}>Session</h2>
+                  <div className="row-between" style={{ padding: isWritingNote ? '0.5rem 0' : undefined }}>
+                    <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+                      {isTextEntrySelected && !isWritingNote && (
+                        <button
+                          type="button"
+                          className="ghost text-sm"
+                          onClick={() => {
+                            setSelectedJournalPath("");
+                            setSelectedJournalItem(null);
+                            setSelectedJournalText("");
+                            setJournalDraftText("");
+                            setRecordingHint(DEFAULT_RECORDING_HINT);
+                          }}
+                        >
+                          ← Capture
+                        </button>
+                      )}
+                      <h2 style={{ margin: 0 }}>{isTextEntrySelected ? selectedJournalItem?.title || "Journal" : "Session"}</h2>
+                    </div>
                     <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
                       {selectedJournalSynthSourcePath ? (
                         <button
@@ -7163,7 +7318,7 @@ function App() {
                         </button>
                       ) : null}
                       <span className="text-sm muted">{journalSaveStatus !== "Journal idle" ? journalSaveStatus : ""}</span>
-                      {isWritingNote && <button type="button" className="ghost" onClick={() => setIsWritingNote(false)}>Done</button>}
+                      {(isWritingNote || isTextEntrySelected) && <button type="button" className="primary" style={{ padding: '0.5rem 1.2rem', fontSize: '0.95rem' }} onClick={() => setIsWritingNote(false)}>Done</button>}
                     </div>
                   </div>
                   {selectedJournalItem &&
@@ -7196,7 +7351,7 @@ function App() {
                       </div>
                     )}
                   <textarea
-                    rows={isWritingNote || isMediaTranscriptMode || isFreshNoteMode ? 15 : 5}
+                    rows={expandSession ? 15 : 5}
                     value={journalDraftText}
                     onChange={(e) => setJournalDraftText(e.target.value)}
                     onFocus={() => {
@@ -7206,14 +7361,67 @@ function App() {
                     }}
                     placeholder="Write your thoughts..."
                     style={{
-                      flex: isWritingNote || isMediaTranscriptMode || isFreshNoteMode ? 1 : undefined,
+                      flex: expandSession ? 1 : undefined,
                       resize: "none",
                       minHeight:
-                        isWritingNote || isMediaTranscriptMode || isFreshNoteMode
+                        expandSession
                           ? "100%"
                           : undefined
                     }}
                   />
+                  {journalDraftText.trim() && (
+                    <div className="generate-post-section">
+                      <div className="row" style={{ gap: '0.5rem', flexWrap: 'wrap' }}>
+                        <button
+                          type="button"
+                          className="primary"
+                          onClick={() => void generatePostFromJournal()}
+                          disabled={generatePostBusy}
+                          style={{ flex: 1 }}
+                        >
+                          {generatePostBusy ? (
+                            <span className="row" style={{ gap: '0.4rem', alignItems: 'center', justifyContent: 'center' }}>
+                              <span className="btn-spinner" aria-hidden />
+                              Generating...
+                            </span>
+                          ) : (
+                            "✨ Generate Post"
+                          )}
+                        </button>
+                      </div>
+                      {generatePostStatus && (
+                        <p className="text-sm muted" style={{ marginTop: '0.4rem' }}>{generatePostStatus}</p>
+                      )}
+                      {generatedPost && (
+                        <div className="generated-post-card">
+                          <p className="text-sm muted">Generated post:</p>
+                          <p style={{ whiteSpace: 'pre-wrap' }}>{generatedPost}</p>
+                          <div className="row" style={{ gap: '0.5rem', marginTop: '0.5rem' }}>
+                            <button
+                              type="button"
+                              className="ghost text-sm"
+                              onClick={() => {
+                                navigator.clipboard?.writeText(generatedPost);
+                                setGeneratePostStatus("Copied to clipboard!");
+                              }}
+                            >
+                              Copy
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost text-sm"
+                              onClick={() => {
+                                setGeneratedPost("");
+                                setGeneratePostStatus("");
+                              }}
+                            >
+                              Dismiss
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 

@@ -902,9 +902,36 @@ button.local-ai-preset {
 }
 
 .journal-main { min-width: 0; }
-.journal-main-writing { min-height: calc(100dvh - 180px); }
-.note-card-expanded { min-height: calc(100dvh - 200px); }
-.note-card-expanded textarea { height: 100%; }
+.journal-main-writing { min-height: calc(100dvh - 120px); }
+.note-card-expanded {
+  min-height: calc(100dvh - 180px);
+  display: flex;
+  flex-direction: column;
+}
+.note-card-expanded textarea {
+  height: 100%;
+  flex: 1;
+  font-size: 1rem;
+  line-height: 1.6;
+}
+
+.generate-post-section {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--line);
+}
+
+.generated-post-card {
+  margin-top: 0.5rem;
+  padding: 0.75rem;
+  background: var(--accent-dim);
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--line));
+  border-radius: 12px;
+}
+
+.generated-post-card p:first-of-type {
+  margin-bottom: 0.3rem;
+}
 
 @media (max-width: 900px) {
   .journal-desktop-layout { display: block; }
@@ -1002,6 +1029,15 @@ button.local-ai-preset {
 
 :root[data-theme="dark"] .record-btn.video {
   background: linear-gradient(145deg, #4a4a50, #3a3a3e);
+}
+
+.record-btn.gallery {
+  background: linear-gradient(145deg, #2563eb, #1d4ed8);
+  box-shadow: 0 8px 20px rgba(37,99,235,0.35), 0 2px 6px rgba(37,99,235,0.18);
+}
+
+:root[data-theme="dark"] .record-btn.gallery {
+  background: linear-gradient(145deg, #3b82f6, #2563eb);
 }
 
 .record-btn svg {
