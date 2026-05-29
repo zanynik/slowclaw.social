@@ -36,6 +36,7 @@ import {
   getNativeLocalAiStatus,
   nativeAiChat,
   nativeAiEngineStatus,
+  transcribeAudio,
   startRecording as startNativeAudioRecording,
   stopRecording as stopNativeAudioRecording,
   blobToBase64,
@@ -1608,6 +1609,30 @@ function App() {
     }
   }
 
+  async function transcribeAfterSave(audioPath: string, entryId: string) {
+    if (!audioPath) return;
+    setJournalSaveStatus("Transcribing audio...");
+    try {
+      const result = await transcribeAudio(audioPath);
+      if (result.text.trim()) {
+        // Save transcript as a text journal entry
+        const transcriptText = result.text.trim();
+        setJournalDraftText(transcriptText);
+        setJournalSaveStatus(`Transcribed: ${transcriptText.length} chars`);
+        // Auto-save as a new text entry so it persists
+        setRecordingHint(`\u{1F3A4} Transcript ready (${transcriptText.split(/\s+/).length} words)`);
+      } else {
+        setJournalSaveStatus("No speech detected in recording.");
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      // Don't show error for non-iOS or when Speech is unavailable
+      if (!msg.includes("only available on iOS")) {
+        setJournalSaveStatus(`Transcription: ${msg}`);
+      }
+    }
+  }
+
   async function uploadJournalFile(file: File, kind: "audio" | "video") {
     let token = chatGatewayToken.trim();
     if (!gatewayBaseUrl.trim()) {
@@ -1654,6 +1679,9 @@ function App() {
             }));
             setJournalSaveStatus("Transcription queued...");
             void waitForTranscriptForMedia(uploadedPath, token || undefined);
+          } else if (kind === "audio" && isTauriMobileRuntime()) {
+            // No server-side transcription — use on-device Speech.framework
+            void transcribeAfterSave(uploadedPath, "");
           }
         }
       } catch (gatewayError) {
@@ -1668,6 +1696,10 @@ function App() {
           );
           await refreshLibrary("journal");
           setSelectedJournalPath(localJournalPath(saved.id));
+          // Auto-transcribe audio on iOS
+          if (kind === "audio" && isTauriMobileRuntime()) {
+            void transcribeAfterSave(saved.filePath || "", saved.id);
+          }
         } catch (localError) {
           if (isMissingDesktopCommand(localError, "save_journal_media")) {
             throw gatewayError;
@@ -5579,9 +5611,9 @@ function App() {
   }
 
   // ── AI inference helpers ──────────────────────────────────────────────────
-  // Context ~2048 tokens on iPhone. System prompt ~150 tokens, gen ~256–512.
-  // ~1300 user tokens ≈ ~5200 chars. Chunk longer notes.
-  const CHUNK_CHAR_LIMIT = 4800;
+  // Context ~1536 tokens on iPhone. System prompt ~150 tokens, gen ~256–512.
+  // ~800-1000 user tokens ≈ ~3200 chars. Chunk longer notes.
+  const CHUNK_CHAR_LIMIT = 3200;
 
   function splitIntoChunks(text: string, limit: number): string[] {
     if (text.length <= limit) return [text];
@@ -6119,6 +6151,17 @@ function App() {
   // Load local model catalog on app startup
   useEffect(() => {
     void loadLocalModels();
+  }, [chatGatewayToken, gatewayBaseUrl]);
+
+  // Re-check model status when app comes back to foreground (after screen lock/unlock)
+  useEffect(() => {
+    function handleVisibility() {
+      if (document.visibilityState === "visible") {
+        void loadLocalModels();
+      }
+    }
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
   }, [chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
@@ -8596,7 +8639,7 @@ function App() {
                           onClick={() => void startLocalModelDownload(model.id)}
                           disabled={Boolean(localModelBusyId) || isDownloading}
                         >
-                          {isDownloading ? "Downloading..." : `Download (${model.sizeLabel})`}
+                          {isDownloading ? "Downloading..." : download?.status === "failed" && transferred > 0 ? `Resume Download (${Math.round((transferred / total) * 100)}%)` : `Download (${model.sizeLabel})`}
                         </button>
                       ) : model.installed && !isConfigured ? (
                         <button
