@@ -25,6 +25,8 @@ type ProductivityViewProps = {
   formatEventTiming: (startAt: string, endAt?: string | null, allDay?: boolean) => string;
   formatTimestamp: (value?: number | string) => string;
   onToggleTodo: (item: WorkspaceTodoItem) => void;
+  onExtractTasks?: () => void;
+  extractingTasks?: boolean;
 };
 
 type ProductivityFilter = "all" | "todos" | "events" | "done";
@@ -375,7 +377,9 @@ export function ProductivityView({
   formatTodoDueLabel,
   formatEventTiming,
   formatTimestamp,
-  onToggleTodo
+  onToggleTodo,
+  onExtractTasks,
+  extractingTasks = false
 }: ProductivityViewProps) {
   const [filter, setFilter] = useState<ProductivityFilter>("all");
   const activeEvents = [...todayEventItems, ...upcomingEventItems];
@@ -419,11 +423,28 @@ export function ProductivityView({
     <div className="stack">
       <div className="card">
         <div className="stack-sm">
-          <h2 style={{ margin: 0 }}>Productivity</h2>
+          <h2 style={{ margin: 0 }}>Tasks &amp; Events</h2>
           <p className="text-sm muted" style={{ margin: 0 }}>
-            Todos and calendar commitments extracted from the workspace, ranked by what needs
-            attention next.
+            Extracted from your journal entries using AI.
           </p>
+          {onExtractTasks && (
+            <button
+              type="button"
+              className="primary"
+              style={{ width: '100%', borderRadius: '10px', marginTop: '0.5rem' }}
+              onClick={onExtractTasks}
+              disabled={extractingTasks}
+            >
+              {extractingTasks ? (
+                <span className="row" style={{ gap: '0.4rem', alignItems: 'center', justifyContent: 'center' }}>
+                  <span className="btn-spinner" aria-hidden />
+                  Extracting...
+                </span>
+              ) : (
+                `🧠 Extract Tasks from Journals`
+              )}
+            </button>
+          )}
         </div>
 
         <div className="workspace-synth-card">
