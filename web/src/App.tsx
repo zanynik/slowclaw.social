@@ -6191,7 +6191,8 @@ function App() {
     : installedLocalModelCount > 0
     ? "Downloaded"
     : "Setup needed";
-  const needsMobileQrLogin = !isNativeClient && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
+  const isLocalDev = typeof window !== "undefined" && /^localhost$|^127\.0\.0\.1$/.test(window.location.hostname);
+  const needsMobileQrLogin = !isNativeClient && !isLocalDev && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
   const isCaptureZenMode = mobileTab === "journal" && (isRecording || captureMode !== null);
   const hideChrome = isWritingNote || isCaptureZenMode;
   const showDesktopJournalLayout = isDesktopLayout && mobileTab === "journal";
