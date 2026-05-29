@@ -933,6 +933,41 @@ button.local-ai-preset {
   margin-bottom: 0.3rem;
 }
 
+.post-edit-textarea {
+  width: 100%;
+  min-height: 4rem;
+  padding: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.todo-edit-input {
+  width: 100%;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+}
+
+.todo-edit-input:focus {
+  border-color: var(--accent);
+  background: var(--bg);
+  outline: none;
+}
+
+.todo-edit-input.text-sm {
+  font-weight: 400;
+}
+
 /* ─────────────────────────────────────────────────
    FEED CREATE HERO
    ───────────────────────────────────────────────── */
@@ -2854,7 +2889,23 @@ button.local-ai-preset {
   background: var(--bg, #111);
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
-  padding: env(safe-area-inset-top, 20px) 1rem calc(env(safe-area-inset-bottom, 20px) + 80px) 1rem;
+  padding: env(safe-area-inset-top, 20px) 1rem calc(env(safe-area-inset-bottom, 20px) + 20px) 1rem;
+}
+
+.settings-overlay .settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 0;
+  margin-bottom: 0.5rem;
+}
+
+.settings-overlay .settings-header h2 { margin: 0; }
+
+.settings-overlay .settings-back {
+  font-size: 1.1rem;
+  padding: 0.4rem 0.8rem;
+  border-radius: 10px;
 }
 
 /* ─────────────────────────────────────────────

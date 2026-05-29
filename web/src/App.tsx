@@ -5578,23 +5578,17 @@ function App() {
     }
   }
 
-  // ── Chunked inference helpers ──────────────────────────────────────────────
-  // The Qwen 1.5B model on iPhone has a 2048-token context. The system prompt
-  // + chat template overhead consume ~150 tokens, generation needs ~256-512.
-  // That leaves ~1300 tokens for user content (~5200 chars).
-  // For longer notes, we chunk and process each chunk separately.
-  const CHUNK_CHAR_LIMIT = 4800; // conservative chars-per-chunk
+  // ── AI inference helpers ──────────────────────────────────────────────────
+  // Context ~2048 tokens on iPhone. System prompt ~150 tokens, gen ~256–512.
+  // ~1300 user tokens ≈ ~5200 chars. Chunk longer notes.
+  const CHUNK_CHAR_LIMIT = 4800;
 
   function splitIntoChunks(text: string, limit: number): string[] {
     if (text.length <= limit) return [text];
     const chunks: string[] = [];
     let remaining = text;
     while (remaining.length > 0) {
-      if (remaining.length <= limit) {
-        chunks.push(remaining);
-        break;
-      }
-      // Try to split at a paragraph or sentence boundary
+      if (remaining.length <= limit) { chunks.push(remaining); break; }
       let splitAt = remaining.lastIndexOf('\n\n', limit);
       if (splitAt < limit * 0.3) splitAt = remaining.lastIndexOf('. ', limit);
       if (splitAt < limit * 0.3) splitAt = remaining.lastIndexOf(' ', limit);
@@ -5605,135 +5599,127 @@ function App() {
     return chunks;
   }
 
+  /** Try to parse JSON from AI output with multiple format recovery attempts */
+  function tryParseJsonArray<T>(raw: string): T[] | null {
+    // Strip markdown fences
+    let cleaned = raw.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/m, "").trim();
+    // Try direct parse
+    try { const r = JSON.parse(cleaned); if (Array.isArray(r)) return r; } catch {}
+    // Try extracting first [...] block
+    const bracketMatch = cleaned.match(/\[\s*\{[\s\S]*\}\s*\]/);
+    if (bracketMatch) {
+      try { const r = JSON.parse(bracketMatch[0]); if (Array.isArray(r)) return r; } catch {}
+    }
+    // Try line-by-line JSON objects  {"title":...}
+    const objLines = cleaned.split('\n').filter((l) => l.trim().startsWith('{'));
+    if (objLines.length > 0) {
+      const arr: T[] = [];
+      for (const line of objLines) {
+        try { arr.push(JSON.parse(line.replace(/,\s*$/, ''))); } catch {}
+      }
+      if (arr.length > 0) return arr;
+    }
+    return null;
+  }
+
+  function requireModel(): boolean {
+    const hasModel = localModels.some((m) => m.installed) || nativeLocalAiStatus?.configured;
+    if (!hasModel) {
+      setGeneratePostStatus("No AI model downloaded. Tap the \u2699\uFE0F gear icon to download one.");
+      return false;
+    }
+    return true;
+  }
+
   async function generatePostFromJournal() {
     const content = journalDraftText.trim();
-    if (!content) {
-      setGeneratePostStatus("Write or select a journal entry first.");
-      return;
-    }
+    if (!content) { setGeneratePostStatus("Write or select a journal entry first."); return; }
+    if (!requireModel()) return;
     setGeneratePostBusy(true);
-    setGeneratePostStatus("Generating post with local AI...");
+    setGeneratePostStatus("Generating posts with local AI...");
     setGeneratedPost("");
     try {
-      let postText = "";
+      let posts: string[] = [];
       if (isTauriMobileRuntime()) {
         const chunks = splitIntoChunks(content, CHUNK_CHAR_LIMIT);
-        if (chunks.length === 1) {
-          // Single chunk — direct generation
-          const result = await nativeAiChat(
-            content,
-            "You are a social media content writer. Turn the following journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text, no hashtags unless they add value.",
-            256,
-            0.8
-          );
-          postText = result.text;
-          setGeneratePostStatus(
-            `Generated in ${result.tokensGenerated} tokens (${result.tokensPerSecond.toFixed(1)} tok/s)`
-          );
-        } else {
-          // Multi-chunk — summarize each chunk, then compose
-          setGeneratePostStatus(`Processing ${chunks.length} chunks...`);
-          const summaries: string[] = [];
-          for (let i = 0; i < chunks.length; i++) {
-            setGeneratePostStatus(`Summarizing chunk ${i + 1}/${chunks.length}...`);
+        // Each chunk generates its own tweet-style post (multiple posts from long notes)
+        for (let i = 0; i < chunks.length; i++) {
+          if (chunks.length > 1) setGeneratePostStatus(`Generating post ${i + 1}/${chunks.length}...`);
+          // Retry up to 3 times for each chunk
+          let postText = "";
+          for (let attempt = 0; attempt < 3; attempt++) {
             const result = await nativeAiChat(
               chunks[i],
-              "Summarize the following journal text in 2-3 bullet points. Keep key facts, actions, and feelings. Output ONLY the bullet points.",
-              200,
-              0.4
+              "You are a social media content writer. Turn the following journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text, no hashtags unless they add real value. No quotes around the text.",
+              256,
+              0.8 + attempt * 0.1 // slightly vary temperature on retry
             );
-            summaries.push(result.text);
+            postText = result.text.replace(/^["']|["']$/g, '').trim();
+            if (postText.length > 10 && postText.length < 400) break; // good output
           }
-          // Final pass: compose a post from the summaries
-          setGeneratePostStatus("Composing final post...");
-          const combined = summaries.join("\n");
-          const finalResult = await nativeAiChat(
-            combined,
-            "You are a social media content writer. Turn these journal summary notes into ONE concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text.",
-            256,
-            0.8
-          );
-          postText = finalResult.text;
-          setGeneratePostStatus(
-            `Generated from ${chunks.length} chunks (${finalResult.tokensPerSecond.toFixed(1)} tok/s)`
-          );
+          if (postText) posts.push(postText);
         }
+        setGeneratePostStatus(`Generated ${posts.length} post${posts.length > 1 ? 's' : ''}`);
       } else {
-        // Desktop: use the gateway chat endpoint
         const token = await resolveRuntimeGatewayToken();
         const response = await fetch(`${gatewayBaseUrl || ""}/api/chat/messages`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
-          body: JSON.stringify({
-            threadId: createThreadId(),
-            content: `Turn this journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text:\n\n${content}`,
-          }),
+          headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+          body: JSON.stringify({ threadId: createThreadId(), content: `Turn this journal entry into a concise tweet-style post (under 280 chars). Output ONLY the post:\n\n${content}` }),
         });
-        if (!response.ok) {
-          throw new Error(`Gateway returned ${response.status}`);
-        }
+        if (!response.ok) throw new Error(`Gateway returned ${response.status}`);
         const data = await response.json();
-        postText = data.content || data.text || JSON.stringify(data);
+        posts = [(data.content || data.text || "").trim()];
         setGeneratePostStatus("Generated via gateway.");
       }
-      setGeneratedPost(postText);
-      // Persist to Feed > Create tab
-      if (postText.trim()) {
-        const newPost: PersistedPost = {
-          id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          text: postText.trim(),
-          sourceExcerpt: content.slice(0, 120),
-          createdAt: Date.now(),
-        };
-        setPersistedPosts((prev) => {
-          const next = [newPost, ...prev];
-          savePersistedPosts(next);
-          return next;
-        });
+      setGeneratedPost(posts[0] || "");
+      // Persist all generated posts to Feed > Create
+      const newPosts: PersistedPost[] = posts.filter((t) => t.trim()).map((t) => ({
+        id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        text: t.trim(),
+        sourceExcerpt: content.slice(0, 120),
+        createdAt: Date.now(),
+      }));
+      if (newPosts.length > 0) {
+        setPersistedPosts((prev) => { const next = [...newPosts, ...prev]; savePersistedPosts(next); return next; });
       }
     } catch (error) {
-      setGeneratePostStatus(
-        `Generation failed: ${error instanceof Error ? error.message : String(error)}`
-      );
+      setGeneratePostStatus(`Generation failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setGeneratePostBusy(false);
     }
   }
 
   async function extractTasksFromJournals() {
-    // Gather all journal text for task extraction
+    if (!requireModel()) return;
     const allJournalText = journalItems
       .slice(0, 20)
       .map((item) => item.previewText || item.title || "")
       .filter((t) => t.trim().length > 10)
       .join("\n---\n")
       .trim();
-    if (!allJournalText) {
-      setGeneratePostStatus("No journal entries to extract tasks from.");
-      return;
-    }
+    if (!allJournalText) { setGeneratePostStatus("No journal entries to extract tasks from."); return; }
     setExtractingLocalTasks(true);
     try {
-      const taskSystemPrompt = `You extract action items and tasks from journal entries. Output a JSON array of objects, each with "title" and "details" fields. Only include real actionable tasks. Output ONLY valid JSON, no markdown fences, no commentary. Example: [{"title":"Buy groceries","details":"Need milk and eggs"}]`;
-
+      const taskPrompt = `You extract action items and tasks from journal entries. Output a JSON array of objects with "title" and "details" fields. Only real actionable tasks. Output ONLY valid JSON, no markdown fences. Example: [{"title":"Buy groceries","details":"Need milk and eggs"}]`;
       const chunks = splitIntoChunks(allJournalText, CHUNK_CHAR_LIMIT);
       const allParsed: Array<{ title: string; details?: string }> = [];
 
       for (let i = 0; i < chunks.length; i++) {
-        if (chunks.length > 1) {
-          setGeneratePostStatus(`Extracting tasks from chunk ${i + 1}/${chunks.length}...`);
-        }
-        const result = await nativeAiChat(chunks[i], taskSystemPrompt, 512, 0.3);
-        try {
-          const cleaned = result.text.replace(/^```json?\n?/i, "").replace(/```$/, "").trim();
-          const parsed = JSON.parse(cleaned);
-          if (Array.isArray(parsed)) allParsed.push(...parsed);
-        } catch {
-          const lines = result.text.split("\n").filter((l) => l.trim().startsWith("-") || l.trim().startsWith("*"));
-          allParsed.push(...lines.map((l) => ({ title: l.replace(/^[-*]\s*/, "").trim() })));
+        if (chunks.length > 1) setGeneratePostStatus(`Extracting tasks ${i + 1}/${chunks.length}...`);
+        // Retry up to 3 times for JSON output
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const result = await nativeAiChat(chunks[i], taskPrompt, 512, 0.2 + attempt * 0.1);
+          const parsed = tryParseJsonArray<{ title: string; details?: string }>(result.text);
+          if (parsed && parsed.length > 0) {
+            allParsed.push(...parsed);
+            break;
+          }
+          // Fallback: try bullet-point parsing on last attempt
+          if (attempt === 2) {
+            const lines = result.text.split("\n").filter((l) => /^\s*[-*\d.]/.test(l));
+            allParsed.push(...lines.map((l) => ({ title: l.replace(/^\s*[-*\d.]+\s*/, "").trim() })));
+          }
         }
       }
 
@@ -5750,18 +5736,14 @@ function App() {
         setPersistedTodos((prev) => {
           const existingTitles = new Set(prev.map((t) => t.title.toLowerCase()));
           const unique = newTodos.filter((t) => !existingTitles.has(t.title.toLowerCase()));
-          const next = [...unique, ...prev];
-          savePersistedTodos(next);
-          return next;
+          const next = [...unique, ...prev]; savePersistedTodos(next); return next;
         });
         setGeneratePostStatus(`Extracted ${allParsed.length} tasks from ${chunks.length} chunk${chunks.length > 1 ? 's' : ''}`);
       } else {
         setGeneratePostStatus("No tasks found in journal entries.");
       }
     } catch (error) {
-      setGeneratePostStatus(
-        `Task extraction failed: ${error instanceof Error ? error.message : String(error)}`
-      );
+      setGeneratePostStatus(`Task extraction failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setExtractingLocalTasks(false);
     }
@@ -6134,17 +6116,7 @@ function App() {
     return () => window.clearInterval(timer);
   }, [mobileTab, localModels, localModelRuntime?.running]);
 
-  // Auto-show onboarding/settings when no model is downloaded on first load
-  useEffect(() => {
-    // Wait until models have been loaded at least once
-    if (localModels.length === 0) return;
-    const hasInstalledModel = localModels.some((m) => m.installed);
-    if (!hasInstalledModel) {
-      setShowSettings(true);
-    }
-  }, [localModels.length > 0 && localModels.some((m) => m.installed)]);
-
-  // Load models on app startup so onboarding can detect whether to show
+  // Load local model catalog on app startup
   useEffect(() => {
     void loadLocalModels();
   }, [chatGatewayToken, gatewayBaseUrl]);
@@ -7686,39 +7658,30 @@ function App() {
                 <div className="stack">
                   {persistedPosts.map((post) => (
                     <div key={post.id} className="generated-post-card">
-                      <p style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{post.text}</p>
-                      <div className="row-between" style={{ marginTop: '0.5rem' }}>
+                      <textarea
+                        className="post-edit-textarea"
+                        value={post.text}
+                        onChange={(e) => {
+                          const newText = e.target.value;
+                          setPersistedPosts((prev) => {
+                            const next = prev.map((p) => p.id === post.id ? { ...p, text: newText } : p);
+                            savePersistedPosts(next);
+                            return next;
+                          });
+                        }}
+                        rows={3}
+                      />
+                      <div className="row-between" style={{ marginTop: '0.35rem' }}>
                         <span className="text-sm muted">
                           {new Date(post.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                         </span>
                         <div className="row" style={{ gap: '0.35rem' }}>
-                          <button
-                            type="button"
-                            className="ghost text-sm"
-                            onClick={() => { navigator.clipboard?.writeText(post.text); }}
-                          >
-                            Copy
-                          </button>
-                          <button
-                            type="button"
-                            className="ghost text-sm"
-                            onClick={() => {
-                              setPersistedPosts((prev) => {
-                                const next = prev.filter((p) => p.id !== post.id);
-                                savePersistedPosts(next);
-                                return next;
-                              });
-                            }}
-                          >
-                            Delete
-                          </button>
+                          <button type="button" className="ghost text-sm" onClick={() => { navigator.clipboard?.writeText(post.text); }}>Copy</button>
+                          <button type="button" className="ghost text-sm" onClick={() => {
+                            setPersistedPosts((prev) => { const next = prev.filter((p) => p.id !== post.id); savePersistedPosts(next); return next; });
+                          }}>Delete</button>
                         </div>
                       </div>
-                      {post.sourceExcerpt ? (
-                        <p className="text-sm muted" style={{ margin: '0.25rem 0 0', fontStyle: 'italic' }}>
-                          From: {post.sourceExcerpt}...
-                        </p>
-                      ) : null}
                     </div>
                   ))}
                 </div>
@@ -8418,8 +8381,34 @@ function App() {
                       <div key={todo.id} className="planner-item-card">
                         <div className="row-between" style={{ gap: '0.8rem', alignItems: 'flex-start' }}>
                           <div className="stack-sm" style={{ gap: '0.25rem', flex: 1 }}>
-                            <strong>{todo.title}</strong>
-                            {todo.details ? <p className="text-sm muted" style={{ margin: 0 }}>{todo.details}</p> : null}
+                            <input
+                              type="text"
+                              value={todo.title}
+                              className="todo-edit-input"
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setPersistedTodos((prev) => {
+                                  const next = prev.map((t) => t.id === todo.id ? { ...t, title: val } : t);
+                                  savePersistedTodos(next);
+                                  return next;
+                                });
+                              }}
+                            />
+                            {todo.details ? (
+                              <input
+                                type="text"
+                                value={todo.details}
+                                className="todo-edit-input text-sm muted"
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  setPersistedTodos((prev) => {
+                                    const next = prev.map((t) => t.id === todo.id ? { ...t, details: val } : t);
+                                    savePersistedTodos(next);
+                                    return next;
+                                  });
+                                }}
+                              />
+                            ) : null}
                             <span className="text-sm muted">
                               {new Date(todo.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric' })}
                             </span>
@@ -8552,34 +8541,25 @@ function App() {
             </div>
           </ViewErrorBoundary>
         ) : null}
+      </main>
+      </SwipeableView>
 
         {showSettings ? (
           <div className="settings-overlay view-enter">
+            <div className="settings-header">
+              <button type="button" className="ghost settings-back" onClick={() => setShowSettings(false)}>
+                ← Back
+              </button>
+              <h2>Settings</h2>
+              <div style={{ width: '60px' }} />
+            </div>
+
             <div className="stack">
               <div className="card">
-                <div className="row-between" style={{ alignItems: 'center' }}>
-                  <h2 style={{ margin: 0 }}>
-                    {localModels.some((m) => m.installed) ? 'Settings' : 'Welcome to SlowClaw'}
-                  </h2>
-                  <button type="button" className="ghost" onClick={() => setShowSettings(false)}>
-                    ✕
-                  </button>
-                </div>
-
-                {!localModels.some((m) => m.installed) ? (
-                  <div className="stack-sm" style={{ margin: '0.5rem 0' }}>
-                    <p className="text-sm" style={{ margin: 0 }}>
-                      SlowClaw runs a private AI model on your iPhone to turn journal entries into posts and tasks. No data leaves your device.
-                    </p>
-                    <p className="text-sm muted" style={{ margin: 0 }}>
-                      Download the model below to get started (~1 GB, needs Wi-Fi).
-                    </p>
-                  </div>
-                ) : (
-                  <p className="text-sm muted" style={{ margin: '0.25rem 0 0.5rem' }}>
-                    On-device AI — all processing stays on your iPhone.
-                  </p>
-                )}
+                <h3 style={{ margin: 0 }}>On-Device AI</h3>
+                <p className="text-sm muted" style={{ margin: '0.25rem 0 0.75rem' }}>
+                  Private AI model on your iPhone. No data leaves your device.
+                </p>
 
                 {localModels.map((model) => {
                   const download = model.download;
@@ -8588,15 +8568,16 @@ function App() {
                   const total = download?.totalBytes || model.sizeBytes || 0;
                   const progress = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 0;
                   const isConfigured = nativeLocalAiStatus?.modelId === model.id;
+                  const isInCatalog = ["unsloth/gemma-4-E2B-it-Q4_K_M"].includes(model.id);
                   return (
-                    <div key={model.id} className="stack-sm" style={{ gap: '0.5rem' }}>
+                    <div key={model.id} className="card" style={{ margin: '0.5rem 0' }}>
                       <div className="row-between">
                         <strong>{model.title}</strong>
                         <span className={model.installed ? "local-model-pill installed" : "local-model-pill"}>
                           {isConfigured ? "Ready" : model.installed ? "Downloaded" : model.sizeLabel}
                         </span>
                       </div>
-                      <p className="text-sm muted" style={{ margin: 0 }}>{model.description}</p>
+                      <p className="text-sm muted" style={{ margin: '0.25rem 0' }}>{model.description}</p>
                       {isDownloading ? (
                         <div className="local-model-progress">
                           <div className="local-model-progress-track">
@@ -8608,32 +8589,48 @@ function App() {
                       {download?.status === "failed" && download.error ? (
                         <p className="text-sm local-model-error">{download.error}</p>
                       ) : null}
-                      {!model.installed ? (
+                      {!model.installed && isInCatalog ? (
                         <button
-                          type="button"
-                          className="primary"
-                          style={{ width: '100%', borderRadius: '10px', padding: '0.75rem' }}
+                          type="button" className="primary"
+                          style={{ width: '100%', borderRadius: '10px', padding: '0.75rem', marginTop: '0.5rem' }}
                           onClick={() => void startLocalModelDownload(model.id)}
                           disabled={Boolean(localModelBusyId) || isDownloading}
                         >
-                          {isDownloading ? "Downloading..." : "Download Model (1.0 GB)"}
+                          {isDownloading ? "Downloading..." : `Download (${model.sizeLabel})`}
                         </button>
-                      ) : !isConfigured ? (
+                      ) : model.installed && !isConfigured ? (
                         <button
-                          type="button"
-                          className="primary"
-                          style={{ width: '100%', borderRadius: '10px', padding: '0.75rem' }}
+                          type="button" className="primary"
+                          style={{ width: '100%', borderRadius: '10px', padding: '0.75rem', marginTop: '0.5rem' }}
                           onClick={() => void startDownloadedLocalModel(model.id)}
                           disabled={Boolean(localModelBusyId)}
                         >
                           Activate Model
                         </button>
-                      ) : (
-                        <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+                      ) : model.installed && isConfigured ? (
+                        <div className="row" style={{ gap: '0.5rem', alignItems: 'center', marginTop: '0.5rem' }}>
                           <span className="model-hub-orb ready" />
-                          <span className="text-sm">AI is ready. Close settings and start journaling!</span>
+                          <span className="text-sm">AI is ready</span>
                         </div>
-                      )}
+                      ) : null}
+                      {model.installed && !isInCatalog ? (
+                        <button
+                          type="button" className="ghost text-sm"
+                          style={{ marginTop: '0.5rem', color: 'var(--danger, #e55)' }}
+                          onClick={async () => {
+                            if (!confirm(`Delete ${model.title}? The file will be removed.`)) return;
+                            try {
+                              const { remove } = await import("@tauri-apps/plugin-fs");
+                              if (model.path) await remove(model.path);
+                              void loadLocalModels();
+                            } catch (err) {
+                              setLocalModelsStatus(`Delete failed: ${err instanceof Error ? err.message : String(err)}`);
+                            }
+                          }}
+                        >
+                          Delete Model
+                        </button>
+                      ) : null}
                     </div>
                   );
                 })}
@@ -8641,9 +8638,7 @@ function App() {
                 {localModels.length === 0 ? (
                   <div className="stack-sm" style={{ textAlign: 'center', padding: '1rem 0' }}>
                     <p className="text-sm muted">Loading model info...</p>
-                    <button type="button" className="ghost" onClick={() => void loadLocalModels()}>
-                      Refresh
-                    </button>
+                    <button type="button" className="ghost" onClick={() => void loadLocalModels()}>Refresh</button>
                   </div>
                 ) : null}
 
@@ -8654,8 +8649,6 @@ function App() {
             </div>
           </div>
         ) : null}
-      </main>
-      </SwipeableView>
 
       {!hideChrome && (
         <BottomNav
