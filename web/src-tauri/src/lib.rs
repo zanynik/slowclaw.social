@@ -12,6 +12,7 @@ use tauri::async_runtime::JoinHandle;
 use tauri::Manager;
 
 mod inference;
+mod transcription;
 
 const EMBEDDED_GATEWAY_URL: &str = "http://127.0.0.1:42617";
 const PROVIDER_SECRET_SERVICE: &str = "social.slowclaw.gateway";
@@ -300,8 +301,101 @@ async fn load_native_local_ai_state(
     Ok(Some(state))
 }
 
+/// On iOS, the app container UUID changes on update/reinstall, making
+/// previously saved absolute model paths stale. This function tries to
+/// reconstruct the path under the current workspace directory.
+///
+/// It also scans the models directory for any `.gguf` file matching the
+/// model_id pattern as a last resort.
+fn try_repair_model_path(model_id: &str, old_path: &str) -> Option<String> {
+    // Extract the relative suffix after workspace marker
+    // e.g. ".zeroclaw/workspace/local-models/llamacpp/<dir>/<file>.gguf"
+    let workspace_marker = ".zeroclaw/workspace/";
+    let relative_suffix = old_path
+        .find(workspace_marker)
+        .map(|i| &old_path[i + workspace_marker.len()..]);
+
+    // Get the current home directory (works on iOS + macOS + Linux)
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let workspace_dir = home.join(".zeroclaw").join("workspace");
+
+    // Strategy 1: reconstruct from the relative suffix
+    if let Some(suffix) = relative_suffix {
+        let candidate = workspace_dir.join(suffix);
+        if candidate.is_file() {
+            return Some(candidate.display().to_string());
+        }
+    }
+
+    // Strategy 2: look for the GGUF by model_id in the models directory
+    let model_dir_name: String = model_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let search_dir = workspace_dir
+        .join("local-models")
+        .join("llamacpp")
+        .join(&model_dir_name);
+    if search_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&search_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().is_some_and(|ext| ext == "gguf") && p.is_file() {
+                    return Some(p.display().to_string());
+                }
+            }
+        }
+    }
+
+    // Strategy 3: scan ALL model directories for any .gguf file
+    let models_root = workspace_dir.join("local-models").join("llamacpp");
+    if models_root.is_dir() {
+        if let Ok(dirs) = std::fs::read_dir(&models_root) {
+            for dir_entry in dirs.flatten() {
+                if !dir_entry.path().is_dir() {
+                    continue;
+                }
+                if let Ok(files) = std::fs::read_dir(dir_entry.path()) {
+                    for file_entry in files.flatten() {
+                        let p = file_entry.path();
+                        if p.extension().is_some_and(|ext| ext == "gguf") && p.is_file() {
+                            return Some(p.display().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn status_from_native_local_ai_state(saved: NativeLocalAiPersistedState) -> NativeLocalAiStatus {
-    let model_exists = std::path::Path::new(&saved.model_path).is_file();
+    let mut model_path = saved.model_path.clone();
+    let mut model_exists = std::path::Path::new(&model_path).is_file();
+
+    // iOS app containers change UUID on update/reinstall.
+    // If the saved absolute path is stale, try to reconstruct it
+    // from the current workspace directory.
+    if !model_exists {
+        if let Some(repaired) = try_repair_model_path(&saved.model_id, &saved.model_path) {
+            eprintln!(
+                "[native-ai] repaired stale model path: {} -> {}",
+                saved.model_path, repaired
+            );
+            model_path = repaired;
+            model_exists = true;
+        }
+    }
+
     let engine_compiled = cfg!(feature = "native-inference");
     NativeLocalAiStatus {
         provider: NATIVE_LOCAL_AI_PROVIDER.to_string(),
@@ -316,7 +410,7 @@ fn status_from_native_local_ai_state(saved: NativeLocalAiPersistedState) -> Nati
             "configured_engine_missing".to_string()
         },
         model_id: Some(saved.model_id),
-        model_path: Some(saved.model_path),
+        model_path: Some(model_path),
         api_url: NATIVE_LOCAL_AI_URL.to_string(),
         message: if !model_exists {
             "SlowClaw found a saved native local AI model selection, but the GGUF file is missing. Re-download the model."
@@ -789,7 +883,29 @@ async fn restart_embedded_gateway(
 
     if normalized_provider == NATIVE_LOCAL_AI_PROVIDER {
         match load_native_local_ai_state(&config).await {
-            Ok(Some(saved)) => sync_native_local_ai_env(&saved.model_id, &saved.model_path),
+            Ok(Some(saved)) => {
+                let mut model_path = saved.model_path.clone();
+                // Auto-repair stale model path (iOS container UUID changes)
+                if !std::path::Path::new(&model_path).is_file() {
+                    if let Some(repaired) = try_repair_model_path(&saved.model_id, &model_path) {
+                        eprintln!(
+                            "[startup] repaired stale model path: {} -> {}",
+                            model_path, repaired
+                        );
+                        model_path = repaired.clone();
+                        // Persist the repaired path so next startup is fast
+                        let _ = save_native_local_ai_state(
+                            &config,
+                            &NativeLocalAiPersistedState {
+                                model_id: saved.model_id.clone(),
+                                model_path: repaired,
+                            },
+                        )
+                        .await;
+                    }
+                }
+                sync_native_local_ai_env(&saved.model_id, &model_path);
+            }
             Ok(None) => {}
             Err(err) => eprintln!("native local AI state restore failed: {err}"),
         }
@@ -2178,6 +2294,18 @@ fn native_ai_engine_status() -> serde_json::Value {
     })
 }
 
+#[tauri::command]
+async fn transcribe_audio(audio_path: String) -> Result<transcription::TranscriptionResult, String> {
+    let path = audio_path.trim().to_string();
+    if path.is_empty() {
+        return Err("audio_path is required".to_string());
+    }
+    // Run on a blocking thread since the iOS API uses a sync wait
+    tokio::task::spawn_blocking(move || transcription::transcribe_audio_file(&path))
+        .await
+        .map_err(|e| format!("transcription task failed: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let gateway_state = GatewayState::default();
@@ -2229,7 +2357,8 @@ pub fn run() {
             show_main_window,
             native_ai_load_model,
             native_ai_chat,
-            native_ai_engine_status
+            native_ai_engine_status,
+            transcribe_audio
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");

@@ -2,7 +2,9 @@
 //!
 //! When the `native-inference` feature is enabled, this module loads a GGUF
 //! model file using `llama-cpp-2` and runs text generation locally on the
-//! device. On iOS this uses Metal acceleration via Apple's GPU.
+//! device. On iOS the build links Metal, but the runtime defaults to CPU-backed
+//! inference for stability because TestFlight devices showed uncatchable Metal
+//! allocator crashes during repeated context creation.
 //!
 //! When the feature is disabled, all functions return a clear error explaining
 //! that the native inference engine was not compiled into this build.
@@ -133,11 +135,11 @@ mod engine {
         // through CPU/offload modes when Metal allocation fails.
         let is_ios = cfg!(target_os = "ios");
         let load_attempts: Vec<(u32, bool)> = if is_ios {
-            if file_size > 2_500_000_000 {
-                vec![(0, true), (16, true), (0, false)]
-            } else {
-                vec![(99, true), (0, true), (99, false), (0, false)]
-            }
+            // iOS TestFlight crashes showed Metal allocator faults during
+            // context creation when the model was loaded with full GPU offload.
+            // Prefer CPU/file-backed mmap for stability. This is slower, but it
+            // avoids uncatchable ggml/Metal SIGSEGV/SIGABRT failures.
+            vec![(0, true), (0, false)]
         } else {
             vec![(99, true)]
         };
@@ -308,7 +310,7 @@ mod engine {
         // iOS has limited RAM; cap the KV-cache to a safe ceiling.
         // The context must fit: prompt_tokens + generation headroom.
         // If the prompt is too long, truncate it (keep start + end).
-        let max_ctx: u32 = if cfg!(target_os = "ios") { 2048 } else { 4096 };
+        let max_ctx: u32 = if cfg!(target_os = "ios") { 1536 } else { 4096 };
         let gen_headroom = req.max_tokens.min(max_ctx / 2);
         let max_prompt_tokens = (max_ctx - gen_headroom - 8) as usize; // 8 for safety margin
 
@@ -334,32 +336,42 @@ mod engine {
             n_ctx, tokens.len(), gen_headroom
         );
 
+        let n_batch: usize = if cfg!(target_os = "ios") { 128 } else { 512 };
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
-            .with_n_batch(512);
+            .with_n_batch(n_batch as u32);
 
         let mut ctx = model
             .new_context(&state.backend, ctx_params)
             .map_err(|e| format!("context creation failed: {e}"))?;
 
-        // Create a batch and add prompt tokens
-        let mut batch = LlamaBatch::new(n_ctx as usize, 1);
-
-        for (i, &token) in tokens.iter().enumerate() {
-            let is_last = i == tokens.len() - 1;
-            batch
-                .add(token, i as i32, &[0], is_last)
-                .map_err(|e| format!("batch add failed: {e}"))?;
+        // Decode the prompt in chunks no larger than n_batch. The previous
+        // implementation decoded the whole prompt in one batch even when the
+        // prompt had >512 tokens while n_batch=512, which can trigger ggml_abort
+        // inside llama_context::decode instead of returning a Rust error.
+        let mut batch = LlamaBatch::new(n_batch, 1);
+        for chunk_start in (0..tokens.len()).step_by(n_batch) {
+            batch.clear();
+            let chunk_end = (chunk_start + n_batch).min(tokens.len());
+            for (offset, &token) in tokens[chunk_start..chunk_end].iter().enumerate() {
+                let pos = chunk_start + offset;
+                let is_last_prompt_token = pos == tokens.len() - 1;
+                batch
+                    .add(token, pos as i32, &[0], is_last_prompt_token)
+                    .map_err(|e| format!("batch add failed: {e}"))?;
+            }
+            ctx.decode(&mut batch)
+                .map_err(|e| format!("prompt decode failed: {e}"))?;
         }
 
-        // Decode the prompt
-        ctx.decode(&mut batch)
-            .map_err(|e| format!("prompt decode failed: {e}"))?;
-
         // Setup sampler
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_nanos() & 0xffff_ffff) as u32)
+            .unwrap_or(42);
         let mut sampler = LlamaSampler::chain_simple([
             LlamaSampler::temp(req.temperature),
-            LlamaSampler::dist(42),
+            LlamaSampler::dist(seed),
         ]);
 
         // Generate tokens
