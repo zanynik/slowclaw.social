@@ -7,3 +7,4 @@
 export { useMediaQuery, useIsLargeScreen, useIsMobile, useIsTablet, usePrefersReducedMotion, usePrefersDarkMode } from "./useMediaQuery";
 export { useDebounce, useDebouncedCallback, useAutosave } from "./useDebounce";
 export { useKeyboardHeight, useIsKeyboardOpen } from "./useKeyboardHeight";
+export { useScrollDirection } from "./useScrollDirection";
