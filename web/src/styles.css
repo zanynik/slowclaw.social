@@ -365,8 +365,8 @@ textarea {
 }
 
 .bottom-nav svg {
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   stroke-width: 1.8px;
   transition: transform 0.2s var(--ease-out);
 }
@@ -3058,6 +3058,7 @@ button.local-ai-preset {
   margin-top: 0.3rem;
   width: 100%;
   min-height: 3rem;
+  max-height: none;
   padding: 0.4rem 0;
   border: none;
   background: transparent;
@@ -3067,8 +3068,10 @@ button.local-ai-preset {
   line-height: 1.5;
   resize: none;
   overflow: hidden;
+  overflow-y: visible;
   outline: none;
   field-sizing: content;
+  -webkit-appearance: none;
 }
 
 .tweet-actions {
@@ -3312,4 +3315,45 @@ button.local-ai-preset {
 }
 .tasks-empty-icon {
   font-size: 2rem;
+}
+
+/* ── Liked state on tweet action ─────────────────────────────────────────── */
+.tweet-action.liked {
+  color: #e0245e;
+}
+.tweet-action.liked svg {
+  fill: #e0245e;
+  stroke: #e0245e;
+}
+
+/* ── Modal overlay + dialog ──────────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  padding: 1rem;
+  animation: fadeIn 0.15s ease;
+}
+.modal-dialog {
+  background: var(--surface);
+  border-radius: 16px;
+  padding: 1.5rem;
+  max-width: 340px;
+  width: 100%;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  animation: scaleIn 0.2s ease;
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes scaleIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to   { opacity: 1; transform: scale(1); }
 }

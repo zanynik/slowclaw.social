@@ -9,6 +9,13 @@ import { ToastContainer } from "./components/ui/ToastContainer";
 import { appActions } from "./stores/useAppStore";
 import { useIsKeyboardOpen } from "./hooks/useKeyboardHeight";
 import { useScrollDirection } from "./hooks/useScrollDirection";
+import {
+  fetchNotesFromRelays,
+  fetchPersonalizedNotes,
+  extractKeywordsFromJournals,
+  publishNote,
+  type NostrNote,
+} from "./lib/nostr";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
   saveJournalText,
@@ -185,6 +192,7 @@ type PersistedPost = {
   text: string;
   sourceExcerpt: string;
   createdAt: number;
+  liked?: boolean;
 };
 
 type PersistedTodo = {
@@ -372,8 +380,8 @@ const ATOMIC_LOCAL_MODEL = "gemma-3n-e4b-it";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
-type MobileTab = "journal" | "feed" | "productivity" | "profile";
-const TAB_ORDER: MobileTab[] = ["journal", "feed", "productivity", "profile"];
+type MobileTab = "journal" | "queue" | "productivity" | "feed" | "profile";
+const TAB_ORDER: MobileTab[] = ["journal", "queue", "productivity", "feed", "profile"];
 type ThemeMode = "light" | "dark";
 type DesktopGatewayBootstrap = {
   token?: string | null;
@@ -409,7 +417,7 @@ function defaultMobileTab(): MobileTab {
   if (saved === "todos" || saved === "events") {
     return "productivity";
   }
-  return saved === "feed" || saved === "productivity" || saved === "profile" ? saved : "journal";
+  return saved === "queue" || saved === "feed" || saved === "productivity" || saved === "profile" ? saved : "journal";
 }
 
 function useIsLargeScreen() {
@@ -1420,7 +1428,7 @@ function App() {
   });
   const workspaceTabActive =
     mobileTab === "productivity" ||
-    (mobileTab === "feed" && feedSource === "local");
+    mobileTab === "queue";
   const workspaceSynthArtifacts = [
     { key: "posts", label: "Posts", state: workspaceSynthStatus.artifactStates?.insightPosts },
     { key: "todos", label: "Todos", state: workspaceSynthStatus.artifactStates?.todos },
@@ -1460,6 +1468,10 @@ function App() {
   // Nostr identity
   const [nostrKeys, setNostrKeys] = useState<NostrKeys | null>(null);
   const [nostrKeysBusy, setNostrKeysBusy] = useState(false);
+  const [nostrFeedNotes, setNostrFeedNotes] = useState<NostrNote[]>([]);
+  const [nostrFeedLoading, setNostrFeedLoading] = useState(false);
+  const [nostrPostConfirmPost, setNostrPostConfirmPost] = useState<PersistedPost | null>(null);
+  const [nostrPostConfirmStep, setNostrPostConfirmStep] = useState<"confirm" | "account" | null>(null);
 
   // Progressive feed: generation-based polling
   const [feedGeneration, setFeedGeneration] = useState<number | undefined>(undefined);
@@ -4672,7 +4684,7 @@ function App() {
     setNostrKeysBusy(true);
     try {
       const nostrModule = await import("./lib/nostr");
-      const keys = await nostrModule.generateNostrKeys();
+      const keys = nostrModule.generateNostrKeys();
       await saveNostrKeysSecure(keys);
       setNostrKeys(keys);
       return keys;
@@ -4689,7 +4701,7 @@ function App() {
     if (!keys) return;
     try {
       const nostrModule = await import("./lib/nostr");
-      const event = await nostrModule.createSignedEvent(keys, 7, "+", [["e", eventId], ["p", ""]]);
+      const event = await nostrModule.createSignedEvent(keys.secretKeyHex, 7, "+", [["e", eventId], ["p", ""]]);
       await nostrModule.publishToRelay(relayUrl, event);
     } catch (err) {
       console.error("Nostr reaction failed:", err);
@@ -4701,7 +4713,7 @@ function App() {
     if (!keys || !content.trim()) return;
     try {
       const nostrModule = await import("./lib/nostr");
-      const event = await nostrModule.createSignedEvent(keys, 1, content.trim(), [["e", eventId, relayUrl, "reply"]]);
+      const event = await nostrModule.createSignedEvent(keys.secretKeyHex, 1, content.trim(), [["e", eventId, relayUrl, "reply"]]);
       await nostrModule.publishToRelay(relayUrl, event);
     } catch (err) {
       console.error("Nostr reply failed:", err);
@@ -4921,7 +4933,7 @@ function App() {
   }, [blueskyFeedSnapshot?.refreshedAt, blueskyFeedSnapshot?.refreshState]);
 
   useEffect(() => {
-    if (mobileTab !== "feed" || feedSource !== "local") {
+    if (mobileTab !== "queue") {
       setFeedSidebarOpen(false);
       setFeedCreateWorkflowOpen(false);
       return;
@@ -5994,6 +6006,131 @@ function App() {
     return { path: random.path, text: random.previewText || random.title };
   }
 
+  // ── Nostr Feed ────────────────────────────────────────────────────────────
+
+  async function loadNostrFeed() {
+    if (nostrFeedLoading) return;
+    setNostrFeedLoading(true);
+    try {
+      // Extract keywords from journal entries for personalization
+      const journalTexts = journalItems
+        .filter((item) => item.previewText && item.previewText.length > 20)
+        .slice(0, 10)
+        .map((item) => item.previewText || "");
+      const keywords = extractKeywordsFromJournals(journalTexts);
+      const notes = keywords.length > 0
+        ? await fetchPersonalizedNotes(keywords, 30)
+        : await fetchNotesFromRelays({ limit: 30 });
+      setNostrFeedNotes(notes);
+    } catch {
+      // Fallback to generic notes
+      try {
+        const notes = await fetchNotesFromRelays({ limit: 30 });
+        setNostrFeedNotes(notes);
+      } catch {
+        setNostrFeedNotes([]);
+      }
+    } finally {
+      setNostrFeedLoading(false);
+    }
+  }
+
+  function handleLikePost(post: PersistedPost) {
+    if (post.liked) {
+      // Unlike — just toggle off
+      setPersistedPosts((prev) => {
+        const next = prev.map((p) => p.id === post.id ? { ...p, liked: false } : p);
+        savePersistedPosts(next);
+        return next;
+      });
+      return;
+    }
+    // First like — show confirm dialog
+    setNostrPostConfirmPost(post);
+    setNostrPostConfirmStep("confirm");
+  }
+
+  async function handleNostrPostConfirm(wantsToPost: boolean) {
+    if (!wantsToPost || !nostrPostConfirmPost) {
+      // Just like locally, don't post
+      if (nostrPostConfirmPost) {
+        setPersistedPosts((prev) => {
+          const next = prev.map((p) => p.id === nostrPostConfirmPost.id ? { ...p, liked: true } : p);
+          savePersistedPosts(next);
+          return next;
+        });
+      }
+      setNostrPostConfirmPost(null);
+      setNostrPostConfirmStep(null);
+      return;
+    }
+    // User wants to post to Nostr — check if they have keys
+    setNostrPostConfirmStep("account");
+  }
+
+  async function handleNostrAccountChoice(choice: "has_account" | "create" | "cancel") {
+    if (choice === "cancel") {
+      // Like locally but don't post
+      if (nostrPostConfirmPost) {
+        setPersistedPosts((prev) => {
+          const next = prev.map((p) => p.id === nostrPostConfirmPost.id ? { ...p, liked: true } : p);
+          savePersistedPosts(next);
+          return next;
+        });
+      }
+      setNostrPostConfirmPost(null);
+      setNostrPostConfirmStep(null);
+      return;
+    }
+    if (choice === "has_account") {
+      // Like locally, prompt to enter key in Profile
+      if (nostrPostConfirmPost) {
+        setPersistedPosts((prev) => {
+          const next = prev.map((p) => p.id === nostrPostConfirmPost.id ? { ...p, liked: true } : p);
+          savePersistedPosts(next);
+          return next;
+        });
+      }
+      setNostrPostConfirmPost(null);
+      setNostrPostConfirmStep(null);
+      setMobileTab("profile");
+      return;
+    }
+    // choice === "create" — auto-generate keys and post
+    if (nostrPostConfirmPost) {
+      try {
+        const { generateAndSaveNostrKeys } = await import("./lib/nostr");
+        const keys = generateAndSaveNostrKeys();
+        // Save to secure storage too
+        await saveNostrKeysSecure({
+          nsec: keys.privkey,
+          npub: keys.pubkey,
+          secretKeyHex: keys.privkey,
+          publicKeyHex: keys.pubkey,
+        });
+        setNostrKeys({ nsec: keys.privkey, npub: keys.pubkey, secretKeyHex: keys.privkey, publicKeyHex: keys.pubkey });
+        // Post to Nostr
+        const result = await publishNote(nostrPostConfirmPost.text);
+        if (result.success) {
+          setPersistedPosts((prev) => {
+            const next = prev.map((p) => p.id === nostrPostConfirmPost!.id ? { ...p, liked: true } : p);
+            savePersistedPosts(next);
+            return next;
+          });
+        }
+      } catch {
+        // Still like locally even if post fails
+        setPersistedPosts((prev) => {
+          const next = prev.map((p) => p.id === nostrPostConfirmPost!.id ? { ...p, liked: true } : p);
+          savePersistedPosts(next);
+          return next;
+        });
+      }
+    }
+    setNostrPostConfirmPost(null);
+    setNostrPostConfirmStep(null);
+  }
+
   async function handleFeedPullRefresh() {
     // Guard against concurrent calls
     if (generatePostBusy) return;
@@ -6532,6 +6669,13 @@ function App() {
     }
     void loadRuntimeMediaCapabilities();
   }, [mobileTab, feedSource, chatGatewayToken, gatewayBaseUrl]);
+
+  // Auto-load Nostr feed when feed tab is shown and empty
+  useEffect(() => {
+    if (mobileTab === "feed" && nostrFeedNotes.length === 0 && !nostrFeedLoading) {
+      void loadNostrFeed();
+    }
+  }, [mobileTab]);
 
   useEffect(() => {
     let cancelled = false;
@@ -7840,13 +7984,13 @@ function App() {
           </ViewErrorBoundary>
         ) : null}
 
-        {mobileTab === "feed" ? (
-          <ViewErrorBoundary title="Feed">
+        {mobileTab === "queue" ? (
+          <ViewErrorBoundary title="Queue">
             <PullToRefresh onRefresh={handleFeedPullRefresh} enabled={!generatePostBusy}>
             <div className="stack">
               <div className="feed-tab-container">
               <div className="row-between" style={{ padding: '0 0.25rem' }}>
-                <h2>Your Feed</h2>
+                <h2>Queue</h2>
                 {generatePostBusy && (
                   <span className="row" style={{ gap: '0.3rem', alignItems: 'center' }}>
                     <span className="btn-spinner" aria-hidden />
@@ -7855,24 +7999,7 @@ function App() {
                 )}
               </div>
 
-              <div className="segmented-control mt-2 mb-2">
-                <button
-                  type="button"
-                  className={feedSource === "local" ? "active" : ""}
-                  onClick={() => setFeedSource("local")}
-                >
-                  Create
-                </button>
-                <button
-                  type="button"
-                  className={feedSource === "bluesky" ? "active" : ""}
-                  onClick={() => setFeedSource("bluesky")}
-                >
-                  Discover
-                </button>
-              </div>
-
-              {feedSource === "local" && persistedPosts.length === 0 && (
+              {persistedPosts.length === 0 && (
                 <div className="feed-create-hero">
                   <div className="feed-create-hero-icon">✨</div>
                   <h3>Turn journals into posts</h3>
@@ -7887,7 +8014,7 @@ function App() {
                 </div>
               )}
 
-              {feedSource === "local" && persistedPosts.length > 0 && (
+              {persistedPosts.length > 0 && (
                 <div className="feed-posts-list">
                   {persistedPosts.map((post) => {
                     const timeAgo = getRelativeTime(post.createdAt);
@@ -7896,8 +8023,8 @@ function App() {
                         <div className="tweet-avatar" aria-hidden>🐾</div>
                         <div className="tweet-body">
                           <div className="tweet-header">
-                            <span className="tweet-name">TweetClaw</span>
-                            <span className="tweet-handle">@tweetclaw</span>
+                            <span className="tweet-name">SlowClaw</span>
+                            <span className="tweet-handle">@slowclaw</span>
                             <span className="tweet-dot">·</span>
                             <span className="tweet-time">{timeAgo}</span>
                           </div>
@@ -7911,19 +8038,22 @@ function App() {
                                 savePersistedPosts(next);
                                 return next;
                               });
+                              // Auto-expand for iOS 18 which lacks field-sizing: content
+                              const el = e.target;
+                              el.style.height = 'auto';
+                              el.style.height = el.scrollHeight + 'px';
                             }}
-                            rows={2}
+                            onFocus={(e) => { const el = e.target; el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; }}
+                            ref={(el) => { if (el) { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; } }}
                           />
                           <div className="tweet-actions">
-                            <button type="button" className="tweet-action" onClick={() => { navigator.clipboard?.writeText(post.text); }} title="Copy">
-                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                              Copy
+                            <button type="button" className={`tweet-action${post.liked ? " liked" : ""}`} onClick={() => handleLikePost(post)} title="Like">
+                              <svg viewBox="0 0 24 24" fill={post.liked ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
                             </button>
                             <button type="button" className="tweet-action" onClick={() => {
                               setPersistedPosts((prev) => { const next = prev.filter((p) => p.id !== post.id); savePersistedPosts(next); return next; });
                             }} title="Delete">
                               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                              Delete
                             </button>
                           </div>
                         </div>
@@ -7933,661 +8063,62 @@ function App() {
                 </div>
               )}
 
-              {feedSource === "bluesky" ? (
-                blueskyFeedLoading ? (
-                  <p className="text-center muted" style={{ padding: "2rem" }}>Loading world feed...</p>
-                ) : blueskyFeedItems.length === 0 ? (
-                  <div className="stack-sm" style={{ padding: "2rem" }}>
-                    {blueskyFeedStatus ? (
-                      <p className="text-center muted">{blueskyFeedStatus}</p>
-                    ) : null}
-                    <p className="text-center muted">
-                      No world-feed items found yet. Add workspace posts or journals, seed more RSS sources, or connect Bluesky.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="stack">
-                    {blueskyFeedStatus ? (
-                      <p className="text-sm muted" style={{ padding: "0 0.25rem" }}>{blueskyFeedStatus}</p>
-                    ) : null}
-                    {blueskyFeedSnapshot ? (
-                      <div className="workflow-settings-panel stack" style={{ gap: "0.65rem" }}>
-                        <div className="row-between" style={{ alignItems: "center", gap: "0.8rem" }}>
-                          <h3 style={{ margin: 0 }}>World Feed Signals</h3>
-                          <div className="row" style={{ gap: "0.6rem", alignItems: "center" }}>
-                            <span className="text-sm muted">
-                              {blueskyFeedItems.length} item{blueskyFeedItems.length === 1 ? "" : "s"}
-                            </span>
-                            <button
-                              type="button"
-                              className="ghost text-sm"
-                              style={{ padding: "0.3rem 0.65rem", borderRadius: "8px" }}
-                              onClick={() => void refreshWorldFeedDiagnostics()}
-                              disabled={blueskyFeedLoading || worldFeedInterestsLoading}
-                            >
-                              Refresh diagnostics
-                            </button>
-                          </div>
-                        </div>
-                        <div className="feed-agent-facts">
-                          <div>
-                            <span className="text-sm muted">Mode</span>
-                            <strong>{blueskyFeedSnapshot.usedFallback ? "Fallback" : "Ranked"}</strong>
-                          </div>
-                          <div>
-                            <span className="text-sm muted">Refresh state</span>
-                            <strong>
-                              {blueskyFeedSnapshot.refreshStatus && blueskyFeedSnapshot.refreshStatus !== "idle"
-                                ? blueskyFeedSnapshot.refreshStatus
-                                : blueskyFeedSnapshot.refreshState || "warming"}
-                            </strong>
-                          </div>
-                          <div>
-                            <span className="text-sm muted">Interests</span>
-                            <strong>{blueskyProfileStats.interestCount}</strong>
-                          </div>
-                          <div>
-                            <span className="text-sm muted">Shortlisted sources</span>
-                            <strong>{blueskyFeedSnapshot.selectedSources.length}</strong>
-                          </div>
-                        </div>
-                        <div className="stack" style={{ gap: "0.45rem" }}>
-                          <span className="text-sm muted">Discovery and matching</span>
-                          <div className="feed-agent-facts">
-                            <div>
-                              <span className="text-sm muted">RSS shortlisted</span>
-                              <strong>{blueskyFeedSnapshot.diagnostics.rss.shortlistedCount}</strong>
-                            </div>
-                            <div>
-                              <span className="text-sm muted">Nostr relays checked</span>
-                              <strong>{blueskyFeedSnapshot.diagnostics.nostr.scannedCount}</strong>
-                            </div>
-                            <div>
-                              <span className="text-sm muted">Bluesky algos checked</span>
-                              <strong>{blueskyFeedSnapshot.diagnostics.bluesky.scannedCount}</strong>
-                            </div>
-                            <div>
-                              <span className="text-sm muted">Candidates before ranking</span>
-                              <strong>{blueskyFeedSnapshot.diagnostics.ranking.candidateCountBeforeRanking}</strong>
-                            </div>
-                          </div>
-                          <div className="feed-agent-facts">
-                            <div>
-                              <span className="text-sm muted">RSS posts matched</span>
-                              <strong>{blueskyFeedSnapshot.diagnostics.rss.candidateCount}</strong>
-                            </div>
-                            <div>
-                              <span className="text-sm muted">Nostr metadata fetched</span>
-                              <strong>{blueskyFeedSnapshot.diagnostics.nostr.metadataFetchedCount}</strong>
-                            </div>
-                            <div>
-                              <span className="text-sm muted">Bluesky posts matched</span>
-                              <strong>{blueskyFeedSnapshot.diagnostics.bluesky.candidateCount}</strong>
-                            </div>
-                            <div>
-                              <span className="text-sm muted">Final ranked items</span>
-                              <strong>{blueskyFeedSnapshot.diagnostics.ranking.rankedItemCount}</strong>
-                            </div>
-                          </div>
-                          {([
-                            {
-                              key: "rss" as const,
-                              label: "RSS sample",
-                              data: blueskyFeedSnapshot.diagnostics.rss,
-                              empty: "No RSS source sample yet."
-                            },
-                            {
-                              key: "nostr" as const,
-                              label: "Nostr relay sample",
-                              data: blueskyFeedSnapshot.diagnostics.nostr,
-                              empty: "No Nostr relay sample yet."
-                            },
-                            {
-                              key: "bluesky" as const,
-                              label: "Bluesky feed sample",
-                              data: blueskyFeedSnapshot.diagnostics.bluesky,
-                              empty: "No Bluesky feed sample yet. This usually means auth is missing or discovery has not completed."
-                            }
-                          ]).map((protocol) => {
-                            const samples = protocol.data.sampledSources || [];
-                            const sample =
-                              samples.length > 0
-                                ? samples[worldFeedSampleIndexByProtocol[protocol.key] % samples.length]
-                                : null;
-                            return (
-                              <div key={protocol.key} className="workflow-run-card">
-                                <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
-                                  <span className="text-sm muted">{protocol.label}</span>
-                                  <div className="row" style={{ gap: "0.45rem", alignItems: "center" }}>
-                                    <span className="text-sm muted">
-                                      shortlisted {protocol.data.shortlistedCount}
-                                    </span>
-                                    <button
-                                      type="button"
-                                      className="ghost text-sm"
-                                      style={{ padding: "0.25rem 0.55rem", borderRadius: "8px" }}
-                                      onClick={() => chooseNextWorldFeedSample(protocol.key, samples.length)}
-                                      disabled={samples.length <= 1}
-                                    >
-                                      Next sample
-                                    </button>
-                                  </div>
-                                </div>
-                                {sample ? (
-                                  <div className="stack-sm">
-                                    <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
-                                      <span className="feed-bot-chip">
-                                        <span className="feed-bot-avatar">
-                                          {(sample.protocol || "?").slice(0, 1).toUpperCase()}
-                                        </span>
-                                        <span>{sample.label}</span>
-                                      </span>
-                                      <span className="text-sm muted">
-                                        {(sample.score * 100).toFixed(0)}%
-                                      </span>
-                                    </div>
-                                    <div className="text-sm muted">
-                                      {sample.metadata?.uri
-                                        ? `uri ${sample.metadata.uri}`
-                                        : sample.metadata?.relayUrl
-                                          ? `relay ${sample.metadata.relayUrl}`
-                                          : sample.metadata?.domain
-                                            ? `domain ${sample.metadata.domain}`
-                                            : "No metadata captured yet."}
-                                    </div>
-                                    {sample.description ? (
-                                      <div className="text-sm muted">{sample.description}</div>
-                                    ) : null}
-                                  </div>
-                                ) : (
-                                  <p className="text-sm muted" style={{ margin: 0 }}>
-                                    {protocol.empty}
-                                  </p>
-                                )}
-                                {protocol.data.error ? (
-                                  <div className="feed-comment-status">
-                                    Error: {protocol.data.error}
-                                  </div>
-                                ) : null}
-                              </div>
-                            );
-                          })}
-                        </div>
-                        {blueskyFeedSnapshot.usedFallback ? (
-                          <div className="feed-comment-status">
-                            Current items are fallback/recent content, not the final ranked world-feed snapshot.
-                          </div>
-                        ) : null}
-                        {blueskyFeedSnapshot.lastError ? (
-                          <div className="feed-comment-status">
-                            Last refresh error: {blueskyFeedSnapshot.lastError}
-                          </div>
-                        ) : null}
-                        {blueskyFeedSnapshot.selectedSources.length ? (
-                          <div className="stack" style={{ gap: "0.45rem" }}>
-                            <span className="text-sm muted">Top shortlisted sources</span>
-                            {blueskyFeedSnapshot.selectedSources.slice(0, 6).map((source) => (
-                              <div key={source.key} className="workflow-run-card">
-                                <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
-                                  <span className="feed-bot-chip">
-                                    <span className="feed-bot-avatar">
-                                      {(source.protocol || "?").slice(0, 1).toUpperCase()}
-                                    </span>
-                                    <span>{source.label}</span>
-                                  </span>
-                                  <span className="text-sm muted">
-                                    {(source.score * 100).toFixed(0)}%
-                                  </span>
-                                </div>
-                                <div className="text-sm muted">
-                                  {(source.protocol || "source").toUpperCase()}
-                                  {source.matchedInterestLabel
-                                    ? ` · keyword "${source.matchedInterestLabel}"${
-                                        source.matchedInterestScore != null
-                                          ? ` (${(source.matchedInterestScore * 100).toFixed(0)}%)`
-                                          : ""
-                                      }`
-                                    : ""}
-                                </div>
-                                {source.description ? (
-                                  <div className="text-sm muted">{source.description}</div>
-                                ) : null}
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <p className="text-sm muted" style={{ margin: 0 }}>
-                            No source shortlist is available yet for this refresh cycle.
-                          </p>
-                        )}
-                        <div className="stack" style={{ gap: "0.45rem" }}>
-                          <div className="row-between" style={{ gap: "0.75rem", alignItems: "center" }}>
-                            <span className="text-sm muted">Interest vectors</span>
-                            <span className="text-sm muted">
-                              {worldFeedInterests.length} total
-                            </span>
-                          </div>
-                          <p className="text-sm muted" style={{ margin: 0 }}>
-                            Diagnostic approach: adding one broad synthetic interest is reasonable for testing relay/feed discovery.
-                            It is useful in development as long as synthetic vectors are clearly marked and removable.
-                          </p>
-                          <form
-                            className="row"
-                            style={{ gap: "0.5rem", alignItems: "stretch", flexWrap: "wrap" }}
-                            onSubmit={(event) => void createDiagnosticWorldFeedInterest(event)}
-                          >
-                            <input
-                              value={worldFeedDummyLabel}
-                              onChange={(event) => setWorldFeedDummyLabel(event.target.value)}
-                              placeholder="Diagnostic interest label"
-                              style={{ flex: 1, minWidth: "18rem" }}
-                            />
-                            <button
-                              type="submit"
-                              className="secondary"
-                              disabled={worldFeedInterestsLoading || !worldFeedDummyLabel.trim()}
-                            >
-                              Add dummy interest
-                            </button>
-                          </form>
-                          {worldFeedInterestStatus ? (
-                            <div className="feed-comment-status">{worldFeedInterestStatus}</div>
-                          ) : null}
-                          {worldFeedInterestsLoading ? (
-                            <p className="text-sm muted" style={{ margin: 0 }}>
-                              Loading interest vectors...
-                            </p>
-                          ) : worldFeedInterests.length ? (
-                            worldFeedInterests.map((interest) => (
-                              <div key={interest.id} className="workflow-run-card">
-                                <div className="row-between" style={{ gap: "0.6rem", alignItems: "center" }}>
-                                  <span className="feed-bot-chip">
-                                    <span className="feed-bot-avatar">
-                                      {interest.synthetic ? "D" : "I"}
-                                    </span>
-                                    <span>{interest.label}</span>
-                                  </span>
-                                  <span className="text-sm muted">
-                                    health {(interest.healthScore * 100).toFixed(0)}%
-                                  </span>
-                                </div>
-                                <div className="text-sm muted">
-                                  {interest.synthetic ? "Diagnostic synthetic vector" : "Workspace-derived vector"}
-                                  {` · ${interest.embeddingDimensions} dims`}
-                                </div>
-                                <div className="text-sm muted">
-                                  source {interest.sourcePath}
-                                </div>
-                                <div className="text-sm muted">
-                                  updated {formatTimestamp(interest.updatedAt)}
-                                  {interest.lastSeenAt ? ` · seen ${formatTimestamp(interest.lastSeenAt)}` : ""}
-                                </div>
-                                <div className="stack-sm" style={{ gap: "0.3rem" }}>
-                                  <div className="row-between" style={{ alignItems: "center" }}>
-                                    <span className="text-sm muted">
-                                      Keywords{interest.keywordsOverride ? " (custom)" : " (auto)"}
-                                    </span>
-                                    {editingInterestId !== interest.id ? (
-                                      <button
-                                        type="button"
-                                        className="ghost text-sm"
-                                        style={{ padding: "0.2rem 0.5rem", borderRadius: "6px" }}
-                                        onClick={() => {
-                                          setEditingInterestId(interest.id);
-                                          setEditingInterestKeywords(interest.keywords.join(", "));
-                                        }}
-                                      >
-                                        Edit
-                                      </button>
-                                    ) : null}
-                                  </div>
-                                  {editingInterestId === interest.id ? (
-                                    <div className="stack-sm" style={{ gap: "0.3rem" }}>
-                                      <input
-                                        value={editingInterestKeywords}
-                                        onChange={(e) => setEditingInterestKeywords(e.target.value)}
-                                        placeholder="keyword1, keyword2, keyword3"
-                                        style={{ fontSize: "0.85rem" }}
-                                      />
-                                      <div className="row" style={{ gap: "0.4rem", justifyContent: "flex-end" }}>
-                                        {interest.keywordsOverride ? (
-                                          <button
-                                            type="button"
-                                            className="ghost text-sm"
-                                            style={{ padding: "0.2rem 0.5rem" }}
-                                            onClick={() => void clearInterestKeywordsOverride(interest.id)}
-                                          >
-                                            Reset to auto
-                                          </button>
-                                        ) : null}
-                                        <button
-                                          type="button"
-                                          className="ghost text-sm"
-                                          style={{ padding: "0.2rem 0.5rem" }}
-                                          onClick={() => {
-                                            setEditingInterestId(null);
-                                            setEditingInterestKeywords("");
-                                          }}
-                                        >
-                                          Cancel
-                                        </button>
-                                        <button
-                                          type="button"
-                                          className="secondary text-sm"
-                                          style={{ padding: "0.2rem 0.5rem" }}
-                                          onClick={() => void saveInterestKeywords(interest.id)}
-                                        >
-                                          Save
-                                        </button>
-                                      </div>
-                                    </div>
-                                  ) : (
-                                    <div className="row" style={{ gap: "0.3rem", flexWrap: "wrap" }}>
-                                      {interest.keywords.length > 0 ? (
-                                        interest.keywords.map((kw) => (
-                                          <span
-                                            key={kw}
-                                            className="text-sm"
-                                            style={{
-                                              background: "var(--color-surface-hover, #2a2a2a)",
-                                              padding: "0.15rem 0.45rem",
-                                              borderRadius: "4px",
-                                              fontSize: "0.78rem",
-                                            }}
-                                          >
-                                            {kw}
-                                          </span>
-                                        ))
-                                      ) : (
-                                        <span className="text-sm muted">No keywords derived yet.</span>
-                                      )}
-                                    </div>
-                                  )}
-                                </div>
-                                <div className="row" style={{ justifyContent: "flex-end", gap: "0.4rem" }}>
-                                  <button
-                                    type="button"
-                                    className="secondary danger text-sm"
-                                    style={{ padding: "0.25rem 0.55rem" }}
-                                    onClick={() => void removeWorldFeedInterest(interest)}
-                                  >
-                                    {interest.synthetic ? "Delete" : "Remove"}
-                                  </button>
-                                </div>
-                              </div>
-                            ))
-                          ) : (
-                            <p className="text-sm muted" style={{ margin: 0 }}>
-                              No interest vectors exist yet.
-                            </p>
-                          )}
-                        </div>
-                      </div>
-                    ) : null}
-                    <div className="feed-section-tabs world-feed-tabs">
-                      <button
-                        type="button"
-                        className={`feed-section-tab ${worldFeedTab === "tweets" ? "active" : ""}`}
-                        onClick={() => setWorldFeedTab("tweets")}
-                      >
-                        Tweets
-                        <span className="feed-section-tab-count">{worldTweetItems.length}</span>
-                      </button>
-                      <button
-                        type="button"
-                        className={`feed-section-tab ${worldFeedTab === "articles" ? "active" : ""}`}
-                        onClick={() => setWorldFeedTab("articles")}
-                      >
-                        Articles
-                        <span className="feed-section-tab-count">{worldArticleItems.length}</span>
-                      </button>
-                      <button
-                        type="button"
-                        className={`feed-section-tab ${worldFeedTab === "videos" ? "active" : ""}`}
-                        onClick={() => {
-                          setWorldFeedTab("videos");
-                          void fetchVideoFallback();
-                        }}
-                      >
-                        Videos
-                        <span className="feed-section-tab-count">{worldVideoItems.length}</span>
-                      </button>
-                    </div>
-                    {worldFeedNewPostsBanner}
-                    {renderWorldFeedItems()}
-                  </div>
-                )
-              ) : (
-                <div className="stack">
-                  {/* Me feed profile header */}
-                  <div className="me-profile-header">
-                    {session ? (
-                      <div className="me-profile-avatar-placeholder">{session.handle.charAt(0).toUpperCase()}</div>
-                    ) : (
-                      <div className="me-profile-avatar-placeholder">?</div>
-                    )}
-                    <div className="me-profile-info">
-                      <div className="me-profile-name">{session?.handle || "Your Profile"}</div>
-                      {session ? <div className="me-profile-handle">@{session.handle}</div> : null}
-                      <div className="me-profile-stats">
-                        <span><strong>{feedItems.length}</strong> draft{feedItems.length === 1 ? "" : "s"}</span>
-                        <span><strong>{postedHistory.length}</strong> published</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Me feed sub-tabs */}
-                  <div className="feed-section-tabs me-feed-tabs">
-                    <button
-                      type="button"
-                      className={`feed-section-tab ${meFeedTab === "drafts" ? "active" : ""}`}
-                      onClick={() => setMeFeedTab("drafts")}
-                    >
-                      Drafts
-                      <span className="feed-section-tab-count">{feedItems.length}</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={`feed-section-tab ${meFeedTab === "published" ? "active" : ""}`}
-                      onClick={() => setMeFeedTab("published")}
-                    >
-                      Published
-                      <span className="feed-section-tab-count">{postedHistory.length}</span>
-                    </button>
-                  </div>
-
-                  {meFeedTab === "published" ? (
-                    postedHistory.length === 0 ? (
-                      <p className="text-center muted" style={{ padding: "1.5rem" }}>No published posts yet.</p>
-                    ) : (
-                      <div className="stack">
-                        {postedHistory.slice(0, 40).map((item, idx) => (
-                          <div key={`${item.uri || item.created}-${idx}`} className="feed-item">
-                            <div className="feed-header">
-                              <div className="feed-title">
-                                {item.videoName || "Text post"}
-                                {item.status === "error" ? <span style={{ color: "var(--error)", marginLeft: "0.4rem" }}>(failed)</span> : null}
-                              </div>
-                              <div className="feed-time">{formatTimestamp(item.created)}</div>
-                            </div>
-                            {item.text ? (
-                              <div className="feed-body" style={{ maxHeight: "6rem", overflow: "hidden" }}>
-                                {item.text.slice(0, 300)}{item.text.length > 300 ? "..." : ""}
-                              </div>
-                            ) : null}
-                            <div className="feed-actions">
-                              {item.uri ? (
-                                <a
-                                  href={`https://bsky.app/profile/${session?.handle || ""}/post/${item.uri.split("/").pop()}`}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="ghost text-sm"
-                                  style={{ padding: "0.35rem 0.75rem", borderRadius: "8px", textDecoration: "none" }}
-                                >
-                                  View on Bluesky
-                                </a>
-                              ) : null}
-                              {item.error ? (
-                                <span className="text-sm" style={{ color: "var(--error)" }}>{item.error}</span>
-                              ) : null}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )
-                  ) : feedItems.length === 0 ? (
-                    <p className="text-center muted" style={{ padding: "1.5rem" }}>No draft items in your workspace feed yet.</p>
-                  ) : feedItems.map(item => {
-                    const workflowBot = workflowBotForPath(item.path, feedAttributedBots);
-                    const isCommentOpen = activeFeedCommentPath === item.path;
-                    const commentDraft = feedCommentDrafts[item.path] || "";
-                    const commentStatus = feedCommentStatusByPath[item.path] || "";
-                    const isCommentSubmitting = submittingFeedCommentPath === item.path;
-                    const isDraftLoading = !!feedDraftLoadingByPath[item.path];
-                    const inlineDraft = feedDraftsByPath[item.path];
-                    const inlineText = inlineDraft ?? item.previewText ?? item.title;
-                    const canEditInline = item.kind === "text" || item.kind === "audio" || item.kind === "video";
-                    return (
-                      <div key={item.path} className="feed-item feed-item-card">
-                        <div className="feed-header">
-                          <div className="feed-title stack-sm">
-                            {workflowBot && (
-                              <button
-                                type="button"
-                                className="feed-bot-chip"
-                                onClick={() => {
-                                  openFeedBotSettings(workflowBot);
-                                }}
-                                title={`Open ${workflowBot.name} settings`}
-                              >
-                                <span className="feed-bot-avatar">{workflowBot.avatar}</span>
-                                <span>{workflowBot.name}</span>
-                              </button>
-                            )}
-                            <span>{item.title}</span>
-                          </div>
-                          <div className="feed-time">{formatTimestamp(item.modifiedAt)}</div>
-                        </div>
-                        {canEditInline ? (
-                          <textarea
-                            rows={1}
-                            className="feed-inline-editor"
-                            value={inlineText}
-                            ref={(node) => {
-                              if (!node) {
-                                return;
-                              }
-                              node.style.height = "0px";
-                              node.style.height = `${node.scrollHeight}px`;
-                            }}
-                            onChange={(e) => {
-                              e.target.style.height = "0px";
-                              e.target.style.height = `${e.target.scrollHeight}px`;
-                              updateFeedDraft(item, e.target.value);
-                            }}
-                            placeholder={isDraftLoading ? "Loading post..." : "Write your post"}
-                            disabled={isDraftLoading}
-                          />
-                        ) : (
-                          <div className="feed-body">
-                            {item.previewText ? item.previewText : <span className="muted">[{item.kind.toUpperCase()} File attached]</span>}
-                          </div>
-                        )}
-                        <div className="feed-actions">
-                          {(item.kind === "text" || item.kind === "video") && (
-                            <button
-                              type="button"
-                              className="primary text-sm"
-                              style={{ padding: '0.4rem 0.8rem', borderRadius: '8px' }}
-                              onClick={() => void postFeedItemToBluesky(item)}
-                              disabled={postingFeedPath === item.path || !!isPathPosted(item.path)}
-                            >
-                              {isPathPosted(item.path)
-                                ? "Posted"
-                                : postingFeedPath === item.path
-                                  ? "Posting..."
-                                  : "Like & Post"}
-                            </button>
-                          )}
-                          {workflowBot && (
-                            <button
-                              type="button"
-                              className="ghost text-sm"
-                              style={{ padding: '0.4rem 0.8rem', borderRadius: '8px' }}
-                              onClick={() => toggleFeedCommentComposer(item.path)}
-                            >
-                              {isCommentOpen ? "Hide Comment" : "Comment"}
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            className="ghost text-sm"
-                            style={{ padding: '0.4rem 0.8rem', borderRadius: '8px', color: 'var(--error)' }}
-                            onClick={() => setPendingDeleteFeedItem(item)}
-                          >
-                            Delete
-                          </button>
-                        </div>
-
-                        <div className={`feed-comment-panel ${isCommentOpen ? "open" : ""}`}>
-                          {isCommentOpen && (
-                            <>
-                              <textarea
-                                rows={3}
-                                className="feed-comment-input"
-                                placeholder={`Comment to modify ${workflowBot?.name || "workflow"}...`}
-                                value={commentDraft}
-                                onChange={(e) =>
-                                  setFeedCommentDrafts((prev) => ({
-                                    ...prev,
-                                    [item.path]: e.target.value
-                                  }))
-                                }
-                              />
-                              <div className="feed-comment-actions">
-                                <button
-                                  type="button"
-                                  className="primary text-sm"
-                                  style={{ padding: '0.35rem 0.75rem', borderRadius: '8px' }}
-                                  onClick={() => void submitWorkflowCommentForFeedItem(item)}
-                                  disabled={isCommentSubmitting}
-                                >
-                                  {isCommentSubmitting ? "Sending..." : "Send Comment"}
-                                </button>
-                                <button
-                                  type="button"
-                                  className="ghost text-sm"
-                                  style={{ padding: '0.35rem 0.75rem', borderRadius: '8px' }}
-                                  onClick={() => setActiveFeedCommentPath("")}
-                                  disabled={isCommentSubmitting}
-                                >
-                                  Cancel
-                                </button>
-                              </div>
-                            </>
-                          )}
-                          {commentStatus ? <div className="feed-comment-status">{commentStatus}</div> : null}
-                        </div>
-
-                        {postProgress?.path === item.path && (
-                          <div className="post-progress-wrap">
-                            <div className="post-progress-text">{postProgress.label}</div>
-                            <div className="post-progress-track">
-                              <div
-                                className="post-progress-fill"
-                                style={{ width: `${Math.max(0, Math.min(100, postProgress.percent))}%` }}
-                              />
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
+              {generatePostStatus && (
+                <p className="text-sm muted" style={{ padding: '0.5rem 0.25rem' }}>{generatePostStatus}</p>
               )}
               </div>
             </div>
             </PullToRefresh>
+          </ViewErrorBoundary>
+        ) : null}
+
+        {mobileTab === "feed" ? (
+          <ViewErrorBoundary title="Feed">
+            <div className="stack">
+              <div className="feed-tab-container">
+                <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
+                  <h2>Feed</h2>
+                  <button type="button" className="ghost" style={{ padding: '0.4rem' }} title="Notifications">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+                  </button>
+                </div>
+
+                {nostrFeedLoading ? (
+                  <div style={{ padding: '2rem', textAlign: 'center' }}>
+                    <span className="btn-spinner" aria-hidden />
+                    <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Loading feed...</p>
+                  </div>
+                ) : nostrFeedNotes.length === 0 ? (
+                  <div className="feed-create-hero">
+                    <div className="feed-create-hero-icon">\uD83C\uDF10</div>
+                    <h3>Discover on Nostr</h3>
+                    <p className="text-sm muted">Your personalized feed from the Nostr network. Notes are matched to your journal topics.</p>
+                    <button type="button" className="primary" onClick={() => void loadNostrFeed()}>Load Feed</button>
+                  </div>
+                ) : (
+                  <div className="feed-posts-list">
+                    {nostrFeedNotes.map((note) => {
+                      const timeAgo = getRelativeTime(note.createdAt * 1000);
+                      const shortPubkey = note.pubkey.slice(0, 8) + "..." + note.pubkey.slice(-4);
+                      return (
+                        <div key={note.id} className="tweet-card">
+                          <div className="tweet-avatar" aria-hidden>\uD83D\uDC64</div>
+                          <div className="tweet-body">
+                            <div className="tweet-header">
+                              <span className="tweet-name">{shortPubkey}</span>
+                              <span className="tweet-dot">\u00B7</span>
+                              <span className="tweet-time">{timeAgo}</span>
+                            </div>
+                            <p className="tweet-text">{note.content}</p>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <button type="button" className="ghost" style={{ margin: '1rem auto', display: 'block' }} onClick={() => void loadNostrFeed()}>Load more</button>
+                  </div>
+                )}
+              </div>
+            </div>
           </ViewErrorBoundary>
         ) : null}
 
@@ -8761,6 +8292,60 @@ function App() {
                   </form>
                 )}
               </div>
+
+              {/* Nostr Account */}
+              <div className="card">
+                <h2>Nostr</h2>
+                {nostrKeys ? (
+                  <div className="stack-sm">
+                    <div className="badge success text-center" style={{ alignSelf: 'center' }}>
+                      Connected
+                    </div>
+                    <p className="text-sm muted text-center" style={{ wordBreak: 'break-all' }}>npub: {nostrKeys.publicKeyHex.slice(0, 12)}...{nostrKeys.publicKeyHex.slice(-8)}</p>
+                    <button
+                      type="button"
+                      className="ghost"
+                      style={{ alignSelf: 'center' }}
+                      onClick={() => {
+                        setNostrKeys(null);
+                        localStorage.removeItem("slowclaw.nostr.privkey");
+                        localStorage.removeItem("slowclaw.nostr.pubkey");
+                      }}
+                    >
+                      Disconnect
+                    </button>
+                  </div>
+                ) : (
+                  <div className="stack">
+                    <p className="text-sm muted">Connect your Nostr account to publish posts to the Nostr network. Enter your private key (nsec or hex).</p>
+                    <input
+                      id="nostr-key-input"
+                      type="password"
+                      placeholder="Private key (nsec1... or hex)"
+                    />
+                    <div className="row" style={{ gap: '0.5rem' }}>
+                      <button type="button" className="primary" style={{ flex: 1 }} onClick={async () => {
+                        const input = (document.getElementById('nostr-key-input') as HTMLInputElement)?.value?.trim();
+                        if (!input) return;
+                        const { importNostrPrivkey } = await import("./lib/nostr");
+                        const result = importNostrPrivkey(input);
+                        if (result) {
+                          const keys: NostrKeys = { nsec: input, npub: result.pubkey, secretKeyHex: input.replace(/^nsec1/, ''), publicKeyHex: result.pubkey };
+                          await saveNostrKeysSecure(keys);
+                          setNostrKeys(keys);
+                        }
+                      }}>Import Key</button>
+                      <button type="button" className="ghost" style={{ flex: 1 }} onClick={async () => {
+                        const { generateAndSaveNostrKeys } = await import("./lib/nostr");
+                        const keys = generateAndSaveNostrKeys();
+                        const stored: NostrKeys = { nsec: keys.privkey, npub: keys.pubkey, secretKeyHex: keys.privkey, publicKeyHex: keys.pubkey };
+                        await saveNostrKeysSecure(stored);
+                        setNostrKeys(stored);
+                      }}>Create New</button>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           </ViewErrorBoundary>
         ) : null}
@@ -8928,6 +8513,33 @@ function App() {
           onTabChange={setMobileTab}
           productivityBadgeCount={openTodos.length + todayEventItems.length + upcomingEventItems.length}
         />
+      )}
+      {/* Nostr post confirm dialog */}
+      {nostrPostConfirmStep === "confirm" && nostrPostConfirmPost && (
+        <div className="modal-overlay" onClick={() => { setNostrPostConfirmPost(null); setNostrPostConfirmStep(null); }}>
+          <div className="modal-dialog" onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 0.75rem' }}>Post to Nostr?</h3>
+            <p className="text-sm" style={{ margin: '0 0 1rem', color: 'var(--muted)' }}>Do you want to publish this post to the Nostr social network?</p>
+            <p className="text-sm" style={{ margin: '0 0 1.25rem', fontStyle: 'italic', color: 'var(--text)' }}>"{nostrPostConfirmPost.text.slice(0, 100)}{nostrPostConfirmPost.text.length > 100 ? '...' : ''}"</p>
+            <div className="row" style={{ gap: '0.5rem', justifyContent: 'flex-end' }}>
+              <button type="button" className="ghost" onClick={() => void handleNostrPostConfirm(false)}>No</button>
+              <button type="button" className="primary" onClick={() => void handleNostrPostConfirm(true)}>Yes</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {nostrPostConfirmStep === "account" && nostrPostConfirmPost && (
+        <div className="modal-overlay" onClick={() => { setNostrPostConfirmPost(null); setNostrPostConfirmStep(null); }}>
+          <div className="modal-dialog" onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 0.75rem' }}>Nostr Account</h3>
+            <p className="text-sm" style={{ margin: '0 0 1.25rem', color: 'var(--muted)' }}>Do you have a Nostr account?</p>
+            <div className="stack-sm">
+              <button type="button" className="ghost" style={{ width: '100%', textAlign: 'left' }} onClick={() => void handleNostrAccountChoice("has_account")}>Yes \u2014 I'll enter my key in Profile</button>
+              <button type="button" className="primary" style={{ width: '100%', textAlign: 'left' }} onClick={() => void handleNostrAccountChoice("create")}>No \u2014 Create one for me</button>
+              <button type="button" className="ghost" style={{ width: '100%', textAlign: 'left', color: 'var(--muted)' }} onClick={() => void handleNostrAccountChoice("cancel")}>Cancel</button>
+            </div>
+          </div>
+        </div>
       )}
       <ToastContainer />
     </div>
