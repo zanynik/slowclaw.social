@@ -5644,10 +5644,24 @@ function App() {
   }
 
   async function loadLocalModels() {
+    // On iOS native, the model catalog lives on the gateway (localhost:42617).
+    // After app resume, the gateway may need a moment to restart.
+    // Always check native AI status independently of gateway availability.
+    if (isTauriMobileRuntime()) {
+      try {
+        const status = await getNativeLocalAiStatus();
+        setNativeLocalAiStatus(status);
+      } catch {
+        // Non-fatal — native status unavailable but don't wipe
+      }
+    }
     if (!gatewayBaseUrl.trim()) {
-      setLocalModels([]);
-      setLocalModelsStatus("Local model catalog unavailable (gateway URL missing).");
-      setLocalModelsEngineStatus("");
+      // Even without gateway, native AI status was already checked above
+      if (!nativeLocalAiStatus?.configured) {
+        setLocalModels([]);
+        setLocalModelsStatus("Local model catalog unavailable (gateway URL missing).");
+        setLocalModelsEngineStatus("");
+      }
       return;
     }
     try {
@@ -5660,18 +5674,24 @@ function App() {
         try {
           setNativeLocalAiStatus(await getNativeLocalAiStatus());
         } catch {
-          setNativeLocalAiStatus(null);
+          // Already set above, keep existing value
         }
       }
       setLocalModelsStatus(response.models.length ? "" : "No local models are available yet.");
     } catch (error) {
+      // Gateway unreachable — but don't wipe native AI status if it was already set
       setLocalModels([]);
       setLocalModelsEngineStatus("");
       setLocalModelRuntime(null);
-      setNativeLocalAiStatus(null);
-      setLocalModelsStatus(
-        `Local models unavailable (${error instanceof Error ? error.message : String(error)})`
-      );
+      // Only wipe native status if we don't already have a valid one
+      if (!nativeLocalAiStatus?.configured) {
+        setLocalModelsStatus(
+          `Local models unavailable (${error instanceof Error ? error.message : String(error)})`
+        );
+      } else {
+        // Native AI is configured but gateway is down — still usable for inference
+        setLocalModelsStatus("");
+      }
     }
   }
 
@@ -5975,15 +5995,16 @@ function App() {
   }
 
   async function handleFeedPullRefresh() {
+    // Guard against concurrent calls
+    if (generatePostBusy) return;
     const entry = getNextJournalForProcessing();
     if (!entry) {
       setGeneratePostStatus("Write a journal entry first, then pull to generate posts.");
       return;
     }
     if (!requireModel()) return;
-    // Use the entry text for generation (same logic as generatePostFromJournal)
     setGeneratePostBusy(true);
-    setGeneratePostStatus("Generating posts...");
+    setGeneratePostStatus("\u2728 Generating posts from your journal...");
     try {
       const posts: string[] = [];
       if (isTauriMobileRuntime()) {
@@ -6025,7 +6046,7 @@ function App() {
       }
       // Mark this journal as processed
       markJournalProcessed(entry.path);
-      setGeneratePostStatus(`Generated ${posts.length} post${posts.length > 1 ? 's' : ''} from your journal`);
+      setGeneratePostStatus(`\u2728 Generated ${posts.length} post${posts.length > 1 ? 's' : ''} from your journal`);
     } catch (error) {
       setGeneratePostStatus(`Generation failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -6034,6 +6055,8 @@ function App() {
   }
 
   async function handleTasksPullRefresh() {
+    // Guard against concurrent calls
+    if (extractingLocalTasks) return;
     const entry = getNextJournalForProcessing();
     if (!entry) {
       setGeneratePostStatus("Write a journal entry first, then pull to extract tasks.");
@@ -6041,6 +6064,7 @@ function App() {
     }
     if (!requireModel()) return;
     setExtractingLocalTasks(true);
+    setGeneratePostStatus("\uD83E\uDDE0 Extracting tasks from your journal...");
     try {
       const taskPrompt = `You extract action items and tasks from journal entries. Output a JSON array of objects with "title" and "details" fields. Only real actionable tasks. Output ONLY valid JSON, no markdown fences. Example: [{"title":"Buy groceries","details":"Need milk and eggs"}]`;
       const chunks = splitIntoChunks(entry.text, CHUNK_CHAR_LIMIT);
@@ -6073,6 +6097,10 @@ function App() {
         });
       }
       markJournalProcessed(entry.path);
+      setGeneratePostStatus(allParsed.length > 0
+        ? `\u2705 Extracted ${allParsed.length} task${allParsed.length > 1 ? 's' : ''} from your journal`
+        : "No tasks found in this journal entry. Try pulling again."
+      );
     } catch (error) {
       setGeneratePostStatus(`Task extraction failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -6475,14 +6503,27 @@ function App() {
   }, []);
 
   // Re-check model status when app comes back to foreground (after screen lock/unlock)
+  // iOS suspends the gateway when the app is backgrounded. On resume, the gateway
+  // needs a moment to restart, so we retry with increasing delays.
   useEffect(() => {
+    let t1: ReturnType<typeof setTimeout> | undefined;
+    let t2: ReturnType<typeof setTimeout> | undefined;
     function handleVisibility() {
-      if (document.visibilityState === "visible") {
-        void loadLocalModels();
-      }
+      if (document.visibilityState !== "visible") return;
+      // Clear any pending retries from a previous resume cycle
+      clearTimeout(t1); clearTimeout(t2);
+      // Immediate check (picks up native AI status even if gateway is slow)
+      void loadLocalModels();
+      // Retry after 1.5s — gateway usually restarts within this window
+      t1 = setTimeout(() => void loadLocalModels(), 1500);
+      // Final retry at 4s for slow restarts
+      t2 = setTimeout(() => void loadLocalModels(), 4000);
     }
     document.addEventListener("visibilitychange", handleVisibility);
-    return () => document.removeEventListener("visibilitychange", handleVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+      clearTimeout(t1); clearTimeout(t2);
+    };
   }, [chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
@@ -8817,10 +8858,20 @@ function App() {
                   );
                 })}
 
-                {localModels.length === 0 ? (
+                {localModels.length === 0 && !nativeLocalAiStatus?.configured ? (
                   <div className="stack-sm" style={{ textAlign: 'center', padding: '1rem 0' }}>
                     <p className="text-sm muted">Loading model info...</p>
                     <button type="button" className="ghost" onClick={() => void loadLocalModels()}>Refresh</button>
+                  </div>
+                ) : localModels.length === 0 && nativeLocalAiStatus?.configured ? (
+                  <div className="stack-sm" style={{ padding: '0.75rem 0' }}>
+                    <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+                      <span style={{ fontSize: '1.2rem' }}>\u2705</span>
+                      <div>
+                        <strong className="text-sm">{nativeLocalAiStatus.modelId || "AI Model"}</strong>
+                        <p className="text-sm muted" style={{ margin: '0.1rem 0 0' }}>AI is ready for on-device inference</p>
+                      </div>
+                    </div>
                   </div>
                 ) : null}
 
