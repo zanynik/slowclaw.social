@@ -267,7 +267,14 @@ textarea {
   align-items: flex-end;
   gap: 0.75rem;
   border-bottom: 1px solid transparent;
-  transition: border-color 0.2s;
+  transition: border-color 0.2s, transform 0.3s ease, opacity 0.3s ease;
+  will-change: transform, opacity;
+}
+
+.topbar-hidden {
+  transform: translateY(-100%);
+  opacity: 0;
+  pointer-events: none;
 }
 
 :root[data-theme="dark"] .topbar {
@@ -2953,4 +2960,356 @@ button.local-ai-preset {
   body {
     padding-bottom: calc(90px + env(safe-area-inset-bottom, 0px));
   }
+}
+
+/* ── Auto-expand textarea (no nested scroll) ─────────────────────────────── */
+.journal-textarea-autoexpand {
+  width: 100%;
+  min-height: 5rem;
+  padding: 0.75rem;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1.65;
+  resize: none;
+  overflow: hidden;
+  outline: none;
+  field-sizing: content; /* Chrome 123+ auto-expands */
+}
+.journal-textarea-autoexpand::placeholder {
+  color: var(--muted);
+}
+
+/* ── TweetClaw post card (Twitter/X style) ───────────────────────────────── */
+.tweet-card {
+  padding: 1rem;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 0.75rem;
+  transition: background 0.15s;
+}
+.tweet-card:last-child {
+  border-bottom: none;
+}
+.tweet-card:hover {
+  background: color-mix(in srgb, var(--surface) 60%, transparent);
+}
+
+.tweet-avatar {
+  width: 40px;
+  height: 40px;
+  min-width: 40px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 60%, #8b5cf6));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.85rem;
+  color: #fff;
+}
+
+.tweet-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.tweet-header {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.tweet-name {
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--ink);
+}
+
+.tweet-handle {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.tweet-dot {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.tweet-time {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.tweet-text {
+  margin-top: 0.3rem;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tweet-text-edit {
+  margin-top: 0.3rem;
+  width: 100%;
+  min-height: 3rem;
+  padding: 0.4rem 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  resize: none;
+  overflow: hidden;
+  outline: none;
+  field-sizing: content;
+}
+
+.tweet-actions {
+  display: flex;
+  gap: 1.5rem;
+  margin-top: 0.6rem;
+  align-items: center;
+}
+
+.tweet-action {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: color 0.15s;
+  background: none;
+  border: none;
+  padding: 0.25rem;
+  border-radius: var(--r-pill);
+}
+.tweet-action:hover {
+  color: var(--accent);
+}
+.tweet-action svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* ── Feed posts container (no nested scroll) ─────────────────────────────── */
+.feed-posts-list {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Feed tab container — no nested scroll, content flows in page */
+.feed-tab-container {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* ── Journal sidebar list (Messages/WhatsApp style) ──────────────────────── */
+.journal-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.journal-list-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 0.85rem;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.journal-list-item:hover {
+  background: color-mix(in srgb, var(--line) 30%, transparent);
+}
+.journal-list-item.active {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.journal-list-item-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.journal-list-item-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.journal-list-item-title {
+  font-weight: 600;
+  font-size: 0.92rem;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.journal-list-item-time {
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.journal-list-item-preview {
+  margin: 0.15rem 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.journal-list-item-delete {
+  padding: 0.3rem !important;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.journal-list-item:hover .journal-list-item-delete {
+  opacity: 0.6;
+}
+.journal-list-item-delete:hover {
+  opacity: 1 !important;
+  color: var(--danger, #e55);
+}
+
+/* ── Tasks (Apple Reminders style) ───────────────────────────────────────── */
+.tasks-header-card {
+  padding: 1rem;
+}
+
+.tasks-section {
+  padding: 0.5rem 0;
+}
+
+.tasks-section-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+  margin: 0;
+  padding: 0.5rem 1rem 0.4rem;
+}
+
+.task-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent);
+  transition: background 0.1s;
+}
+.task-item:last-child {
+  border-bottom: none;
+}
+.task-item:hover {
+  background: color-mix(in srgb, var(--surface) 40%, transparent);
+}
+
+.task-checkbox {
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  background: transparent;
+  cursor: pointer;
+  margin-top: 2px;
+  transition: background 0.15s, border-color 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.task-checkbox:hover {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+.task-checkbox.checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.task-item-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.task-title-input {
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--ink);
+  border: none;
+  background: transparent;
+  padding: 0;
+  width: 100%;
+  outline: none;
+}
+.task-title-input:focus {
+  color: var(--text);
+}
+
+.task-detail-input {
+  font-size: 0.82rem;
+  color: var(--muted);
+  border: none;
+  background: transparent;
+  padding: 0;
+  width: 100%;
+  outline: none;
+}
+
+.task-time {
+  font-size: 0.75rem;
+  color: var(--muted);
+  white-space: nowrap;
+  margin-top: 3px;
+}
+
+.task-item-done {
+  opacity: 0.6;
+}
+.task-title-done {
+  text-decoration: line-through;
+  font-size: 0.95rem;
+  color: var(--muted);
+}
+
+.task-delete-btn {
+  padding: 0.25rem !important;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.task-item:hover .task-delete-btn {
+  opacity: 0.5;
+}
+.task-delete-btn:hover {
+  opacity: 1 !important;
+  color: var(--danger, #e55);
+}
+
+.tasks-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 3rem 1rem;
+  text-align: center;
+}
+.tasks-empty-icon {
+  font-size: 2rem;
 }

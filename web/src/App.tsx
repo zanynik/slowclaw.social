@@ -8,6 +8,7 @@ import { PullToRefresh } from "./components/PullToRefresh";
 import { ToastContainer } from "./components/ui/ToastContainer";
 import { appActions } from "./stores/useAppStore";
 import { useIsKeyboardOpen } from "./hooks/useKeyboardHeight";
+import { useScrollDirection } from "./hooks/useScrollDirection";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
   saveJournalText,
@@ -161,6 +162,23 @@ const CHAT_PROVIDER_STORAGE_KEY = "slowclaw.settings.provider";
 const CHAT_MODEL_STORAGE_KEY = "slowclaw.settings.model";
 const PERSISTED_POSTS_KEY = "slowclaw.generated_posts";
 const PERSISTED_TODOS_KEY = "slowclaw.extracted_todos";
+const PROCESSED_JOURNALS_KEY = "slowclaw.processed_journals";
+
+// Track which journal paths have been processed for feed/tasks
+function loadProcessedJournals(): Set<string> {
+  try {
+    const raw = localStorage.getItem(PROCESSED_JOURNALS_KEY);
+    return raw ? new Set(JSON.parse(raw)) : new Set();
+  } catch { return new Set(); }
+}
+function saveProcessedJournals(paths: Set<string>) {
+  try { localStorage.setItem(PROCESSED_JOURNALS_KEY, JSON.stringify([...paths])); } catch {}
+}
+function markJournalProcessed(path: string) {
+  const set = loadProcessedJournals();
+  set.add(path);
+  saveProcessedJournals(set);
+}
 
 type PersistedPost = {
   id: string;
@@ -177,11 +195,147 @@ type PersistedTodo = {
   createdAt: number;
 };
 
+// ── Dev-mode sample data ─────────────────────────────────────────────────────
+const DEV_SAMPLE_POSTS: PersistedPost[] = [
+  {
+    id: "dev-post-1",
+    text: "Just discovered that running AI models locally on your phone is actually possible now. No cloud, no API keys, full privacy. The future of personal computing is local-first. \ud83e\udde0\ud83d\udcf1",
+    sourceExcerpt: "journal entry about local AI",
+    createdAt: Date.now() - 1000 * 60 * 23,
+  },
+  {
+    id: "dev-post-2",
+    text: "Hot take: The best social media posts come from journaling first, then distilling. Write for yourself, then share the best parts with the world.",
+    sourceExcerpt: "reflection on content creation",
+    createdAt: Date.now() - 1000 * 60 * 60 * 2,
+  },
+  {
+    id: "dev-post-3",
+    text: "Shipped a fix today where the app was crashing because Metal GPU on iPhone tried to allocate more memory than the system allows. Solution: CPU-only inference with a graceful fallback. Stability > speed. \u2705",
+    sourceExcerpt: "debugging session notes",
+    createdAt: Date.now() - 1000 * 60 * 60 * 5,
+  },
+  {
+    id: "dev-post-4",
+    text: "Three things I learned building a journaling app:\n\n1. Privacy is a feature, not a constraint\n2. Small models (2B params) are surprisingly good\n3. People write more when they know no one is watching",
+    sourceExcerpt: "weekly reflection",
+    createdAt: Date.now() - 1000 * 60 * 60 * 24,
+  },
+  {
+    id: "dev-post-5",
+    text: "The trick to making AI-generated tweets sound natural: give it your raw journal entry as context, not a polished prompt. Authenticity in, authenticity out.",
+    sourceExcerpt: "AI prompt engineering notes",
+    createdAt: Date.now() - 1000 * 60 * 60 * 48,
+  },
+];
+
+const DEV_SAMPLE_TODOS: PersistedTodo[] = [
+  {
+    id: "dev-todo-1",
+    title: "Test Q3_K_M model on iPhone",
+    details: "Download the smaller quantization and verify stable CPU-only inference",
+    done: false,
+    createdAt: Date.now() - 1000 * 60 * 60,
+  },
+  {
+    id: "dev-todo-2",
+    title: "Write blog post about local-first AI",
+    details: "Cover the journey from cloud API to on-device inference",
+    done: false,
+    createdAt: Date.now() - 1000 * 60 * 60 * 3,
+  },
+  {
+    id: "dev-todo-3",
+    title: "Fix auto-transcription for audio journals",
+    details: "Speech.framework via Swift plugin instead of Rust ObjC FFI",
+    done: true,
+    createdAt: Date.now() - 1000 * 60 * 60 * 24,
+  },
+  {
+    id: "dev-todo-4",
+    title: "Design feed algorithm for Bluesky discovery",
+    details: "Interest-weighted ranking with local vector similarity",
+    done: false,
+    createdAt: Date.now() - 1000 * 60 * 60 * 48,
+  },
+  {
+    id: "dev-todo-5",
+    title: "Update TestFlight build with crash fixes",
+    details: "CPU-only inference, chunked decode, smaller context window",
+    done: true,
+    createdAt: Date.now() - 1000 * 60 * 60 * 72,
+  },
+];
+// ── End dev-mode sample data ─────────────────────────────────────────────────
+
+const DEV_SAMPLE_JOURNALS: LibraryItem[] = [
+  {
+    id: "dev-journal-1",
+    path: "journal://dev-journal-1",
+    title: "Thoughts on local AI",
+    kind: "text",
+    sizeBytes: 1200,
+    modifiedAt: (Date.now() - 1000 * 60 * 30) / 1000,
+    previewText: "Today I finally got the Gemma 4 model running on my iPhone. It's incredible that a 2B parameter model can run locally with decent speed. The key insight was keeping Metal GPU off and using CPU-only inference — it's slower but doesn't crash. I've been thinking about how this changes the privacy equation for personal AI assistants. No data leaves your device, ever. That's a fundamentally different trust model than cloud AI.",
+    editableText: true,
+    scope: "journal",
+  },
+  {
+    id: "dev-journal-2",
+    path: "journal://dev-journal-2",
+    title: "Content creation workflow",
+    kind: "text",
+    sizeBytes: 800,
+    modifiedAt: (Date.now() - 1000 * 60 * 60 * 4) / 1000,
+    previewText: "My new workflow: write raw thoughts in the journal, then pull down in the Feed tab to turn them into tweet-ready content. The AI does a surprisingly good job of distilling long rambling thoughts into punchy social posts. I'm getting 3-4 usable tweets from a single journal session.",
+    editableText: true,
+    scope: "journal",
+  },
+  {
+    id: "dev-journal-3",
+    path: "journal://dev-journal-3",
+    title: "Debugging Metal crashes",
+    kind: "text",
+    sizeBytes: 2400,
+    modifiedAt: (Date.now() - 1000 * 60 * 60 * 24) / 1000,
+    previewText: "Spent all day debugging why the app crashes on some iPhones but not others. The crash logs show SIGSEGV in ggml_metal_buffer_is_shared. This is an uncatchable signal — there's no way to gracefully handle it in Rust. The only safe approach is to avoid Metal GPU entirely for context creation on iOS. CPU-only is the answer for now.",
+    editableText: true,
+    scope: "journal",
+  },
+  {
+    id: "dev-journal-4",
+    path: "journal://dev-journal-4",
+    title: "Morning reflection",
+    kind: "text",
+    sizeBytes: 600,
+    modifiedAt: (Date.now() - 1000 * 60 * 60 * 48) / 1000,
+    previewText: "Woke up early today and had a clear head about the product direction. SlowClaw should be the anti-Twitter — write slow, publish deliberately. The journal is the creative sandbox, the feed is your curated output. No infinite scroll, no engagement metrics, just thoughtful content creation.",
+    editableText: true,
+    scope: "journal",
+  },
+  {
+    id: "dev-journal-5",
+    path: "journal://dev-journal-5",
+    title: "Audio recording test",
+    kind: "audio",
+    sizeBytes: 45000,
+    modifiedAt: (Date.now() - 1000 * 60 * 60 * 72) / 1000,
+    previewText: "",
+    editableText: false,
+    scope: "journal",
+  },
+];
+
 function loadPersistedPosts(): PersistedPost[] {
   try {
     const raw = localStorage.getItem(PERSISTED_POSTS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch { return []; }
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  // Seed with sample posts in local dev so the UI is visible immediately
+  if (typeof window !== "undefined" && /^localhost$|^127\.0\.0\.1$/.test(window.location.hostname)) {
+    return DEV_SAMPLE_POSTS;
+  }
+  return [];
 }
 
 function savePersistedPosts(posts: PersistedPost[]) {
@@ -191,8 +345,12 @@ function savePersistedPosts(posts: PersistedPost[]) {
 function loadPersistedTodos(): PersistedTodo[] {
   try {
     const raw = localStorage.getItem(PERSISTED_TODOS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch { return []; }
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  if (typeof window !== "undefined" && /^localhost$|^127\.0\.0\.1$/.test(window.location.hostname)) {
+    return DEV_SAMPLE_TODOS;
+  }
+  return [];
 }
 
 function savePersistedTodos(todos: PersistedTodo[]) {
@@ -288,6 +446,17 @@ function formatTimestamp(value?: number | string) {
     return String(value);
   }
   return date.toLocaleString();
+}
+
+function getRelativeTime(dateVal: string | number): string {
+  const now = Date.now();
+  const then = typeof dateVal === "number" ? dateVal : new Date(dateVal).getTime();
+  const diffSec = Math.round((now - then) / 1000);
+  if (diffSec < 60) return "now";
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
+  if (diffSec < 604800) return `${Math.floor(diffSec / 86400)}d`;
+  return new Date(then).toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
 function parseDateValue(value?: string | null) {
@@ -973,6 +1142,7 @@ function App() {
   const isDesktopClient = isTauriDesktopRuntime();
   const isNativeClient = isDesktopClient || isTauriMobileRuntime();
   const isLargeScreen = useIsLargeScreen();
+  const scrollDirection = useScrollDirection(8);
   const isDesktopLayout = isDesktopClient || isLargeScreen;
   const [gatewayBaseUrl, setGatewayBaseUrl] = useState(defaultGatewayBaseUrl);
   const [creds, setCreds] = useState<BlueskyCredentials>(() => loadCredentialsFallback());
@@ -5786,6 +5956,130 @@ function App() {
     }
   }
 
+  // ── Pull-to-refresh handlers for Feed and Tasks ───────────────────────────
+  // Finds the latest unprocessed journal and uses it for generation/extraction.
+  // If all journals are processed, picks a random one for reprocessing.
+  function getNextJournalForProcessing(): { path: string; text: string } | null {
+    const textItems = journalItems.filter((item) => item.kind === "text" && (item.previewText || "").trim().length > 10);
+    if (textItems.length === 0) return null;
+    const processed = loadProcessedJournals();
+    // Find the most recently modified unprocessed entry
+    const unprocessed = textItems.filter((item) => !processed.has(item.path));
+    if (unprocessed.length > 0) {
+      const newest = unprocessed[0]; // already sorted by modifiedAt desc
+      return { path: newest.path, text: newest.previewText || newest.title };
+    }
+    // All processed — pick a random one for reprocessing
+    const random = textItems[Math.floor(Math.random() * textItems.length)];
+    return { path: random.path, text: random.previewText || random.title };
+  }
+
+  async function handleFeedPullRefresh() {
+    const entry = getNextJournalForProcessing();
+    if (!entry) {
+      setGeneratePostStatus("Write a journal entry first, then pull to generate posts.");
+      return;
+    }
+    if (!requireModel()) return;
+    // Use the entry text for generation (same logic as generatePostFromJournal)
+    setGeneratePostBusy(true);
+    setGeneratePostStatus("Generating posts...");
+    try {
+      const posts: string[] = [];
+      if (isTauriMobileRuntime()) {
+        const chunks = splitIntoChunks(entry.text, CHUNK_CHAR_LIMIT);
+        for (let i = 0; i < chunks.length; i++) {
+          if (chunks.length > 1) setGeneratePostStatus(`Generating post ${i + 1}/${chunks.length}...`);
+          let postText = "";
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const result = await nativeAiChat(
+              chunks[i],
+              "You are a social media content writer. Turn the following journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text, no hashtags unless they add real value. No quotes around the text.",
+              256,
+              0.8 + attempt * 0.1
+            );
+            postText = result.text.replace(/^["']|["']$/g, '').trim();
+            if (postText.length > 10 && postText.length < 400) break;
+          }
+          if (postText) posts.push(postText);
+        }
+      } else {
+        const token = await resolveRuntimeGatewayToken();
+        const response = await fetch(`${gatewayBaseUrl || ""}/api/chat/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+          body: JSON.stringify({ threadId: createThreadId(), content: `Turn this journal entry into a concise tweet-style post (under 280 chars). Output ONLY the post:\n\n${entry.text}` }),
+        });
+        if (!response.ok) throw new Error(`Gateway returned ${response.status}`);
+        const data = await response.json();
+        posts.push((data.content || data.text || "").trim());
+      }
+      const newPosts: PersistedPost[] = posts.filter((t) => t.trim()).map((t) => ({
+        id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        text: t.trim(),
+        sourceExcerpt: entry.text.slice(0, 120),
+        createdAt: Date.now(),
+      }));
+      if (newPosts.length > 0) {
+        setPersistedPosts((prev) => { const next = [...newPosts, ...prev]; savePersistedPosts(next); return next; });
+      }
+      // Mark this journal as processed
+      markJournalProcessed(entry.path);
+      setGeneratePostStatus(`Generated ${posts.length} post${posts.length > 1 ? 's' : ''} from your journal`);
+    } catch (error) {
+      setGeneratePostStatus(`Generation failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setGeneratePostBusy(false);
+    }
+  }
+
+  async function handleTasksPullRefresh() {
+    const entry = getNextJournalForProcessing();
+    if (!entry) {
+      setGeneratePostStatus("Write a journal entry first, then pull to extract tasks.");
+      return;
+    }
+    if (!requireModel()) return;
+    setExtractingLocalTasks(true);
+    try {
+      const taskPrompt = `You extract action items and tasks from journal entries. Output a JSON array of objects with "title" and "details" fields. Only real actionable tasks. Output ONLY valid JSON, no markdown fences. Example: [{"title":"Buy groceries","details":"Need milk and eggs"}]`;
+      const chunks = splitIntoChunks(entry.text, CHUNK_CHAR_LIMIT);
+      const allParsed: Array<{ title: string; details?: string }> = [];
+      for (let i = 0; i < chunks.length; i++) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const result = await nativeAiChat(chunks[i], taskPrompt, 512, 0.2 + attempt * 0.1);
+          const parsed = tryParseJsonArray<{ title: string; details?: string }>(result.text);
+          if (parsed && parsed.length > 0) { allParsed.push(...parsed); break; }
+          if (attempt === 2) {
+            const lines = result.text.split("\n").filter((l) => /^\s*[-*\d.]/.test(l));
+            allParsed.push(...lines.map((l) => ({ title: l.replace(/^\s*[-*\d.]+\s*/, "").trim() })));
+          }
+        }
+      }
+      if (allParsed.length > 0) {
+        const newTodos: PersistedTodo[] = allParsed
+          .filter((t) => t.title?.trim())
+          .map((t) => ({
+            id: `todo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            title: t.title.trim(),
+            details: (t.details || "").trim(),
+            done: false,
+            createdAt: Date.now(),
+          }));
+        setPersistedTodos((prev) => {
+          const existingTitles = new Set(prev.map((t) => t.title.toLowerCase()));
+          const unique = newTodos.filter((t) => !existingTitles.has(t.title.toLowerCase()));
+          const next = [...unique, ...prev]; savePersistedTodos(next); return next;
+        });
+      }
+      markJournalProcessed(entry.path);
+    } catch (error) {
+      setGeneratePostStatus(`Task extraction failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setExtractingLocalTasks(false);
+    }
+  }
+
   async function loadRuntimeConfigForSettings() {
     let token = normalizeGatewayToken(chatGatewayToken);
     if (!token && isDesktopClient) {
@@ -6161,6 +6455,24 @@ function App() {
       void setMetalModeBackend(true).catch(() => {});
     }
   }, [chatGatewayToken, gatewayBaseUrl]);
+
+  // Seed journal items in local dev mode for UI preview (delayed to run after refresh attempts)
+  useEffect(() => {
+    const isDevHost = typeof window !== "undefined" && /^localhost$|^127\.0\.0\.1$/.test(window.location.hostname);
+    if (!isDevHost) return;
+    const timer = setTimeout(() => {
+      // Only seed if journals are still empty (refresh didn't find anything)
+      setJournalItems((prev) => {
+        if (prev.length > 0) return prev;
+        setSelectedJournalPath(DEV_SAMPLE_JOURNALS[0].path);
+        setSelectedJournalText(DEV_SAMPLE_JOURNALS[0].previewText || "");
+        setJournalDraftText(DEV_SAMPLE_JOURNALS[0].previewText || "");
+        return DEV_SAMPLE_JOURNALS;
+      });
+    }, 500);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Re-check model status when app comes back to foreground (after screen lock/unlock)
   useEffect(() => {
@@ -6566,35 +6878,40 @@ function App() {
       ) : filteredJournalList.length === 0 ? (
         <p className="text-center muted">No journals match your search.</p>
       ) : (
-        <div className="stack">
-          {filteredJournalList.map(item => (
-            <div key={item.path} className="row-between" style={{ padding: "0.8rem", background: selectedJournalPath === item.path ? "color-mix(in srgb, var(--line) 40%, transparent)" : "transparent", borderRadius: "12px" }}>
+        <div className="journal-list">
+          {filteredJournalList.map(item => {
+            const isActive = selectedJournalPath === item.path;
+            const preview = item.previewText?.slice(0, 60) || (item.kind !== "text" ? `${item.kind} recording` : "");
+            return (
               <div
-                className="stack"
-                style={{ gap: '4px', flex: 1, cursor: 'pointer' }}
+                key={item.path}
+                className={`journal-list-item${isActive ? " active" : ""}`}
                 onClick={() => {
                   setSelectedJournalPath(item.path);
-                  if (closeOnSelect) {
-                    setJournalSidebarOpen(false);
-                  }
+                  if (closeOnSelect) setJournalSidebarOpen(false);
                 }}
               >
-                <div className="feed-title">{item.title}</div>
-                <div className="feed-time">{formatTimestamp(item.modifiedAt)} · {item.kind.toUpperCase()}</div>
+                <div className="journal-list-item-content">
+                  <div className="journal-list-item-top">
+                    <span className="journal-list-item-title">{item.title}</span>
+                    <span className="journal-list-item-time">{getRelativeTime(item.modifiedAt * 1000)}</span>
+                  </div>
+                  {preview && <p className="journal-list-item-preview">{preview}</p>}
+                </div>
+                <button
+                  type="button"
+                  className="ghost journal-list-item-delete"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setPendingDeleteJournalItem(item);
+                  }}
+                  title={`Delete ${item.title}`}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+                </button>
               </div>
-              <button
-                type="button"
-                className="ghost"
-                onClick={() => {
-                  setPendingDeleteJournalItem(item);
-                }}
-                title={`Delete ${item.title}`}
-                style={{ padding: "0.35rem" }}
-              >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg>
-              </button>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </>
@@ -7185,7 +7502,7 @@ function App() {
   return (
     <div className="app-shell">
       {!hideChrome && (
-        <header className="topbar">
+        <header className={`topbar${scrollDirection === "down" ? " topbar-hidden" : ""}`}>
           <div className="row" style={{ alignItems: "center", gap: "1rem" }}>
             {mobileTab === "journal" && !showDesktopJournalLayout && (
               <button type="button" className="ghost" onClick={() => setJournalSidebarOpen(true)} style={{ padding: "0.2rem" }}>
@@ -7326,85 +7643,6 @@ function App() {
                 </aside>
               ) : null}
               <div className={`stack journal-main ${isWritingNote ? "journal-main-writing" : ""}`}>
-              {showCaptureCard && (
-                <div className="card">
-                  <div className="text-center">
-                    <h2>Capture</h2>
-                    <p className="text-sm mt-2">{recordingHint || "Record audio or video directly to workspace"}</p>
-                  </div>
-                  {selectedJournalItem &&
-                    (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video") ? (
-                    <div className="stack" style={{ marginTop: "1rem" }}>
-                      {mediaPreviewLoading ? (
-                        <p className="text-sm muted text-center">Loading media preview...</p>
-                      ) : mediaPreviewUrl ? (
-                        <>
-                          {selectedJournalItem.kind === "audio" ? (
-                            <div className="audio-preview-shell">
-                              <div className="audio-preview-meta">
-                                <div className="audio-preview-icon" aria-hidden>
-                                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
-                                </div>
-                                <div className="stack-sm" style={{ gap: "0.2rem" }}>
-                                  <span className="section-label">Audio Preview</span>
-                                  <span className="text-sm muted">{selectedJournalItem.title || "Recorded audio"}</span>
-                                </div>
-                              </div>
-                              <audio controls style={{ width: "100%" }}>
-                                <source src={mediaPreviewUrl} type={mediaPreviewMime || undefined} />
-                              </audio>
-                            </div>
-                          ) : (
-                            <video controls src={mediaPreviewUrl} className="media-viewer" style={{ marginTop: 0 }} />
-                          )}
-                        </>
-                      ) : (
-                        <p className="text-sm muted text-center">Media preview unavailable.</p>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="stack">
-                      <div className="record-btn-group">
-                        <button
-                          type="button"
-                          className="record-btn audio"
-                          onClick={() => {
-                            setCaptureMode("audio");
-                            setRecordingHint("Preparing audio capture...");
-                            void startLiveRecording("audio");
-                          }}
-                          title="Record Audio"
-                        >
-                          <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
-                        </button>
-                        <button
-                          type="button"
-                          className="record-btn gallery"
-                          onClick={() => void importFromGallery()}
-                          title="Import from Gallery"
-                        >
-                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
-                        </button>
-                      </div>
-
-                      {audioDevices.length > 1 && (
-                        <div className="text-center mt-2">
-                          <select
-                            value={selectedAudioDeviceId}
-                            onChange={(e) => setSelectedAudioDeviceId(e.target.value)}
-                            className="text-sm"
-                            style={{ background: "transparent", border: "1px solid var(--line)", padding: "4px 8px", borderRadius: "12px", color: "var(--muted)" }}
-                          >
-                            {audioDevices.map(d => (
-                              <option key={d.deviceId} value={d.deviceId}>{d.label || 'Microphone'}</option>
-                            ))}
-                          </select>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
 
               {isCaptureZenMode && (
                 <div className="card capture-zen">
@@ -7496,48 +7734,9 @@ function App() {
                 >
                   <div className="row-between" style={{ padding: isWritingNote ? '0.5rem 0' : undefined }}>
                     <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
-                      {isTextEntrySelected && !isWritingNote && (
-                        <button
-                          type="button"
-                          className="ghost text-sm"
-                          onClick={() => {
-                            setSelectedJournalPath("");
-                            setSelectedJournalItem(null);
-                            setSelectedJournalText("");
-                            setJournalDraftText("");
-                            setRecordingHint(DEFAULT_RECORDING_HINT);
-                          }}
-                        >
-                          ← Capture
-                        </button>
-                      )}
-                      <h2 style={{ margin: 0 }}>{isTextEntrySelected ? selectedJournalItem?.title || "Journal" : "Session"}</h2>
+                      <h2 style={{ margin: 0 }}>{isTextEntrySelected ? selectedJournalItem?.title || "Journal" : "Journal"}</h2>
                     </div>
                     <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
-                      {selectedJournalSynthSourcePath ? (
-                        <button
-                          type="button"
-                          className="ghost text-sm"
-                          onClick={() =>
-                            void runWorkspaceSynthesizerManual({
-                              sourcePath: selectedJournalSynthSourcePath,
-                              force: selectedJournalWasProcessed
-                            })
-                          }
-                          disabled={
-                            workspaceSynthBusy || workspaceSynthRunning || !workspaceSynthProviderReady
-                          }
-                          title={
-                            !workspaceSynthProviderReady
-                              ? workspaceSynthProviderBlockedReason
-                              : selectedJournalWasProcessed
-                              ? "Run the synthesizer again for this journal entry"
-                              : "Process this journal entry now"
-                          }
-                        >
-                          {selectedJournalWasProcessed ? "Re-process" : "Process"}
-                        </button>
-                      ) : null}
                       <span className="text-sm muted">{journalSaveStatus !== "Journal idle" ? journalSaveStatus : ""}</span>
                       {(isWritingNote || isTextEntrySelected) && <button type="button" className="primary" style={{ padding: '0.5rem 1.2rem', fontSize: '0.95rem' }} onClick={() => setIsWritingNote(false)}>Done</button>}
                     </div>
@@ -7572,77 +7771,26 @@ function App() {
                       </div>
                     )}
                   <textarea
-                    rows={expandSession ? 15 : 5}
+                    className="journal-textarea-autoexpand"
                     value={journalDraftText}
-                    onChange={(e) => setJournalDraftText(e.target.value)}
-                    onFocus={() => {
+                    onChange={(e) => {
+                      setJournalDraftText(e.target.value);
+                      // Auto-expand: reset height then set to scrollHeight
+                      const el = e.target;
+                      el.style.height = "auto";
+                      el.style.height = el.scrollHeight + "px";
+                    }}
+                    onFocus={(e) => {
                       if (!isMediaTranscriptMode) {
                         setIsWritingNote(true);
                       }
+                      // Expand to content on focus
+                      const el = e.target;
+                      el.style.height = "auto";
+                      el.style.height = el.scrollHeight + "px";
                     }}
                     placeholder="Write your thoughts..."
-                    style={{
-                      flex: expandSession ? 1 : undefined,
-                      resize: "none",
-                      minHeight:
-                        expandSession
-                          ? "100%"
-                          : undefined
-                    }}
                   />
-                  {journalDraftText.trim() && (
-                    <div className="generate-post-section">
-                      <div className="row" style={{ gap: '0.5rem', flexWrap: 'wrap' }}>
-                        <button
-                          type="button"
-                          className="primary"
-                          onClick={() => void generatePostFromJournal()}
-                          disabled={generatePostBusy}
-                          style={{ flex: 1 }}
-                        >
-                          {generatePostBusy ? (
-                            <span className="row" style={{ gap: '0.4rem', alignItems: 'center', justifyContent: 'center' }}>
-                              <span className="btn-spinner" aria-hidden />
-                              Generating...
-                            </span>
-                          ) : (
-                            "✨ Generate Post"
-                          )}
-                        </button>
-                      </div>
-                      {generatePostStatus && (
-                        <p className="text-sm muted" style={{ marginTop: '0.4rem' }}>{generatePostStatus}</p>
-                      )}
-                      {generatedPost && (
-                        <div className="generated-post-card">
-                          <p className="text-sm muted">Generated post:</p>
-                          <p style={{ whiteSpace: 'pre-wrap' }}>{generatedPost}</p>
-                          <div className="row" style={{ gap: '0.5rem', marginTop: '0.5rem' }}>
-                            <button
-                              type="button"
-                              className="ghost text-sm"
-                              onClick={() => {
-                                navigator.clipboard?.writeText(generatedPost);
-                                setGeneratePostStatus("Copied to clipboard!");
-                              }}
-                            >
-                              Copy
-                            </button>
-                            <button
-                              type="button"
-                              className="ghost text-sm"
-                              onClick={() => {
-                                setGeneratedPost("");
-                                setGeneratePostStatus("");
-                              }}
-                            >
-                              Dismiss
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
                 </div>
               )}
 
@@ -7653,25 +7801,17 @@ function App() {
 
         {mobileTab === "feed" ? (
           <ViewErrorBoundary title="Feed">
+            <PullToRefresh onRefresh={handleFeedPullRefresh} enabled={!generatePostBusy}>
             <div className="stack">
-              <div className="card">
-              <div className="row-between">
+              <div className="feed-tab-container">
+              <div className="row-between" style={{ padding: '0 0.25rem' }}>
                 <h2>Your Feed</h2>
-                <div className="row" style={{ gap: "0.35rem", alignItems: "center" }}>
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => {
-                      if (feedSource === "bluesky") {
-                        void fetchBlueskyFeed({ force: true });
-                      } else {
-                        void refreshWorkspaceViews({ runSynthIfPending: true });
-                      }
-                    }}
-                  >
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-                  </button>
-                </div>
+                {generatePostBusy && (
+                  <span className="row" style={{ gap: '0.3rem', alignItems: 'center' }}>
+                    <span className="btn-spinner" aria-hidden />
+                    <span className="text-sm muted">Generating...</span>
+                  </span>
+                )}
               </div>
 
               <div className="segmented-control mt-2 mb-2">
@@ -7695,7 +7835,7 @@ function App() {
                 <div className="feed-create-hero">
                   <div className="feed-create-hero-icon">✨</div>
                   <h3>Turn journals into posts</h3>
-                  <p className="text-sm muted">Write in your journal, then use on-device AI to generate tweet-ready posts.</p>
+                  <p className="text-sm muted">Write in your journal, then pull down here to generate tweet-ready posts using on-device AI.</p>
                   <button
                     type="button"
                     className="primary"
@@ -7707,35 +7847,48 @@ function App() {
               )}
 
               {feedSource === "local" && persistedPosts.length > 0 && (
-                <div className="stack">
-                  {persistedPosts.map((post) => (
-                    <div key={post.id} className="generated-post-card">
-                      <textarea
-                        className="post-edit-textarea"
-                        value={post.text}
-                        onChange={(e) => {
-                          const newText = e.target.value;
-                          setPersistedPosts((prev) => {
-                            const next = prev.map((p) => p.id === post.id ? { ...p, text: newText } : p);
-                            savePersistedPosts(next);
-                            return next;
-                          });
-                        }}
-                        rows={3}
-                      />
-                      <div className="row-between" style={{ marginTop: '0.35rem' }}>
-                        <span className="text-sm muted">
-                          {new Date(post.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
-                        </span>
-                        <div className="row" style={{ gap: '0.35rem' }}>
-                          <button type="button" className="ghost text-sm" onClick={() => { navigator.clipboard?.writeText(post.text); }}>Copy</button>
-                          <button type="button" className="ghost text-sm" onClick={() => {
-                            setPersistedPosts((prev) => { const next = prev.filter((p) => p.id !== post.id); savePersistedPosts(next); return next; });
-                          }}>Delete</button>
+                <div className="feed-posts-list">
+                  {persistedPosts.map((post) => {
+                    const timeAgo = getRelativeTime(post.createdAt);
+                    return (
+                      <div key={post.id} className="tweet-card">
+                        <div className="tweet-avatar" aria-hidden>🐾</div>
+                        <div className="tweet-body">
+                          <div className="tweet-header">
+                            <span className="tweet-name">TweetClaw</span>
+                            <span className="tweet-handle">@tweetclaw</span>
+                            <span className="tweet-dot">·</span>
+                            <span className="tweet-time">{timeAgo}</span>
+                          </div>
+                          <textarea
+                            className="tweet-text-edit"
+                            value={post.text}
+                            onChange={(e) => {
+                              const newText = e.target.value;
+                              setPersistedPosts((prev) => {
+                                const next = prev.map((p) => p.id === post.id ? { ...p, text: newText } : p);
+                                savePersistedPosts(next);
+                                return next;
+                              });
+                            }}
+                            rows={2}
+                          />
+                          <div className="tweet-actions">
+                            <button type="button" className="tweet-action" onClick={() => { navigator.clipboard?.writeText(post.text); }} title="Copy">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                              Copy
+                            </button>
+                            <button type="button" className="tweet-action" onClick={() => {
+                              setPersistedPosts((prev) => { const next = prev.filter((p) => p.id !== post.id); savePersistedPosts(next); return next; });
+                            }} title="Delete">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                              Delete
+                            </button>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
 
@@ -8393,156 +8546,133 @@ function App() {
               )}
               </div>
             </div>
+            </PullToRefresh>
           </ViewErrorBoundary>
         ) : null}
 
         {mobileTab === "productivity" ? (
           <ViewErrorBoundary title="Tasks">
+            <PullToRefresh onRefresh={handleTasksPullRefresh} enabled={!extractingLocalTasks}>
             <div className="stack">
-              <div className="card">
-                <h2 style={{ margin: 0 }}>Tasks</h2>
-                <p className="text-sm muted" style={{ margin: '0.25rem 0 0.75rem' }}>
-                  Extracted from your journal entries by on-device AI.
-                </p>
-                <button
-                  type="button"
-                  className="primary"
-                  style={{ width: '100%', borderRadius: '10px' }}
-                  onClick={() => void extractTasksFromJournals()}
-                  disabled={extractingLocalTasks}
-                >
-                  {extractingLocalTasks ? (
-                    <span className="row" style={{ gap: '0.4rem', alignItems: 'center', justifyContent: 'center' }}>
+              <div className="tasks-header-card">
+                <div className="row-between" style={{ alignItems: 'center' }}>
+                  <h2 style={{ margin: 0 }}>Tasks</h2>
+                  {extractingLocalTasks && (
+                    <span className="row" style={{ gap: '0.3rem', alignItems: 'center' }}>
                       <span className="btn-spinner" aria-hidden />
-                      Extracting...
+                      <span className="text-sm muted">Extracting...</span>
                     </span>
-                  ) : (
-                    `\uD83E\uDDE0 Extract Tasks from Journals`
                   )}
-                </button>
-                {generatePostStatus && mobileTab === "productivity" ? (
-                  <p className="text-sm muted" style={{ margin: '0.5rem 0 0' }}>{generatePostStatus}</p>
-                ) : null}
+                </div>
+                <p className="text-sm muted" style={{ margin: '0.15rem 0 0' }}>
+                  Pull down to extract tasks from your journals
+                </p>
               </div>
 
               {persistedTodos.filter((t) => !t.done).length > 0 ? (
-                <div className="card">
-                  <h3 style={{ margin: 0 }}>Open ({persistedTodos.filter((t) => !t.done).length})</h3>
-                  <div className="stack" style={{ marginTop: '0.5rem' }}>
-                    {persistedTodos.filter((t) => !t.done).map((todo) => (
-                      <div key={todo.id} className="planner-item-card">
-                        <div className="row-between" style={{ gap: '0.8rem', alignItems: 'flex-start' }}>
-                          <div className="stack-sm" style={{ gap: '0.25rem', flex: 1 }}>
-                            <input
-                              type="text"
-                              value={todo.title}
-                              className="todo-edit-input"
-                              onChange={(e) => {
-                                const val = e.target.value;
-                                setPersistedTodos((prev) => {
-                                  const next = prev.map((t) => t.id === todo.id ? { ...t, title: val } : t);
-                                  savePersistedTodos(next);
-                                  return next;
-                                });
-                              }}
-                            />
-                            {todo.details ? (
-                              <input
-                                type="text"
-                                value={todo.details}
-                                className="todo-edit-input text-sm muted"
-                                onChange={(e) => {
-                                  const val = e.target.value;
-                                  setPersistedTodos((prev) => {
-                                    const next = prev.map((t) => t.id === todo.id ? { ...t, details: val } : t);
-                                    savePersistedTodos(next);
-                                    return next;
-                                  });
-                                }}
-                              />
-                            ) : null}
-                            <span className="text-sm muted">
-                              {new Date(todo.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric' })}
-                            </span>
-                          </div>
-                          <button
-                            type="button"
-                            className="primary text-sm"
-                            style={{ padding: '0.35rem 0.75rem', borderRadius: '999px' }}
-                            onClick={() => {
+                <div className="tasks-section">
+                  <h3 className="tasks-section-title">Open \u00b7 {persistedTodos.filter((t) => !t.done).length}</h3>
+                  {persistedTodos.filter((t) => !t.done).map((todo) => (
+                    <div key={todo.id} className="task-item">
+                      <button
+                        type="button"
+                        className="task-checkbox"
+                        onClick={() => {
+                          setPersistedTodos((prev) => {
+                            const next = prev.map((t) => t.id === todo.id ? { ...t, done: true } : t);
+                            savePersistedTodos(next);
+                            return next;
+                          });
+                        }}
+                        aria-label="Mark done"
+                      />
+                      <div className="task-item-content">
+                        <input
+                          type="text"
+                          value={todo.title}
+                          className="task-title-input"
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setPersistedTodos((prev) => {
+                              const next = prev.map((t) => t.id === todo.id ? { ...t, title: val } : t);
+                              savePersistedTodos(next);
+                              return next;
+                            });
+                          }}
+                        />
+                        {todo.details && (
+                          <input
+                            type="text"
+                            value={todo.details}
+                            className="task-detail-input"
+                            onChange={(e) => {
+                              const val = e.target.value;
                               setPersistedTodos((prev) => {
-                                const next = prev.map((t) => t.id === todo.id ? { ...t, done: true } : t);
+                                const next = prev.map((t) => t.id === todo.id ? { ...t, details: val } : t);
                                 savePersistedTodos(next);
                                 return next;
                               });
                             }}
-                          >
-                            Done
-                          </button>
-                        </div>
+                          />
+                        )}
                       </div>
-                    ))}
-                  </div>
+                      <span className="task-time">{getRelativeTime(todo.createdAt)}</span>
+                    </div>
+                  ))}
                 </div>
               ) : null}
 
               {persistedTodos.filter((t) => t.done).length > 0 ? (
-                <div className="card">
-                  <h3 style={{ margin: 0 }}>Completed ({persistedTodos.filter((t) => t.done).length})</h3>
-                  <div className="stack" style={{ marginTop: '0.5rem' }}>
-                    {persistedTodos.filter((t) => t.done).map((todo) => (
-                      <div key={todo.id} className="planner-item-card planner-item-card-done">
-                        <div className="row-between" style={{ gap: '0.8rem', alignItems: 'flex-start' }}>
-                          <div className="stack-sm" style={{ gap: '0.25rem', flex: 1 }}>
-                            <strong style={{ textDecoration: 'line-through' }}>{todo.title}</strong>
-                          </div>
-                          <div className="row" style={{ gap: '0.35rem' }}>
-                            <button
-                              type="button"
-                              className="ghost text-sm"
-                              style={{ padding: '0.35rem 0.75rem', borderRadius: '999px' }}
-                              onClick={() => {
-                                setPersistedTodos((prev) => {
-                                  const next = prev.map((t) => t.id === todo.id ? { ...t, done: false } : t);
-                                  savePersistedTodos(next);
-                                  return next;
-                                });
-                              }}
-                            >
-                              Reopen
-                            </button>
-                            <button
-                              type="button"
-                              className="ghost text-sm"
-                              style={{ padding: '0.35rem 0.75rem', borderRadius: '999px' }}
-                              onClick={() => {
-                                setPersistedTodos((prev) => {
-                                  const next = prev.filter((t) => t.id !== todo.id);
-                                  savePersistedTodos(next);
-                                  return next;
-                                });
-                              }}
-                            >
-                              Delete
-                            </button>
-                          </div>
-                        </div>
+                <div className="tasks-section">
+                  <h3 className="tasks-section-title" style={{ color: 'var(--muted)' }}>Completed \u00b7 {persistedTodos.filter((t) => t.done).length}</h3>
+                  {persistedTodos.filter((t) => t.done).map((todo) => (
+                    <div key={todo.id} className="task-item task-item-done">
+                      <button
+                        type="button"
+                        className="task-checkbox checked"
+                        onClick={() => {
+                          setPersistedTodos((prev) => {
+                            const next = prev.map((t) => t.id === todo.id ? { ...t, done: false } : t);
+                            savePersistedTodos(next);
+                            return next;
+                          });
+                        }}
+                        aria-label="Reopen"
+                      >
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                      </button>
+                      <div className="task-item-content">
+                        <span className="task-title-done">{todo.title}</span>
                       </div>
-                    ))}
-                  </div>
+                      <button
+                        type="button"
+                        className="ghost task-delete-btn"
+                        onClick={() => {
+                          setPersistedTodos((prev) => {
+                            const next = prev.filter((t) => t.id !== todo.id);
+                            savePersistedTodos(next);
+                            return next;
+                          });
+                        }}
+                        title="Delete"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                      </button>
+                    </div>
+                  ))}
                 </div>
               ) : null}
 
               {persistedTodos.length === 0 ? (
-                <div className="card">
-                  <div className="planner-empty-state">
-                    <p className="text-center muted" style={{ margin: 0 }}>
-                      No tasks yet. Write journal entries, then tap "Extract Tasks" to pull out action items.
-                    </p>
-                  </div>
+                <div className="tasks-empty">
+                  <div className="tasks-empty-icon">\u2705</div>
+                  <p className="text-sm muted" style={{ margin: 0 }}>
+                    No tasks yet. Pull down to extract from your journals.
+                  </p>
                 </div>
               ) : null}
             </div>
+            </PullToRefresh>
           </ViewErrorBoundary>
         ) : null}
 
