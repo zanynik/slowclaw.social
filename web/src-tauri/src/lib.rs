@@ -1099,11 +1099,21 @@ fn safe_filename(value: &str, fallback: &str) -> String {
 }
 
 fn title_from_path(path: &Path) -> String {
-    path.file_stem()
+    let raw = path.file_stem()
         .and_then(|value| value.to_str())
         .map(|value| value.replace(['-', '_'], " "))
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "Journal entry".to_string())
+        .unwrap_or_else(|| "Journal entry".to_string());
+    // Strip leading Unix timestamp (10+ digits) prefix for cleaner display
+    let trimmed = raw.trim_start();
+    if trimmed.len() > 11 && trimmed.as_bytes().iter().take(10).all(|b| b.is_ascii_digit()) {
+        let after_digits = trimmed.trim_start_matches(|c: char| c.is_ascii_digit());
+        let title_part = after_digits.trim();
+        if !title_part.is_empty() {
+            return title_part.to_string();
+        }
+    }
+    raw
 }
 
 fn media_kind_from_extension(path: &Path) -> Option<&'static str> {
@@ -1855,6 +1865,41 @@ async fn delete_journal(id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn rename_journal(id: String, new_title: String) -> Result<JournalEntry, String> {
+    let config = load_workspace_config_for_ui("journal rename config load failed").await?;
+    let old_path = resolve_journal_id(&config.workspace_dir, &id)?;
+    if !old_path.is_file() {
+        return Err("Journal entry not found.".to_string());
+    }
+    let new_title_trimmed = new_title.trim();
+    if new_title_trimmed.is_empty() {
+        return Err("Title cannot be empty.".to_string());
+    }
+    // Keep the same timestamp prefix, replace the title part of the filename
+    let filename = old_path.file_name().unwrap_or_default().to_string_lossy();
+    let extension = old_path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "txt".to_string());
+    // Filename format: {timestamp}-{title}.{ext}
+    let new_filename = if let Some(dash_pos) = filename.find('-') {
+        let timestamp_part = &filename[..dash_pos];
+        format!("{}-{}.{}", timestamp_part, safe_filename(new_title_trimmed, "journal-entry"), extension)
+    } else {
+        format!("{}-{}.{}", unix_time_label(), safe_filename(new_title_trimmed, "journal-entry"), extension)
+    };
+    let new_path = old_path.parent().unwrap_or(&config.workspace_dir).join(&new_filename);
+    if new_path != old_path {
+        std::fs::rename(&old_path, &new_path).map_err(|e| {
+            ui_command_error(
+                "journal rename failed",
+                "Failed to rename the journal entry.",
+                e,
+            )
+        })?;
+    }
+    journal_entry_from_path(&config.workspace_dir, &new_path)
+        .ok_or_else(|| "Failed to read renamed journal entry.".to_string())
+}
+
+#[tauri::command]
 async fn get_config() -> Result<AppConfig, String> {
     let config = load_workspace_config_for_ui("app config load failed").await?;
     Ok(AppConfig {
@@ -2355,6 +2400,7 @@ pub fn run() {
             list_journals,
             get_journal,
             update_journal_text,
+            rename_journal,
             delete_journal,
             open_workspace_journals_folder,
             open_external_url,
