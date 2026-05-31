@@ -23,6 +23,7 @@ import {
   listJournals,
   getJournal,
   updateJournalText,
+  renameJournal,
   deleteJournal,
   summarizeJournal,
   listSummaries,
@@ -170,6 +171,7 @@ const CHAT_MODEL_STORAGE_KEY = "slowclaw.settings.model";
 const PERSISTED_POSTS_KEY = "slowclaw.generated_posts";
 const PERSISTED_TODOS_KEY = "slowclaw.extracted_todos";
 const PROCESSED_JOURNALS_KEY = "slowclaw.processed_journals";
+const CHUNK_CHAR_LIMIT = 3200;
 
 // Track which journal paths have been processed for feed/tasks
 function loadProcessedJournals(): Set<string> {
@@ -219,7 +221,7 @@ const DEV_SAMPLE_POSTS: PersistedPost[] = [
   },
   {
     id: "dev-post-3",
-    text: "Shipped a fix today where the app was crashing because Metal GPU on iPhone tried to allocate more memory than the system allows. Solution: CPU-only inference with a graceful fallback. Stability > speed. \u2705",
+    text: "Shipped a fix today where the app was crashing because Metal GPU on iPhone tried to allocate more memory than the system allows. Solution: CPU-only inference with a graceful fallback. Stability > speed. ✅",
     sourceExcerpt: "debugging session notes",
     createdAt: Date.now() - 1000 * 60 * 60 * 5,
   },
@@ -1473,6 +1475,17 @@ function App() {
   const [nostrPostConfirmPost, setNostrPostConfirmPost] = useState<PersistedPost | null>(null);
   const [nostrPostConfirmStep, setNostrPostConfirmStep] = useState<"confirm" | "account" | null>(null);
 
+  // Profile overlay (view Nostr user or TweetClaw skill)
+  type ProfileView = { kind: "nostr"; pubkey: string } | { kind: "skill"; skillId: string } | null;
+  const [profileView, setProfileView] = useState<ProfileView>(null);
+  const [profileViewNotes, setProfileViewNotes] = useState<NostrNote[]>([]);
+  const [profileViewLoading, setProfileViewLoading] = useState(false);
+
+  // TweetClaw prompt (editable)
+  const TWEETCLAW_PROMPT_KEY = "slowclaw.skill.tweetclaw.prompt";
+  const defaultTweetClawPrompt = "You are a social media content writer. Turn the following journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text, no hashtags unless they add real value. No quotes around the text.";
+  const [tweetClawPrompt, setTweetClawPrompt] = useState(() => localStorage.getItem(TWEETCLAW_PROMPT_KEY) || defaultTweetClawPrompt);
+
   // Progressive feed: generation-based polling
   const [feedGeneration, setFeedGeneration] = useState<number | undefined>(undefined);
   const [feedNewPostsBanner, setFeedNewPostsBanner] = useState(false);
@@ -2014,6 +2027,145 @@ function App() {
         `Save failed (${error instanceof Error ? error.message : String(error)})`
       );
     }
+  }
+
+  // ── Done button handler: save → AI title → rename → generate posts → extract tasks ──
+  async function handleJournalDone() {
+    // 1. Save first (in case autosave hasn't fired)
+    await saveJournalTextDraft();
+
+    const content = journalDraftText.trim();
+    if (!content || content.length < 10) {
+      setIsWritingNote(false);
+      return;
+    }
+
+    const currentPath = selectedJournalPathRef.current.trim();
+    const localId = currentPath ? localJournalIdFromPath(currentPath) : null;
+
+    // 2. Generate AI title
+    if (isTauriMobileRuntime() && nativeLocalAiStatus?.available && localId) {
+      try {
+        holdJournalStatus("Generating title...");
+        const titleResult = await nativeAiChat(
+          content.slice(0, 1500),
+          "Generate a short, descriptive title (3-7 words) for this journal entry. Output ONLY the title text, nothing else. No quotes, no punctuation at start/end.",
+          32,
+          0.3
+        );
+        const aiTitle = titleResult.text
+          .replace(/^["'`]+|["'`]+$/g, "")
+          .replace(/\n.*/s, "")
+          .trim();
+        if (aiTitle && aiTitle.length >= 3 && aiTitle.length <= 80) {
+          try {
+            const renamed = await renameJournal(localId, aiTitle);
+            selectedJournalPathRef.current = `local://journals/${renamed.id}`;
+            setSelectedJournalPath(`local://journals/${renamed.id}`);
+            holdJournalStatus(`Titled: ${aiTitle}`);
+          } catch {
+            // Rename failed — non-fatal, continue with processing
+          }
+        }
+      } catch {
+        // AI title generation failed — non-fatal
+      }
+    }
+
+    // 3. Generate posts from this entry
+    if (isTauriMobileRuntime() && nativeLocalAiStatus?.available) {
+      try {
+        setGeneratePostBusy(true);
+        setGeneratePostStatus("✨ Generating posts...");
+        const existingTexts = persistedPosts.slice(0, 10).map((p) => p.text);
+        const dedupeInstruction = existingTexts.length > 0
+          ? `\nDo NOT generate anything similar to these existing posts:\n${existingTexts.map((t, i) => `${i + 1}. ${t}`).join("\n")}\n`
+          : "";
+        const chunks = splitIntoChunks(content, CHUNK_CHAR_LIMIT);
+        const posts: string[] = [];
+        for (const chunk of chunks) {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const result = await nativeAiChat(
+              chunk,
+              `${tweetClawPrompt} Turn this into 1-2 posts. Output a JSON array of strings. Output ONLY valid JSON, no markdown fences.${dedupeInstruction}`,
+              512,
+              0.3 + attempt * 0.1
+            );
+            const parsed = tryParseJsonArray<string>(result.text);
+            if (parsed && parsed.length > 0) {
+              posts.push(...parsed.filter((t) => typeof t === "string" && t.trim()));
+              break;
+            }
+          }
+        }
+        if (posts.length > 0) {
+          const newPosts: PersistedPost[] = posts.map((t) => ({
+            id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            text: t.trim(),
+            sourceExcerpt: content.slice(0, 100),
+            createdAt: Date.now(),
+          }));
+          setPersistedPosts((prev) => { const next = [...newPosts, ...prev]; savePersistedPosts(next); return next; });
+          setGeneratePostStatus(`✨ Generated ${posts.length} post${posts.length > 1 ? 's' : ''}`);
+        }
+      } catch {
+        // Post generation failed — non-fatal
+      } finally {
+        setGeneratePostBusy(false);
+      }
+    }
+
+    // 4. Extract tasks from this entry
+    if (isTauriMobileRuntime() && nativeLocalAiStatus?.available) {
+      try {
+        setExtractingLocalTasks(true);
+        const existingTitles = persistedTodos.slice(0, 10).map((t) => t.title);
+        const dedupeInstruction = existingTitles.length > 0
+          ? `\nDo NOT extract tasks similar to these existing ones:\n${existingTitles.map((t, i) => `${i + 1}. ${t}`).join("\n")}\n`
+          : "";
+        const taskPrompt = `You extract action items and tasks from journal entries. Output a JSON array of objects with "title" and "details" fields. Only real actionable tasks. Output ONLY valid JSON, no markdown fences. Example: [{"title":"Buy groceries","details":"Need milk and eggs"}]${dedupeInstruction}`;
+        const chunks = splitIntoChunks(content, CHUNK_CHAR_LIMIT);
+        const allParsed: Array<{ title: string; details?: string }> = [];
+        for (const chunk of chunks) {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const result = await nativeAiChat(chunk, taskPrompt, 512, 0.2 + attempt * 0.1);
+            const parsed = tryParseJsonArray<{ title: string; details?: string }>(result.text);
+            if (parsed && parsed.length > 0) { allParsed.push(...parsed); break; }
+            if (attempt === 2) {
+              const lines = result.text.split("\n").filter((l) => /^\s*[-*\d.]/.test(l));
+              allParsed.push(...lines.map((l) => ({ title: l.replace(/^\s*[-*\d.]+\s*/, "").trim() })));
+            }
+          }
+        }
+        if (allParsed.length > 0) {
+          const newTodos: PersistedTodo[] = allParsed
+            .filter((t) => t.title?.trim())
+            .map((t) => ({
+              id: `todo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+              title: t.title.trim(),
+              details: (t.details || "").trim(),
+              done: false,
+              createdAt: Date.now(),
+            }));
+          setPersistedTodos((prev) => {
+            const existingSet = new Set(prev.map((t) => t.title.toLowerCase()));
+            const unique = newTodos.filter((t) => !existingSet.has(t.title.toLowerCase()));
+            const next = [...unique, ...prev]; savePersistedTodos(next); return next;
+          });
+        }
+      } catch {
+        // Task extraction failed — non-fatal
+      } finally {
+        setExtractingLocalTasks(false);
+      }
+    }
+
+    // 5. Mark as processed and close
+    if (currentPath) {
+      markJournalProcessed(currentPath);
+    }
+    setIsWritingNote(false);
+    await refreshLibrary("journal");
   }
 
   async function deleteJournalItem(item: LibraryItem) {
@@ -5820,7 +5972,7 @@ function App() {
   // ── AI inference helpers ──────────────────────────────────────────────────
   // Context ~1536 tokens on iPhone. System prompt ~150 tokens, gen ~256–512.
   // ~800-1000 user tokens ≈ ~3200 chars. Chunk longer notes.
-  const CHUNK_CHAR_LIMIT = 3200;
+  // (CHUNK_CHAR_LIMIT moved to module scope for hoisting)
 
   function splitIntoChunks(text: string, limit: number): string[] {
     if (text.length <= limit) return [text];
@@ -5889,7 +6041,7 @@ function App() {
           for (let attempt = 0; attempt < 3; attempt++) {
             const result = await nativeAiChat(
               chunks[i],
-              "You are a social media content writer. Turn the following journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text, no hashtags unless they add real value. No quotes around the text.",
+              tweetClawPrompt,
               256,
               0.8 + attempt * 0.1 // slightly vary temperature on retry
             );
@@ -6018,9 +6170,14 @@ function App() {
         .slice(0, 10)
         .map((item) => item.previewText || "");
       const keywords = extractKeywordsFromJournals(journalTexts);
-      const notes = keywords.length > 0
-        ? await fetchPersonalizedNotes(keywords, 30)
-        : await fetchNotesFromRelays({ limit: 30 });
+      let notes: NostrNote[] = [];
+      if (keywords.length > 0) {
+        notes = await fetchPersonalizedNotes(keywords, 30);
+      }
+      // If personalized search returned nothing, fetch generic feed
+      if (notes.length === 0) {
+        notes = await fetchNotesFromRelays({ limit: 30 });
+      }
       setNostrFeedNotes(notes);
     } catch {
       // Fallback to generic notes
@@ -6035,6 +6192,25 @@ function App() {
     }
   }
 
+  async function openNostrProfile(pubkey: string) {
+    setProfileView({ kind: "nostr", pubkey });
+    setProfileViewLoading(true);
+    try {
+      const notes = await fetchNotesFromRelays({ authors: [pubkey], limit: 20 });
+      setProfileViewNotes(notes);
+    } catch {
+      setProfileViewNotes([]);
+    } finally {
+      setProfileViewLoading(false);
+    }
+  }
+
+  function openSkillProfile(skillId: string) {
+    setProfileView({ kind: "skill", skillId });
+    setProfileViewNotes([]);
+    setProfileViewLoading(false);
+  }
+
   function handleLikePost(post: PersistedPost) {
     if (post.liked) {
       // Unlike — just toggle off
@@ -6045,7 +6221,19 @@ function App() {
       });
       return;
     }
-    // First like — show confirm dialog
+    // If user has posted to Nostr before (has keys + has posted), skip popup and post directly
+    const hasPostedBefore = localStorage.getItem("slowclaw.nostr.hasPosted") === "true";
+    if (hasPostedBefore && nostrKeys) {
+      // Direct post without popup
+      setPersistedPosts((prev) => {
+        const next = prev.map((p) => p.id === post.id ? { ...p, liked: true } : p);
+        savePersistedPosts(next);
+        return next;
+      });
+      void publishNote(post.text); // fire and forget
+      return;
+    }
+    // First time — show confirm dialog
     setNostrPostConfirmPost(post);
     setNostrPostConfirmStep("confirm");
   }
@@ -6093,7 +6281,7 @@ function App() {
       }
       setNostrPostConfirmPost(null);
       setNostrPostConfirmStep(null);
-      setMobileTab("profile");
+      setShowSettings(true);
       return;
     }
     // choice === "create" — auto-generate keys and post
@@ -6112,6 +6300,7 @@ function App() {
         // Post to Nostr
         const result = await publishNote(nostrPostConfirmPost.text);
         if (result.success) {
+          localStorage.setItem("slowclaw.nostr.hasPosted", "true");
           setPersistedPosts((prev) => {
             const next = prev.map((p) => p.id === nostrPostConfirmPost!.id ? { ...p, liked: true } : p);
             savePersistedPosts(next);
@@ -6141,10 +6330,14 @@ function App() {
     }
     if (!requireModel()) return;
     setGeneratePostBusy(true);
-    setGeneratePostStatus("\u2728 Generating posts from your journal...");
+    setGeneratePostStatus("✨ Generating posts from your journal...");
     try {
       const posts: string[] = [];
       if (isTauriMobileRuntime()) {
+        const existingTexts = persistedPosts.slice(0, 10).map((p) => p.text);
+        const dedupeNote = existingTexts.length > 0
+          ? `\nIMPORTANT: Do NOT generate anything similar to these existing posts:\n${existingTexts.map((t, i) => `${i + 1}. ${t}`).join("\n")}\n`
+          : "";
         const chunks = splitIntoChunks(entry.text, CHUNK_CHAR_LIMIT);
         for (let i = 0; i < chunks.length; i++) {
           if (chunks.length > 1) setGeneratePostStatus(`Generating post ${i + 1}/${chunks.length}...`);
@@ -6152,7 +6345,7 @@ function App() {
           for (let attempt = 0; attempt < 3; attempt++) {
             const result = await nativeAiChat(
               chunks[i],
-              "You are a social media content writer. Turn the following journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text, no hashtags unless they add real value. No quotes around the text.",
+              tweetClawPrompt + dedupeNote,
               256,
               0.8 + attempt * 0.1
             );
@@ -6183,7 +6376,7 @@ function App() {
       }
       // Mark this journal as processed
       markJournalProcessed(entry.path);
-      setGeneratePostStatus(`\u2728 Generated ${posts.length} post${posts.length > 1 ? 's' : ''} from your journal`);
+      setGeneratePostStatus(`✨ Generated ${posts.length} post${posts.length > 1 ? 's' : ''} from your journal`);
     } catch (error) {
       setGeneratePostStatus(`Generation failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -6201,9 +6394,13 @@ function App() {
     }
     if (!requireModel()) return;
     setExtractingLocalTasks(true);
-    setGeneratePostStatus("\uD83E\uDDE0 Extracting tasks from your journal...");
+    setGeneratePostStatus("🧠 Extracting tasks from your journal...");
     try {
-      const taskPrompt = `You extract action items and tasks from journal entries. Output a JSON array of objects with "title" and "details" fields. Only real actionable tasks. Output ONLY valid JSON, no markdown fences. Example: [{"title":"Buy groceries","details":"Need milk and eggs"}]`;
+      const existingTitles = persistedTodos.slice(0, 10).map((t) => t.title);
+      const dedupeNote = existingTitles.length > 0
+        ? `\nDo NOT extract tasks similar to these existing ones:\n${existingTitles.map((t, i) => `${i + 1}. ${t}`).join("\n")}\n`
+        : "";
+      const taskPrompt = `You extract action items and tasks from journal entries. Output a JSON array of objects with "title" and "details" fields. Only real actionable tasks. Output ONLY valid JSON, no markdown fences. Example: [{"title":"Buy groceries","details":"Need milk and eggs"}]${dedupeNote}`;
       const chunks = splitIntoChunks(entry.text, CHUNK_CHAR_LIMIT);
       const allParsed: Array<{ title: string; details?: string }> = [];
       for (let i = 0; i < chunks.length; i++) {
@@ -6235,7 +6432,7 @@ function App() {
       }
       markJournalProcessed(entry.path);
       setGeneratePostStatus(allParsed.length > 0
-        ? `\u2705 Extracted ${allParsed.length} task${allParsed.length > 1 ? 's' : ''} from your journal`
+        ? `✅ Extracted ${allParsed.length} task${allParsed.length > 1 ? 's' : ''} from your journal`
         : "No tasks found in this journal entry. Try pulling again."
       );
     } catch (error) {
@@ -6867,6 +7064,17 @@ function App() {
       if (journalAutosaveTimerRef.current) window.clearTimeout(journalAutosaveTimerRef.current);
     };
   }, [journalDraftText, selectedJournalItem, selectedJournalPath, selectedJournalText, chatGatewayToken, gatewayBaseUrl]);
+
+  // Periodic auto-save every 60s while writing (catches long idle sessions)
+  useEffect(() => {
+    if (!isWritingNote && !selectedJournalItem) return;
+    const timer = window.setInterval(() => {
+      if (journalDraftText.trim() && (selectedJournalItem || !selectedJournalPath.trim())) {
+        void saveJournalTextDraft();
+      }
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [isWritingNote, selectedJournalItem]);
 
   useEffect(() => {
     return () => {
@@ -7923,7 +8131,7 @@ function App() {
                     </div>
                     <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
                       <span className="text-sm muted">{journalSaveStatus !== "Journal idle" ? journalSaveStatus : ""}</span>
-                      {(isWritingNote || isTextEntrySelected) && <button type="button" className="primary" style={{ padding: '0.5rem 1.2rem', fontSize: '0.95rem' }} onClick={() => setIsWritingNote(false)}>Done</button>}
+                      {(isWritingNote || isTextEntrySelected) && <button type="button" className="primary" style={{ padding: '0.5rem 1.2rem', fontSize: '0.95rem' }} onClick={() => void handleJournalDone()}>Done</button>}
                     </div>
                   </div>
                   {selectedJournalItem &&
@@ -8020,11 +8228,11 @@ function App() {
                     const timeAgo = getRelativeTime(post.createdAt);
                     return (
                       <div key={post.id} className="tweet-card">
-                        <div className="tweet-avatar" aria-hidden>🐾</div>
+                        <div className="tweet-avatar" style={{ cursor: 'pointer' }} onClick={() => openSkillProfile("tweetclaw")} aria-hidden>🐾</div>
                         <div className="tweet-body">
                           <div className="tweet-header">
-                            <span className="tweet-name">SlowClaw</span>
-                            <span className="tweet-handle">@slowclaw</span>
+                            <span className="tweet-name" style={{ cursor: 'pointer' }} onClick={() => openSkillProfile("tweetclaw")}>TweetClaw</span>
+                            <span className="tweet-handle" style={{ cursor: 'pointer' }} onClick={() => openSkillProfile("tweetclaw")}>@tweetclaw</span>
                             <span className="tweet-dot">·</span>
                             <span className="tweet-time">{timeAgo}</span>
                           </div>
@@ -8090,7 +8298,7 @@ function App() {
                   </div>
                 ) : nostrFeedNotes.length === 0 ? (
                   <div className="feed-create-hero">
-                    <div className="feed-create-hero-icon">\uD83C\uDF10</div>
+                    <div className="feed-create-hero-icon">🌐</div>
                     <h3>Discover on Nostr</h3>
                     <p className="text-sm muted">Your personalized feed from the Nostr network. Notes are matched to your journal topics.</p>
                     <button type="button" className="primary" onClick={() => void loadNostrFeed()}>Load Feed</button>
@@ -8102,11 +8310,11 @@ function App() {
                       const shortPubkey = note.pubkey.slice(0, 8) + "..." + note.pubkey.slice(-4);
                       return (
                         <div key={note.id} className="tweet-card">
-                          <div className="tweet-avatar" aria-hidden>\uD83D\uDC64</div>
+                          <div className="tweet-avatar" style={{ cursor: 'pointer' }} onClick={() => void openNostrProfile(note.pubkey)} aria-hidden>👤</div>
                           <div className="tweet-body">
                             <div className="tweet-header">
-                              <span className="tweet-name">{shortPubkey}</span>
-                              <span className="tweet-dot">\u00B7</span>
+                              <span className="tweet-name" style={{ cursor: 'pointer' }} onClick={() => void openNostrProfile(note.pubkey)}>{shortPubkey}</span>
+                              <span className="tweet-dot">·</span>
                               <span className="tweet-time">{timeAgo}</span>
                             </div>
                             <p className="tweet-text">{note.content}</p>
@@ -8237,7 +8445,7 @@ function App() {
 
               {persistedTodos.length === 0 ? (
                 <div className="tasks-empty">
-                  <div className="tasks-empty-icon">\u2705</div>
+                  <div className="tasks-empty-icon">✅</div>
                   <p className="text-sm muted" style={{ margin: 0 }}>
                     No tasks yet. Pull down to extract from your journals.
                   </p>
@@ -8250,102 +8458,60 @@ function App() {
 
         {mobileTab === "profile" ? (
           <ViewErrorBoundary title="Profile">
-            <div className="stack">
-              <div className="card">
-                <h2>Bluesky</h2>
-                {session ? (
-                  <div className="stack-sm">
-                    <div className="badge success text-center" style={{ alignSelf: 'center' }}>
-                      Signed in as @{session.handle}
-                    </div>
-                    <button
-                      type="button"
-                      className="ghost"
-                      style={{ alignSelf: 'center' }}
-                      onClick={async () => {
-                        await deleteCredentialsSecure();
-                        setCreds({ serviceUrl: "https://bsky.social", handle: "", appPassword: "" });
-                        setSession(null);
-                        setAgent(null);
-                        setAuthMessage("Signed out");
-                      }}
-                    >
-                      Sign Out
-                    </button>
-                  </div>
-                ) : (
-                  <form className="stack" onSubmit={handleLogin}>
-                    <p className="text-sm muted">Connect your Bluesky account to publish posts and browse the Discover feed.</p>
-                    <input
-                      value={creds.handle}
-                      onChange={(e) => setCreds(prev => ({ ...prev, handle: e.target.value }))}
-                      placeholder="Bluesky Handle or Email"
-                    />
-                    <input
-                      type="password"
-                      value={creds.appPassword}
-                      onChange={(e) => setCreds(prev => ({ ...prev, appPassword: e.target.value }))}
-                      placeholder="Bluesky App Password"
-                    />
-                    <button type="submit" className="primary">Sign In</button>
-                    {authMessage && <p className="text-sm text-center muted">{authMessage}</p>}
-                  </form>
-                )}
+            <div className="stack" style={{ padding: '0.5rem 0' }}>
+              {/* Profile header */}
+              <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', padding: '0.5rem 0.25rem' }}>
+                <div className="profile-pic-circle" onClick={() => {/* TODO: pic upload */}}>
+                  <span style={{ fontSize: '1.5rem' }}>👤</span>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <input
+                    className="profile-name-input"
+                    defaultValue={nostrKeys ? `npub:${nostrKeys.publicKeyHex.slice(0, 8)}...` : "Anonymous"}
+                    placeholder="Your name"
+                    readOnly
+                  />
+                  <input
+                    className="profile-bio-input"
+                    defaultValue=""
+                    placeholder="Add a short bio..."
+                  />
+                </div>
               </div>
 
-              {/* Nostr Account */}
-              <div className="card">
-                <h2>Nostr</h2>
-                {nostrKeys ? (
-                  <div className="stack-sm">
-                    <div className="badge success text-center" style={{ alignSelf: 'center' }}>
-                      Connected
-                    </div>
-                    <p className="text-sm muted text-center" style={{ wordBreak: 'break-all' }}>npub: {nostrKeys.publicKeyHex.slice(0, 12)}...{nostrKeys.publicKeyHex.slice(-8)}</p>
-                    <button
-                      type="button"
-                      className="ghost"
-                      style={{ alignSelf: 'center' }}
-                      onClick={() => {
-                        setNostrKeys(null);
-                        localStorage.removeItem("slowclaw.nostr.privkey");
-                        localStorage.removeItem("slowclaw.nostr.pubkey");
-                      }}
-                    >
-                      Disconnect
-                    </button>
-                  </div>
-                ) : (
-                  <div className="stack">
-                    <p className="text-sm muted">Connect your Nostr account to publish posts to the Nostr network. Enter your private key (nsec or hex).</p>
-                    <input
-                      id="nostr-key-input"
-                      type="password"
-                      placeholder="Private key (nsec1... or hex)"
-                    />
-                    <div className="row" style={{ gap: '0.5rem' }}>
-                      <button type="button" className="primary" style={{ flex: 1 }} onClick={async () => {
-                        const input = (document.getElementById('nostr-key-input') as HTMLInputElement)?.value?.trim();
-                        if (!input) return;
-                        const { importNostrPrivkey } = await import("./lib/nostr");
-                        const result = importNostrPrivkey(input);
-                        if (result) {
-                          const keys: NostrKeys = { nsec: input, npub: result.pubkey, secretKeyHex: input.replace(/^nsec1/, ''), publicKeyHex: result.pubkey };
-                          await saveNostrKeysSecure(keys);
-                          setNostrKeys(keys);
-                        }
-                      }}>Import Key</button>
-                      <button type="button" className="ghost" style={{ flex: 1 }} onClick={async () => {
-                        const { generateAndSaveNostrKeys } = await import("./lib/nostr");
-                        const keys = generateAndSaveNostrKeys();
-                        const stored: NostrKeys = { nsec: keys.privkey, npub: keys.pubkey, secretKeyHex: keys.privkey, publicKeyHex: keys.pubkey };
-                        await saveNostrKeysSecure(stored);
-                        setNostrKeys(stored);
-                      }}>Create New</button>
-                    </div>
-                  </div>
-                )}
+              {/* Connected accounts badges */}
+              <div className="row" style={{ gap: '0.5rem', flexWrap: 'wrap', padding: '0 0.25rem' }}>
+                {session && <span className="badge success">Bluesky: @{session.handle}</span>}
+                {nostrKeys && <span className="badge success">Nostr connected</span>}
+                {!session && !nostrKeys && <span className="text-sm muted">Connect accounts in Settings \u2699\uFE0F</span>}
               </div>
+
+              {/* Posted/liked posts */}
+              <div style={{ padding: '0.5rem 0.25rem 0' }}>
+                <h3 style={{ margin: '0 0 0.5rem' }}>Posted</h3>
+              </div>
+              {persistedPosts.filter((p) => p.liked).length === 0 ? (
+                <p className="text-sm muted" style={{ padding: '1rem', textAlign: 'center' }}>Like a post in Queue to publish it here and to Nostr.</p>
+              ) : (
+                <div className="feed-posts-list">
+                  {persistedPosts.filter((p) => p.liked).map((post) => {
+                    const timeAgo = getRelativeTime(post.createdAt);
+                    return (
+                      <div key={post.id} className="tweet-card">
+                        <div className="tweet-avatar" aria-hidden>🐾</div>
+                        <div className="tweet-body">
+                          <div className="tweet-header">
+                            <span className="tweet-name">You</span>
+                            <span className="tweet-dot">·</span>
+                            <span className="tweet-time">{timeAgo}</span>
+                          </div>
+                          <p className="tweet-text">{post.text}</p>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </ViewErrorBoundary>
         ) : null}
@@ -8451,7 +8617,7 @@ function App() {
                 ) : localModels.length === 0 && nativeLocalAiStatus?.configured ? (
                   <div className="stack-sm" style={{ padding: '0.75rem 0' }}>
                     <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
-                      <span style={{ fontSize: '1.2rem' }}>\u2705</span>
+                      <span style={{ fontSize: '1.2rem' }}>✅</span>
                       <div>
                         <strong className="text-sm">{nativeLocalAiStatus.modelId || "AI Model"}</strong>
                         <p className="text-sm muted" style={{ margin: '0.1rem 0 0' }}>AI is ready for on-device inference</p>
@@ -8504,6 +8670,76 @@ function App() {
                 </div>
               </div>
             </div>
+
+            {/* ── Accounts (collapsible) ── */}
+            <div className="card" style={{ marginTop: '1rem' }}>
+              <details>
+                <summary style={{ cursor: 'pointer', fontWeight: 600, fontSize: '1rem' }}>Bluesky</summary>
+                <div style={{ paddingTop: '0.75rem' }}>
+                  {session ? (
+                    <div className="stack-sm">
+                      <span className="badge success">Signed in as @{session.handle}</span>
+                      <button type="button" className="ghost text-sm" onClick={async () => {
+                        await deleteCredentialsSecure();
+                        setCreds({ serviceUrl: "https://bsky.social", handle: "", appPassword: "" });
+                        setSession(null); setAgent(null); setAuthMessage("Signed out");
+                      }}>Sign Out</button>
+                    </div>
+                  ) : (
+                    <form className="stack-sm" onSubmit={handleLogin}>
+                      <input value={creds.handle} onChange={(e) => setCreds(prev => ({ ...prev, handle: e.target.value }))} placeholder="Handle or Email" />
+                      <input type="password" value={creds.appPassword} onChange={(e) => setCreds(prev => ({ ...prev, appPassword: e.target.value }))} placeholder="App Password" />
+                      <button type="submit" className="primary">Sign In</button>
+                      {authMessage && <p className="text-sm muted">{authMessage}</p>}
+                    </form>
+                  )}
+                </div>
+              </details>
+            </div>
+
+            <div className="card" style={{ marginTop: '0.5rem' }}>
+              <details>
+                <summary style={{ cursor: 'pointer', fontWeight: 600, fontSize: '1rem' }}>Nostr</summary>
+                <div style={{ paddingTop: '0.75rem' }}>
+                  {nostrKeys ? (
+                    <div className="stack-sm">
+                      <span className="badge success">Connected</span>
+                      <p className="text-sm muted" style={{ wordBreak: 'break-all' }}>npub: {nostrKeys.publicKeyHex.slice(0, 12)}...{nostrKeys.publicKeyHex.slice(-8)}</p>
+                      <button type="button" className="ghost text-sm" onClick={() => {
+                        setNostrKeys(null);
+                        localStorage.removeItem("slowclaw.nostr.privkey");
+                        localStorage.removeItem("slowclaw.nostr.pubkey");
+                      }}>Disconnect</button>
+                    </div>
+                  ) : (
+                    <div className="stack-sm">
+                      <input id="settings-nostr-key" type="password" placeholder="Private key (nsec1... or hex)" />
+                      <div className="row" style={{ gap: '0.5rem' }}>
+                        <button type="button" className="primary" style={{ flex: 1 }} onClick={async () => {
+                          const input = (document.getElementById('settings-nostr-key') as HTMLInputElement)?.value?.trim();
+                          if (!input) return;
+                          const { importNostrPrivkey } = await import("./lib/nostr");
+                          const result = importNostrPrivkey(input);
+                          if (result) {
+                            const keys: NostrKeys = { nsec: input, npub: result.pubkey, secretKeyHex: input.replace(/^nsec1/, ''), publicKeyHex: result.pubkey };
+                            await saveNostrKeysSecure(keys);
+                            setNostrKeys(keys);
+                          }
+                        }}>Import Key</button>
+                        <button type="button" className="ghost" style={{ flex: 1 }} onClick={async () => {
+                          const { generateAndSaveNostrKeys } = await import("./lib/nostr");
+                          const keys = generateAndSaveNostrKeys();
+                          const stored: NostrKeys = { nsec: keys.privkey, npub: keys.pubkey, secretKeyHex: keys.privkey, publicKeyHex: keys.pubkey };
+                          await saveNostrKeysSecure(stored);
+                          setNostrKeys(stored);
+                        }}>Create New</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </details>
+            </div>
+
           </div>
         ) : null}
 
@@ -8534,10 +8770,82 @@ function App() {
             <h3 style={{ margin: '0 0 0.75rem' }}>Nostr Account</h3>
             <p className="text-sm" style={{ margin: '0 0 1.25rem', color: 'var(--muted)' }}>Do you have a Nostr account?</p>
             <div className="stack-sm">
-              <button type="button" className="ghost" style={{ width: '100%', textAlign: 'left' }} onClick={() => void handleNostrAccountChoice("has_account")}>Yes \u2014 I'll enter my key in Profile</button>
+              <button type="button" className="ghost" style={{ width: '100%', textAlign: 'left' }} onClick={() => void handleNostrAccountChoice("has_account")}>Yes \u2014 I'll enter my key in Settings</button>
               <button type="button" className="primary" style={{ width: '100%', textAlign: 'left' }} onClick={() => void handleNostrAccountChoice("create")}>No \u2014 Create one for me</button>
               <button type="button" className="ghost" style={{ width: '100%', textAlign: 'left', color: 'var(--muted)' }} onClick={() => void handleNostrAccountChoice("cancel")}>Cancel</button>
             </div>
+          </div>
+        </div>
+      )}
+      {/* Profile overlay (Nostr user or Skill) */}
+      {profileView && (
+        <div className="modal-overlay" onClick={() => setProfileView(null)}>
+          <div className="modal-dialog" style={{ maxWidth: '400px', maxHeight: '80vh', overflow: 'auto' }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+              <h3 style={{ margin: 0 }}>{profileView.kind === "skill" ? "Skill" : "Profile"}</h3>
+              <button type="button" className="ghost" style={{ padding: '0.3rem' }} onClick={() => setProfileView(null)}>✕</button>
+            </div>
+
+            {profileView.kind === "nostr" && (
+              <div className="stack-sm">
+                <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+                  <div className="profile-pic-circle">👤</div>
+                  <div>
+                    <p style={{ fontWeight: 700, margin: 0 }}>{profileView.pubkey.slice(0, 12)}...{profileView.pubkey.slice(-6)}</p>
+                    <p className="text-sm muted" style={{ margin: '0.1rem 0 0' }}>Nostr user</p>
+                  </div>
+                </div>
+                <div style={{ borderTop: '1px solid var(--line)', paddingTop: '0.75rem', marginTop: '0.25rem' }}>
+                  <p className="text-sm" style={{ fontWeight: 600, marginBottom: '0.5rem' }}>Recent notes</p>
+                  {profileViewLoading ? (
+                    <p className="text-sm muted">Loading...</p>
+                  ) : profileViewNotes.length === 0 ? (
+                    <p className="text-sm muted">No notes found.</p>
+                  ) : (
+                    profileViewNotes.slice(0, 10).map((note) => (
+                      <div key={note.id} style={{ padding: '0.5rem 0', borderBottom: '1px solid var(--line)' }}>
+                        <p className="text-sm" style={{ margin: 0 }}>{note.content.slice(0, 200)}{note.content.length > 200 ? "..." : ""}</p>
+                        <p className="text-sm muted" style={{ margin: '0.2rem 0 0' }}>{getRelativeTime(note.createdAt * 1000)}</p>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+
+            {profileView.kind === "skill" && profileView.skillId === "tweetclaw" && (
+              <div className="stack-sm">
+                <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+                  <div className="profile-pic-circle">🐾</div>
+                  <div>
+                    <p style={{ fontWeight: 700, margin: 0 }}>TweetClaw</p>
+                    <p className="text-sm muted" style={{ margin: '0.1rem 0 0' }}>@tweetclaw</p>
+                  </div>
+                </div>
+                <p className="text-sm" style={{ color: 'var(--muted)', margin: '0.5rem 0' }}>AI skill that transforms journal entries into tweet-style social media posts. Powered by on-device inference.</p>
+                <div style={{ borderTop: '1px solid var(--line)', paddingTop: '0.75rem' }}>
+                  <p className="text-sm" style={{ fontWeight: 600, marginBottom: '0.4rem' }}>Prompt</p>
+                  <textarea
+                    className="tweet-text-edit"
+                    style={{ border: '1px solid var(--line)', borderRadius: '8px', padding: '0.5rem', minHeight: '5rem', background: 'var(--surface-3)' }}
+                    value={tweetClawPrompt}
+                    onChange={(e) => {
+                      setTweetClawPrompt(e.target.value);
+                      localStorage.setItem(TWEETCLAW_PROMPT_KEY, e.target.value);
+                      const el = e.target; el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px';
+                    }}
+                    onFocus={(e) => { const el = e.target; el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; }}
+                    ref={(el) => { if (el) { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; } }}
+                  />
+                  {tweetClawPrompt !== defaultTweetClawPrompt && (
+                    <button type="button" className="ghost text-sm" style={{ marginTop: '0.4rem' }} onClick={() => {
+                      setTweetClawPrompt(defaultTweetClawPrompt);
+                      localStorage.removeItem(TWEETCLAW_PROMPT_KEY);
+                    }}>Reset to default</button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

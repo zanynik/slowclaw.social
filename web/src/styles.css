@@ -3357,3 +3357,41 @@ button.local-ai-preset {
   from { opacity: 0; transform: scale(0.95); }
   to   { opacity: 1; transform: scale(1); }
 }
+
+/* ── Profile page ────────────────────────────────────────────────────────── */
+.profile-pic-circle {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--surface-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border: 2px solid var(--line);
+  transition: border-color 0.2s;
+  flex-shrink: 0;
+}
+.profile-pic-circle:hover {
+  border-color: var(--accent);
+}
+.profile-name-input {
+  font-size: 1.1rem;
+  font-weight: 700;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  padding: 0;
+  width: 100%;
+  outline: none;
+}
+.profile-bio-input {
+  font-size: 0.85rem;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 0;
+  width: 100%;
+  outline: none;
+  margin-top: 0.15rem;
+}
