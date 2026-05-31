@@ -124,6 +124,10 @@ export async function updateJournalText(id: string, content: string): Promise<Jo
   return invoke("update_journal_text", { id, content });
 }
 
+export async function renameJournal(id: string, newTitle: string): Promise<JournalEntry> {
+  return invoke("rename_journal", { id, newTitle });
+}
+
 export async function deleteJournal(id: string): Promise<void> {
   return invoke("delete_journal", { id });
 }

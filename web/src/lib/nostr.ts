@@ -339,7 +339,9 @@ export function fetchNotesFromRelays(
 
         ws.onmessage = (msg) => {
           try {
-            const data = JSON.parse(msg.data as string);
+            const raw = typeof msg.data === "string" ? msg.data : "";
+            if (!raw) return;
+            const data = JSON.parse(raw);
             if (data[0] === "EVENT" && data[2]) {
               const ev = data[2] as NostrEvent;
               if (!seenIds.has(ev.id) && ev.content?.trim()) {
@@ -359,7 +361,10 @@ export function fetchNotesFromRelays(
           } catch {}
         };
 
-        ws.onerror = () => { try { ws.close(); } catch {} };
+        ws.onerror = (e) => {
+          console.warn(`[nostr] relay error: ${relay}`, e);
+          try { ws.close(); } catch {}
+        };
         ws.onclose = () => {
           closedRelays++;
           if (closedRelays >= relays.length) finish();
