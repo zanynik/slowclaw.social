@@ -10,6 +10,7 @@ on:
             - "Cargo.toml"
             - "src/**"
             - "web/**"
+            - "scripts/ios-add-speech-plugin.rb"
     workflow_dispatch:
         inputs:
             build_number:
@@ -292,6 +293,12 @@ jobs:
                   if [[ ! -d src-tauri/gen/apple ]]; then
                     npm run tauri -- ios init --ci --skip-targets-install
                   fi
+
+            - name: Add SFSpeechRecognizer Swift bridge to iOS project
+              run: |
+                  set -euo pipefail
+                  sudo gem install xcodeproj --no-document
+                  ruby scripts/ios-add-speech-plugin.rb
 
             - name: Build signed iOS IPA
               working-directory: web
