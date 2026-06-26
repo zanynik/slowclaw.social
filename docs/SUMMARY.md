@@ -85,4 +85,5 @@ Last refreshed: **February 18, 2026**.
 
 - [project/README.md](project/README.md)
 - [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)
+- [project/on-device-asr-embeddings-db-research-2026-06-26.md](project/on-device-asr-embeddings-db-research-2026-06-26.md)
 - [docs-inventory.md](docs-inventory.md)
