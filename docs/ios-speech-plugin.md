@@ -23,7 +23,19 @@ on-device audio transcription feature in the SlowClaw iOS app.
   present in `web/src-tauri/Info.ios.plist` — no change needed.
 - **Frameworks:** `Speech.framework` and `AVFoundation.framework` are already
   linked under the `native-inference` feature in `web/src-tauri/build.rs` — no
-  change needed.
+  change to framework linking.
+- **Link resolution:** `build.rs` now emits
+  `cargo:rustc-link-arg-cdylib=-Wl,-undefined,dynamic_lookup` for iOS under
+  `native-inference`. The Swift `@_cdecl("slowclaw_transcribe_audio")` symbol
+  is compiled into the iOS app target by Xcode at the FINAL app link, not
+  during the Rust build. The Rust crate is built as both a `staticlib` (linked
+  into the app by Xcode, where the symbol resolves against the Swift object)
+  and a `cdylib` (built by cargo as a side effect, but not shipped for iOS).
+  The `staticlib` link uses `ar` and never resolves symbols; the `cdylib` link
+  uses `cc` and would otherwise fail on the undefined symbol. The flag lets
+  that vestigial iOS cdylib link with the symbol resolved lazily; the shipped
+  app resolves it normally from the Swift object at the final Xcode link, so
+  the flag never reaches an App Store binary.
 - **Frontend:** no change. `invoke("transcribe_audio", { audioPath })` in
   `web/src/lib/tauriApi.ts` is the public API and is unchanged.
 - **Capabilities:** no change. `transcribe_audio` is a Rust `#[tauri::command]`
