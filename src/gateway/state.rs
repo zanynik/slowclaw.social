@@ -6,8 +6,6 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use std::net::IpAddr;
-use tokio::async_runtime::JoinHandle;
 use serde::{Deserialize, Serialize};
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
@@ -250,12 +248,4 @@ pub struct AppState {
     pub local_model_runtime: Arc<tokio::sync::Mutex<LocalModelRuntimeState>>,
     /// In-flight OpenRouter OAuth PKCE session (one at a time).
     pub openrouter_oauth: Arc<Mutex<Option<OpenRouterOAuthSession>>>,
-}
-
-pub fn parse_client_ip(value: &str) -> Option<IpAddr> {
-    let value = value.trim().trim_matches('"').trim();
-    if value.is_empty() {
-        return None;
-    }
-    value.parse::<IpAddr>().ok()
 }

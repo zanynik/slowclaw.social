@@ -17,6 +17,13 @@ pub mod handlers;
 
 pub use state::*;
 
+use handlers::{
+    handle_local_model_download, handle_local_model_runtime_start,
+    handle_local_model_runtime_status, handle_local_model_runtime_stop,
+    handle_local_model_use, handle_local_models, handle_openrouter_oauth_callback,
+    handle_openrouter_oauth_start, handle_openrouter_oauth_status,
+};
+
 use crate::auth::AuthService;
 use crate::config::{Config, TranscriptionConfig};
 use crate::gateway::feed_web_sources::DEFAULT_FEED_WEB_SOURCES;
@@ -155,8 +162,7 @@ fn collect_journal_audio_inbox_rel_paths(workspace_dir: &StdPath) -> Vec<String>
 }
 
 /// How often the rate limiter sweeps stale IP entries from its map.
-const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes// SlidingWindowRateLimiter, GatewayRateLimiter, IdempotencyStore moved to state.rs}
-}
+const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 fn parse_client_ip(value: &str) -> Option<IpAddr> {
     let value = value.trim().trim_matches('"').trim();
@@ -731,7 +737,7 @@ fn frontend_error_payload_with_meta(
     Json(serde_json::Value::Object(payload))
 }
 
-fn frontend_error_response(
+pub(crate) fn frontend_error_response(
     status: StatusCode,
     code: impl Into<String>,
     message: impl Into<String>,
@@ -748,7 +754,7 @@ fn frontend_error_response_with_meta(
     (status, frontend_error_payload_with_meta(code, message, extra))
 }
 
-fn frontend_error_response_with_retry_after(
+pub(crate) fn frontend_error_response_with_retry_after(
     status: StatusCode,
     code: impl Into<String>,
     message: impl Into<String>,
@@ -774,7 +780,7 @@ fn frontend_internal_error<E: std::fmt::Display>(
     frontend_error_response(status, frontend_error_code_from_context(context), user_message)
 }
 
-fn frontend_internal_error_response<E: std::fmt::Display>(
+pub(crate) fn frontend_internal_error_response<E: std::fmt::Display>(
     status: StatusCode,
     context: &str,
     user_message: &str,
@@ -955,27 +961,6 @@ async fn handle_runtime_config_update(
         "availableTranscriptionModels": available_local_transcription_models(),
     });
     (StatusCode::OK, Json(resp)).into_response()
-}
-
-    let body = match session {
-        Some(s) => serde_json::json!({
-            "active": true,
-            "status": match s.status {
-                OpenRouterOAuthStatus::Pending => "pending",
-                OpenRouterOAuthStatus::Complete => "complete",
-                OpenRouterOAuthStatus::Failed => "failed",
-            },
-            "hasKey": s.api_key.is_some(),
-            "error": s.error,
-        }),
-        None => serde_json::json!({
-            "active": false,
-            "status": "none",
-            "hasKey": false,
-            "error": null,
-        }),
-    };
-    (StatusCode::OK, Json(body)).into_response()
 }
 
 fn html_escape(s: &str) -> String {
