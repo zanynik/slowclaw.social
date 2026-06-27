@@ -13,6 +13,7 @@ use tauri::Manager;
 
 mod inference;
 mod transcription;
+pub mod commands;
 
 const EMBEDDED_GATEWAY_URL: &str = "http://127.0.0.1:42617";
 const PROVIDER_SECRET_SERVICE: &str = "social.slowclaw.gateway";
@@ -82,38 +83,38 @@ impl From<NativeJournalRecord> for JournalEntry {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct EmbeddedGatewayInfo {
-    gateway_url: String,
-    running: bool,
-    last_error: Option<String>,
-    provider_api_key_set: bool,
+pub(crate) struct EmbeddedGatewayInfo {
+    pub(crate) gateway_url: String,
+    pub(crate) running: bool,
+    pub(crate) last_error: Option<String>,
+    pub(crate) provider_api_key_set: bool,
 }
 
 #[derive(Debug, Serialize)]
-struct GatewayQrPayload {
-    gateway_url: String,
-    token: String,
-    qr_value: String,
+pub(crate) struct GatewayQrPayload {
+    pub(crate) gateway_url: String,
+    pub(crate) token: String,
+    pub(crate) qr_value: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DesktopGatewayBootstrap {
-    gateway_url: String,
-    token: String,
+pub(crate) struct DesktopGatewayBootstrap {
+    pub(crate) gateway_url: String,
+    pub(crate) token: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OpenAiDeviceCodeStatus {
-    state: String,
-    running: bool,
-    completed: bool,
-    message: String,
-    verification_url: Option<String>,
-    user_code: Option<String>,
-    fast_link: Option<String>,
-    error: Option<String>,
+pub(crate) struct OpenAiDeviceCodeStatus {
+    pub(crate) state: String,
+    pub(crate) running: bool,
+    pub(crate) completed: bool,
+    pub(crate) message: String,
+    pub(crate) verification_url: Option<String>,
+    pub(crate) user_code: Option<String>,
+    pub(crate) fast_link: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 impl Default for OpenAiDeviceCodeStatus {
@@ -132,12 +133,12 @@ impl Default for OpenAiDeviceCodeStatus {
 }
 
 #[derive(Debug)]
-struct GatewayRuntimeState {
-    gateway_url: String,
-    running: bool,
-    last_error: Option<String>,
-    provider_api_key_set: bool,
-    gateway_handle: Option<JoinHandle<()>>,
+pub(crate) struct GatewayRuntimeState {
+    pub(crate) gateway_url: String,
+    pub(crate) running: bool,
+    pub(crate) last_error: Option<String>,
+    pub(crate) provider_api_key_set: bool,
+    pub(crate) gateway_handle: Option<JoinHandle<()>>,
 }
 
 impl Default for GatewayRuntimeState {
@@ -153,18 +154,18 @@ impl Default for GatewayRuntimeState {
 }
 
 #[derive(Clone, Default)]
-struct GatewayState {
-    inner: Arc<Mutex<GatewayRuntimeState>>,
+pub(crate) struct GatewayState {
+    pub(crate) inner: Arc<Mutex<GatewayRuntimeState>>,
 }
 
 #[derive(Debug, Default)]
-struct OpenAiDeviceCodeRuntimeState {
-    status: OpenAiDeviceCodeStatus,
+pub(crate) struct OpenAiDeviceCodeRuntimeState {
+    pub(crate) status: OpenAiDeviceCodeStatus,
 }
 
 #[derive(Clone, Default)]
-struct OpenAiDeviceCodeState {
-    inner: Arc<Mutex<OpenAiDeviceCodeRuntimeState>>,
+pub(crate) struct OpenAiDeviceCodeState {
+    pub(crate) inner: Arc<Mutex<OpenAiDeviceCodeRuntimeState>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -204,8 +205,8 @@ impl Default for NativeLocalAiRuntimeState {
 }
 
 #[derive(Clone, Default)]
-struct NativeLocalAiState {
-    inner: Arc<Mutex<NativeLocalAiRuntimeState>>,
+pub(crate) struct NativeLocalAiState {
+    pub(crate) inner: Arc<Mutex<NativeLocalAiRuntimeState>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,30 +435,15 @@ fn status_from_native_local_ai_state(saved: NativeLocalAiPersistedState) -> Nati
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AppConfig {
-    ollama_base_url: String,
-    ollama_model: String,
-    bluesky_handle: String,
-    bluesky_service_url: String,
-    transcription_enabled: bool,
+pub(crate) struct AppConfig {
+    pub(crate) ollama_base_url: String,
+    pub(crate) ollama_model: String,
+    pub(crate) bluesky_handle: String,
+    pub(crate) bluesky_service_url: String,
+    pub(crate) transcription_enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OllamaStatus {
-    available: bool,
-    base_url: String,
-    model: String,
-    models: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LocalModelDownloadStatus {
-    model: String,
-    available: bool,
-    message: String,
-}
+// Moved OllamaStatus and LocalModelDownloadStatus to commands/desktop.rs
 
 fn validate_secret_locator(service: &str, account: &str) -> Result<(), String> {
     if service.trim().is_empty() {
@@ -469,7 +455,7 @@ fn validate_secret_locator(service: &str, account: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn ui_command_error(context: &str, user_message: &str, err: impl std::fmt::Display) -> String {
+pub(crate) fn ui_command_error(context: &str, user_message: &str, err: impl std::fmt::Display) -> String {
     eprintln!("{context}: {err}");
     user_message.to_string()
 }
@@ -684,7 +670,7 @@ fn lock_gateway_state<'a>(
         .map_err(|_| "gateway state lock poisoned".to_string())
 }
 
-fn lock_openai_state<'a>(
+pub(crate) fn lock_openai_state<'a>(
     state: &'a Arc<Mutex<OpenAiDeviceCodeRuntimeState>>,
 ) -> Result<std::sync::MutexGuard<'a, OpenAiDeviceCodeRuntimeState>, String> {
     state
@@ -692,14 +678,14 @@ fn lock_openai_state<'a>(
         .map_err(|_| "openai device-code state lock poisoned".to_string())
 }
 
-fn lock_native_local_ai_state<'a>(
+pub(crate) fn lock_native_local_ai_state<'a>(
     state: &'a Arc<Mutex<NativeLocalAiRuntimeState>>,
 ) -> Result<std::sync::MutexGuard<'a, NativeLocalAiRuntimeState>, String> {
     state
         .lock()
         .map_err(|_| "native local AI state lock poisoned".to_string())
 }
-fn snapshot_gateway_state(
+pub(crate) fn snapshot_gateway_state(
     state: &Arc<Mutex<GatewayRuntimeState>>,
 ) -> Result<EmbeddedGatewayInfo, String> {
     let guard = lock_gateway_state(state)?;
@@ -711,7 +697,7 @@ fn snapshot_gateway_state(
     })
 }
 
-fn snapshot_openai_status(
+pub(crate) fn snapshot_openai_status(
     state: &Arc<Mutex<OpenAiDeviceCodeRuntimeState>>,
 ) -> Result<OpenAiDeviceCodeStatus, String> {
     let guard = lock_openai_state(state)?;
@@ -789,7 +775,7 @@ fn parse_gateway_port(gateway_url: &str) -> u16 {
         .unwrap_or(42617)
 }
 
-fn resolve_mobile_gateway_url(desktop_gateway_url: &str) -> String {
+pub(crate) fn resolve_mobile_gateway_url(desktop_gateway_url: &str) -> String {
     let port = parse_gateway_port(desktop_gateway_url);
     if let Some(ip) = discover_lan_ipv4() {
         return format!("http://{ip}:{port}");
@@ -797,7 +783,7 @@ fn resolve_mobile_gateway_url(desktop_gateway_url: &str) -> String {
     desktop_gateway_url.to_string()
 }
 
-fn ensure_desktop_gateway_token() -> Result<String, String> {
+pub(crate) fn ensure_desktop_gateway_token() -> Result<String, String> {
     if let Some(token) = read_keyring_secret(
         PROVIDER_SECRET_SERVICE,
         DESKTOP_GATEWAY_TOKEN_SECRET_ACCOUNT,
@@ -836,7 +822,7 @@ async fn clear_provider_api_key_from_config() -> Result<(), String> {
         .map_err(|e| format!("failed to save config: {e}"))
 }
 
-async fn restart_embedded_gateway(
+pub(crate) async fn restart_embedded_gateway(
     shared: Arc<Mutex<GatewayRuntimeState>>,
 ) -> Result<EmbeddedGatewayInfo, String> {
     let old_gateway_handle = {
@@ -1066,7 +1052,7 @@ fn configure_app_owned_workspace(app: &tauri::App) {
     }
 }
 
-async fn load_workspace_config_for_ui(context: &str) -> Result<zeroclaw::Config, String> {
+pub(crate) async fn load_workspace_config_for_ui(context: &str) -> Result<zeroclaw::Config, String> {
     zeroclaw::Config::load_or_init()
         .await
         .map_err(|e| ui_command_error(context, "Failed to load the workspace configuration.", e))
@@ -1224,7 +1210,7 @@ fn collect_journal_files(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn open_path_with_system_handler(path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn open_path_with_system_handler(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new("open");
@@ -1259,7 +1245,7 @@ fn open_path_with_system_handler(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-fn open_url_with_system_handler(url: &str) -> Result<(), String> {
+pub(crate) fn open_url_with_system_handler(url: &str) -> Result<(), String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err("url is required".to_string());
@@ -1393,7 +1379,7 @@ fn spawn_openai_device_login_process() -> Result<Child, String> {
     }
 }
 
-fn run_openai_device_login_worker(
+pub(crate) fn run_openai_device_login_worker(
     openai_state: Arc<Mutex<OpenAiDeviceCodeRuntimeState>>,
     gateway_state: Arc<Mutex<GatewayRuntimeState>>,
 ) {
@@ -1555,77 +1541,7 @@ fn get_embedded_gateway_info(
     snapshot_gateway_state(&state.inner)
 }
 
-#[tauri::command]
-fn generate_mobile_pairing_qr(
-    state: tauri::State<'_, GatewayState>,
-) -> Result<GatewayQrPayload, String> {
-    let info = snapshot_gateway_state(&state.inner)?;
-    let mobile_gateway_url = resolve_mobile_gateway_url(&info.gateway_url);
-    let token = ensure_desktop_gateway_token().map_err(|e| {
-        ui_command_error(
-            "desktop gateway token generation failed",
-            "Failed to prepare the desktop pairing token.",
-            e,
-        )
-    })?;
-    let qr_value = serde_json::to_string(&serde_json::json!({
-        "gateway_url": mobile_gateway_url.clone(),
-        "gatewayUrl": mobile_gateway_url.clone(),
-        "token": token.clone(),
-    }))
-    .map_err(|e| {
-        ui_command_error(
-            "QR payload encode failed",
-            "Failed to generate the pairing QR payload.",
-            e,
-        )
-    })?;
-
-    Ok(GatewayQrPayload {
-        gateway_url: mobile_gateway_url,
-        token,
-        qr_value,
-    })
-}
-
-#[tauri::command]
-fn get_desktop_gateway_bootstrap(
-    state: tauri::State<'_, GatewayState>,
-) -> Result<DesktopGatewayBootstrap, String> {
-    let info = snapshot_gateway_state(&state.inner)?;
-    let token = ensure_desktop_gateway_token().map_err(|e| {
-        ui_command_error(
-            "desktop gateway token generation failed",
-            "Failed to prepare the desktop gateway token.",
-            e,
-        )
-    })?;
-    Ok(DesktopGatewayBootstrap {
-        gateway_url: info.gateway_url,
-        token,
-    })
-}
-
-#[tauri::command]
-async fn restart_gateway_daemon(state: tauri::State<'_, GatewayState>) -> Result<String, String> {
-    let _ = ensure_desktop_gateway_token().map_err(|e| {
-        ui_command_error(
-            "desktop gateway token generation failed",
-            "Failed to prepare the desktop gateway token.",
-            e,
-        )
-    })?;
-    let info = restart_embedded_gateway(state.inner.clone())
-        .await
-        .map_err(|e| {
-            ui_command_error(
-                "gateway restart failed",
-                "Failed to restart the desktop gateway.",
-                e,
-            )
-        })?;
-    Ok(info.gateway_url)
-}
+// generate_mobile_pairing_qr, get_desktop_gateway_bootstrap, and restart_gateway_daemon moved to commands/desktop.rs
 
 #[tauri::command]
 async fn set_provider_api_key(
@@ -1682,39 +1598,7 @@ async fn set_provider_api_key(
         })
 }
 
-#[tauri::command]
-async fn open_workspace_journals_folder() -> Result<String, String> {
-    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
-        ui_command_error(
-            "journals folder config load failed",
-            "Failed to load the workspace configuration.",
-            e,
-        )
-    })?;
-    let journals_dir = config.workspace_dir.join("journals");
-    for rel in ["", "text/inbox", "media/audio/inbox"] {
-        let target = if rel.is_empty() {
-            journals_dir.clone()
-        } else {
-            journals_dir.join(rel)
-        };
-        std::fs::create_dir_all(&target).map_err(|e| {
-            ui_command_error(
-                "journals folder create failed",
-                "Failed to prepare the journals folder.",
-                e,
-            )
-        })?;
-    }
-    open_path_with_system_handler(&journals_dir).map_err(|e| {
-        ui_command_error(
-            "journals folder open failed",
-            "Failed to open the journals folder.",
-            e,
-        )
-    })?;
-    Ok(journals_dir.display().to_string())
-}
+// open_workspace_journals_folder moved to commands/desktop.rs
 
 #[tauri::command]
 async fn save_journal_text(title: String, content: String) -> Result<JournalEntry, String> {
@@ -1958,7 +1842,7 @@ async fn save_config(config: AppConfig) -> Result<(), String> {
     })
 }
 
-fn installed_ollama_models() -> Vec<String> {
+pub(crate) fn installed_ollama_models() -> Vec<String> {
     let output = Command::new("ollama").arg("list").output();
     let Ok(output) = output else {
         return Vec::new();
@@ -1974,63 +1858,7 @@ fn installed_ollama_models() -> Vec<String> {
         .collect()
 }
 
-#[tauri::command]
-async fn list_ollama_models() -> Result<Vec<String>, String> {
-    Ok(installed_ollama_models())
-}
-
-#[tauri::command]
-async fn check_ollama() -> Result<OllamaStatus, String> {
-    let config = load_workspace_config_for_ui("ollama config load failed").await?;
-    let models = installed_ollama_models();
-    Ok(OllamaStatus {
-        available: !models.is_empty() || Command::new("ollama").arg("--version").output().is_ok(),
-        base_url: config
-            .api_url
-            .unwrap_or_else(|| "http://127.0.0.1:11434".to_string()),
-        model: config
-            .default_model
-            .unwrap_or_else(|| "llama3.2".to_string()),
-        models,
-    })
-}
-
-#[tauri::command]
-async fn download_ollama_model(model: String) -> Result<LocalModelDownloadStatus, String> {
-    let model = model.trim();
-    if model.is_empty() || model.contains(char::is_whitespace) {
-        return Err("Pick a valid model name.".to_string());
-    }
-    let status = Command::new("ollama")
-        .args(["pull", model])
-        .status()
-        .map_err(|e| {
-            ui_command_error(
-                "ollama pull start failed",
-                "Failed to start the local model download.",
-                e,
-            )
-        })?;
-    if !status.success() {
-        return Err("Local model download failed.".to_string());
-    }
-    Ok(LocalModelDownloadStatus {
-        model: model.to_string(),
-        available: true,
-        message: format!("{model} is ready."),
-    })
-}
-
-#[tauri::command]
-fn open_external_url(url: String) -> Result<(), String> {
-    open_url_with_system_handler(&url).map_err(|e| {
-        ui_command_error(
-            "external url open failed",
-            "Failed to open the link in your browser.",
-            e,
-        )
-    })
-}
+// list_ollama_models, check_ollama, download_ollama_model, and open_external_url moved to commands/desktop.rs
 
 #[tauri::command]
 async fn get_openai_device_code_status(
@@ -2076,36 +1904,7 @@ async fn get_openai_device_code_status(
     Ok(next)
 }
 
-#[tauri::command]
-fn start_openai_device_code_login(
-    state: tauri::State<'_, OpenAiDeviceCodeState>,
-    gateway_state: tauri::State<'_, GatewayState>,
-) -> Result<OpenAiDeviceCodeStatus, String> {
-    {
-        let mut guard = lock_openai_state(&state.inner)?;
-        if guard.status.running {
-            return Ok(guard.status.clone());
-        }
-        guard.status = OpenAiDeviceCodeStatus {
-            state: "starting".to_string(),
-            running: true,
-            completed: false,
-            message: "Starting OpenAI setup...".to_string(),
-            verification_url: None,
-            user_code: None,
-            fast_link: None,
-            error: None,
-        };
-    }
-
-    let openai_state = state.inner.clone();
-    let gateway_state = gateway_state.inner.clone();
-    thread::spawn(move || {
-        run_openai_device_login_worker(openai_state, gateway_state);
-    });
-
-    snapshot_openai_status(&state.inner)
-}
+// start_openai_device_code_login moved to commands/desktop.rs
 
 #[tauri::command]
 async fn get_anthropic_token_status() -> Result<AnthropicTokenStatus, String> {
@@ -2286,20 +2085,7 @@ async fn configure_native_local_ai(
     Ok(status)
 }
 
-#[tauri::command]
-fn show_main_window(window: tauri::Window) {
-    #[cfg(not(mobile))]
-    {
-        if let Err(e) = window.show() {
-            eprintln!("failed to show main window: {e}");
-        }
-    }
-
-    #[cfg(mobile)]
-    {
-        let _ = window;
-    }
-}
+// show_main_window moved to commands/desktop.rs
 
 #[tauri::command]
 async fn native_ai_load_model(
@@ -2482,9 +2268,9 @@ pub fn run() {
             set_secret,
             delete_secret,
             get_embedded_gateway_info,
-            generate_mobile_pairing_qr,
-            get_desktop_gateway_bootstrap,
-            restart_gateway_daemon,
+            commands::desktop::generate_mobile_pairing_qr,
+            commands::desktop::get_desktop_gateway_bootstrap,
+            commands::desktop::restart_gateway_daemon,
             set_provider_api_key,
             save_journal_text,
             save_journal_media,
@@ -2493,10 +2279,10 @@ pub fn run() {
             update_journal_text,
             rename_journal,
             delete_journal,
-            open_workspace_journals_folder,
-            open_external_url,
+            commands::desktop::open_workspace_journals_folder,
+            commands::desktop::open_external_url,
             get_openai_device_code_status,
-            start_openai_device_code_login,
+            commands::desktop::start_openai_device_code_login,
             get_anthropic_token_status,
             save_anthropic_token,
             clear_anthropic_token,
@@ -2504,10 +2290,10 @@ pub fn run() {
             configure_native_local_ai,
             get_config,
             save_config,
-            list_ollama_models,
-            check_ollama,
-            download_ollama_model,
-            show_main_window,
+            commands::desktop::list_ollama_models,
+            commands::desktop::check_ollama,
+            commands::desktop::download_ollama_model,
+            commands::desktop::show_main_window,
             native_ai_load_model,
             native_ai_chat,
             native_ai_engine_status,
