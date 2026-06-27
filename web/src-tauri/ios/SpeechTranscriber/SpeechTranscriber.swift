@@ -108,11 +108,15 @@ public func slowclaw_transcribe_audio(
     }
 
     // 3. Build a recognizer for the current locale and verify availability
-    //    and on-device support. SFSpeechRecognizer(locale:) is non-failing,
-    //    so we always get an instance back; the meaningful checks are
-    //    `isAvailable` and `supportsOnDeviceRecognition` below.
+    //    and on-device support. `SFSpeechRecognizer(locale:)` is a failable
+    //    initializer returning `SFSpeechRecognizer?` (e.g. when the locale is
+    //    unsupported or the recognizer service is unavailable). Unwrap it,
+    //    then check `isAvailable` and `supportsOnDeviceRecognition`.
     let localeIdentifier = Locale.preferredLanguages.first ?? "en-US"
-    let activeRecognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier))
+    guard let activeRecognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier)) else {
+        writeError("Speech recognizer is unavailable for locale \(localeIdentifier).")
+        return -1
+    }
     guard activeRecognizer.isAvailable else {
         writeError("Speech recognition is not available right now (network or service issue).")
         return -1
