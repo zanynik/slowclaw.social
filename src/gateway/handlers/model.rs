@@ -7,14 +7,13 @@ use axum::{
 use std::collections::HashMap;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::config::Config;
 use crate::gateway::state::*;
 use crate::gateway::{
     pairing_auth_error, frontend_error_response,

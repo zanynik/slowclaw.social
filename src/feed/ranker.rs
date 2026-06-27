@@ -1,7 +1,6 @@
 use crate::memory::{self, vector::cosine_similarity};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
-use async_trait::async_trait;
 use chrono::Utc;
 use rust_stemmers::{Algorithm as StemAlgorithm, Stemmer};
 use std::cmp::Ordering;
@@ -9,7 +8,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use super::types::{
-    FeedCandidate, FeedProfile, InterestVector, PersonalizedFeedItem, SelectedSource,
+    FeedCandidate, FeedProfile, InterestVector, PersonalizedFeedItem,
 };
 
 const FEED_PROFILE_MAX_CHARS: usize = 2_400;
@@ -29,7 +28,7 @@ pub struct RankedCandidate {
     pub score: f32,
 }
 
-type SharedEmbedder = Arc<dyn memory::embeddings::EmbeddingProvider>;
+pub type SharedEmbedder = Arc<dyn memory::embeddings::EmbeddingProvider>;
 
 pub struct FeedRanker;
 

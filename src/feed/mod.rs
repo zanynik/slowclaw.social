@@ -2,7 +2,7 @@ pub mod traits;
 
 use crate::config::Config;
 use crate::gateway::{feed_web_sources::DEFAULT_FEED_WEB_SOURCES, local_store};
-use crate::memory::{self, vector::{cosine_similarity, vec_to_bytes}};
+use crate::memory::{self, vector::vec_to_bytes};
 use crate::tools::web_search_tool::WebSearchTool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -14,12 +14,12 @@ use nostr_sdk::prelude::{
 };
 use parking_lot::Mutex;
 use regex::Regex;
-use rust_stemmers::{Algorithm as StemAlgorithm, Stemmer};
-use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use traits::FeedSource;
@@ -1899,26 +1899,6 @@ fn derive_interest_label(default_title: &str, content: &str) -> String {
     "Workspace interest".to_string()
 }
 
-fn stage1_stopwords() -> &'static HashSet<&'static str> {
-    static WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    WORDS.get_or_init(|| {
-        HashSet::from([
-            "about", "after", "also", "been", "being", "because", "before", "between", "could",
-            "from", "have", "into", "just", "like", "more", "most", "only", "other", "over",
-            "really", "some", "than", "that", "their", "there", "these", "they", "this",
-            "those", "through", "very", "what", "when", "where", "which", "with", "would",
-            "your", "ours", "ourselves", "the", "and", "for", "are", "was", "were", "you",
-            "has", "had", "but", "not", "too", "out", "off", "its", "why", "how", "who",
-            "insight", "post", "notes", "note", "journal", "entry", "entries", "work", "thing",
-            "things", "stuff", "really", "just", "dont", "didnt", "doesnt", "cant", "wont",
-            "ive", "im", "youre", "thats", "maybe", "also", "still", "feel", "kind", "lot",
-            "can", "should", "did", "done", "her", "his", "our", "lack", "start", "write",
-            "need", "needs", "want", "wants", "think", "thinking", "good", "bad", "better",
-            "best", "worse", "life", "people", "person", "someone", "something",
-        ])
-    })
-}
-
 fn broaden_stage1_keyword(term: &str) -> &'static [&'static str] {
     match term {
         "ai" => &["llm", "ml", "machine", "learning", "intelligence"],
@@ -3372,54 +3352,6 @@ fn resolve_feed_web_domain(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     Some(normalize_feed_web_domain(host))
-}
-
-fn rank_candidate_cmp(left: &RankedCandidate, right: &RankedCandidate) -> Ordering {
-    let score_order = right
-        .score
-        .partial_cmp(&left.score)
-        .unwrap_or(Ordering::Equal);
-    if score_order != Ordering::Equal {
-        return score_order;
-    }
-    let timestamp_order = item_sort_timestamp(&right.item).cmp(item_sort_timestamp(&left.item));
-    if timestamp_order != Ordering::Equal {
-        return timestamp_order;
-    }
-    left.original_index.cmp(&right.original_index)
-}
-
-fn candidate_source_mix_key(item: &PersonalizedFeedItem) -> String {
-    if let Some(label) = item
-        .feed_source
-        .as_ref()
-        .map(|source| source.label.trim())
-        .filter(|label| !label.is_empty())
-    {
-        return label.to_ascii_lowercase();
-    }
-    item.source_type.trim().to_ascii_lowercase()
-}
-
-fn item_sort_timestamp(item: &PersonalizedFeedItem) -> &str {
-    if let Some(discovered_at) = item
-        .web_preview
-        .as_ref()
-        .map(|preview| preview.discovered_at.as_str())
-        .filter(|value| !value.is_empty())
-    {
-        return discovered_at;
-    }
-    item.feed_item
-        .get("post")
-        .and_then(|post| post.get("indexedAt"))
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            item.feed_item
-                .get("publishedAt")
-                .and_then(serde_json::Value::as_str)
-        })
-        .unwrap_or("")
 }
 
 fn build_raw_feed_items(

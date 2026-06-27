@@ -1,5 +1,4 @@
 use serde::Serialize;
-use std::sync::Arc;
 use std::process::Command;
 
 use crate::{
@@ -25,7 +24,7 @@ pub struct LocalModelDownloadStatus {
 }
 
 #[tauri::command]
-pub async fn open_workspace_journals_folder() -> Result<String, String> {
+pub(crate) async fn open_workspace_journals_folder() -> Result<String, String> {
     #[cfg(mobile)]
     {
         Err("Accessing the journals folder is only supported on Desktop.".to_string())
@@ -66,7 +65,7 @@ pub async fn open_workspace_journals_folder() -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn open_external_url(url: String) -> Result<(), String> {
+pub(crate) fn open_external_url(url: String) -> Result<(), String> {
     #[cfg(mobile)]
     {
         let _ = url;
@@ -85,7 +84,7 @@ pub fn open_external_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn restart_gateway_daemon(state: tauri::State<'_, GatewayState>) -> Result<String, String> {
+pub(crate) async fn restart_gateway_daemon(state: tauri::State<'_, GatewayState>) -> Result<String, String> {
     #[cfg(mobile)]
     {
         let _ = state;
@@ -114,7 +113,7 @@ pub async fn restart_gateway_daemon(state: tauri::State<'_, GatewayState>) -> Re
 }
 
 #[tauri::command]
-pub async fn list_ollama_models() -> Result<Vec<String>, String> {
+pub(crate) async fn list_ollama_models() -> Result<Vec<String>, String> {
     #[cfg(mobile)]
     {
         Err("Ollama integration is only supported on Desktop.".to_string())
@@ -126,7 +125,7 @@ pub async fn list_ollama_models() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-pub async fn check_ollama() -> Result<OllamaStatus, String> {
+pub(crate) async fn check_ollama() -> Result<OllamaStatus, String> {
     #[cfg(mobile)]
     {
         Err("Ollama integration is only supported on Desktop.".to_string())
@@ -149,7 +148,7 @@ pub async fn check_ollama() -> Result<OllamaStatus, String> {
 }
 
 #[tauri::command]
-pub async fn download_ollama_model(model: String) -> Result<LocalModelDownloadStatus, String> {
+pub(crate) async fn download_ollama_model(model: String) -> Result<LocalModelDownloadStatus, String> {
     #[cfg(mobile)]
     {
         let _ = model;
@@ -183,7 +182,7 @@ pub async fn download_ollama_model(model: String) -> Result<LocalModelDownloadSt
 }
 
 #[tauri::command]
-pub fn show_main_window(window: tauri::Window) {
+pub(crate) fn show_main_window(window: tauri::Window) {
     #[cfg(not(mobile))]
     {
         if let Err(e) = window.show() {
@@ -198,7 +197,7 @@ pub fn show_main_window(window: tauri::Window) {
 }
 
 #[tauri::command]
-pub fn start_openai_device_code_login(
+pub(crate) fn start_openai_device_code_login(
     state: tauri::State<'_, OpenAiDeviceCodeState>,
     gateway_state: tauri::State<'_, GatewayState>,
 ) -> Result<OpenAiDeviceCodeStatus, String> {
@@ -238,7 +237,7 @@ pub fn start_openai_device_code_login(
 }
 
 #[tauri::command]
-pub fn get_desktop_gateway_bootstrap(
+pub(crate) fn get_desktop_gateway_bootstrap(
     state: tauri::State<'_, GatewayState>,
 ) -> Result<DesktopGatewayBootstrap, String> {
     #[cfg(mobile)]
@@ -264,7 +263,7 @@ pub fn get_desktop_gateway_bootstrap(
 }
 
 #[tauri::command]
-pub fn generate_mobile_pairing_qr(
+pub(crate) fn generate_mobile_pairing_qr(
     state: tauri::State<'_, GatewayState>,
 ) -> Result<GatewayQrPayload, String> {
     #[cfg(mobile)]
