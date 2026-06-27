@@ -678,14 +678,18 @@ function encodeWavFromFloat32(chunks: Float32Array[], sampleRate: number) {
   return new Blob([buffer], { type: "audio/wav" });
 }
 
-function journalTranscriptPathForMedia(item: LibraryItem) {
-  const normalized = item.path.replace(/^\/+/, "");
+function journalTranscriptPathForMediaPath(mediaPath: string) {
+  const normalized = mediaPath.replace(/^\/+/, "");
   if (normalized.startsWith("journals/media/")) {
     const relative = normalized.slice("journals/media/".length);
     const stemmed = relative.replace(/\.[^/.]+$/, ".txt");
     return `journals/text/transcriptions/${stemmed}`;
   }
-  return `journals/text/transcriptions/${fileStemFromPath(item.path)}.txt`;
+  return `journals/text/transcriptions/${fileStemFromPath(mediaPath)}.txt`;
+}
+
+function journalTranscriptPathForMedia(item: LibraryItem) {
+  return journalTranscriptPathForMediaPath(item.path);
 }
 
 function legacyJournalTranscriptPathForMedia(item: LibraryItem) {
@@ -1815,17 +1819,30 @@ function App() {
     }
   }
 
-  async function transcribeAfterSave(audioPath: string, entryId: string) {
+  async function transcribeAfterSave(audioPath: string, entryId: string, token: string) {
     if (!audioPath) return;
     setJournalSaveStatus("Transcribing audio...");
     try {
       const result = await transcribeAudio(audioPath);
       if (result.text.trim()) {
-        // Save transcript as a text journal entry
         const transcriptText = result.text.trim();
         setJournalDraftText(transcriptText);
-        setJournalSaveStatus(`Transcribed: ${transcriptText.length} chars`);
-        // Auto-save as a new text entry so it persists
+        // Persist the transcript to the workspace so it survives navigation
+        // and reload. On-device Speech.framework only returns text (unlike the
+        // server transcribe path, which writes this file internally), so write
+        // it ourselves to the same path the loader reads from.
+        const transcriptPath = journalTranscriptPathForMediaPath(audioPath);
+        let persisted = true;
+        try {
+          await saveLibraryText(transcriptPath, transcriptText, token || undefined, gatewayBaseUrl);
+        } catch {
+          persisted = false;
+        }
+        setJournalSaveStatus(
+          persisted
+            ? `Transcribed: ${transcriptText.length} chars`
+            : `Transcribed (not saved): ${transcriptText.length} chars`
+        );
         setRecordingHint(`\u{1F3A4} Transcript ready (${transcriptText.split(/\s+/).length} words)`);
       } else {
         setJournalSaveStatus("No speech detected in recording.");
@@ -1887,7 +1904,7 @@ function App() {
             void waitForTranscriptForMedia(uploadedPath, token || undefined);
           } else if (kind === "audio" && isTauriMobileRuntime()) {
             // No server-side transcription — use on-device Speech.framework
-            void transcribeAfterSave(uploadedPath, "");
+            void transcribeAfterSave(uploadedPath, "", token || "");
           }
         }
       } catch (gatewayError) {
@@ -1904,7 +1921,7 @@ function App() {
           setSelectedJournalPath(localJournalPath(saved.id));
           // Auto-transcribe audio on iOS
           if (kind === "audio" && isTauriMobileRuntime()) {
-            void transcribeAfterSave(saved.filePath || "", saved.id);
+            void transcribeAfterSave(saved.filePath || "", saved.id, token || "");
           }
         } catch (localError) {
           if (isMissingDesktopCommand(localError, "save_journal_media")) {
@@ -2423,6 +2440,10 @@ function App() {
     // selected entry by its workspace-relative id instead of the gateway path,
     // which would otherwise be blocked with "No local media tools...".
     if (isTauriMobileRuntime()) {
+      let token = chatGatewayToken.trim();
+      if (!token && isNativeClient) {
+        token = normalizeGatewayToken((await syncDesktopGatewayBootstrap()) || "");
+      }
       const journalId =
         localJournalIdFromPath(selectedJournalItem.path) || selectedJournalItem.path;
       setJournalTranscribing(true);
@@ -2435,14 +2456,27 @@ function App() {
         const result = await transcribeJournalMediaNative(journalId);
         const transcriptText = (result.text || "").trim();
         if (transcriptText) {
+          const transcriptPath = journalTranscriptPathForMedia(selectedJournalItem);
+          // Persist the transcript to the workspace so it survives navigation
+          // and reload (see transcribeAfterSave for rationale).
+          let persisted = true;
+          try {
+            await saveLibraryText(transcriptPath, transcriptText, token || undefined, gatewayBaseUrl);
+          } catch {
+            persisted = false;
+          }
           setJournalTranscriptionStatusByPath((prev) => ({
             ...prev,
             [selectedJournalItem.path]: "done"
           }));
-          loadedTextPathRef.current = journalTranscriptPathForMedia(selectedJournalItem);
+          loadedTextPathRef.current = transcriptPath;
           setSelectedJournalText(transcriptText);
           setJournalDraftText(transcriptText);
-          setJournalSaveStatus(`Transcribed: ${transcriptText.length} chars`);
+          setJournalSaveStatus(
+            persisted
+              ? `Transcribed: ${transcriptText.length} chars`
+              : `Transcribed (not saved): ${transcriptText.length} chars`
+          );
         } else {
           setJournalTranscriptionStatusByPath((prev) => ({
             ...prev,
