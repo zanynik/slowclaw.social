@@ -46,10 +46,13 @@ import {
   nativeAiChat,
   nativeAiEngineStatus,
   transcribeAudio,
+  transcribeJournalMediaNative,
+  readJournalMediaBytes,
   setMetalMode as setMetalModeBackend,
   startRecording as startNativeAudioRecording,
   stopRecording as stopNativeAudioRecording,
   blobToBase64,
+  base64ToBlob,
 } from "./lib/tauriApi";
 import type {
   JournalEntry,
@@ -1223,6 +1226,9 @@ function App() {
   const [selectedJournalPath, setSelectedJournalPath] = useState<string>("");
   const [selectedFeedPath, setSelectedFeedPath] = useState<string>("");
   const [selectedJournalItem, setSelectedJournalItem] = useState<LibraryItem | null>(null);
+  const [audioPlaybackUrl, setAudioPlaybackUrl] = useState("");
+  const [audioPlaybackLoading, setAudioPlaybackLoading] = useState(false);
+  const audioPlaybackUrlRef = useRef("");
   const [selectedFeedItem, setSelectedFeedItem] = useState<LibraryItem | null>(null);
   const [selectedJournalText, setSelectedJournalText] = useState("");
   const [selectedFeedText, setSelectedFeedText] = useState("");
@@ -2370,8 +2376,90 @@ function App() {
     }
   }
 
+  // Load a saved journal audio recording's bytes for inline playback.
+  // Native clients only: recordings live on the device; the browser/preview
+  // client has no local file access. The object URL is revoked on change to
+  // avoid leaks.
+  useEffect(() => {
+    const prevUrl = audioPlaybackUrlRef.current;
+    if (prevUrl) {
+      URL.revokeObjectURL(prevUrl);
+      audioPlaybackUrlRef.current = "";
+    }
+    setAudioPlaybackUrl("");
+    const item = selectedJournalItem;
+    if (!isNativeClient || !item || item.kind !== "audio") {
+      setAudioPlaybackLoading(false);
+      return;
+    }
+    const journalId = localJournalIdFromPath(item.path) || item.path;
+    let cancelled = false;
+    setAudioPlaybackLoading(true);
+    readJournalMediaBytes(journalId)
+      .then(({ dataB64, mimeType }) => {
+        if (cancelled) return;
+        const mime = mimeType || inferMediaMimeType(item.path, "audio");
+        const url = URL.createObjectURL(base64ToBlob(dataB64, mime));
+        audioPlaybackUrlRef.current = url;
+        setAudioPlaybackUrl(url);
+      })
+      .catch(() => {
+        // Reading failed (e.g. file moved) — player simply stays hidden.
+      })
+      .finally(() => {
+        if (!cancelled) setAudioPlaybackLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedJournalItem?.path, selectedJournalItem?.kind, isNativeClient]);
+
   async function transcribeSelectedJournalMedia() {
     if (!selectedJournalItem || selectedJournalItem.kind !== "audio") {
+      return;
+    }
+    // On iOS (native mobile), the gateway reports no CLI-based media tools, but
+    // on-device Speech.framework transcription is available. Transcribe the
+    // selected entry by its workspace-relative id instead of the gateway path,
+    // which would otherwise be blocked with "No local media tools...".
+    if (isTauriMobileRuntime()) {
+      const journalId =
+        localJournalIdFromPath(selectedJournalItem.path) || selectedJournalItem.path;
+      setJournalTranscribing(true);
+      setJournalTranscriptionStatusByPath((prev) => ({
+        ...prev,
+        [selectedJournalItem.path]: "running"
+      }));
+      setJournalSaveStatus("Transcribing audio...");
+      try {
+        const result = await transcribeJournalMediaNative(journalId);
+        const transcriptText = (result.text || "").trim();
+        if (transcriptText) {
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [selectedJournalItem.path]: "done"
+          }));
+          loadedTextPathRef.current = journalTranscriptPathForMedia(selectedJournalItem);
+          setSelectedJournalText(transcriptText);
+          setJournalDraftText(transcriptText);
+          setJournalSaveStatus(`Transcribed: ${transcriptText.length} chars`);
+        } else {
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [selectedJournalItem.path]: "error"
+          }));
+          setJournalSaveStatus("No speech detected in recording.");
+        }
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        setJournalTranscriptionStatusByPath((prev) => ({
+          ...prev,
+          [selectedJournalItem.path]: "error"
+        }));
+        setJournalSaveStatus(`Transcription: ${msg}`);
+      } finally {
+        setJournalTranscribing(false);
+      }
       return;
     }
     if (runtimeMediaCapabilities && !runtimeMediaCapabilities.transcribeMedia) {
@@ -8187,6 +8275,20 @@ function App() {
                       {(isWritingNote || isTextEntrySelected) && <button type="button" className="primary" style={{ padding: '0.5rem 1.2rem', fontSize: '0.95rem' }} onClick={() => void handleJournalDone()}>Done</button>}
                     </div>
                   </div>
+                  {selectedJournalItem && selectedJournalItem.kind === "audio" && (
+                    <div className="row" style={{ marginBottom: "0.6rem", alignItems: "center", gap: "0.5rem" }}>
+                      {audioPlaybackUrl ? (
+                        <audio
+                          controls
+                          preload="metadata"
+                          src={audioPlaybackUrl}
+                          style={{ width: "100%", maxWidth: "26rem" }}
+                        />
+                      ) : audioPlaybackLoading ? (
+                        <span className="text-sm muted">Loading recording…</span>
+                      ) : null}
+                    </div>
+                  )}
                   {selectedJournalItem &&
                     selectedJournalItem.kind === "audio" &&
                     !journalDraftText.trim() && (

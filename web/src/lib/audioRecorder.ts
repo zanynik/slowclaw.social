@@ -150,3 +150,16 @@ export function blobToBase64(blob: Blob): Promise<string> {
     reader.readAsDataURL(blob);
   });
 }
+
+/** Decode a base64 string (with optional data-URL prefix) into a Blob. */
+export function base64ToBlob(b64: string, mimeType: string): Blob {
+  const clean = b64.includes(";")
+    ? b64.slice(b64.indexOf(",") + 1)
+    : b64.trim();
+  const binary = atob(clean);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: mimeType || "application/octet-stream" });
+}

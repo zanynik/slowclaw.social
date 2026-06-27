@@ -1130,6 +1130,33 @@ fn media_kind_from_extension(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// Map a media file extension to a MIME type. Falls back to a generic
+/// octet-stream type so the webview can still build a blob URL.
+fn media_mime_type_for_extension(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "webm" => "audio/webm",
+        "mp4" | "m4v" | "mkv" => "video/mp4",
+        "mov" => "video/quicktime",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        _ => "application/octet-stream",
+    }
+}
+
 fn rel_path_to_id(workspace_dir: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(workspace_dir)
         .ok()
@@ -2367,6 +2394,70 @@ async fn transcribe_audio(audio_path: String) -> Result<transcription::Transcrip
         .map_err(|e| format!("transcription task failed: {e}"))?
 }
 
+#[derive(Serialize)]
+struct JournalMediaBytes {
+    #[serde(rename = "dataB64")]
+    data_b64: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+}
+
+/// Transcribe a journal audio entry by its workspace-relative id.
+///
+/// Resolves the id to an absolute workspace path (rejecting traversal and any
+/// path outside the workspace), validates it is an audio file, then delegates
+/// to the shared on-device transcriber (`transcription::transcribe_audio_file`).
+/// On iOS with `native-inference` this uses Speech.framework; elsewhere it
+/// returns a clear error so the caller can fall back to the gateway path.
+#[tauri::command]
+async fn transcribe_journal_media(
+    id: String,
+) -> Result<transcription::TranscriptionResult, String> {
+    let config = load_workspace_config_for_ui("journal transcribe config load failed").await?;
+    let path = resolve_journal_id(&config.workspace_dir, &id)?;
+    if !path.is_file() {
+        return Err("Journal audio entry not found.".to_string());
+    }
+    if media_kind_from_extension(&path) != Some("audio") {
+        return Err("Only audio journal entries can be transcribed.".to_string());
+    }
+    let abs_path = path.to_string_lossy().to_string();
+    tauri::async_runtime::spawn_blocking(move || transcription::transcribe_audio_file(&abs_path))
+        .await
+        .map_err(|e| format!("transcription task failed: {e}"))?
+}
+
+/// Read a journal media entry's bytes by its workspace-relative id, returning
+/// base64 + MIME so the webview can build a blob URL for an inline player.
+///
+/// Workspace-scoped via `resolve_journal_id` (traversal rejected). Restricted to
+/// audio/video entries — text entries are read through the existing text paths.
+#[tauri::command]
+async fn read_journal_media_bytes(id: String) -> Result<JournalMediaBytes, String> {
+    let config = load_workspace_config_for_ui("journal media read config load failed").await?;
+    let path = resolve_journal_id(&config.workspace_dir, &id)?;
+    if !path.is_file() {
+        return Err("Journal media entry not found.".to_string());
+    }
+    match media_kind_from_extension(&path) {
+        Some("audio") | Some("video") => {}
+        _ => return Err("Only audio or video journal entries can be read.".to_string()),
+    }
+    let bytes = std::fs::read(&path).map_err(|e| {
+        ui_command_error(
+            "journal media read failed",
+            "Failed to read the recording.",
+            e,
+        )
+    })?;
+    let data_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let mime_type = media_mime_type_for_extension(&path).to_string();
+    Ok(JournalMediaBytes {
+        data_b64,
+        mime_type,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let gateway_state = GatewayState::default();
@@ -2421,7 +2512,9 @@ pub fn run() {
             native_ai_chat,
             native_ai_engine_status,
             set_metal_mode,
-            transcribe_audio
+            transcribe_audio,
+            transcribe_journal_media,
+            read_journal_media_bytes
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");

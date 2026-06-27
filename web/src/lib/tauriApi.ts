@@ -309,6 +309,28 @@ export async function transcribeAudio(audioPath: string): Promise<TranscriptionR
   return invoke("transcribe_audio", { audioPath });
 }
 
+/**
+ * Transcribe a saved journal audio entry by its workspace-relative id (native).
+ *
+ * Resolves the id to the on-disk file inside the Tauri host and runs the
+ * shared on-device transcriber (Speech.framework on iOS). Use this for the
+ * manual "Transcribe" action on native clients, where the gateway reports no
+ * CLI media tools but on-device transcription is available.
+ */
+export async function transcribeJournalMediaNative(id: string): Promise<TranscriptionResult> {
+  return invoke("transcribe_journal_media", { id });
+}
+
+export type JournalMediaBytes = {
+  dataB64: string;
+  mimeType: string;
+};
+
+/** Read a saved journal media entry's bytes (base64 + MIME) for inline playback. */
+export async function readJournalMediaBytes(id: string): Promise<JournalMediaBytes> {
+  return invoke("read_journal_media_bytes", { id });
+}
+
 export async function setMetalMode(enabled: boolean): Promise<void> {
   return invoke("set_metal_mode", { enabled });
 }
@@ -334,4 +356,10 @@ export async function deleteSecret(service: string, account: string): Promise<vo
 // See: audioRecorder.ts
 // ─────────────────────────────────────────────
 
-export { startRecording, stopRecording, getRecordingState, blobToBase64 } from "./audioRecorder";
+export {
+  startRecording,
+  stopRecording,
+  getRecordingState,
+  blobToBase64,
+  base64ToBlob
+} from "./audioRecorder";
