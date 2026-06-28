@@ -112,6 +112,20 @@ export async function saveJournalMedia(
   return invoke("save_journal_media", { kind, filename, dataB64, title });
 }
 
+/**
+ * Import voice memos shared into the app via iOS file hand-off.
+ *
+ * iOS places share-sheet ("Copy to SlowClaw") files in `Documents/Inbox/` and
+ * the user can also drop `.m4a` recordings into the Files-app-visible
+ * `Documents/Voice Memos/` folder. This moves every audio file found in either
+ * location into the workspace media inbox (`journals/media/audio/inbox/`) and
+ * returns the resulting journal entries, ready for on-device transcription.
+ * Returns an empty array when nothing new is available.
+ */
+export async function importVoiceMemos(): Promise<JournalEntry[]> {
+  return invoke("import_voice_memos");
+}
+
 export async function listJournals(limit?: number, offset?: number): Promise<JournalEntry[]> {
   return invoke("list_journals", { limit, offset });
 }

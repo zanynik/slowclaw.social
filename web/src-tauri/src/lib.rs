@@ -1699,6 +1699,116 @@ async fn save_journal_media(
     Ok(entry)
 }
 
+/// Import voice memos shared into the app via iOS file hand-off.
+///
+/// iOS places files shared through the share sheet ("Copy to SlowClaw",
+/// enabled by `CFBundleDocumentTypes` in `Info.ios.plist`) into the app's
+/// `Documents/Inbox/`. The user can also drop `.m4a` recordings into the
+/// `Documents/Voice Memos/` folder shown in the Files app
+/// (`UIFileSharingEnabled`).
+///
+/// This command scans both folders for audio files, MOVES each one into the
+/// same workspace media inbox used by `save_journal_media`
+/// (`journals/media/audio/inbox/`), and returns the resulting journal entries.
+/// Moving (rather than copying) keeps the Inbox a one-way drop zone and
+/// prevents re-importing the same file. The on-device transcription pipeline
+/// then treats each imported memo exactly like an in-app recording.
+#[tauri::command]
+async fn import_voice_memos() -> Result<Vec<JournalEntry>, String> {
+    let config = load_workspace_config_for_ui("voice memo import config load failed").await?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "HOME directory is not set.".to_string())?;
+
+    // Must match `media_kind_from_extension`'s audio set so that
+    // `journal_entry_from_path` recognizes the imported file as audio.
+    const AUDIO_EXTS: &[&str] = &["m4a", "mp3", "aac", "ogg", "wav", "flac", "webm"];
+
+    // iOS file hand-off locations:
+    //  - Documents/Inbox       : "Copy to SlowClaw" share-sheet destination.
+    //  - Documents/Voice Memos : manual drag-drop folder from the Files app.
+    let sources = [
+        home.join("Documents").join("Inbox"),
+        home.join("Documents").join("Voice Memos"),
+    ];
+
+    let inbox_dir = config
+        .workspace_dir
+        .join("journals")
+        .join("media")
+        .join("audio")
+        .join("inbox");
+    std::fs::create_dir_all(&inbox_dir).map_err(|e| {
+        ui_command_error(
+            "voice memo inbox create failed",
+            "Failed to prepare the voice memo storage.",
+            e,
+        )
+    })?;
+
+    // Recursively collect candidate audio files (dependency-free stack walk).
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for source in &sources {
+        if !source.is_dir() {
+            continue;
+        }
+        let mut stack = vec![source.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(read_dir) => read_dir,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let is_audio = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| AUDIO_EXTS.contains(&ext.to_ascii_lowercase().as_str()))
+                    .unwrap_or(false);
+                if is_audio {
+                    candidates.push(path);
+                }
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Per-call timestamp + per-file index guarantees unique names within a bulk
+    // import even if two memos share an original filename.
+    let base_ts = unix_time_label();
+    let mut imported: Vec<JournalEntry> = Vec::new();
+    for (index, src) in candidates.into_iter().enumerate() {
+        let original_name = src
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("voice-memo");
+        let safe_name = safe_filename(original_name, &format!("voice-memo-{base_ts}-{index}"));
+        let dest = inbox_dir.join(format!("{base_ts}-{index}-{safe_name}"));
+
+        // Move first; fall back to copy+remove if rename fails (e.g. across
+        // volumes). Skip a file on error rather than aborting the whole import.
+        if std::fs::rename(&src, &dest).is_err() {
+            if let Err(err) = std::fs::copy(&src, &dest).and_then(|_| std::fs::remove_file(&src)) {
+                eprintln!("voice memo import skipped {}: {err}", src.display());
+                continue;
+            }
+        }
+
+        if let Some(entry) = journal_entry_from_path(&config.workspace_dir, &dest) {
+            imported.push(entry);
+        }
+    }
+
+    Ok(imported)
+}
+
 #[tauri::command]
 async fn list_journals(
     limit: Option<usize>,
@@ -2300,7 +2410,8 @@ pub fn run() {
             set_metal_mode,
             transcribe_audio,
             transcribe_journal_media,
-            read_journal_media_bytes
+            read_journal_media_bytes,
+            import_voice_memos
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");

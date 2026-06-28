@@ -20,6 +20,7 @@ import {
 import {
   saveJournalText,
   saveJournalMedia,
+  importVoiceMemos,
   listJournals,
   getJournal,
   updateJournalText,
@@ -1241,6 +1242,7 @@ function App() {
   const [pendingDeleteJournalItem, setPendingDeleteJournalItem] = useState<LibraryItem | null>(null);
   const [pendingDeleteFeedItem, setPendingDeleteFeedItem] = useState<LibraryItem | null>(null);
   const [journalTranscribing, setJournalTranscribing] = useState(false);
+  const [importingVoiceMemos, setImportingVoiceMemos] = useState(false);
   const [journalTranscriptionStatusByPath, setJournalTranscriptionStatusByPath] = useState<
     Record<string, "idle" | "queued" | "running" | "done" | "error">
   >({});
@@ -1853,6 +1855,66 @@ function App() {
       if (!msg.includes("only available on iOS")) {
         setJournalSaveStatus(`Transcription: ${msg}`);
       }
+    }
+  }
+
+  // Import voice memos shared into the app via iOS file hand-off ("Copy to
+  // SlowClaw" share sheet, or files dropped into the Files-app-visible
+  // `Voice Memos` folder). Each imported memo is moved into the workspace
+  // media inbox by the Rust side, then transcribed on-device and persisted as
+  // a journal transcript — exactly like an in-app recording. Returns true when
+  // one or more memos were imported (so callers can stay silent on foreground
+  // auto-runs that find nothing new).
+  async function importAndTranscribeVoiceMemos(
+    options?: { silentIfEmpty?: boolean }
+  ): Promise<boolean> {
+    if (importingVoiceMemos) return false;
+    setImportingVoiceMemos(true);
+    try {
+      const entries = await importVoiceMemos();
+      if (entries.length === 0) {
+        if (!options?.silentIfEmpty) {
+          setJournalSaveStatus(
+            "No new voice memos found. Share recordings from Voice Memos via “Copy to SlowClaw”, or drop .m4a files into SlowClaw → Voice Memos in the Files app."
+          );
+        }
+        return false;
+      }
+      setJournalSaveStatus(
+        `Imported ${entries.length} voice memo${entries.length > 1 ? "s" : ""}. Transcribing…`
+      );
+      let transcribed = 0;
+      for (const entry of entries) {
+        const audioPath = entry.filePath || "";
+        if (!audioPath) continue;
+        try {
+          const result = await transcribeAudio(audioPath);
+          const text = result.text.trim();
+          if (text) {
+            await saveLibraryText(
+              journalTranscriptPathForMediaPath(audioPath),
+              text,
+              chatGatewayToken || undefined,
+              gatewayBaseUrl
+            );
+            transcribed += 1;
+          }
+        } catch {
+          // Keep going: a single transcription failure shouldn't abort the
+          // whole import. The audio entry still exists and can be retried.
+        }
+      }
+      await refreshLibrary("journal");
+      setJournalSaveStatus(
+        `Imported ${entries.length} voice memo${entries.length > 1 ? "s" : ""} · transcribed ${transcribed}`
+      );
+      return true;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      setJournalSaveStatus(`Voice memo import failed: ${msg}`);
+      return false;
+    } finally {
+      setImportingVoiceMemos(false);
     }
   }
 
@@ -5231,6 +5293,11 @@ function App() {
         return;
       }
       void loadWorkspaceSynthStatus();
+      // On iOS, a return-to-foreground is the moment shared voice memos land in
+      // the app's Inbox. Import + transcribe them silently when new files exist.
+      if (isTauriMobileRuntime()) {
+        void importAndTranscribeVoiceMemos({ silentIfEmpty: true });
+      }
     };
 
     window.addEventListener("focus", refreshFromForeground);
@@ -7387,6 +7454,25 @@ function App() {
           {journalSidebarStatus ? <span>{journalSidebarStatus}</span> : null}
         </div>
       </div>
+
+      {isTauriMobileRuntime() ? (
+        <button
+          type="button"
+          className="ghost"
+          style={{ marginBottom: "0.75rem", width: "100%" }}
+          onClick={() => void importAndTranscribeVoiceMemos()}
+          disabled={importingVoiceMemos}
+        >
+          {importingVoiceMemos ? (
+            <span className="row" style={{ gap: "0.45rem", alignItems: "center" }}>
+              <span className="btn-spinner" aria-hidden />
+              Importing voice memos…
+            </span>
+          ) : (
+            "Import Voice Memos"
+          )}
+        </button>
+      ) : null}
 
       {journalItems.length === 0 ? (
         <p className="text-center muted">No journals found.</p>
