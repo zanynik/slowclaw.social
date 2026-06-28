@@ -201,6 +201,16 @@ type PersistedPost = {
   liked?: boolean;
 };
 
+type TechNewsItem = {
+  id: number;
+  title: string;
+  url: string;
+  source: string;
+  score: number;
+  comments: number;
+  createdAt: number;
+};
+
 type PersistedTodo = {
   id: string;
   title: string;
@@ -471,6 +481,14 @@ function getRelativeTime(dateVal: string | number): string {
   if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
   if (diffSec < 604800) return `${Math.floor(diffSec / 86400)}d`;
   return new Date(then).toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function domainFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "news.ycombinator.com";
+  }
 }
 
 function parseDateValue(value?: string | null) {
@@ -1484,6 +1502,9 @@ function App() {
   const [nostrKeysBusy, setNostrKeysBusy] = useState(false);
   const [nostrFeedNotes, setNostrFeedNotes] = useState<NostrNote[]>([]);
   const [nostrFeedLoading, setNostrFeedLoading] = useState(false);
+  const [techNewsItems, setTechNewsItems] = useState<TechNewsItem[]>([]);
+  const [techNewsLoading, setTechNewsLoading] = useState(false);
+  const [techNewsError, setTechNewsError] = useState("");
   const [nostrPostConfirmPost, setNostrPostConfirmPost] = useState<PersistedPost | null>(null);
   const [nostrPostConfirmStep, setNostrPostConfirmStep] = useState<"confirm" | "account" | null>(null);
 
@@ -6381,6 +6402,56 @@ function App() {
     }
   }
 
+  async function loadTechNews() {
+    if (techNewsLoading) return;
+    setTechNewsLoading(true);
+    setTechNewsError("");
+    try {
+      const res = await fetch("https://hacker-news.firebaseio.com/v0/topstories.json", { cache: "no-store" });
+      if (!res.ok) throw new Error(`Tech news service responded ${res.status}.`);
+      const ids: number[] = await res.json();
+      type HnItem = {
+        id: number; title?: string; url?: string;
+        score?: number; descendants?: number;
+        time?: number; type?: string;
+      } | null;
+      // Fetch a few more than 5 so the strongest stories survive even when
+      // some are job posts or missing fields.
+      const fetched: HnItem[] = await Promise.all(
+        ids.slice(0, 12).map(async (id) => {
+          try {
+            const r = await fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`, { cache: "no-store" });
+            return r.ok ? ((await r.json()) as HnItem) : null;
+          } catch {
+            return null;
+          }
+        })
+      );
+      const stories: TechNewsItem[] = fetched
+        .filter((it): it is NonNullable<HnItem> =>
+          Boolean(it && it.type === "story" && typeof it.title === "string")
+        )
+        .map((it) => {
+          const url: string = it.url || `https://news.ycombinator.com/item?id=${it.id}`;
+          return {
+            id: it.id,
+            title: it.title as string,
+            url,
+            source: domainFromUrl(url),
+            score: typeof it.score === "number" ? it.score : 0,
+            comments: typeof it.descendants === "number" ? it.descendants : 0,
+            createdAt: typeof it.time === "number" ? it.time : 0,
+          };
+        })
+        .slice(0, 5);
+      setTechNewsItems(stories);
+    } catch (error) {
+      setTechNewsError(error instanceof Error ? error.message : "Failed to load tech news.");
+    } finally {
+      setTechNewsLoading(false);
+    }
+  }
+
   async function openNostrProfile(pubkey: string) {
     setProfileView({ kind: "nostr", pubkey });
     setProfileViewLoading(true);
@@ -7060,6 +7131,13 @@ function App() {
   useEffect(() => {
     if (mobileTab === "feed" && nostrFeedNotes.length === 0 && !nostrFeedLoading) {
       void loadNostrFeed();
+    }
+  }, [mobileTab]);
+
+  // Auto-load tech news the first time the feed tab is shown.
+  useEffect(() => {
+    if (mobileTab === "feed" && techNewsItems.length === 0 && !techNewsLoading) {
+      void loadTechNews();
     }
   }, [mobileTab]);
 
@@ -8566,6 +8644,59 @@ function App() {
                   </button>
                 </div>
 
+                <div className="tech-news-section">
+                  <div className="tech-news-header">
+                    <span className="tech-news-title"><span className="tech-news-title-dot" aria-hidden />Tech News</span>
+                    <button
+                      type="button"
+                      className="tech-news-refresh"
+                      onClick={() => void loadTechNews()}
+                      disabled={techNewsLoading}
+                      title="Refresh tech news"
+                      aria-label="Refresh tech news"
+                    >
+                      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+                    </button>
+                  </div>
+                  {techNewsLoading && techNewsItems.length === 0 ? (
+                    <div className="tech-news-list">
+                      {[0, 1, 2, 3, 4].map((i) => (
+                        <div key={i} className="tech-news-skeleton-card">
+                          <div className="tech-news-skeleton">
+                            <div className="tech-news-skeleton-row short" />
+                            <div className="tech-news-skeleton-row" />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : techNewsError && techNewsItems.length === 0 ? (
+                    <div>
+                      <p className="tech-news-error">{techNewsError}</p>
+                      <button type="button" className="ghost text-sm" onClick={() => void loadTechNews()}>Retry</button>
+                    </div>
+                  ) : techNewsItems.length > 0 ? (
+                    <div className="tech-news-list">
+                      {techNewsItems.map((item, idx) => (
+                        <a key={item.id} className="tech-news-card" href={item.url} target="_blank" rel="noopener noreferrer">
+                          <div className="tech-news-card-rank">#{idx + 1} · <span className="tech-news-card-source">{item.source}</span></div>
+                          <p className="tech-news-card-title">{item.title}</p>
+                          <div className="tech-news-card-meta">
+                            <span className="tech-news-card-stat">▲ {item.score}</span>
+                            <span className="tech-news-card-dot">·</span>
+                            <span className="tech-news-card-stat">💬 {item.comments}</span>
+                            <span className="tech-news-card-dot">·</span>
+                            <span>{getRelativeTime(item.createdAt * 1000)}</span>
+                          </div>
+                        </a>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-sm muted" style={{ padding: '0.4rem 0' }}>No tech news right now.</p>
+                  )}
+                </div>
+
+                <div className="tech-news-section-label">From Nostr</div>
+
                 {nostrFeedLoading ? (
                   <div style={{ padding: '2rem', textAlign: 'center' }}>
                     <span className="btn-spinner" aria-hidden />
@@ -8580,7 +8711,7 @@ function App() {
                   </div>
                 ) : (
                   <div className="feed-posts-list">
-                    {nostrFeedNotes.map((note) => {
+                    {nostrFeedNotes.slice(0, 5).map((note) => {
                       const timeAgo = getRelativeTime(note.createdAt * 1000);
                       const shortPubkey = note.pubkey.slice(0, 8) + "..." + note.pubkey.slice(-4);
                       return (
@@ -8597,7 +8728,6 @@ function App() {
                         </div>
                       );
                     })}
-                    <button type="button" className="ghost" style={{ margin: '1rem auto', display: 'block' }} onClick={() => void loadNostrFeed()}>Load more</button>
                   </div>
                 )}
               </div>
@@ -8817,7 +8947,7 @@ function App() {
                   const total = download?.totalBytes || model.sizeBytes || 0;
                   const progress = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 0;
                   const isConfigured = nativeLocalAiStatus?.modelId === model.id;
-                  const isInCatalog = ["unsloth/gemma-4-E2B-it-Q3_K_M", "unsloth/gemma-4-E2B-it-Q4_K_M"].includes(model.id);
+                  const isInCatalog = ["unsloth/gemma-4-E2B-it-qat-UD-Q2_K_XL", "unsloth/gemma-4-E2B-it-qat-UD-Q4_K_XL"].includes(model.id);
                   return (
                     <div key={model.id} className="card" style={{ margin: '0.5rem 0' }}>
                       <div className="row-between">
