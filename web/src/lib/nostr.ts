@@ -109,6 +109,102 @@ function bytesToBigint(bytes: Uint8Array): bigint {
   return BigInt("0x" + bytesToHex(bytes));
 }
 
+// ─── Bech32 (BIP-173) for npub/nsec encoding ────────────────────────────────
+//
+// Nostr public/private keys are canonically exchanged as bech32 strings:
+//   npub1...  (public key)   nsec1...  (private key)
+// The data payload is the 32-byte X-only pubkey / private key. Implemented
+// inline (no dependency) consistent with the rest of this module.
+
+const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+function bech32Polymod(values: number[]): number {
+  let chk = 1;
+  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  for (const v of values) {
+    const top = chk >> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) {
+      if ((top >> i) & 1) chk ^= GEN[i];
+    }
+  }
+  return chk;
+}
+
+function bech32HrpExpand(hrp: string): number[] {
+  const ret: number[] = [];
+  for (const c of hrp) ret.push(c.charCodeAt(0) >> 5);
+  ret.push(0);
+  for (const c of hrp) ret.push(c.charCodeAt(0) & 31);
+  return ret;
+}
+
+function bech32CreateChecksum(hrp: string, data: number[]): number[] {
+  const values = [...bech32HrpExpand(hrp), ...data, 0, 0, 0, 0, 0, 0];
+  const polymod = bech32Polymod(values) ^ 1;
+  const ret: number[] = [];
+  for (let i = 0; i < 6; i++) ret.push((polymod >> (5 * (5 - i))) & 31);
+  return ret;
+}
+
+function bech32VerifyChecksum(hrp: string, data: number[]): boolean {
+  return bech32Polymod([...bech32HrpExpand(hrp), ...data]) === 1;
+}
+
+function convertBits(data: number[], fromBits: number, toBits: number, pad: boolean): number[] {
+  let acc = 0;
+  let bits = 0;
+  const ret: number[] = [];
+  const maxv = (1 << toBits) - 1;
+  const maxAcc = (1 << (fromBits + toBits - 1)) - 1;
+  for (const value of data) {
+    if (value < 0 || value >> fromBits !== 0) throw new Error("bech32: invalid data value");
+    acc = ((acc << fromBits) | value) & maxAcc;
+    bits += fromBits;
+    while (bits >= toBits) {
+      bits -= toBits;
+      ret.push((acc >> bits) & maxv);
+    }
+  }
+  if (pad) {
+    if (bits) ret.push((acc << (toBits - bits)) & maxv);
+  } else if (bits >= fromBits || ((acc << (toBits - bits)) & maxv)) {
+    throw new Error("bech32: invalid padding");
+  }
+  return ret;
+}
+
+function encodeBech32(hrp: string, hexData: string): string {
+  const bytes = hexToBytes(hexData);
+  const data = convertBits(Array.from(bytes), 8, 5, true);
+  const checksum = bech32CreateChecksum(hrp, data);
+  return hrp + "1" + [...data, ...checksum].map((v) => BECH32_CHARSET[v]).join("");
+}
+
+function decodeBech32(str: string, expectedHrp: string): string | null {
+  const clean = str.trim().toLowerCase();
+  if (clean.length < 8 || clean.length > 90) return null;
+  const pos = clean.lastIndexOf("1");
+  if (pos < 1 || pos + 7 > clean.length) return null;
+  const hrp = clean.slice(0, pos);
+  if (hrp !== expectedHrp) return null;
+  const data: number[] = [];
+  for (let i = pos + 1; i < clean.length; i++) {
+    const v = BECH32_CHARSET.indexOf(clean[i]);
+    if (v === -1) return null;
+    data.push(v);
+  }
+  if (!bech32VerifyChecksum(hrp, data)) return null;
+  // Strip the 6-char checksum, decode the 5-bit groups back to 8-bit bytes.
+  const payload = data.slice(0, -6);
+  try {
+    const bytes = convertBits(payload, 5, 8, false);
+    return bytesToHex(Uint8Array.from(bytes));
+  } catch {
+    return null;
+  }
+}
+
 // ─── SHA-256 using Web Crypto ────────────────────────────────────────────────
 
 async function sha256(data: Uint8Array): Promise<Uint8Array> {
@@ -123,6 +219,24 @@ function getPublicKey(privKeyHex: string): string {
   const point = pointMul(k, G);
   if (!point) throw new Error("Invalid private key");
   return bytesToHex(bigintToBytes32(point.x));
+}
+
+// ─── Bech32 key helpers (npub1... / nsec1...) ───────────────────────────────
+
+export function npubFromHex(pubkeyHex: string): string {
+  return encodeBech32("npub", pubkeyHex);
+}
+
+export function nsecFromHex(privkeyHex: string): string {
+  return encodeBech32("nsec", privkeyHex);
+}
+
+export function decodeNpub(npub: string): string | null {
+  return decodeBech32(npub, "npub");
+}
+
+export function decodeNsec(nsec: string): string | null {
+  return decodeBech32(nsec, "nsec");
 }
 
 function generatePrivateKey(): string {
@@ -218,6 +332,37 @@ export type NostrNote = {
   tags: string[][];
 };
 
+/** NIP-01 kind-0 profile metadata (parsed from the event's content JSON). */
+export type NostrProfile = {
+  pubkey: string;
+  name: string | null;        // handle, e.g. "satoshi"
+  displayName: string | null; // human name, e.g. "Satoshi Nakamoto"
+  picture: string | null;     // avatar URL
+  about: string | null;
+  website: string | null;
+  nip05: string | null;       // verified identifier, e.g. "satoshi@example.com"
+  updatedAt: number;
+};
+
+/**
+ * Resolve the immediate parent event id for a note, per NIP-10 tagging.
+ * Returns null for top-level (root) posts.
+ */
+export function getReplyParentId(note: NostrNote): string | null {
+  const eTags = (note.tags || []).filter((t) => t[0] === "e" && t[1]);
+  if (eTags.length === 0) return null;
+  // Explicit "reply" marker wins.
+  const reply = eTags.find((t) => t[3] === "reply");
+  if (reply) return reply[1];
+  const hasMarkers = eTags.some((t) => t[3]);
+  // Deprecated positional form (no markers): last e-tag is the parent.
+  if (!hasMarkers) return eTags[eTags.length - 1][1];
+  // A lone "root" marker (single-level reply) is its own parent.
+  const root = eTags.find((t) => t[3] === "root");
+  if (root) return root[1];
+  return eTags[eTags.length - 1][1];
+}
+
 // ─── Event creation and signing ──────────────────────────────────────────────
 
 export async function createSignedEvent(
@@ -250,26 +395,73 @@ export function getNostrPubkey(): string | null {
   return localStorage.getItem(STORAGE_KEY_NOSTR_PUBKEY);
 }
 
-export function generateAndSaveNostrKeys(): { privkey: string; pubkey: string } {
-  const privkey = generatePrivateKey();
-  const pubkey = getPublicKey(privkey);
-  localStorage.setItem(STORAGE_KEY_NOSTR_PRIVKEY, privkey);
-  localStorage.setItem(STORAGE_KEY_NOSTR_PUBKEY, pubkey);
-  return { privkey, pubkey };
+/**
+ * Generate a fresh key pair and persist it. Returns the full NostrKeys shape:
+ * secretKeyHex/publicKeyHex (raw hex, used for signing) and nsec/npub
+ * (canonical bech32 strings shown to users).
+ */
+export function generateAndSaveNostrKeys(): {
+  nsec: string;
+  npub: string;
+  secretKeyHex: string;
+  publicKeyHex: string;
+} {
+  const secretKeyHex = generatePrivateKey();
+  const publicKeyHex = getPublicKey(secretKeyHex);
+  localStorage.setItem(STORAGE_KEY_NOSTR_PRIVKEY, secretKeyHex);
+  localStorage.setItem(STORAGE_KEY_NOSTR_PUBKEY, publicKeyHex);
+  return {
+    nsec: nsecFromHex(secretKeyHex),
+    npub: npubFromHex(publicKeyHex),
+    secretKeyHex,
+    publicKeyHex,
+  };
 }
 
-export function importNostrPrivkey(privkeyHex: string): { pubkey: string } | null {
+/**
+ * Import a private key given as bech32 (nsec1...) or raw 64-char hex.
+ * Validates and persists. Returns the full NostrKeys shape, or null on bad input.
+ */
+export function importNostrPrivkey(
+  input: string
+): { nsec: string; npub: string; secretKeyHex: string; publicKeyHex: string } | null {
   try {
-    const clean = privkeyHex.replace(/^nsec1/, "").trim();
-    // Validate it's a valid hex key
-    if (!/^[0-9a-f]{64}$/i.test(clean)) return null;
-    const pubkey = getPublicKey(clean);
-    localStorage.setItem(STORAGE_KEY_NOSTR_PRIVKEY, clean);
-    localStorage.setItem(STORAGE_KEY_NOSTR_PUBKEY, pubkey);
-    return { pubkey };
+    const trimmed = input.trim();
+    let secretKeyHex: string | null = null;
+    if (trimmed.startsWith("nsec1")) {
+      secretKeyHex = decodeNsec(trimmed);
+    } else if (/^[0-9a-f]{64}$/i.test(trimmed)) {
+      secretKeyHex = trimmed.toLowerCase();
+    }
+    if (!secretKeyHex) return null;
+    const publicKeyHex = getPublicKey(secretKeyHex);
+    localStorage.setItem(STORAGE_KEY_NOSTR_PRIVKEY, secretKeyHex);
+    localStorage.setItem(STORAGE_KEY_NOSTR_PUBKEY, publicKeyHex);
+    return {
+      nsec: nsecFromHex(secretKeyHex),
+      npub: npubFromHex(publicKeyHex),
+      secretKeyHex,
+      publicKeyHex,
+    };
   } catch {
     return null;
   }
+}
+
+/**
+ * Ensure a NostrKeys object carries canonical bech32 nsec/npub. Older builds
+ * stored raw hex in those fields; this re-encodes from the hex fields so the UI
+ * always shows nsec1.../npub1... Migration is idempotent and lossless.
+ */
+export function normalizeNostrKeys(keys: {
+  nsec: string;
+  npub: string;
+  secretKeyHex: string;
+  publicKeyHex: string;
+}): { nsec: string; npub: string; secretKeyHex: string; publicKeyHex: string } {
+  const nsec = keys.nsec?.startsWith("nsec1") ? keys.nsec : nsecFromHex(keys.secretKeyHex);
+  const npub = keys.npub?.startsWith("npub1") ? keys.npub : npubFromHex(keys.publicKeyHex);
+  return { ...keys, nsec, npub };
 }
 
 export function clearNostrKeys(): void {
@@ -279,47 +471,43 @@ export function clearNostrKeys(): void {
 
 // ─── Relay communication ─────────────────────────────────────────────────────
 
-/**
- * Fetch recent notes from public relays. No authentication needed.
- * Returns up to `limit` notes from `kinds` (default: kind 1 = text notes).
- */
-export function fetchNotesFromRelays(
-  opts: {
-    limit?: number;
-    kinds?: number[];
-    authors?: string[];
-    search?: string;
-    relays?: string[];
-    since?: number;
-  } = {}
-): Promise<NostrNote[]> {
-  const {
-    limit = 30,
-    kinds = [1],
-    authors,
-    search,
-    relays = DEFAULT_RELAYS,
-    since,
-  } = opts;
+/** Map a raw relay event to the lightweight NostrNote view model. */
+function eventToNote(ev: NostrEvent): NostrNote {
+  return {
+    id: ev.id,
+    pubkey: ev.pubkey,
+    content: ev.content,
+    createdAt: ev.created_at,
+    tags: ev.tags || [],
+  };
+}
 
+/**
+ * Low-level helper: open REQ subscriptions against `relays` with `filter`, collect
+ * unique events until all relays EOSE/close or the timeout elapses. Shared by every
+ * higher-level fetch (notes, profiles, reactions, replies). Tolerant of partial
+ * relay failures — returns whatever events arrived.
+ */
+export function fetchEventsByFilter(
+  filter: Record<string, unknown>,
+  opts: { relays?: string[]; timeoutMs?: number; limit?: number } = {}
+): Promise<NostrEvent[]> {
+  const { relays = DEFAULT_RELAYS, timeoutMs = 6000, limit = 100 } = opts;
   return new Promise((resolve) => {
-    const notes: NostrNote[] = [];
+    const events: NostrEvent[] = [];
     const seenIds = new Set<string>();
     let resolved = false;
-    let connectedRelays = 0;
     let closedRelays = 0;
     const sockets: WebSocket[] = [];
 
-    const timer = setTimeout(() => finish(), 8000); // 8s timeout
+    const timer = setTimeout(finish, timeoutMs);
 
     function finish() {
       if (resolved) return;
       resolved = true;
       clearTimeout(timer);
       sockets.forEach((ws) => { try { ws.close(); } catch {} });
-      // Sort by newest first, deduplicate
-      notes.sort((a, b) => b.createdAt - a.createdAt);
-      resolve(notes.slice(0, limit));
+      resolve(events);
     }
 
     for (const relay of relays) {
@@ -328,13 +516,9 @@ export function fetchNotesFromRelays(
         sockets.push(ws);
 
         ws.onopen = () => {
-          connectedRelays++;
           const subId = "sc_" + Math.random().toString(36).slice(2, 8);
-          const filter: Record<string, unknown> = { kinds, limit: Math.min(limit, 50) };
-          if (authors?.length) filter.authors = authors;
-          if (search) filter.search = search;
-          if (since) filter.since = since;
-          ws.send(JSON.stringify(["REQ", subId, filter]));
+          const reqFilter = { ...filter, limit: Math.min(filter.limit ? Number(filter.limit) : limit, 200) };
+          ws.send(JSON.stringify(["REQ", subId, reqFilter]));
         };
 
         ws.onmessage = (msg) => {
@@ -344,15 +528,9 @@ export function fetchNotesFromRelays(
             const data = JSON.parse(raw);
             if (data[0] === "EVENT" && data[2]) {
               const ev = data[2] as NostrEvent;
-              if (!seenIds.has(ev.id) && ev.content?.trim()) {
+              if (ev.id && !seenIds.has(ev.id)) {
                 seenIds.add(ev.id);
-                notes.push({
-                  id: ev.id,
-                  pubkey: ev.pubkey,
-                  content: ev.content,
-                  createdAt: ev.created_at,
-                  tags: ev.tags || [],
-                });
+                events.push(ev);
               }
             }
             if (data[0] === "EOSE") {
@@ -375,6 +553,154 @@ export function fetchNotesFromRelays(
       }
     }
   });
+}
+
+/**
+ * Fetch recent notes from public relays. No authentication needed.
+ * Returns up to `limit` notes from `kinds` (default: kind 1 = text notes),
+ * newest first, deduplicated.
+ */
+export function fetchNotesFromRelays(
+  opts: {
+    limit?: number;
+    kinds?: number[];
+    authors?: string[];
+    search?: string;
+    relays?: string[];
+    since?: number;
+  } = {}
+): Promise<NostrNote[]> {
+  const {
+    limit = 30,
+    kinds = [1],
+    authors,
+    search,
+    relays = DEFAULT_RELAYS,
+    since,
+  } = opts;
+
+  const filter: Record<string, unknown> = { kinds, limit: Math.min(limit, 50) };
+  if (authors?.length) filter.authors = authors;
+  if (search) filter.search = search;
+  if (since) filter.since = since;
+
+  return fetchEventsByFilter(filter, { relays, timeoutMs: 8000 }).then((events) =>
+    events
+      .filter((ev) => ev.content?.trim())
+      .map(eventToNote)
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, limit)
+  );
+}
+
+/**
+ * Fetch NIP-01 kind-0 profile metadata for a set of pubkeys.
+ * Returns the newest profile per pubkey. Tolerates malformed content JSON.
+ */
+export async function fetchProfiles(
+  pubkeys: string[],
+  opts: { relays?: string[]; timeoutMs?: number } = {}
+): Promise<Map<string, NostrProfile>> {
+  const result = new Map<string, NostrProfile>();
+  const unique = [...new Set(pubkeys.filter(Boolean))];
+  if (unique.length === 0) return result;
+
+  const events = await fetchEventsByFilter(
+    { kinds: [0], authors: unique, limit: unique.length * 2 },
+    { timeoutMs: opts.timeoutMs ?? 6000, relays: opts.relays }
+  );
+
+  for (const ev of events) {
+    const existing = result.get(ev.pubkey);
+    // Keep the most recently created metadata event per pubkey.
+    if (existing && existing.updatedAt >= ev.created_at) continue;
+    try {
+      const raw = JSON.parse(ev.content || "{}") as Record<string, unknown>;
+      result.set(ev.pubkey, {
+        pubkey: ev.pubkey,
+        name: typeof raw.name === "string" ? raw.name : null,
+        displayName: typeof raw.display_name === "string" ? raw.display_name : null,
+        picture: typeof raw.picture === "string" ? raw.picture : null,
+        about: typeof raw.about === "string" ? raw.about : null,
+        website: typeof raw.website === "string" ? raw.website : null,
+        nip05: typeof raw.nip05 === "string" ? raw.nip05 : null,
+        updatedAt: ev.created_at,
+      });
+    } catch {
+      // Malformed metadata — skip silently.
+    }
+  }
+  return result;
+}
+
+/**
+ * Fetch NIP-25 kind-7 reaction counts for a set of note ids.
+ * Returns the number of distinct reactors per note (deduped by reactor pubkey).
+ * Negative reactions (content "-") are excluded.
+ */
+export async function fetchReactionsForEvents(
+  eventIds: string[],
+  opts: { relays?: string[]; timeoutMs?: number } = {}
+): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  const unique = [...new Set(eventIds.filter(Boolean))];
+  if (unique.length === 0) return counts;
+
+  const reactors = new Map<string, Set<string>>(); // eventId -> set of reactor pubkeys
+  const events = await fetchEventsByFilter(
+    { kinds: [7], "#e": unique, limit: 400 },
+    { timeoutMs: opts.timeoutMs ?? 6000, relays: opts.relays }
+  );
+
+  for (const ev of events) {
+    if (ev.content?.trim() === "-") continue; // skip dislikes
+    const targetTag = (ev.tags || []).find((t) => t[0] === "e" && t[1]);
+    if (!targetTag) continue;
+    const set = reactors.get(targetTag[1]) || new Set<string>();
+    set.add(ev.pubkey);
+    reactors.set(targetTag[1], set);
+  }
+  for (const [id, set] of reactors) counts.set(id, set.size);
+  return counts;
+}
+
+/**
+ * Fetch kind-1 notes that reply to `eventId` (tagged via NIP-10).
+ * Newest first, excluding the event itself.
+ */
+export async function fetchRepliesForEvent(
+  eventId: string,
+  opts: { relays?: string[]; timeoutMs?: number } = {}
+): Promise<NostrNote[]> {
+  const events = await fetchEventsByFilter(
+    { kinds: [1], "#e": [eventId], limit: 50 },
+    { timeoutMs: opts.timeoutMs ?? 6000, relays: opts.relays }
+  );
+  return events
+    .filter((ev) => ev.id !== eventId && ev.content?.trim())
+    .map(eventToNote)
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+/**
+ * Fetch notes by id (used to resolve the parent of a reply for inline context).
+ * Returns a map of id -> note for whichever ids were found.
+ */
+export async function fetchNotesByIds(
+  ids: string[],
+  opts: { relays?: string[]; timeoutMs?: number } = {}
+): Promise<Map<string, NostrNote>> {
+  const result = new Map<string, NostrNote>();
+  const unique = [...new Set(ids.filter(Boolean))];
+  if (unique.length === 0) return result;
+  const events = await fetchEventsByFilter(
+    { ids: unique, limit: unique.length },
+    { timeoutMs: opts.timeoutMs ?? 6000, relays: opts.relays }
+  );
+  for (const ev of events) {
+    if (ev.content?.trim()) result.set(ev.id, eventToNote(ev));
+  }
+  return result;
 }
 
 /**
@@ -505,12 +831,8 @@ export function generateNostrKeys(): {
   secretKeyHex: string;
   publicKeyHex: string;
 } {
-  const privkey = generatePrivateKey();
-  const pubkey = getPublicKey(privkey);
-  // Save to localStorage as well for quick access
-  localStorage.setItem(STORAGE_KEY_NOSTR_PRIVKEY, privkey);
-  localStorage.setItem(STORAGE_KEY_NOSTR_PUBKEY, pubkey);
-  return { nsec: privkey, npub: pubkey, secretKeyHex: privkey, publicKeyHex: pubkey };
+  // Delegate to the canonical generator (keeps localStorage + return shape in sync).
+  return generateAndSaveNostrKeys();
 }
 
 /**

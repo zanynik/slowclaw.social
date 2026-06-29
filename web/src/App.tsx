@@ -12,9 +12,16 @@ import { useScrollDirection } from "./hooks/useScrollDirection";
 import {
   fetchNotesFromRelays,
   fetchPersonalizedNotes,
+  fetchProfiles,
+  fetchReactionsForEvents,
+  fetchRepliesForEvent,
+  fetchNotesByIds,
+  getReplyParentId,
+  npubFromHex,
   extractKeywordsFromJournals,
   publishNote,
   type NostrNote,
+  type NostrProfile,
 } from "./lib/nostr";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
@@ -1515,6 +1522,17 @@ function App() {
   const [nostrKeysBusy, setNostrKeysBusy] = useState(false);
   const [nostrFeedNotes, setNostrFeedNotes] = useState<NostrNote[]>([]);
   const [nostrFeedLoading, setNostrFeedLoading] = useState(false);
+  // Enrichment state for a richer Nostr feed/profile: profile metadata (kind 0),
+  // reaction counts (kind 7), resolved parent notes (for reply context), and
+  // expandable reply threads. Each keyed by pubkey / event id.
+  const [nostrProfiles, setNostrProfiles] = useState<Record<string, NostrProfile>>({});
+  const [nostrReactions, setNostrReactions] = useState<Record<string, number>>({});
+  const [nostrParentNotes, setNostrParentNotes] = useState<Record<string, NostrNote>>({});
+  const [nostrReplyThreads, setNostrReplyThreads] = useState<Record<string, NostrNote[]>>({});
+  const [nostrRepliesLoading, setNostrRepliesLoading] = useState<Record<string, boolean>>({});
+  const [nostrProfileOverlay, setNostrProfileOverlay] = useState<NostrProfile | null>(null);
+  const [nostrRevealPrivkey, setNostrRevealPrivkey] = useState(false);
+  const [nostrCopiedKey, setNostrCopiedKey] = useState<"" | "npub" | "nsec">("");
   const [techNewsItems, setTechNewsItems] = useState<TechNewsItem[]>([]);
   const [techNewsLoading, setTechNewsLoading] = useState(false);
   const [techNewsError, setTechNewsError] = useState("");
@@ -1559,10 +1577,11 @@ function App() {
           }
         }
       }
-      // Load Nostr keys
+      // Load Nostr keys (normalize legacy hex-in-nsec/npub storage to bech32)
       const storedNostrKeys = await loadNostrKeysSecure();
       if (!cancelled && storedNostrKeys) {
-        setNostrKeys(storedNostrKeys);
+        const { normalizeNostrKeys } = await import("./lib/nostr");
+        setNostrKeys(normalizeNostrKeys(storedNostrKeys));
       }
       if (!cancelled && isDesktopClient) {
         const secureGatewayToken = await loadGatewayTokenSecure();
@@ -6409,17 +6428,192 @@ function App() {
         notes = await fetchNotesFromRelays({ limit: 30 });
       }
       setNostrFeedNotes(notes);
+      // Enrich the feed in the background: real names/avatars (kind 0),
+      // like counts (kind 7), and parent notes for reply context. Fire and
+      // forget so the notes render immediately; enrichment fills in as it lands.
+      void enrichNostrFeed(notes);
     } catch {
       // Fallback to generic notes
       try {
         const notes = await fetchNotesFromRelays({ limit: 30 });
         setNostrFeedNotes(notes);
+        void enrichNostrFeed(notes);
       } catch {
         setNostrFeedNotes([]);
       }
     } finally {
       setNostrFeedLoading(false);
     }
+  }
+
+  /** Resolve profiles + reactions + reply-parents for a set of notes. */
+  async function enrichNostrFeed(notes: NostrNote[]) {
+    if (notes.length === 0) return;
+    try {
+      const pubkeys = [...new Set(notes.map((n) => n.pubkey))];
+      const ids = notes.map((n) => n.id);
+      const parentIds = [...new Set(
+        notes.map((n) => getReplyParentId(n)).filter((p): p is string => !!p)
+      )];
+      const [profiles, reactions, parents] = await Promise.all([
+        fetchProfiles(pubkeys),
+        fetchReactionsForEvents(ids),
+        parentIds.length ? fetchNotesByIds(parentIds) : Promise.resolve(new Map<string, NostrNote>()),
+      ]);
+      setNostrProfiles((prev) => ({ ...prev, ...Object.fromEntries(profiles) }));
+      setNostrReactions((prev) => ({ ...prev, ...Object.fromEntries(reactions) }));
+      setNostrParentNotes((prev) => ({ ...prev, ...Object.fromEntries(parents) }));
+      // Parent authors' profiles may also be missing — fetch them too.
+      const parentPubs = [...parents.values()].map((n) => n.pubkey).filter((p) => !profiles.has(p));
+      if (parentPubs.length) {
+        const pm = await fetchProfiles(parentPubs);
+        setNostrProfiles((prev) => ({ ...prev, ...Object.fromEntries(pm) }));
+      }
+    } catch (e) {
+      console.warn("[nostr] feed enrichment failed", e);
+    }
+  }
+
+  /** Lazy-load the replies (kind 1) for a single note and expand them inline. */
+  async function loadNostrReplies(eventId: string) {
+    setNostrRepliesLoading((prev) => ({ ...prev, [eventId]: true }));
+    try {
+      const replies = await fetchRepliesForEvent(eventId);
+      setNostrReplyThreads((prev) => ({ ...prev, [eventId]: replies }));
+      // Expand only if there are replies to show (keeps the UI tidy when empty).
+      setNostrRepliesLoading((prev) => ({ ...prev, [eventId]: false }));
+      if (replies.length) {
+        const pubs = [...new Set(replies.map((r) => r.pubkey))];
+        const pm = await fetchProfiles(pubs);
+        setNostrProfiles((prev) => ({ ...prev, ...Object.fromEntries(pm) }));
+      }
+    } catch {
+      setNostrReplyThreads((prev) => ({ ...prev, [eventId]: [] }));
+      setNostrRepliesLoading((prev) => ({ ...prev, [eventId]: false }));
+    }
+  }
+
+  /** Resolve the best display name for a pubkey (profile name, else truncated npub). */
+  function nostrDisplayName(pubkey: string, profile?: NostrProfile | null): string {
+    if (profile?.displayName?.trim()) return profile.displayName.trim();
+    if (profile?.name?.trim()) return profile.name.trim();
+    try {
+      const npub = npubFromHex(pubkey);
+      return npub.slice(0, 12) + "…" + npub.slice(-6);
+    } catch {
+      return pubkey.slice(0, 12) + "…";
+    }
+  }
+
+  /** Avatar for a Nostr author: profile picture if available, else a fallback initial. */
+  function renderNostrAvatar(pubkey: string, profile?: NostrProfile | null) {
+    const name = nostrDisplayName(pubkey, profile);
+    if (profile?.picture) {
+      return (
+        <img
+          src={profile.picture}
+          alt=""
+          className="tweet-avatar nostr-avatar-img"
+          style={{ cursor: 'pointer', objectFit: 'cover' }}
+          onClick={() => void openNostrProfile(pubkey)}
+          onError={(e) => {
+            // Hide broken avatars so the CSS fallback initial shows instead.
+            (e.currentTarget as HTMLImageElement).style.display = 'none';
+          }}
+          aria-hidden
+          loading="lazy"
+        />
+      );
+    }
+    const initial = name.replace(/^@/, "").charAt(0).toUpperCase() || "?";
+    return (
+      <div className="tweet-avatar" style={{ cursor: 'pointer' }} onClick={() => void openNostrProfile(pubkey)} aria-hidden>{initial}</div>
+    );
+  }
+
+  /**
+   * Render a single Nostr note as a rich card: avatar + name, optional
+   * "replying to @parent" context, content, and a footer with like count and
+   * an expandable reply thread. Reused by both the Feed tab and profile overlay.
+   */
+  function renderNostrNoteCard(note: NostrNote) {
+    const timeAgo = getRelativeTime(note.createdAt * 1000);
+    const profile = nostrProfiles[note.pubkey];
+    const name = nostrDisplayName(note.pubkey, profile);
+    const parentId = getReplyParentId(note);
+    const parent = parentId ? nostrParentNotes[parentId] : undefined;
+    const parentProfile = parent ? nostrProfiles[parent.pubkey] : undefined;
+    const parentName = parent ? nostrDisplayName(parent.pubkey, parentProfile) : null;
+    const reactionCount = nostrReactions[note.id] || 0;
+    const replies = nostrReplyThreads[note.id];
+    const repliesLoading = nostrRepliesLoading[note.id];
+    return (
+      <div key={note.id} className="tweet-card">
+        {renderNostrAvatar(note.pubkey, profile)}
+        <div className="tweet-body">
+          <div className="tweet-header">
+            <span className="tweet-name" style={{ cursor: 'pointer' }} onClick={() => void openNostrProfile(note.pubkey)}>{name}</span>
+            {profile?.nip05 ? <span className="tweet-handle">✅ {profile.nip05}</span> : null}
+            <span className="tweet-dot">·</span>
+            <span className="tweet-time">{timeAgo}</span>
+          </div>
+          {parent ? (
+            <p className="nostr-reply-context text-sm muted" style={{ margin: '0.1rem 0 0.35rem' }}>
+              Replying to <span className="nostr-reply-context-name" onClick={() => void openNostrProfile(parent.pubkey)} aria-hidden>{parentName}</span>
+            </p>
+          ) : null}
+          {parent ? (
+            <blockquote className="nostr-parent-quote">{parent.content.slice(0, 160)}{parent.content.length > 160 ? "…" : ""}</blockquote>
+          ) : null}
+          <p className="tweet-text">{note.content}</p>
+          <div className="nostr-note-footer">
+            <span className="nostr-note-stat" title={`${reactionCount} like${reactionCount === 1 ? "" : "s"}`}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill={reactionCount > 0 ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+              {reactionCount > 0 ? reactionCount : ""}
+            </span>
+            <button
+              type="button"
+              className="nostr-note-stat nostr-reply-toggle"
+              onClick={() => {
+                if (repliesLoading) return;
+                if (!replies) {
+                  void loadNostrReplies(note.id);
+                } else if (replies.length) {
+                  // Toggle collapse when already loaded.
+                  setNostrReplyThreads((prev) => {
+                    const next = { ...prev };
+                    delete next[note.id];
+                    return next;
+                  });
+                }
+              }}
+              disabled={!!repliesLoading}
+              aria-expanded={!!replies?.length}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+              {repliesLoading ? "…" : (replies ? (replies.length ? `Hide ${replies.length}` : "No replies") : "Replies")}
+            </button>
+          </div>
+          {replies && replies.length > 0 ? (
+            <div className="nostr-reply-thread">
+              {replies.slice(0, 10).map((reply) => (
+                <div key={reply.id} className="nostr-reply-item">
+                  {renderNostrAvatar(reply.pubkey, nostrProfiles[reply.pubkey])}
+                  <div className="nostr-reply-item-body">
+                    <div className="tweet-header">
+                      <span className="tweet-name" style={{ cursor: 'pointer', fontSize: '0.85rem' }} onClick={() => void openNostrProfile(reply.pubkey)}>{nostrDisplayName(reply.pubkey, nostrProfiles[reply.pubkey])}</span>
+                      <span className="tweet-dot">·</span>
+                      <span className="tweet-time">{getRelativeTime(reply.createdAt * 1000)}</span>
+                    </div>
+                    <p className="tweet-text" style={{ fontSize: '0.88rem' }}>{reply.content}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    );
   }
 
   async function loadTechNews() {
@@ -6475,8 +6669,13 @@ function App() {
   async function openNostrProfile(pubkey: string) {
     setProfileView({ kind: "nostr", pubkey });
     setProfileViewLoading(true);
+    setNostrProfileOverlay(null);
     try {
-      const notes = await fetchNotesFromRelays({ authors: [pubkey], limit: 20 });
+      const [profileMap, notes] = await Promise.all([
+        fetchProfiles([pubkey]),
+        fetchNotesFromRelays({ authors: [pubkey], limit: 20 }),
+      ]);
+      setNostrProfileOverlay(profileMap.get(pubkey) || null);
       setProfileViewNotes(notes);
     } catch {
       setProfileViewNotes([]);
@@ -6570,13 +6769,8 @@ function App() {
         const { generateAndSaveNostrKeys } = await import("./lib/nostr");
         const keys = generateAndSaveNostrKeys();
         // Save to secure storage too
-        await saveNostrKeysSecure({
-          nsec: keys.privkey,
-          npub: keys.pubkey,
-          secretKeyHex: keys.privkey,
-          publicKeyHex: keys.pubkey,
-        });
-        setNostrKeys({ nsec: keys.privkey, npub: keys.pubkey, secretKeyHex: keys.privkey, publicKeyHex: keys.pubkey });
+        await saveNostrKeysSecure(keys);
+        setNostrKeys(keys);
         // Post to Nostr
         const result = await publishNote(nostrPostConfirmPost.text);
         if (result.success) {
@@ -8740,23 +8934,7 @@ function App() {
                   </div>
                 ) : (
                   <div className="feed-posts-list">
-                    {nostrFeedNotes.slice(0, 5).map((note) => {
-                      const timeAgo = getRelativeTime(note.createdAt * 1000);
-                      const shortPubkey = note.pubkey.slice(0, 8) + "..." + note.pubkey.slice(-4);
-                      return (
-                        <div key={note.id} className="tweet-card">
-                          <div className="tweet-avatar" style={{ cursor: 'pointer' }} onClick={() => void openNostrProfile(note.pubkey)} aria-hidden>👤</div>
-                          <div className="tweet-body">
-                            <div className="tweet-header">
-                              <span className="tweet-name" style={{ cursor: 'pointer' }} onClick={() => void openNostrProfile(note.pubkey)}>{shortPubkey}</span>
-                              <span className="tweet-dot">·</span>
-                              <span className="tweet-time">{timeAgo}</span>
-                            </div>
-                            <p className="tweet-text">{note.content}</p>
-                          </div>
-                        </div>
-                      );
-                    })}
+                    {nostrFeedNotes.slice(0, 5).map((note) => renderNostrNoteCard(note))}
                   </div>
                 )}
               </div>
@@ -9138,24 +9316,60 @@ function App() {
                   {nostrKeys ? (
                     <div className="stack-sm">
                       <span className="badge success">Connected</span>
-                      <p className="text-sm muted" style={{ wordBreak: 'break-all' }}>npub: {nostrKeys.publicKeyHex.slice(0, 12)}...{nostrKeys.publicKeyHex.slice(-8)}</p>
+                      {/* Public key — always visible, copyable (npub1...) */}
+                      <div className="nostr-key-row">
+                        <div className="nostr-key-row-head">
+                          <span className="text-sm" style={{ fontWeight: 600 }}>Public key</span>
+                          <button type="button" className="nostr-copy-btn" onClick={() => {
+                            void navigator.clipboard?.writeText(nostrKeys.npub).then(() => {
+                              setNostrCopiedKey("npub"); setTimeout(() => setNostrCopiedKey(""), 1500);
+                            });
+                          }} aria-label="Copy public key">{nostrCopiedKey === "npub" ? "Copied" : "Copy"}</button>
+                        </div>
+                        <p className="nostr-key-value" style={{ wordBreak: 'break-all' }}>{nostrKeys.npub}</p>
+                      </div>
+                      {/* Private key — hidden by default, reveal + copy gated behind a warning */}
+                      <div className="nostr-key-row">
+                        <div className="nostr-key-row-head">
+                          <span className="text-sm" style={{ fontWeight: 600 }}>Private key (secret)</span>
+                          <div className="row" style={{ gap: '0.4rem' }}>
+                            <button type="button" className="nostr-copy-btn" onClick={() => setNostrRevealPrivkey((v) => !v)} aria-label={nostrRevealPrivkey ? "Hide private key" : "Reveal private key"}>{nostrRevealPrivkey ? "Hide" : "Reveal"}</button>
+                            {nostrRevealPrivkey ? (
+                              <button type="button" className="nostr-copy-btn" onClick={() => {
+                                void navigator.clipboard?.writeText(nostrKeys.nsec).then(() => {
+                                  setNostrCopiedKey("nsec"); setTimeout(() => setNostrCopiedKey(""), 1500);
+                                });
+                              }} aria-label="Copy private key">{nostrCopiedKey === "nsec" ? "Copied" : "Copy"}</button>
+                            ) : null}
+                          </div>
+                        </div>
+                        {nostrRevealPrivkey ? (
+                          <>
+                            <p className="nostr-key-value" style={{ wordBreak: 'break-all' }}>{nostrKeys.nsec}</p>
+                            <p className="text-sm" style={{ color: 'var(--danger)', margin: 0 }}>Never share your private key. Anyone with it can post as you.</p>
+                          </>
+                        ) : (
+                          <p className="text-sm muted" style={{ margin: 0 }}>Hidden. Reveal to view or copy your nsec1... key.</p>
+                        )}
+                      </div>
                       <button type="button" className="ghost text-sm" onClick={() => {
                         setNostrKeys(null);
+                        setNostrRevealPrivkey(false);
                         localStorage.removeItem("slowclaw.nostr.privkey");
                         localStorage.removeItem("slowclaw.nostr.pubkey");
                       }}>Disconnect</button>
                     </div>
                   ) : (
                     <div className="stack-sm">
-                      <input id="settings-nostr-key" type="password" placeholder="Private key (nsec1... or hex)" />
+                      <p className="text-sm muted" style={{ margin: 0 }}>Create a Nostr identity, or import an existing private key (nsec1... or 64-char hex).</p>
+                      <input id="settings-nostr-key" type="password" placeholder="Private key (nsec1... or hex)" autoComplete="off" />
                       <div className="row" style={{ gap: '0.5rem' }}>
                         <button type="button" className="primary" style={{ flex: 1 }} onClick={async () => {
                           const input = (document.getElementById('settings-nostr-key') as HTMLInputElement)?.value?.trim();
                           if (!input) return;
                           const { importNostrPrivkey } = await import("./lib/nostr");
-                          const result = importNostrPrivkey(input);
-                          if (result) {
-                            const keys: NostrKeys = { nsec: input, npub: result.pubkey, secretKeyHex: input.replace(/^nsec1/, ''), publicKeyHex: result.pubkey };
+                          const keys = importNostrPrivkey(input);
+                          if (keys) {
                             await saveNostrKeysSecure(keys);
                             setNostrKeys(keys);
                           }
@@ -9163,9 +9377,8 @@ function App() {
                         <button type="button" className="ghost" style={{ flex: 1 }} onClick={async () => {
                           const { generateAndSaveNostrKeys } = await import("./lib/nostr");
                           const keys = generateAndSaveNostrKeys();
-                          const stored: NostrKeys = { nsec: keys.privkey, npub: keys.pubkey, secretKeyHex: keys.privkey, publicKeyHex: keys.pubkey };
-                          await saveNostrKeysSecure(stored);
-                          setNostrKeys(stored);
+                          await saveNostrKeysSecure(keys);
+                          setNostrKeys(keys);
                         }}>Create New</button>
                       </div>
                     </div>
@@ -9222,13 +9435,33 @@ function App() {
 
             {profileView.kind === "nostr" && (
               <div className="stack-sm">
-                <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-                  <div className="profile-pic-circle">👤</div>
-                  <div>
-                    <p style={{ fontWeight: 700, margin: 0 }}>{profileView.pubkey.slice(0, 12)}...{profileView.pubkey.slice(-6)}</p>
-                    <p className="text-sm muted" style={{ margin: '0.1rem 0 0' }}>Nostr user</p>
+                <div className="nostr-profile-head">
+                  {nostrProfileOverlay?.picture ? (
+                    <img
+                      src={nostrProfileOverlay.picture}
+                      alt=""
+                      className="profile-pic-circle nostr-profile-avatar"
+                      onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+                    />
+                  ) : (
+                    <div className="profile-pic-circle">👤</div>
+                  )}
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <p style={{ fontWeight: 700, margin: 0, fontSize: '1.05rem' }}>
+                      {nostrProfileOverlay?.displayName || nostrProfileOverlay?.name || "Nostr user"}
+                    </p>
+                    {nostrProfileOverlay?.name && nostrProfileOverlay.displayName ? (
+                      <p className="text-sm muted" style={{ margin: '0.05rem 0 0' }}>@{nostrProfileOverlay.name}</p>
+                    ) : null}
+                    {nostrProfileOverlay?.nip05 ? (
+                      <p className="text-sm" style={{ margin: '0.05rem 0 0', color: 'var(--accent)' }}>✅ {nostrProfileOverlay.nip05}</p>
+                    ) : null}
+                    {(() => { try { return <p className="text-sm muted nostr-profile-npub" style={{ margin: '0.1rem 0 0', wordBreak: 'break-all' }}>{npubFromHex(profileView.pubkey)}</p>; } catch { return null; } })()}
                   </div>
                 </div>
+                {nostrProfileOverlay?.about ? (
+                  <p className="text-sm" style={{ margin: '0.25rem 0 0', whiteSpace: 'pre-wrap' }}>{nostrProfileOverlay.about}</p>
+                ) : null}
                 <div style={{ borderTop: '1px solid var(--line)', paddingTop: '0.75rem', marginTop: '0.25rem' }}>
                   <p className="text-sm" style={{ fontWeight: 600, marginBottom: '0.5rem' }}>Recent notes</p>
                   {profileViewLoading ? (
@@ -9236,12 +9469,9 @@ function App() {
                   ) : profileViewNotes.length === 0 ? (
                     <p className="text-sm muted">No notes found.</p>
                   ) : (
-                    profileViewNotes.slice(0, 10).map((note) => (
-                      <div key={note.id} style={{ padding: '0.5rem 0', borderBottom: '1px solid var(--line)' }}>
-                        <p className="text-sm" style={{ margin: 0 }}>{note.content.slice(0, 200)}{note.content.length > 200 ? "..." : ""}</p>
-                        <p className="text-sm muted" style={{ margin: '0.2rem 0 0' }}>{getRelativeTime(note.createdAt * 1000)}</p>
-                      </div>
-                    ))
+                    <div className="nostr-profile-notes">
+                      {profileViewNotes.slice(0, 10).map((note) => renderNostrNoteCard(note))}
+                    </div>
                   )}
                 </div>
               </div>
