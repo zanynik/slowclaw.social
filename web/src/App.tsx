@@ -355,8 +355,8 @@ function loadPersistedPosts(): PersistedPost[] {
     const raw = localStorage.getItem(PERSISTED_POSTS_KEY);
     if (raw) return JSON.parse(raw);
   } catch {}
-  // Seed with sample posts in local dev so the UI is visible immediately
-  if (typeof window !== "undefined" && /^localhost$|^127\.0\.0\.1$/.test(window.location.hostname)) {
+  // Seed with sample posts in local dev / public demo so the UI is visible immediately
+  if (isDemoContext()) {
     return DEV_SAMPLE_POSTS;
   }
   return [];
@@ -371,7 +371,7 @@ function loadPersistedTodos(): PersistedTodo[] {
     const raw = localStorage.getItem(PERSISTED_TODOS_KEY);
     if (raw) return JSON.parse(raw);
   } catch {}
-  if (typeof window !== "undefined" && /^localhost$|^127\.0\.0\.1$/.test(window.location.hostname)) {
+  if (isDemoContext()) {
     return DEV_SAMPLE_TODOS;
   }
   return [];
@@ -756,6 +756,19 @@ function isTauriMobileRuntime() {
     Boolean((window as any).__TAURI_MOBILE__) ||
     (Boolean((window as any).__TAURI_INTERNALS__) && isMobileUserAgent())
   );
+}
+
+// True when running as the public in-browser demo (build-time flag) or on a local
+// dev host. In this context the app seeds sample journals/posts/todos for UI
+// preview and never expects a reachable gateway backend.
+function isDemoContext() {
+  if (typeof __SLOWCLAW_DEMO_BUILD__ !== "undefined" && __SLOWCLAW_DEMO_BUILD__) {
+    return true;
+  }
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return /^localhost$|^127\.0\.0\.1$/.test(window.location.hostname);
 }
 
 function isLoopbackUrl(value: string) {
@@ -2676,9 +2689,16 @@ function App() {
     if (item.kind === "text") {
       try {
         const localId = localJournalIdFromPath(item.path);
-        const content = localId
-          ? (await getJournal(localId)).content || ""
-          : await readLibraryText(item.path, token, gatewayBaseUrl);
+        let content: string;
+        if (localId && localId.startsWith("dev-journal-")) {
+          // Dev/demo sample journals aren't backed by storage — use their in-memory
+          // preview text so clicking a sample note shows content (not an empty editor).
+          content = item.previewText || "";
+        } else if (localId) {
+          content = (await getJournal(localId)).content || "";
+        } else {
+          content = await readLibraryText(item.path, token, gatewayBaseUrl);
+        }
         if (scope === "journal") {
           if (!isCurrentJournalSelection()) {
             return;
@@ -7078,10 +7098,9 @@ function App() {
     }
   }, [chatGatewayToken, gatewayBaseUrl]);
 
-  // Seed journal items in local dev mode for UI preview (delayed to run after refresh attempts)
+  // Seed journal items in local dev / public demo for UI preview (delayed to run after refresh attempts)
   useEffect(() => {
-    const isDevHost = typeof window !== "undefined" && /^localhost$|^127\.0\.0\.1$/.test(window.location.hostname);
-    if (!isDevHost) return;
+    if (!isDemoContext()) return;
     const timer = setTimeout(() => {
       // Only seed if journals are still empty (refresh didn't find anything)
       setJournalItems((prev) => {
@@ -8180,6 +8199,14 @@ function App() {
 
   return (
     <div className="app-shell">
+      {isDemoContext() && (
+        <div className="demo-banner" role="status">
+          <span>
+            <strong>Demo mode</strong> — exploring with sample data. Nothing is saved to a server.
+          </span>
+          <a className="demo-banner-link" href="/">Back to site ↑</a>
+        </div>
+      )}
       {!hideChrome && (
         <header className={`topbar${scrollDirection === "down" ? " topbar-hidden" : ""}`}>
           <div className="row" style={{ alignItems: "center", gap: "1rem" }}>

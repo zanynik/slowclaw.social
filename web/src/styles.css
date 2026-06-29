@@ -254,6 +254,31 @@ textarea {
 }
 
 /* ── Top bar ── */
+
+.demo-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 1rem;
+  margin: 0;
+  font-size: 0.82rem;
+  color: #fff;
+  background: var(--accent);
+}
+
+.demo-banner strong { font-weight: 700; }
+
+.demo-banner-link {
+  color: #fff;
+  text-decoration: none;
+  font-weight: 600;
+  white-space: nowrap;
+  opacity: 0.92;
+}
+
+.demo-banner-link:hover { opacity: 1; text-decoration: underline; }
 .topbar {
   padding: calc(2.25rem + env(safe-area-inset-top, 0px)) max(1.5rem, env(safe-area-inset-right, 0px)) 1rem max(1.5rem, env(safe-area-inset-left, 0px));
   position: sticky;
