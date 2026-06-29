@@ -7402,8 +7402,10 @@ function App() {
     : installedLocalModelCount > 0
     ? "Downloaded"
     : "Setup needed";
-  const isLocalDev = typeof window !== "undefined" && /^localhost$|^127\.0\.0\.1$/.test(window.location.hostname);
-  const needsMobileQrLogin = !isNativeClient && !isLocalDev && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
+  // The mobile->desktop pairing scanner is irrelevant in the public demo build and on
+  // localhost (no desktop to pair with); isDemoContext() covers both. Bypassing it keeps
+  // the real app UI visible in the in-browser demo.
+  const needsMobileQrLogin = !isNativeClient && !isDemoContext() && !(chatGatewayToken.trim() && gatewayBaseUrl.trim());
   const isCaptureZenMode = mobileTab === "journal" && (isRecording || captureMode !== null);
   const hideChrome = isWritingNote || isCaptureZenMode;
   const showDesktopJournalLayout = isDesktopLayout && mobileTab === "journal";
