@@ -1,0 +1,87 @@
+name: Deploy site + demo to Pages
+
+# Builds the marketing site (site/) together with a read-only, sample-data build
+# of the web app (web/ -> /app/) and deploys both to GitHub Pages under the
+# configured custom domain (site/CNAME). The demo is produced with SLOWCLAW_DEMO=1
+# so it seeds sample journals/posts/todos and never expects a reachable gateway.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "site/**"
+      - "web/src/**"
+      - "web/index.html"
+      - "web/package.json"
+      - "web/package-lock.json"
+      - "web/tsconfig.json"
+      - "web/vite.config.ts"
+      - ".github/workflows/deploy-site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent Pages deployment.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web deps
+        working-directory: web
+        run: npm ci
+
+      - name: Build demo app (sample-data build for /app/)
+        working-directory: web
+        env:
+          SLOWCLAW_DEMO: "1"
+          SLOWCLAW_WEB_BASE: "/app/"
+        run: npm run build
+
+      - name: Assemble site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          # Marketing site at the root.
+          cp -r site/. _site/
+          # Live demo served at /app/.
+          rm -rf _site/app
+          cp -r web/dist _site/app
+          # CNAME must live at the root for the custom apex domain.
+          test -f _site/CNAME
+          echo "Assembled _site:" && find _site -maxdepth 2 -mindepth 1 | sort | head -40
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
