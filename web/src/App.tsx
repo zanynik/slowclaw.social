@@ -1,24 +1,24 @@
 import { lazy, Suspense, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { AtpAgent, AppBskyFeedDefs } from "@atproto/api";
-import type { BlueskySession } from "./lib/bluesky";
+import type { BlueskySession, BlueskyPublicPost } from "./lib/bluesky";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
 import { BottomNav } from "./components/BottomNav";
 import { SwipeableView } from "./components/SwipeableView";
 import { PullToRefresh } from "./components/PullToRefresh";
+import { MediaTile } from "./components/MediaTile";
 import { ToastContainer } from "./components/ui/ToastContainer";
 import { appActions } from "./stores/useAppStore";
 import { useIsKeyboardOpen } from "./hooks/useKeyboardHeight";
 import { useScrollDirection } from "./hooks/useScrollDirection";
 import {
   fetchNotesFromRelays,
-  fetchPersonalizedNotes,
   fetchProfiles,
   fetchReactionsForEvents,
   fetchRepliesForEvent,
   fetchNotesByIds,
+  fetchNotesByHashtag,
   getReplyParentId,
   npubFromHex,
-  extractKeywordsFromJournals,
   publishNote,
   type NostrNote,
   type NostrProfile,
@@ -27,9 +27,13 @@ import {
 import {
   toUnifiedFromNostr,
   toUnifiedFromHN,
+  toUnifiedFromBluesky,
   extractJournalTopics,
   matchesTopic,
+  channelsForSource,
   type UnifiedItem,
+  type ContentChannel,
+  type SocialSource,
 } from "./lib/socialFeed";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
@@ -411,8 +415,8 @@ const ATOMIC_LOCAL_MODEL = "gemma-3n-e4b-it";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
-type MobileTab = "feed" | "news" | "journal" | "queue" | "productivity" | "profile";
-const TAB_ORDER: MobileTab[] = ["journal", "queue", "productivity", "feed", "profile"];
+type MobileTab = "feed" | "media" | "journal" | "queue" | "profile";
+const TAB_ORDER: MobileTab[] = ["feed", "media", "journal", "queue", "profile"];
 type ThemeMode = "light" | "dark";
 type DesktopGatewayBootstrap = {
   token?: string | null;
@@ -438,17 +442,23 @@ function defaultThemeMode(): ThemeMode {
 }
 
 function defaultMobileTab(): MobileTab {
-  // Social-first: the Feed (Nostr home timeline) is the landing surface on
-  // every form factor. A persisted tab choice still wins once the user picks one.
+  // Social-first: the Feed is the landing surface on every form factor. A
+  // persisted tab choice still wins once the user picks one.
   const fallback = "feed";
   if (typeof window === "undefined") {
     return fallback;
   }
   const saved = window.localStorage.getItem(UI_TAB_STORAGE_KEY);
-  if (saved === "todos" || saved === "events") {
-    return "productivity";
+  // Migration: fold removed tabs into their successors.
+  //   productivity / todos / events  → queue (Tasks now lives in Queue)
+  //   news                            → feed   (Tech News is now a Feed toggle)
+  if (saved === "todos" || saved === "events" || saved === "productivity") {
+    return "queue";
   }
-  if (saved === "feed" || saved === "news" || saved === "journal" || saved === "queue" || saved === "productivity" || saved === "profile") {
+  if (saved === "news") {
+    return "feed";
+  }
+  if (saved === "feed" || saved === "media" || saved === "journal" || saved === "queue" || saved === "profile") {
     return saved;
   }
   return fallback;
@@ -1489,9 +1499,7 @@ function App() {
     spawnedCount: 0,
     ignoredCount: 0,
   });
-  const workspaceTabActive =
-    mobileTab === "productivity" ||
-    mobileTab === "queue";
+  const workspaceTabActive = mobileTab === "queue";
   const workspaceSynthArtifacts = [
     { key: "posts", label: "Posts", state: workspaceSynthStatus.artifactStates?.insightPosts },
     { key: "todos", label: "Todos", state: workspaceSynthStatus.artifactStates?.todos },
@@ -1550,6 +1558,20 @@ function App() {
   // Topics are mined from journal entries; the user picks one to filter every
   // social surface through a single universal predicate (lib/socialFeed.ts).
   const [activeSocialTopic, setActiveSocialTopic] = useState<string>("");
+
+  // ── Social source + channel state (validated source-level filter levers) ────
+  // `socialSource` picks the open-protocol source: Nostr (NIP-12 hashtags) or
+  // Bluesky (anonymous searchPosts). `activeChannel` is the preset lever (or
+  // "" for firehose/discover). Switching a channel re-fetches from the SOURCE
+  // so content is guaranteed for popular terms (see lib/socialFeed.ts catalog).
+  const [socialSource, setSocialSource] = useState<SocialSource>("nostr");
+  const [activeChannelId, setActiveChannelId] = useState<string>("");
+  const [feedView, setFeedView] = useState<"social" | "news">("social");
+  // Bluesky public posts cache + loading (separate from the authed blueskyFeedItems).
+  const [blueskyPublicPosts, setBlueskyPublicPosts] = useState<import("./lib/bluesky").BlueskyPublicPost[]>([]);
+  const [blueskyPublicLoading, setBlueskyPublicLoading] = useState(false);
+  const [blueskyPublicError, setBlueskyPublicError] = useState("");
+  const [socialFeedError, setSocialFeedError] = useState("");
   const [techNewsLoading, setTechNewsLoading] = useState(false);
   const [techNewsError, setTechNewsError] = useState("");
   const [nostrPostConfirmPost, setNostrPostConfirmPost] = useState<PersistedPost | null>(null);
@@ -6441,8 +6463,11 @@ function App() {
     [journalItems],
   );
 
-  /** Nostr notes normalized to UnifiedItem and filtered by the active topic. */
+  /** Nostr notes for the active channel (source-level filter, not client-side). */
   const visibleNostrNotes = useMemo(() => {
+    // Channels filter at the SOURCE (loadNostrFeed already applied the NIP-12
+    // subscription), so here we only apply the optional journal-derived topic
+    // refinement on top. Empty topic = show everything the channel returned.
     const t = activeSocialTopic.trim().toLowerCase();
     if (!t) return nostrFeedNotes;
     return nostrFeedNotes.filter((note) => {
@@ -6454,6 +6479,52 @@ function App() {
     });
   }, [nostrFeedNotes, nostrProfiles, activeSocialTopic]);
 
+  /** Bluesky public posts normalized to UnifiedItem, with optional journal refinement. */
+  const visibleBlueskyItems = useMemo(() => {
+    const t = activeSocialTopic.trim().toLowerCase();
+    if (!t) return blueskyPublicPosts;
+    return blueskyPublicPosts.filter((p) => matchesTopic(toUnifiedFromBluesky(p), t));
+  }, [blueskyPublicPosts, activeSocialTopic]);
+
+  /**
+   * Media gallery: all image/video-bearing UnifiedItems aggregated across the
+   * loaded Nostr + Bluesky sources. Powers the dedicated Media tab. Reuses the
+   * same normalized items as the Feed, just filtered to those carrying media,
+   * newest first. If both sources are empty, the tab prompts the user to load a
+   * Feed channel first.
+   */
+  const mediaGalleryItems = useMemo(() => {
+    const nostrMedia = nostrFeedNotes
+      .filter((n) => {
+        const profile = nostrProfiles[n.pubkey];
+        return toUnifiedFromNostr(
+          n,
+          profile?.name ?? profile?.displayName ?? undefined,
+          profile?.picture ?? undefined,
+        ).media.type !== "none";
+      })
+      .map((n) => {
+        const profile = nostrProfiles[n.pubkey];
+        return {
+          unified: toUnifiedFromNostr(n, profile?.name ?? profile?.displayName ?? undefined, profile?.picture ?? undefined),
+          authorName: nostrDisplayName(n.pubkey, profile),
+          authorHandle: profile?.name ?? undefined,
+          authorAvatar: profile?.picture ?? undefined,
+          note: n,
+        };
+      });
+    const bskyMedia = blueskyPublicPosts
+      .filter((p) => toUnifiedFromBluesky(p).media.type !== "none")
+      .map((p) => ({
+        unified: toUnifiedFromBluesky(p),
+        authorName: p.author?.displayName?.trim() || p.author?.handle || "unknown",
+        authorHandle: p.author?.handle,
+        authorAvatar: p.author?.avatar ?? undefined,
+        post: p,
+      }));
+    return [...nostrMedia, ...bskyMedia].sort((a, b) => b.unified.timestamp - a.unified.timestamp);
+  }, [nostrFeedNotes, blueskyPublicPosts, nostrProfiles]);
+
   /** Hacker News items normalized to UnifiedItem and filtered by the active topic. */
   const visibleTechNews = useMemo(() => {
     const t = activeSocialTopic.trim().toLowerCase();
@@ -6464,20 +6535,20 @@ function App() {
   async function loadNostrFeed() {
     if (nostrFeedLoading) return;
     setNostrFeedLoading(true);
+    setSocialFeedError("");
     try {
-      // Extract keywords from journal entries for personalization
-      const journalTexts = journalItems
-        .filter((item) => item.previewText && item.previewText.length > 20)
-        .slice(0, 10)
-        .map((item) => item.previewText || "");
-      const keywords = extractKeywordsFromJournals(journalTexts);
-      let notes: NostrNote[] = [];
-      if (keywords.length > 0) {
-        notes = await fetchPersonalizedNotes(keywords, 30);
-      }
-      // If personalized search returned nothing, fetch generic feed
-      if (notes.length === 0) {
-        notes = await fetchNotesFromRelays({ limit: 30 });
+      // LEVER selection: if an active Nostr channel is a hashtag, subscribe via
+      // NIP-12 at the relay (source-side filter → guaranteed content for popular
+      // tags). Otherwise stream the firehose. We no longer rely on the
+      // journal-keyword + NIP-50 path, which returned 0 notes for rare terms.
+      const channel = activeChannelId
+        ? channelsForSource("nostr").find((c) => c.id === activeChannelId)
+        : undefined;
+      let notes: NostrNote[];
+      if (channel && channel.lever === "nostr-hashtag" && channel.query) {
+        notes = await fetchNotesByHashtag([channel.query], { limit: 40 });
+      } else {
+        notes = await fetchNotesFromRelays({ limit: 40 });
       }
       setNostrFeedNotes(notes);
       // Enrich the feed in the background: real names/avatars (kind 0),
@@ -6487,14 +6558,53 @@ function App() {
     } catch {
       // Fallback to generic notes
       try {
-        const notes = await fetchNotesFromRelays({ limit: 30 });
+        const notes = await fetchNotesFromRelays({ limit: 40 });
         setNostrFeedNotes(notes);
         void enrichNostrFeed(notes);
       } catch {
         setNostrFeedNotes([]);
+        setSocialFeedError("Couldn't reach Nostr relays. Try another channel.");
       }
     } finally {
       setNostrFeedLoading(false);
+    }
+  }
+
+  /**
+   * LEVER: Bluesky anonymous searchPosts. The most reliable content lever —
+   * returns ~20 posts for any term. "Discover" (empty query) falls back to a
+   * broad search. No auth needed (public AppView). On error we surface a clear
+   * message rather than silently clearing the feed.
+   */
+  async function loadBlueskyPublicFeed() {
+    if (blueskyPublicLoading) return;
+    setBlueskyPublicLoading(true);
+    setBlueskyPublicError("");
+    setSocialFeedError("");
+    try {
+      const mod = await loadBlueskyModule();
+      const channel = activeChannelId
+        ? channelsForSource("bluesky").find((c) => c.id === activeChannelId)
+        : undefined;
+      // Empty/discover channel → a broad, ever-green query so the feed is never empty.
+      const query = channel?.query || "tech";
+      const posts = await mod.searchPublicBlueskyPosts(query, { limit: 30 });
+      setBlueskyPublicPosts(posts);
+    } catch (e) {
+      setBlueskyPublicPosts([]);
+      const msg = e instanceof Error ? e.message : String(e);
+      setBlueskyPublicError(`Couldn't reach Bluesky: ${msg.slice(0, 120)}`);
+    } finally {
+      setBlueskyPublicLoading(false);
+    }
+  }
+
+  /** Dispatcher: load whichever source is active. */
+  async function loadSocialFeed() {
+    if (socialSource === "bluesky") {
+      await loadBlueskyPublicFeed();
+    } else {
+      await loadNostrFeed();
     }
   }
 
@@ -6546,34 +6656,70 @@ function App() {
   }
 
   /**
-   * Horizontal topic-chip rail, reused by the Feed and News tabs. Topics are
-   * mined from journals; selecting one filters the active surface through the
-   * universal `matchesTopic` predicate. An "All" chip clears the filter.
+   * Source + channel + journal chip system. This is the filtering control panel:
+   *   1. SOURCE row: Nostr | Bluesky (picks the open-protocol source)
+   *   2. CHANNEL row: preset source-level levers (validated to return content).
+   *      Switching a channel RE-FETCHES from the source — content is guaranteed
+   *      for popular terms (NIP-12 hashtags on Nostr, searchPosts on Bluesky).
+   *   3. JOURNAL refinement (optional): narrows the channel's results using
+   *      journal-derived topics via the client-side matchesTopic predicate.
    */
-  function renderTopicChips() {
-    if (journalTopics.length === 0) {
-      return (
-        <p className="text-sm muted social-topics-empty" style={{ margin: '0 0 0.25rem' }}>
-          Write in your Journal to grow topics that curate this feed.
-        </p>
-      );
-    }
+  function renderSourceAndChannels() {
+    const channels = channelsForSource(socialSource);
     return (
-      <div className="topic-chips" role="group" aria-label="Filter by journal topic">
-        <button
-          type="button"
-          className={`topic-chip${activeSocialTopic === "" ? " active" : ""}`}
-          onClick={() => setActiveSocialTopic("")}
-        >All</button>
-        {journalTopics.map((topic) => (
+      <div className="filter-panel">
+        <div className="source-toggle" role="group" aria-label="Content source">
           <button
-            key={topic.label}
             type="button"
-            className={`topic-chip${activeSocialTopic === topic.label ? " active" : ""}`}
-            onClick={() => setActiveSocialTopic(activeSocialTopic === topic.label ? "" : topic.label)}
-            title={`${topic.weight} mentions in your journals`}
-          >{topic.label}</button>
-        ))}
+            className={`source-pill${socialSource === "nostr" ? " active" : ""}`}
+            onClick={() => { if (socialSource !== "nostr") { setSocialSource("nostr"); setActiveChannelId(""); } }}
+          >Nostr</button>
+          <button
+            type="button"
+            className={`source-pill${socialSource === "bluesky" ? " active" : ""}`}
+            onClick={() => { if (socialSource !== "bluesky") { setSocialSource("bluesky"); setActiveChannelId(""); } }}
+          >Bluesky</button>
+        </div>
+
+        <div className="topic-chips" role="group" aria-label="Content channels">
+          {channels.map((ch) => (
+            <button
+              key={ch.id}
+              type="button"
+              className={`topic-chip${activeChannelId === ch.id ? " active" : ""}`}
+              onClick={() => {
+                const next = activeChannelId === ch.id ? "" : ch.id;
+                setActiveChannelId(next);
+                // Immediately fetch the newly-selected channel.
+                // Defer via microtask so state is committed first.
+                queueMicrotask(() => {
+                  if (next) {
+                    void (socialSource === "bluesky" ? loadBlueskyPublicFeed() : loadNostrFeed());
+                  } else {
+                    void loadSocialFeed();
+                  }
+                });
+              }}
+              title={`${ch.lever}: ${ch.query || ch.label}`}
+            >{ch.emoji ? <span aria-hidden>{ch.emoji}</span> : null}{ch.label}</button>
+          ))}
+        </div>
+
+        {/* Optional journal refinement — narrows channel results further. */}
+        {journalTopics.length > 0 ? (
+          <div className="topic-chips journal-refine" role="group" aria-label="Refine by journal topic">
+            <span className="topic-chips-label">From journals:</span>
+            {journalTopics.slice(0, 6).map((topic) => (
+              <button
+                key={topic.label}
+                type="button"
+                className={`topic-chip small${activeSocialTopic === topic.label ? " active" : ""}`}
+                onClick={() => setActiveSocialTopic(activeSocialTopic === topic.label ? "" : topic.label)}
+                title={`${topic.weight} mentions in your journals`}
+              >{topic.label}</button>
+            ))}
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -6697,6 +6843,185 @@ function App() {
             </div>
           ) : null}
         </div>
+      </div>
+    );
+  }
+
+  /**
+   * Render a Bluesky public post as a card. Mirrors renderNostrNoteCard's
+   * visual language (avatar, name, body, engagement footer). Rich features
+   * (reply threads, in-app reply/like) are follow-ups; this v1 surfaces the
+   * post, author, optional images, and like/repost counts from the AppView.
+   */
+  function renderBlueskyCard(post: BlueskyPublicPost) {
+    const handle = post.author?.handle || "unknown";
+    const name = post.author?.displayName?.trim() || handle;
+    const avatar = post.author?.avatar || "";
+    const body = post.record?.text || "";
+    const images = post.embed?.images || [];
+    const tsMs = Date.parse(post.indexedAt || post.record?.createdAt || "");
+    const ts = Number.isFinite(tsMs) ? Math.floor(tsMs / 1000) : 0;
+    const profileUrl = `https://bsky.app/profile/${handle}`;
+    return (
+      <article className="nostr-note-card bluesky-note-card" key={post.uri}>
+        <div className="nostr-note-head">
+          {avatar
+            ? <img src={avatar} alt="" className="nostr-avatar" loading="lazy" />
+            : <div className="nostr-avatar nostr-avatar-fallback" aria-hidden>{name.slice(0, 1).toUpperCase()}</div>}
+          <div className="nostr-note-author">
+            <span className="nostr-note-name">{name}</span>
+            <span className="nostr-note-handle">@{handle}</span>
+          </div>
+          <a className="nostr-note-source" href={profileUrl} target="_blank" rel="noreferrer" title="Open on Bluesky">🌐</a>
+        </div>
+        <p className="nostr-note-text">{body}</p>
+        {images.length > 0 ? (
+          <div className={`bluesky-image-grid count-${Math.min(images.length, 4)}`}>
+            {images.slice(0, 4).map((img, i) => (
+              img.thumb ? <img key={i} src={img.thumb} alt={img.alt || ""} className="bluesky-grid-image" loading="lazy" /> : null
+            ))}
+          </div>
+        ) : null}
+        <div className="nostr-note-footer">
+          <span className="nostr-note-stat">💬 {post.replyCount ?? 0}</span>
+          <span className="nostr-note-stat">🔁 {post.repostCount ?? 0}</span>
+          <span className="nostr-note-stat">❤️ {post.likeCount ?? 0}</span>
+          <span className="nostr-note-time">{getRelativeTime(ts * 1000)}</span>
+        </div>
+      </article>
+    );
+  }
+
+  /**
+   * Reusable Tasks section (extracted from the former standalone Tasks tab so it
+   * can be folded into the Queue tab). Same UI + behavior; an explicit "Extract"
+   * button replaces the old tab-level pull-to-refresh (the Queue tab's pull is
+   * wired to post generation, so Tasks needs its own trigger).
+   */
+  function renderTasksSection() {
+    return (
+      <div className="stack" style={{ marginTop: '0.75rem' }}>
+        <div className="tasks-header-card">
+          <div className="row-between" style={{ alignItems: 'center' }}>
+            <h2 style={{ margin: 0 }}>Tasks</h2>
+            <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+              {extractingLocalTasks ? (
+                <span className="row" style={{ gap: '0.3rem', alignItems: 'center' }}>
+                  <span className="btn-spinner" aria-hidden />
+                  <span className="text-sm muted">Extracting...</span>
+                </span>
+              ) : (
+                <button type="button" className="ghost text-sm" onClick={() => void handleTasksPullRefresh()} title="Extract tasks from journals">Extract</button>
+              )}
+            </div>
+          </div>
+          <p className="text-sm muted" style={{ margin: '0.15rem 0 0' }}>
+            Extracted from your journals
+          </p>
+        </div>
+
+        {persistedTodos.filter((t) => !t.done).length > 0 ? (
+          <div className="tasks-section">
+            <h3 className="tasks-section-title">Open · {persistedTodos.filter((t) => !t.done).length}</h3>
+            {persistedTodos.filter((t) => !t.done).map((todo) => (
+              <div key={todo.id} className="task-item">
+                <button
+                  type="button"
+                  className="task-checkbox"
+                  onClick={() => {
+                    setPersistedTodos((prev) => {
+                      const next = prev.map((t) => t.id === todo.id ? { ...t, done: true } : t);
+                      savePersistedTodos(next);
+                      return next;
+                    });
+                  }}
+                  aria-label="Mark done"
+                />
+                <div className="task-item-content">
+                  <input
+                    type="text"
+                    value={todo.title}
+                    className="task-title-input"
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setPersistedTodos((prev) => {
+                        const next = prev.map((t) => t.id === todo.id ? { ...t, title: val } : t);
+                        savePersistedTodos(next);
+                        return next;
+                      });
+                    }}
+                  />
+                  {todo.details && (
+                    <input
+                      type="text"
+                      value={todo.details}
+                      className="task-detail-input"
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setPersistedTodos((prev) => {
+                          const next = prev.map((t) => t.id === todo.id ? { ...t, details: val } : t);
+                          savePersistedTodos(next);
+                          return next;
+                        });
+                      }}
+                    />
+                  )}
+                </div>
+                <span className="task-time">{getRelativeTime(todo.createdAt)}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {persistedTodos.filter((t) => t.done).length > 0 ? (
+          <div className="tasks-section">
+            <h3 className="tasks-section-title" style={{ color: 'var(--muted)' }}>Completed · {persistedTodos.filter((t) => t.done).length}</h3>
+            {persistedTodos.filter((t) => t.done).map((todo) => (
+              <div key={todo.id} className="task-item task-item-done">
+                <button
+                  type="button"
+                  className="task-checkbox checked"
+                  onClick={() => {
+                    setPersistedTodos((prev) => {
+                      const next = prev.map((t) => t.id === todo.id ? { ...t, done: false } : t);
+                      savePersistedTodos(next);
+                      return next;
+                    });
+                  }}
+                  aria-label="Reopen"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </button>
+                <div className="task-item-content">
+                  <span className="task-title-done">{todo.title}</span>
+                </div>
+                <button
+                  type="button"
+                  className="ghost task-delete-btn"
+                  onClick={() => {
+                    setPersistedTodos((prev) => {
+                      const next = prev.filter((t) => t.id !== todo.id);
+                      savePersistedTodos(next);
+                      return next;
+                    });
+                  }}
+                  title="Delete"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {persistedTodos.length === 0 ? (
+          <div className="tasks-empty">
+            <div className="tasks-empty-icon">✅</div>
+            <p className="text-sm muted" style={{ margin: 0 }}>
+              No tasks yet. Tap Extract to pull them from your journals.
+            </p>
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -7425,19 +7750,23 @@ function App() {
     void loadRuntimeMediaCapabilities();
   }, [mobileTab, feedSource, chatGatewayToken, gatewayBaseUrl]);
 
-  // Auto-load Nostr feed when the Feed tab is shown and empty
+  // Auto-load social feed (Nostr or Bluesky) when the Feed tab is shown and empty.
   useEffect(() => {
-    if (mobileTab === "feed" && nostrFeedNotes.length === 0 && !nostrFeedLoading) {
-      void loadNostrFeed();
+    if (mobileTab === "feed" && feedView === "social") {
+      if (socialSource === "bluesky") {
+        if (blueskyPublicPosts.length === 0 && !blueskyPublicLoading) void loadBlueskyPublicFeed();
+      } else if (nostrFeedNotes.length === 0 && !nostrFeedLoading) {
+        void loadNostrFeed();
+      }
     }
-  }, [mobileTab]);
+  }, [mobileTab, feedView, socialSource]);
 
-  // Auto-load tech news the first time the News tab is shown.
+  // Auto-load tech news when the Feed's News view is shown and empty.
   useEffect(() => {
-    if (mobileTab === "news" && techNewsItems.length === 0 && !techNewsLoading) {
+    if (mobileTab === "feed" && feedView === "news" && techNewsItems.length === 0 && !techNewsLoading) {
       void loadTechNews();
     }
-  }, [mobileTab]);
+  }, [mobileTab, feedView]);
 
   useEffect(() => {
     let cancelled = false;
@@ -8935,6 +9264,9 @@ function App() {
               {generatePostStatus && (
                 <p className="text-sm muted" style={{ padding: '0.5rem 0.25rem' }}>{generatePostStatus}</p>
               )}
+
+              {/* Tasks folded into Queue (was its own tab). */}
+              {renderTasksSection()}
               </div>
             </div>
             </PullToRefresh>
@@ -8943,48 +9275,137 @@ function App() {
 
         {mobileTab === "feed" ? (
           <ViewErrorBoundary title="Feed">
-            <PullToRefresh onRefresh={() => loadNostrFeed()} enabled={!nostrFeedLoading}>
+            <PullToRefresh onRefresh={() => feedView === "news" ? loadTechNews() : loadSocialFeed()} enabled={feedView === "news" ? !techNewsLoading : !(nostrFeedLoading || blueskyPublicLoading)}>
             <div className="stack">
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
                   <h2>Feed</h2>
-                  <button
-                    type="button"
-                    className="ghost"
-                    style={{ padding: '0.4rem' }}
-                    onClick={() => void loadNostrFeed()}
-                    disabled={nostrFeedLoading}
-                    title="Refresh feed"
-                    aria-label="Refresh feed"
-                  >
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
-                  </button>
+                  {/* Newspaper icon: toggles between social feed and tech news. */}
+                  <div className="feed-view-toggle" role="group" aria-label="Feed view">
+                    <button
+                      type="button"
+                      className={`feed-view-pill${feedView === "social" ? " active" : ""}`}
+                      onClick={() => setFeedView("social")}
+                      aria-label="Social feed"
+                      title="Social feed"
+                    >
+                      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 11l18-8-8 18-2-7-8-3z"/></svg>
+                    </button>
+                    <button
+                      type="button"
+                      className={`feed-view-pill${feedView === "news" ? " active" : ""}`}
+                      onClick={() => setFeedView("news")}
+                      aria-label="Tech news"
+                      title="Tech news"
+                    >
+                      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2"/><path d="M18 14h-8M15 18h-5M10 6h8v4h-8V6z"/></svg>
+                    </button>
+                  </div>
                 </div>
 
-                <div className="social-section-label">From your journals</div>
-                {renderTopicChips()}
-
-                {nostrFeedLoading && nostrFeedNotes.length === 0 ? (
-                  <div style={{ padding: '2rem', textAlign: 'center' }}>
-                    <span className="btn-spinner" aria-hidden />
-                    <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Loading feed...</p>
-                  </div>
-                ) : nostrFeedNotes.length === 0 ? (
-                  <div className="feed-create-hero">
-                    <div className="feed-create-hero-icon">🌐</div>
-                    <h3>Discover on Nostr</h3>
-                    <p className="text-sm muted">Your social feed from the Nostr network — a permissionless, open protocol. Notes are matched to your journal topics.</p>
-                    <button type="button" className="primary" onClick={() => void loadNostrFeed()}>Load Feed</button>
-                  </div>
-                ) : visibleNostrNotes.length === 0 ? (
-                  <div className="feed-empty-filtered">
-                    <p className="text-sm muted" style={{ margin: 0 }}>No notes match “{activeSocialTopic}” right now.</p>
-                    <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => setActiveSocialTopic("")}>Clear filter</button>
-                  </div>
+                {feedView === "news" ? (
+                  <>
+                    <div className="social-section-label">Hacker News · top stories</div>
+                    {techNewsLoading && techNewsItems.length === 0 ? (
+                      <div className="tech-news-list">
+                        {[0, 1, 2, 3, 4].map((i) => (
+                          <div key={i} className="tech-news-skeleton-card">
+                            <div className="tech-news-skeleton">
+                              <div className="tech-news-skeleton-row short" />
+                              <div className="tech-news-skeleton-row" />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : techNewsError && techNewsItems.length === 0 ? (
+                      <div>
+                        <p className="tech-news-error">{techNewsError}</p>
+                        <button type="button" className="ghost text-sm" onClick={() => void loadTechNews()}>Retry</button>
+                      </div>
+                    ) : techNewsItems.length > 0 ? (
+                      <div className="tech-news-list">
+                        {techNewsItems.map((item, idx) => (
+                          <a key={item.id} className="tech-news-card" href={item.url} target="_blank" rel="noopener noreferrer">
+                            <div className="tech-news-card-rank">#{idx + 1} · <span className="tech-news-card-source">{item.source}</span></div>
+                            <p className="tech-news-card-title">{item.title}</p>
+                            <div className="tech-news-card-meta">
+                              <span className="tech-news-card-stat">▲ {item.score}</span>
+                              <span className="tech-news-card-dot">·</span>
+                              <span className="tech-news-card-stat">💬 {item.comments}</span>
+                              <span className="tech-news-card-dot">·</span>
+                              <span>{getRelativeTime(item.createdAt * 1000)}</span>
+                            </div>
+                          </a>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-sm muted" style={{ padding: '0.4rem 0' }}>No tech news right now.</p>
+                    )}
+                  </>
                 ) : (
-                  <div className="feed-posts-list">
-                    {visibleNostrNotes.slice(0, 40).map((note) => renderNostrNoteCard(note))}
-                  </div>
+                  <>
+                    <div className="social-section-label">Channels · open-protocol feeds</div>
+                    {renderSourceAndChannels()}
+
+                    {socialSource === "nostr" ? (
+                      nostrFeedLoading && nostrFeedNotes.length === 0 ? (
+                        <div style={{ padding: '2rem', textAlign: 'center' }}>
+                          <span className="btn-spinner" aria-hidden />
+                          <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Loading Nostr…</p>
+                        </div>
+                      ) : socialFeedError ? (
+                        <div className="feed-empty-filtered">
+                          <p className="text-sm muted" style={{ margin: 0 }}>{socialFeedError}</p>
+                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadNostrFeed()}>Retry</button>
+                        </div>
+                      ) : nostrFeedNotes.length === 0 ? (
+                        <div className="feed-create-hero">
+                          <div className="feed-create-hero-icon">🌐</div>
+                          <h3>Discover on Nostr</h3>
+                          <p className="text-sm muted">Pick a channel above to subscribe to a Nostr topic. Hashtags stream live from relays — try #nostr or #bitcoin.</p>
+                          <button type="button" className="primary" onClick={() => void loadNostrFeed()}>Load Feed</button>
+                        </div>
+                      ) : visibleNostrNotes.length === 0 ? (
+                        <div className="feed-empty-filtered">
+                          <p className="text-sm muted" style={{ margin: 0 }}>No notes match “{activeSocialTopic}” right now.</p>
+                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => setActiveSocialTopic("")}>Clear filter</button>
+                        </div>
+                      ) : (
+                        <div className="feed-posts-list">
+                          {visibleNostrNotes.slice(0, 40).map((note) => renderNostrNoteCard(note))}
+                        </div>
+                      )
+                    ) : (
+                      // Bluesky source
+                      blueskyPublicLoading && blueskyPublicPosts.length === 0 ? (
+                        <div style={{ padding: '2rem', textAlign: 'center' }}>
+                          <span className="btn-spinner" aria-hidden />
+                          <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Searching Bluesky…</p>
+                        </div>
+                      ) : blueskyPublicError ? (
+                        <div className="feed-empty-filtered">
+                          <p className="text-sm muted" style={{ margin: 0 }}>{blueskyPublicError}</p>
+                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadBlueskyPublicFeed()}>Retry</button>
+                        </div>
+                      ) : blueskyPublicPosts.length === 0 ? (
+                        <div className="feed-create-hero">
+                          <div className="feed-create-hero-icon">✨</div>
+                          <h3>Discover on Bluesky</h3>
+                          <p className="text-sm muted">Pick a channel above to search public Bluesky posts. Works for any term — try tech, art, or photography.</p>
+                          <button type="button" className="primary" onClick={() => void loadBlueskyPublicFeed()}>Search Bluesky</button>
+                        </div>
+                      ) : visibleBlueskyItems.length === 0 ? (
+                        <div className="feed-empty-filtered">
+                          <p className="text-sm muted" style={{ margin: 0 }}>No posts match “{activeSocialTopic}” right now.</p>
+                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => setActiveSocialTopic("")}>Clear filter</button>
+                        </div>
+                      ) : (
+                        <div className="feed-posts-list">
+                          {visibleBlueskyItems.slice(0, 40).map((post) => renderBlueskyCard(post))}
+                        </div>
+                      )
+                    )}
+                  </>
                 )}
               </div>
             </div>
@@ -8992,196 +9413,45 @@ function App() {
           </ViewErrorBoundary>
         ) : null}
 
-        {mobileTab === "news" ? (
-          <ViewErrorBoundary title="News">
-            <PullToRefresh onRefresh={() => loadTechNews()} enabled={!techNewsLoading}>
+        {mobileTab === "media" ? (
+          <ViewErrorBoundary title="Media">
+            <PullToRefresh onRefresh={() => loadSocialFeed()} enabled={!(nostrFeedLoading || blueskyPublicLoading)}>
             <div className="stack">
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
-                  <h2>Tech News</h2>
-                  <button
-                    type="button"
-                    className="ghost"
-                    style={{ padding: '0.4rem' }}
-                    onClick={() => void loadTechNews()}
-                    disabled={techNewsLoading}
-                    title="Refresh news"
-                    aria-label="Refresh news"
-                  >
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
-                  </button>
+                  <h2>Media</h2>
+                  <span className="text-sm muted">{socialSource === "bluesky" ? "Bluesky" : "Nostr"} · {mediaGalleryItems.length}</span>
                 </div>
+                <div className="social-section-label">Images & videos from {socialSource === "bluesky" ? "Bluesky" : "Nostr"}</div>
 
-                <div className="social-section-label">From your journals</div>
-                {renderTopicChips()}
-
-                {techNewsLoading && techNewsItems.length === 0 ? (
-                  <div className="tech-news-list">
-                    {[0, 1, 2, 3, 4].map((i) => (
-                      <div key={i} className="tech-news-skeleton-card">
-                        <div className="tech-news-skeleton">
-                          <div className="tech-news-skeleton-row short" />
-                          <div className="tech-news-skeleton-row" />
-                        </div>
-                      </div>
-                    ))}
+                {(nostrFeedLoading || blueskyPublicLoading) && mediaGalleryItems.length === 0 ? (
+                  <div style={{ padding: '2rem', textAlign: 'center' }}>
+                    <span className="btn-spinner" aria-hidden />
+                    <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Loading media…</p>
                   </div>
-                ) : techNewsError && techNewsItems.length === 0 ? (
-                  <div>
-                    <p className="tech-news-error">{techNewsError}</p>
-                    <button type="button" className="ghost text-sm" onClick={() => void loadTechNews()}>Retry</button>
-                  </div>
-                ) : visibleTechNews.length === 0 ? (
-                  <div className="feed-empty-filtered">
-                    <p className="text-sm muted" style={{ margin: 0 }}>No stories match “{activeSocialTopic}” right now.</p>
-                    <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => setActiveSocialTopic("")}>Clear filter</button>
-                  </div>
-                ) : techNewsItems.length > 0 ? (
-                  <div className="tech-news-list">
-                    {visibleTechNews.map((item, idx) => (
-                      <a key={item.id} className="tech-news-card" href={item.url} target="_blank" rel="noopener noreferrer">
-                        <div className="tech-news-card-rank">#{idx + 1} · <span className="tech-news-card-source">{item.source}</span></div>
-                        <p className="tech-news-card-title">{item.title}</p>
-                        <div className="tech-news-card-meta">
-                          <span className="tech-news-card-stat">▲ {item.score}</span>
-                          <span className="tech-news-card-dot">·</span>
-                          <span className="tech-news-card-stat">💬 {item.comments}</span>
-                          <span className="tech-news-card-dot">·</span>
-                          <span>{getRelativeTime(item.createdAt * 1000)}</span>
-                        </div>
-                      </a>
-                    ))}
+                ) : mediaGalleryItems.length === 0 ? (
+                  <div className="feed-create-hero">
+                    <div className="feed-create-hero-icon">🖼️</div>
+                    <h3>No media yet</h3>
+                    <p className="text-sm muted">Load a Feed channel first — image and video posts from {socialSource === "bluesky" ? "Bluesky" : "Nostr"} will collect here. Try the “art” or “photography” channel.</p>
+                    <button type="button" className="primary" onClick={() => { setMobileTab("feed"); void loadSocialFeed(); }}>Open Feed</button>
                   </div>
                 ) : (
-                  <p className="text-sm muted" style={{ padding: '0.4rem 0' }}>No tech news right now.</p>
+                  <div className="media-grid">
+                    {mediaGalleryItems.slice(0, 60).map((item) => (
+                      <MediaTile
+                        key={item.unified.id}
+                        unified={item.unified}
+                        authorName={item.authorName}
+                        authorHandle={item.authorHandle}
+                        authorAvatar={item.authorAvatar}
+                        platform={item.unified.sourcePlatform}
+                        body={item.unified.content.body}
+                      />
+                    ))}
+                  </div>
                 )}
               </div>
-            </div>
-            </PullToRefresh>
-          </ViewErrorBoundary>
-        ) : null}
-
-        {mobileTab === "productivity" ? (
-          <ViewErrorBoundary title="Tasks">
-            <PullToRefresh onRefresh={handleTasksPullRefresh} enabled={!extractingLocalTasks}>
-            <div className="stack">
-              <div className="tasks-header-card">
-                <div className="row-between" style={{ alignItems: 'center' }}>
-                  <h2 style={{ margin: 0 }}>Tasks</h2>
-                  {extractingLocalTasks && (
-                    <span className="row" style={{ gap: '0.3rem', alignItems: 'center' }}>
-                      <span className="btn-spinner" aria-hidden />
-                      <span className="text-sm muted">Extracting...</span>
-                    </span>
-                  )}
-                </div>
-                <p className="text-sm muted" style={{ margin: '0.15rem 0 0' }}>
-                  Pull down to extract tasks from your journals
-                </p>
-              </div>
-
-              {persistedTodos.filter((t) => !t.done).length > 0 ? (
-                <div className="tasks-section">
-                  <h3 className="tasks-section-title">Open \u00b7 {persistedTodos.filter((t) => !t.done).length}</h3>
-                  {persistedTodos.filter((t) => !t.done).map((todo) => (
-                    <div key={todo.id} className="task-item">
-                      <button
-                        type="button"
-                        className="task-checkbox"
-                        onClick={() => {
-                          setPersistedTodos((prev) => {
-                            const next = prev.map((t) => t.id === todo.id ? { ...t, done: true } : t);
-                            savePersistedTodos(next);
-                            return next;
-                          });
-                        }}
-                        aria-label="Mark done"
-                      />
-                      <div className="task-item-content">
-                        <input
-                          type="text"
-                          value={todo.title}
-                          className="task-title-input"
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            setPersistedTodos((prev) => {
-                              const next = prev.map((t) => t.id === todo.id ? { ...t, title: val } : t);
-                              savePersistedTodos(next);
-                              return next;
-                            });
-                          }}
-                        />
-                        {todo.details && (
-                          <input
-                            type="text"
-                            value={todo.details}
-                            className="task-detail-input"
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setPersistedTodos((prev) => {
-                                const next = prev.map((t) => t.id === todo.id ? { ...t, details: val } : t);
-                                savePersistedTodos(next);
-                                return next;
-                              });
-                            }}
-                          />
-                        )}
-                      </div>
-                      <span className="task-time">{getRelativeTime(todo.createdAt)}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-
-              {persistedTodos.filter((t) => t.done).length > 0 ? (
-                <div className="tasks-section">
-                  <h3 className="tasks-section-title" style={{ color: 'var(--muted)' }}>Completed \u00b7 {persistedTodos.filter((t) => t.done).length}</h3>
-                  {persistedTodos.filter((t) => t.done).map((todo) => (
-                    <div key={todo.id} className="task-item task-item-done">
-                      <button
-                        type="button"
-                        className="task-checkbox checked"
-                        onClick={() => {
-                          setPersistedTodos((prev) => {
-                            const next = prev.map((t) => t.id === todo.id ? { ...t, done: false } : t);
-                            savePersistedTodos(next);
-                            return next;
-                          });
-                        }}
-                        aria-label="Reopen"
-                      >
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-                      </button>
-                      <div className="task-item-content">
-                        <span className="task-title-done">{todo.title}</span>
-                      </div>
-                      <button
-                        type="button"
-                        className="ghost task-delete-btn"
-                        onClick={() => {
-                          setPersistedTodos((prev) => {
-                            const next = prev.filter((t) => t.id !== todo.id);
-                            savePersistedTodos(next);
-                            return next;
-                          });
-                        }}
-                        title="Delete"
-                      >
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-
-              {persistedTodos.length === 0 ? (
-                <div className="tasks-empty">
-                  <div className="tasks-empty-icon">✅</div>
-                  <p className="text-sm muted" style={{ margin: 0 }}>
-                    No tasks yet. Pull down to extract from your journals.
-                  </p>
-                </div>
-              ) : null}
             </div>
             </PullToRefresh>
           </ViewErrorBoundary>

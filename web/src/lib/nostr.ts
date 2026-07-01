@@ -594,6 +594,33 @@ export function fetchNotesFromRelays(
 }
 
 /**
+ * LEVER: Nostr NIP-12 hashtag subscription. Asks relays to send ONLY notes
+ * tagged with one of `tags` (the `#t` filter), so filtering happens at the
+ * source rather than client-side. This is the most reliable Nostr content
+ * lever for popular tags — relay.nostr.band / nos.lol / damus push constant
+ * traffic for #bitcoin, #nostr, #ai, #art, etc. Tags are matched without the
+ * leading '#'. Returns up to `limit` notes, newest first, deduped.
+ */
+export function fetchNotesByHashtag(
+  tags: string[],
+  opts: { limit?: number; relays?: string[]; timeoutMs?: number; kinds?: number[] } = {}
+): Promise<NostrNote[]> {
+  const clean = tags.map((t) => t.trim().toLowerCase().replace(/^#/, "")).filter(Boolean);
+  if (clean.length === 0) return fetchNotesFromRelays({ limit: opts.limit, relays: opts.relays, kinds: opts.kinds });
+  const { limit = 30, relays = DEFAULT_RELAYS, timeoutMs = 7000, kinds = [1] } = opts;
+  return fetchEventsByFilter(
+    { kinds, "#t": clean, limit: Math.min(limit, 50) },
+    { relays, timeoutMs, limit }
+  ).then((events) =>
+    events
+      .filter((ev) => ev.content?.trim())
+      .map(eventToNote)
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, limit)
+  );
+}
+
+/**
  * Fetch NIP-01 kind-0 profile metadata for a set of pubkeys.
  * Returns the newest profile per pubkey. Tolerates malformed content JSON.
  */

@@ -1,18 +1,25 @@
 /**
  * BottomNav.tsx — Mobile tab bar (icons only).
  *
- * Social-first IA: Feed (Nostr) → News (HN) → Journal → Queue → Tasks → Profile.
- * Journals power curation (topic filtering) across the social surfaces; they
- * sit in the middle as the capture/compose surface.
+ * Social-first IA (5 tabs): Feed → Media → Journal → Queue(+Tasks) → Profile.
+ *
+ * - Feed: Nostr / Bluesky social stream + Tech News toggle (newspaper icon).
+ * - Media: image/video gallery across Nostr + Bluesky (UnifiedItem media).
+ * - Journal: capture/compose — also grows the topics that curate Feed/Media.
+ * - Queue: AI drafts + Tasks (productivity) folded together.
+ * - Profile.
+ *
+ * Refresh actions live inside each tab's header (no global refresh icon), so
+ * the bar stays icon-only and breathes on small screens.
  */
 
-type MobileTab = "feed" | "news" | "journal" | "queue" | "productivity" | "profile";
+type MobileTab = "feed" | "media" | "journal" | "queue" | "profile";
 
 type BottomNavProps = {
   activeTab: MobileTab;
   onTabChange: (tab: MobileTab) => void;
   productivityBadgeCount?: number;
-  /** Unread count for the social Feed tab (e.g. new Nostr notes since last view). */
+  /** Unread count for the social Feed tab. */
   feedBadgeCount?: number;
 };
 
@@ -37,7 +44,7 @@ export function BottomNav({
 
   return (
     <nav className="bottom-nav" role="tablist" aria-label="Main navigation">
-      {/* Feed — Nostr social stream (the "home" timeline) */}
+      {/* Feed — social stream (Nostr/Bluesky) + Tech News toggle */}
       <button
         type="button"
         role="tab"
@@ -54,18 +61,19 @@ export function BottomNav({
         ) : null}
       </button>
 
-      {/* News — Hacker News tech cards (explore) */}
+      {/* Media — image/video gallery across sources */}
       <button
         type="button"
         role="tab"
-        aria-selected={activeTab === "news"}
-        aria-label="News"
-        className={activeTab === "news" ? "active" : ""}
-        onClick={() => handleTab("news")}
+        aria-selected={activeTab === "media"}
+        aria-label="Media"
+        className={activeTab === "media" ? "active" : ""}
+        onClick={() => handleTab("media")}
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2" />
-          <path d="M18 14h-8M15 18h-5M10 6h8v4h-8V6z" />
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+          <circle cx="8.5" cy="8.5" r="1.5" />
+          <path d="M21 15l-5-5L5 21" />
         </svg>
       </button>
 
@@ -84,7 +92,7 @@ export function BottomNav({
         </svg>
       </button>
 
-      {/* Queue — AI-generated drafts (sparkles/wand) */}
+      {/* Queue — AI drafts + Tasks folded together (sparkles/wand) */}
       <button
         type="button"
         role="tab"
@@ -97,21 +105,6 @@ export function BottomNav({
           <path d="M12 2l1.09 3.26L16 6l-2.91.74L12 10l-1.09-3.26L8 6l2.91-.74L12 2z" />
           <path d="M5 15l.54 1.63L7 17.17l-1.46.37L5 19.17l-.54-1.63L3 17.17l1.46-.37L5 15z" />
           <path d="M19 11l.54 1.63L21 13.17l-1.46.37L19 15.17l-.54-1.63L17 13.17l1.46-.37L19 11z" />
-        </svg>
-      </button>
-
-      {/* Tasks — productivity (checkbox) */}
-      <button
-        type="button"
-        role="tab"
-        aria-selected={activeTab === "productivity"}
-        aria-label="Tasks"
-        className={activeTab === "productivity" ? "active" : ""}
-        onClick={() => handleTab("productivity")}
-      >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M9 11l3 3L22 4" />
-          <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
         </svg>
         {productivityBadgeCount > 0 ? (
           <span className="bottom-nav-badge">{productivityBadgeCount}</span>

@@ -8,6 +8,15 @@ export type BlueskySession = {
   handle: string;
 };
 
+/**
+ * Public (anonymous) Bluesky AppView base URL. Reads of PUBLIC posts do NOT
+ * require auth — this is a permissionless source per the open-web design. We
+ * use `api.bsky.app` (Bluesky's public AppView) which serves searchPosts /
+ * getAuthorFeed / getFeed without a session. CORS-enabled for browser use.
+ */
+export const BLUESKY_PUBLIC_APPVIEW = "https://api.bsky.app";
+
+
 export function createAgent(serviceUrl: string) {
   return new AtpAgent({ service: serviceUrl });
 }
@@ -442,4 +451,128 @@ export async function sendAuthedXrpcRequest(args: {
     statusText: res.statusText,
     data: parsed
   };
+}
+
+/* ── Anonymous (permissionless) public reads ─────────────────────────────────
+ * These call the public Bluesky AppView with NO session token. They power the
+ * social Feed / Media tabs as an open-protocol source alongside Nostr. All
+ * return plain data shapes (no AtpAgent) so the UI can normalize them via
+ * UnifiedItem without depending on auth state.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** A minimal, plain view of a public Bluesky post (subset we render). */
+export type BlueskyPublicPost = {
+  uri: string;
+  cid: string;
+  author: {
+    did: string;
+    handle: string;
+    displayName?: string | null;
+    avatar?: string | null;
+  };
+  record: {
+    text: string;
+    createdAt: string;
+    langs?: string[];
+    reply?: { root?: { uri: string }; parent?: { uri: string } };
+  };
+  embed?: {
+    $type?: string;
+    images?: Array<{ thumb?: string; fullsize?: string; alt?: string }>;
+    video?: string | null;
+    playlists?: unknown;
+    external?: { uri: string; title?: string; description?: string; thumb?: string };
+  };
+  likeCount?: number;
+  repostCount?: number;
+  replyCount?: number;
+  indexedAt: string;
+};
+
+type BlueskyFetchOpts = { limit?: number; signal?: AbortSignal };
+
+async function blueskyPublicGet<T>(path: string, params: Record<string, string>, opts: BlueskyFetchOpts = {}): Promise<T> {
+  const url = new URL(BLUESKY_PUBLIC_APPVIEW + "/xrpc/" + path);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      // AppView requires a non-empty UA and an Accept header.
+      "Accept": "application/json",
+      "User-Agent": "slowclaw-social/1.0",
+    },
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Bluesky ${path} ${res.status}: ${body.slice(0, 200)}`);
+  }
+  return (await res.json()) as T;
+}
+
+/** Epoch seconds from an ISO timestamp (Bluesky uses ISO-8601 `indexedAt`). */
+function epochFromIso(iso: string): number {
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? Math.floor(t / 1000) : 0;
+}
+
+/**
+ * LEVER: Bluesky full-text search (most reliable content lever). Searches ALL
+ * public posts for `query` server-side via the AppView. Works for ANY term and
+ * returns constant traffic for popular queries (AI, tech, art, ...). Anonymous.
+ */
+export async function searchPublicBlueskyPosts(
+  query: string,
+  opts: BlueskyFetchOpts = {}
+): Promise<BlueskyPublicPost[]> {
+  const q = query.trim();
+  if (!q) return [];
+  const limit = Math.min(opts.limit ?? 25, 100);
+  const data = await blueskyPublicGet<{ posts: BlueskyPublicPost[] }>(
+    "app.bsky.feed.searchPosts",
+    { q, limit: String(limit), sort: "latest" },
+    opts,
+  );
+  return data.posts || [];
+}
+
+/**
+ * Recent posts by a single actor (handle or DID). Anonymous. Useful for the
+ * "follow specific authors" lever later.
+ */
+export async function getPublicBlueskyAuthorFeed(
+  actor: string,
+  opts: BlueskyFetchOpts = {}
+): Promise<BlueskyPublicPost[]> {
+  if (!actor.trim()) return [];
+  const limit = Math.min(opts.limit ?? 30, 100);
+  const data = await blueskyPublicGet<{ feed: Array<{ post: BlueskyPublicPost }> }>(
+    "app.bsky.feed.getAuthorFeed",
+    { actor, limit: String(limit) },
+    opts,
+  );
+  return (data.feed || []).map((f) => f.post);
+}
+
+/**
+ * Resolve a handle to a DID (needed to build feed URIs). Anonymous.
+ */
+export async function resolveBlueskyHandle(handle: string, opts: BlueskyFetchOpts = {}): Promise<string | null> {
+  const h = handle.trim().replace(/^@/, "");
+  if (!h) return null;
+  try {
+    const data = await blueskyPublicGet<{ did: string }>(
+      "com.atproto.identity.resolveHandle",
+      { handle: h },
+      opts,
+    );
+    return data.did || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Convenience: epoch seconds from a BlueskyPublicPost. */
+export function blueskyPostTimestamp(post: BlueskyPublicPost): number {
+  return epochFromIso(post.indexedAt || post.record?.createdAt || "");
 }

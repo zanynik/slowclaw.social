@@ -36,8 +36,6 @@ export interface UnifiedItem {
   };
 }
 
-/* ── Source converters (structural typing to avoid import cycles) ─────────── */
-
 /** Minimal shape of a Nostr text note (kind 1) as produced by lib/nostr.ts. */
 interface NostrNoteLike {
   id: string;
@@ -88,6 +86,51 @@ export function extractNostrMedia(note: NostrNoteLike): UnifiedItem["media"] {
   if (videoUrls.length) return { type: "video", urls: videoUrls, thumbnailUrl: videoUrls[0] };
   if (imageUrls.length) return { type: "image", urls: imageUrls, thumbnailUrl: imageUrls[0] };
   return { type: "none", urls: [] };
+}
+
+/** Minimal shape of a Bluesky public post (matches lib/bluesky.ts). */
+interface BlueskyPostLike {
+  uri: string;
+  author: { did: string; handle: string; displayName?: string | null; avatar?: string | null };
+  record: { text: string; createdAt?: string };
+  embed?: {
+    $type?: string;
+    images?: Array<{ thumb?: string; fullsize?: string; alt?: string }>;
+    video?: string | null;
+    external?: { uri: string; title?: string; description?: string; thumb?: string };
+  };
+  indexedAt: string;
+  likeCount?: number;
+  repostCount?: number;
+}
+
+/** Pull image/video URLs from a Bluesky post's embed block. */
+export function extractBlueskyMedia(post: BlueskyPostLike): UnifiedItem["media"] {
+  const images = post.embed?.images || [];
+  const videoUrl = post.embed?.video || undefined;
+  if (videoUrl) return { type: "video", urls: [videoUrl], thumbnailUrl: undefined };
+  const imgUrls = images.map((i) => i.fullsize || i.thumb).filter(Boolean) as string[];
+  if (imgUrls.length) return { type: "image", urls: imgUrls, thumbnailUrl: imgUrls[0] };
+  return { type: "none", urls: [] };
+}
+
+export function toUnifiedFromBluesky(post: BlueskyPostLike): UnifiedItem {
+  const tsMs = Date.parse(post.indexedAt || post.record?.createdAt || "");
+  return {
+    id: post.uri,
+    sourcePlatform: "atproto",
+    timestamp: Number.isFinite(tsMs) ? Math.floor(tsMs / 1000) : 0,
+    author: {
+      id: post.author.did,
+      handle: post.author.handle,
+      avatar: post.author.avatar ?? undefined,
+    },
+    content: {
+      body: post.record?.text || "",
+      linkUrl: post.embed?.external?.uri,
+    },
+    media: extractBlueskyMedia(post),
+  };
 }
 
 export function toUnifiedFromNostr(note: NostrNoteLike, handle?: string, avatar?: string): UnifiedItem {
@@ -236,3 +279,76 @@ export function filterByTopic(items: UnifiedItem[], topic: string): UnifiedItem[
   if (!topic.trim()) return items;
   return items.filter((i) => matchesTopic(i, topic));
 }
+
+/* ── CONTENT CHANNELS — validated source-level filter levers ────────────────
+ * A "channel" is a pre-wired source-level filter that GUARANTEES content for
+ * popular topics. Instead of fetching the firehose and filtering client-side
+ * (which fails for rare terms — the user's original bug), each channel asks the
+ * SOURCE to do the filtering:
+ *   - nostr-hashtag → NIP-12 `#t` subscription (relay only sends matching notes)
+ *   - bluesky-search → app.bsky.feed.searchPosts (AppView full-text search)
+ *   - firehose      → no filter (baseline stream)
+ *
+ * Validated live: see handoff. Bluesky search returns ~20 posts for any term;
+ * Nostr hashtags return 10-15 notes for #bitcoin/#nostr; NIP-50 search is
+ * UNRELIABLE and is intentionally NOT exposed as a channel.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+export type SocialSource = "nostr" | "bluesky" | "news";
+
+export type ChannelLever = "nostr-hashtag" | "bluesky-search" | "firehose";
+
+export interface ContentChannel {
+  /** Stable id, also used as the chip label if no `label` override. */
+  id: string;
+  label: string;
+  /** Which source this channel runs against. */
+  source: SocialSource;
+  /** The mechanism (lever) used to filter at the source. */
+  lever: ChannelLever;
+  /**
+   * The query value passed to the lever:
+   *   nostr-hashtag → tag without '#' (e.g. "bitcoin")
+   *   bluesky-search → search query string (e.g. "machine learning")
+   *   firehose → ignored
+   */
+  query: string;
+  /** Optional emoji for the chip. */
+  emoji?: string;
+}
+
+/**
+ * Preset channel catalog. Curated for guaranteed content volume across diverse
+ * interests (tech, art, music, crypto, photography). Each is proven to return
+ * results from its source. Grouped by source so the UI can show only the
+ * channels relevant to the active source toggle.
+ */
+export const CONTENT_CHANNELS: ContentChannel[] = [
+  // ── Nostr (NIP-12 hashtag subscriptions) ──
+  { id: "nostr-firehose", label: "Firehose", source: "nostr", lever: "firehose", query: "", emoji: "📡" },
+  { id: "nostr-nostr", label: "nostr", source: "nostr", lever: "nostr-hashtag", query: "nostr", emoji: "🟣" },
+  { id: "nostr-bitcoin", label: "bitcoin", source: "nostr", lever: "nostr-hashtag", query: "bitcoin", emoji: "₿" },
+  { id: "nostr-ai", label: "ai", source: "nostr", lever: "nostr-hashtag", query: "ai", emoji: "🤖" },
+  { id: "nostr-tech", label: "tech", source: "nostr", lever: "nostr-hashtag", query: "tech", emoji: "💻" },
+  { id: "nostr-art", label: "art", source: "nostr", lever: "nostr-hashtag", query: "art", emoji: "🎨" },
+  { id: "nostr-photography", label: "photography", source: "nostr", lever: "nostr-hashtag", query: "photography", emoji: "📷" },
+  { id: "nostr-music", label: "music", source: "nostr", lever: "nostr-hashtag", query: "music", emoji: "🎵" },
+  { id: "nostr-plebchain", label: "plebchain", source: "nostr", lever: "nostr-hashtag", query: "plebchain", emoji: "⛓️" },
+
+  // ── Bluesky (full-text search — works for ANY term) ──
+  { id: "bsky-discover", label: "Discover", source: "bluesky", lever: "bluesky-search", query: "", emoji: "✨" },
+  { id: "bsky-tech", label: "tech", source: "bluesky", lever: "bluesky-search", query: "tech", emoji: "💻" },
+  { id: "bsky-ai", label: "ai", source: "bluesky", lever: "bluesky-search", query: "AI", emoji: "🤖" },
+  { id: "bsky-programming", label: "programming", source: "bluesky", lever: "bluesky-search", query: "programming", emoji: "⌨️" },
+  { id: "bsky-art", label: "art", source: "bluesky", lever: "bluesky-search", query: "art", emoji: "🎨" },
+  { id: "bsky-photography", label: "photography", source: "bluesky", lever: "bluesky-search", query: "photography", emoji: "📷" },
+  { id: "bsky-music", label: "music", source: "bluesky", lever: "bluesky-search", query: "music", emoji: "🎵" },
+  { id: "bsky-film", label: "film", source: "bluesky", lever: "bluesky-search", query: "film", emoji: "🎬" },
+  { id: "bsky-science", label: "science", source: "bluesky", lever: "bluesky-search", query: "science", emoji: "🔬" },
+];
+
+/** Channels available for a given source (for the chip row). */
+export function channelsForSource(source: SocialSource): ContentChannel[] {
+  return CONTENT_CHANNELS.filter((c) => c.source === source);
+}
+
