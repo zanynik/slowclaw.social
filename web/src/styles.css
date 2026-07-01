@@ -3224,6 +3224,59 @@ button.local-ai-preset {
   word-break: break-word;
 }
 
+/* ── Social-first IA: topic chips (journal-driven curation) ─────────────── */
+.social-section-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0.25rem 0.25rem 0.4rem;
+}
+.social-topics-empty {
+  padding: 0 0.25rem;
+}
+.topic-chips {
+  display: flex;
+  gap: 0.4rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0 0.25rem 0.6rem;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.topic-chips::-webkit-scrollbar {
+  display: none;
+}
+.topic-chip {
+  flex: 0 0 auto;
+  padding: 0.35rem 0.8rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s var(--ease-out), color 0.15s var(--ease-out), border-color 0.15s var(--ease-out);
+}
+.topic-chip:hover {
+  border-color: var(--accent);
+}
+.topic-chip.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-contrast, #fff);
+  font-weight: 600;
+}
+.feed-empty-filtered {
+  padding: 1.5rem 0.5rem;
+  text-align: center;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-sm);
+}
+
 /* ── Nostr feed: rich note cards, reply context, reactions, threads ─────── */
 .nostr-avatar-img {
   overflow: hidden;

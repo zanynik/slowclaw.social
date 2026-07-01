@@ -1,4 +1,4 @@
-import { lazy, Suspense, FormEvent, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { AtpAgent, AppBskyFeedDefs } from "@atproto/api";
 import type { BlueskySession } from "./lib/bluesky";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
@@ -23,6 +23,14 @@ import {
   type NostrNote,
   type NostrProfile,
 } from "./lib/nostr";
+// ── Unified social feed: normalization + journal-driven topic curation ───────
+import {
+  toUnifiedFromNostr,
+  toUnifiedFromHN,
+  extractJournalTopics,
+  matchesTopic,
+  type UnifiedItem,
+} from "./lib/socialFeed";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
   saveJournalText,
@@ -403,7 +411,7 @@ const ATOMIC_LOCAL_MODEL = "gemma-3n-e4b-it";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
-type MobileTab = "journal" | "queue" | "productivity" | "feed" | "profile";
+type MobileTab = "feed" | "news" | "journal" | "queue" | "productivity" | "profile";
 const TAB_ORDER: MobileTab[] = ["journal", "queue", "productivity", "feed", "profile"];
 type ThemeMode = "light" | "dark";
 type DesktopGatewayBootstrap = {
@@ -430,17 +438,20 @@ function defaultThemeMode(): ThemeMode {
 }
 
 function defaultMobileTab(): MobileTab {
+  // Social-first: the Feed (Nostr home timeline) is the landing surface on
+  // every form factor. A persisted tab choice still wins once the user picks one.
+  const fallback = "feed";
   if (typeof window === "undefined") {
-    return "journal";
-  }
-  if (window.innerWidth > 900) {
-    return "journal";
+    return fallback;
   }
   const saved = window.localStorage.getItem(UI_TAB_STORAGE_KEY);
   if (saved === "todos" || saved === "events") {
     return "productivity";
   }
-  return saved === "queue" || saved === "feed" || saved === "productivity" || saved === "profile" ? saved : "journal";
+  if (saved === "feed" || saved === "news" || saved === "journal" || saved === "queue" || saved === "productivity" || saved === "profile") {
+    return saved;
+  }
+  return fallback;
 }
 
 function useIsLargeScreen() {
@@ -1534,6 +1545,11 @@ function App() {
   const [nostrRevealPrivkey, setNostrRevealPrivkey] = useState(false);
   const [nostrCopiedKey, setNostrCopiedKey] = useState<"" | "npub" | "nsec">("");
   const [techNewsItems, setTechNewsItems] = useState<TechNewsItem[]>([]);
+
+  // ── Journal-driven topic curation (applies across News + Nostr tabs) ────────
+  // Topics are mined from journal entries; the user picks one to filter every
+  // social surface through a single universal predicate (lib/socialFeed.ts).
+  const [activeSocialTopic, setActiveSocialTopic] = useState<string>("");
   const [techNewsLoading, setTechNewsLoading] = useState(false);
   const [techNewsError, setTechNewsError] = useState("");
   const [nostrPostConfirmPost, setNostrPostConfirmPost] = useState<PersistedPost | null>(null);
@@ -6409,6 +6425,42 @@ function App() {
 
   // ── Nostr Feed ────────────────────────────────────────────────────────────
 
+  /**
+   * Journal-derived topics drive curation across every social surface. They're
+   * memoized on the journal set so the chip row only recomputes when journals
+   * change. Topics feed the shared `matchesTopic` predicate (lib/socialFeed.ts).
+   */
+  const journalTopics = useMemo(
+    () => extractJournalTopics(
+      journalItems
+        .filter((item) => item.kind === "text" && (item.previewText || "").trim().length > 10)
+        .slice(0, 60)
+        .map((item) => item.previewText || ""),
+      10,
+    ),
+    [journalItems],
+  );
+
+  /** Nostr notes normalized to UnifiedItem and filtered by the active topic. */
+  const visibleNostrNotes = useMemo(() => {
+    const t = activeSocialTopic.trim().toLowerCase();
+    if (!t) return nostrFeedNotes;
+    return nostrFeedNotes.filter((note) => {
+      const profile = nostrProfiles[note.pubkey];
+      const handle = profile?.name ?? profile?.displayName ?? undefined;
+      const avatar = profile?.picture ?? undefined;
+      const unified = toUnifiedFromNostr(note, handle, avatar);
+      return matchesTopic(unified, t);
+    });
+  }, [nostrFeedNotes, nostrProfiles, activeSocialTopic]);
+
+  /** Hacker News items normalized to UnifiedItem and filtered by the active topic. */
+  const visibleTechNews = useMemo(() => {
+    const t = activeSocialTopic.trim().toLowerCase();
+    if (!t) return techNewsItems;
+    return techNewsItems.filter((item) => matchesTopic(toUnifiedFromHN(item), t));
+  }, [techNewsItems, activeSocialTopic]);
+
   async function loadNostrFeed() {
     if (nostrFeedLoading) return;
     setNostrFeedLoading(true);
@@ -6491,6 +6543,39 @@ function App() {
       setNostrReplyThreads((prev) => ({ ...prev, [eventId]: [] }));
       setNostrRepliesLoading((prev) => ({ ...prev, [eventId]: false }));
     }
+  }
+
+  /**
+   * Horizontal topic-chip rail, reused by the Feed and News tabs. Topics are
+   * mined from journals; selecting one filters the active surface through the
+   * universal `matchesTopic` predicate. An "All" chip clears the filter.
+   */
+  function renderTopicChips() {
+    if (journalTopics.length === 0) {
+      return (
+        <p className="text-sm muted social-topics-empty" style={{ margin: '0 0 0.25rem' }}>
+          Write in your Journal to grow topics that curate this feed.
+        </p>
+      );
+    }
+    return (
+      <div className="topic-chips" role="group" aria-label="Filter by journal topic">
+        <button
+          type="button"
+          className={`topic-chip${activeSocialTopic === "" ? " active" : ""}`}
+          onClick={() => setActiveSocialTopic("")}
+        >All</button>
+        {journalTopics.map((topic) => (
+          <button
+            key={topic.label}
+            type="button"
+            className={`topic-chip${activeSocialTopic === topic.label ? " active" : ""}`}
+            onClick={() => setActiveSocialTopic(activeSocialTopic === topic.label ? "" : topic.label)}
+            title={`${topic.weight} mentions in your journals`}
+          >{topic.label}</button>
+        ))}
+      </div>
+    );
   }
 
   /** Resolve the best display name for a pubkey (profile name, else truncated npub). */
@@ -7340,16 +7425,16 @@ function App() {
     void loadRuntimeMediaCapabilities();
   }, [mobileTab, feedSource, chatGatewayToken, gatewayBaseUrl]);
 
-  // Auto-load Nostr feed when feed tab is shown and empty
+  // Auto-load Nostr feed when the Feed tab is shown and empty
   useEffect(() => {
     if (mobileTab === "feed" && nostrFeedNotes.length === 0 && !nostrFeedLoading) {
       void loadNostrFeed();
     }
   }, [mobileTab]);
 
-  // Auto-load tech news the first time the feed tab is shown.
+  // Auto-load tech news the first time the News tab is shown.
   useEffect(() => {
-    if (mobileTab === "feed" && techNewsItems.length === 0 && !techNewsLoading) {
+    if (mobileTab === "news" && techNewsItems.length === 0 && !techNewsLoading) {
       void loadTechNews();
     }
   }, [mobileTab]);
@@ -8858,69 +8943,28 @@ function App() {
 
         {mobileTab === "feed" ? (
           <ViewErrorBoundary title="Feed">
+            <PullToRefresh onRefresh={() => loadNostrFeed()} enabled={!nostrFeedLoading}>
             <div className="stack">
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
                   <h2>Feed</h2>
-                  <button type="button" className="ghost" style={{ padding: '0.4rem' }} title="Notifications">
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+                  <button
+                    type="button"
+                    className="ghost"
+                    style={{ padding: '0.4rem' }}
+                    onClick={() => void loadNostrFeed()}
+                    disabled={nostrFeedLoading}
+                    title="Refresh feed"
+                    aria-label="Refresh feed"
+                  >
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
                   </button>
                 </div>
 
-                <div className="tech-news-section">
-                  <div className="tech-news-header">
-                    <span className="tech-news-title"><span className="tech-news-title-dot" aria-hidden />Tech News</span>
-                    <button
-                      type="button"
-                      className="tech-news-refresh"
-                      onClick={() => void loadTechNews()}
-                      disabled={techNewsLoading}
-                      title="Refresh tech news"
-                      aria-label="Refresh tech news"
-                    >
-                      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
-                    </button>
-                  </div>
-                  {techNewsLoading && techNewsItems.length === 0 ? (
-                    <div className="tech-news-list">
-                      {[0, 1, 2, 3, 4].map((i) => (
-                        <div key={i} className="tech-news-skeleton-card">
-                          <div className="tech-news-skeleton">
-                            <div className="tech-news-skeleton-row short" />
-                            <div className="tech-news-skeleton-row" />
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : techNewsError && techNewsItems.length === 0 ? (
-                    <div>
-                      <p className="tech-news-error">{techNewsError}</p>
-                      <button type="button" className="ghost text-sm" onClick={() => void loadTechNews()}>Retry</button>
-                    </div>
-                  ) : techNewsItems.length > 0 ? (
-                    <div className="tech-news-list">
-                      {techNewsItems.map((item, idx) => (
-                        <a key={item.id} className="tech-news-card" href={item.url} target="_blank" rel="noopener noreferrer">
-                          <div className="tech-news-card-rank">#{idx + 1} · <span className="tech-news-card-source">{item.source}</span></div>
-                          <p className="tech-news-card-title">{item.title}</p>
-                          <div className="tech-news-card-meta">
-                            <span className="tech-news-card-stat">▲ {item.score}</span>
-                            <span className="tech-news-card-dot">·</span>
-                            <span className="tech-news-card-stat">💬 {item.comments}</span>
-                            <span className="tech-news-card-dot">·</span>
-                            <span>{getRelativeTime(item.createdAt * 1000)}</span>
-                          </div>
-                        </a>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-sm muted" style={{ padding: '0.4rem 0' }}>No tech news right now.</p>
-                  )}
-                </div>
+                <div className="social-section-label">From your journals</div>
+                {renderTopicChips()}
 
-                <div className="tech-news-section-label">From Nostr</div>
-
-                {nostrFeedLoading ? (
+                {nostrFeedLoading && nostrFeedNotes.length === 0 ? (
                   <div style={{ padding: '2rem', textAlign: 'center' }}>
                     <span className="btn-spinner" aria-hidden />
                     <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Loading feed...</p>
@@ -8929,16 +8973,91 @@ function App() {
                   <div className="feed-create-hero">
                     <div className="feed-create-hero-icon">🌐</div>
                     <h3>Discover on Nostr</h3>
-                    <p className="text-sm muted">Your personalized feed from the Nostr network. Notes are matched to your journal topics.</p>
+                    <p className="text-sm muted">Your social feed from the Nostr network — a permissionless, open protocol. Notes are matched to your journal topics.</p>
                     <button type="button" className="primary" onClick={() => void loadNostrFeed()}>Load Feed</button>
+                  </div>
+                ) : visibleNostrNotes.length === 0 ? (
+                  <div className="feed-empty-filtered">
+                    <p className="text-sm muted" style={{ margin: 0 }}>No notes match “{activeSocialTopic}” right now.</p>
+                    <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => setActiveSocialTopic("")}>Clear filter</button>
                   </div>
                 ) : (
                   <div className="feed-posts-list">
-                    {nostrFeedNotes.slice(0, 5).map((note) => renderNostrNoteCard(note))}
+                    {visibleNostrNotes.slice(0, 40).map((note) => renderNostrNoteCard(note))}
                   </div>
                 )}
               </div>
             </div>
+            </PullToRefresh>
+          </ViewErrorBoundary>
+        ) : null}
+
+        {mobileTab === "news" ? (
+          <ViewErrorBoundary title="News">
+            <PullToRefresh onRefresh={() => loadTechNews()} enabled={!techNewsLoading}>
+            <div className="stack">
+              <div className="feed-tab-container">
+                <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
+                  <h2>Tech News</h2>
+                  <button
+                    type="button"
+                    className="ghost"
+                    style={{ padding: '0.4rem' }}
+                    onClick={() => void loadTechNews()}
+                    disabled={techNewsLoading}
+                    title="Refresh news"
+                    aria-label="Refresh news"
+                  >
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+                  </button>
+                </div>
+
+                <div className="social-section-label">From your journals</div>
+                {renderTopicChips()}
+
+                {techNewsLoading && techNewsItems.length === 0 ? (
+                  <div className="tech-news-list">
+                    {[0, 1, 2, 3, 4].map((i) => (
+                      <div key={i} className="tech-news-skeleton-card">
+                        <div className="tech-news-skeleton">
+                          <div className="tech-news-skeleton-row short" />
+                          <div className="tech-news-skeleton-row" />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : techNewsError && techNewsItems.length === 0 ? (
+                  <div>
+                    <p className="tech-news-error">{techNewsError}</p>
+                    <button type="button" className="ghost text-sm" onClick={() => void loadTechNews()}>Retry</button>
+                  </div>
+                ) : visibleTechNews.length === 0 ? (
+                  <div className="feed-empty-filtered">
+                    <p className="text-sm muted" style={{ margin: 0 }}>No stories match “{activeSocialTopic}” right now.</p>
+                    <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => setActiveSocialTopic("")}>Clear filter</button>
+                  </div>
+                ) : techNewsItems.length > 0 ? (
+                  <div className="tech-news-list">
+                    {visibleTechNews.map((item, idx) => (
+                      <a key={item.id} className="tech-news-card" href={item.url} target="_blank" rel="noopener noreferrer">
+                        <div className="tech-news-card-rank">#{idx + 1} · <span className="tech-news-card-source">{item.source}</span></div>
+                        <p className="tech-news-card-title">{item.title}</p>
+                        <div className="tech-news-card-meta">
+                          <span className="tech-news-card-stat">▲ {item.score}</span>
+                          <span className="tech-news-card-dot">·</span>
+                          <span className="tech-news-card-stat">💬 {item.comments}</span>
+                          <span className="tech-news-card-dot">·</span>
+                          <span>{getRelativeTime(item.createdAt * 1000)}</span>
+                        </div>
+                      </a>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm muted" style={{ padding: '0.4rem 0' }}>No tech news right now.</p>
+                )}
+              </div>
+            </div>
+            </PullToRefresh>
           </ViewErrorBoundary>
         ) : null}
 

@@ -1,15 +1,19 @@
 /**
- * BottomNav.tsx — Mobile tab bar component (icons only).
+ * BottomNav.tsx — Mobile tab bar (icons only).
  *
- * Five tabs: Journal, Queue, Tasks, Feed, Profile.
+ * Social-first IA: Feed (Nostr) → News (HN) → Journal → Queue → Tasks → Profile.
+ * Journals power curation (topic filtering) across the social surfaces; they
+ * sit in the middle as the capture/compose surface.
  */
 
-type MobileTab = "journal" | "queue" | "productivity" | "feed" | "profile";
+type MobileTab = "feed" | "news" | "journal" | "queue" | "productivity" | "profile";
 
 type BottomNavProps = {
   activeTab: MobileTab;
   onTabChange: (tab: MobileTab) => void;
   productivityBadgeCount?: number;
+  /** Unread count for the social Feed tab (e.g. new Nostr notes since last view). */
+  feedBadgeCount?: number;
 };
 
 function triggerHaptic() {
@@ -22,6 +26,7 @@ export function BottomNav({
   activeTab,
   onTabChange,
   productivityBadgeCount = 0,
+  feedBadgeCount = 0,
 }: BottomNavProps) {
   const handleTab = (tab: MobileTab) => {
     if (tab !== activeTab) {
@@ -32,7 +37,39 @@ export function BottomNav({
 
   return (
     <nav className="bottom-nav" role="tablist" aria-label="Main navigation">
-      {/* Journal — pen/edit icon */}
+      {/* Feed — Nostr social stream (the "home" timeline) */}
+      <button
+        type="button"
+        role="tab"
+        aria-selected={activeTab === "feed"}
+        aria-label="Feed"
+        className={activeTab === "feed" ? "active" : ""}
+        onClick={() => handleTab("feed")}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M3 11l18-8-8 18-2-7-8-3z" />
+        </svg>
+        {feedBadgeCount > 0 ? (
+          <span className="bottom-nav-badge">{feedBadgeCount}</span>
+        ) : null}
+      </button>
+
+      {/* News — Hacker News tech cards (explore) */}
+      <button
+        type="button"
+        role="tab"
+        aria-selected={activeTab === "news"}
+        aria-label="News"
+        className={activeTab === "news" ? "active" : ""}
+        onClick={() => handleTab("news")}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2" />
+          <path d="M18 14h-8M15 18h-5M10 6h8v4h-8V6z" />
+        </svg>
+      </button>
+
+      {/* Journal — capture/compose (pen/edit) */}
       <button
         type="button"
         role="tab"
@@ -47,7 +84,7 @@ export function BottomNav({
         </svg>
       </button>
 
-      {/* Queue — sparkles/wand icon (AI-generated content) */}
+      {/* Queue — AI-generated drafts (sparkles/wand) */}
       <button
         type="button"
         role="tab"
@@ -63,7 +100,7 @@ export function BottomNav({
         </svg>
       </button>
 
-      {/* Tasks — checkbox icon */}
+      {/* Tasks — productivity (checkbox) */}
       <button
         type="button"
         role="tab"
@@ -81,23 +118,7 @@ export function BottomNav({
         ) : null}
       </button>
 
-      {/* Feed — globe/compass icon (Nostr/discover) */}
-      <button
-        type="button"
-        role="tab"
-        aria-selected={activeTab === "feed"}
-        aria-label="Feed"
-        className={activeTab === "feed" ? "active" : ""}
-        onClick={() => handleTab("feed")}
-      >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <circle cx="12" cy="12" r="10" />
-          <line x1="2" y1="12" x2="22" y2="12" />
-          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
-        </svg>
-      </button>
-
-      {/* Profile — person icon */}
+      {/* Profile */}
       <button
         type="button"
         role="tab"
