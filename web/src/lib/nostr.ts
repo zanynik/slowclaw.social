@@ -621,6 +621,27 @@ export function fetchNotesByHashtag(
 }
 
 /**
+ * Fetch NIP-23 long-form articles (kind 30023 — the format Habla News uses).
+ * These power the Reads tab. Returns raw events (with `created_at` + tags) so
+ * the converter in socialFeed.ts can read title/summary/image/published_at
+ * from the NIP-23 tags. Newest first.
+ */
+export async function fetchLongFormArticles(
+  opts: { limit?: number; relays?: string[]; timeoutMs?: number } = {}
+): Promise<NostrEvent[]> {
+  const { limit = 20, relays = DEFAULT_RELAYS, timeoutMs = 8000 } = opts;
+  const events = await fetchEventsByFilter(
+    { kinds: [30023], limit: Math.min(limit * 2, 50) },
+    { relays, timeoutMs, limit: limit * 2 }
+  );
+  // Keep only articles with a title tag (well-formed NIP-23) and non-trivial body.
+  return events
+    .filter((ev) => (ev.tags || []).some((t) => t[0] === "title") && (ev.content || "").length > 200)
+    .sort((a, b) => b.created_at - a.created_at)
+    .slice(0, limit);
+}
+
+/**
  * Fetch NIP-01 kind-0 profile metadata for a set of pubkeys.
  * Returns the newest profile per pubkey. Tolerates malformed content JSON.
  */

@@ -92,25 +92,45 @@ export function extractNostrMedia(note: NostrNoteLike): UnifiedItem["media"] {
 interface BlueskyPostLike {
   uri: string;
   author: { did: string; handle: string; displayName?: string | null; avatar?: string | null };
-  record: { text: string; createdAt?: string };
-  embed?: {
-    $type?: string;
-    images?: Array<{ thumb?: string; fullsize?: string; alt?: string }>;
-    video?: string | null;
-    external?: { uri: string; title?: string; description?: string; thumb?: string };
-  };
+  record: { text: string; createdAt?: string; langs?: string[] };
+  embed?: any;
   indexedAt: string;
   likeCount?: number;
   repostCount?: number;
 }
 
-/** Pull image/video URLs from a Bluesky post's embed block. */
+/**
+ * Pull image/video URLs from a Bluesky post's embed block, handling the REAL
+ * AppView shapes (note the `#view` suffix and recordWithMedia nesting):
+ *   - images#view      → { $type, images:[{thumb,fullsize,alt}] }
+ *   - video#view        → { $type, playlist(.m3u8), thumbnail, aspectRatio }
+ *   - external#view     → { $type, external:{uri,title,thumb} }
+ *   - recordWithMedia   → { $type, record, media:<one of the above> }
+ * Returns the BEST single media (video > images > external-thumb).
+ */
 export function extractBlueskyMedia(post: BlueskyPostLike): UnifiedItem["media"] {
-  const images = post.embed?.images || [];
-  const videoUrl = post.embed?.video || undefined;
-  if (videoUrl) return { type: "video", urls: [videoUrl], thumbnailUrl: undefined };
-  const imgUrls = images.map((i) => i.fullsize || i.thumb).filter(Boolean) as string[];
-  if (imgUrls.length) return { type: "image", urls: imgUrls, thumbnailUrl: imgUrls[0] };
+  const raw = post.embed;
+  if (!raw) return { type: "none", urls: [] };
+  // Unwrap one level of recordWithMedia.
+  const e = raw.$type === "app.bsky.embed.recordWithMedia#view" ? raw.media : raw;
+  if (!e) return { type: "none", urls: [] };
+  // Video (HLS playlist + thumbnail).
+  if (e.$type === "app.bsky.embed.video#view") {
+    const playlist = e.playlist || e.video?.playlist;
+    const thumbnail = e.thumbnail || e.video?.thumbnail;
+    if (playlist || thumbnail) {
+      return { type: "video", urls: [playlist || ""].filter(Boolean), thumbnailUrl: thumbnail || undefined };
+    }
+  }
+  // Images.
+  if (e.$type === "app.bsky.embed.images#view" && Array.isArray(e.images) && e.images.length) {
+    const imgUrls = e.images.map((i: any) => i.fullsize || i.thumb).filter(Boolean) as string[];
+    if (imgUrls.length) return { type: "image", urls: imgUrls, thumbnailUrl: imgUrls[0] };
+  }
+  // External card thumbnail (fallback, for link previews).
+  if (e.$type === "app.bsky.embed.external#view" && e.external?.thumb) {
+    return { type: "image", urls: [e.external.thumb], thumbnailUrl: e.external.thumb };
+  }
   return { type: "none", urls: [] };
 }
 
@@ -152,6 +172,85 @@ export function toUnifiedFromHN(item: HNItemLike): UnifiedItem {
     author: { id: "hn", handle: item.source || "Hacker News" },
     content: { title: item.title, body: "", linkUrl: item.url },
     media: { type: "none", urls: [] },
+  };
+}
+
+/** Minimal shape of a Nostr long-form article (NIP-23 / kind 30023). */
+export interface NostrArticleLike {
+  id: string;
+  pubkey: string;
+  content: string; // markdown body
+  created_at: number;
+  tags?: string[][];
+}
+
+/**
+ * Convert a Nostr long-form article (Habla-style, kind 30023) to UnifiedItem.
+ * Pulls title/summary/image/published_at from the NIP-23 tags.
+ */
+export function toUnifiedFromNostrArticle(
+  article: NostrArticleLike,
+  handle?: string,
+  avatar?: string,
+): UnifiedItem {
+  const tags = article.tags || [];
+  const title = tags.find((t) => t[0] === "title")?.[1] || "Untitled";
+  const summary = tags.find((t) => t[0] === "summary")?.[1] || "";
+  const image = tags.find((t) => t[0] === "image")?.[1];
+  const publishedRaw = tags.find((t) => t[0] === "published_at")?.[1];
+  const published = publishedRaw ? Number(publishedRaw) : article.created_at;
+  return {
+    id: article.id,
+    sourcePlatform: "nostr",
+    timestamp: Number.isFinite(published) ? published : article.created_at,
+    author: { id: article.pubkey, handle: handle || article.pubkey.slice(0, 10), avatar },
+    content: {
+      title,
+      body: summary || article.content.slice(0, 280),
+      linkUrl: `https://habla.news/a/${article.id}`,
+    },
+    media: image
+      ? { type: "image", urls: [image], thumbnailUrl: image }
+      : { type: "none", urls: [] },
+  };
+}
+
+/** Minimal shape of an RSS item from the rss2json API. */
+export interface RssItemLike {
+  guid?: string;
+  link?: string;
+  title: string;
+  pubDate?: string;
+  description?: string;
+  content?: string;
+  thumbnail?: string;
+  enclosure?: { link?: string; type?: string };
+  categories?: string[];
+}
+
+/**
+ * Convert an RSS item (from rss2json) to UnifiedItem. Strips HTML from the
+ * description for the body preview; uses enclosure/thumbnail as cover image.
+ */
+export function toUnifiedFromRss(item: RssItemLike, feedTitle: string): UnifiedItem {
+  const tsMs = item.pubDate ? Date.parse(item.pubDate) : NaN;
+  const stripHtml = (s: string) => (s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const bodyRaw = stripHtml(item.description || item.content || "");
+  const thumb =
+    item.thumbnail ||
+    item.enclosure?.link ||
+    (/<img[^>]+src="([^"]+)"/i.exec(item.content || "")?.[1]);
+  return {
+    id: `rss-${item.guid || item.link || item.title}`,
+    sourcePlatform: "rss",
+    timestamp: Number.isFinite(tsMs) ? Math.floor(tsMs / 1000) : 0,
+    author: { id: feedTitle, handle: feedTitle },
+    content: {
+      title: stripHtml(item.title),
+      body: bodyRaw.slice(0, 320),
+      linkUrl: item.link,
+    },
+    media: thumb ? { type: "image", urls: [thumb], thumbnailUrl: thumb } : { type: "none", urls: [] },
   };
 }
 

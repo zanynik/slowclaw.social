@@ -461,6 +461,30 @@ export async function sendAuthedXrpcRequest(args: {
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** A minimal, plain view of a public Bluesky post (subset we render). */
+export type BlueskyImage = { thumb?: string; fullsize?: string; alt?: string; aspectRatio?: { width: number; height: number } };
+export type BlueskyVideoView = {
+  cid?: string;
+  /** HLS playlist (.m3u8). iOS Safari/WKWebView plays HLS natively. */
+  playlist?: string;
+  thumbnail?: string;
+  aspectRatio?: { width: number; height: number };
+};
+export type BlueskyExternalView = { uri: string; title?: string; description?: string; thumb?: string };
+
+/**
+ * Discriminated embed union matching the REAL AppView response shapes
+ * (note the `#view` suffix on `$type`). The previous flat shape (looking for
+ * `embed.video` as a string) was wrong and silently dropped video embeds.
+ */
+export type BlueskyEmbedView =
+  | { $type: "app.bsky.embed.images#view"; images: BlueskyImage[] }
+  | { $type: "app.bsky.embed.video#view"; video?: BlueskyVideoView; playlist?: string; thumbnail?: string; cid?: string; aspectRatio?: { width: number; height: number } }
+  // Some responses inline the video fields directly (playlist/thumbnail).
+  | ({ $type: "app.bsky.embed.video#view" } & BlueskyVideoView)
+  | { $type: "app.bsky.embed.external#view"; external: BlueskyExternalView }
+  | { $type: "app.bsky.embed.record#view"; record: { uri?: string; author?: { handle?: string; displayName?: string | null; avatar?: string | null }; value?: { text?: string } } }
+  | { $type: "app.bsky.embed.recordWithMedia#view"; record: { record?: { uri?: string; author?: { handle?: string; displayName?: string | null; avatar?: string | null }; value?: { text?: string } } }; media: BlueskyEmbedView };
+
 export type BlueskyPublicPost = {
   uri: string;
   cid: string;
@@ -476,13 +500,7 @@ export type BlueskyPublicPost = {
     langs?: string[];
     reply?: { root?: { uri: string }; parent?: { uri: string } };
   };
-  embed?: {
-    $type?: string;
-    images?: Array<{ thumb?: string; fullsize?: string; alt?: string }>;
-    video?: string | null;
-    playlists?: unknown;
-    external?: { uri: string; title?: string; description?: string; thumb?: string };
-  };
+  embed?: BlueskyEmbedView & Record<string, unknown>;
   likeCount?: number;
   repostCount?: number;
   replyCount?: number;
@@ -523,17 +541,75 @@ function epochFromIso(iso: string): number {
  */
 export async function searchPublicBlueskyPosts(
   query: string,
-  opts: BlueskyFetchOpts = {}
+  opts: BlueskyFetchOpts & { lang?: string; sinceHours?: number } = {}
 ): Promise<BlueskyPublicPost[]> {
   const q = query.trim();
   if (!q) return [];
   const limit = Math.min(opts.limit ?? 25, 100);
+  const params: Record<string, string> = { q, limit: String(limit), sort: "latest" };
+  // LEVER: server-side language filter. `lang=en` returns 49/49 English posts
+  // (validated live). Cleanest language lever for Bluesky — no client
+  // detection needed. Defaults to English; pass "" to disable.
+  const lang = opts.lang ?? "en";
+  if (lang) params.lang = lang;
+  if (opts.sinceHours) {
+    params.since = new Date(Date.now() - opts.sinceHours * 3600_000).toISOString();
+  }
   const data = await blueskyPublicGet<{ posts: BlueskyPublicPost[] }>(
     "app.bsky.feed.searchPosts",
-    { q, limit: String(limit), sort: "latest" },
+    params,
     opts,
   );
   return data.posts || [];
+}
+
+/**
+ * Convenience: search Bluesky posts that have a video embed. Used by the Reels
+ * tab. Searches broadly then filters client-side to video-bearing posts (there
+ * is no server-side "videos only" param). Returns posts newest-first.
+ */
+export async function searchPublicBlueskyVideos(
+  query: string,
+  opts: BlueskyFetchOpts & { lang?: string } = {},
+): Promise<BlueskyPublicPost[]> {
+  const posts = await searchPublicBlueskyPosts(query, { ...opts, limit: opts.limit ?? 40 });
+  return posts.filter((p) => blueskyVideoOf(p) !== null);
+}
+
+/**
+ * Curated set of visually-rich topics for the Reels tab. Because Bluesky has no
+ * server-side "videos only" search, the Reels feed is assembled by searching
+ * several video-heavy topics and merging unique results. Validated live: this
+ * list of 12 topics yields ~20 unique videos across a fresh search window.
+ */
+export const REELS_VIDEO_TOPICS = [
+  "video", "music", "comedy", "nature", "art", "dance",
+  "sports", "cat", "dog", "gaming", "skate", "food",
+];
+
+/**
+ * Assemble a Reels feed by merging video-bearing posts across several topics,
+ * deduplicated by URI, newest-first. This is the volume strategy for the Reels
+ * tab (single-topic searches return only 1-3 videos each).
+ */
+export async function fetchBlueskyReelsFeed(
+  opts: BlueskyFetchOpts & { lang?: string; topics?: string[] } = {},
+): Promise<BlueskyPublicPost[]> {
+  const topics = opts.topics ?? REELS_VIDEO_TOPICS;
+  const results = await Promise.allSettled(
+    topics.map((t) => searchPublicBlueskyVideos(t, { ...opts, limit: 50 })),
+  );
+  const seen = new Set<string>();
+  const merged: BlueskyPublicPost[] = [];
+  for (const r of results) {
+    if (r.status !== "fulfilled") continue;
+    for (const p of r.value) {
+      if (seen.has(p.uri)) continue;
+      seen.add(p.uri);
+      merged.push(p);
+    }
+  }
+  return merged.sort((a, b) => blueskyPostTimestamp(b) - blueskyPostTimestamp(a));
 }
 
 /**
@@ -575,4 +651,60 @@ export async function resolveBlueskyHandle(handle: string, opts: BlueskyFetchOpt
 /** Convenience: epoch seconds from a BlueskyPublicPost. */
 export function blueskyPostTimestamp(post: BlueskyPublicPost): number {
   return epochFromIso(post.indexedAt || post.record?.createdAt || "");
+}
+
+/**
+ * Unwrap a recordWithMedia embed to its inner media embed, otherwise return
+ * the embed as-is. Lets all the extractors below handle one level of nesting.
+ */
+function unwrapMediaEmbed(embed: BlueskyEmbedView | undefined): BlueskyEmbedView | undefined {
+  if (!embed) return undefined;
+  if (embed.$type === "app.bsky.embed.recordWithMedia#view") {
+    return embed.media;
+  }
+  return embed;
+}
+
+/**
+ * Extract the video view (playlist HLS url + thumbnail) from a post, handling
+ * both top-level `video#view` and nested `recordWithMedia` media. Returns null
+ * when the post has no video.
+ */
+export function blueskyVideoOf(post: BlueskyPublicPost): BlueskyVideoView | null {
+  const e = unwrapMediaEmbed(post.embed as BlueskyEmbedView | undefined);
+  if (!e || e.$type !== "app.bsky.embed.video#view") return null;
+  // Two shapes observed: fields inlined (playlist/thumbnail) or nested under `video`.
+  const anyE = e as unknown as BlueskyVideoView & { video?: BlueskyVideoView };
+  const playlist = anyE.playlist || anyE.video?.playlist;
+  const thumbnail = anyE.thumbnail || anyE.video?.thumbnail;
+  if (!playlist && !thumbnail) return null;
+  return { playlist, thumbnail, aspectRatio: anyE.aspectRatio || anyE.video?.aspectRatio, cid: anyE.cid || anyE.video?.cid };
+}
+
+/** Extract image array (handles nesting). Empty when none. */
+export function blueskyImagesOf(post: BlueskyPublicPost): BlueskyImage[] {
+  const e = unwrapMediaEmbed(post.embed as BlueskyEmbedView | undefined);
+  if (!e || e.$type !== "app.bsky.embed.images#view") return [];
+  return e.images || [];
+}
+
+/** Extract an external link card (handles nesting). Null when none. */
+export function blueskyExternalOf(post: BlueskyPublicPost): BlueskyExternalView | null {
+  const e = unwrapMediaEmbed(post.embed as BlueskyEmbedView | undefined);
+  if (!e || e.$type !== "app.bsky.embed.external#view") return null;
+  return e.external || null;
+}
+
+/** Extract a quoted/parent record (handles nesting). Null when none. */
+export function blueskyQuotedRecordOf(post: BlueskyPublicPost): { uri?: string; handle?: string; name?: string; avatar?: string; text?: string } | null {
+  const raw = post.embed as BlueskyEmbedView | undefined;
+  if (!raw) return null;
+  if (raw.$type === "app.bsky.embed.record#view") {
+    return { uri: raw.record?.uri, handle: raw.record?.author?.handle || undefined, name: raw.record?.author?.displayName || undefined, avatar: raw.record?.author?.avatar || undefined, text: raw.record?.value?.text };
+  }
+  if (raw.$type === "app.bsky.embed.recordWithMedia#view") {
+    const r = raw.record?.record;
+    return r ? { uri: r.uri, handle: r.author?.handle || undefined, name: r.author?.displayName || undefined, avatar: r.author?.avatar || undefined, text: r.value?.text } : null;
+  }
+  return null;
 }
