@@ -57,6 +57,7 @@ pub mod media;
 pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;
+pub mod nostr_store;
 pub mod observability;
 pub(crate) mod onboard;
 pub mod providers;

@@ -22,6 +22,7 @@ The binary name is `slowclaw`.
 - `workspace-script <relative/path>` scheduled command support
 - PocketBase delivery for cron/heartbeat output
 - Gateway-managed local SQLite store for chat, drafts, history, todos, events, and feed metadata
+- Local Nostr store at `state/nostr.db` — a persistent, on-device cache of Nostr events, profiles, reactions, replies, and articles, populated by a background ingester (see [Local Nostr Store](#local-nostr-store))
 - `memory/` folder structure (unchanged)
 
 ## What This Fork Removes
@@ -239,6 +240,17 @@ Optional override for migration source:
 ```bash
 ZEROCLAW_LEGACY_POCKETBASE_DATA_DIR=/absolute/path/to/pb_data ./target/release/slowclaw gateway
 ```
+
+## Local Nostr Store
+
+Under the Tauri (desktop + iOS) shell, SlowClaw runs a background ingester that maintains a persistent, on-device cache of Nostr events in a dedicated SQLite database at `state/nostr.db` (kept separate from the gateway's `state/local_data.db` to avoid WAL contention and allow independent reset).
+
+- events, profiles (kind 0), reactions (kind 7), replies, and long-form articles (kind 30023) are cached with an inverted tag index (`#e`, `#p`, `#t`, `#d`, `#a`) for fast local queries
+- the `npub` for each author is precomputed once at ingest, retiring the per-render bech32 encode the browser path used to do
+- the web UI reads the feed, profiles, reactions, replies, and articles from the local store via Tauri IPC instead of re-hitting relays on every load — the browser-direct WebSocket path is retained as the standalone web/demo fallback
+- publishing (notes, reactions, replies) signs with the user's keys and goes out through the persistent relay client; the own event is ingested immediately so it appears in the UI without waiting for a round-trip
+
+The store file lives strictly under `workspace_dir/state/`, honoring the workspace-only file policy. Resetting it (delete `state/nostr.db`) does not affect any other app data.
 
 ## Scheduling Workspace Scripts
 

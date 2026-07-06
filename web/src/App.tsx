@@ -27,6 +27,19 @@ import {
   type NostrProfile,
   type NostrEvent,
 } from "./lib/nostr";
+// ── On-device Nostr store (Tauri-only; null outside the native runtime) ──────
+import {
+  cachedNpub,
+  nostrGetNote,
+  nostrGetProfiles,
+  nostrGetReactions,
+  nostrGetReplies,
+  nostrPublishReaction,
+  nostrPublishReply,
+  nostrQueryNotes,
+  nostrStoreStatus,
+  type NostrStoreStatus,
+} from "./lib/nostrLocalStore";
 // ── Nostr content-quality filter (language + spam + dedup) ───────────────────
 import { filterNostrFeed, type NostrFeedStats } from "./lib/feedFilter";
 // ── RSS/Atom feeds (Reads tab) ────────────────────────────────────────────────
@@ -1228,6 +1241,12 @@ function hasInlineVideoUrl(text: string) {
 function App() {
   const isDesktopClient = isTauriDesktopRuntime();
   const isNativeClient = isDesktopClient || isTauriMobileRuntime();
+  // When true, Nostr read/publish routes through the on-device store (Tauri
+  // IPC). When false (web/demo), falls back to direct browser WebSocket reads.
+  // Default to the native path so the store is preferred from first paint;
+  // a status poll below downgrades this if the ingester isn't actually running.
+  const [nostrLocalStoreStatus, setNostrLocalStoreStatus] = useState<NostrStoreStatus | null>(null);
+  const useNostrLocalStore = isNativeClient && nostrLocalStoreStatus?.running !== false;
   const isLargeScreen = useIsLargeScreen();
   const scrollDirection = useScrollDirection(8);
   const isDesktopLayout = isDesktopClient || isLargeScreen;
@@ -1711,6 +1730,23 @@ function App() {
     }
     void saveCredentialsSecure(creds);
   }, [creds, secureStoreReady]);
+
+  // Poll the on-device Nostr store status so the UI knows whether the
+  // background ingester is running. Outside Tauri this is a no-op.
+  useEffect(() => {
+    if (!isNativeClient) return;
+    let cancelled = false;
+    const poll = async () => {
+      const status = await nostrStoreStatus();
+      if (!cancelled) setNostrLocalStoreStatus(status);
+    };
+    void poll();
+    const id = window.setInterval(poll, 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [isNativeClient]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -5154,6 +5190,16 @@ function App() {
   }
 
   async function handleNostrReaction(eventId: string, relayUrl: string) {
+    if (useNostrLocalStore) {
+      // Sign + publish via the Rust ingester's persistent client. The ingester
+      // also ingests our own event so the like count updates instantly.
+      const result = await nostrPublishReaction(eventId, "+");
+      if (result?.published) {
+        // Optimistically bump the local reaction count.
+        setNostrReactions((prev) => ({ ...prev, [eventId]: (prev[eventId] ?? 0) + 1 }));
+      }
+      return;
+    }
     const keys = await ensureNostrKeys();
     if (!keys) return;
     try {
@@ -5166,8 +5212,20 @@ function App() {
   }
 
   async function handleNostrReply(eventId: string, relayUrl: string, content: string) {
+    if (!content.trim()) return;
+    if (useNostrLocalStore) {
+      const result = await nostrPublishReply(eventId, relayUrl, content.trim());
+      if (result?.published) {
+        // Optimistically show the reply inline.
+        setNostrReplyThreads((prev) => ({
+          ...prev,
+          [eventId]: [...(prev[eventId] ?? [])],
+        }));
+      }
+      return;
+    }
     const keys = await ensureNostrKeys();
-    if (!keys || !content.trim()) return;
+    if (!keys) return;
     try {
       const nostrModule = await import("./lib/nostr");
       const event = await nostrModule.createSignedEvent(keys.secretKeyHex, 1, content.trim(), [["e", eventId, relayUrl, "reply"]]);
@@ -6560,16 +6618,28 @@ function App() {
     setNostrFeedLoading(true);
     setSocialFeedError("");
     try {
-      // LEVER selection: if an active Nostr channel is a hashtag, subscribe via
-      // NIP-12 at the relay (source-side filter → guaranteed content for popular
-      // tags). Otherwise stream the firehose. We no longer rely on the
-      // journal-keyword + NIP-50 path, which returned 0 notes for rare terms.
+      // LEVER selection: if an active Nostr channel is a hashtag, scope the
+      // query to that tag. Otherwise read broadly.
       const channel = activeChannelId
         ? channelsForSource("nostr").find((c) => c.id === activeChannelId)
         : undefined;
+      const hashtag = channel && channel.lever === "nostr-hashtag" && channel.query
+        ? channel.query.toLowerCase()
+        : undefined;
+
       let notes: NostrNote[];
-      if (channel && channel.lever === "nostr-hashtag" && channel.query) {
-        notes = await fetchNotesByHashtag([channel.query], { limit: 40 });
+      if (useNostrLocalStore) {
+        // On-device store path: query the local SQLite store populated by the
+        // background ingester. The ingester subscribes to the configured
+        // hashtag channels continuously, so this is a local lookup — no relay
+        // round-trip per load.
+        notes = await nostrQueryNotes({
+          kinds: [1],
+          ...(hashtag ? { hashtags: [hashtag] } : {}),
+          limit: 60,
+        });
+      } else if (hashtag) {
+        notes = await fetchNotesByHashtag([hashtag], { limit: 40 });
       } else {
         notes = await fetchNotesFromRelays({ limit: 40 });
       }
@@ -6703,6 +6773,35 @@ function App() {
       const parentIds = [...new Set(
         notes.map((n) => getReplyParentId(n)).filter((p): p is string => !!p)
       )];
+
+      if (useNostrLocalStore) {
+        // Local-store path: the ingester keeps profiles/reactions/parents fresh,
+        // so this is three cheap local lookups — no relay round-trips on a warm
+        // cache. We still issue relay fetches below only for genuine cache
+        // misses (pubkeys/parents the ingester hasn't seen yet).
+        const [profiles, reactions, parents] = await Promise.all([
+          nostrGetProfiles(pubkeys),
+          nostrGetReactions(ids),
+          parentIds.length
+            ? Promise.all(parentIds.map((id) => fetchLocalNote(id))).then((arr) => {
+                const m = new Map<string, NostrNote>();
+                arr.forEach((n) => { if (n) m.set(n.id, n); });
+                return m;
+              })
+            : Promise.resolve(new Map<string, NostrNote>()),
+        ]);
+        setNostrProfiles((prev) => ({ ...prev, ...Object.fromEntries(profiles) }));
+        setNostrReactions((prev) => ({ ...prev, ...Object.fromEntries(reactions) }));
+        setNostrParentNotes((prev) => ({ ...prev, ...Object.fromEntries(parents) }));
+        // Backfill any pubkeys the store didn't have.
+        const missingPubs = pubkeys.filter((p) => !profiles.has(p));
+        if (missingPubs.length) {
+          const pm = await fetchProfiles(missingPubs);
+          setNostrProfiles((prev) => ({ ...prev, ...Object.fromEntries(pm) }));
+        }
+        return;
+      }
+
       const [profiles, reactions, parents] = await Promise.all([
         fetchProfiles(pubkeys),
         fetchReactionsForEvents(ids),
@@ -6722,17 +6821,26 @@ function App() {
     }
   }
 
+  /** Local-store lookup of a single note by id (used for reply-parent enrichment). */
+  async function fetchLocalNote(eventId: string): Promise<NostrNote | null> {
+    return nostrGetNote(eventId);
+  }
+
   /** Lazy-load the replies (kind 1) for a single note and expand them inline. */
   async function loadNostrReplies(eventId: string) {
     setNostrRepliesLoading((prev) => ({ ...prev, [eventId]: true }));
     try {
-      const replies = await fetchRepliesForEvent(eventId);
+      const replies = useNostrLocalStore
+        ? await nostrGetReplies(eventId)
+        : await fetchRepliesForEvent(eventId);
       setNostrReplyThreads((prev) => ({ ...prev, [eventId]: replies }));
       // Expand only if there are replies to show (keeps the UI tidy when empty).
       setNostrRepliesLoading((prev) => ({ ...prev, [eventId]: false }));
       if (replies.length) {
         const pubs = [...new Set(replies.map((r) => r.pubkey))];
-        const pm = await fetchProfiles(pubs);
+        const pm = useNostrLocalStore
+          ? await nostrGetProfiles(pubs)
+          : await fetchProfiles(pubs);
         setNostrProfiles((prev) => ({ ...prev, ...Object.fromEntries(pm) }));
       }
     } catch {
@@ -6814,6 +6922,11 @@ function App() {
   function nostrDisplayName(pubkey: string, profile?: NostrProfile | null): string {
     if (profile?.displayName?.trim()) return profile.displayName.trim();
     if (profile?.name?.trim()) return profile.name.trim();
+    // Prefer the npub precomputed at ingest (in the local store) over a
+    // per-render bech32 encode. Only fall back to npubFromHex when the store
+    // hasn't cached this pubkey yet (e.g. web/demo build).
+    const cached = cachedNpub(pubkey);
+    if (cached) return cached.slice(0, 12) + "…" + cached.slice(-6);
     try {
       const npub = npubFromHex(pubkey);
       return npub.slice(0, 12) + "…" + npub.slice(-6);
@@ -7204,10 +7317,12 @@ function App() {
     setProfileViewLoading(true);
     setNostrProfileOverlay(null);
     try {
-      const [profileMap, notes] = await Promise.all([
-        fetchProfiles([pubkey]),
-        fetchNotesFromRelays({ authors: [pubkey], limit: 20 }),
-      ]);
+      const profileMap = useNostrLocalStore
+        ? await nostrGetProfiles([pubkey])
+        : await fetchProfiles([pubkey]);
+      const notes = useNostrLocalStore
+        ? await nostrQueryNotes({ authors: [pubkey], limit: 20 })
+        : await fetchNotesFromRelays({ authors: [pubkey], limit: 20 });
       setNostrProfileOverlay(profileMap.get(pubkey) || null);
       setProfileViewNotes(notes);
     } catch {

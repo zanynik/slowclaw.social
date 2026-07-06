@@ -11,9 +11,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::async_runtime::JoinHandle;
 use tauri::Manager;
 
-mod inference;
-mod transcription;
 pub mod commands;
+mod inference;
+mod nostr_ingest;
+mod transcription;
 
 const EMBEDDED_GATEWAY_URL: &str = "http://127.0.0.1:42617";
 const PROVIDER_SECRET_SERVICE: &str = "social.slowclaw.gateway";
@@ -25,6 +26,11 @@ const OPENAI_DEVICE_LOGIN_PROFILE: &str = "default";
 const NATIVE_LOCAL_AI_PROVIDER: &str = "slowclaw-local";
 const NATIVE_LOCAL_AI_URL: &str = "slowclaw-native://local";
 const NATIVE_JOURNAL_INDEX_DIR: &str = "native_journals";
+/// Secure-storage locator for the Nostr key bundle (mirrors the frontend's
+/// `secureStorage.ts` constants). The stored value is JSON:
+/// `{"nsec","npub","secretKeyHex","publicKeyHex"}`.
+const NOSTR_KEYS_SECRET_SERVICE: &str = "com.example.myskyposter";
+const NOSTR_KEYS_SECRET_ACCOUNT: &str = "nostr.keys";
 
 #[derive(Debug, Deserialize)]
 struct SecretGetRequest {
@@ -207,6 +213,102 @@ impl Default for NativeLocalAiRuntimeState {
 #[derive(Clone, Default)]
 pub(crate) struct NativeLocalAiState {
     pub(crate) inner: Arc<Mutex<NativeLocalAiRuntimeState>>,
+}
+
+/// Runtime state for the background Nostr ingester. Holds the persistent
+/// client behind a tokio Mutex so publish commands can reuse the same relay
+/// connections the ingester maintains.
+#[derive(Debug)]
+struct NostrIngestRuntimeState {
+    running: bool,
+    last_error: Option<String>,
+    relays: Vec<String>,
+    hashtag_channels: Vec<String>,
+    events_ingested: i64,
+    last_event_at: Option<String>,
+    db_path: Option<PathBuf>,
+    /// Wrapped client shared with publish commands. `None` when the ingester
+    /// is stopped or failed to start.
+    client: Arc<tokio::sync::Mutex<Option<Arc<nostr_sdk::Client>>>>,
+    /// Background drain task handle.
+    ingest_handle: Option<JoinHandle<()>>,
+}
+
+impl Default for NostrIngestRuntimeState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            last_error: None,
+            relays: nostr_ingest::DEFAULT_INGESTER_RELAYS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            hashtag_channels: nostr_ingest::DEFAULT_HASHTAG_CHANNELS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            events_ingested: 0,
+            last_event_at: None,
+            db_path: None,
+            client: Arc::new(tokio::sync::Mutex::new(None)),
+            ingest_handle: None,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct NostrIngestState {
+    pub(crate) inner: Arc<Mutex<NostrIngestRuntimeState>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NostrStoreStatus {
+    running: bool,
+    relays: Vec<String>,
+    hashtag_channels: Vec<String>,
+    events_ingested: i64,
+    last_event_at: Option<String>,
+    db_path: Option<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NostrQueryRequest {
+    /// Hex pubkeys to filter on.
+    #[serde(default)]
+    authors: Vec<String>,
+    /// Lowercase hashtag values (no `#`).
+    #[serde(default)]
+    hashtags: Vec<String>,
+    /// Event kinds (e.g. 1, 30023).
+    #[serde(default)]
+    kinds: Vec<i64>,
+    /// UNIX-seconds lower bound.
+    #[serde(default)]
+    since: Option<i64>,
+    /// UNIX-seconds upper bound.
+    #[serde(default)]
+    until: Option<i64>,
+    /// Cap on rows. Defaults to 50 server-side.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NostrArticleQueryRequest {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NostrPublishResult {
+    event_id: String,
+    published: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,7 +557,11 @@ fn validate_secret_locator(service: &str, account: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn ui_command_error(context: &str, user_message: &str, err: impl std::fmt::Display) -> String {
+pub(crate) fn ui_command_error(
+    context: &str,
+    user_message: &str,
+    err: impl std::fmt::Display,
+) -> String {
     eprintln!("{context}: {err}");
     user_message.to_string()
 }
@@ -709,6 +815,32 @@ fn snapshot_native_local_ai_status(
 ) -> Result<NativeLocalAiStatus, String> {
     let guard = lock_native_local_ai_state(state)?;
     Ok(guard.status.clone())
+}
+
+fn lock_nostr_ingest_state<'a>(
+    state: &'a Arc<Mutex<NostrIngestRuntimeState>>,
+) -> Result<std::sync::MutexGuard<'a, NostrIngestRuntimeState>, String> {
+    state
+        .lock()
+        .map_err(|_| "nostr ingest state lock poisoned".to_string())
+}
+
+/// Build a serializable snapshot of the ingester status. Reads the live
+/// `events_ingested` / `last_event_at` from the store so the count stays
+/// current even when the background task hasn't updated state recently.
+fn snapshot_nostr_ingest_status(
+    state: &Arc<Mutex<NostrIngestRuntimeState>>,
+) -> Result<NostrStoreStatus, String> {
+    let guard = lock_nostr_ingest_state(state)?;
+    Ok(NostrStoreStatus {
+        running: guard.running,
+        relays: guard.relays.clone(),
+        hashtag_channels: guard.hashtag_channels.clone(),
+        events_ingested: guard.events_ingested,
+        last_event_at: guard.last_event_at.clone(),
+        db_path: guard.db_path.as_ref().map(|p| p.display().to_string()),
+        last_error: guard.last_error.clone(),
+    })
 }
 
 fn read_keyring_secret(service: &str, account: &str) -> Result<Option<String>, String> {
@@ -1052,7 +1184,9 @@ fn configure_app_owned_workspace(app: &tauri::App) {
     }
 }
 
-pub(crate) async fn load_workspace_config_for_ui(context: &str) -> Result<zeroclaw::Config, String> {
+pub(crate) async fn load_workspace_config_for_ui(
+    context: &str,
+) -> Result<zeroclaw::Config, String> {
     zeroclaw::Config::load_or_init()
         .await
         .map_err(|e| ui_command_error(context, "Failed to load the workspace configuration.", e))
@@ -1085,14 +1219,21 @@ fn safe_filename(value: &str, fallback: &str) -> String {
 }
 
 fn title_from_path(path: &Path) -> String {
-    let raw = path.file_stem()
+    let raw = path
+        .file_stem()
         .and_then(|value| value.to_str())
         .map(|value| value.replace(['-', '_'], " "))
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "Journal entry".to_string());
     // Strip leading Unix timestamp (10+ digits) prefix for cleaner display
     let trimmed = raw.trim_start();
-    if trimmed.len() > 11 && trimmed.as_bytes().iter().take(10).all(|b| b.is_ascii_digit()) {
+    if trimmed.len() > 11
+        && trimmed
+            .as_bytes()
+            .iter()
+            .take(10)
+            .all(|b| b.is_ascii_digit())
+    {
         let after_digits = trimmed.trim_start_matches(|c: char| c.is_ascii_digit());
         let title_part = after_digits.trim();
         if !title_part.is_empty() {
@@ -1898,15 +2039,31 @@ async fn rename_journal(id: String, new_title: String) -> Result<JournalEntry, S
     }
     // Keep the same timestamp prefix, replace the title part of the filename
     let filename = old_path.file_name().unwrap_or_default().to_string_lossy();
-    let extension = old_path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "txt".to_string());
+    let extension = old_path
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| "txt".to_string());
     // Filename format: {timestamp}-{title}.{ext}
     let new_filename = if let Some(dash_pos) = filename.find('-') {
         let timestamp_part = &filename[..dash_pos];
-        format!("{}-{}.{}", timestamp_part, safe_filename(new_title_trimmed, "journal-entry"), extension)
+        format!(
+            "{}-{}.{}",
+            timestamp_part,
+            safe_filename(new_title_trimmed, "journal-entry"),
+            extension
+        )
     } else {
-        format!("{}-{}.{}", unix_time_label(), safe_filename(new_title_trimmed, "journal-entry"), extension)
+        format!(
+            "{}-{}.{}",
+            unix_time_label(),
+            safe_filename(new_title_trimmed, "journal-entry"),
+            extension
+        )
     };
-    let new_path = old_path.parent().unwrap_or(&config.workspace_dir).join(&new_filename);
+    let new_path = old_path
+        .parent()
+        .unwrap_or(&config.workspace_dir)
+        .join(&new_filename);
     if new_path != old_path {
         std::fs::rename(&old_path, &new_path).map_err(|e| {
             ui_command_error(
@@ -2202,18 +2359,16 @@ async fn native_ai_load_model(
     state: tauri::State<'_, NativeLocalAiState>,
 ) -> Result<String, String> {
     let status = snapshot_native_local_ai_status(&state.inner)?;
-    let model_id = status.model_id.ok_or(
-        "No model configured. Download and select a model from the Profile tab.",
-    )?;
-    let model_path = status.model_path.ok_or(
-        "No model path configured. Download and select a model from the Profile tab.",
-    )?;
+    let model_id = status
+        .model_id
+        .ok_or("No model configured. Download and select a model from the Profile tab.")?;
+    let model_path = status
+        .model_path
+        .ok_or("No model path configured. Download and select a model from the Profile tab.")?;
     // Run model loading on a blocking thread to avoid blocking the async runtime
-    tauri::async_runtime::spawn_blocking(move || {
-        inference::load_model(&model_id, &model_path)
-    })
-    .await
-    .map_err(|e| format!("Model load task failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || inference::load_model(&model_id, &model_path))
+        .await
+        .map_err(|e| format!("Model load task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -2279,7 +2434,9 @@ fn set_metal_mode(enabled: bool) {
 }
 
 #[tauri::command]
-async fn transcribe_audio(audio_path: String) -> Result<transcription::TranscriptionResult, String> {
+async fn transcribe_audio(
+    audio_path: String,
+) -> Result<transcription::TranscriptionResult, String> {
     let path = audio_path.trim().to_string();
     if path.is_empty() {
         return Err("audio_path is required".to_string());
@@ -2354,22 +2511,386 @@ async fn read_journal_media_bytes(id: String) -> Result<JournalMediaBytes, Strin
     })
 }
 
+/// Resolve the workspace_dir for a Nostr-store command. Centralized so every
+/// command uses the same error wording.
+async fn nostr_workspace_dir() -> Result<PathBuf, String> {
+    let config = load_workspace_config_for_ui("nostr store").await?;
+    Ok(config.workspace_dir.clone())
+}
+
+#[tauri::command]
+async fn nostr_store_status(
+    state: tauri::State<'_, NostrIngestState>,
+) -> Result<NostrStoreStatus, String> {
+    // Refresh counts from the store so the UI sees live progress.
+    let workspace = nostr_workspace_dir().await.ok();
+    if let Some(ws) = workspace {
+        let ws_clone = ws.clone();
+        let (count, last) = tauri::async_runtime::spawn_blocking(move || {
+            let count = nostr_ingest::event_count(&ws_clone).unwrap_or(0);
+            let last = nostr_ingest::last_received_at(&ws_clone).ok().flatten();
+            (count, last)
+        })
+        .await
+        .map_err(|e| format!("nostr status task failed: {e}"))?;
+        if let Ok(mut guard) = state.inner.lock() {
+            guard.events_ingested = count;
+            guard.last_event_at = last;
+        }
+    }
+    snapshot_nostr_ingest_status(&state.inner)
+}
+
+#[tauri::command]
+async fn nostr_query_notes(
+    req: NostrQueryRequest,
+) -> Result<Vec<zeroclaw::nostr_store::NoteRecord>, String> {
+    let workspace = nostr_workspace_dir().await?;
+    let query = zeroclaw::nostr_store::NoteQuery {
+        authors: if req.authors.is_empty() {
+            None
+        } else {
+            Some(req.authors)
+        },
+        hashtags: if req.hashtags.is_empty() {
+            None
+        } else {
+            Some(req.hashtags)
+        },
+        kinds: if req.kinds.is_empty() {
+            None
+        } else {
+            Some(req.kinds)
+        },
+        since: req.since,
+        until: req.until,
+        limit: req.limit,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        zeroclaw::nostr_store::query_notes(&workspace, &query)
+    })
+    .await
+    .map_err(|e| format!("nostr query task failed: {e}"))?
+    .map_err(|e| format!("Failed to query nostr notes: {e}"))
+}
+
+#[tauri::command]
+async fn nostr_get_note(
+    event_id: String,
+) -> Result<Option<zeroclaw::nostr_store::NoteRecord>, String> {
+    let workspace = nostr_workspace_dir().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        zeroclaw::nostr_store::get_note(&workspace, &event_id)
+    })
+    .await
+    .map_err(|e| format!("nostr get_note task failed: {e}"))?
+    .map_err(|e| format!("Failed to read nostr note: {e}"))
+}
+
+#[tauri::command]
+async fn nostr_get_profiles(
+    pubkeys: Vec<String>,
+) -> Result<Vec<zeroclaw::nostr_store::ProfileRecord>, String> {
+    let workspace = nostr_workspace_dir().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        zeroclaw::nostr_store::get_profiles(&workspace, &pubkeys)
+    })
+    .await
+    .map_err(|e| format!("nostr profiles task failed: {e}"))?
+    .map_err(|e| format!("Failed to query nostr profiles: {e}"))
+}
+
+#[tauri::command]
+async fn nostr_get_reactions(
+    event_ids: Vec<String>,
+) -> Result<std::collections::HashMap<String, i64>, String> {
+    let workspace = nostr_workspace_dir().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        zeroclaw::nostr_store::get_reactions(&workspace, &event_ids)
+    })
+    .await
+    .map_err(|e| format!("nostr reactions task failed: {e}"))?
+    .map_err(|e| format!("Failed to query nostr reactions: {e}"))
+}
+
+#[tauri::command]
+async fn nostr_get_replies(
+    event_id: String,
+) -> Result<Vec<zeroclaw::nostr_store::NoteRecord>, String> {
+    let workspace = nostr_workspace_dir().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        zeroclaw::nostr_store::get_replies(&workspace, &event_id)
+    })
+    .await
+    .map_err(|e| format!("nostr replies task failed: {e}"))?
+    .map_err(|e| format!("Failed to query nostr replies: {e}"))
+}
+
+#[tauri::command]
+async fn nostr_get_articles(
+    req: NostrArticleQueryRequest,
+) -> Result<Vec<zeroclaw::nostr_store::ArticleRecord>, String> {
+    let workspace = nostr_workspace_dir().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        zeroclaw::nostr_store::get_articles(&workspace, req.limit)
+    })
+    .await
+    .map_err(|e| format!("nostr articles task failed: {e}"))?
+    .map_err(|e| format!("Failed to query nostr articles: {e}"))
+}
+
+#[tauri::command]
+async fn nostr_ingest_refresh(state: tauri::State<'_, NostrIngestState>) -> Result<(), String> {
+    // Stop any existing ingester, then start a fresh one with current config.
+    let old_handle = {
+        let mut guard = state.inner.lock().map_err(|_| "state lock poisoned")?;
+        guard.ingest_handle.take()
+    };
+    if let Some(handle) = old_handle {
+        handle.abort();
+    }
+    // Start a fresh ingester; `start_nostr_ingester` writes the new handle,
+    // client, and status fields back into the managed state.
+    let ingest_state = NostrIngestState {
+        inner: state.inner.clone(),
+    };
+    start_nostr_ingester(ingest_state).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn nostr_publish_note(
+    content: String,
+    state: tauri::State<'_, NostrIngestState>,
+) -> Result<NostrPublishResult, String> {
+    let keys = load_nostr_keys()?;
+    let event = nostr_sdk::EventBuilder::text_note(content)
+        .sign_with_keys(&keys)
+        .map_err(|e| format!("Failed to build text note: {e}"))?;
+    finalize_publish(&state, event).await
+}
+
+#[tauri::command]
+async fn nostr_publish_reaction(
+    event_id: String,
+    content: String,
+    state: tauri::State<'_, NostrIngestState>,
+) -> Result<NostrPublishResult, String> {
+    let keys = load_nostr_keys()?;
+    // NIP-25 reactions need the full target event. Look it up locally — the
+    // ingester caches any note the user is reacting to from the feed.
+    let target = lookup_target_event(&event_id).await?;
+    let event = nostr_sdk::EventBuilder::reaction(&target, content)
+        .sign_with_keys(&keys)
+        .map_err(|e| format!("Failed to build reaction: {e}"))?;
+    finalize_publish(&state, event).await
+}
+
+#[tauri::command]
+async fn nostr_publish_reply(
+    event_id: String,
+    relay_url: String,
+    content: String,
+    state: tauri::State<'_, NostrIngestState>,
+) -> Result<NostrPublishResult, String> {
+    let keys = load_nostr_keys()?;
+    // NIP-10 replies need the full target event (for the `p` tag of its author).
+    let target = lookup_target_event(&event_id).await?;
+    let relay =
+        nostr_sdk::RelayUrl::parse(&relay_url).map_err(|e| format!("Invalid relay url: {e}"))?;
+    let event = nostr_sdk::EventBuilder::text_note_reply(content, &target, None, Some(relay))
+        .sign_with_keys(&keys)
+        .map_err(|e| format!("Failed to build reply: {e}"))?;
+    finalize_publish(&state, event).await
+}
+
+/// Read the Nostr key bundle from secure storage and parse it into [`Keys`].
+fn load_nostr_keys() -> Result<nostr_sdk::Keys, String> {
+    let entry = keyring::Entry::new(NOSTR_KEYS_SECRET_SERVICE, NOSTR_KEYS_SECRET_ACCOUNT)
+        .map_err(|e| format!("Failed to open nostr key storage: {e}"))?;
+    let raw = entry
+        .get_password()
+        .map_err(|e| format!("Failed to read nostr keys: {e}"))?;
+    #[derive(serde::Deserialize)]
+    struct NostrKeyBundle {
+        #[serde(rename = "secretKeyHex")]
+        secret_key_hex: String,
+    }
+    let bundle: NostrKeyBundle =
+        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse nostr keys: {e}"))?;
+    nostr_sdk::Keys::parse(bundle.secret_key_hex.trim())
+        .map_err(|e| format!("Invalid nostr private key: {e}"))
+}
+
+/// Look up a stored event by id so we can build a proper reply/reaction. The
+/// store only persists the structural fields needed for queries, so we
+/// reconstruct a minimal-but-valid `Event` (the builder only reads `id`,
+/// `pubkey`, `kind`, and `coordinate()`).
+async fn lookup_target_event(event_id: &str) -> Result<nostr_sdk::Event, String> {
+    let workspace = nostr_workspace_dir().await?;
+    let id = event_id.to_string();
+    let note = tauri::async_runtime::spawn_blocking(move || {
+        zeroclaw::nostr_store::get_note(&workspace, &id)
+    })
+    .await
+    .map_err(|e| format!("target lookup task failed: {e}"))?
+    .map_err(|e| format!("Failed to read target note: {e}"))?
+    .ok_or_else(|| "Target note not found in local store".to_string())?;
+
+    // Reconstruct a structurally-complete event. Signature correctness is
+    // irrelevant here — `EventBuilder::reaction` / `text_note_reply` only read
+    // `id`, `pubkey`, `kind`, tags (for coordinate), not the signature.
+    use nostr_sdk::prelude::{EventId, Keys, PublicKey, Signature, Timestamp};
+    use std::str::FromStr;
+    let event_id = EventId::from_hex(&note.id).map_err(|e| format!("bad event id: {e}"))?;
+    let public_key = PublicKey::from_hex(&note.pubkey).map_err(|e| format!("bad pubkey: {e}"))?;
+    let created_at = Timestamp::from_secs(note.created_at.max(0) as u64);
+    let kind = nostr_sdk::Kind::from(note.kind as u16);
+    let tags_parsed = nostr_sdk::Tags::parse(
+        note.tags
+            .iter()
+            .map(|t| t.iter().cloned().collect::<Vec<String>>()),
+    )
+    .map_err(|e| format!("bad tags: {e}"))?;
+    // A throwaway key + zero signature — never used for verification here.
+    let dummy_keys = Keys::generate();
+    let sig = Signature::from_str(
+        "0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000",
+    )
+    .map_err(|_| "bad dummy signature".to_string())?;
+    // Build directly via `Event::new` so we don't re-sign.
+    Ok(nostr_sdk::Event::new(
+        event_id,
+        public_key,
+        created_at,
+        kind,
+        tags_parsed,
+        String::new(),
+        sig,
+    ))
+    .map(|ev| {
+        // Silence unused warning for dummy_keys (kept for clarity).
+        let _ = &dummy_keys;
+        ev
+    })
+}
+
+/// Publish through the ingester's persistent client, then ingest our own event
+/// so the UI shows it instantly.
+async fn finalize_publish(
+    state: &tauri::State<'_, NostrIngestState>,
+    event: nostr_sdk::Event,
+) -> Result<NostrPublishResult, String> {
+    let client_opt = {
+        let guard = state.inner.lock().map_err(|_| "state lock poisoned")?;
+        guard.client.clone()
+    };
+    let published = match client_opt.lock().await.clone() {
+        Some(client) => match client.send_event(&event).await {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("nostr publish failed: {e}");
+                false
+            }
+        },
+        None => false,
+    };
+
+    // Ingest our own event so it appears in the local store immediately.
+    let workspace = nostr_workspace_dir().await?;
+    let ev_for_ingest = event.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        let _ = zeroclaw::nostr_store::ingest_event(&workspace, &ev_for_ingest);
+    })
+    .await;
+
+    Ok(NostrPublishResult {
+        event_id: event.id.to_hex(),
+        published,
+        error: if published {
+            None
+        } else {
+            Some("Event was not accepted by any relay.".to_string())
+        },
+    })
+}
+
+/// Start (or restart) the background Nostr ingester. Resolves relays + hashtag
+/// channels from config, spawns the drain task, and records the handle + a
+/// shared client wrapper into `NostrIngestState`.
+async fn start_nostr_ingester(state: NostrIngestState) {
+    let config = match load_workspace_config_for_ui("nostr ingester config").await {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("nostr ingester: failed to load config: {err}");
+            if let Ok(mut guard) = state.inner.lock() {
+                guard.running = false;
+                guard.last_error = Some(err);
+            }
+            return;
+        }
+    };
+
+    let workspace_dir = config.workspace_dir.clone();
+    let relays = nostr_ingest::resolve_configured_relays(&config);
+    // Hashtag channels come from the defaults for now; a future config key can
+    // override this. Kept simple per YAGNI.
+    let hashtags = nostr_ingest::DEFAULT_HASHTAG_CHANNELS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect::<Vec<_>>();
+
+    match nostr_ingest::start_ingester(workspace_dir.clone(), relays.clone(), hashtags.clone())
+        .await
+    {
+        Ok(handle) => {
+            let client_wrapper = nostr_ingest::wrap_client(handle.client.clone());
+            if let Ok(mut guard) = state.inner.lock() {
+                guard.running = true;
+                guard.last_error = None;
+                guard.relays = relays;
+                guard.hashtag_channels = hashtags;
+                guard.db_path = Some(zeroclaw::nostr_store::db_path(&workspace_dir));
+                guard.client = client_wrapper;
+                guard.ingest_handle = Some(handle.join_handle);
+            }
+        }
+        Err(err) => {
+            eprintln!("nostr ingester: failed to start: {err}");
+            if let Ok(mut guard) = state.inner.lock() {
+                guard.running = false;
+                guard.last_error = Some(err);
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let gateway_state = GatewayState::default();
     let openai_state = OpenAiDeviceCodeState::default();
     let native_local_ai_state = NativeLocalAiState::default();
+    let nostr_ingest_state = NostrIngestState::default();
     tauri::Builder::default()
         .manage(gateway_state)
         .manage(openai_state)
         .manage(native_local_ai_state)
-        .setup(|app| {
+        .manage(nostr_ingest_state.clone())
+        .setup(move |app| {
             configure_app_owned_workspace(app);
             let shared = app.state::<GatewayState>().inner.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(err) = ensure_embedded_gateway_started(shared).await {
                     eprintln!("embedded gateway failed to start: {err}");
                 }
+            });
+            // Start the background Nostr ingester. Failures are non-fatal —
+            // the UI falls back to direct relay reads when the local store is
+            // empty or the ingester is not running.
+            let ingest_state = nostr_ingest_state.clone();
+            tauri::async_runtime::spawn(async move {
+                start_nostr_ingester(ingest_state).await;
             });
             Ok(())
         })
@@ -2411,7 +2932,18 @@ pub fn run() {
             transcribe_audio,
             transcribe_journal_media,
             read_journal_media_bytes,
-            import_voice_memos
+            import_voice_memos,
+            nostr_store_status,
+            nostr_query_notes,
+            nostr_get_note,
+            nostr_get_profiles,
+            nostr_get_reactions,
+            nostr_get_replies,
+            nostr_get_articles,
+            nostr_ingest_refresh,
+            nostr_publish_note,
+            nostr_publish_reaction,
+            nostr_publish_reply
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");
