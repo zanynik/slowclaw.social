@@ -465,20 +465,22 @@ export type PersonalizedFeedRequest = {
   force?: boolean;
 };
 
+export type WebPreview = {
+  url: string;
+  title: string;
+  description: string;
+  contentText: string;
+  imageUrl?: string | null;
+  domain: string;
+  provider: string;
+  providerSnippet?: string | null;
+  discoveredAt: string;
+};
+
 export type PersonalizedFeedItem = {
   sourceType?: "bluesky" | "web";
   feedItem: any;
-  webPreview?: {
-    url: string;
-    title: string;
-    description: string;
-    contentText: string;
-    imageUrl?: string | null;
-    domain: string;
-    provider: string;
-    providerSnippet?: string | null;
-    discoveredAt: string;
-  } | null;
+  webPreview?: WebPreview | null;
   feedSource?: {
     label: string;
     description?: string | null;
@@ -1088,6 +1090,45 @@ export async function readLibraryText(
   });
   const data = await parseJsonOrThrow(res);
   return String(data.content || "");
+}
+
+/**
+ * Fetch Open Graph metadata (title, description, image, domain) for an
+ * arbitrary http(s) URL via the gateway's preview extractor + cache. Used to
+ * derive thumbnails for sources that carry no image of their own (e.g.
+ * Hacker News stories). Always returns `null` on any failure so callers can
+ * treat it as best-effort enrichment.
+ */
+export async function fetchWebPreview(
+  url: string,
+  bearerToken?: string,
+  gatewayBaseUrl?: string
+): Promise<WebPreview | null> {
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  try {
+    const params = new URLSearchParams({ url: trimmed });
+    const res = await fetch(resolveGatewayEndpoint(`/api/feed/web-preview?${params}`, gatewayBaseUrl), {
+      headers: authHeaders(bearerToken)
+    });
+    if (!res.ok) return null;
+    const data = await parseJsonOrThrow(res);
+    if (!data || typeof data !== "object") return null;
+    const imageUrl = data.imageUrl ? String(data.imageUrl) : null;
+    return {
+      url: String(data.url || trimmed),
+      title: String(data.title || ""),
+      description: String(data.description || ""),
+      contentText: String(data.contentText || ""),
+      imageUrl,
+      domain: String(data.domain || ""),
+      provider: String(data.provider || ""),
+      providerSnippet: data.providerSnippet ? String(data.providerSnippet) : null,
+      discoveredAt: String(data.discoveredAt || "")
+    };
+  } catch {
+    return null;
+  }
 }
 
 export async function saveLibraryText(

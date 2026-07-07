@@ -77,11 +77,15 @@ pub async fn start_ingester(
     relays: Vec<String>,
     hashtag_channels: Vec<String>,
 ) -> Result<IngesterHandle, String> {
-    // Ensure the schema exists before the first ingest.
+    // Ensure the schemas exist before the first ingest. The video store is
+    // initialized alongside the nostr store so the drain loop can upsert
+    // video-bearing notes into both stores without a separate boot step.
     {
         let ws = workspace_dir.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            nostr_store::initialize(&ws).map_err(|e| format!("Failed to init nostr store: {e}"))
+            nostr_store::initialize(&ws).map_err(|e| format!("Failed to init nostr store: {e}"))?;
+            zeroclaw::video_store::initialize(&ws)
+                .map_err(|e| format!("Failed to init video store: {e}"))
         })
         .await
         .map_err(|e| format!("Init task failed: {e}"))??;
@@ -196,9 +200,13 @@ async fn drain_notifications(client: Arc<NostrClient>, workspace_dir: PathBuf) {
                 let ws = workspace_dir.clone();
                 let ev = (*event).clone();
                 // Ingest on a blocking thread so SQLite I/O never stalls the
-                // async notification stream.
+                // async notification stream. Both stores are written here:
+                // `nostr_store` keeps the full note/profile/reaction graph,
+                // and `video_store` gets a row for any note carrying a video
+                // URL (no-op for text-only notes).
                 let _ = tauri::async_runtime::spawn_blocking(move || {
                     let _ = nostr_store::ingest_event(&ws, &ev);
+                    let _ = zeroclaw::video_store::upsert_from_nostr_event(&ws, &ev);
                 })
                 .await;
             }

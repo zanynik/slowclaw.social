@@ -311,6 +311,33 @@ struct NostrPublishResult {
     error: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct VideoQueryRequest {
+    /// Restrict to a source (`"bluesky"` or `"nostr"`). Empty = all sources.
+    #[serde(default)]
+    source: Option<String>,
+    /// UNIX-seconds lower bound.
+    #[serde(default)]
+    since: Option<i64>,
+    /// Cap on rows. Defaults to 50 server-side.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoStoreStatus {
+    /// Always true once the store is initialized — there's no long-lived
+    /// ingester task to track (unlike Nostr). The UI uses this as the gate.
+    initialized: bool,
+    total_count: i64,
+    bluesky_count: i64,
+    nostr_count: i64,
+    last_received_at: Option<String>,
+    db_path: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeLocalAiConfigureRequest {
@@ -2866,6 +2893,78 @@ async fn start_nostr_ingester(state: NostrIngestState) {
     }
 }
 
+/// Resolve the workspace_dir for a video-store command. Centralized so every
+/// command uses the same error wording — mirrors `nostr_workspace_dir`.
+async fn video_workspace_dir() -> Result<PathBuf, String> {
+    let config = load_workspace_config_for_ui("video store").await?;
+    Ok(config.workspace_dir.clone())
+}
+
+/// Ensure the video store schema exists. Idempotent — safe to call on every
+/// status poll. No-ops if the workspace dir is unavailable.
+async fn ensure_video_store_initialized(workspace: &Path) {
+    let ws = workspace.to_path_buf();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        zeroclaw::video_store::initialize(&ws)
+    })
+    .await;
+}
+
+#[tauri::command]
+async fn video_store_status() -> Result<VideoStoreStatus, String> {
+    let workspace = video_workspace_dir().await?;
+    ensure_video_store_initialized(&workspace).await;
+    let ws = workspace.clone();
+    let (total, counts, last, path) = tauri::async_runtime::spawn_blocking(move || {
+        let total = zeroclaw::video_store::video_count(&ws).unwrap_or(0);
+        let counts = zeroclaw::video_store::count_by_source(&ws).unwrap_or_default();
+        let last = zeroclaw::video_store::last_received_at(&ws).ok().flatten();
+        let path = zeroclaw::video_store::db_path(&ws).to_string_lossy().to_string();
+        (total, counts, last, path)
+    })
+    .await
+    .map_err(|e| format!("video status task failed: {e}"))?;
+    Ok(VideoStoreStatus {
+        initialized: true,
+        total_count: total,
+        bluesky_count: counts.get("bluesky").copied().unwrap_or(0),
+        nostr_count: counts.get("nostr").copied().unwrap_or(0),
+        last_received_at: last,
+        db_path: Some(path),
+    })
+}
+
+#[tauri::command]
+async fn video_query(
+    req: VideoQueryRequest,
+) -> Result<Vec<zeroclaw::video_store::VideoRecord>, String> {
+    let workspace = video_workspace_dir().await?;
+    ensure_video_store_initialized(&workspace).await;
+    let query = zeroclaw::video_store::VideoQuery {
+        source: req.source,
+        since: req.since,
+        limit: req.limit,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        zeroclaw::video_store::query_videos(&workspace, &query)
+    })
+    .await
+    .map_err(|e| format!("video query task failed: {e}"))?
+    .map_err(|e| format!("Failed to query video items: {e}"))
+}
+
+#[tauri::command]
+async fn video_upsert_bluesky(posts: Vec<serde_json::Value>) -> Result<usize, String> {
+    let workspace = video_workspace_dir().await?;
+    ensure_video_store_initialized(&workspace).await;
+    tauri::async_runtime::spawn_blocking(move || {
+        zeroclaw::video_store::upsert_bluesky_posts(&workspace, &posts)
+    })
+    .await
+    .map_err(|e| format!("video upsert task failed: {e}"))?
+    .map_err(|e| format!("Failed to upsert bluesky video posts: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let gateway_state = GatewayState::default();
@@ -2943,7 +3042,10 @@ pub fn run() {
             nostr_ingest_refresh,
             nostr_publish_note,
             nostr_publish_reaction,
-            nostr_publish_reply
+            nostr_publish_reply,
+            video_store_status,
+            video_query,
+            video_upsert_bluesky
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");

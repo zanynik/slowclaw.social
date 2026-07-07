@@ -502,6 +502,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             post(handle_feed_personalized),
         )
         .route("/api/feed/personalized", post(handle_feed_personalized))
+        .route("/api/feed/web-preview", get(handle_feed_web_preview))
         .route("/api/sync/export", get(handle_sync_export))
         .route("/api/sync/import", post(handle_sync_import))
         .route("/api/feed/workflow-run", post(handle_feed_workflow_run))
@@ -8027,6 +8028,11 @@ struct LibraryTextQuery {
 }
 
 #[derive(serde::Deserialize)]
+struct FeedWebPreviewQuery {
+    url: String,
+}
+
+#[derive(serde::Deserialize)]
 struct SaveTextBody {
     path: String,
     content: String,
@@ -8483,6 +8489,45 @@ async fn handle_library_text(
             err,
         ),
     }
+}
+
+/// `GET /api/feed/web-preview?url=<http(s) url>` — returns Open Graph metadata
+/// (title, description, image, domain) for an arbitrary URL, reusing the same
+/// extractor + 24h SQLite cache that the personalized-feed workflow uses.
+/// Used by the web client to derive thumbnails for sources that carry no image
+/// of their own (e.g. Hacker News stories).
+async fn handle_feed_web_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FeedWebPreviewQuery>,
+) -> axum::response::Response {
+    if let Some(err) = pairing_auth_error(&state, &headers, "Feed web preview") {
+        return err.into_response();
+    }
+    let url = query.url.trim().to_string();
+    let parsed = reqwest::Url::parse(&url);
+    let host = match parsed.as_ref().ok() {
+        Some(p) if matches!(p.scheme(), "http" | "https") => p.host_str().unwrap_or("").to_string(),
+        _ => {
+            return frontend_error_response(
+                StatusCode::BAD_REQUEST,
+                "FEED_WEB_PREVIEW_URL_INVALID",
+                "url must be an http(s) URL",
+            )
+            .into_response();
+        }
+    };
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let candidate = CandidateWebResult {
+        url,
+        title: String::new(),
+        description: String::new(),
+        domain: host,
+        provider: String::new(),
+        search_query: String::new(),
+    };
+    let preview = resolve_web_preview(&workspace_dir, &candidate).await;
+    (StatusCode::OK, Json(preview)).into_response()
 }
 
 fn maybe_mark_world_feed_dirty_for_path(workspace_dir: &StdPath, rel_path: &str) {

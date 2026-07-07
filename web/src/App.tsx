@@ -40,6 +40,13 @@ import {
   nostrStoreStatus,
   type NostrStoreStatus,
 } from "./lib/nostrLocalStore";
+import {
+  videoStoreStatus,
+  videoQueryBluesky,
+  videoQueryRaw,
+  videoUpsertBluesky,
+  type VideoStoreStatus,
+} from "./lib/videoLocalStore";
 // ── Nostr content-quality filter (language + spam + dedup) ───────────────────
 import { filterNostrFeed, type NostrFeedStats } from "./lib/feedFilter";
 // ── RSS/Atom feeds (Reads tab) ────────────────────────────────────────────────
@@ -186,6 +193,7 @@ import {
   getOpenRouterOAuthStatus,
   stopLocalModelRuntime,
   useLocalModel,
+  fetchWebPreview,
 } from "./lib/gatewayApi";
 import type {
   FeedContentAgentItem,
@@ -251,6 +259,7 @@ type TechNewsItem = {
   score: number;
   comments: number;
   createdAt: number;
+  thumbnailUrl?: string;
 };
 
 type PersistedTodo = {
@@ -1247,6 +1256,12 @@ function App() {
   // a status poll below downgrades this if the ingester isn't actually running.
   const [nostrLocalStoreStatus, setNostrLocalStoreStatus] = useState<NostrStoreStatus | null>(null);
   const useNostrLocalStore = isNativeClient && nostrLocalStoreStatus?.running !== false;
+  // Video local store gate. Unlike Nostr, there's no long-lived ingester task
+  // — the store is populated lazily by `videoUpsertBluesky` after each network
+  // fetch, and by the Nostr ingester's video hook. "initialized" just means the
+  // store file exists, so cached Reels render instantly on tab-open.
+  const [videoLocalStoreStatus, setVideoLocalStoreStatus] = useState<VideoStoreStatus | null>(null);
+  const useVideoLocalStore = isNativeClient && videoLocalStoreStatus?.initialized !== false;
   const isLargeScreen = useIsLargeScreen();
   const scrollDirection = useScrollDirection(8);
   const isDesktopLayout = isDesktopClient || isLargeScreen;
@@ -1731,14 +1746,19 @@ function App() {
     void saveCredentialsSecure(creds);
   }, [creds, secureStoreReady]);
 
-  // Poll the on-device Nostr store status so the UI knows whether the
-  // background ingester is running. Outside Tauri this is a no-op.
+  // Poll the on-device Nostr + video store status so the UI knows whether the
+  // background ingester is running and whether cached videos are available.
+  // Outside Tauri this is a no-op. The video poll rides the same interval — no
+  // extra timer.
   useEffect(() => {
     if (!isNativeClient) return;
     let cancelled = false;
     const poll = async () => {
-      const status = await nostrStoreStatus();
-      if (!cancelled) setNostrLocalStoreStatus(status);
+      const [ns, vs] = await Promise.all([nostrStoreStatus(), videoStoreStatus()]);
+      if (!cancelled) {
+        setNostrLocalStoreStatus(ns);
+        setVideoLocalStoreStatus(vs);
+      }
     };
     void poll();
     const id = window.setInterval(poll, 15_000);
@@ -5239,6 +5259,34 @@ function App() {
     if (videoFallbackLoading || videoFallbackItems.length > 0) return;
     setVideoFallbackLoading(true);
     const results: any[] = [];
+
+    // Local-first: render cached videos instantly before the network fan-out.
+    // The Media tab mixes Bluesky + Nostr, so we read both sources from the
+    // store and reconstruct the per-source item shapes the renderer expects.
+    if (useVideoLocalStore) {
+      try {
+        const cached = await videoQueryRaw({ limit: 40 });
+        for (const rec of cached) {
+          if (rec.source === "bluesky" && rec.raw_json && rec.raw_json !== "{}") {
+            try {
+              const post = JSON.parse(rec.raw_json);
+              if (post?.uri) results.push({ source: "bluesky", post, feedItem: { post } });
+            } catch {}
+          } else if (rec.source === "nostr" && rec.raw_json && rec.raw_json !== "{}") {
+            try {
+              const event = JSON.parse(rec.raw_json);
+              results.push({ source: "nostr", event, relayUrl: "wss://relay.primal.net" });
+            } catch {}
+          }
+        }
+        // Show cached items immediately; the network refresh below will replace.
+        if (results.length > 0) setVideoFallbackItems(results);
+      } catch {
+        // Non-fatal: fall through to the network fetch.
+      }
+    }
+
+    const fresh: any[] = [];
     try {
       // Fetch from Bluesky "videos" feed generator (whats-hot-video)
       const activeJwt = session?.accessJwt;
@@ -5254,14 +5302,20 @@ function App() {
           if (res.ok) {
             const data = await res.json();
             const feed = Array.isArray(data?.feed) ? data.feed : [];
+            const blueskyPosts: any[] = [];
             for (const entry of feed) {
               const post = entry?.post;
               if (!post) continue;
               const embed = post.embed;
               if (embed?.$type === "app.bsky.embed.video#view" ||
                   (embed?.$type === "app.bsky.embed.recordWithMedia#view" && embed?.media?.$type === "app.bsky.embed.video#view")) {
-                results.push({ source: "bluesky", post, feedItem: entry });
+                fresh.push({ source: "bluesky", post, feedItem: entry });
+                blueskyPosts.push(post);
               }
+            }
+            // Persist fresh Bluesky posts for the next tab-open.
+            if (useVideoLocalStore && blueskyPosts.length > 0) {
+              void videoUpsertBluesky(blueskyPosts);
             }
           }
         } catch (err) {
@@ -5299,13 +5353,14 @@ function App() {
           ws.onerror = () => { clearTimeout(timeout); resolve(items); };
         });
         for (const ev of nostrVideos.slice(0, 10)) {
-          results.push({ source: "nostr", event: ev, relayUrl: "wss://relay.primal.net" });
+          fresh.push({ source: "nostr", event: ev, relayUrl: "wss://relay.primal.net" });
         }
       } catch (err) {
         console.warn("Nostr video fallback failed:", err);
       }
     } finally {
-      setVideoFallbackItems(results);
+      // Prefer the fresh network results when available; otherwise keep cache.
+      setVideoFallbackItems(fresh.length > 0 ? fresh : results);
       setVideoFallbackLoading(false);
     }
   }
@@ -6712,19 +6767,42 @@ function App() {
    * Reels feed: assemble Bluesky videos by merging several visually-rich topics
    * (single-topic searches return only 1-3 videos each, so we merge ~12).
    * Validated live: this yields ~20 unique videos. No auth needed.
+   *
+   * Local-first: when the on-device video store has cached posts, render them
+   * instantly before the network fan-out completes. The network fetch then
+   * refreshes the list and upserts the fresh posts back into the store, so the
+   * next tab-open is instant. Mirrors the `useNostrLocalStore` pattern.
    */
   async function loadReelsFeed() {
     if (reelsLoading) return;
     setReelsLoading(true);
     setReelsError("");
+
+    // 1. Instant render from the local store (no network round-trip).
+    if (useVideoLocalStore) {
+      try {
+        const cached = await videoQueryBluesky({ limit: 50 });
+        if (cached.length > 0) setReelsPosts(cached);
+      } catch {
+        // Non-fatal: fall through to the network fetch.
+      }
+    }
+
+    // 2. Network refresh — always runs so the list stays fresh. Upserts back
+    //    into the local store for the next tab-open.
     try {
       const posts = await fetchBlueskyReelsFeed({ limit: 50 });
       if (posts.length === 0) {
         setReelsError("No videos found right now. Pull to refresh.");
       }
       setReelsPosts(posts);
+      if (useVideoLocalStore && posts.length > 0) {
+        void videoUpsertBluesky(posts);
+      }
     } catch (e) {
-      setReelsPosts([]);
+      // Keep the cached posts on screen if we have them; only clear on a cold
+      // failure (no cache + network error).
+      if (reelsPosts.length === 0) setReelsPosts([]);
       const msg = e instanceof Error ? e.message : String(e);
       setReelsError(`Couldn't load Bluesky videos: ${msg.slice(0, 120)}`);
     } finally {
@@ -7305,6 +7383,36 @@ function App() {
         })
         .slice(0, 5);
       setTechNewsItems(stories);
+
+      // Best-effort thumbnail enrichment for external article URLs. HN stories
+      // carry no images, so derive an OG image via the gateway preview route.
+      // Self-links (news.ycombinator.com) have nothing useful to preview.
+      const token = chatGatewayToken.trim() || undefined;
+      Promise.allSettled(
+        stories.map(async (story) => {
+          if (!story.url || story.source === "news.ycombinator.com") return null;
+          const preview = await fetchWebPreview(story.url, token, gatewayBaseUrl);
+          if (!preview?.imageUrl) return null;
+          return { id: story.id, thumbnailUrl: preview.imageUrl } as const;
+        })
+      )
+        .then((results) => {
+          const updates = new Map<number, string>();
+          for (const r of results) {
+            if (r.status === "fulfilled" && r.value) {
+              updates.set(r.value.id, r.value.thumbnailUrl);
+            }
+          }
+          if (updates.size === 0) return;
+          setTechNewsItems((prev) =>
+            prev.map((item) =>
+              updates.has(item.id) ? { ...item, thumbnailUrl: updates.get(item.id) } : item
+            )
+          );
+        })
+        .catch(() => {
+          // Enrichment is best-effort; ignore failures.
+        });
     } catch (error) {
       setTechNewsError(error instanceof Error ? error.message : "Failed to load tech news.");
     } finally {
@@ -9578,7 +9686,20 @@ function App() {
                     ) : techNewsItems.length > 0 ? (
                       <div className="tech-news-list">
                         {techNewsItems.map((item, idx) => (
-                          <a key={item.id} className="tech-news-card" href={item.url} target="_blank" rel="noopener noreferrer">
+                          <a
+                            key={item.id}
+                            className="tech-news-card"
+                            href={item.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              void openFeedLink(item.url);
+                            }}
+                          >
+                            {item.thumbnailUrl ? (
+                              <img src={item.thumbnailUrl} alt="" className="tech-news-card-thumb" loading="lazy" />
+                            ) : null}
                             <div className="tech-news-card-rank">#{idx + 1} · <span className="tech-news-card-source">{item.source}</span></div>
                             <p className="tech-news-card-title">{item.title}</p>
                             <div className="tech-news-card-meta">
@@ -9816,7 +9937,17 @@ function App() {
                         const publishedRaw = (a.tags || []).find((t) => t[0] === "published_at")?.[1];
                         const ts = publishedRaw ? Number(publishedRaw) * 1000 : a.created_at * 1000;
                         return (
-                          <a key={a.id} className="reads-card" href={hablaUrl} target="_blank" rel="noreferrer">
+                          <a
+                            key={a.id}
+                            className="reads-card"
+                            href={hablaUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              void openFeedLink(hablaUrl);
+                            }}
+                          >
                             {image ? <img src={image} alt="" className="reads-card-cover" loading="lazy" /> : null}
                             <div className="reads-card-body">
                               <span className="reads-card-source">Nostr · {getRelativeTime(ts)}</span>
@@ -9843,7 +9974,21 @@ function App() {
                           const stripHtml = (s: string) => (s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
                           const bodyText = stripHtml(item.description || item.content || "").slice(0, 200);
                           return (
-                            <a key={unified.id} className="reads-card" href={item.link || "#"} target="_blank" rel="noreferrer">
+                            <a
+                              key={unified.id}
+                              className="reads-card"
+                              href={item.link || "#"}
+                              target="_blank"
+                              rel="noreferrer"
+                              onClick={(e) => {
+                                if (!item.link) {
+                                  e.preventDefault();
+                                  return;
+                                }
+                                e.preventDefault();
+                                void openFeedLink(item.link);
+                              }}
+                            >
                               {unified.media.thumbnailUrl ? <img src={unified.media.thumbnailUrl} alt="" className="reads-card-cover" loading="lazy" /> : null}
                               <div className="reads-card-body">
                                 <span className="reads-card-source">{group.feed.emoji ? group.feed.emoji + " " : ""}{group.feed.label}</span>

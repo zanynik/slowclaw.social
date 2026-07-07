@@ -67,6 +67,7 @@ pub(crate) mod service;
 pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod util;
+pub mod video_store;
 pub(crate) mod workflow_assets;
 
 pub use config::Config;
@@ -262,4 +263,3 @@ pub enum IntegrationCommands {
         name: String,
     },
 }
-

@@ -1099,6 +1099,15 @@ button.local-ai-preset {
     box-shadow: var(--shadow-sm);
   }
 }
+.tech-news-card-thumb {
+  display: block;
+  width: calc(100% + 1.9rem);
+  height: 140px;
+  object-fit: cover;
+  background: var(--surface-3, var(--surface));
+  margin: -0.8rem -0.95rem 0.6rem;
+  border-radius: var(--r-md) var(--r-md) 0 0;
+}
 .tech-news-card-rank {
   font-size: 0.72rem;
   font-weight: 700;
