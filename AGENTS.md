@@ -213,6 +213,15 @@ All contributors (human or agent) follow the same flow:
 - Wait for required checks and review outcomes before merging. Merge via PR controls.
 - Branch deletion after merge is optional; long-lived branches are allowed when intentionally maintained.
 
+### 6.1.1 Commit-and-Push After Every Change (Required)
+**After completing any change (a fix, feature, or doc edit), the agent must commit and push to the branch it is currently working in — every time, without being asked.** This is the standing default for all agent work in this repo.
+- Run the relevant validation (per §8) **before** committing so the branch never lands in a broken state. If validation is impractical, run the most relevant subset and say so in the commit body.
+- Use a clear, scoped conventional-commit message (`feat(scope): ...`, `fix(scope): ...`, `docs: ...`, `chore: ...`). One concern per commit; do not bundle unrelated changes.
+- Commit **and push** (`git push`) to the current working branch. Do not leave finished work sitting unpushed locally. Do not push to `main`.
+- Do **not** open a PR unless asked, and do **not** merge — pushing the branch is the checkpoint. PR/merge remains a separate, explicit human decision per §6.1.
+- If the change is large, split it into multiple small commits before pushing (each independently buildable), per the reversibility principle in §3.8.
+- Re-confirm the current branch with `git rev-parse --abbrev-ref HEAD` before committing if there is any doubt; never accidentally commit onto `main`.
+
 ### 6.2 Worktree Workflow (Required for Multi-Track Agent Work)
 Use Git worktrees to isolate concurrent agent/human tracks safely:
 - One worktree per active branch/PR stream; do not mix unrelated edits in one worktree.
