@@ -68,6 +68,8 @@ import {
 } from "./lib/socialFeed";
 // ── Local-first interactions: saved/liked items + native share ──────────────
 import { getSavedItems, onSavedChange, type SavedItem } from "./lib/savedItems";
+// ── Local-first profile (name / bio / avatar) ──────────────────────────────
+import { getProfile, saveProfile, onProfileChange, fileToAvatarDataUrl, setAvatar, type LocalProfile } from "./lib/profile";
 // ── Reads ranking + read-time (Google News / Substack-style "For You") ──────
 import { rankReads, chronologicalReads, type RankedRead } from "./lib/readsRanking";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
@@ -254,6 +256,10 @@ type PersistedPost = {
   sourceExcerpt: string;
   createdAt: number;
   liked?: boolean;
+  /** When successfully pushed to Nostr/Bluesky (epoch ms). Absent on legacy data = assume published if liked. */
+  publishedAt?: number;
+  /** Nostr event id of the published note, for deep-linking + verification. */
+  eventId?: string;
 };
 
 type TechNewsItem = {
@@ -1650,6 +1656,12 @@ function App() {
   // Saved items (Profile tab) — mirrored from the localStorage store so the
   // Profile list re-renders when Feed/Reels/Reads save or unsave an item.
   const [savedItems, setSavedItems] = useState<SavedItem[]>(() => getSavedItems());
+  // Local profile (name / bio / avatar) — persisted to localStorage, mirrored here.
+  const [localProfile, setLocalProfile] = useState<LocalProfile | null>(() => getProfile());
+  // Profile content tab: Posted | Drafts | Saved (Twitter/Instagram-style segmented control).
+  const [profileContentTab, setProfileContentTab] = useState<"posted" | "drafts" | "saved">("posted");
+  // Profile avatar picker (hidden file input, triggered by tapping the avatar).
+  const profileAvatarInputRef = useRef<HTMLInputElement | null>(null);
   // Reels snap-scroll container ref (shared with PullToRefresh for nested pull).
   const reelsScrollRef = useRef<HTMLDivElement | null>(null);
   const [techNewsLoading, setTechNewsLoading] = useState(false);
@@ -1687,6 +1699,8 @@ function App() {
   // Mirror the localStorage saved-items store into state for the Profile list,
   // and re-sync when Feed/Reels/Reads mutate it (same-tab custom event + cross-tab storage).
   useEffect(() => onSavedChange(() => setSavedItems(getSavedItems())), []);
+  // Mirror local profile store into state (re-renders Profile on edits).
+  useEffect(() => onProfileChange(() => setLocalProfile(getProfile())), []);
 
   // Reset feed pagination when the source/topic changes (so the list isn't empty).
   useEffect(() => { setFeedVisibleCount(20); }, [socialSource, activeChannelId, activeSocialTopic, feedView]);
@@ -7556,7 +7570,16 @@ function App() {
         savePersistedPosts(next);
         return next;
       });
-      void publishNote(post.text); // fire and forget
+      // Capture the Nostr event id so the Profile "Posted" tab can deep-link + verify.
+      void publishNote(post.text).then((result) => {
+        if (result.success && result.eventId) {
+          setPersistedPosts((prev) => {
+            const next = prev.map((p) => p.id === post.id ? { ...p, publishedAt: Date.now(), eventId: result.eventId } : p);
+            savePersistedPosts(next);
+            return next;
+          });
+        }
+      });
       return;
     }
     // First time — show confirm dialog
@@ -7623,7 +7646,7 @@ function App() {
         if (result.success) {
           localStorage.setItem("slowclaw.nostr.hasPosted", "true");
           setPersistedPosts((prev) => {
-            const next = prev.map((p) => p.id === nostrPostConfirmPost!.id ? { ...p, liked: true } : p);
+            const next = prev.map((p) => p.id === nostrPostConfirmPost!.id ? { ...p, liked: true, publishedAt: Date.now(), eventId: result.eventId } : p);
             savePersistedPosts(next);
             return next;
           });
@@ -10128,88 +10151,191 @@ function App() {
         {mobileTab === "profile" ? (
           <ViewErrorBoundary title="Profile">
             <div className="stack" style={{ padding: '0.5rem 0' }}>
-              {/* Profile header */}
-              <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', padding: '0.5rem 0.25rem' }}>
-                <div className="profile-pic-circle" onClick={() => {/* TODO: pic upload */}}>
-                  <span style={{ fontSize: '1.5rem' }}>👤</span>
-                </div>
-                <div style={{ flex: 1 }}>
+              {/* Hidden avatar file picker (triggered by tapping the avatar). */}
+              <input
+                ref={profileAvatarInputRef}
+                type="file"
+                accept="image/*"
+                style={{ display: 'none' }}
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const dataUrl = await fileToAvatarDataUrl(file);
+                  if (dataUrl) {
+                    // setAvatar returns false if the (downscaled) image still exceeds quota;
+                    // fileToAvatarDataUrl already downscale so this rarely trips.
+                    setAvatar(dataUrl);
+                    setLocalProfile(getProfile());
+                  }
+                  // Reset so picking the same file again re-triggers onChange.
+                  e.target.value = "";
+                }}
+              />
+
+              {/* Profile header: avatar + name + handles + settings gear. */}
+              <div className="profile-header">
+                <button
+                  type="button"
+                  className="profile-avatar-btn"
+                  onClick={() => profileAvatarInputRef.current?.click()}
+                  aria-label="Change profile picture"
+                  title="Change profile picture"
+                >
+                  {localProfile?.avatar
+                    ? <img src={localProfile.avatar} alt="" className="profile-avatar-img" />
+                    : <span className="profile-avatar-placeholder" aria-hidden>{(localProfile?.name || "S").trim().charAt(0).toUpperCase()}</span>}
+                  <span className="profile-avatar-edit" aria-hidden>✎</span>
+                </button>
+                <div className="profile-header-info">
                   <input
                     className="profile-name-input"
-                    defaultValue={nostrKeys ? `npub:${nostrKeys.publicKeyHex.slice(0, 8)}...` : "Anonymous"}
+                    defaultValue={localProfile?.name || ""}
                     placeholder="Your name"
-                    readOnly
+                    onBlur={(e) => {
+                      const v = e.target.value.trim();
+                      if (v !== (localProfile?.name || "")) {
+                        saveProfile({ name: v });
+                        setLocalProfile(getProfile());
+                      }
+                    }}
                   />
-                  <input
-                    className="profile-bio-input"
-                    defaultValue=""
-                    placeholder="Add a short bio..."
-                  />
+                  <div className="profile-handles">
+                    {session ? <span className="profile-handle">Bluesky · @{session.handle}</span> : null}
+                    {nostrKeys ? <span className="profile-handle">Nostr · npub:{nostrKeys.publicKeyHex.slice(0, 8)}…</span> : null}
+                    {!session && !nostrKeys ? <span className="profile-handle muted">No accounts connected</span> : null}
+                  </div>
                 </div>
+                <button
+                  type="button"
+                  className="profile-settings-btn"
+                  onClick={() => setShowSettings(true)}
+                  aria-label="Open settings"
+                  title="Settings"
+                >⚙️</button>
               </div>
 
-              {/* Connected accounts badges */}
-              <div className="row" style={{ gap: '0.5rem', flexWrap: 'wrap', padding: '0 0.25rem' }}>
-                {session && <span className="badge success">Bluesky: @{session.handle}</span>}
-                {nostrKeys && <span className="badge success">Nostr connected</span>}
-                {!session && !nostrKeys && <span className="text-sm muted">Connect accounts in Settings \u2699\uFE0F</span>}
+              {/* Editable bio (persists on blur). */}
+              <textarea
+                className="profile-bio-input"
+                defaultValue={localProfile?.bio || ""}
+                placeholder="Add a short bio…"
+                rows={2}
+                onBlur={(e) => {
+                  const v = e.target.value.trim();
+                  if (v !== (localProfile?.bio || "")) {
+                    saveProfile({ bio: v });
+                    setLocalProfile(getProfile());
+                  }
+                }}
+              />
+
+              {/* Stats row (Twitter/Instagram signature) — tappable to switch tabs. */}
+              {(() => {
+                const postedCount = persistedPosts.filter((p) => p.liked).length;
+                const draftsCount = persistedPosts.filter((p) => !p.liked).length;
+                const savedCount = savedItems.length;
+                return (
+                  <div className="profile-stats">
+                    <button type="button" className={`profile-stat${profileContentTab === "posted" ? " active" : ""}`} onClick={() => setProfileContentTab("posted")}>
+                      <strong>{postedCount}</strong> Posts
+                    </button>
+                    <button type="button" className={`profile-stat${profileContentTab === "drafts" ? " active" : ""}`} onClick={() => setProfileContentTab("drafts")}>
+                      <strong>{draftsCount}</strong> Drafts
+                    </button>
+                    <button type="button" className={`profile-stat${profileContentTab === "saved" ? " active" : ""}`} onClick={() => setProfileContentTab("saved")}>
+                      <strong>{savedCount}</strong> Saved
+                    </button>
+                  </div>
+                );
+              })()}
+
+              {/* Content tabs (segmented control). */}
+              <div className="profile-tabs" role="tablist">
+                <button role="tab" type="button" className={`profile-tab${profileContentTab === "posted" ? " active" : ""}`} onClick={() => setProfileContentTab("posted")}>Posts</button>
+                <button role="tab" type="button" className={`profile-tab${profileContentTab === "drafts" ? " active" : ""}`} onClick={() => setProfileContentTab("drafts")}>Drafts</button>
+                <button role="tab" type="button" className={`profile-tab${profileContentTab === "saved" ? " active" : ""}`} onClick={() => setProfileContentTab("saved")}>Saved</button>
               </div>
 
-              {/* Posted/liked posts */}
-              <div style={{ padding: '0.5rem 0.25rem 0' }}>
-                <h3 style={{ margin: '0 0 0.5rem' }}>Posted</h3>
-              </div>
-              {persistedPosts.filter((p) => p.liked).length === 0 ? (
-                <p className="text-sm muted" style={{ padding: '1rem', textAlign: 'center' }}>Like a post in Queue to publish it here and to Nostr.</p>
-              ) : (
-                <div className="feed-posts-list">
-                  {persistedPosts.filter((p) => p.liked).map((post) => {
-                    const timeAgo = getRelativeTime(post.createdAt);
-                    return (
-                      <div key={post.id} className="tweet-card">
-                        <div className="tweet-avatar" aria-hidden>🐾</div>
-                        <div className="tweet-body">
-                          <div className="tweet-header">
-                            <span className="tweet-name">You</span>
-                            <span className="tweet-dot">·</span>
-                            <span className="tweet-time">{timeAgo}</span>
+              {/* Tab content. */}
+              {profileContentTab === "posted" ? (
+                persistedPosts.filter((p) => p.liked).length === 0 ? (
+                  <p className="text-sm muted" style={{ padding: '1rem', textAlign: 'center' }}>No posts yet. Tap the heart on a draft in the Queue tab to publish it to Nostr.</p>
+                ) : (
+                  <div className="feed-posts-list">
+                    {persistedPosts.filter((p) => p.liked).map((post) => {
+                      const timeAgo = getRelativeTime(post.createdAt);
+                      const nostrLink = post.eventId ? `https://njump.at/${post.eventId}` : null;
+                      return (
+                        <div key={post.id} className="tweet-card">
+                          {localProfile?.avatar
+                            ? <img src={localProfile.avatar} alt="" className="tweet-avatar" />
+                            : <div className="tweet-avatar" aria-hidden>🐾</div>}
+                          <div className="tweet-body">
+                            <div className="tweet-header">
+                              <span className="tweet-name">{localProfile?.name?.trim() || "You"}</span>
+                              {nostrLink ? (
+                                <a className="profile-verified-badge" href={nostrLink} target="_blank" rel="noreferrer" title="View on Nostr" onClick={(e) => { e.preventDefault(); void openFeedLink(nostrLink); }}>🔗</a>
+                              ) : null}
+                              <span className="tweet-dot">·</span>
+                              <span className="tweet-time">{timeAgo}</span>
+                            </div>
+                            <p className="tweet-text">{post.text}</p>
                           </div>
-                          <p className="tweet-text">{post.text}</p>
                         </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Saved (bookmarked) items from Feed/Reels/Reads. */}
-              <div style={{ padding: '0.5rem 0.25rem 0' }}>
-                <h3 style={{ margin: '0 0 0.5rem' }}>Saved</h3>
-              </div>
-              {savedItems.length === 0 ? (
-                <p className="text-sm muted" style={{ padding: '1rem', textAlign: 'center' }}>Bookmark posts, videos, or articles from any tab to save them here.</p>
+                      );
+                    })}
+                  </div>
+                )
+              ) : profileContentTab === "drafts" ? (
+                persistedPosts.filter((p) => !p.liked).length === 0 ? (
+                  <p className="text-sm muted" style={{ padding: '1rem', textAlign: 'center' }}>No drafts. Generate one from a journal in the Queue tab.</p>
+                ) : (
+                  <div className="feed-posts-list">
+                    {persistedPosts.filter((p) => !p.liked).map((post) => {
+                      const timeAgo = getRelativeTime(post.createdAt);
+                      return (
+                        <div key={post.id} className="tweet-card">
+                          <div className="tweet-avatar" aria-hidden>📝</div>
+                          <div className="tweet-body">
+                            <div className="tweet-header">
+                              <span className="tweet-name">Draft</span>
+                              <span className="tweet-dot">·</span>
+                              <span className="tweet-time">{timeAgo}</span>
+                            </div>
+                            <p className="tweet-text">{post.text}</p>
+                            <p className="text-sm muted" style={{ margin: '0.3rem 0 0', fontSize: '0.75rem' }}>Open Queue to review & publish →</p>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )
               ) : (
-                <div className="saved-list">
-                  {savedItems.map((s) => (
-                    <a
-                      key={s.id}
-                      className="saved-item"
-                      href={s.url || "#"}
-                      target="_blank"
-                      rel="noreferrer"
-                      onClick={(e) => { if (!s.url) { e.preventDefault(); return; } e.preventDefault(); void openFeedLink(s.url); }}
-                    >
-                      {s.thumbnail ? <img src={s.thumbnail} alt="" className="saved-item-thumb" loading="lazy" /> : null}
-                      <div className="saved-item-body">
-                        <div className="saved-item-top">
-                          <span className="saved-item-source">{s.source}{s.authorHandle ? ` · @${s.authorHandle}` : ""}</span>
-                          <span className="saved-item-time">{getRelativeTime(s.savedAt)}</span>
+                savedItems.length === 0 ? (
+                  <p className="text-sm muted" style={{ padding: '1rem', textAlign: 'center' }}>Bookmark posts, videos, or articles from any tab to save them here.</p>
+                ) : (
+                  <div className="saved-list">
+                    {savedItems.map((s) => (
+                      <a
+                        key={s.id}
+                        className="saved-item"
+                        href={s.url || "#"}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(e) => { if (!s.url) { e.preventDefault(); return; } e.preventDefault(); void openFeedLink(s.url); }}
+                      >
+                        {s.thumbnail ? <img src={s.thumbnail} alt="" className="saved-item-thumb" loading="lazy" /> : null}
+                        <div className="saved-item-body">
+                          <div className="saved-item-top">
+                            <span className="saved-item-source">{s.source}{s.authorHandle ? ` · @${s.authorHandle}` : ""}</span>
+                            <span className="saved-item-time">{getRelativeTime(s.savedAt)}</span>
+                          </div>
+                          {s.title ? <p className="saved-item-title">{s.title}</p> : null}
                         </div>
-                        {s.title ? <p className="saved-item-title">{s.title}</p> : null}
-                      </div>
-                    </a>
-                  ))}
-                </div>
+                      </a>
+                    ))}
+                  </div>
+                )
               )}
             </div>
           </ViewErrorBoundary>
