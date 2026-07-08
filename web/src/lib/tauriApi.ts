@@ -146,6 +146,20 @@ export async function deleteJournal(id: string): Promise<void> {
   return invoke("delete_journal", { id });
 }
 
+/**
+ * Store AI-extracted interest keywords for a journal entry into the feed's
+ * per-source triage-keyword slot, then mark the world feed dirty so the next
+ * load re-profiles from these keywords instead of the heuristic extractor.
+ * iOS-first; mirrors the journal CRUD command shape.
+ */
+export async function saveJournalInterestKeywords(
+  journalId: string,
+  keywords: string[],
+  contentHash: string,
+): Promise<void> {
+  return invoke("save_journal_interest_keywords", { journalId, keywords, contentHash });
+}
+
 // ─────────────────────────────────────────────
 // Summary / AI commands
 // ─────────────────────────────────────────────

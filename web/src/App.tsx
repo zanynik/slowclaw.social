@@ -92,6 +92,7 @@ import {
   updateJournalText,
   renameJournal,
   deleteJournal,
+  saveJournalInterestKeywords,
   summarizeJournal,
   listSummaries,
   generateWeeklyDigest,
@@ -2570,6 +2571,42 @@ function App() {
         // Task extraction failed — non-fatal
       } finally {
         setExtractingLocalTasks(false);
+      }
+    }
+
+    // 4.5. Extract interest keywords → feed (aggressive register bridge)
+    if (isTauriMobileRuntime() && nativeLocalAiStatus?.available && localId) {
+      try {
+        holdJournalStatus("Extracting interests...");
+        const interestPrompt = `You extract the author's interests from a personal journal entry.
+Translate the author's private, personal phrasing into PUBLIC vocabulary that news feeds, hashtags, and search engines actually use (e.g. "should move somewhere quieter near water" → "urbanism, slow living"; "third places like the corner cafe" → "third places, cafe culture, morning rituals"; "read the Medici book" → "Renaissance history, history of banking"). Bridge aggressively so the keywords can match real feed content.
+Rules:
+- Output a JSON array of short lowercase keyword phrases (1-3 words each).
+- 4-10 keywords. Prefer concrete subject-matter topics over moods.
+- DO NOT infer emotional, mental-health, or wellness framings (depression, burnout, anxiety, insomnia, self-care) UNLESS the entry substantively engages with that topic as a named interest — a single mention of poor sleep or feeling low is not a mental-health interest.
+- No generic filler ("life", "thoughts", "journal"). No quotes. Output ONLY valid JSON, no markdown fences.`;
+        const interestResult = await nativeAiChat(content.slice(0, 2400), interestPrompt, 160, 0.3);
+        const interestKeywords = tryParseJsonArray<string>(interestResult.text)
+          ?.filter((k) => typeof k === "string" && k.trim())
+          .map((k) => k.trim().toLowerCase())
+          .slice(0, 10);
+        if (interestKeywords && interestKeywords.length > 0) {
+          // Short stable fingerprint of the text at extraction time. A fresh
+          // hash defeats the feed's profile_input_hash cache short-circuit so
+          // the new keywords always take effect on the next feed load.
+          const hash = String(
+            content
+              .slice(0, 2400)
+              .split("")
+              .reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7),
+          );
+          await saveJournalInterestKeywords(localId, interestKeywords, hash);
+          holdJournalStatus(
+            `Added ${interestKeywords.length} interest${interestKeywords.length > 1 ? "s" : ""} to feed`,
+          );
+        }
+      } catch {
+        // Interest extraction failed — non-fatal, do not block journal completion
       }
     }
 

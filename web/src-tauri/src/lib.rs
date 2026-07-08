@@ -2053,6 +2053,62 @@ async fn delete_journal(id: String) -> Result<(), String> {
     })
 }
 
+/// Stores AI-extracted interest keywords for a journal entry into the feed's
+/// per-source triage-keywords slot, then marks the world feed dirty so the next
+/// `load_world_feed` re-profiles from these keywords instead of the heuristic
+/// extractor (see `feed::rebuild_interest_profile` — when `triage_keywords_json`
+/// is non-empty, mode switches from `"local"` to `"triage"`).
+///
+/// `journal_id` is the same local id the UI tracks (`journals/...` relative).
+/// `keywords` is a flat `Vec<String>` of lowercase public-vocabulary phrases.
+/// `content_hash` is a short UI-supplied fingerprint of the journal text at
+/// extraction time; a fresh hash defeats the `profile_input_hash` cache
+/// short-circuit so the new keywords always take effect.
+#[tauri::command]
+async fn save_journal_interest_keywords(
+    journal_id: String,
+    keywords: Vec<String>,
+    content_hash: String,
+) -> Result<(), String> {
+    let config = load_workspace_config_for_ui("journal interest keywords config load failed").await?;
+    let path = resolve_journal_id(&config.workspace_dir, &journal_id)?;
+    // Workspace-relative key with forward slashes — must match the path the feed
+    // engine stores/reads in `feed_interest_sources` (see `collect_post_text_sources`).
+    let Some(source_path) = rel_path_to_id(&config.workspace_dir, &path) else {
+        return Err("Journal entry is outside the workspace.".to_string());
+    };
+    let triage_keywords_json = serde_json::to_string(&keywords)
+        .map_err(|e| format!("Failed to serialize interest keywords: {e}"))?;
+    // Preserve interest_id/title across re-extraction; blank profile_input_hash
+    // forces `rebuild_interest_profile` to recompute (no cache short-circuit).
+    let existing = zeroclaw::gateway::local_store::get_feed_interest_source(
+        &config.workspace_dir,
+        &source_path,
+    )
+    .ok()
+    .flatten();
+    let record = zeroclaw::gateway::local_store::FeedInterestSourceRecord {
+        source_path: source_path.clone(),
+        content_hash,
+        profile_input_hash: String::new(),
+        interest_id: existing.as_ref().and_then(|r| r.interest_id.clone()),
+        title: existing
+            .as_ref()
+            .map(|r| r.title.clone())
+            .unwrap_or_default(),
+        triage_keywords_json,
+        updated_at: unix_time_label(),
+    };
+    zeroclaw::gateway::local_store::upsert_feed_interest_source(
+        &config.workspace_dir,
+        &record,
+    )
+    .map_err(|e| format!("Failed to store interest keywords: {e}"))?;
+    zeroclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
+        .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn rename_journal(id: String, new_title: String) -> Result<JournalEntry, String> {
     let config = load_workspace_config_for_ui("journal rename config load failed").await?;
@@ -3009,6 +3065,7 @@ pub fn run() {
             update_journal_text,
             rename_journal,
             delete_journal,
+            save_journal_interest_keywords,
             commands::desktop::open_workspace_journals_folder,
             commands::desktop::open_external_url,
             get_openai_device_code_status,
