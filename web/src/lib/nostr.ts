@@ -898,6 +898,131 @@ export async function fetchNostrFollowingCount(
 }
 
 /**
+ * Fetch a Nostr author's full kind-3 contact list as the set of followed
+ * pubkeys. Anonymous read. Used by publishNostrFollowList to merge a new follow
+ * without clobbering the user's existing contacts (NIP-02).
+ */
+export async function fetchNostrFollowSet(
+  pubkey: string,
+  relays: string[] = DEFAULT_RELAYS,
+  timeoutMs = 6000
+): Promise<string[]> {
+  try {
+    const events = await fetchEventsByFilter(
+      { authors: [pubkey], kinds: [3], limit: 1 },
+      { relays, timeoutMs }
+    );
+    if (!events.length) return [];
+    const contact = events[0];
+    return (contact.tags || [])
+      .filter((t) => t[0] === "p" && t[1])
+      .map((t) => t[1]);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Publish a kind-3 contact list (NIP-02) to follow a pubkey. Merges with the
+ * existing contact list first so we never clobber the user's current follows,
+ * then signs + broadcasts. Returns success + event id like publishNote.
+ */
+export async function publishNostrFollow(
+  followPubkey: string,
+  relays: string[] = DEFAULT_RELAYS
+): Promise<{ success: boolean; eventId?: string; error?: string }> {
+  const privkey = localStorage.getItem(STORAGE_KEY_NOSTR_PRIVKEY);
+  const pubkey = localStorage.getItem(STORAGE_KEY_NOSTR_PUBKEY);
+  if (!privkey || !pubkey) {
+    return { success: false, error: "No Nostr key configured" };
+  }
+  try {
+    // Merge into the existing contact list (don't clobber).
+    const existing = await fetchNostrFollowSet(pubkey, relays);
+    const follows = Array.from(new Set([...existing, followPubkey]));
+    const tags = follows.map((pk) => ["p", pk]);
+    const event = await createSignedEvent(privkey, 3, "", tags);
+
+    const results = await Promise.allSettled(
+      relays.map(
+        (relay) =>
+          new Promise<boolean>((resolve) => {
+            const ws = new WebSocket(relay);
+            const timeout = setTimeout(() => { ws.close(); resolve(false); }, 5000);
+            ws.onopen = () => { ws.send(JSON.stringify(["EVENT", event])); };
+            ws.onmessage = (msg) => {
+              try {
+                const data = JSON.parse(msg.data as string);
+                if (data[0] === "OK" && data[1] === event.id) {
+                  clearTimeout(timeout);
+                  ws.close();
+                  resolve(data[2] === true);
+                }
+              } catch {}
+            };
+            ws.onerror = () => { clearTimeout(timeout); ws.close(); resolve(false); };
+          })
+      )
+    );
+    const anySuccess = results.some((r) => r.status === "fulfilled" && r.value === true);
+    return anySuccess
+      ? { success: true, eventId: event.id }
+      : { success: false, error: "Failed to publish follow to any relay" };
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Unfollow a Nostr pubkey by removing it from the kind-3 contact list and
+ * re-publishing. Same merge-then-publish shape as publishNostrFollow.
+ */
+export async function publishNostrUnfollow(
+  unfollowPubkey: string,
+  relays: string[] = DEFAULT_RELAYS
+): Promise<{ success: boolean; eventId?: string; error?: string }> {
+  const privkey = localStorage.getItem(STORAGE_KEY_NOSTR_PRIVKEY);
+  const pubkey = localStorage.getItem(STORAGE_KEY_NOSTR_PUBKEY);
+  if (!privkey || !pubkey) {
+    return { success: false, error: "No Nostr key configured" };
+  }
+  try {
+    const existing = await fetchNostrFollowSet(pubkey, relays);
+    const follows = existing.filter((pk) => pk !== unfollowPubkey);
+    const tags = follows.map((pk) => ["p", pk]);
+    const event = await createSignedEvent(privkey, 3, "", tags);
+
+    const results = await Promise.allSettled(
+      relays.map(
+        (relay) =>
+          new Promise<boolean>((resolve) => {
+            const ws = new WebSocket(relay);
+            const timeout = setTimeout(() => { ws.close(); resolve(false); }, 5000);
+            ws.onopen = () => { ws.send(JSON.stringify(["EVENT", event])); };
+            ws.onmessage = (msg) => {
+              try {
+                const data = JSON.parse(msg.data as string);
+                if (data[0] === "OK" && data[1] === event.id) {
+                  clearTimeout(timeout);
+                  ws.close();
+                  resolve(data[2] === true);
+                }
+              } catch {}
+            };
+            ws.onerror = () => { clearTimeout(timeout); ws.close(); resolve(false); };
+          })
+      )
+    );
+    const anySuccess = results.some((r) => r.status === "fulfilled" && r.value === true);
+    return anySuccess
+      ? { success: true, eventId: event.id }
+      : { success: false, error: "Failed to publish unfollow to any relay" };
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
  * Extract keywords from journal entries for personalized feed.
  */
 export function extractKeywordsFromJournals(texts: string[]): string[] {

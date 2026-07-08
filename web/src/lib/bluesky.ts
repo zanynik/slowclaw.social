@@ -664,6 +664,84 @@ export async function getBlueskyProfileCounts(actor: string): Promise<BlueskyPro
   }
 }
 
+export type BlueskyProfile = BlueskyProfileCounts & {
+  did: string;
+  handle: string;
+  displayName: string;
+  description: string;
+  avatar: string;
+};
+
+/**
+ * Fetch a full Bluesky actor profile (identity + bio + avatar + counts) via the
+ * anonymous public AppView `getProfile`. No auth needed — powers the in-app
+ * profile view for any Bluesky author tapped in the feed. Returns null if the
+ * lookup fails so the UI can show a graceful empty state.
+ */
+export async function getBlueskyProfile(actor: string): Promise<BlueskyProfile | null> {
+  if (!actor.trim()) return null;
+  try {
+    const data = await blueskyPublicGet<{
+      did?: string;
+      handle?: string;
+      displayName?: string;
+      description?: string;
+      avatar?: string;
+      followersCount?: number;
+      followsCount?: number;
+      postsCount?: number;
+    }>("app.bsky.actor.getProfile", { actor });
+    return {
+      did: data.did ?? "",
+      handle: data.handle ?? actor,
+      displayName: data.displayName ?? data.handle ?? actor,
+      description: data.description ?? "",
+      avatar: data.avatar ?? "",
+      followers: data.followersCount ?? 0,
+      following: data.followsCount ?? 0,
+      posts: data.postsCount ?? 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Follow a Bluesky actor. Requires an authenticated agent (the user must have a
+ * Bluesky session). Creates an `app.bsky.graph.follow` record in the user's repo
+ * and returns the follow record's URI (store it to enable unfollow later).
+ */
+export async function followBlueskyAuthor(
+  agent: AtpAgent,
+  viewerDid: string,
+  subjectDid: string
+): Promise<{ uri: string }> {
+  const res = await agent.com.atproto.repo.createRecord({
+    repo: viewerDid,
+    collection: "app.bsky.graph.follow",
+    record: {
+      $type: "app.bsky.graph.follow",
+      subject: subjectDid,
+      createdAt: new Date().toISOString(),
+    },
+  });
+  return { uri: res.data.uri };
+}
+
+/**
+ * Unfollow a Bluesky actor by deleting the follow record. `followUri` is the
+ * URI returned by followBlueskyAuthor (or looked up from the user's graph).
+ */
+export async function unfollowBlueskyAuthor(agent: AtpAgent, followUri: string): Promise<void> {
+  const rkey = followUri.split("/").pop() || "";
+  const repo = followUri.replace("at://", "").split("/")[0];
+  await agent.com.atproto.repo.deleteRecord({
+    repo,
+    collection: "app.bsky.graph.follow",
+    rkey,
+  });
+}
+
 /**
  * Resolve a handle to a DID (needed to build feed URIs). Anonymous.
  */

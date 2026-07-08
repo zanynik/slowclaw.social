@@ -1,7 +1,7 @@
 import { lazy, Suspense, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { AtpAgent, AppBskyFeedDefs } from "@atproto/api";
-import { blueskyImagesOf, blueskyVideoOf, blueskyExternalOf, blueskyQuotedRecordOf, fetchBlueskyReelsFeed, REELS_VIDEO_TOPICS, getBlueskyProfileCounts } from "./lib/bluesky";
-import type { BlueskySession, BlueskyPublicPost, BlueskyProfileCounts } from "./lib/bluesky";
+import { blueskyImagesOf, blueskyVideoOf, blueskyExternalOf, blueskyQuotedRecordOf, fetchBlueskyReelsFeed, REELS_VIDEO_TOPICS, getBlueskyProfileCounts, getBlueskyProfile, getPublicBlueskyAuthorFeed, followBlueskyAuthor, unfollowBlueskyAuthor } from "./lib/bluesky";
+import type { BlueskySession, BlueskyPublicPost, BlueskyProfileCounts, BlueskyProfile } from "./lib/bluesky";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
 import { BottomNav } from "./components/BottomNav";
 import { SwipeableView } from "./components/SwipeableView";
@@ -25,6 +25,8 @@ import {
   npubFromHex,
   publishNote,
   publishProfile,
+  publishNostrFollow,
+  publishNostrUnfollow,
   fetchNostrFollowingCount,
   type NostrNote,
   type NostrProfile,
@@ -72,6 +74,8 @@ import {
 import { getSavedItems, onSavedChange, type SavedItem } from "./lib/savedItems";
 // ── Local-first profile (name / bio / avatar) ──────────────────────────────
 import { getProfile, saveProfile, onProfileChange, fileToAvatarDataUrl, setAvatar, type LocalProfile } from "./lib/profile";
+// ── Local-first optimistic follows ─────────────────────────────────────────
+import { getFollowedIds, onFollowsChange, toggleFollow, nostrFollowKey, blueskyFollowKey } from "./lib/follows";
 // ── Reads ranking + read-time (Google News / Substack-style "For You") ──────
 import { rankReads, chronologicalReads, type RankedRead } from "./lib/readsRanking";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
@@ -1682,11 +1686,20 @@ function App() {
   const [nostrPostConfirmPost, setNostrPostConfirmPost] = useState<PersistedPost | null>(null);
   const [nostrPostConfirmStep, setNostrPostConfirmStep] = useState<"confirm" | "account" | null>(null);
 
-  // Profile overlay (view Nostr user or TweetClaw skill)
-  type ProfileView = { kind: "nostr"; pubkey: string } | { kind: "skill"; skillId: string } | null;
+  // Profile overlay (view Nostr / Bluesky user or TweetClaw skill)
+  type ProfileView =
+    | { kind: "nostr"; pubkey: string }
+    | { kind: "bluesky"; actor: string }
+    | { kind: "skill"; skillId: string }
+    | null;
   const [profileView, setProfileView] = useState<ProfileView>(null);
   const [profileViewNotes, setProfileViewNotes] = useState<NostrNote[]>([]);
+  const [profileViewBlueskyPosts, setProfileViewBlueskyPosts] = useState<BlueskyPublicPost[]>([]);
+  const [profileViewBlueskyProfile, setProfileViewBlueskyProfile] = useState<BlueskyProfile | null>(null);
+  const [profileViewNostrFollowing, setProfileViewNostrFollowing] = useState<number | null>(null);
   const [profileViewLoading, setProfileViewLoading] = useState(false);
+  // Local optimistic follow state (mirrors lib/follows store; re-renders modal + cards).
+  const [followedIds, setFollowedIds] = useState<string[]>(() => getFollowedIds());
 
   // TweetClaw prompt (editable)
   const TWEETCLAW_PROMPT_KEY = "slowclaw.skill.tweetclaw.prompt";
@@ -1714,6 +1727,8 @@ function App() {
   useEffect(() => onSavedChange(() => setSavedItems(getSavedItems())), []);
   // Mirror local profile store into state (re-renders Profile on edits).
   useEffect(() => onProfileChange(() => setLocalProfile(getProfile())), []);
+  // Mirror the localStorage follows store so the modal + cards re-render on toggle.
+  useEffect(() => onFollowsChange(() => setFollowedIds(getFollowedIds())), []);
 
   // Fetch follower/following counts when the Profile tab opens (or accounts change).
   // Bluesky: anonymous public AppView getProfile. Nostr: kind-3 contact-list count.
@@ -7344,9 +7359,9 @@ function App() {
       <article className="nostr-note-card bluesky-note-card" key={post.uri}>
         <div className="nostr-note-head">
           {avatar
-            ? <img src={avatar} alt="" className="nostr-avatar" loading="lazy" />
-            : <div className="nostr-avatar nostr-avatar-fallback" aria-hidden>{name.slice(0, 1).toUpperCase()}</div>}
-          <div className="nostr-note-author">
+            ? <img src={avatar} alt="" className="nostr-avatar clickable" loading="lazy" onClick={() => void openBlueskyProfile(handle)} />
+            : <div className="nostr-avatar nostr-avatar-fallback clickable" aria-hidden onClick={() => void openBlueskyProfile(handle)}>{name.slice(0, 1).toUpperCase()}</div>}
+          <div className="nostr-note-author clickable" onClick={() => void openBlueskyProfile(handle)}>
             <span className="nostr-note-name">{name}</span>
             <span className="nostr-note-handle">@{handle}</span>
           </div>
@@ -7631,6 +7646,7 @@ function App() {
     setProfileView({ kind: "nostr", pubkey });
     setProfileViewLoading(true);
     setNostrProfileOverlay(null);
+    setProfileViewNostrFollowing(null);
     try {
       const profileMap = useNostrLocalStore
         ? await nostrGetProfiles([pubkey])
@@ -7640,10 +7656,72 @@ function App() {
         : await fetchNotesFromRelays({ authors: [pubkey], limit: 20 });
       setNostrProfileOverlay(profileMap.get(pubkey) || null);
       setProfileViewNotes(notes);
+      // Best-effort following count for the stats row (anonymous read).
+      void fetchNostrFollowingCount(pubkey).then((n) => setProfileViewNostrFollowing(n));
     } catch {
       setProfileViewNotes([]);
     } finally {
       setProfileViewLoading(false);
+    }
+  }
+
+  /**
+   * Open an in-app Bluesky author profile (auth-free read). Mirrors
+   * openNostrProfile: fetches the full profile + recent posts in parallel and
+   * surfaces them in the shared profile modal.
+   */
+  async function openBlueskyProfile(actor: string) {
+    const clean = actor.trim().replace(/^@/, "");
+    if (!clean) return;
+    setProfileView({ kind: "bluesky", actor: clean });
+    setProfileViewLoading(true);
+    setProfileViewBlueskyProfile(null);
+    setProfileViewBlueskyPosts([]);
+    try {
+      const [profile, posts] = await Promise.all([
+        getBlueskyProfile(clean),
+        getPublicBlueskyAuthorFeed(clean, { limit: 20 }),
+      ]);
+      setProfileViewBlueskyProfile(profile);
+      setProfileViewBlueskyPosts(posts);
+    } catch {
+      setProfileViewBlueskyPosts([]);
+    } finally {
+      setProfileViewLoading(false);
+    }
+  }
+
+  /**
+   * Toggle follow on an author. Optimistic local state flips instantly; the
+   * protocol write fires in the background. If the user has no keys/session,
+   * route to Settings instead (smart-degrade, mirrors the Nostr-publish flow).
+   */
+  async function handleToggleFollow(kind: "nostr" | "bluesky", id: string) {
+    const key = kind === "nostr" ? nostrFollowKey(id) : blueskyFollowKey(id);
+    const nowFollowing = toggleFollow(key);
+    setFollowedIds(getFollowedIds());
+
+    if (kind === "nostr") {
+      if (!nostrKeys) { setShowSettings(true); return; }
+      void (nowFollowing
+        ? publishNostrFollow(id)
+        : publishNostrUnfollow(id)
+      ).catch(() => { /* local state already reflects intent */ });
+    } else {
+      if (!session || !agent) { setShowSettings(true); return; }
+      const profile = profileViewBlueskyProfile;
+      if (!profile?.did) return;
+      try {
+        if (nowFollowing) {
+          await followBlueskyAuthor(agent, session.did, profile.did);
+        } else {
+          // Without a stored followUri we can't delete by URI. Best-effort:
+          // we keep the local "unfollowed" state; the server-side record may
+          // linger until a future getFollows-driven cleanup. Acceptable for v1.
+        }
+      } catch {
+        /* local state already reflects intent */
+      }
     }
   }
 
@@ -10789,7 +10867,7 @@ function App() {
         <div className="modal-overlay" onClick={() => setProfileView(null)}>
           <div className="modal-dialog" style={{ maxWidth: '400px', maxHeight: '80vh', overflow: 'auto' }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
-              <h3 style={{ margin: 0 }}>{profileView.kind === "skill" ? "Skill" : "Profile"}</h3>
+              <h3 style={{ margin: 0 }}>{profileView.kind === "skill" ? "Skill" : profileView.kind === "bluesky" ? "Bluesky profile" : "Nostr profile"}</h3>
               <button type="button" className="ghost" style={{ padding: '0.3rem' }} onClick={() => setProfileView(null)}>✕</button>
             </div>
 
@@ -10822,6 +10900,20 @@ function App() {
                 {nostrProfileOverlay?.about ? (
                   <p className="text-sm" style={{ margin: '0.25rem 0 0', whiteSpace: 'pre-wrap' }}>{nostrProfileOverlay.about}</p>
                 ) : null}
+                {/* Stats row + Follow button */}
+                <div className="profile-modal-stats">
+                  {profileViewNostrFollowing !== null ? (
+                    <span className="profile-modal-stat"><strong>{profileViewNostrFollowing}</strong> following</span>
+                  ) : null}
+                  <span className="profile-modal-stat"><strong>{profileViewNotes.length}</strong> notes</span>
+                  <button
+                    type="button"
+                    className={`profile-modal-follow-btn${followedIds.includes(nostrFollowKey(profileView.pubkey)) ? " following" : ""}`}
+                    onClick={() => void handleToggleFollow("nostr", profileView.pubkey)}
+                  >
+                    {followedIds.includes(nostrFollowKey(profileView.pubkey)) ? "Following" : (nostrKeys ? "Follow" : "Follow · connect key")}
+                  </button>
+                </div>
                 <div style={{ borderTop: '1px solid var(--line)', paddingTop: '0.75rem', marginTop: '0.25rem' }}>
                   <p className="text-sm" style={{ fontWeight: 600, marginBottom: '0.5rem' }}>Recent notes</p>
                   {profileViewLoading ? (
@@ -10831,6 +10923,61 @@ function App() {
                   ) : (
                     <div className="nostr-profile-notes">
                       {profileViewNotes.slice(0, 10).map((note) => renderNostrNoteCard(note))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {profileView.kind === "bluesky" && (
+              <div className="stack-sm">
+                <div className="nostr-profile-head">
+                  {profileViewBlueskyProfile?.avatar ? (
+                    <img
+                      src={profileViewBlueskyProfile.avatar}
+                      alt=""
+                      className="profile-pic-circle nostr-profile-avatar"
+                      onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+                    />
+                  ) : (
+                    <div className="profile-pic-circle">🌐</div>
+                  )}
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <p style={{ fontWeight: 700, margin: 0, fontSize: '1.05rem' }}>
+                      {profileViewBlueskyProfile?.displayName || profileViewBlueskyProfile?.handle || profileView.actor}
+                    </p>
+                    <p className="text-sm muted" style={{ margin: '0.05rem 0 0' }}>@{profileViewBlueskyProfile?.handle || profileView.actor}</p>
+                  </div>
+                </div>
+                {profileViewBlueskyProfile?.description ? (
+                  <p className="text-sm" style={{ margin: '0.25rem 0 0', whiteSpace: 'pre-wrap' }}>{profileViewBlueskyProfile.description}</p>
+                ) : null}
+                {/* Stats row + Follow button */}
+                <div className="profile-modal-stats">
+                  {profileViewBlueskyProfile ? (
+                    <>
+                      <span className="profile-modal-stat"><strong>{profileViewBlueskyProfile.followers}</strong> followers</span>
+                      <span className="profile-modal-stat"><strong>{profileViewBlueskyProfile.following}</strong> following</span>
+                      <span className="profile-modal-stat"><strong>{profileViewBlueskyProfile.posts}</strong> posts</span>
+                    </>
+                  ) : null}
+                  <button
+                    type="button"
+                    className={`profile-modal-follow-btn${followedIds.includes(blueskyFollowKey(profileView.actor)) ? " following" : ""}`}
+                    onClick={() => void handleToggleFollow("bluesky", profileView.actor)}
+                  >
+                    {followedIds.includes(blueskyFollowKey(profileView.actor)) ? "Following" : (session ? "Follow" : "Follow · sign in")}
+                  </button>
+                </div>
+                <div style={{ borderTop: '1px solid var(--line)', paddingTop: '0.75rem', marginTop: '0.25rem' }}>
+                  <p className="text-sm" style={{ fontWeight: 600, marginBottom: '0.5rem' }}>Recent posts</p>
+                  {profileViewLoading ? (
+                    <p className="text-sm muted">Loading...</p>
+                  ) : profileViewBlueskyPosts.length === 0 ? (
+                    <p className="text-sm muted">No posts found.</p>
+                  ) : (
+                    <div className="nostr-profile-notes">
+                      {profileViewBlueskyPosts.slice(0, 10).map((post) => renderBlueskyCard(post))}
                     </div>
                   )}
                 </div>

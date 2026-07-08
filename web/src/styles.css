@@ -4757,3 +4757,53 @@ button.local-ai-preset {
   from { opacity: 0; transform: translate(-50%, 12px); }
   to   { opacity: 1; transform: translate(-50%, 0); }
 }
+
+/* ── Profile modal: stats row + follow button ────────────────────────────── */
+.profile-modal-stats {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 0 0;
+}
+.profile-modal-stat {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.profile-modal-stat strong {
+  color: var(--ink);
+  font-weight: 700;
+}
+.profile-modal-follow-btn {
+  margin-left: auto;
+  padding: 0.4rem 1rem;
+  border: none;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-family: inherit;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s var(--ease-out), color 0.15s var(--ease-out);
+}
+.profile-modal-follow-btn:hover { filter: brightness(1.05); }
+.profile-modal-follow-btn:active { transform: scale(0.97); }
+.profile-modal-follow-btn.following {
+  background: var(--surface-3, var(--surface));
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
+/* ── Clickable author affordance (feed cards + profile modal) ────────────── */
+.nostr-avatar.clickable,
+.nostr-avatar-fallback.clickable,
+.nostr-note-author.clickable {
+  cursor: pointer;
+  transition: opacity 0.12s var(--ease-out);
+}
+.nostr-avatar.clickable:hover,
+.nostr-avatar-fallback.clickable:hover,
+.nostr-note-author.clickable:hover {
+  opacity: 0.75;
+}
