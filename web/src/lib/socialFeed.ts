@@ -393,7 +393,7 @@ export function filterByTopic(items: UnifiedItem[], topic: string): UnifiedItem[
  * UNRELIABLE and is intentionally NOT exposed as a channel.
  * ────────────────────────────────────────────────────────────────────────── */
 
-export type SocialSource = "nostr" | "bluesky" | "news";
+export type SocialSource = "nostr" | "bluesky" | "news" | "following";
 
 export type ChannelLever = "nostr-hashtag" | "bluesky-search" | "firehose";
 

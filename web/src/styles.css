@@ -4807,3 +4807,39 @@ button.local-ai-preset {
 .nostr-note-author.clickable:hover {
   opacity: 0.75;
 }
+
+/* ── Inline reply compose (Feed / Following / profile) ───────────────────── */
+.reply-compose {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  background: var(--surface-3, var(--surface));
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+.reply-compose-input {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.88rem;
+  line-height: 1.4;
+  padding: 0.3rem 0;
+  outline: none;
+  max-height: 8rem;
+}
+.reply-compose-send {
+  flex-shrink: 0;
+  padding: 0.35rem 0.85rem;
+  font-size: 0.8rem;
+  border-radius: 999px;
+}
+
+/* Repost state on the action bar (mirrors .liked/.saved). */
+.feed-action.reposted { color: #22c55e; }
+.feed-action.reposted svg { stroke: currentColor; }

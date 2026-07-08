@@ -105,6 +105,77 @@ export async function unlikeBlueskyPost(agent: AtpAgent, likeUri: string) {
   });
 }
 
+/**
+ * Repost a Bluesky post. Creates an `app.bsky.feed.repost` record in the user's
+ * repo referencing the subject post. Requires an authed session. Mirrors the
+ * likeBlueskyPost shape (subject = { uri, cid }).
+ */
+export async function repostBlueskyPost(
+  agent: AtpAgent,
+  viewerDid: string,
+  postUri: string,
+  postCid: string
+): Promise<{ uri: string }> {
+  const res = await agent.com.atproto.repo.createRecord({
+    repo: viewerDid,
+    collection: "app.bsky.feed.repost",
+    record: {
+      $type: "app.bsky.feed.repost",
+      subject: { uri: postUri, cid: postCid },
+      createdAt: new Date().toISOString(),
+    },
+  });
+  return { uri: res.data.uri };
+}
+
+/** Delete a repost record (unrepost). followUri is the repost record's uri. */
+export async function unrepostBlueskyPost(agent: AtpAgent, repostUri: string): Promise<void> {
+  const rkey = repostUri.split("/").pop() || "";
+  const repo = repostUri.replace("at://", "").split("/")[0];
+  await agent.com.atproto.repo.deleteRecord({
+    repo,
+    collection: "app.bsky.feed.repost",
+    rkey,
+  });
+}
+
+/**
+ * Quote-post: a normal app.bsky.feed.post that embeds another post as a record
+ * embed (the AT Protocol quote pattern). `quotedCid` should be the target post's
+ * cid; if unknown pass "" (the AppView may still render the embed).
+ */
+export async function quoteBlueskyPost(
+  agent: AtpAgent,
+  viewerDid: string,
+  text: string,
+  quotedUri: string,
+  quotedCid: string
+): Promise<{ uri: string }> {
+  const record: Record<string, unknown> = {
+    $type: "app.bsky.feed.post",
+    text,
+    createdAt: new Date().toISOString(),
+  };
+  if (quotedCid) {
+    record.embed = {
+      $type: "app.bsky.embed.record",
+      record: { uri: quotedUri, cid: quotedCid },
+    };
+  } else {
+    // No cid — still a valid record embed by uri only.
+    record.embed = {
+      $type: "app.bsky.embed.record",
+      record: { uri: quotedUri },
+    };
+  }
+  const res = await agent.com.atproto.repo.createRecord({
+    repo: viewerDid,
+    collection: "app.bsky.feed.post",
+    record,
+  });
+  return { uri: res.data.uri };
+}
+
 export async function fetchBlueskyThread(
   serviceUrl: string,
   accessJwt: string,

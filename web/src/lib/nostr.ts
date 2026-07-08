@@ -1023,8 +1023,102 @@ export async function publishNostrUnfollow(
 }
 
 /**
- * Extract keywords from journal entries for personalized feed.
+ * Publish a Nostr repost (kind 6, NIP-18). The reposted event id is tagged via
+ * `["e", <id>, <relay>, "", "mention"]` per NIP-18, and the author via a "p"
+ * tag so clients can attribute it. Empty content (a pure repost) is standard;
+ * quoting (a kind-1 with an "e" ... "reply"/"mention" tag) is left to a future
+ * helper since Nostr has no single canonical quote event kind.
  */
+export async function publishNostrRepost(
+  eventId: string,
+  authorPubkey: string,
+  relays: string[] = DEFAULT_RELAYS
+): Promise<{ success: boolean; eventId?: string; error?: string }> {
+  const privkey = localStorage.getItem(STORAGE_KEY_NOSTR_PRIVKEY);
+  if (!privkey) return { success: false, error: "No Nostr key configured" };
+  try {
+    const recommendedRelay = relays[0] || DEFAULT_RELAYS[0];
+    // NIP-18: kind-6 repost tags the original event + its author.
+    const tags: string[][] = [
+      ["e", eventId, recommendedRelay, "", "mention"],
+    ];
+    if (authorPubkey) tags.push(["p", authorPubkey]);
+    const event = await createSignedEvent(privkey, 6, "", tags);
+    const results = await Promise.allSettled(
+      relays.map(
+        (relay) =>
+          new Promise<boolean>((resolve) => {
+            const ws = new WebSocket(relay);
+            const timeout = setTimeout(() => { ws.close(); resolve(false); }, 5000);
+            ws.onopen = () => { ws.send(JSON.stringify(["EVENT", event])); };
+            ws.onmessage = (msg) => {
+              try {
+                const data = JSON.parse(msg.data as string);
+                if (data[0] === "OK" && data[1] === event.id) {
+                  clearTimeout(timeout);
+                  ws.close();
+                  resolve(data[2] === true);
+                }
+              } catch {}
+            };
+            ws.onerror = () => { clearTimeout(timeout); ws.close(); resolve(false); };
+          })
+      )
+    );
+    const anySuccess = results.some((r) => r.status === "fulfilled" && r.value === true);
+    return anySuccess
+      ? { success: true, eventId: event.id }
+      : { success: false, error: "Failed to publish repost to any relay" };
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Publish a kind-1 reply (NIP-10) to a parent note. Tags the parent event id
+ * with the "reply" marker. Broadcasts to all default relays. Returns success +
+ * event id like publishNote. Used by the social Feed's inline reply compose.
+ */
+export async function publishNostrReply(
+  parentEventId: string,
+  content: string,
+  relays: string[] = DEFAULT_RELAYS
+): Promise<{ success: boolean; eventId?: string; error?: string }> {
+  const privkey = localStorage.getItem(STORAGE_KEY_NOSTR_PRIVKEY);
+  if (!privkey) return { success: false, error: "No Nostr key configured" };
+  try {
+    const tags: string[][] = [["e", parentEventId, relays[0] || "", "reply"]];
+    const event = await createSignedEvent(privkey, 1, content, tags);
+    const results = await Promise.allSettled(
+      relays.map(
+        (relay) =>
+          new Promise<boolean>((resolve) => {
+            const ws = new WebSocket(relay);
+            const timeout = setTimeout(() => { ws.close(); resolve(false); }, 5000);
+            ws.onopen = () => { ws.send(JSON.stringify(["EVENT", event])); };
+            ws.onmessage = (msg) => {
+              try {
+                const data = JSON.parse(msg.data as string);
+                if (data[0] === "OK" && data[1] === event.id) {
+                  clearTimeout(timeout);
+                  ws.close();
+                  resolve(data[2] === true);
+                }
+              } catch {}
+            };
+            ws.onerror = () => { clearTimeout(timeout); ws.close(); resolve(false); };
+          })
+      )
+    );
+    const anySuccess = results.some((r) => r.status === "fulfilled" && r.value === true);
+    return anySuccess
+      ? { success: true, eventId: event.id }
+      : { success: false, error: "Failed to publish reply to any relay" };
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export function extractKeywordsFromJournals(texts: string[]): string[] {
   const stopWords = new Set([
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",

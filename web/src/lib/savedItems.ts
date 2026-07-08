@@ -110,6 +110,30 @@ export function toggleLiked(id: string): boolean {
   return nowLiked;
 }
 
+/* ── Reposted (optimistic local repost) ──────────────────────────────────── */
+
+const REPOSTED_KEY = "slowclaw.reposted.v1";
+
+export function getRepostedIds(): string[] {
+  return readJSON<string[]>(REPOSTED_KEY, []);
+}
+
+export function isReposted(id: string): boolean {
+  return getRepostedIds().includes(id);
+}
+
+export function setReposted(id: string, reposted: boolean): void {
+  const ids = getRepostedIds();
+  const next = reposted ? (ids.includes(id) ? ids : [...ids, id]) : ids.filter((x) => x !== id);
+  writeJSON(REPOSTED_KEY, next);
+}
+
+export function toggleReposted(id: string): boolean {
+  const nowReposted = !isReposted(id);
+  setReposted(id, nowReposted);
+  return nowReposted;
+}
+
 /* ── React subscription helper ──────────────────────────────────────────── */
 
 /**

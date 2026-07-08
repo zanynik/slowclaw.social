@@ -1,6 +1,6 @@
 import { lazy, Suspense, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { AtpAgent, AppBskyFeedDefs } from "@atproto/api";
-import { blueskyImagesOf, blueskyVideoOf, blueskyExternalOf, blueskyQuotedRecordOf, fetchBlueskyReelsFeed, REELS_VIDEO_TOPICS, getBlueskyProfileCounts, getBlueskyProfile, getPublicBlueskyAuthorFeed, followBlueskyAuthor, unfollowBlueskyAuthor } from "./lib/bluesky";
+import { blueskyImagesOf, blueskyVideoOf, blueskyExternalOf, blueskyQuotedRecordOf, fetchBlueskyReelsFeed, REELS_VIDEO_TOPICS, getBlueskyProfileCounts, getBlueskyProfile, getPublicBlueskyAuthorFeed, followBlueskyAuthor, unfollowBlueskyAuthor, repostBlueskyPost, unrepostBlueskyPost, quoteBlueskyPost } from "./lib/bluesky";
 import type { BlueskySession, BlueskyPublicPost, BlueskyProfileCounts, BlueskyProfile } from "./lib/bluesky";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
 import { BottomNav } from "./components/BottomNav";
@@ -27,6 +27,8 @@ import {
   publishProfile,
   publishNostrFollow,
   publishNostrUnfollow,
+  publishNostrRepost,
+  publishNostrReply,
   fetchNostrFollowingCount,
   type NostrNote,
   type NostrProfile,
@@ -70,12 +72,14 @@ import {
   type ContentChannel,
   type SocialSource,
 } from "./lib/socialFeed";
-// ── Local-first interactions: saved/liked items + native share ──────────────
-import { getSavedItems, onSavedChange, type SavedItem } from "./lib/savedItems";
+// ── Local-first interactions: saved/liked/reposted items + native share ────
+import { getSavedItems, onSavedChange, type SavedItem, isReposted, toggleReposted, getRepostedIds } from "./lib/savedItems";
 // ── Local-first profile (name / bio / avatar) ──────────────────────────────
 import { getProfile, saveProfile, onProfileChange, fileToAvatarDataUrl, setAvatar, type LocalProfile } from "./lib/profile";
 // ── Local-first optimistic follows ─────────────────────────────────────────
 import { getFollowedIds, onFollowsChange, toggleFollow, nostrFollowKey, blueskyFollowKey } from "./lib/follows";
+// ── Following home timeline (merged Nostr + Bluesky) ───────────────────────
+import { loadFollowingFeed, type FollowingFeedItem } from "./lib/followingFeed";
 // ── Reads ranking + read-time (Google News / Substack-style "For You") ──────
 import { rankReads, chronologicalReads, type RankedRead } from "./lib/readsRanking";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
@@ -1589,6 +1593,10 @@ function App() {
   const [threadLoading, setThreadLoading] = useState(false);
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
   const [replyingUri, setReplyingUri] = useState("");
+  // Reply success/failure toast for the social Feed reply compose boxes.
+  const [replyToast, setReplyToast] = useState<string | null>(null);
+  // Which Bluesky posts have their inline reply compose expanded.
+  const [blueskyReplyExpanded, setBlueskyReplyExpanded] = useState<Set<string>>(new Set());
 
   // World feed sub-tabs & Me feed sub-tabs
   const [worldFeedTab, setWorldFeedTab] = useState<"tweets" | "articles" | "videos">("tweets");
@@ -1628,6 +1636,12 @@ function App() {
   const [socialSource, setSocialSource] = useState<SocialSource>("nostr");
   const [activeChannelId, setActiveChannelId] = useState<string>("");
   const [feedView, setFeedView] = useState<"social" | "news">("social");
+  // Following home timeline (merged Nostr + Bluesky from the follows store).
+  const [followingItems, setFollowingItems] = useState<FollowingFeedItem[]>([]);
+  const [followingLoading, setFollowingLoading] = useState(false);
+  const [followingError, setFollowingError] = useState("");
+  // Reposted-set (mirrors localStorage so FeedActionBar reflects optimistic state).
+  const [repostedIds, setRepostedIds] = useState<string[]>(() => getRepostedIds());
   // Bluesky public posts cache + loading (separate from the authed blueskyFeedItems).
   const [blueskyPublicPosts, setBlueskyPublicPosts] = useState<import("./lib/bluesky").BlueskyPublicPost[]>([]);
   const [blueskyPublicLoading, setBlueskyPublicLoading] = useState(false);
@@ -1729,6 +1743,8 @@ function App() {
   useEffect(() => onProfileChange(() => setLocalProfile(getProfile())), []);
   // Mirror the localStorage follows store so the modal + cards re-render on toggle.
   useEffect(() => onFollowsChange(() => setFollowedIds(getFollowedIds())), []);
+  // Mirror the reposted store so FeedActionBar re-renders on toggle.
+  useEffect(() => onSavedChange(() => setRepostedIds(getRepostedIds())), []);
 
   // Fetch follower/following counts when the Profile tab opens (or accounts change).
   // Bluesky: anonymous public AppView getProfile. Nostr: kind-3 contact-list count.
@@ -6970,10 +6986,38 @@ function App() {
 
   /** Dispatcher: load whichever source is active. */
   async function loadSocialFeed() {
-    if (socialSource === "bluesky") {
+    if (socialSource === "following") {
+      await loadFollowingFeedApp();
+    } else if (socialSource === "bluesky") {
       await loadBlueskyPublicFeed();
     } else {
       await loadNostrFeed();
+    }
+  }
+
+  /**
+   * Following home timeline: the newest posts from authors the user follows,
+   * merged across Nostr (one multi-author relay query) and Bluesky (per-author
+   * fan-out). This is the Twitter/Bluesky home-timeline experience.
+   */
+  async function loadFollowingFeedApp() {
+    if (followingLoading) return;
+    setFollowingLoading(true);
+    setFollowingError("");
+    try {
+      const result = await loadFollowingFeed(getFollowedIds(), {
+        nostrProfiles: useNostrLocalStore ? undefined : undefined, // profiles resolve lazily via card render
+      });
+      setFollowingItems(result.items);
+      if (result.items.length === 0 && getFollowedIds().length === 0) {
+        setFollowingError(""); // empty state handled in UI, not as error
+      }
+    } catch (e) {
+      setFollowingItems([]);
+      const msg = e instanceof Error ? e.message : String(e);
+      setFollowingError(`Couldn't load following feed: ${msg.slice(0, 100)}`);
+    } finally {
+      setFollowingLoading(false);
     }
   }
 
@@ -7157,6 +7201,12 @@ function App() {
         <div className="source-toggle" role="group" aria-label="Content source">
           <button
             type="button"
+            className={`source-pill${socialSource === "following" ? " active" : ""}`}
+            onClick={() => { if (socialSource !== "following") { setSocialSource("following"); setActiveChannelId(""); } }}
+            title="Home timeline — newest posts from people you follow"
+          >Following</button>
+          <button
+            type="button"
             className={`source-pill${socialSource === "nostr" ? " active" : ""}`}
             onClick={() => { if (socialSource !== "nostr") { setSocialSource("nostr"); setActiveChannelId(""); } }}
           >Nostr</button>
@@ -7313,7 +7363,27 @@ function App() {
             }}
             replyLoading={!!repliesLoading}
             replyExpanded={!!replies?.length}
+            reposted={repostedIds.includes(note.id)}
+            onRepost={() => void handleRepost("nostr", note.id, note.pubkey)}
           />
+          {/* Inline reply compose (shown when the thread is expanded). */}
+          {replies ? (
+            <div className="reply-compose">
+              <textarea
+                className="reply-compose-input"
+                rows={1}
+                placeholder={nostrKeys ? "Reply on Nostr…" : "Connect your Nostr key to reply…"}
+                value={replyDrafts[note.id] || ""}
+                onChange={(e) => setReplyDrafts((prev) => ({ ...prev, [note.id]: e.target.value }))}
+              />
+              <button
+                type="button"
+                className="primary reply-compose-send"
+                disabled={!replyDrafts[note.id]?.trim()}
+                onClick={() => { void handleNostrReplyFromCard(note.id, replyDrafts[note.id] || ""); }}
+              >Reply</button>
+            </div>
+          ) : null}
           {repliesLoading ? <p className="text-sm muted nostr-reply-meta">Loading replies…</p> : null}
           {replies && replies.length > 0 ? (
             <div className="nostr-reply-thread">
@@ -7419,11 +7489,36 @@ function App() {
           likeCount={post.likeCount}
           repostCount={post.repostCount}
           replyCount={post.replyCount}
-          permalink={profileUrl}
+          permalink={(() => { const rkey = post.uri.split("/").pop(); return rkey ? `${profileUrl}/post/${rkey}` : profileUrl; })()}
           authorName={name}
           authorHandle={handle}
           thumbnail={avatar}
+          reposted={repostedIds.includes(post.uri)}
+          onRepost={() => void handleRepost("bluesky", post.uri, post.author.did, post.cid)}
+          onReply={() => setBlueskyReplyExpanded((prev) => {
+            const next = new Set(prev);
+            if (next.has(post.uri)) next.delete(post.uri); else next.add(post.uri);
+            return next;
+          })}
+          replyExpanded={blueskyReplyExpanded.has(post.uri)}
         />
+        {blueskyReplyExpanded.has(post.uri) ? (
+          <div className="reply-compose">
+            <textarea
+              className="reply-compose-input"
+              rows={1}
+              placeholder={session ? "Reply on Bluesky…" : "Sign in to Bluesky to reply…"}
+              value={replyDrafts[post.uri] || ""}
+              onChange={(e) => setReplyDrafts((prev) => ({ ...prev, [post.uri]: e.target.value }))}
+            />
+            <button
+              type="button"
+              className="primary reply-compose-send"
+              disabled={!replyDrafts[post.uri]?.trim() || !session}
+              onClick={() => void handleBlueskyReplyFromCard(post.uri, post.cid)}
+            >Reply</button>
+          </div>
+        ) : null}
       </article>
     );
   }
@@ -7729,6 +7824,79 @@ function App() {
     setProfileView({ kind: "skill", skillId });
     setProfileViewNotes([]);
     setProfileViewLoading(false);
+  }
+
+  /**
+   * Repost a post. Optimistic local toggle flips the icon instantly; the
+   * protocol write fires in the background. Smart-degrades to Settings when no
+   * keys/session are connected (mirrors the follow/publish flows).
+   *   - Nostr: kind-6 repost event (NIP-18).
+   *   - Bluesky: app.bsky.feed.repost createRecord.
+   */
+  async function handleRepost(kind: "nostr" | "bluesky", postId: string, authorId?: string, blueskyCid?: string) {
+    const nowReposted = toggleReposted(postId);
+    setRepostedIds(getRepostedIds());
+    if (kind === "nostr") {
+      if (!nostrKeys) { setShowSettings(true); return; }
+      void publishNostrRepost(postId, authorId || "").catch(() => { /* local state reflects intent */ });
+    } else {
+      if (!session || !agent) { setShowSettings(true); return; }
+      try {
+        if (nowReposted) {
+          await repostBlueskyPost(agent, session.did, postId, blueskyCid || "");
+        } else {
+          // Without a stored repostUri we can't delete by URI. Best-effort for v1:
+          // local "unreposted" state is correct; server record may linger.
+        }
+      } catch {
+        /* local state reflects intent */
+      }
+    }
+  }
+
+  /**
+   * Reply to a Bluesky post from the social Feed / Following / profile surfaces.
+   * For a direct reply to a top-level post, root = parent = the post itself.
+   * Mirrors handleReplyToBlueskyPost (the World-tab path) but reads the draft
+   * from replyDrafts keyed by post uri.
+   */
+  async function handleBlueskyReplyFromCard(postUri: string, postCid: string) {
+    const text = replyDrafts[postUri]?.trim();
+    if (!text || !agent || !session) return;
+    try {
+      const bluesky = await loadBlueskyModule();
+      await bluesky.replyToBlueskyPost(agent, session.did, text, postUri, postCid, postUri, postCid);
+      setReplyDrafts((prev) => { const next = { ...prev }; delete next[postUri]; return next; });
+      setReplyToast("Reply posted");
+      window.setTimeout(() => setReplyToast((c) => (c === "Reply posted" ? null : c)), 2200);
+    } catch {
+      setReplyToast("Reply failed");
+      window.setTimeout(() => setReplyToast((c) => (c === "Reply failed" ? null : c)), 2200);
+    }
+  }
+
+  /**
+   * Reply to a Nostr note from the social Feed / Following surfaces. Mirrors
+   * handleNostrReply but uses the shared replyDrafts store keyed by note id.
+   */
+  async function handleNostrReplyFromCard(noteId: string, content: string) {
+    if (!content.trim()) return;
+    if (!nostrKeys) { setShowSettings(true); return; }
+    try {
+      const result = await publishNostrReply(noteId, content.trim());
+      if (result.success) {
+        // Refresh the thread so the new reply shows.
+        void loadNostrReplies(noteId);
+        setReplyDrafts((prev) => { const next = { ...prev }; delete next[noteId]; return next; });
+        setReplyToast("Reply posted");
+      } else {
+        setReplyToast("Reply failed");
+      }
+      window.setTimeout(() => setReplyToast((c) => (c === "Reply posted" || c === "Reply failed" ? null : c)), 2200);
+    } catch {
+      setReplyToast("Reply failed");
+      window.setTimeout(() => setReplyToast((c) => (c === "Reply failed" ? null : c)), 2200);
+    }
   }
 
   function handleLikePost(post: PersistedPost) {
@@ -8390,10 +8558,12 @@ function App() {
     void loadRuntimeMediaCapabilities();
   }, [mobileTab, feedSource, chatGatewayToken, gatewayBaseUrl]);
 
-  // Auto-load social feed (Nostr or Bluesky) when the Feed tab is shown and empty.
+  // Auto-load social feed (Nostr / Bluesky / Following) when the Feed tab is shown and empty.
   useEffect(() => {
     if (mobileTab === "feed" && feedView === "social") {
-      if (socialSource === "bluesky") {
+      if (socialSource === "following") {
+        if (followingItems.length === 0 && !followingLoading) void loadFollowingFeedApp();
+      } else if (socialSource === "bluesky") {
         if (blueskyPublicPosts.length === 0 && !blueskyPublicLoading) void loadBlueskyPublicFeed();
       } else if (nostrFeedNotes.length === 0 && !nostrFeedLoading) {
         void loadNostrFeed();
@@ -9940,7 +10110,7 @@ function App() {
                 ↑ {newPostsCount} new {newPostsCount === 1 ? "post" : "posts"}
               </button>
             ) : null}
-            <PullToRefresh onRefresh={withRefreshToast("Feed updated", () => feedView === "news" ? loadTechNews() : loadSocialFeed())} enabled={feedView === "news" ? !techNewsLoading : !(nostrFeedLoading || blueskyPublicLoading)}>
+            <PullToRefresh onRefresh={withRefreshToast("Feed updated", () => feedView === "news" ? loadTechNews() : loadSocialFeed())} enabled={feedView === "news" ? !techNewsLoading : !(nostrFeedLoading || blueskyPublicLoading || followingLoading)}>
             <div className="stack">
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
@@ -10022,7 +10192,7 @@ function App() {
                   </>
                 ) : (
                   <>
-                    <div className="social-section-label">Channels · open-protocol feeds</div>
+                    <div className="social-section-label">{socialSource === "following" ? "Home · your follows" : "Channels · open-protocol feeds"}</div>
                     {renderSourceAndChannels()}
                     {/* Show how many notes the quality filter dropped (language/spam/dedup). */}
                     {socialSource === "nostr" && nostrFeedStats && nostrFeedNotes.length > 0 ? (
@@ -10031,7 +10201,42 @@ function App() {
                       </p>
                     ) : null}
 
-                    {socialSource === "nostr" ? (
+                    {socialSource === "following" ? (
+                      followingLoading && followingItems.length === 0 ? (
+                        <div style={{ padding: '2rem', textAlign: 'center' }}>
+                          <span className="btn-spinner" aria-hidden />
+                          <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Loading your timeline…</p>
+                        </div>
+                      ) : followingError ? (
+                        <div className="feed-empty-filtered">
+                          <p className="text-sm muted" style={{ margin: 0 }}>{followingError}</p>
+                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadFollowingFeedApp()}>Retry</button>
+                        </div>
+                      ) : getFollowedIds().length === 0 ? (
+                        <div className="feed-create-hero">
+                          <div className="feed-create-hero-icon">👥</div>
+                          <h3>Follow people to build your timeline</h3>
+                          <p className="text-sm muted">Tap any author's name in the Nostr or Bluesky feeds, then Follow. Their newest posts will appear here — your home timeline, across both protocols.</p>
+                          <button type="button" className="primary" onClick={() => { setSocialSource("nostr"); setActiveChannelId(""); }}>Discover on Nostr</button>
+                        </div>
+                      ) : followingItems.length === 0 ? (
+                        <div className="feed-empty-filtered">
+                          <p className="text-sm muted" style={{ margin: 0 }}>No recent posts from the {getFollowedIds().length} {getFollowedIds().length === 1 ? "person" : "people"} you follow.</p>
+                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadFollowingFeedApp()}>Refresh</button>
+                        </div>
+                      ) : (
+                        <div className="feed-posts-list">
+                          {followingItems.slice(0, feedVisibleCount).map((item) =>
+                            item.nostrNote ? renderNostrNoteCard(item.nostrNote)
+                            : item.blueskyPost ? renderBlueskyCard(item.blueskyPost)
+                            : null
+                          )}
+                          {followingItems.length > feedVisibleCount ? (
+                            <button type="button" className="load-more-btn" onClick={() => setFeedVisibleCount((c) => c + 20)}>Show more</button>
+                          ) : null}
+                        </div>
+                      )
+                    ) : socialSource === "nostr" ? (
                       nostrFeedLoading && nostrFeedNotes.length === 0 ? (
                         <div style={{ padding: '2rem', textAlign: 'center' }}>
                           <span className="btn-spinner" aria-hidden />
@@ -11024,6 +11229,10 @@ function App() {
       {/* Refresh toast (#5): confirms a pull-to-refresh completed. */}
       {refreshToast ? (
         <div className="refresh-toast" role="status" aria-live="polite">{refreshToast}</div>
+      ) : null}
+      {/* Reply toast: confirms a reply posted (or failed) from a compose box. */}
+      {replyToast ? (
+        <div className="refresh-toast" role="status" aria-live="polite">{replyToast}</div>
       ) : null}
     </div>
   );
