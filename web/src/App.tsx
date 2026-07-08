@@ -8,6 +8,7 @@ import { SwipeableView } from "./components/SwipeableView";
 import { PullToRefresh } from "./components/PullToRefresh";
 import { MediaTile } from "./components/MediaTile";
 import { ReelsPlayer } from "./components/ReelsPlayer";
+import { FeedActionBar } from "./components/FeedActionBar";
 import { ToastContainer } from "./components/ui/ToastContainer";
 import { appActions } from "./stores/useAppStore";
 import { useIsKeyboardOpen } from "./hooks/useKeyboardHeight";
@@ -65,6 +66,10 @@ import {
   type ContentChannel,
   type SocialSource,
 } from "./lib/socialFeed";
+// ── Local-first interactions: saved/liked items + native share ──────────────
+import { getSavedItems, onSavedChange, type SavedItem } from "./lib/savedItems";
+// ── Reads ranking + read-time (Google News / Substack-style "For You") ──────
+import { rankReads, chronologicalReads, type RankedRead } from "./lib/readsRanking";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
   saveJournalText,
@@ -1629,6 +1634,24 @@ function App() {
   const [readsError, setReadsError] = useState("");
   const [readsSource, setReadsSource] = useState<"nostr" | "rss">("nostr");
   const [activeRssFeedIds, setActiveRssFeedIds] = useState<string[]>(["hackernews", "stratechery", "verge"]);
+  // Reads ranking mode: "foryou" (scored merge) vs "latest" (chronological).
+  const [readsRankMode, setReadsRankMode] = useState<"foryou" | "latest">(() => {
+    if (typeof window === "undefined") return "foryou";
+    return window.localStorage.getItem("slowclaw.reads.rank") === "latest" ? "latest" : "foryou";
+  });
+  // Feed/Reels "Show more" pagination (replaces the silent 40-item cliff).
+  const [feedVisibleCount, setFeedVisibleCount] = useState(20);
+  const [readsVisibleCount, setReadsVisibleCount] = useState(12);
+  // Reels global mute — lifted out of ReelsPlayer so unmuting one unmutes all.
+  const [reelsMuted, setReelsMuted] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    return window.localStorage.getItem("slowclaw.reels.muted") !== "false";
+  });
+  // Saved items (Profile tab) — mirrored from the localStorage store so the
+  // Profile list re-renders when Feed/Reels/Reads save or unsave an item.
+  const [savedItems, setSavedItems] = useState<SavedItem[]>(() => getSavedItems());
+  // Reels snap-scroll container ref (shared with PullToRefresh for nested pull).
+  const reelsScrollRef = useRef<HTMLDivElement | null>(null);
   const [techNewsLoading, setTechNewsLoading] = useState(false);
   const [techNewsError, setTechNewsError] = useState("");
   const [nostrPostConfirmPost, setNostrPostConfirmPost] = useState<PersistedPost | null>(null);
@@ -1650,6 +1673,25 @@ function App() {
   const [feedNewPostsBanner, setFeedNewPostsBanner] = useState(false);
   const feedPollTimerRef = useRef<number | undefined>(undefined);
   const pendingFeedItemsRef = useRef<PersonalizedFeedResponse | null>(null);
+
+  // Persist Reels global mute + Reads rank mode (survive tab switches / reloads).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("slowclaw.reels.muted", reelsMuted ? "true" : "false");
+  }, [reelsMuted]);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("slowclaw.reads.rank", readsRankMode);
+  }, [readsRankMode]);
+
+  // Mirror the localStorage saved-items store into state for the Profile list,
+  // and re-sync when Feed/Reels/Reads mutate it (same-tab custom event + cross-tab storage).
+  useEffect(() => onSavedChange(() => setSavedItems(getSavedItems())), []);
+
+  // Reset feed pagination when the source/topic changes (so the list isn't empty).
+  useEffect(() => { setFeedVisibleCount(20); }, [socialSource, activeChannelId, activeSocialTopic, feedView]);
+  // Reset Reads pagination when the rank mode / RSS filter changes.
+  useEffect(() => { setReadsVisibleCount(12); }, [readsRankMode, activeRssFeedIds]);
 
   useEffect(() => {
     let cancelled = false;
@@ -6615,11 +6657,27 @@ function App() {
     });
   }, [nostrFeedNotes, nostrProfiles, activeSocialTopic]);
 
-  /** Bluesky public posts normalized to UnifiedItem, with optional journal refinement. */
+  /**
+   * Bluesky public posts for the text Feed, optionally filtered by the active
+   * journal topic. The Feed tab is text-first by product vision (it mirrors a
+   * Twitter timeline), so we also **prioritize text posts above media posts**:
+   * posts with no image/video/external embed sort first, then posts with media.
+   * This compensates for `searchPosts` returning image-heavy results for
+   * generic terms (Bluesky has no reliable server-side text-only filter).
+   */
   const visibleBlueskyItems = useMemo(() => {
     const t = activeSocialTopic.trim().toLowerCase();
-    if (!t) return blueskyPublicPosts;
-    return blueskyPublicPosts.filter((p) => matchesTopic(toUnifiedFromBluesky(p), t));
+    const filtered = t
+      ? blueskyPublicPosts.filter((p) => matchesTopic(toUnifiedFromBluesky(p), t))
+      : blueskyPublicPosts;
+    const hasMedia = (p: BlueskyPublicPost) =>
+      blueskyImagesOf(p).length > 0 || !!blueskyVideoOf(p) || !!blueskyExternalOf(p);
+    // Stable text-first sort: preserve server order (top/relevance) within each bucket.
+    return [...filtered].sort((a, b) => {
+      const am = hasMedia(a) ? 1 : 0;
+      const bm = hasMedia(b) ? 1 : 0;
+      return am - bm;
+    });
   }, [blueskyPublicPosts, activeSocialTopic]);
 
   /**
@@ -6667,6 +6725,23 @@ function App() {
     if (!t) return techNewsItems;
     return techNewsItems.filter((item) => matchesTopic(toUnifiedFromHN(item), t));
   }, [techNewsItems, activeSocialTopic]);
+
+  /**
+   * Reads tab unified stream: merges Nostr articles + RSS items into one
+   * `UnifiedItem[]`, then ranks ("For You") or sorts chronologically ("Latest").
+   * The existing Nostr/RSS toggle becomes an *additive source filter* on top of
+   * this unified stream, instead of a hard either/or.
+   */
+  const rankedReads = useMemo<RankedRead[]>(() => {
+    const unified: UnifiedItem[] = [];
+    for (const a of readsArticles) {
+      unified.push(toUnifiedFromNostrArticle(a));
+    }
+    for (const group of readsRssItems) {
+      for (const item of group.items) unified.push(toUnifiedFromRss(item, group.feed.label));
+    }
+    return readsRankMode === "latest" ? chronologicalReads(unified) : rankReads(unified);
+  }, [readsArticles, readsRssItems, readsRankMode]);
 
   async function loadNostrFeed() {
     if (nostrFeedLoading) return;
@@ -6743,7 +6818,15 @@ function App() {
         : undefined;
       // Empty/discover channel → a broad, ever-green query so the feed is never empty.
       const query = channel?.query || "tech";
-      const posts = await mod.searchPublicBlueskyPosts(query, { limit: 30 });
+      // Text Feed tuning: sort "top" (engagement-weighted, favors discussion over
+      // fresh image reposts) within a 48h window. The Feed tab is text-first by
+      // product vision; `sort:"latest"` returned mostly image-heavy posts for
+      // generic terms. (Media tab keeps latest via its own loader.)
+      const posts = await mod.searchPublicBlueskyPosts(query, {
+        limit: 30,
+        sort: "top",
+        sinceHours: 48,
+      });
       setBlueskyPublicPosts(posts);
     } catch (e) {
       setBlueskyPublicPosts([]);
@@ -7074,34 +7157,33 @@ function App() {
             <blockquote className="nostr-parent-quote">{parent.content.slice(0, 160)}{parent.content.length > 160 ? "…" : ""}</blockquote>
           ) : null}
           <p className="tweet-text">{note.content}</p>
-          <div className="nostr-note-footer">
-            <span className="nostr-note-stat" title={`${reactionCount} like${reactionCount === 1 ? "" : "s"}`}>
-              <svg width="15" height="15" viewBox="0 0 24 24" fill={reactionCount > 0 ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
-              {reactionCount > 0 ? reactionCount : ""}
-            </span>
-            <button
-              type="button"
-              className="nostr-note-stat nostr-reply-toggle"
-              onClick={() => {
-                if (repliesLoading) return;
-                if (!replies) {
-                  void loadNostrReplies(note.id);
-                } else if (replies.length) {
-                  // Toggle collapse when already loaded.
-                  setNostrReplyThreads((prev) => {
-                    const next = { ...prev };
-                    delete next[note.id];
-                    return next;
-                  });
-                }
-              }}
-              disabled={!!repliesLoading}
-              aria-expanded={!!replies?.length}
-            >
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
-              {repliesLoading ? "…" : (replies ? (replies.length ? `Hide ${replies.length}` : "No replies") : "Replies")}
-            </button>
-          </div>
+          <FeedActionBar
+            id={note.id}
+            source="nostr"
+            text={note.content}
+            likeCount={reactionCount}
+            replyCount={replies?.length || 0}
+            permalink={`https://nostrapp.co#${note.id}`}
+            authorName={name}
+            authorHandle={profile?.nip05 || profile?.name || note.pubkey.slice(0, 10)}
+            thumbnail={profile?.picture ?? undefined}
+            onReply={() => {
+              if (repliesLoading) return;
+              if (!replies) {
+                void loadNostrReplies(note.id);
+              } else if (replies.length) {
+                // Toggle collapse when already loaded.
+                setNostrReplyThreads((prev) => {
+                  const next = { ...prev };
+                  delete next[note.id];
+                  return next;
+                });
+              }
+            }}
+            replyLoading={!!repliesLoading}
+            replyExpanded={!!replies?.length}
+          />
+          {repliesLoading ? <p className="text-sm muted nostr-reply-meta">Loading replies…</p> : null}
           {replies && replies.length > 0 ? (
             <div className="nostr-reply-thread">
               {replies.slice(0, 10).map((reply) => (
@@ -7196,12 +7278,21 @@ function App() {
             {quote.text ? <p className="bluesky-quote-text">{quote.text.slice(0, 200)}</p> : null}
           </div>
         ) : null}
-        <div className="nostr-note-footer">
-          <span className="nostr-note-stat">💬 {post.replyCount ?? 0}</span>
-          <span className="nostr-note-stat">🔁 {post.repostCount ?? 0}</span>
-          <span className="nostr-note-stat">❤️ {post.likeCount ?? 0}</span>
+        <div className="nostr-note-time-row">
           <span className="nostr-note-time">{getRelativeTime(ts * 1000)}</span>
         </div>
+        <FeedActionBar
+          id={post.uri}
+          source="bluesky"
+          text={body}
+          likeCount={post.likeCount}
+          repostCount={post.repostCount}
+          replyCount={post.replyCount}
+          permalink={profileUrl}
+          authorName={name}
+          authorHandle={handle}
+          thumbnail={avatar}
+        />
       </article>
     );
   }
@@ -9752,7 +9843,10 @@ function App() {
                         </div>
                       ) : (
                         <div className="feed-posts-list">
-                          {visibleNostrNotes.slice(0, 40).map((note) => renderNostrNoteCard(note))}
+                          {visibleNostrNotes.slice(0, feedVisibleCount).map((note) => renderNostrNoteCard(note))}
+                          {visibleNostrNotes.length > feedVisibleCount ? (
+                            <button type="button" className="load-more-btn" onClick={() => setFeedVisibleCount((c) => c + 20)}>Show more</button>
+                          ) : null}
                         </div>
                       )
                     ) : (
@@ -9781,7 +9875,10 @@ function App() {
                         </div>
                       ) : (
                         <div className="feed-posts-list">
-                          {visibleBlueskyItems.slice(0, 40).map((post) => renderBlueskyCard(post))}
+                          {visibleBlueskyItems.slice(0, feedVisibleCount).map((post) => renderBlueskyCard(post))}
+                          {visibleBlueskyItems.length > feedVisibleCount ? (
+                            <button type="button" className="load-more-btn" onClick={() => setFeedVisibleCount((c) => c + 20)}>Show more</button>
+                          ) : null}
                         </div>
                       )
                     )}
@@ -9795,40 +9892,65 @@ function App() {
 
         {mobileTab === "reels" ? (
           <ViewErrorBoundary title="Reels">
-            <PullToRefresh onRefresh={() => loadReelsFeed()} enabled={!reelsLoading}>
-            <div className="stack">
-              <div className="feed-tab-container">
-                <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
-                  <h2>Reels</h2>
-                  <span className="text-sm muted">Bluesky · {reelsPosts.length} videos</span>
+            {/* Loading / error / empty states render in the normal page flow. */}
+            {reelsLoading && reelsPosts.length === 0 ? (
+              <div className="stack"><div className="feed-tab-container" style={{ padding: '2rem', textAlign: 'center' }}>
+                <span className="btn-spinner" aria-hidden />
+                <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Gathering videos…</p>
+              </div></div>
+            ) : reelsError ? (
+              <div className="stack"><div className="feed-tab-container">
+                <div className="feed-empty-filtered">
+                  <p className="text-sm muted" style={{ margin: 0 }}>{reelsError}</p>
+                  <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadReelsFeed()}>Retry</button>
                 </div>
-
-                {reelsLoading && reelsPosts.length === 0 ? (
-                  <div style={{ padding: '2rem', textAlign: 'center' }}>
-                    <span className="btn-spinner" aria-hidden />
-                    <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Gathering videos…</p>
-                  </div>
-                ) : reelsError ? (
-                  <div className="feed-empty-filtered">
-                    <p className="text-sm muted" style={{ margin: 0 }}>{reelsError}</p>
-                    <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadReelsFeed()}>Retry</button>
-                  </div>
-                ) : reelsPosts.length === 0 ? (
+              </div></div>
+            ) : reelsPosts.length === 0 ? (
+              <PullToRefresh onRefresh={() => loadReelsFeed()} enabled={!reelsLoading}>
+                <div className="stack"><div className="feed-tab-container">
                   <div className="feed-create-hero">
                     <div className="feed-create-hero-icon">🎬</div>
                     <h3>No videos yet</h3>
                     <p className="text-sm muted">Pull down to gather videos from Bluesky. Videos are assembled by merging several visual topics.</p>
                   </div>
-                ) : (
-                  <div className="reels-feed">
-                    {reelsPosts.slice(0, 40).map((post) => (
-                      <ReelsPlayer key={post.uri} post={post} active />
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-            </PullToRefresh>
+                </div></div>
+              </PullToRefresh>
+            ) : (
+              // Fullscreen TikTok-style snap feed. Its own scroll container so
+              // scroll-snap locks each 100dvh tile; PullToRefresh anchors to it
+              // via scrollContainerRef so pull-to-refresh still works at the top.
+              <PullToRefresh onRefresh={() => loadReelsFeed()} enabled={!reelsLoading} scrollContainerRef={reelsScrollRef}>
+                <div
+                  className="reels-feed"
+                  ref={reelsScrollRef}
+                  tabIndex={0}
+                  role="region"
+                  aria-label="Reels feed"
+                  onKeyDown={(e) => {
+                    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+                    e.preventDefault();
+                    const root = reelsScrollRef.current;
+                    if (!root) return;
+                    const tiles = Array.from(root.querySelectorAll<HTMLElement>(".reels-tile"));
+                    if (!tiles.length) return;
+                    const tileH = root.clientHeight;
+                    const idx = Math.round(root.scrollTop / tileH);
+                    const next = e.key === "ArrowDown" ? Math.min(tiles.length - 1, idx + 1) : Math.max(0, idx - 1);
+                    tiles[next]?.scrollIntoView({ behavior: "smooth" });
+                  }}
+                >
+                  {reelsPosts.slice(0, 40).map((post) => (
+                    <ReelsPlayer
+                      key={post.uri}
+                      post={post}
+                      active
+                      muted={reelsMuted}
+                      onToggleMute={() => setReelsMuted((m) => !m)}
+                    />
+                  ))}
+                </div>
+              </PullToRefresh>
+            )}
           </ViewErrorBoundary>
         ) : null}
 
@@ -9883,32 +10005,31 @@ function App() {
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
                   <h2>Reads</h2>
-                  <span className="text-sm muted">{readsSource === "nostr" ? "Nostr articles" : "RSS blogs"}</span>
+                  <span className="text-sm muted">{rankedReads.length} stories · Nostr + RSS</span>
                 </div>
 
-                {/* Source toggle: Nostr articles (NIP-23) vs RSS blogs */}
+                {/* Rank mode toggle: "For You" (scored) vs "Latest" (chronological). */}
                 <div className="source-toggle">
-                  <button type="button" className={`source-pill${readsSource === "nostr" ? " active" : ""}`} onClick={() => { setReadsSource("nostr"); setReadsArticles([]); }}>Nostr Articles</button>
-                  <button type="button" className={`source-pill${readsSource === "rss" ? " active" : ""}`} onClick={() => { setReadsSource("rss"); setReadsRssItems([]); }}>RSS Blogs</button>
+                  <button type="button" className={`source-pill${readsRankMode === "foryou" ? " active" : ""}`} onClick={() => setReadsRankMode("foryou")}>✨ For You</button>
+                  <button type="button" className={`source-pill${readsRankMode === "latest" ? " active" : ""}`} onClick={() => setReadsRankMode("latest")}>🕒 Latest</button>
                 </div>
 
-                {readsSource === "rss" ? (
-                  <div className="topic-chips" style={{ paddingBottom: '0.4rem' }}>
-                    {RSS_FEEDS.map((f) => (
-                      <button
-                        key={f.id}
-                        type="button"
-                        className={`topic-chip small${activeRssFeedIds.includes(f.id) ? " active" : ""}`}
-                        onClick={() => {
-                          setActiveRssFeedIds((prev) => prev.includes(f.id) ? prev.filter((x) => x !== f.id) : [...prev, f.id]);
-                          setReadsRssItems([]);
-                        }}
-                      >
-                        {f.emoji ? `${f.emoji} ` : ""}{f.label}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
+                {/* RSS feed chips now act as an additive filter on the unified stream. */}
+                <div className="topic-chips" style={{ paddingBottom: '0.4rem' }}>
+                  {RSS_FEEDS.map((f) => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      className={`topic-chip small${activeRssFeedIds.includes(f.id) ? " active" : ""}`}
+                      onClick={() => {
+                        setActiveRssFeedIds((prev) => prev.includes(f.id) ? prev.filter((x) => x !== f.id) : [...prev, f.id]);
+                        setReadsRssItems([]);
+                      }}
+                    >
+                      {f.emoji ? `${f.emoji} ` : ""}{f.label}
+                    </button>
+                  ))}
+                </div>
 
                 {readsLoading ? (
                   <div style={{ padding: '2rem', textAlign: 'center' }}>
@@ -9920,88 +10041,84 @@ function App() {
                     <p className="text-sm muted" style={{ margin: 0 }}>{readsError}</p>
                     <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadReadsFeed()}>Retry</button>
                   </div>
-                ) : readsSource === "nostr" ? (
-                  readsArticles.length === 0 ? (
-                    <div className="feed-create-hero">
-                      <div className="feed-create-hero-icon">📰</div>
-                      <h3>No articles yet</h3>
-                      <p className="text-sm muted">Long-form posts from Nostr (NIP-23, like Habla News). Pull to refresh.</p>
-                    </div>
-                  ) : (
-                    <div className="reads-list">
-                      {readsArticles.map((a) => {
-                        const title = (a.tags || []).find((t) => t[0] === "title")?.[1] || "Untitled";
-                        const summary = (a.tags || []).find((t) => t[0] === "summary")?.[1] || a.content.slice(0, 200);
-                        const image = (a.tags || []).find((t) => t[0] === "image")?.[1];
-                        const hablaUrl = `https://habla.news/a/${a.id}`;
-                        const publishedRaw = (a.tags || []).find((t) => t[0] === "published_at")?.[1];
-                        const ts = publishedRaw ? Number(publishedRaw) * 1000 : a.created_at * 1000;
-                        return (
-                          <a
-                            key={a.id}
-                            className="reads-card"
-                            href={hablaUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            onClick={(e) => {
-                              e.preventDefault();
-                              void openFeedLink(hablaUrl);
-                            }}
-                          >
-                            {image ? <img src={image} alt="" className="reads-card-cover" loading="lazy" /> : null}
-                            <div className="reads-card-body">
-                              <span className="reads-card-source">Nostr · {getRelativeTime(ts)}</span>
-                              <h3 className="reads-card-title">{title}</h3>
-                              {summary ? <p className="reads-card-summary">{summary.slice(0, 200)}</p> : null}
-                            </div>
-                          </a>
-                        );
-                      })}
-                    </div>
-                  )
-                ) : (
-                  readsRssItems.length === 0 ? (
-                    <div className="feed-create-hero">
-                      <div className="feed-create-hero-icon">📚</div>
-                      <h3>No blog posts yet</h3>
-                      <p className="text-sm muted">Pick feeds above (or pull to refresh) to load long-form blog posts.</p>
-                    </div>
-                  ) : (
-                    <div className="reads-list">
-                      {readsRssItems.flatMap((group) =>
-                        group.items.map((item) => {
-                          const unified = toUnifiedFromRss(item, group.feed.label);
-                          const stripHtml = (s: string) => (s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-                          const bodyText = stripHtml(item.description || item.content || "").slice(0, 200);
-                          return (
-                            <a
-                              key={unified.id}
-                              className="reads-card"
-                              href={item.link || "#"}
-                              target="_blank"
-                              rel="noreferrer"
-                              onClick={(e) => {
-                                if (!item.link) {
-                                  e.preventDefault();
-                                  return;
-                                }
-                                e.preventDefault();
-                                void openFeedLink(item.link);
-                              }}
-                            >
-                              {unified.media.thumbnailUrl ? <img src={unified.media.thumbnailUrl} alt="" className="reads-card-cover" loading="lazy" /> : null}
-                              <div className="reads-card-body">
-                                <span className="reads-card-source">{group.feed.emoji ? group.feed.emoji + " " : ""}{group.feed.label}</span>
-                                <h3 className="reads-card-title">{unified.content.title || "Untitled"}</h3>
-                                {bodyText ? <p className="reads-card-summary">{bodyText}</p> : null}
-                              </div>
-                            </a>
-                          );
-                        }),
-                      )}
-                    </div>
-                  )
-                )}
+                ) : rankedReads.length === 0 ? (
+                  <div className="feed-create-hero">
+                    <div className="feed-create-hero-icon">📰</div>
+                    <h3>No articles yet</h3>
+                    <p className="text-sm muted">Long-form posts from Nostr (NIP-23) and RSS blogs. Pull to refresh, or toggle sources above.</p>
+                  </div>
+                ) : (() => {
+                  // Apply pagination first, then split hero from the rest.
+                  const visible = rankedReads.slice(0, readsVisibleCount);
+                  const [hero, ...rest] = visible;
+                  const heroUrl = hero.item.content.linkUrl || "#";
+                  const heroHost = (() => { try { return heroUrl !== "#" ? new URL(heroUrl).hostname.replace(/^www\./, "") : ""; } catch { return ""; } })();
+                  // Group the remainder by sourceLabel, preserving rank order.
+                  const groups: { label: string; items: RankedRead[] }[] = [];
+                  for (const r of rest) {
+                    const last = groups[groups.length - 1];
+                    if (last && last.label === r.sourceLabel) last.items.push(r);
+                    else groups.push({ label: r.sourceLabel, items: [r] });
+                  }
+                  return (
+                    <>
+                      {/* Top story (hero) card. */}
+                      <a
+                        className="reads-hero"
+                        href={heroUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(e) => { if (heroUrl === "#") { e.preventDefault(); return; } e.preventDefault(); void openFeedLink(heroUrl); }}
+                      >
+                        {hero.item.media.thumbnailUrl ? <img src={hero.item.media.thumbnailUrl} alt="" className="reads-hero-cover" loading="lazy" /> : null}
+                        <div className="reads-hero-body">
+                          <div className="reads-card-source-row">
+                            <span className="reads-card-source">{hero.sourceLabel}{heroHost ? ` · ${heroHost}` : ""}</span>
+                            <span className="reads-readtime">⏱ {hero.readMinutes} min</span>
+                          </div>
+                          <h3 className="reads-hero-title">{hero.item.content.title || "Untitled"}</h3>
+                          {hero.item.content.body ? <p className="reads-hero-summary">{hero.item.content.body.slice(0, 220)}</p> : null}
+                        </div>
+                      </a>
+
+                      {/* Source-grouped compact cards (Google News "by source" pattern). */}
+                      <div className="reads-list">
+                        {groups.map((g) => (
+                          <div key={g.label} className="reads-group">
+                            <div className="reads-group-header">{g.label} <span className="reads-group-count">· {g.items.length}</span></div>
+                            {g.items.map(({ item, readMinutes }) => {
+                              const url = item.content.linkUrl || "#";
+                              const host = (() => { try { return url !== "#" ? new URL(url).hostname.replace(/^www\./, "") : ""; } catch { return ""; } })();
+                              return (
+                                <a
+                                  key={item.id}
+                                  className="reads-card"
+                                  href={url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  onClick={(e) => { if (url === "#") { e.preventDefault(); return; } e.preventDefault(); void openFeedLink(url); }}
+                                >
+                                  {item.media.thumbnailUrl ? <img src={item.media.thumbnailUrl} alt="" className="reads-card-cover" loading="lazy" /> : null}
+                                  <div className="reads-card-body">
+                                    <div className="reads-card-source-row">
+                                      <span className="reads-card-source">{host || item.sourcePlatform}</span>
+                                      <span className="reads-readtime">⏱ {readMinutes} min</span>
+                                    </div>
+                                    <h3 className="reads-card-title">{item.content.title || "Untitled"}</h3>
+                                    {item.content.body ? <p className="reads-card-summary">{item.content.body.slice(0, 200)}</p> : null}
+                                  </div>
+                                </a>
+                              );
+                            })}
+                          </div>
+                        ))}
+                        {rankedReads.length > readsVisibleCount ? (
+                          <button type="button" className="load-more-btn" onClick={() => setReadsVisibleCount((c) => c + 12)}>Show more</button>
+                        ) : null}
+                      </div>
+                    </>
+                  );
+                })()}
               </div>
             </div>
             </PullToRefresh>
@@ -10062,6 +10179,36 @@ function App() {
                       </div>
                     );
                   })}
+                </div>
+              )}
+
+              {/* Saved (bookmarked) items from Feed/Reels/Reads. */}
+              <div style={{ padding: '0.5rem 0.25rem 0' }}>
+                <h3 style={{ margin: '0 0 0.5rem' }}>Saved</h3>
+              </div>
+              {savedItems.length === 0 ? (
+                <p className="text-sm muted" style={{ padding: '1rem', textAlign: 'center' }}>Bookmark posts, videos, or articles from any tab to save them here.</p>
+              ) : (
+                <div className="saved-list">
+                  {savedItems.map((s) => (
+                    <a
+                      key={s.id}
+                      className="saved-item"
+                      href={s.url || "#"}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={(e) => { if (!s.url) { e.preventDefault(); return; } e.preventDefault(); void openFeedLink(s.url); }}
+                    >
+                      {s.thumbnail ? <img src={s.thumbnail} alt="" className="saved-item-thumb" loading="lazy" /> : null}
+                      <div className="saved-item-body">
+                        <div className="saved-item-top">
+                          <span className="saved-item-source">{s.source}{s.authorHandle ? ` · @${s.authorHandle}` : ""}</span>
+                          <span className="saved-item-time">{getRelativeTime(s.savedAt)}</span>
+                        </div>
+                        {s.title ? <p className="saved-item-title">{s.title}</p> : null}
+                      </div>
+                    </a>
+                  ))}
                 </div>
               )}
             </div>

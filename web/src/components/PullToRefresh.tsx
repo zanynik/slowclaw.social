@@ -8,7 +8,7 @@
  * - Works within Tauri mobile WebView
  */
 
-import { useRef, useState, type ReactNode, type TouchEvent } from "react";
+import { useRef, useState, type ReactNode, type RefObject, type TouchEvent } from "react";
 
 type PullToRefreshProps = {
   children: ReactNode;
@@ -16,6 +16,12 @@ type PullToRefreshProps = {
   enabled?: boolean;
   threshold?: number;
   className?: string;
+  /**
+   * Optional ref to the actual scrolling ancestor. When provided, the
+   * "scrolled to top?" check anchors to this element instead of walking the
+   * DOM tree — needed for nested scroll containers like the Reels snap feed.
+   */
+  scrollContainerRef?: RefObject<HTMLElement | null>;
 };
 
 export function PullToRefresh({
@@ -24,6 +30,7 @@ export function PullToRefresh({
   enabled = true,
   threshold = 80,
   className = "",
+  scrollContainerRef,
 }: PullToRefreshProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const startYRef = useRef(0);
@@ -37,8 +44,13 @@ export function PullToRefresh({
   }
 
   function isScrolledToTop(): boolean {
+    // Prefer the explicit scroll container when provided (nested scroll case,
+    // e.g. the Reels snap feed scrolls inside the page).
+    if (scrollContainerRef?.current) {
+      return scrollContainerRef.current.scrollTop <= 2;
+    }
     if (!containerRef.current) return true;
-    // Check if the scrollable ancestor is at the top
+    // Otherwise walk up the DOM to find the first scrolling ancestor.
     let el: HTMLElement | null = containerRef.current;
     while (el) {
       if (el.scrollTop > 2) return false;

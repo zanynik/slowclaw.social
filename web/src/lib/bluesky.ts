@@ -541,12 +541,16 @@ function epochFromIso(iso: string): number {
  */
 export async function searchPublicBlueskyPosts(
   query: string,
-  opts: BlueskyFetchOpts & { lang?: string; sinceHours?: number } = {}
+  opts: BlueskyFetchOpts & { lang?: string; sinceHours?: number; sort?: "latest" | "top" } = {}
 ): Promise<BlueskyPublicPost[]> {
   const q = query.trim();
   if (!q) return [];
   const limit = Math.min(opts.limit ?? 25, 100);
-  const params: Record<string, string> = { q, limit: String(limit), sort: "latest" };
+  // `sort`: "latest" (newest-first) is the default and works well for the Media
+  // tab, but returns image-heavy results for generic terms on the text Feed.
+  // Callers wanting discussion-leaning text posts pass `sort: "top"` (engagement
+  // weighted) which favors text replies over fresh image reposts.
+  const params: Record<string, string> = { q, limit: String(limit), sort: opts.sort ?? "latest" };
   // LEVER: server-side language filter. `lang=en` returns 49/49 English posts
   // (validated live). Cleanest language lever for Bluesky — no client
   // detection needed. Defaults to English; pass "" to disable.
