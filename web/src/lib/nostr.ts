@@ -785,13 +785,71 @@ export async function publishNote(
     // Publish to all relays
     const results = await Promise.allSettled(
       relays.map(
+          (relay) =>
+            new Promise<boolean>((resolve) => {
+              const ws = new WebSocket(relay);
+              const timeout = setTimeout(() => { ws.close(); resolve(false); }, 5000);
+              ws.onopen = () => {
+                ws.send(JSON.stringify(["EVENT", event]));
+              };
+              ws.onmessage = (msg) => {
+                try {
+                  const data = JSON.parse(msg.data as string);
+                  if (data[0] === "OK" && data[1] === event.id) {
+                    clearTimeout(timeout);
+                    ws.close();
+                    resolve(data[2] === true);
+                  }
+                } catch {}
+              };
+              ws.onerror = () => { clearTimeout(timeout); ws.close(); resolve(false); };
+            })
+        )
+      );
+
+    const anySuccess = results.some(
+      (r) => r.status === "fulfilled" && r.value === true
+    );
+    return anySuccess
+      ? { success: true, eventId: event.id }
+      : { success: false, error: "Failed to publish to any relay" };
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Publish a kind-0 profile (NIP-01 metadata) to relays. Sets the user's
+ * display name, about, and picture so their Nostr identity matches the local
+ * profile. Content is the JSON-stringified metadata object per NIP-01.
+ */
+export async function publishProfile(
+  meta: { name?: string; displayName?: string; about?: string; picture?: string; website?: string },
+  relays: string[] = DEFAULT_RELAYS
+): Promise<{ success: boolean; eventId?: string; error?: string }> {
+  const privkey = localStorage.getItem(STORAGE_KEY_NOSTR_PRIVKEY);
+  if (!privkey) return { success: false, error: "No Nostr key configured" };
+  try {
+    // NIP-01 kind-0 content is a JSON metadata object. Omit empty fields.
+    const content = JSON.stringify(
+      Object.fromEntries(
+        Object.entries({
+          name: meta.name || undefined,
+          display_name: meta.displayName || undefined,
+          about: meta.about || undefined,
+          picture: meta.picture || undefined,
+          website: meta.website || undefined,
+        }).filter(([, v]) => v !== undefined)
+      )
+    );
+    const event = await createSignedEvent(privkey, 0, content);
+    const results = await Promise.allSettled(
+      relays.map(
         (relay) =>
           new Promise<boolean>((resolve) => {
             const ws = new WebSocket(relay);
             const timeout = setTimeout(() => { ws.close(); resolve(false); }, 5000);
-            ws.onopen = () => {
-              ws.send(JSON.stringify(["EVENT", event]));
-            };
+            ws.onopen = () => { ws.send(JSON.stringify(["EVENT", event])); };
             ws.onmessage = (msg) => {
               try {
                 const data = JSON.parse(msg.data as string);
@@ -806,15 +864,36 @@ export async function publishNote(
           })
       )
     );
-
-    const anySuccess = results.some(
-      (r) => r.status === "fulfilled" && r.value === true
-    );
+    const anySuccess = results.some((r) => r.status === "fulfilled" && r.value === true);
     return anySuccess
       ? { success: true, eventId: event.id }
-      : { success: false, error: "Failed to publish to any relay" };
+      : { success: false, error: "Failed to publish profile to any relay" };
   } catch (e) {
     return { success: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Fetch the user's own kind-3 contact list (NIP-02) to count their follows.
+ * Each ["p", <pubkey>, ...] tag represents one followed account. Returns 0 if
+ * no contact list is found. Followers count isn't reliably available without a
+ * reverse index service, so only `following` is returned here.
+ */
+export async function fetchNostrFollowingCount(
+  pubkey: string,
+  relays: string[] = DEFAULT_RELAYS,
+  timeoutMs = 6000
+): Promise<number> {
+  try {
+    const events = await fetchEventsByFilter(
+      { authors: [pubkey], kinds: [3], limit: 1 },
+      { relays, timeoutMs }
+    );
+    if (!events.length) return 0;
+    const contact = events[0];
+    return (contact.tags || []).filter((t) => t[0] === "p").length;
+  } catch {
+    return 0;
   }
 }
 

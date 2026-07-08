@@ -1,7 +1,7 @@
 import { lazy, Suspense, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { AtpAgent, AppBskyFeedDefs } from "@atproto/api";
-import { blueskyImagesOf, blueskyVideoOf, blueskyExternalOf, blueskyQuotedRecordOf, fetchBlueskyReelsFeed, REELS_VIDEO_TOPICS } from "./lib/bluesky";
-import type { BlueskySession, BlueskyPublicPost } from "./lib/bluesky";
+import { blueskyImagesOf, blueskyVideoOf, blueskyExternalOf, blueskyQuotedRecordOf, fetchBlueskyReelsFeed, REELS_VIDEO_TOPICS, getBlueskyProfileCounts } from "./lib/bluesky";
+import type { BlueskySession, BlueskyPublicPost, BlueskyProfileCounts } from "./lib/bluesky";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
 import { BottomNav } from "./components/BottomNav";
 import { SwipeableView } from "./components/SwipeableView";
@@ -24,6 +24,8 @@ import {
   getReplyParentId,
   npubFromHex,
   publishNote,
+  publishProfile,
+  fetchNostrFollowingCount,
   type NostrNote,
   type NostrProfile,
   type NostrEvent,
@@ -1660,8 +1662,19 @@ function App() {
   const [localProfile, setLocalProfile] = useState<LocalProfile | null>(() => getProfile());
   // Profile content tab: Posted | Drafts | Saved (Twitter/Instagram-style segmented control).
   const [profileContentTab, setProfileContentTab] = useState<"posted" | "drafts" | "saved">("posted");
+  // Profile follower/following counts (Bluesky via public AppView, Nostr via kind-3).
+  const [blueskyCounts, setBlueskyCounts] = useState<BlueskyProfileCounts | null>(null);
+  const [nostrFollowingCount, setNostrFollowingCount] = useState<number | null>(null);
+  const [profilePublishing, setProfilePublishing] = useState(false);
+  const [profilePublishToast, setProfilePublishToast] = useState<string | null>(null);
   // Profile avatar picker (hidden file input, triggered by tapping the avatar).
   const profileAvatarInputRef = useRef<HTMLInputElement | null>(null);
+  // Refresh toast (#5): a tiny "Updated" confirmation shown after pull-to-refresh.
+  const [refreshToast, setRefreshToast] = useState<string | null>(null);
+  // New-posts pill (#4): count of fresh social-feed items arrived since the user
+  // last viewed the top. Resets on tap (scrolls to top) or tab switch.
+  const [newPostsCount, setNewPostsCount] = useState(0);
+  const lastSeenTopPostIdRef = useRef<string | null>(null);
   // Reels snap-scroll container ref (shared with PullToRefresh for nested pull).
   const reelsScrollRef = useRef<HTMLDivElement | null>(null);
   const [techNewsLoading, setTechNewsLoading] = useState(false);
@@ -1701,6 +1714,64 @@ function App() {
   useEffect(() => onSavedChange(() => setSavedItems(getSavedItems())), []);
   // Mirror local profile store into state (re-renders Profile on edits).
   useEffect(() => onProfileChange(() => setLocalProfile(getProfile())), []);
+
+  // Fetch follower/following counts when the Profile tab opens (or accounts change).
+  // Bluesky: anonymous public AppView getProfile. Nostr: kind-3 contact-list count.
+  // Both best-effort — failures leave the stat hidden rather than blocking the UI.
+  useEffect(() => {
+    if (mobileTab !== "profile") return;
+    let cancelled = false;
+    if (session?.handle) {
+      void getBlueskyProfileCounts(session.handle).then((c) => {
+        if (!cancelled) setBlueskyCounts(c);
+      });
+    } else {
+      setBlueskyCounts(null);
+    }
+    if (nostrKeys?.publicKeyHex) {
+      void fetchNostrFollowingCount(nostrKeys.publicKeyHex).then((n) => {
+        if (!cancelled) setNostrFollowingCount(n);
+      });
+    } else {
+      setNostrFollowingCount(null);
+    }
+    return () => { cancelled = true; };
+  }, [mobileTab, session?.handle, nostrKeys?.publicKeyHex]);
+
+  // Publish the local profile (name/bio/avatar) to Nostr as a kind-0 event so
+  // the user's relay identity matches what they see in-app.
+  async function handlePublishProfileToNostr() {
+    if (profilePublishing || !nostrKeys) return;
+    setProfilePublishing(true);
+    setProfilePublishToast(null);
+    try {
+      const result = await publishProfile({
+        name: localProfile?.name?.trim() || undefined,
+        displayName: localProfile?.name?.trim() || undefined,
+        about: localProfile?.bio?.trim() || undefined,
+        picture: localProfile?.avatar || undefined,
+      });
+      setProfilePublishToast(result.success ? "Profile published to Nostr" : (result.error || "Publish failed"));
+    } catch {
+      setProfilePublishToast("Publish failed");
+    } finally {
+      setProfilePublishing(false);
+      window.setTimeout(() => setProfilePublishToast(null), 2600);
+    }
+  }
+
+  // Wrap any refresh handler with a tiny "Updated" toast (#5). Returns a fn the
+  // PullToRefresh onRefresh prop can consume directly.
+  function withRefreshToast(label: string, fn: () => Promise<void> | void) {
+    return async () => {
+      try {
+        await fn();
+      } finally {
+        setRefreshToast(label);
+        window.setTimeout(() => setRefreshToast((cur) => (cur === label ? null : cur)), 1800);
+      }
+    };
+  }
 
   // Reset feed pagination when the source/topic changes (so the list isn't empty).
   useEffect(() => { setFeedVisibleCount(20); }, [socialSource, activeChannelId, activeSocialTopic, feedView]);
@@ -6694,6 +6765,37 @@ function App() {
     });
   }, [blueskyPublicPosts, activeSocialTopic]);
 
+  // New-posts pill (#4): when the social feed gains items newer than the last
+  // top item the user saw, surface a count. Snapshots the top id on first load;
+  // counts how many new ids land above that snapshot on subsequent loads.
+  useEffect(() => {
+    if (mobileTab !== "feed" || feedView !== "social") return;
+    const topId = (socialSource === "nostr" ? visibleNostrNotes[0]?.id : visibleBlueskyItems[0]?.uri) || null;
+    if (topId === null) return;
+    if (lastSeenTopPostIdRef.current === null) {
+      lastSeenTopPostIdRef.current = topId;
+      return;
+    }
+    if (topId === lastSeenTopPostIdRef.current) return;
+    // New top item arrived — count how many sit above the last-seen snapshot.
+    const list: ReadonlyArray<{ id?: string; uri?: string }> =
+      socialSource === "nostr" ? visibleNostrNotes : visibleBlueskyItems;
+    const keyOf = (i: { id?: string; uri?: string }) =>
+      (socialSource === "nostr" ? i.id : i.uri) || "";
+    const idx = list.findIndex((i) => keyOf(i) === lastSeenTopPostIdRef.current);
+    const fresh = idx === -1 ? list.length : idx;
+    if (fresh > 0) setNewPostsCount((c) => c + fresh);
+    lastSeenTopPostIdRef.current = topId;
+  }, [mobileTab, feedView, socialSource, visibleNostrNotes, visibleBlueskyItems]);
+
+  // Reset the new-posts pill + snapshot when leaving/switching the social feed.
+  useEffect(() => {
+    if (mobileTab !== "feed" || feedView !== "social") {
+      setNewPostsCount(0);
+      lastSeenTopPostIdRef.current = null;
+    }
+  }, [mobileTab, feedView, socialSource, activeChannelId, activeSocialTopic]);
+
   /**
    * Media gallery: all image/video-bearing UnifiedItems aggregated across the
    * loaded Nostr + Bluesky sources. Powers the dedicated Media tab. Reuses the
@@ -9750,7 +9852,17 @@ function App() {
 
         {mobileTab === "feed" ? (
           <ViewErrorBoundary title="Feed">
-            <PullToRefresh onRefresh={() => feedView === "news" ? loadTechNews() : loadSocialFeed()} enabled={feedView === "news" ? !techNewsLoading : !(nostrFeedLoading || blueskyPublicLoading)}>
+            {/* New-posts pill (#4): surfaces when fresh social items arrive. */}
+            {newPostsCount > 0 && feedView === "social" ? (
+              <button
+                type="button"
+                className="new-posts-pill"
+                onClick={() => { window.scrollTo({ top: 0, behavior: "smooth" }); setNewPostsCount(0); }}
+              >
+                ↑ {newPostsCount} new {newPostsCount === 1 ? "post" : "posts"}
+              </button>
+            ) : null}
+            <PullToRefresh onRefresh={withRefreshToast("Feed updated", () => feedView === "news" ? loadTechNews() : loadSocialFeed())} enabled={feedView === "news" ? !techNewsLoading : !(nostrFeedLoading || blueskyPublicLoading)}>
             <div className="stack">
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
@@ -9929,7 +10041,7 @@ function App() {
                 </div>
               </div></div>
             ) : reelsPosts.length === 0 ? (
-              <PullToRefresh onRefresh={() => loadReelsFeed()} enabled={!reelsLoading}>
+              <PullToRefresh onRefresh={withRefreshToast("Reels updated", () => loadReelsFeed())} enabled={!reelsLoading}>
                 <div className="stack"><div className="feed-tab-container">
                   <div className="feed-create-hero">
                     <div className="feed-create-hero-icon">🎬</div>
@@ -9942,7 +10054,7 @@ function App() {
               // Fullscreen TikTok-style snap feed. Its own scroll container so
               // scroll-snap locks each 100dvh tile; PullToRefresh anchors to it
               // via scrollContainerRef so pull-to-refresh still works at the top.
-              <PullToRefresh onRefresh={() => loadReelsFeed()} enabled={!reelsLoading} scrollContainerRef={reelsScrollRef}>
+              <PullToRefresh onRefresh={withRefreshToast("Reels updated", () => loadReelsFeed())} enabled={!reelsLoading} scrollContainerRef={reelsScrollRef}>
                 <div
                   className="reels-feed"
                   ref={reelsScrollRef}
@@ -9979,7 +10091,7 @@ function App() {
 
         {mobileTab === "media" ? (
           <ViewErrorBoundary title="Media">
-            <PullToRefresh onRefresh={() => loadSocialFeed()} enabled={!(nostrFeedLoading || blueskyPublicLoading)}>
+              <PullToRefresh onRefresh={withRefreshToast("Media updated", () => loadSocialFeed())} enabled={!(nostrFeedLoading || blueskyPublicLoading)}>
             <div className="stack">
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
@@ -10023,7 +10135,7 @@ function App() {
 
         {mobileTab === "reads" ? (
           <ViewErrorBoundary title="Reads">
-            <PullToRefresh onRefresh={() => loadReadsFeed()} enabled={!readsLoading}>
+            <PullToRefresh onRefresh={withRefreshToast("Reads updated", () => loadReadsFeed())} enabled={!readsLoading}>
             <div className="stack">
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
@@ -10228,6 +10340,41 @@ function App() {
                   }
                 }}
               />
+
+              {/* Network follower/following counts (Bluesky via public AppView, Nostr via kind-3).
+                  Best-effort — omitted entirely if both lookups fail/are unavailable. */}
+              {(blueskyCounts || nostrFollowingCount !== null) ? (
+                <div className="profile-network-counts">
+                  {blueskyCounts ? (
+                    <>
+                      <span className="profile-network-stat"><strong>{blueskyCounts.followers}</strong> followers</span>
+                      <span className="profile-network-sep">·</span>
+                      <span className="profile-network-stat"><strong>{blueskyCounts.following}</strong> following</span>
+                    </>
+                  ) : null}
+                  {nostrFollowingCount !== null ? (
+                    <>
+                      {blueskyCounts ? <span className="profile-network-sep">·</span> : null}
+                      <span className="profile-network-stat">Nostr · <strong>{nostrFollowingCount}</strong> following</span>
+                    </>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {/* Publish local profile to Nostr (kind-0) so the relay identity matches. */}
+              {nostrKeys ? (
+                <div className="profile-publish-row">
+                  <button
+                    type="button"
+                    className="ghost profile-publish-btn"
+                    onClick={() => void handlePublishProfileToNostr()}
+                    disabled={profilePublishing}
+                  >
+                    {profilePublishing ? "Publishing…" : "Sync profile to Nostr"}
+                  </button>
+                  {profilePublishToast ? <span className="profile-publish-toast" role="status">{profilePublishToast}</span> : null}
+                </div>
+              ) : null}
 
               {/* Stats row (Twitter/Instagram signature) — tappable to switch tabs. */}
               {(() => {
@@ -10727,6 +10874,10 @@ function App() {
         </div>
       )}
       <ToastContainer />
+      {/* Refresh toast (#5): confirms a pull-to-refresh completed. */}
+      {refreshToast ? (
+        <div className="refresh-toast" role="status" aria-live="polite">{refreshToast}</div>
+      ) : null}
     </div>
   );
 }

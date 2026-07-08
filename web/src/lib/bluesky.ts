@@ -634,6 +634,36 @@ export async function getPublicBlueskyAuthorFeed(
   return (data.feed || []).map((f) => f.post);
 }
 
+export type BlueskyProfileCounts = {
+  followers: number;
+  following: number;
+  posts: number;
+};
+
+/**
+ * Fetch a Bluesky actor's public counts (followers / following / posts) via the
+ * anonymous public AppView. No auth needed — `getProfile` is a permissionless
+ * read. Used by the Profile tab stats row. Returns null if the lookup fails
+ * (e.g. unknown handle / network) so the UI can silently omit the stat.
+ */
+export async function getBlueskyProfileCounts(actor: string): Promise<BlueskyProfileCounts | null> {
+  if (!actor.trim()) return null;
+  try {
+    const data = await blueskyPublicGet<{
+      followersCount?: number;
+      followsCount?: number;
+      postsCount?: number;
+    }>("app.bsky.actor.getProfile", { actor });
+    return {
+      followers: data.followersCount ?? 0,
+      following: data.followsCount ?? 0,
+      posts: data.postsCount ?? 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Resolve a handle to a DID (needed to build feed URIs). Anonymous.
  */
