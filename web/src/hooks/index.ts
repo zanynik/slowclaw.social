@@ -8,3 +8,5 @@ export { useMediaQuery, useIsLargeScreen, useIsMobile, useIsTablet, usePrefersRe
 export { useDebounce, useDebouncedCallback, useAutosave } from "./useDebounce";
 export { useKeyboardHeight, useIsKeyboardOpen } from "./useKeyboardHeight";
 export { useScrollDirection } from "./useScrollDirection";
+export { useLocalFirstList } from "./useLocalFirstList";
+export type { LocalFirstListState } from "./useLocalFirstList";

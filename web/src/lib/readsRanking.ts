@@ -101,3 +101,75 @@ export function chronologicalReads(items: UnifiedItem[]): RankedRead[] {
   out.sort((a, b) => b.item.timestamp - a.item.timestamp);
   return out;
 }
+
+/* ── Unified feed ranking (social: text / image / video) ──────────────────── */
+//
+// The Reads scorer above favors long-form (read-time Goldilocks). The unified
+// social feed wants a different bias: keep recency dominant, reward media
+// richness so images/video surface, but lightly nudge text posts above equally
+// fresh media posts (text drives discussion; a pure media sort buries it). This
+// is the ranker behind the merged Feed tab (text + image + video interleaved).
+
+/** A scored social item: the unified record plus its computed score. */
+export interface RankedFeedItem {
+  item: UnifiedItem;
+  /** Higher = more prominent. */
+  score: number;
+}
+
+/**
+ * Media weight for the unified feed. Video and image posts get a small boost so
+ * the merged feed stays visually varied; text stays competitive via recency.
+ */
+function mediaBonus(item: UnifiedItem): number {
+  switch (item.media.type) {
+    case "video":
+      return 0.12;
+    case "image":
+      return 0.08;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Light text bias: posts with no media get a tiny nudge so a flood of image
+ * posts doesn't bury discussion. Combined with mediaBonus, a fresh text post
+ * ranks above an equally-fresh image post, but a video post can still overtake
+ * a stale text post via recency decay.
+ */
+const TEXT_BIAS = 0.03;
+
+/**
+ * Score a unified item for the social feed. Components:
+ *   recency  — exponential decay (same 36h half-life as reads)
+ *   media    — +0.12 video, +0.08 image
+ *   textBias — +0.03 for media-less posts (discussion-first)
+ *   length   — tiny tiebreak against near-empty posts
+ */
+export function scoreUnifiedItem(item: UnifiedItem): number {
+  const now = NOW();
+  const ageHours = Math.max(0, (now - item.timestamp) / 3600);
+  const recency = Math.pow(0.5, ageHours / RECENCY_HALF_LIFE_HOURS);
+  const media = mediaBonus(item);
+  const text = item.media.type === "none" ? TEXT_BIAS : 0;
+  // Discourage near-empty / spammy one-liners: small positive bias for
+  // substantive bodies, no penalty floor so genuinely empty items still score.
+  const length = Math.min(0.04, (item.content.body || "").length / 1000);
+  return recency + media + text + length;
+}
+
+/** Rank social items by score, highest first. Stable on ties. */
+export function rankFeed(items: UnifiedItem[]): RankedFeedItem[] {
+  const scored = items.map((item) => ({ item, score: scoreUnifiedItem(item) }));
+  scored.sort((a, b) => b.score - a.score);
+  return scored;
+}
+
+/** Chronological (newest-first) variant of the unified feed. */
+export function chronologicalFeed(items: UnifiedItem[]): RankedFeedItem[] {
+  const out = items.map((item) => ({ item, score: scoreUnifiedItem(item) }));
+  out.sort((a, b) => b.item.timestamp - a.item.timestamp);
+  return out;
+}
+
