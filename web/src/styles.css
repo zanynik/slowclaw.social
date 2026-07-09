@@ -3490,6 +3490,30 @@ button.local-ai-preset {
 }
 
 /* ── Nostr feed: rich note cards, reply context, reactions, threads ─────── */
+/*
+ * Base sizing for `.nostr-avatar` (used by Bluesky cards' author avatar <img>
+ * and the initial-letter fallback <div>). Without this, the avatar renders at
+ * its intrinsic image size — Bluesky CDN avatars are ~1000px, so they showed
+ * up as huge full-width images instead of small profile pictures. Mirrors the
+ * `.tweet-avatar` 40px circle used by the Nostr feed.
+ */
+.nostr-avatar {
+  width: 40px;
+  height: 40px;
+  min-width: 40px;
+  border-radius: 50%;
+  object-fit: cover;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--accent) 22%, var(--surface-3, var(--surface)));
+}
+.nostr-avatar-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.85rem;
+  color: #fff;
+}
 .nostr-avatar-img {
   overflow: hidden;
   background: color-mix(in srgb, var(--accent) 22%, var(--surface-3, var(--surface)));
