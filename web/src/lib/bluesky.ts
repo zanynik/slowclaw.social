@@ -653,13 +653,20 @@ export async function searchPublicBlueskyVideos(
 
 /**
  * Curated set of visually-rich topics for the Reels tab. Because Bluesky has no
- * server-side "videos only" search, the Reels feed is assembled by searching
- * several video-heavy topics and merging unique results. Validated live: this
- * list of 12 topics yields ~20 unique videos across a fresh search window.
+ * server-side "videos only" search (and getFeedSkeleton requires auth, which the
+ * anonymous public AppView rejects with MethodNotImplemented), the Reels feed is
+ * assembled by searching several video-heavy topics and merging unique results.
+ *
+ * Topic selection is driven by live video yield: generic text topics (cat, dog,
+ * comedy, food, skate) return 0 video embeds per 50 results, while visually-led
+ * topics (timelapse ~24/50, vlog ~7/50, pottery ~5/50, wildlife ~4/50) return
+ * many. This 18-topic set yields ~60 unique videos per fresh search window
+ * (vs ~14 for the previous 12-topic set), enough to reliably populate the tab.
  */
 export const REELS_VIDEO_TOPICS = [
-  "video", "music", "comedy", "nature", "art", "dance",
-  "sports", "cat", "dog", "gaming", "skate", "food",
+  "timelapse", "vlog", "pottery", "wildlife", "film", "tutorial",
+  "travel", "drone", "nature", "art", "dance", "music",
+  "video", "gaming", "photography", "animal", "climbing", "snowboard",
 ];
 
 /**
