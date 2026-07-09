@@ -113,6 +113,7 @@ import {
   getNativeLocalAiStatus,
   nativeAiChat,
   nativeAiEngineStatus,
+  clearNativeLocalAi,
   transcribeAudio,
   transcribeJournalMediaNative,
   readJournalMediaBytes,
@@ -2566,6 +2567,9 @@ function App() {
           }));
           setPersistedPosts((prev) => { const next = [...newPosts, ...prev]; savePersistedPosts(next); return next; });
           setGeneratePostStatus(`✨ Generated ${posts.length} post${posts.length > 1 ? 's' : ''}`);
+        } else {
+          // Model ran but produced no usable output — surface it instead of silence.
+          setGeneratePostStatus("Model produced no output. It may need re-downloading (Settings → Delete Model).");
         }
       } catch (error) {
         // Post generation failed — surface the real reason instead of swallowing.
@@ -8224,7 +8228,18 @@ Rules:
       }
       // Mark this journal as processed
       markJournalProcessed(entry.path);
-      setGeneratePostStatus(`✨ Generated ${posts.length} post${posts.length > 1 ? 's' : ''} from your journal`);
+      if (posts.length === 0) {
+        // The model ran without throwing but produced no usable output. This is
+        // the "generating then nothing" symptom: nativeAiChat resolved with
+        // empty/garbage text (model emitted EOS immediately, wrong chat template,
+        // or output outside the length gate across all 3 retries). Surface it as
+        // an actionable message instead of silent "Generated 0 posts".
+        setGeneratePostStatus(
+          "Model produced no output. The model may need re-downloading, or its chat template may not match this build. Try Settings → Delete Model, then re-download.",
+        );
+      } else {
+        setGeneratePostStatus(`✨ Generated ${posts.length} post${posts.length > 1 ? 's' : ''} from your journal`);
+      }
     } catch (error) {
       setGeneratePostStatus(`Generation failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -11011,18 +11026,40 @@ Rules:
                           <span className="text-sm">AI is ready</span>
                         </div>
                       ) : null}
-                      {model.installed && !isInCatalog ? (
+                      {model.installed ? (
                         <button
                           type="button" className="ghost text-sm"
                           style={{ marginTop: '0.5rem', color: 'var(--danger, #e55)' }}
                           onClick={async () => {
-                            if (!confirm(`Delete ${model.title}? The file will be removed.`)) return;
+                            if (!confirm(`Delete ${model.title}? The file will be removed and the model deselected.`)) return;
+                            setLocalModelBusyId(model.id);
                             try {
-                              const { remove } = await import("@tauri-apps/plugin-fs");
-                              if (model.path) await remove(model.path);
-                              void loadLocalModels();
+                              // 1. If this model is the active config, clear the native AI
+                              //    config first (unloads it from memory, deletes native_local_ai.json,
+                              //    resets status). Otherwise the deleted file would leave a stale path.
+                              if (isConfigured) {
+                                try {
+                                  const refreshed = await clearNativeLocalAi();
+                                  setNativeLocalAiStatus(refreshed);
+                                } catch (err) {
+                                  setLocalModelsStatus(`Failed to clear model config: ${err instanceof Error ? err.message : String(err)}`);
+                                  return;
+                                }
+                              }
+                              // 2. Remove the GGUF file from disk.
+                              try {
+                                const { remove } = await import("@tauri-apps/plugin-fs");
+                                if (model.path) await remove(model.path);
+                              } catch (err) {
+                                // File may already be gone (e.g. container UUID changed);
+                                // config was already cleared above, so treat as non-fatal.
+                                console.warn("Model file removal skipped:", err);
+                              }
+                              await loadLocalModels();
                             } catch (err) {
                               setLocalModelsStatus(`Delete failed: ${err instanceof Error ? err.message : String(err)}`);
+                            } finally {
+                              setLocalModelBusyId("");
                             }
                           }}
                         >
@@ -11047,6 +11084,22 @@ Rules:
                         <p className="text-sm muted" style={{ margin: '0.1rem 0 0' }}>AI is ready for on-device inference</p>
                       </div>
                     </div>
+                    <button
+                      type="button" className="ghost text-sm"
+                      style={{ marginTop: '0.5rem', color: 'var(--danger, #e55)' }}
+                      onClick={async () => {
+                        if (!confirm("Clear the configured model? You can re-download and select it again later.")) return;
+                        try {
+                          const refreshed = await clearNativeLocalAi();
+                          setNativeLocalAiStatus(refreshed);
+                          await loadLocalModels();
+                        } catch (err) {
+                          setLocalModelsStatus(`Failed to clear model config: ${err instanceof Error ? err.message : String(err)}`);
+                        }
+                      }}
+                    >
+                      Clear Model Config
+                    </button>
                   </div>
                 ) : null}
 
