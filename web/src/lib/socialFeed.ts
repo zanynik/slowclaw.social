@@ -16,7 +16,7 @@
 /** The normalized social item — every source collapses into this. */
 export interface UnifiedItem {
   id: string;
-  sourcePlatform: "nostr" | "hackernews" | "rss" | "atproto";
+  sourcePlatform: "nostr" | "hackernews" | "rss" | "atproto" | "youtube";
   /** Epoch seconds, for chronological sorting across sources. */
   timestamp: number;
   author: {
@@ -214,6 +214,44 @@ export function toUnifiedFromNostrArticle(
     media: image
       ? { type: "image", urls: [image], thumbnailUrl: image }
       : { type: "none", urls: [] },
+  };
+}
+
+/** Minimal shape of a YouTube video (matches lib/youtube.ts YouTubeVideo). */
+export interface YouTubeVideoLike {
+  id: string;
+  title: string;
+  description?: string;
+  author?: string;
+  /** Epoch seconds. */
+  publishedAt?: number;
+  durationSeconds?: number;
+  thumbnailUrl: string;
+  watchUrl: string;
+}
+
+/**
+ * Convert a YouTube video to UnifiedItem. The description is kept as the body
+ * (not just the duration) so the journal-topic lens can match against it —
+ * matching on title alone would weaken the "journal is the lens" signal.
+ * Media is typed as `video`; the watch URL is both the link and the media URL.
+ */
+export function toUnifiedFromYouTube(video: YouTubeVideoLike): UnifiedItem {
+  return {
+    id: `yt-${video.id}`,
+    sourcePlatform: "youtube",
+    timestamp: video.publishedAt && Number.isFinite(video.publishedAt) ? video.publishedAt : 0,
+    author: { id: video.author || "youtube", handle: video.author || "YouTube" },
+    content: {
+      title: video.title,
+      body: video.description || "",
+      linkUrl: video.watchUrl,
+    },
+    media: {
+      type: "video",
+      urls: [video.watchUrl],
+      thumbnailUrl: video.thumbnailUrl,
+    },
   };
 }
 

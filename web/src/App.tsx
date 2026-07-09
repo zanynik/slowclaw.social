@@ -57,6 +57,8 @@ import {
 import { filterNostrFeed, type NostrFeedStats } from "./lib/feedFilter";
 // ── RSS/Atom feeds (Reads tab) ────────────────────────────────────────────────
 import { fetchRssFeeds, RSS_FEEDS, type RssFeed, type RssItem } from "./lib/rss";
+// ── YouTube ingestion (keyless; journal-topic-driven) ─────────────────────
+import { searchYouTubeByTopics, type YouTubeVideo } from "./lib/youtube";
 // ── Unified social feed: normalization + journal-driven topic curation ───────
 import {
   toUnifiedFromNostr,
@@ -64,6 +66,7 @@ import {
   toUnifiedFromBluesky,
   toUnifiedFromNostrArticle,
   toUnifiedFromRss,
+  toUnifiedFromYouTube,
   extractJournalTopics,
   matchesTopic,
   channelsForSource,
@@ -1713,6 +1716,10 @@ function App() {
   const [readsLoading, setReadsLoading] = useState(false);
   const [readsError, setReadsError] = useState("");
   const [readsSource, setReadsSource] = useState<"nostr" | "rss">("nostr");
+  // YouTube (keyless) folds into the ranked Reads stream when toggled on,
+  // searched by the user's journal topics — the lens applied to video.
+  const [readsYouTubeEnabled, setReadsYouTubeEnabled] = useState(false);
+  const [readsYouTubeItems, setReadsYouTubeItems] = useState<YouTubeVideo[]>([]);
   const [activeRssFeedIds, setActiveRssFeedIds] = useState<string[]>(["hackernews", "stratechery", "verge"]);
   // Reads ranking mode: "foryou" (scored merge) vs "latest" (chronological).
   const [readsRankMode, setReadsRankMode] = useState<"foryou" | "latest">(() => {
@@ -7096,10 +7103,15 @@ Rules:
     for (const hn of techNewsItems) {
       unified.push(toUnifiedFromHN(hn, hn.thumbnailUrl));
     }
+    // YouTube videos (keyless, journal-topic-driven) fold into the same stream.
+    // The journal-topic ranker promotes videos relevant to the user's writing.
+    for (const v of readsYouTubeItems) {
+      unified.push(toUnifiedFromYouTube(v));
+    }
     return readsRankMode === "latest"
       ? chronologicalReads(unified)
       : rankReads(unified, journalTopics);
-  }, [readsArticles, readsRssItems, techNewsItems, readsRankMode, journalTopics]);
+  }, [readsArticles, readsRssItems, techNewsItems, readsYouTubeItems, readsRankMode, journalTopics]);
 
   // Persist the ranked Reads stream so the next open paints instantly from
   // cache (local-first). Only the UnifiedItem[] is cached; ranking re-runs on
@@ -7331,6 +7343,9 @@ Rules:
       // Kick off HN alongside; it sets its own state and is best-effort, so we
       // don't await it — it folds into the ranked stream as it lands.
       if (techNewsItems.length === 0) void loadTechNews();
+      // YouTube (keyless) is likewise best-effort: searched by the user's
+      // journal topics so the videos are "what feeds this user's mind".
+      if (readsYouTubeEnabled) void loadYouTubeReads();
       const primary = await primaryPromise;
       if (readsSource === "nostr") {
         setReadsArticles(primary as NostrEvent[]);
@@ -7345,6 +7360,29 @@ Rules:
     }
   }
 
+  /**
+   * Fetch YouTube videos for the user's top journal topics (keyless). Best-effort:
+   * on total failure the Reads stream simply shows no videos, matching the
+   * HN best-effort contract. Topics drive the queries — the journal is the lens.
+   */
+  async function loadYouTubeReads() {
+    if (!readsYouTubeEnabled) {
+      setReadsYouTubeItems([]);
+      return;
+    }
+    const topics = journalTopics.map((t) => t.label);
+    if (topics.length === 0) {
+      setReadsYouTubeItems([]);
+      return;
+    }
+    try {
+      const videos = await searchYouTubeByTopics(topics, { perTopic: 5 });
+      setReadsYouTubeItems(videos);
+    } catch {
+      // All Invidious instances unreachable / blocked — degrade to no videos.
+      setReadsYouTubeItems([]);
+    }
+  }
   /** Resolve profiles + reactions + reply-parents for a set of notes. */
   async function enrichNostrFeed(notes: NostrNote[]) {
     if (notes.length === 0) return;
@@ -8866,8 +8904,11 @@ Rules:
     if (mobileTab === "reads") {
       if (readsSource === "nostr" && readsArticles.length === 0 && !readsLoading) void loadReadsFeed();
       else if (readsSource === "rss" && readsRssItems.length === 0 && !readsLoading) void loadReadsFeed();
+      // YouTube (keyless) fetches by journal topics when toggled on; clear on off.
+      if (readsYouTubeEnabled && readsYouTubeItems.length === 0) void loadYouTubeReads();
+      if (!readsYouTubeEnabled && readsYouTubeItems.length > 0) setReadsYouTubeItems([]);
     }
-  }, [mobileTab, readsSource, activeRssFeedIds]);
+  }, [mobileTab, readsSource, activeRssFeedIds, readsYouTubeEnabled]);
 
   useEffect(() => {
     let cancelled = false;
@@ -10506,13 +10547,16 @@ Rules:
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
                   <h2>Reads</h2>
-                  <span className="text-sm muted">{displayReads.length} stories · Nostr + RSS + Hacker News</span>
+                  <span className="text-sm muted">{displayReads.length} stories · Nostr + RSS + Hacker News{readsYouTubeEnabled ? " + YouTube" : ""}</span>
                 </div>
 
-                {/* Rank mode toggle: "For You" (scored) vs "Latest" (chronological). */}
+                {/* Rank mode toggle: "For You" (scored) vs "Latest" (chronological),
+                    plus a YouTube (keyless) on/off — videos are searched by the
+                    user's journal topics and fold into the same ranked stream. */}
                 <div className="source-toggle">
                   <button type="button" className={`source-pill${readsRankMode === "foryou" ? " active" : ""}`} onClick={() => setReadsRankMode("foryou")}>✨ For You</button>
                   <button type="button" className={`source-pill${readsRankMode === "latest" ? " active" : ""}`} onClick={() => setReadsRankMode("latest")}>🕒 Latest</button>
+                  <button type="button" className={`source-pill${readsYouTubeEnabled ? " active" : ""}`} onClick={() => setReadsYouTubeEnabled((v) => !v)} title="Include YouTube videos searched by your journal topics (keyless, best-effort)">▶ Videos</button>
                 </div>
 
                 {/* RSS feed chips now act as an additive filter on the unified stream. */}
@@ -10582,7 +10626,7 @@ Rules:
                         <div className="reads-hero-body">
                           <div className="reads-card-source-row">
                             <span className="reads-card-source">{hero.sourceLabel}{heroHost ? ` · ${heroHost}` : ""}</span>
-                            <span className="reads-readtime">⏱ {hero.readMinutes} min</span>
+                            <span className="reads-readtime">{hero.item.sourcePlatform === "youtube" ? "▶ Video" : `⏱ ${hero.readMinutes} min`}</span>
                           </div>
                           <h3 className="reads-hero-title">{hero.item.content.title || "Untitled"}</h3>
                           {hero.item.content.body ? <p className="reads-hero-summary">{hero.item.content.body.slice(0, 220)}</p> : null}
@@ -10610,7 +10654,7 @@ Rules:
                                   <div className="reads-card-body">
                                     <div className="reads-card-source-row">
                                       <span className="reads-card-source">{host || item.sourcePlatform}</span>
-                                      <span className="reads-readtime">⏱ {readMinutes} min</span>
+                                      <span className="reads-readtime">{item.sourcePlatform === "youtube" ? "▶ Video" : `⏱ ${readMinutes} min`}</span>
                                     </div>
                                     <h3 className="reads-card-title">{item.content.title || "Untitled"}</h3>
                                     {item.content.body ? <p className="reads-card-summary">{item.content.body.slice(0, 200)}</p> : null}
