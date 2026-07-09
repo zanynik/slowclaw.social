@@ -164,14 +164,16 @@ export function toUnifiedFromNostr(note: NostrNoteLike, handle?: string, avatar?
   };
 }
 
-export function toUnifiedFromHN(item: HNItemLike): UnifiedItem {
+export function toUnifiedFromHN(item: HNItemLike, thumbnailUrl?: string): UnifiedItem {
   return {
     id: `hn-${item.id}`,
     sourcePlatform: "hackernews",
     timestamp: item.createdAt,
     author: { id: "hn", handle: item.source || "Hacker News" },
     content: { title: item.title, body: "", linkUrl: item.url },
-    media: { type: "none", urls: [] },
+    media: thumbnailUrl
+      ? { type: "image", urls: [thumbnailUrl], thumbnailUrl }
+      : { type: "none", urls: [] },
   };
 }
 

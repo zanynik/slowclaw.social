@@ -1712,6 +1712,21 @@ function App() {
   // Feed/Reels "Show more" pagination (replaces the silent 40-item cliff).
   const [feedVisibleCount, setFeedVisibleCount] = useState(20);
   const [readsVisibleCount, setReadsVisibleCount] = useState(12);
+  // Local-first cache for Reads: the last-good ranked stream is persisted so
+  // the Reads tab paints instantly on open (Damus-style), then refreshes in
+  // the background. Stores the UnifiedItem[] (not the RankedRead wrapper) so
+  // the cache survives changes to scoring weights / rank mode.
+  const READS_CACHE_KEY = "slowclaw.reads.unified.v1";
+  const [cachedReads, setCachedReads] = useState<UnifiedItem[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = window.localStorage.getItem(READS_CACHE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? (parsed as UnifiedItem[]) : [];
+    } catch {
+      return [];
+    }
+  });
   // Reels global mute — lifted out of ReelsPlayer so unmuting one unmutes all.
   const [reelsMuted, setReelsMuted] = useState<boolean>(() => {
     if (typeof window === "undefined") return true;
@@ -7048,8 +7063,38 @@ Rules:
     for (const group of readsRssItems) {
       for (const item of group.items) unified.push(toUnifiedFromRss(item, group.feed.label));
     }
+    // Hacker News top stories fold into the same ranked stream so the Reads
+    // tab is the single home for all article / news / link content.
+    for (const hn of techNewsItems) {
+      unified.push(toUnifiedFromHN(hn, hn.thumbnailUrl));
+    }
     return readsRankMode === "latest" ? chronologicalReads(unified) : rankReads(unified);
-  }, [readsArticles, readsRssItems, readsRankMode]);
+  }, [readsArticles, readsRssItems, techNewsItems, readsRankMode]);
+
+  // Persist the ranked Reads stream so the next open paints instantly from
+  // cache (local-first). Only the UnifiedItem[] is cached; ranking re-runs on
+  // load so the current rank mode / scoring always applies.
+  useEffect(() => {
+    if (rankedReads.length === 0) return;
+    try {
+      window.localStorage.setItem(
+        READS_CACHE_KEY,
+        JSON.stringify(rankedReads.map((r) => r.item)),
+      );
+      setCachedReads(rankedReads.map((r) => r.item));
+    } catch {
+      // Quota / serialization errors are non-fatal; in-memory state still works.
+    }
+  }, [rankedReads, READS_CACHE_KEY]);
+
+  // What the Reads tab actually renders: the live ranked stream once it has
+  // loaded, otherwise the cached stream so the tab is never blank on open.
+  const displayReads: RankedRead[] =
+    rankedReads.length > 0
+      ? rankedReads
+      : readsRankMode === "latest"
+      ? chronologicalReads(cachedReads)
+      : rankReads(cachedReads);
 
   async function loadNostrFeed() {
     if (nostrFeedLoading) return;
@@ -7239,19 +7284,31 @@ Rules:
     setReadsLoading(true);
     setReadsError("");
     try {
+      // Fetch the primary reads source (Nostr articles OR RSS) and Hacker News
+      // in parallel. HN folds into the same ranked stream so the Reads tab is
+      // one unified surface for all article/news/link content.
+      const primaryPromise =
+        readsSource === "nostr"
+          ? fetchLongFormArticles({ limit: 20 }).then((articles) => {
+              // Language-filter the articles (drop non-Latin titles/bodies).
+              return articles.filter((a) => {
+                const title = (a.tags || []).find((t) => t[0] === "title")?.[1] || "";
+                return filterNostrFeed([{ id: a.id, pubkey: a.pubkey, content: title + " " + a.content.slice(0, 200), createdAt: a.created_at, tags: a.tags || [] }], { maxPerPubkey: 99 }).length > 0;
+              });
+            })
+          : (() => {
+              const selected = RSS_FEEDS.filter((f) => activeRssFeedIds.includes(f.id));
+              const feeds = selected.length > 0 ? selected : RSS_FEEDS.slice(0, 3);
+              return fetchRssFeeds(feeds, { limitPerFeed: 8 });
+            })();
+      // Kick off HN alongside; it sets its own state and is best-effort, so we
+      // don't await it — it folds into the ranked stream as it lands.
+      if (techNewsItems.length === 0) void loadTechNews();
+      const primary = await primaryPromise;
       if (readsSource === "nostr") {
-        const articles = await fetchLongFormArticles({ limit: 20 });
-        // Language-filter the articles (drop non-Latin titles/bodies).
-        const filtered = articles.filter((a) => {
-          const title = (a.tags || []).find((t) => t[0] === "title")?.[1] || "";
-          return filterNostrFeed([{ id: a.id, pubkey: a.pubkey, content: title + " " + a.content.slice(0, 200), createdAt: a.created_at, tags: a.tags || [] }], { maxPerPubkey: 99 }).length > 0;
-        });
-        setReadsArticles(filtered);
+        setReadsArticles(primary as NostrEvent[]);
       } else {
-        const selected = RSS_FEEDS.filter((f) => activeRssFeedIds.includes(f.id));
-        const feeds = selected.length > 0 ? selected : RSS_FEEDS.slice(0, 3);
-        const results = await fetchRssFeeds(feeds, { limitPerFeed: 8 });
-        setReadsRssItems(results);
+        setReadsRssItems(primary as { feed: RssFeed; items: RssItem[] }[]);
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -10608,7 +10665,7 @@ Rules:
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
                   <h2>Reads</h2>
-                  <span className="text-sm muted">{rankedReads.length} stories · Nostr + RSS</span>
+                  <span className="text-sm muted">{displayReads.length} stories · Nostr + RSS + Hacker News</span>
                 </div>
 
                 {/* Rank mode toggle: "For You" (scored) vs "Latest" (chronological). */}
@@ -10634,25 +10691,32 @@ Rules:
                   ))}
                 </div>
 
-                {readsLoading ? (
+                {/* Subtle refresh indicator when content is already showing from cache. */}
+                {readsLoading && displayReads.length > 0 ? (
+                  <div className="text-sm muted" style={{ padding: '0.25rem 0.25rem 0', fontSize: '0.72rem' }}>
+                    <span className="btn-spinner" aria-hidden style={{ width: '0.7rem', height: '0.7rem', marginRight: '0.3rem', verticalAlign: 'middle' }} />Refreshing…
+                  </div>
+                ) : null}
+
+                {readsLoading && displayReads.length === 0 ? (
                   <div style={{ padding: '2rem', textAlign: 'center' }}>
                     <span className="btn-spinner" aria-hidden />
                     <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Loading…</p>
                   </div>
-                ) : readsError ? (
+                ) : readsError && displayReads.length === 0 ? (
                   <div className="feed-empty-filtered">
                     <p className="text-sm muted" style={{ margin: 0 }}>{readsError}</p>
                     <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadReadsFeed()}>Retry</button>
                   </div>
-                ) : rankedReads.length === 0 ? (
+                ) : displayReads.length === 0 ? (
                   <div className="feed-create-hero">
                     <div className="feed-create-hero-icon">📰</div>
                     <h3>No articles yet</h3>
-                    <p className="text-sm muted">Long-form posts from Nostr (NIP-23) and RSS blogs. Pull to refresh, or toggle sources above.</p>
+                    <p className="text-sm muted">Long-form posts from Nostr (NIP-23), RSS blogs, and Hacker News. Pull to refresh, or toggle sources above.</p>
                   </div>
                 ) : (() => {
                   // Apply pagination first, then split hero from the rest.
-                  const visible = rankedReads.slice(0, readsVisibleCount);
+                  const visible = displayReads.slice(0, readsVisibleCount);
                   const [hero, ...rest] = visible;
                   const heroUrl = hero.item.content.linkUrl || "#";
                   const heroHost = (() => { try { return heroUrl !== "#" ? new URL(heroUrl).hostname.replace(/^www\./, "") : ""; } catch { return ""; } })();
@@ -10715,7 +10779,7 @@ Rules:
                             })}
                           </div>
                         ))}
-                        {rankedReads.length > readsVisibleCount ? (
+                        {displayReads.length > readsVisibleCount ? (
                           <button type="button" className="load-more-btn" onClick={() => setReadsVisibleCount((c) => c + 12)}>Show more</button>
                         ) : null}
                       </div>
