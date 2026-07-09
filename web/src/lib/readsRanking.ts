@@ -1,20 +1,25 @@
 /**
- * readsRanking.ts — lightweight client-side ranking + read-time for the Reads tab.
+ * readsRanking.ts — journal-driven client-side ranking + read-time for Reads.
  *
- * Mirrors the "For You" idea from Google News / Substack without any backend:
- * score = recencyDecay + imageBonus + readTimeBonus + lengthTiebreak. Fresh,
- * illustrated, medium-length articles win; nothing is buried purely on age.
+ * "For You" means *for this user*: their own journals are mined for salient
+ * topics (extractJournalTopics, lib/socialFeed.ts), and an article matching one
+ * of those topics gets a strong boost that outranks generic recency. This is
+ * the "journal is the lens" signal made concrete for the Reads stream.
+ *
+ * score = topicBoost + recencyDecay + imageBonus + readTimeBonus + lengthTiebreak.
+ * With no journal topics (cold start / empty journals) topicBoost is 0 and the
+ * ranker degrades gracefully to pure recency/quality.
  *
  * Consumes the existing `UnifiedItem` shape from socialFeed.ts so Nostr
  * articles and RSS items collapse into one ranked stream.
  */
 
-import type { UnifiedItem } from "./socialFeed";
+import { matchesTopic, type Topic, type UnifiedItem } from "./socialFeed";
 
 /** A scored item: the unified record plus its computed score + read-time. */
 export interface RankedRead {
   item: UnifiedItem;
-  /** Higher = more prominent. Roughly 0..1.3 range with current weights. */
+  /** Higher = more prominent. Range depends on inputs; up to ~2.5 when a strong journal-topic match is present. */
   score: number;
   /** Estimated read time in whole minutes (min 1). */
   readMinutes: number;
@@ -43,14 +48,55 @@ export function estimateReadMinutes(text: string): number {
 const RECENCY_HALF_LIFE_HOURS = 36; // fresh wins, but a 3-day piece can still surface
 const NOW = () => Date.now() / 1000;
 
+/* ── Journal-driven relevance (the lens) ──────────────────────────────────
+ * These weights make journal-topic match the DOMINANT signal: a relevant
+ * article outranks a generic-fresh one, and a strong older relevant piece can
+ * still surface (the product thesis welcomes evergreen relevant content).
+ * Magnitudes:
+ *   - matching the user's most-written topic  → +0.8
+ *   - each additional matched topic            → +0.3
+ *   - total topic boost capped at              → +1.2
+ * Recency (≤1.0) + quality (≤0.35) stay as within-relevance tiebreakers.
+ * With no topics passed, journalTopicBoost returns 0 (pure-recency fallback).
+ */
+const TOPIC_MATCH_TOP = 0.8;
+const TOPIC_MATCH_EACH = 0.3;
+const TOPIC_MATCH_CAP = 1.2;
+
+/**
+ * Journal-derived relevance boost. `topics` are the user's own journal topics
+ * (label + weight, from extractJournalTopics); the strongest-weighted matched
+ * topic counts most, additional matches stack (capped). Uses the same
+ * `matchesTopic` predicate as the Feed topic chips so the lens is consistent
+ * across surfaces. Returns 0 when there are no topics (cold start).
+ */
+function journalTopicBoost(item: UnifiedItem, topics: Topic[]): number {
+  if (!topics.length) return 0;
+  const ranked = [...topics].sort((a, b) => b.weight - a.weight);
+  let boost = 0;
+  let first = true;
+  for (const t of ranked) {
+    if (matchesTopic(item, t.label)) {
+      boost += first ? TOPIC_MATCH_TOP : TOPIC_MATCH_EACH;
+      first = false;
+      if (boost >= TOPIC_MATCH_CAP) return TOPIC_MATCH_CAP;
+    }
+  }
+  return boost;
+}
+
 /**
  * Score a single item. Components:
+ *   topicBoost   — journal-derived relevance (dominant; 0 when no topics given)
  *   recency      — exponential decay (1 at t=now, ~0.5 at 36h, ~0.13 at 3 days)
  *   imageBonus   — +0.15 if a cover/thumbnail is present
  *   readTimeBonus — +0.05..0.15 for a 3..15 min read (the Goldilocks zone)
  *   lengthTiebreak — tiny bonus for substantive summaries (proxy for depth)
  */
-export function scoreRead(item: UnifiedItem): { score: number; readMinutes: number } {
+export function scoreRead(
+  item: UnifiedItem,
+  topics?: Topic[],
+): { score: number; readMinutes: number } {
   const now = NOW();
   const ageHours = Math.max(0, (now - item.timestamp) / 3600);
   const recency = Math.pow(0.5, ageHours / RECENCY_HALF_LIFE_HOURS);
@@ -66,14 +112,22 @@ export function scoreRead(item: UnifiedItem): { score: number; readMinutes: numb
   else if (readMinutes >= 2 && readMinutes <= 20) readTimeBonus = 0.05;
 
   const lengthTiebreak = Math.min(0.05, item.content.body.length / 5000);
+  const topicBoost = topics && topics.length ? journalTopicBoost(item, topics) : 0;
 
-  return { score: recency + imageBonus + readTimeBonus + lengthTiebreak, readMinutes };
+  return {
+    score: topicBoost + recency + imageBonus + readTimeBonus + lengthTiebreak,
+    readMinutes,
+  };
 }
 
-/** Rank a list of unified items, highest score first. Stable on ties (keeps input order). */
-export function rankReads(items: UnifiedItem[]): RankedRead[] {
+/**
+ * Rank a list of unified items, highest score first. Stable on ties (keeps
+ * input order). Pass the user's journal `topics` to make "For You" journal-
+ * driven; omit them for pure recency/quality ranking.
+ */
+export function rankReads(items: UnifiedItem[], topics?: Topic[]): RankedRead[] {
   const scored = items.map((item) => {
-    const { score, readMinutes } = scoreRead(item);
+    const { score, readMinutes } = scoreRead(item, topics);
     const sourceLabel =
       item.sourcePlatform === "rss"
         ? item.author.handle

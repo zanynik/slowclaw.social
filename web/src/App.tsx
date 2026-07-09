@@ -7090,8 +7090,10 @@ Rules:
     for (const hn of techNewsItems) {
       unified.push(toUnifiedFromHN(hn, hn.thumbnailUrl));
     }
-    return readsRankMode === "latest" ? chronologicalReads(unified) : rankReads(unified);
-  }, [readsArticles, readsRssItems, techNewsItems, readsRankMode]);
+    return readsRankMode === "latest"
+      ? chronologicalReads(unified)
+      : rankReads(unified, journalTopics);
+  }, [readsArticles, readsRssItems, techNewsItems, readsRankMode, journalTopics]);
 
   // Persist the ranked Reads stream so the next open paints instantly from
   // cache (local-first). Only the UnifiedItem[] is cached; ranking re-runs on
@@ -7116,7 +7118,7 @@ Rules:
       ? rankedReads
       : readsRankMode === "latest"
       ? chronologicalReads(cachedReads)
-      : rankReads(cachedReads);
+      : rankReads(cachedReads, journalTopics);
 
   async function loadNostrFeed() {
     if (nostrFeedLoading) return;
