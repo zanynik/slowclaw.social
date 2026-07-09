@@ -1,7 +1,7 @@
 /**
  * socialFeed.ts — Unified social-content normalization + journal-driven curation.
  *
- * Implements the architecture from `Social-media-app-open-web.md`: every
+ * Implements the architecture from `docs/Social-media-app-open-web.md`: every
  * permissionless source (Nostr, Hacker News, and future RSS / AT Protocol) is
  * funneled through a single `UnifiedItem` shape so the UI never sees raw
  * protocol JSON. On top of that sits a journal-derived **topic** layer: the
