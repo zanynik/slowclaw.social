@@ -9,17 +9,24 @@ Scope: entire repository (`slowclaw.social`).
 
 ## 1) Project Snapshot (Read First)
 
-**SlowClaw Social** is a local-first personal capture and curation app. It is built around **one workspace** where a single user can:
+**SlowClaw Social** is a local-first, **journal-first brain-feeder** — a personal capture and curation app organized around three loops:
 
-- write journals and notes
-- record audio or video into the workspace
-- generate a workspace feed, todos, events, and clip plans from their own material
-- curate personalized Bluesky and web feeds from local interests and cached sources
+1. **Capture loop** — one workspace for journals, **audio-first** (the default), plus video and text. Capture stays on-device (transcription via the native iOS speech bridge, AI via on-device inference).
+2. **Feed loop (journal-driven curation)** — articles, news, and video flow *into* the user through curated surfaces ranked by **relevance to the user's own journals**, not generic popularity. This replaces third-party readers/aggregators and is the core differentiator: **the journal is the lens.**
+3. **Share/Connect loop** — the user distills their thinking into drafts, reviews them, and publishes out to open protocols (Bluesky short-form, Nostr long-form); discovery of people whose insights resonate flows back into the Feed loop.
+
+The workspace lets a single user:
+
+- write journals and notes, and **record audio or video** (audio is the primary capture mode)
+- mine journals for topics that then steer curation across every content surface
+- curate personalized Bluesky/Nostr and web/article/**video** (incl. YouTube) feeds from local interests and cached sources
 - keep the core runtime, storage, and AI workflows on their own machine
 
 **Primary product surface:** a desktop + mobile app (macOS, iOS today; Android in progress) built with **Tauri 2** wrapping a **React + TypeScript** web UI, which embeds a **Rust** gateway/core. The same Rust + web codebase also ships a CLI, gateway, and daemon.
 
 > **🎯 iOS is the primary target.** This is first and foremost an **iOS app**. macOS/desktop, the CLI, gateway, and daemon are secondary surfaces. When adding AI-powered features (generation, extraction, synthesis, summarization, transcription), **default to the on-device path** — `web/src-tauri/src/inference.rs` (llama.cpp/GGUF on iPhone, exposed to JS as `nativeAiChat`) and `web/src-tauri/src/transcription.rs` (Speech.framework on iOS, exposed as `transcribeAudio`). Do **not** build new capture/synthesis features on the desktop gateway + remote-LLM-provider path (`src/gateway/workspace_synthesizer.rs`, skills, `posts/` materialization) when an on-device variant exists — the gateway/skill path is for desktop and server-style workflows only. Frontend on-device features gate on `isTauriMobileRuntime() && nativeLocalAiStatus?.available`. Treat the existing TweetClaw (post generation) and Task Extraction features in `web/src/App.tsx` as the **reference pattern** for any new AI feature on this app.
+
+> **📖 Canonical product thesis.** [`docs/vision-contract.md`](docs/vision-contract.md) is the authoritative, enforceable statement of the vision (three loops; journal-is-the-lens; audio-first capture; local-first AI; open publishing; read-only ingestion incl. video/YouTube). This section is a summary; when they appear to conflict, the vision contract wins.
 
 - Repo / binary: `slowclaw.social` / binary `slowclaw` (crate `slowclaw`, package `slowclaw`)
 - Tauri bundle id: `com.slowclaw.app`, product name **SlowClaw Social**
@@ -48,7 +55,7 @@ These are intentional legacy names carried over from the fork. Renaming any of t
 
 ### Product direction (merge gate)
 
-Treat [`docs/vision-contract.md`](docs/vision-contract.md) **and** the product description in [`README.md`](README.md) as merge gates, not commentary. The pipeline is: **multimodal capture (text / audio / video) → transform workflows → personalized curation → draft review → open publishing/ingestion (Bluesky / Nostr / RSS / Atom).** Reject changes that add cognitive load, fragmented UX, or closed-platform lock-in without a documented user-value reason.
+Treat [`docs/vision-contract.md`](docs/vision-contract.md) **and** the product description in [`README.md`](README.md) as merge gates, not commentary. The pipeline is the **three loops**: **multimodal capture (audio-first, on-device) → journal-driven curation (the journal is the lens; articles + news + video incl. YouTube) → draft review → open publishing/ingestion (Bluesky / Nostr / RSS / Atom).** Video/YouTube is a first-class *ingestion* source (read-only) while the user's own content and publishing stay open-protocol-bound. Reject changes that add cognitive load, fragmented UX, or closed-platform lock-in without a documented user-value reason. New ranking/curation surfaces must be journal-driven (or justify the exception).
 
 ---
 

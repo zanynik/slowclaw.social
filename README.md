@@ -1,16 +1,22 @@
 # slowclaw.social
 
-SlowClaw Social is a local-first personal capture and curation app.
+SlowClaw Social is a local-first, **journal-first brain-feeder** — a personal capture and curation app. Your journals are the **lens** that decides what flows back to you.
 
-It is built around one workspace where you can:
+It is built around **one workspace** and three loops:
 
-- write journals and notes
-- record audio or video into the workspace
+1. **Capture** — write journals and notes, or **record audio (the default) or video**. Capture stays on-device: transcription via the native iOS speech bridge, AI via on-device inference (llama.cpp/GGUF).
+2. **Feed (journal-driven curation)** — articles, news, and video (incl. YouTube) are ranked by **relevance to your own journals**, not generic popularity. What you've written shapes what you read and watch back. This is the core idea: the journal feeds your mind.
+3. **Share / Connect** — distill your thinking into drafts, review them, and publish out to open protocols (Bluesky short-form, Nostr long-form). Discovery of people whose insights resonate flows back into the feed.
+
+You can also:
+
 - generate a workspace feed, todos, events, and clip plans from your own material
-- curate personalized Bluesky and web feeds from local interests and cached sources
+- curate personalized Bluesky/Nostr and web/article/video feeds from local interests and cached sources
 - keep the core runtime, storage, and AI workflows on your own machine
 
 The binary name is `slowclaw`.
+
+> The authoritative, enforceable vision is [`docs/vision-contract.md`](docs/vision-contract.md).
 
 ## What This Fork Keeps
 
