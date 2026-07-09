@@ -471,6 +471,18 @@ mod engine {
             .ok()
             .and_then(|state| state.model.as_ref().map(|m| m.model_id.clone()))
     }
+
+    /// Drop the loaded model from memory (frees the mmap'd GGUF + KV cache).
+    /// No-op if no model is loaded. Used by the "Delete Model" flow so the
+    /// unloaded model's file can be removed on disk without a held lock.
+    pub fn unload_model() {
+        let engine = get_engine();
+        if let Ok(mut state) = engine.lock() {
+            if state.model.take().is_some() {
+                eprintln!("[inference] Model unloaded");
+            }
+        }
+    }
 }
 
 #[cfg(not(feature = "native-inference"))]
@@ -500,8 +512,10 @@ mod engine {
     pub fn loaded_model_id() -> Option<String> {
         None
     }
+
+    pub fn unload_model() {}
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-pub use engine::{is_model_loaded, load_model, loaded_model_id, run_inference};
+pub use engine::{is_model_loaded, load_model, loaded_model_id, run_inference, unload_model};

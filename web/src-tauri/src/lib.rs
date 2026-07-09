@@ -2435,6 +2435,44 @@ async fn configure_native_local_ai(
     Ok(status)
 }
 
+/// Clear the configured native local AI model: remove the persisted config
+/// (`state/native_local_ai.json`), reset the in-memory status to the
+/// unconfigured default, drop any loaded model from memory, and unset the
+/// provider env vars. The caller (frontend) is responsible for deleting the
+/// GGUF file separately. Returns the refreshed status so the UI can update.
+#[tauri::command]
+async fn clear_native_local_ai(
+    state: tauri::State<'_, NativeLocalAiState>,
+    gateway_state: tauri::State<'_, GatewayState>,
+) -> Result<NativeLocalAiStatus, String> {
+    let config = load_workspace_config_for_ui("native local AI clear config load failed").await?;
+
+    // 1. Unload the model from memory (frees the mmap'd GGUF + KV cache) so
+    //    the frontend can safely delete the file without a held lock.
+    tauri::async_runtime::spawn_blocking(|| inference::unload_model())
+        .await
+        .map_err(|e| format!("Model unload task failed: {e}"))?;
+
+    // 2. Delete the persisted config so a restart doesn't restore a model the
+    //    user just removed. Missing file is not an error (already cleared).
+    let state_path = native_local_ai_state_path(&config);
+    let _ = std::fs::remove_file(&state_path);
+
+    // 3. Unset the provider env vars so nothing points at the removed model.
+    std::env::remove_var(zeroclaw::providers::local_native::ENV_NATIVE_MODEL_ID);
+    std::env::remove_var(zeroclaw::providers::local_native::ENV_NATIVE_MODEL_PATH);
+
+    // 4. Reset the in-memory status to the unconfigured default.
+    let status = default_native_local_ai_status();
+    {
+        let mut guard = lock_native_local_ai_state(&state.inner)?;
+        guard.status = status.clone();
+    }
+
+    let _ = restart_embedded_gateway(gateway_state.inner.clone()).await;
+    Ok(status)
+}
+
 // show_main_window moved to commands/desktop.rs
 
 #[tauri::command]
@@ -3084,6 +3122,7 @@ pub fn run() {
             native_ai_load_model,
             native_ai_chat,
             native_ai_engine_status,
+            clear_native_local_ai,
             set_metal_mode,
             transcribe_audio,
             transcribe_journal_media,

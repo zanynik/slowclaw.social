@@ -306,6 +306,16 @@ export async function nativeAiLoadModel(): Promise<string> {
   return invoke("native_ai_load_model");
 }
 
+/**
+ * Clear the configured native local AI model: unloads it from memory, deletes
+ * the persisted config, resets status to the unconfigured default. The caller
+ * is responsible for deleting the GGUF file separately (so it works for both
+ * catalog and sideloaded models). Returns the refreshed status.
+ */
+export async function clearNativeLocalAi(): Promise<NativeLocalAiStatus> {
+  return invoke("clear_native_local_ai");
+}
+
 export async function nativeAiChat(
   prompt: string,
   systemPrompt?: string,
