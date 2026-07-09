@@ -1732,6 +1732,22 @@ function App() {
     if (typeof window === "undefined") return true;
     return window.localStorage.getItem("slowclaw.reels.muted") !== "false";
   });
+  // Fullscreen video overlay: tapping an inline video in the unified Feed opens
+  // a reels-style fullscreen player. Holds the list of video posts available in
+  // the current feed plus the index to start at, so the user can swipe through
+  // all videos — not just the one tapped. null = hidden.
+  type FullscreenVideo = { posts: BlueskyPublicPost[]; startIndex: number } | null;
+  const [fullscreenVideo, setFullscreenVideo] = useState<FullscreenVideo>(null);
+  const fullscreenVideoScrollRef = useRef<HTMLDivElement>(null);
+  // When the fullscreen video overlay opens, jump to the tapped post's index so
+  // the user lands on the video they tapped (not the first in the list).
+  useEffect(() => {
+    if (!fullscreenVideo) return;
+    const root = fullscreenVideoScrollRef.current;
+    if (!root) return;
+    const tile = root.querySelectorAll<HTMLElement>(".reels-tile")[fullscreenVideo.startIndex];
+    if (tile) tile.scrollIntoView({ behavior: "auto" });
+  }, [fullscreenVideo]);
   // Saved items (Profile tab) — mirrored from the localStorage store so the
   // Profile list re-renders when Feed/Reels/Reads save or unsave an item.
   const [savedItems, setSavedItems] = useState<SavedItem[]>(() => getSavedItems());
@@ -7657,19 +7673,37 @@ Rules:
         </div>
         {/* Text is always rendered first and prominently. */}
         {body ? <p className="nostr-note-text">{body}</p> : null}
-        {/* Video embed (HLS playlist). iOS Safari/WKWebView plays natively; the
-            poster thumbnail shows until play. */}
+        {/* Video embed (HLS playlist). Tapping opens a reels-style fullscreen
+            player (tap-to-fullscreen); a poster + play affordance shows inline
+            so the feed stays scannable without autoplaying heavy video. */}
         {video && (video.playlist || video.thumbnail) ? (
-          <div className="bluesky-video-wrap">
-            <video
-              className="bluesky-video"
-              controls
-              playsInline
-              preload="metadata"
-              poster={video.thumbnail || undefined}
-              src={video.playlist || undefined}
-            />
-          </div>
+          <button
+            type="button"
+            className="bluesky-video-wrap"
+            aria-label="Open video fullscreen"
+            onClick={() => {
+              // Build the swipeable video list from the currently loaded Bluesky
+              // video posts, starting at this post. Falls back to just this post
+              // if no broader feed is loaded.
+              const videoPosts = [
+                ...blueskyPublicPosts.filter((p) => !!blueskyVideoOf(p)),
+                ...reelsPosts,
+              ];
+              const deduped: BlueskyPublicPost[] = [];
+              const seen = new Set<string>();
+              for (const p of videoPosts) {
+                if (seen.has(p.uri)) continue;
+                seen.add(p.uri);
+                deduped.push(p);
+              }
+              const list = deduped.length > 0 ? deduped : [post];
+              const startIndex = Math.max(0, list.findIndex((p) => p.uri === post.uri));
+              setFullscreenVideo({ posts: list, startIndex });
+            }}
+          >
+            {video.thumbnail ? <img src={video.thumbnail} alt="" className="bluesky-video-poster" loading="lazy" /> : null}
+            <span className="bluesky-video-play" aria-hidden>▶</span>
+          </button>
         ) : null}
         {/* Image grid (1-4 images, fullsize for quality). */}
         {images.length > 0 ? (
@@ -11357,6 +11391,48 @@ Rules:
           </div>
         </div>
       )}
+      {/* Fullscreen video overlay (tap-to-fullscreen from an inline Feed video).
+          Reuses the ReelsPlayer + reels-feed snap container so the UX matches
+          the Reels tab; swipe through all videos in the current feed. */}
+      {fullscreenVideo ? (
+        <div className="modal-overlay reels-fullscreen-overlay" onClick={() => setFullscreenVideo(null)}>
+          <div
+            className="reels-feed"
+            ref={fullscreenVideoScrollRef}
+            tabIndex={0}
+            role="dialog"
+            aria-label="Video player"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+              e.preventDefault();
+              const root = fullscreenVideoScrollRef.current;
+              if (!root) return;
+              const tiles = Array.from(root.querySelectorAll<HTMLElement>(".reels-tile"));
+              if (!tiles.length) return;
+              const idx = Math.round(root.scrollTop / root.clientHeight);
+              const next = e.key === "ArrowDown" ? Math.min(tiles.length - 1, idx + 1) : Math.max(0, idx - 1);
+              tiles[next]?.scrollIntoView({ behavior: "smooth" });
+            }}
+          >
+            {fullscreenVideo.posts.slice(0, 40).map((post, i) => (
+              <ReelsPlayer
+                key={post.uri}
+                post={post}
+                active={i === fullscreenVideo.startIndex}
+                muted={reelsMuted}
+                onToggleMute={() => setReelsMuted((m) => !m)}
+              />
+            ))}
+          </div>
+          <button
+            type="button"
+            className="reels-fullscreen-close"
+            aria-label="Close video"
+            onClick={() => setFullscreenVideo(null)}
+          >✕</button>
+        </div>
+      ) : null}
       {/* Profile overlay (Nostr user or Skill) */}
       {profileView && (
         <div className="modal-overlay" onClick={() => setProfileView(null)}>
