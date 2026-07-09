@@ -1329,6 +1329,35 @@ fn resolve_journal_id(workspace_dir: &Path, id: &str) -> Result<PathBuf, String>
     Ok(path)
 }
 
+/// Resolve the sidecar transcript path for a media journal entry.
+///
+/// Mirrors the JS `journalTranscriptPathForMediaPath` convention so the
+/// native and web layers agree on where transcripts live: for a media file at
+/// `journals/media/<name>.<ext>` the transcript is expected at
+/// `journals/text/transcriptions/<name>.txt`, with a legacy fallback to
+/// `journals/text/transcript/<name>.txt`. Returns `None` for non-media ids.
+fn media_transcript_path(workspace_dir: &Path, media_id: &str) -> Option<PathBuf> {
+    let normalized = media_id.trim_start_matches('/');
+    let relative = normalized.strip_prefix("journals/media/")?;
+    let stem = relative
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(relative);
+    let primary = workspace_dir
+        .join("journals/text/transcriptions")
+        .join(format!("{stem}.txt"));
+    let legacy = workspace_dir
+        .join("journals/text/transcript")
+        .join(format!("{stem}.txt"));
+    if primary.exists() {
+        Some(primary)
+    } else if legacy.exists() {
+        Some(legacy)
+    } else {
+        None
+    }
+}
+
 fn journal_entry_from_path(workspace_dir: &Path, path: &Path) -> Option<JournalEntry> {
     let id = rel_path_to_id(workspace_dir, path)?;
     if id.starts_with("journals/text/transcript/")
@@ -1347,10 +1376,16 @@ fn journal_entry_from_path(workspace_dir: &Path, path: &Path) -> Option<JournalE
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs().to_string())
         .unwrap_or_else(unix_time_label);
+    // For text journals, read the note body. For media journals, surface the
+    // sidecar transcript (when it exists) so voice/video capture feeds the same
+    // text-based surfaces as written notes — topic extraction, search, ranking.
+    // An untranscribed media entry keeps an empty body (same as before).
     let content = if kind == "text" {
         std::fs::read_to_string(path).unwrap_or_default()
     } else {
-        String::new()
+        media_transcript_path(workspace_dir, &id)
+            .and_then(|transcript| std::fs::read_to_string(&transcript).ok())
+            .unwrap_or_default()
     };
 
     Some(JournalEntry {

@@ -1862,8 +1862,10 @@ function App() {
     const ownPubkey = nostrKeys?.publicKeyHex;
     if (!ownPubkey) return;
     // Journal text feeds the cold-start keyword matching for new users.
+    // Include media transcripts (surfaced in previewText) so voice journals
+    // shape the same lens as written ones.
     const journalTexts = journalItems
-      .filter((item) => item.kind === "text" && (item.previewText || "").trim().length > 10)
+      .filter((item) => (item.previewText || "").trim().length > 10)
       .slice(0, 60)
       .map((item) => item.previewText || "");
     let cancelled = false;
@@ -6977,8 +6979,12 @@ Rules:
    */
   const journalTopics = useMemo(
     () => extractJournalTopics(
+      // Voice/video journals carry their transcript in `previewText` (the Rust
+      // host surfaces the sidecar transcript as `content`), so feed every
+      // entry with substantive text into the lens — not just written notes.
+      // This makes audio-first capture actually shape the curation signal.
       journalItems
-        .filter((item) => item.kind === "text" && (item.previewText || "").trim().length > 10)
+        .filter((item) => (item.previewText || "").trim().length > 10)
         .slice(0, 60)
         .map((item) => item.previewText || ""),
       10,
