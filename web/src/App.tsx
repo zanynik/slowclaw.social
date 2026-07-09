@@ -58,7 +58,7 @@ import { filterNostrFeed, type NostrFeedStats } from "./lib/feedFilter";
 // ── RSS/Atom feeds (Reads tab) ────────────────────────────────────────────────
 import { fetchRssFeeds, RSS_FEEDS, type RssFeed, type RssItem } from "./lib/rss";
 // ── YouTube ingestion (keyless; journal-topic-driven) ─────────────────────
-import { searchYouTubeByTopics, type YouTubeVideo } from "./lib/youtube";
+import { loadYouTubeFeed, YOUTUBE_CHANNELS, type YouTubeVideo } from "./lib/youtube";
 // ── Unified social feed: normalization + journal-driven topic curation ───────
 import {
   toUnifiedFromNostr,
@@ -7425,25 +7425,30 @@ Rules:
   }
 
   /**
-   * Fetch YouTube videos for the user's top journal topics (keyless). Best-effort:
-   * on total failure the Reads stream simply shows no videos, matching the
-   * HN best-effort contract. Topics drive the queries — the journal is the lens.
+   * Load YouTube videos into the Reads stream. The reliable base is the
+   * curated channel catalog (YouTube RSS via the same rss2json proxy RSS blogs
+   * use — robust, keyless, webview-safe). On top of that, a best-effort
+   * topic search (Invidious) adds interest-driven discovery using the user's
+   * journal topics. Channel videos always load; topic search degrades to
+   * nothing on failure without dropping the channels. The journal-driven
+   * ranker then promotes the most relevant videos of either kind.
    */
   async function loadYouTubeReads() {
     if (!readsYouTubeEnabled) {
       setReadsYouTubeItems([]);
       return;
     }
-    const topics = journalTopics.map((t) => t.label);
-    if (topics.length === 0) {
-      setReadsYouTubeItems([]);
-      return;
-    }
     try {
-      const videos = await searchYouTubeByTopics(topics, { perTopic: 5 });
+      const videos = await loadYouTubeFeed({
+        channels: YOUTUBE_CHANNELS,
+        topics: journalTopics.map((t) => t.label),
+        perTopic: 4,
+        limitPerChannel: 6,
+      });
       setReadsYouTubeItems(videos);
     } catch {
-      // All Invidious instances unreachable / blocked — degrade to no videos.
+      // Total failure (network down): keep the tab empty of videos; the rest
+      // of the Reads stream (articles/HN) is unaffected.
       setReadsYouTubeItems([]);
     }
   }
@@ -10620,7 +10625,7 @@ Rules:
                 <div className="source-toggle">
                   <button type="button" className={`source-pill${readsRankMode === "foryou" ? " active" : ""}`} onClick={() => setReadsRankMode("foryou")}>✨ For You</button>
                   <button type="button" className={`source-pill${readsRankMode === "latest" ? " active" : ""}`} onClick={() => setReadsRankMode("latest")}>🕒 Latest</button>
-                  <button type="button" className={`source-pill${readsYouTubeEnabled ? " active" : ""}`} onClick={() => setReadsYouTubeEnabled((v) => !v)} title="Include YouTube videos searched by your journal topics (keyless, best-effort)">▶ Videos</button>
+                  <button type="button" className={`source-pill${readsYouTubeEnabled ? " active" : ""}`} onClick={() => setReadsYouTubeEnabled((v) => !v)} title="Include YouTube: your subscribed channels (reliable) plus best-effort topic discovery from your journals">▶ Videos</button>
                 </div>
 
                 {/* RSS feed chips now act as an additive filter on the unified stream. */}
