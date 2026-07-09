@@ -6,7 +6,6 @@ import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
 import { BottomNav } from "./components/BottomNav";
 import { SwipeableView } from "./components/SwipeableView";
 import { PullToRefresh } from "./components/PullToRefresh";
-import { MediaTile } from "./components/MediaTile";
 import { ReelsPlayer } from "./components/ReelsPlayer";
 import { FeedActionBar } from "./components/FeedActionBar";
 import { ToastContainer } from "./components/ui/ToastContainer";
@@ -475,8 +474,8 @@ const ATOMIC_LOCAL_MODEL = "gemma-3n-e4b-it";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
-type MobileTab = "feed" | "reels" | "media" | "reads" | "journal" | "queue" | "profile";
-const TAB_ORDER: MobileTab[] = ["feed", "reels", "media", "reads", "journal", "queue", "profile"];
+type MobileTab = "feed" | "reads" | "journal" | "queue" | "profile";
+const TAB_ORDER: MobileTab[] = ["feed", "reads", "journal", "queue", "profile"];
 // Rotating seed prompts shown above the composer during first-run onboarding.
 // Indexed by the day-of-month so a returning first-time user sees variety.
 const FIRST_ENTRY_PROMPTS = [
@@ -518,13 +517,14 @@ function defaultMobileTab(): MobileTab {
   // Migration: fold removed tabs into their successors.
   //   productivity / todos / events  → queue (Tasks now lives in Queue)
   //   news                            → feed   (Tech News is now a Feed toggle)
+  //   reels / media                   → feed   (video + images merged into the unified Feed)
   if (saved === "todos" || saved === "events" || saved === "productivity") {
     return "queue";
   }
-  if (saved === "news") {
+  if (saved === "news" || saved === "reels" || saved === "media") {
     return "feed";
   }
-  if (saved === "feed" || saved === "reels" || saved === "media" || saved === "reads" || saved === "journal" || saved === "queue" || saved === "profile") {
+  if (saved === "feed" || saved === "reads" || saved === "journal" || saved === "queue" || saved === "profile") {
     return saved;
   }
   // Capture-first onboarding: a brand-new user (no saved tab, onboarding not
@@ -1693,10 +1693,10 @@ function App() {
   const [socialFeedError, setSocialFeedError] = useState("");
   // Nostr quality-filter stats (how many notes were dropped as spam/non-EN).
   const [nostrFeedStats, setNostrFeedStats] = useState<NostrFeedStats | null>(null);
-  // Reels tab (vertical video doom-scroll, primarily Bluesky).
+  // Bluesky video posts for the unified Feed's inline videos + the
+  // tap-to-fullscreen overlay (the dedicated Reels tab was removed).
   const [reelsPosts, setReelsPosts] = useState<BlueskyPublicPost[]>([]);
   const [reelsLoading, setReelsLoading] = useState(false);
-  const [reelsError, setReelsError] = useState("");
   // Reads tab (long-form: Nostr NIP-23 articles + RSS/Atom blogs).
   const [readsArticles, setReadsArticles] = useState<NostrEvent[]>([]);
   const [readsRssItems, setReadsRssItems] = useState<{ feed: RssFeed; items: RssItem[] }[]>([]);
@@ -1768,8 +1768,6 @@ function App() {
   // last viewed the top. Resets on tap (scrolls to top) or tab switch.
   const [newPostsCount, setNewPostsCount] = useState(0);
   const lastSeenTopPostIdRef = useRef<string | null>(null);
-  // Reels snap-scroll container ref (shared with PullToRefresh for nested pull).
-  const reelsScrollRef = useRef<HTMLDivElement | null>(null);
   const [techNewsLoading, setTechNewsLoading] = useState(false);
   const [techNewsError, setTechNewsError] = useState("");
   const [nostrPostConfirmPost, setNostrPostConfirmPost] = useState<PersistedPost | null>(null);
@@ -7019,45 +7017,6 @@ Rules:
     }
   }, [mobileTab, feedView, socialSource, activeChannelId, activeSocialTopic]);
 
-  /**
-   * Media gallery: all image/video-bearing UnifiedItems aggregated across the
-   * loaded Nostr + Bluesky sources. Powers the dedicated Media tab. Reuses the
-   * same normalized items as the Feed, just filtered to those carrying media,
-   * newest first. If both sources are empty, the tab prompts the user to load a
-   * Feed channel first.
-   */
-  const mediaGalleryItems = useMemo(() => {
-    const nostrMedia = nostrFeedNotes
-      .filter((n) => {
-        const profile = nostrProfiles[n.pubkey];
-        return toUnifiedFromNostr(
-          n,
-          profile?.name ?? profile?.displayName ?? undefined,
-          profile?.picture ?? undefined,
-        ).media.type !== "none";
-      })
-      .map((n) => {
-        const profile = nostrProfiles[n.pubkey];
-        return {
-          unified: toUnifiedFromNostr(n, profile?.name ?? profile?.displayName ?? undefined, profile?.picture ?? undefined),
-          authorName: nostrDisplayName(n.pubkey, profile),
-          authorHandle: profile?.name ?? undefined,
-          authorAvatar: profile?.picture ?? undefined,
-          note: n,
-        };
-      });
-    const bskyMedia = blueskyPublicPosts
-      .filter((p) => toUnifiedFromBluesky(p).media.type !== "none")
-      .map((p) => ({
-        unified: toUnifiedFromBluesky(p),
-        authorName: p.author?.displayName?.trim() || p.author?.handle || "unknown",
-        authorHandle: p.author?.handle,
-        authorAvatar: p.author?.avatar ?? undefined,
-        post: p,
-      }));
-    return [...nostrMedia, ...bskyMedia].sort((a, b) => b.unified.timestamp - a.unified.timestamp);
-  }, [nostrFeedNotes, blueskyPublicPosts, nostrProfiles]);
-
   /** Hacker News items normalized to UnifiedItem and filtered by the active topic. */
   const visibleTechNews = useMemo(() => {
     const t = activeSocialTopic.trim().toLowerCase();
@@ -7256,7 +7215,6 @@ Rules:
   async function loadReelsFeed() {
     if (reelsLoading) return;
     setReelsLoading(true);
-    setReelsError("");
 
     // 1. Instant render from the local store (no network round-trip).
     if (useVideoLocalStore) {
@@ -7269,22 +7227,20 @@ Rules:
     }
 
     // 2. Network refresh — always runs so the list stays fresh. Upserts back
-    //    into the local store for the next tab-open.
+    //    into the local store for the next feed-open. This is now a background
+    //    loader for the unified Feed's inline videos + tap-to-fullscreen overlay
+    //    (no dedicated tab), so failures are silent — the Feed surfaces its own
+    //    errors and the overlay falls back to the tapped post alone.
     try {
       const posts = await fetchBlueskyReelsFeed({ limit: 50 });
-      if (posts.length === 0) {
-        setReelsError("No videos found right now. Pull to refresh.");
-      }
       setReelsPosts(posts);
       if (useVideoLocalStore && posts.length > 0) {
         void videoUpsertBluesky(posts);
       }
-    } catch (e) {
+    } catch {
       // Keep the cached posts on screen if we have them; only clear on a cold
       // failure (no cache + network error).
       if (reelsPosts.length === 0) setReelsPosts([]);
-      const msg = e instanceof Error ? e.message : String(e);
-      setReelsError(`Couldn't load Bluesky videos: ${msg.slice(0, 120)}`);
     } finally {
       setReelsLoading(false);
     }
@@ -8841,9 +8797,11 @@ Rules:
     }
   }, [mobileTab, feedView]);
 
-  // Auto-load Reels when the Reels tab is shown and empty.
+  // Load Bluesky video posts when the Feed tab opens, so the inline videos and
+  // the tap-to-fullscreen overlay have content to show. (The dedicated Reels tab
+  // was removed; video now lives in the unified Feed.)
   useEffect(() => {
-    if (mobileTab === "reels" && reelsPosts.length === 0 && !reelsLoading) {
+    if (mobileTab === "feed" && reelsPosts.length === 0 && !reelsLoading) {
       void loadReelsFeed();
     }
   }, [mobileTab]);
@@ -10577,114 +10535,6 @@ Rules:
                       )
                     )}
                   </>
-                )}
-              </div>
-            </div>
-            </PullToRefresh>
-          </ViewErrorBoundary>
-        ) : null}
-
-        {mobileTab === "reels" ? (
-          <ViewErrorBoundary title="Reels">
-            {/* Loading / error / empty states render in the normal page flow. */}
-            {reelsLoading && reelsPosts.length === 0 ? (
-              <div className="stack"><div className="feed-tab-container" style={{ padding: '2rem', textAlign: 'center' }}>
-                <span className="btn-spinner" aria-hidden />
-                <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Gathering videos…</p>
-              </div></div>
-            ) : reelsError ? (
-              <div className="stack"><div className="feed-tab-container">
-                <div className="feed-empty-filtered">
-                  <p className="text-sm muted" style={{ margin: 0 }}>{reelsError}</p>
-                  <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadReelsFeed()}>Retry</button>
-                </div>
-              </div></div>
-            ) : reelsPosts.length === 0 ? (
-              <PullToRefresh onRefresh={withRefreshToast("Reels updated", () => loadReelsFeed())} enabled={!reelsLoading}>
-                <div className="stack"><div className="feed-tab-container">
-                  <div className="feed-create-hero">
-                    <div className="feed-create-hero-icon">🎬</div>
-                    <h3>No videos yet</h3>
-                    <p className="text-sm muted">Pull down to gather videos from Bluesky. Videos are assembled by merging several visual topics.</p>
-                  </div>
-                </div></div>
-              </PullToRefresh>
-            ) : (
-              // Fullscreen TikTok-style snap feed. Its own scroll container so
-              // scroll-snap locks each 100dvh tile; PullToRefresh anchors to it
-              // via scrollContainerRef so pull-to-refresh still works at the top.
-              <PullToRefresh onRefresh={withRefreshToast("Reels updated", () => loadReelsFeed())} enabled={!reelsLoading} scrollContainerRef={reelsScrollRef}>
-                <div
-                  className="reels-feed"
-                  ref={reelsScrollRef}
-                  tabIndex={0}
-                  role="region"
-                  aria-label="Reels feed"
-                  onKeyDown={(e) => {
-                    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
-                    e.preventDefault();
-                    const root = reelsScrollRef.current;
-                    if (!root) return;
-                    const tiles = Array.from(root.querySelectorAll<HTMLElement>(".reels-tile"));
-                    if (!tiles.length) return;
-                    const tileH = root.clientHeight;
-                    const idx = Math.round(root.scrollTop / tileH);
-                    const next = e.key === "ArrowDown" ? Math.min(tiles.length - 1, idx + 1) : Math.max(0, idx - 1);
-                    tiles[next]?.scrollIntoView({ behavior: "smooth" });
-                  }}
-                >
-                  {reelsPosts.slice(0, 40).map((post) => (
-                    <ReelsPlayer
-                      key={post.uri}
-                      post={post}
-                      active
-                      muted={reelsMuted}
-                      onToggleMute={() => setReelsMuted((m) => !m)}
-                    />
-                  ))}
-                </div>
-              </PullToRefresh>
-            )}
-          </ViewErrorBoundary>
-        ) : null}
-
-        {mobileTab === "media" ? (
-          <ViewErrorBoundary title="Media">
-              <PullToRefresh onRefresh={withRefreshToast("Media updated", () => loadSocialFeed())} enabled={!(nostrFeedLoading || blueskyPublicLoading)}>
-            <div className="stack">
-              <div className="feed-tab-container">
-                <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
-                  <h2>Media</h2>
-                  <span className="text-sm muted">{socialSource === "bluesky" ? "Bluesky" : "Nostr"} · {mediaGalleryItems.length}</span>
-                </div>
-                <div className="social-section-label">Images & videos from {socialSource === "bluesky" ? "Bluesky" : "Nostr"}</div>
-
-                {(nostrFeedLoading || blueskyPublicLoading) && mediaGalleryItems.length === 0 ? (
-                  <div style={{ padding: '2rem', textAlign: 'center' }}>
-                    <span className="btn-spinner" aria-hidden />
-                    <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Loading media…</p>
-                  </div>
-                ) : mediaGalleryItems.length === 0 ? (
-                  <div className="feed-create-hero">
-                    <div className="feed-create-hero-icon">🖼️</div>
-                    <h3>No media yet</h3>
-                    <p className="text-sm muted">Load a Feed channel first — image and video posts from {socialSource === "bluesky" ? "Bluesky" : "Nostr"} will collect here. Try the “art” or “photography” channel.</p>
-                    <button type="button" className="primary" onClick={() => { setMobileTab("feed"); void loadSocialFeed(); }}>Open Feed</button>
-                  </div>
-                ) : (
-                  <div className="media-grid">
-                    {mediaGalleryItems.slice(0, 60).map((item) => (
-                      <MediaTile
-                        key={item.unified.id}
-                        unified={item.unified}
-                        authorName={item.authorName}
-                        authorHandle={item.authorHandle}
-                        authorAvatar={item.authorAvatar}
-                        platform={item.unified.sourcePlatform}
-                        body={item.unified.content.body}
-                      />
-                    ))}
-                  </div>
                 )}
               </div>
             </div>
