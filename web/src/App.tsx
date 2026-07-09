@@ -1643,7 +1643,6 @@ function App() {
   const [blueskyReplyExpanded, setBlueskyReplyExpanded] = useState<Set<string>>(new Set());
 
   // World feed sub-tabs & Me feed sub-tabs
-  const [worldFeedTab, setWorldFeedTab] = useState<"tweets" | "articles" | "videos">("tweets");
   const [videoFallbackItems, setVideoFallbackItems] = useState<any[]>([]);
   const [videoFallbackLoading, setVideoFallbackLoading] = useState(false);
   const [meFeedTab, setMeFeedTab] = useState<"drafts" | "published">("drafts");
@@ -9247,73 +9246,6 @@ Rules:
     </>
   );
 
-  const isWorldNostrItem = (item: PersonalizedFeedItem) =>
-    item.sourceType === "web" && item.webPreview?.provider === "Nostr";
-
-  const isWorldVideoItem = (item: PersonalizedFeedItem) => {
-    if (item.sourceType === "bluesky") {
-      const embed = (item.feedItem as any)?.post?.embed;
-      return (
-        embed?.$type === "app.bsky.embed.video#view" ||
-        (embed?.$type === "app.bsky.embed.recordWithMedia#view" &&
-          embed?.media?.$type === "app.bsky.embed.video#view")
-      );
-    }
-    if (isWorldNostrItem(item)) {
-      const preview = item.webPreview;
-      const candidateText = [
-        preview?.contentText || "",
-        preview?.description || "",
-        preview?.title || "",
-        preview?.url || "",
-      ].join("\n");
-      return hasInlineVideoUrl(candidateText);
-    }
-    return false;
-  };
-
-  const worldTweetItems = blueskyFeedItems.filter(
-    (item) => !isWorldVideoItem(item) && (item.sourceType === "bluesky" || isWorldNostrItem(item))
-  );
-  const worldArticleItems = blueskyFeedItems.filter(
-    (item) => item.sourceType === "web" && item.webPreview && !isWorldNostrItem(item) && !isWorldVideoItem(item)
-  );
-  const worldVideoItems = blueskyFeedItems.filter(isWorldVideoItem);
-
-  const worldFeedNewPostsBanner =
-    feedNewPostsBanner && pendingFeedItemsRef.current ? (
-      <button
-        type="button"
-        className="feed-new-posts-banner"
-        onClick={() => {
-          const pending = pendingFeedItemsRef.current;
-          if (pending) {
-            setBlueskyFeedItems(pending.items);
-            setBlueskyFeedSnapshot(pending);
-            setBlueskyProfileStats(pending.profileStats);
-            setFeedGeneration(pending.generation);
-            pendingFeedItemsRef.current = null;
-            setFeedNewPostsBanner(false);
-          }
-        }}
-        style={{
-          width: "100%",
-          padding: "0.55rem 1rem",
-          border: "1px solid var(--accent, #4a9eff)",
-          borderRadius: "8px",
-          backgroundColor: "var(--accent-bg, #e8f0fe)",
-          color: "var(--accent, #4a9eff)",
-          cursor: "pointer",
-          textAlign: "center",
-          fontSize: "0.85rem",
-          fontWeight: 500,
-          marginBottom: "0.5rem",
-        }}
-      >
-        New posts found — tap to load
-      </button>
-    ) : null;
-
   const renderWorldVideoFallbackItem = (vItem: any, vi: number) => {
     if (vItem.source === "bluesky" && vItem.post) {
       const post = vItem.post;
@@ -9740,37 +9672,6 @@ Rules:
           </div>
         ) : null}
       </div>
-    );
-  };
-
-  const renderWorldFeedItems = () => {
-    if (worldFeedTab === "videos") {
-      if (worldVideoItems.length > 0) {
-        return worldVideoItems.map((item, idx) =>
-          item.sourceType === "bluesky" ? renderWorldBlueskyItem(item, idx) : renderWorldWebItem(item, idx)
-        );
-      }
-      if (videoFallbackLoading) {
-        return <p className="text-center muted" style={{ padding: "1.5rem" }}>Loading videos...</p>;
-      }
-      if (videoFallbackItems.length === 0) {
-        return <p className="text-center muted" style={{ padding: "1.5rem" }}>No video posts found yet. Try refreshing.</p>;
-      }
-      return videoFallbackItems.map(renderWorldVideoFallbackItem);
-    }
-
-    const selectedItems = worldFeedTab === "articles" ? worldArticleItems : worldTweetItems;
-    if (selectedItems.length === 0) {
-      return (
-        <p className="text-center muted" style={{ padding: "1.5rem" }}>
-          {worldFeedTab === "articles"
-            ? "No long-form articles found yet."
-            : "No Bluesky or Nostr posts found yet."}
-        </p>
-      );
-    }
-    return selectedItems.map((item, idx) =>
-      item.sourceType === "bluesky" ? renderWorldBlueskyItem(item, idx) : renderWorldWebItem(item, idx)
     );
   };
 
