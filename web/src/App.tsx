@@ -457,6 +457,10 @@ const LOCAL_JOURNAL_PATH_PREFIX = "journal://";
 const UI_THEME_STORAGE_KEY = "slowclaw.ui.theme";
 const UI_TAB_STORAGE_KEY = "slowclaw.ui.tab";
 const AI_METAL_MODE_KEY = "slowclaw.settings.metalMode";
+// First-run capture-first onboarding: a one-time welcome overlay that routes
+// new users to the Journal composer (not the empty Feed). Once seen, the user
+// is considered onboarded and their tab choice wins thereafter.
+const ONBOARDING_SEEN_KEY = "slowclaw.onboarding.seen";
 
 const DESKTOP_SECRET_SERVICE = "social.slowclaw.gateway";
 const PROVIDER_API_KEY_SECRET_ACCOUNT = "provider.api_key";
@@ -471,6 +475,15 @@ const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.Q
 
 type MobileTab = "feed" | "reels" | "media" | "reads" | "journal" | "queue" | "profile";
 const TAB_ORDER: MobileTab[] = ["feed", "reels", "media", "reads", "journal", "queue", "profile"];
+// Rotating seed prompts shown above the composer during first-run onboarding.
+// Indexed by the day-of-month so a returning first-time user sees variety.
+const FIRST_ENTRY_PROMPTS = [
+  "What made today different?",
+  "Something you're figuring out right now…",
+  "A moment worth keeping.",
+  "What's been on your mind lately?",
+  "One small thing that went well.",
+];
 type ThemeMode = "light" | "dark";
 type DesktopGatewayBootstrap = {
   token?: string | null;
@@ -496,11 +509,8 @@ function defaultThemeMode(): ThemeMode {
 }
 
 function defaultMobileTab(): MobileTab {
-  // Social-first: the Feed is the landing surface on every form factor. A
-  // persisted tab choice still wins once the user picks one.
-  const fallback = "feed";
   if (typeof window === "undefined") {
-    return fallback;
+    return "feed";
   }
   const saved = window.localStorage.getItem(UI_TAB_STORAGE_KEY);
   // Migration: fold removed tabs into their successors.
@@ -515,7 +525,16 @@ function defaultMobileTab(): MobileTab {
   if (saved === "feed" || saved === "reels" || saved === "media" || saved === "reads" || saved === "journal" || saved === "queue" || saved === "profile") {
     return saved;
   }
-  return fallback;
+  // Capture-first onboarding: a brand-new user (no saved tab, onboarding not
+  // yet seen) lands on the Journal composer. The Feed is non-functional until
+  // the first entry seeds an interest profile, so it makes a poor landing
+  // surface. Once the welcome overlay has been seen (dismissed) the user is
+  // routed to the Feed like a returning user.
+  const onboardingSeen = window.localStorage.getItem(ONBOARDING_SEEN_KEY);
+  if (!onboardingSeen) {
+    return "journal";
+  }
+  return "feed";
 }
 
 function useIsLargeScreen() {
@@ -1557,6 +1576,28 @@ function App() {
   );
   const [editingInterestId, setEditingInterestId] = useState<string | null>(null);
   const [editingInterestKeywords, setEditingInterestKeywords] = useState("");
+  // First-run onboarding: a one-time welcome overlay + the post-entry reveal
+  // of the interests the on-device AI extracted from the user's first journal.
+  const [showWelcome, setShowWelcome] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    if (window.localStorage.getItem(ONBOARDING_SEEN_KEY)) return false;
+    // Returning users (a saved tab choice or the legacy welcome-seed flag) are
+    // already onboarded — mark them seen and never show the overlay.
+    const hasSavedTab = Boolean(window.localStorage.getItem(UI_TAB_STORAGE_KEY));
+    const legacySeed = window.localStorage.getItem("slowclaw_welcome_seeded");
+    if (hasSavedTab || legacySeed) {
+      window.localStorage.setItem(ONBOARDING_SEEN_KEY, "1");
+      return false;
+    }
+    return true;
+  });
+  // Transient: warms up the composer copy right after the welcome CTA.
+  const [showFirstEntryPrompt, setShowFirstEntryPrompt] = useState(false);
+  // The most recently extracted interests (for the inline reveal card) and the
+  // journal id they came from (so chip removals can be persisted back).
+  const [lastExtractedInterests, setLastExtractedInterests] = useState<string[]>([]);
+  const [lastInterestJournalId, setLastInterestJournalId] = useState<string | null>(null);
+  const [dismissedInterestReveal, setDismissedInterestReveal] = useState(false);
   const [blueskyProfileStats, setBlueskyProfileStats] = useState<InterestProfileStats>({
     interestCount: 0,
     sourceCount: 0,
@@ -2612,6 +2653,12 @@ Rules:
           holdJournalStatus(
             `Added ${interestKeywords.length} interest${interestKeywords.length > 1 ? "s" : ""} to feed`,
           );
+          // Surface the magic: reveal the extracted keywords inline so the user
+          // can see — and correct — what the on-device AI inferred from their
+          // writing. Drives the interest-reveal card in the Journal tab.
+          setLastExtractedInterests(interestKeywords);
+          setLastInterestJournalId(localId);
+          setDismissedInterestReveal(false);
         }
       } catch (error) {
         // Interest extraction failed — surface the real reason instead of
@@ -2627,6 +2674,7 @@ Rules:
       markJournalProcessed(currentPath);
     }
     setIsWritingNote(false);
+    setShowFirstEntryPrompt(false);
     await refreshLibrary("journal");
   }
 
@@ -5570,6 +5618,65 @@ Rules:
       setVideoFallbackItems(fresh.length > 0 ? fresh : results);
       setVideoFallbackLoading(false);
     }
+  }
+
+  // ── First-run onboarding handlers ─────────────────────────────────────────
+  // dismissWelcome closes the one-time overlay. When goToJournal is true (the
+  // primary CTA), it routes the user into the Journal composer with warm copy.
+  function dismissWelcome(goToJournal: boolean) {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(ONBOARDING_SEEN_KEY, "1");
+    }
+    setShowWelcome(false);
+    if (goToJournal) {
+      setMobileTab("journal");
+      setShowFirstEntryPrompt(true);
+    } else if (mobileTab === "journal") {
+      // They dismissed while already on the Journal tab (the capture-first
+      // default): still warm the composer copy so the first run feels guided.
+      setShowFirstEntryPrompt(true);
+    }
+  }
+
+  // removeRevealedInterest drops one chip from the inline reveal card and
+  // persists the trimmed keyword set back to the journal's triage keywords,
+  // then refreshes the world-feed interest profile. Non-fatal on failure.
+  //
+  // v1 edge case (noted, accepted): removing *every* keyword leaves the source
+  // with no triage keywords, so the feed's heuristic text extractor will
+  // refill the profile from the raw journal text on the next rebuild. The
+  // common case — removing one or two of several — persists correctly.
+  async function removeRevealedInterest(keyword: string) {
+    const journalId = lastInterestJournalId;
+    if (!journalId) return;
+    const remaining = lastExtractedInterests.filter((k) => k !== keyword);
+    setLastExtractedInterests(remaining);
+    if (remaining.length === 0) {
+      setDismissedInterestReveal(true);
+    }
+    try {
+      // Fresh hash defeats the feed's profile_input_hash cache short-circuit so
+      // the trimmed keywords take effect on the next feed load.
+      const hash = String(
+        remaining.join(",").split("").reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7),
+      );
+      await saveJournalInterestKeywords(journalId, remaining, hash);
+      await loadWorldFeedInterests();
+    } catch {
+      // Non-fatal: the chip is already removed from the UI; the persisted
+      // keyword set will reconcile on the next journal save.
+    }
+  }
+
+  // seePersonalizedFeed dismisses the reveal and jumps to the Feed. Nostr works
+  // account-free and is interest-matchable, so it gives the best shot at a
+  // populated, personalized first Feed even before the user links Bluesky.
+  function seePersonalizedFeed() {
+    setDismissedInterestReveal(true);
+    setShowFirstEntryPrompt(false);
+    setMobileTab("feed");
+    setSocialSource("nostr");
+    void loadNostrFeed();
   }
 
   async function loadWorldFeedInterests() {
@@ -8696,30 +8803,6 @@ Rules:
     void refreshLibrary("all");
   }, [chatGatewayToken, gatewayBaseUrl]);
 
-  // Seed a welcome journal entry on first launch
-  useEffect(() => {
-    const SEED_KEY = "slowclaw_welcome_seeded";
-    if (window.localStorage.getItem(SEED_KEY)) return;
-    const seed = async () => {
-      try {
-        const journals = await listJournals(1, 0);
-        if (journals.length > 0) {
-          window.localStorage.setItem(SEED_KEY, "1");
-          return;
-        }
-        await saveJournalText(
-          "What is SlowClaw",
-          `SlowClaw is a private, phone-first journaling app that runs AI entirely on your device.\n\nCapture thoughts as text or voice memos, and let a compact on-device language model turn them into tweet-ready posts, task lists, and weekly insights — all without your data ever leaving your phone.\n\nKey ideas:\n- Journal privately in text or audio\n- On-device AI transforms notes into social posts\n- No cloud required — your words stay yours\n- Publish to Bluesky, Nostr, or keep it personal\n- Built with Rust + Tauri for speed and tiny footprint\n\nSlowClaw is for people who think before they post.`
-        );
-        window.localStorage.setItem(SEED_KEY, "1");
-        void refreshLibrary("journal");
-      } catch {
-        // Seeding is best-effort; don't block the app
-      }
-    };
-    void seed();
-  }, []);
-
   useEffect(() => {
     void refreshPostHistory();
   }, [chatGatewayToken, gatewayBaseUrl]);
@@ -10027,6 +10110,11 @@ Rules:
                         </button>
                       </div>
                     )}
+                  {showFirstEntryPrompt && !journalDraftText.trim() ? (
+                    <div className="first-entry-prompt" aria-hidden={Boolean(journalDraftText.trim())}>
+                      {FIRST_ENTRY_PROMPTS[new Date().getDate() % FIRST_ENTRY_PROMPTS.length]}
+                    </div>
+                  ) : null}
                   <textarea
                     className="journal-textarea-autoexpand"
                     value={journalDraftText}
@@ -10046,10 +10134,41 @@ Rules:
                       el.style.height = "auto";
                       el.style.height = el.scrollHeight + "px";
                     }}
-                    placeholder="Write your thoughts..."
+                    placeholder={showFirstEntryPrompt ? "What's on your mind today?" : "Write your thoughts..."}
                   />
                 </div>
               )}
+
+              {/* Interest reveal: shows what the on-device AI inferred from the
+                  just-saved entry, with removable chips + a jump to the Feed. */}
+              {!isCaptureZenMode && lastExtractedInterests.length > 0 && !dismissedInterestReveal ? (
+                <div className="card interest-reveal-card">
+                  <div className="interest-reveal-header">
+                    <span className="interest-reveal-icon" aria-hidden>✨</span>
+                    <div>
+                      <h3 style={{ margin: 0, fontSize: '1rem' }}>Tuned your feed from this entry</h3>
+                      <p className="text-sm muted" style={{ margin: '0.15rem 0 0' }}>Tap ✕ to remove one, or see your personalized feed.</p>
+                    </div>
+                  </div>
+                  <div className="topic-chips interest-reveal-chips">
+                    {lastExtractedInterests.map((keyword) => (
+                      <button
+                        key={keyword}
+                        type="button"
+                        className="topic-chip interest-reveal-chip"
+                        onClick={() => void removeRevealedInterest(keyword)}
+                        title={`Remove "${keyword}"`}
+                      >
+                        {keyword} <span className="interest-reveal-x" aria-hidden>✕</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="row" style={{ marginTop: '0.75rem', gap: '0.5rem' }}>
+                    <button type="button" className="primary" onClick={() => seePersonalizedFeed()}>See your feed →</button>
+                    <button type="button" className="ghost text-sm" onClick={() => setDismissedInterestReveal(true)}>Dismiss</button>
+                  </div>
+                </div>
+              ) : null}
 
               </div>
             </div>
@@ -10267,6 +10386,7 @@ Rules:
                           <h3>Follow people to build your timeline</h3>
                           <p className="text-sm muted">Tap any author's name in the Nostr or Bluesky feeds, then Follow. Their newest posts will appear here — your home timeline, across both protocols.</p>
                           <button type="button" className="primary" onClick={() => { setSocialSource("nostr"); setActiveChannelId(""); }}>Discover on Nostr</button>
+                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => setMobileTab("journal")}>✍️ Write a journal entry</button>
                         </div>
                       ) : followingItems.length === 0 ? (
                         <div className="feed-empty-filtered">
@@ -11089,6 +11209,22 @@ Rules:
           productivityBadgeCount={openTodos.length + todayEventItems.length + upcomingEventItems.length}
         />
       )}
+      {/* First-run welcome overlay: capture-first onboarding */}
+      {showWelcome ? (
+        <div className="modal-overlay">
+          <div className="modal-dialog welcome-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="welcome-icon" aria-hidden>✍️</div>
+            <h3 style={{ margin: '0 0 0.5rem', textAlign: 'center' }}>Welcome to SlowClaw</h3>
+            <p className="text-sm" style={{ margin: '0 0 1.25rem', textAlign: 'center', color: 'var(--muted)' }}>
+              We learn what you care about from <strong style={{ color: 'var(--text)' }}>what you write</strong> — not from a list of checkboxes. Write one entry and watch your feed tune itself to your actual interests.
+            </p>
+            <div className="stack" style={{ gap: '0.5rem' }}>
+              <button type="button" className="primary" onClick={() => dismissWelcome(true)}>Write your first entry →</button>
+              <button type="button" className="ghost text-sm" onClick={() => dismissWelcome(false)}>Maybe later</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {/* Nostr post confirm dialog */}
       {nostrPostConfirmStep === "confirm" && nostrPostConfirmPost && (
         <div className="modal-overlay" onClick={() => { setNostrPostConfirmPost(null); setNostrPostConfirmStep(null); }}>
