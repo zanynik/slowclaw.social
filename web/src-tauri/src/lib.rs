@@ -2438,12 +2438,23 @@ async fn configure_native_local_ai(
 /// Clear the configured native local AI model: remove the persisted config
 /// (`state/native_local_ai.json`), reset the in-memory status to the
 /// unconfigured default, drop any loaded model from memory, and unset the
-/// provider env vars. The caller (frontend) is responsible for deleting the
-/// GGUF file separately. Returns the refreshed status so the UI can update.
+/// provider env vars. Does NOT delete the GGUF file — call
+/// [`delete_local_model`] for that. Returns the refreshed status so the UI
+/// can update.
 #[tauri::command]
 async fn clear_native_local_ai(
     state: tauri::State<'_, NativeLocalAiState>,
     gateway_state: tauri::State<'_, GatewayState>,
+) -> Result<NativeLocalAiStatus, String> {
+    clear_native_local_ai_impl(state.inner.clone(), gateway_state.inner.clone()).await
+}
+
+/// Shared implementation of "clear the active native local AI model". Takes the
+/// inner `Arc` clones directly so it can be reused by [`delete_local_model`]
+/// without constructing a `tauri::State`.
+async fn clear_native_local_ai_impl(
+    native_state: Arc<Mutex<NativeLocalAiRuntimeState>>,
+    gateway_state: Arc<Mutex<GatewayRuntimeState>>,
 ) -> Result<NativeLocalAiStatus, String> {
     let config = load_workspace_config_for_ui("native local AI clear config load failed").await?;
 
@@ -2465,11 +2476,88 @@ async fn clear_native_local_ai(
     // 4. Reset the in-memory status to the unconfigured default.
     let status = default_native_local_ai_status();
     {
-        let mut guard = lock_native_local_ai_state(&state.inner)?;
+        let mut guard = lock_native_local_ai_state(&native_state)?;
         guard.status = status.clone();
     }
 
-    let _ = restart_embedded_gateway(gateway_state.inner.clone()).await;
+    let _ = restart_embedded_gateway(gateway_state).await;
+    Ok(status)
+}
+
+/// Delete an on-device model: unloads it from memory if active, clears the
+/// persisted native local AI config if this model is the configured one, then
+/// removes the GGUF file from disk. Missing file is not an error. Returns the
+/// refreshed status so the UI can update without a separate gateway poll.
+///
+/// This is the delete path for the Settings "Delete Model" button. It does the
+/// file removal server-side via `std::fs` (not the `tauri-plugin-fs` frontend
+/// path, which requires a separately-registered plugin + permission scope).
+#[tauri::command]
+async fn delete_local_model(
+    model_id: String,
+    state: tauri::State<'_, NativeLocalAiState>,
+    gateway_state: tauri::State<'_, GatewayState>,
+) -> Result<NativeLocalAiStatus, String> {
+    use zeroclaw::gateway::handlers::model::{
+        find_local_model_spec, local_model_file_path, safe_local_model_dir_name,
+    };
+    let config =
+        load_workspace_config_for_ui("native local AI delete model config load failed").await?;
+
+    // Resolve the GGUF path. Catalog models resolve via their spec; any other
+    // id (sideloaded) falls back to the sanitized-dir convention so deletion
+    // still works for non-catalog entries. We don't know the exact file_name
+    // for sideloaded ids, so for those we delete the whole model dir instead.
+    let workspace_dir = &config.workspace_dir;
+    let (file_target, dir_target): (Option<PathBuf>, Option<PathBuf>) =
+        match find_local_model_spec(&model_id) {
+            Some(spec) => (Some(local_model_file_path(workspace_dir, spec)), None),
+            None => {
+                // Sideloaded/unknown id: target its sanitized directory.
+                let dir = workspace_dir
+                    .join("local-models/llamacpp")
+                    .join(safe_local_model_dir_name(&model_id));
+                (None, Some(dir))
+            }
+        };
+
+    // 1. If this model is the active config, unload it from memory and clear
+    //    the config so we never leave a stale path pointing at a deleted file.
+    let active_status = snapshot_native_local_ai_status(&state.inner)?;
+    let was_active = active_status.model_id.as_deref() == Some(model_id.as_str());
+    let status = if was_active {
+        clear_native_local_ai_impl(state.inner.clone(), gateway_state.inner.clone()).await?
+    } else {
+        // Still unload any loaded model to be safe (no-op if a different model
+        // or none is loaded), so the OS file handle is released before unlink.
+        let _ = tauri::async_runtime::spawn_blocking(inference::unload_model)
+            .await
+            .map_err(|e| format!("Model unload task failed: {e}"));
+        active_status
+    };
+
+    // 2. Remove the GGUF file (or the model dir for sideloaded ids).
+    if let Some(path) = &file_target {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Already gone — not an error. Config was cleared above.
+            }
+            Err(e) => {
+                return Err(format!("Failed to remove model file: {e}"));
+            }
+        }
+    }
+    if let Some(dir) = &dir_target {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!("Failed to remove model directory: {e}"));
+            }
+        }
+    }
+
     Ok(status)
 }
 
@@ -3123,6 +3211,7 @@ pub fn run() {
             native_ai_chat,
             native_ai_engine_status,
             clear_native_local_ai,
+            delete_local_model,
             set_metal_mode,
             transcribe_audio,
             transcribe_journal_media,

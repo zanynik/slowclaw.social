@@ -114,6 +114,7 @@ import {
   nativeAiChat,
   nativeAiEngineStatus,
   clearNativeLocalAi,
+  deleteLocalModel,
   transcribeAudio,
   transcribeJournalMediaNative,
   readJournalMediaBytes,
@@ -11034,27 +11035,14 @@ Rules:
                             if (!confirm(`Delete ${model.title}? The file will be removed and the model deselected.`)) return;
                             setLocalModelBusyId(model.id);
                             try {
-                              // 1. If this model is the active config, clear the native AI
-                              //    config first (unloads it from memory, deletes native_local_ai.json,
-                              //    resets status). Otherwise the deleted file would leave a stale path.
-                              if (isConfigured) {
-                                try {
-                                  const refreshed = await clearNativeLocalAi();
-                                  setNativeLocalAiStatus(refreshed);
-                                } catch (err) {
-                                  setLocalModelsStatus(`Failed to clear model config: ${err instanceof Error ? err.message : String(err)}`);
-                                  return;
-                                }
-                              }
-                              // 2. Remove the GGUF file from disk.
-                              try {
-                                const { remove } = await import("@tauri-apps/plugin-fs");
-                                if (model.path) await remove(model.path);
-                              } catch (err) {
-                                // File may already be gone (e.g. container UUID changed);
-                                // config was already cleared above, so treat as non-fatal.
-                                console.warn("Model file removal skipped:", err);
-                              }
+                              // deleteLocalModel unloads the model from memory if
+                              // active, clears the config if it's the configured one,
+                              // and removes the GGUF file from disk — all server-side,
+                              // so it works without the fs plugin or an fs permission
+                              // scope (the previous frontend `plugin-fs` path silently
+                              // no-op'd because that plugin isn't registered here).
+                              const refreshed = await deleteLocalModel(model.id);
+                              setNativeLocalAiStatus(refreshed);
                               await loadLocalModels();
                             } catch (err) {
                               setLocalModelsStatus(`Delete failed: ${err instanceof Error ? err.message : String(err)}`);

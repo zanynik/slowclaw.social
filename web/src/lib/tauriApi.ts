@@ -316,6 +316,17 @@ export async function clearNativeLocalAi(): Promise<NativeLocalAiStatus> {
   return invoke("clear_native_local_ai");
 }
 
+/**
+ * Delete an on-device model: unloads it from memory if active, clears the
+ * persisted config if it is the configured model, and removes the GGUF file
+ * from disk. Returns the refreshed status. Performs the file removal via a
+ * Rust command (not the frontend fs plugin) so it works without registering
+ * `tauri-plugin-fs` or granting an fs permission scope.
+ */
+export async function deleteLocalModel(modelId: string): Promise<NativeLocalAiStatus> {
+  return invoke("delete_local_model", { modelId });
+}
+
 export async function nativeAiChat(
   prompt: string,
   systemPrompt?: string,
