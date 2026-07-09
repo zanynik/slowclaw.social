@@ -81,6 +81,12 @@ import { getFollowedIds, onFollowsChange, toggleFollow, nostrFollowKey, blueskyF
 import { loadFollowingFeed, type FollowingFeedItem } from "./lib/followingFeed";
 // ── Reads ranking + read-time (Google News / Substack-style "For You") ──────
 import { rankReads, chronologicalReads, type RankedRead } from "./lib/readsRanking";
+import {
+  loadCachedWoTSet,
+  refreshWoTSet,
+  onWoTChange,
+  sortByWoTFirst,
+} from "./lib/wot";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
   saveJournalText,
@@ -1653,6 +1659,11 @@ function App() {
   const [nostrKeysBusy, setNostrKeysBusy] = useState(false);
   const [nostrFeedNotes, setNostrFeedNotes] = useState<NostrNote[]>([]);
   const [nostrFeedLoading, setNostrFeedLoading] = useState(false);
+  // Web-of-Trust trusted-pubkey set for ranking the Nostr feed. Initialized
+  // synchronously from the localStorage cache so the first paint already
+  // tier-orders the feed; the background effect refreshes it from relays.
+  // Empty set (no graph / cold start) leaves the chronological feed unchanged.
+  const [wotSet, setWotSet] = useState<Set<string>>(() => loadCachedWoTSet() ?? new Set<string>());
   // Enrichment state for a richer Nostr feed/profile: profile metadata (kind 0),
   // reaction counts (kind 7), resolved parent notes (for reply context), and
   // expandable reply threads. Each keyed by pubkey / event id.
@@ -1840,6 +1851,35 @@ function App() {
     }
     return () => { cancelled = true; };
   }, [mobileTab, session?.handle, nostrKeys?.publicKeyHex]);
+
+  // ── Web-of-Trust refresh ──────────────────────────────────────────────────
+  // Build the trusted-pubkey set in the background so the Nostr feed can be
+  // tier-sorted (WoT authors first). Fire-and-forget: never blocks the feed.
+  // The cached set seeds `wotSet` synchronously on mount; this refreshes it
+  // from relays (follow graph + optional cold-start curated seed) and updates
+  // state when a fresh set lands. `onWoTChange` propagates cross-tab refreshes.
+  useEffect(() => {
+    const ownPubkey = nostrKeys?.publicKeyHex;
+    if (!ownPubkey) return;
+    // Journal text feeds the cold-start keyword matching for new users.
+    const journalTexts = journalItems
+      .filter((item) => item.kind === "text" && (item.previewText || "").trim().length > 10)
+      .slice(0, 60)
+      .map((item) => item.previewText || "");
+    let cancelled = false;
+    void refreshWoTSet({ ownPubkey, journalTexts }).then((set) => {
+      if (!cancelled) setWotSet(set);
+    }).catch(() => {
+      // Best-effort: keep the cached set; the feed stays chronological.
+    });
+    const off = onWoTChange(() => {
+      const cached = loadCachedWoTSet();
+      if (cached && cached.size > 0) setWotSet(cached);
+    });
+    return () => { cancelled = true; off(); };
+    // journalItems is intentionally a dep so cold-start keywords refresh when
+    // journals change; refreshWoTSet itself respects a 24h cache window.
+  }, [nostrKeys?.publicKeyHex, journalItems]);
 
   // Publish the local profile (name/bio/avatar) to Nostr as a kind-0 event so
   // the user's relay identity matches what they see in-app.
@@ -6952,15 +6992,23 @@ Rules:
     // subscription), so here we only apply the optional journal-derived topic
     // refinement on top. Empty topic = show everything the channel returned.
     const t = activeSocialTopic.trim().toLowerCase();
-    if (!t) return nostrFeedNotes;
-    return nostrFeedNotes.filter((note) => {
-      const profile = nostrProfiles[note.pubkey];
-      const handle = profile?.name ?? profile?.displayName ?? undefined;
-      const avatar = profile?.picture ?? undefined;
-      const unified = toUnifiedFromNostr(note, handle, avatar);
-      return matchesTopic(unified, t);
+    const afterTopic = t
+      ? nostrFeedNotes.filter((note) => {
+          const profile = nostrProfiles[note.pubkey];
+          const handle = profile?.name ?? profile?.displayName ?? undefined;
+          const avatar = profile?.picture ?? undefined;
+          const unified = toUnifiedFromNostr(note, handle, avatar);
+          return matchesTopic(unified, t);
+        })
+      : nostrFeedNotes;
+    // Web-of-Trust tier sort: trusted authors first, recency within each tier.
+    // An empty wotSet (no graph / cold start) leaves the chronological order
+    // unchanged.
+    return sortByWoTFirst(afterTopic, wotSet, {
+      pubkey: (n) => n.pubkey,
+      createdAt: (n) => n.createdAt,
     });
-  }, [nostrFeedNotes, nostrProfiles, activeSocialTopic]);
+  }, [nostrFeedNotes, nostrProfiles, activeSocialTopic, wotSet]);
 
   /**
    * Bluesky public posts for the text Feed, optionally filtered by the active
