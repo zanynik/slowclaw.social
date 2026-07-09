@@ -4794,6 +4794,111 @@ button.local-ai-preset {
   animation: feed-toast-in 0.18s var(--ease-out);
 }
 
+/* ── Interest profile editor (#4) — steer the curation lens ───────────── */
+.interest-profile-card {
+  display: flex;
+  flex-direction: column;
+  margin: 0.5rem 0.25rem 0;
+  padding: 0.75rem 0.9rem;
+  background: var(--surface, rgba(0, 0, 0, 0.02));
+  border: 1px solid var(--hairline, rgba(0, 0, 0, 0.08));
+  border-radius: 0.85rem;
+}
+.interest-profile-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.interest-profile-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.interest-profile-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink);
+  text-transform: capitalize;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.interest-profile-label.muted {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--muted);
+  opacity: 0.7;
+}
+.interest-profile-tag {
+  font-size: 0.62rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  border: 1px solid var(--hairline, rgba(0, 0, 0, 0.1));
+  border-radius: 999px;
+  padding: 0.05rem 0.4rem;
+}
+.interest-profile-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.interest-pill {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.72rem;
+  font-family: inherit;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--hairline, rgba(0, 0, 0, 0.12));
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.15s var(--ease-out), color 0.15s var(--ease-out), border-color 0.15s var(--ease-out);
+}
+.interest-pill:hover {
+  border-color: var(--muted);
+}
+.interest-pill.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-contrast, #fff);
+}
+.interest-pill.active.danger {
+  background: var(--danger, #d33);
+  border-color: var(--danger, #d33);
+}
+.interest-pill.active.success {
+  background: var(--success, #2a8);
+  border-color: var(--success, #2a8);
+}
+.interest-pill.ghost {
+  border-color: transparent;
+  color: var(--muted);
+}
+.interest-profile-add {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.65rem;
+}
+.interest-profile-input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.82rem;
+  font-family: inherit;
+  color: var(--ink);
+  background: var(--bg, transparent);
+  border: 1px solid var(--hairline, rgba(0, 0, 0, 0.12));
+  border-radius: 0.6rem;
+}
+.interest-profile-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 /* ── New-posts pill (#4) — Twitter/Bluesky "N new posts" banner ──────────── */
 .new-posts-pill {
   position: sticky;

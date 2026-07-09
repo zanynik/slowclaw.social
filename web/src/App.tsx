@@ -78,6 +78,17 @@ import {
 import { getSavedItems, onSavedChange, type SavedItem, isReposted, toggleReposted, getRepostedIds } from "./lib/savedItems";
 // ── Local-first profile (name / bio / avatar) ──────────────────────────────
 import { getProfile, saveProfile, onProfileChange, fileToAvatarDataUrl, setAvatar, type LocalProfile } from "./lib/profile";
+// ── Editable interest profile (steers the journal-is-the-lens signal) ──────
+import {
+  getInterestOverrides,
+  getManualInterests,
+  setInterestMultiplier,
+  removeInterestOverride,
+  addManualInterest,
+  removeManualInterest,
+  onInterestChange,
+  INTEREST_MULT,
+} from "./lib/interestProfile";
 // ── Local-first optimistic follows ─────────────────────────────────────────
 import { getFollowedIds, onFollowsChange, toggleFollow, nostrFollowKey, blueskyFollowKey } from "./lib/follows";
 // ── Following home timeline (merged Nostr + Bluesky) ───────────────────────
@@ -1770,6 +1781,11 @@ function App() {
   const [savedItems, setSavedItems] = useState<SavedItem[]>(() => getSavedItems());
   // Local profile (name / bio / avatar) — persisted to localStorage, mirrored here.
   const [localProfile, setLocalProfile] = useState<LocalProfile | null>(() => getProfile());
+  // Editable interest overrides + manual interests steer the curation lens.
+  // Kept in state so the journalTopics memo recomputes when the user edits them.
+  const [interestOverrides, setInterestOverrides] = useState<Record<string, { multiplier: number }>>(() => getInterestOverrides());
+  const [manualInterests, setManualInterests] = useState<string[]>(() => getManualInterests());
+  const [interestDraft, setInterestDraft] = useState("");
   // Profile content tab: Posted | Drafts | Saved (Twitter/Instagram-style segmented control).
   const [profileContentTab, setProfileContentTab] = useState<"posted" | "drafts" | "saved">("posted");
   // Profile follower/following counts (Bluesky via public AppView, Nostr via kind-3).
@@ -1831,6 +1847,12 @@ function App() {
   useEffect(() => onSavedChange(() => setSavedItems(getSavedItems())), []);
   // Mirror local profile store into state (re-renders Profile on edits).
   useEffect(() => onProfileChange(() => setLocalProfile(getProfile())), []);
+  // Interest overrides / manual interests are local-first; re-sync on edit
+  // (same-tab event) and cross-tab so the lens updates instantly everywhere.
+  useEffect(() => onInterestChange(() => {
+    setInterestOverrides(getInterestOverrides());
+    setManualInterests(getManualInterests());
+  }), []);
   // Mirror the localStorage follows store so the modal + cards re-render on toggle.
   useEffect(() => onFollowsChange(() => setFollowedIds(getFollowedIds())), []);
   // Mirror the reposted store so FeedActionBar re-renders on toggle.
@@ -6985,19 +7007,61 @@ Rules:
    * change. Topics feed the shared `matchesTopic` predicate (lib/socialFeed.ts).
    */
   const journalTopics = useMemo(
-    () => extractJournalTopics(
+    () => {
       // Voice/video journals carry their transcript in `previewText` (the Rust
       // host surfaces the sidecar transcript as `content`), so feed every
       // entry with substantive text into the lens — not just written notes.
       // This makes audio-first capture actually shape the curation signal.
+      const derived = extractJournalTopics(
+        journalItems
+          .filter((item) => (item.previewText || "").trim().length > 10)
+          .slice(0, 60)
+          .map((item) => item.previewText || ""),
+        10,
+      );
+      // Apply editable overrides (mute/boost) so the user can steer the lens.
+      // Mute (multiplier 0) drops a topic entirely; boost raises its weight so
+      // it's prioritized in the Reads/YouTube/Nostr rankers.
+      const adjusted = derived
+        .map((t) => {
+          const mult = interestOverrides[t.label.toLowerCase()]?.multiplier ?? INTEREST_MULT.NORMAL;
+          return { label: t.label, weight: t.weight * mult };
+        })
+        .filter((t) => t.weight > 0);
+      // Merge manual interests the user added by hand (not yet in journals), so
+      // the lens can follow a topic before the user has written about it. A
+      // muted manual interest is dropped here too.
+      const existing = new Set(adjusted.map((t) => t.label.toLowerCase()));
+      const MANUAL_WEIGHT = 3; // comparable to a strong journal-derived topic
+      for (const label of manualInterests) {
+        const key = label.toLowerCase();
+        if (existing.has(key)) continue;
+        const mult = interestOverrides[key]?.multiplier ?? INTEREST_MULT.NORMAL;
+        if (mult <= 0) continue;
+        adjusted.push({ label, weight: MANUAL_WEIGHT * mult });
+      }
+      return adjusted.sort((a, b) => b.weight - a.weight).slice(0, 12);
+    },
+    [journalItems, interestOverrides, manualInterests],
+  );
+
+  /**
+   * Raw journal-derived topic labels (NO overrides applied) — display-only, used
+   * by the Profile interest editor so muted topics stay visible and restorable.
+   * The effective lens is `journalTopics` above (which applies overrides);
+   * these two are intentionally separate.
+   */
+  const derivedTopicLabels = useMemo(
+    () => extractJournalTopics(
       journalItems
         .filter((item) => (item.previewText || "").trim().length > 10)
         .slice(0, 60)
         .map((item) => item.previewText || ""),
-      10,
-    ),
+      12,
+    ).map((t) => t.label),
     [journalItems],
   );
+
 
   /** Nostr notes for the active channel (source-level filter, not client-side). */
   const visibleNostrNotes = useMemo(() => {
@@ -10757,6 +10821,84 @@ Rules:
                   }
                 }}
               />
+
+              {/* Editable interest profile — steer the curation lens. */}
+              {(() => {
+                // Union of journal-derived labels (pre-override) + manual interests,
+                // so muted topics stay visible and restorable.
+                const seen = new Set<string>();
+                const displayTopics: { label: string; manual: boolean }[] = [];
+                for (const label of derivedTopicLabels) {
+                  const key = label.toLowerCase();
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  displayTopics.push({ label, manual: false });
+                }
+                for (const label of manualInterests) {
+                  if (seen.has(label)) continue;
+                  seen.add(label);
+                  displayTopics.push({ label, manual: true });
+                }
+                return (
+                  <div className="interest-profile-card">
+                    <p className="eyebrow">What feeds your mind</p>
+                    <p className="text-sm muted" style={{ marginTop: '0.15rem', marginBottom: '0.6rem' }}>
+                      These topics are mined from your journals and steer your Reads, YouTube, and Nostr feed. Boost what you want more of, mute what you don't.
+                    </p>
+                    {displayTopics.length === 0 ? (
+                      <p className="text-sm muted" style={{ padding: '0.5rem 0' }}>
+                        Nothing here yet. Write or record a journal entry to seed your interests.
+                      </p>
+                    ) : (
+                      <div className="interest-profile-list">
+                        {displayTopics.map(({ label, manual }) => {
+                          const key = label.toLowerCase();
+                          const mult = interestOverrides[key]?.multiplier ?? INTEREST_MULT.NORMAL;
+                          const isMuted = mult === INTEREST_MULT.MUTE;
+                          const isBoosted = mult === INTEREST_MULT.BOOST;
+                          const setState = (next: number) => {
+                            if (next === INTEREST_MULT.NORMAL) removeInterestOverride(label);
+                            else setInterestMultiplier(label, next);
+                          };
+                          return (
+                            <div key={key} className="interest-profile-row">
+                              <span className={`interest-profile-label${isMuted ? " muted" : ""}`}>{label}{manual ? <span className="interest-profile-tag" aria-hidden>added</span> : null}</span>
+                              <div className="interest-profile-controls" role="group" aria-label={`Steer topic ${label}`}>
+                                <button type="button" className={`interest-pill${isMuted ? " active danger" : ""}`} onClick={() => setState(INTEREST_MULT.MUTE)} title="Mute this topic">Mute</button>
+                                <button type="button" className={`interest-pill${!isMuted && !isBoosted ? " active" : ""}`} onClick={() => setState(INTEREST_MULT.NORMAL)} title="Use as-derived weight">Normal</button>
+                                <button type="button" className={`interest-pill${isBoosted ? " active success" : ""}`} onClick={() => setState(INTEREST_MULT.BOOST)} title="Boost this topic">Boost</button>
+                                {manual ? (
+                                  <button type="button" className="interest-pill ghost" onClick={() => removeManualInterest(label)} title="Remove this interest">✕</button>
+                                ) : null}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                    <form
+                      className="interest-profile-add"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        const v = interestDraft.trim();
+                        if (!v) return;
+                        addManualInterest(v);
+                        setInterestDraft("");
+                      }}
+                    >
+                      <input
+                        className="interest-profile-input"
+                        value={interestDraft}
+                        onChange={(e) => setInterestDraft(e.target.value)}
+                        placeholder="Add an interest (e.g. philosophy)…"
+                        aria-label="Add a manual interest"
+                      />
+                      <button type="submit" className="primary" disabled={!interestDraft.trim()}>Add</button>
+                    </form>
+                  </div>
+                );
+              })()}
+
 
               {/* Network follower/following counts (Bluesky via public AppView, Nostr via kind-3).
                   Best-effort — omitted entirely if both lookups fail/are unavailable. */}
