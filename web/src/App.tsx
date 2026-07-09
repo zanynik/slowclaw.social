@@ -2481,8 +2481,12 @@ function App() {
             // Rename failed — non-fatal, continue with processing
           }
         }
-      } catch {
-        // AI title generation failed — non-fatal
+      } catch (error) {
+        // AI title generation failed — surface the real reason. The Rust
+        // native_ai_chat command returns load/inference failures as Err, which
+        // used to be silently swallowed here (the user saw "nothing happened").
+        const detail = error instanceof Error ? error.message : String(error);
+        holdJournalStatus(`AI title failed: ${detail.slice(0, 140)}`, 8000);
       }
     }
 
@@ -2522,8 +2526,10 @@ function App() {
           setPersistedPosts((prev) => { const next = [...newPosts, ...prev]; savePersistedPosts(next); return next; });
           setGeneratePostStatus(`✨ Generated ${posts.length} post${posts.length > 1 ? 's' : ''}`);
         }
-      } catch {
-        // Post generation failed — non-fatal
+      } catch (error) {
+        // Post generation failed — surface the real reason instead of swallowing.
+        const detail = error instanceof Error ? error.message : String(error);
+        setGeneratePostStatus(`Generation failed: ${detail.slice(0, 200)}`);
       } finally {
         setGeneratePostBusy(false);
       }
@@ -2567,8 +2573,10 @@ function App() {
             const next = [...unique, ...prev]; savePersistedTodos(next); return next;
           });
         }
-      } catch {
-        // Task extraction failed — non-fatal
+      } catch (error) {
+        // Task extraction failed — surface the real reason instead of swallowing.
+        const detail = error instanceof Error ? error.message : String(error);
+        setGeneratePostStatus(`Task extraction failed: ${detail.slice(0, 200)}`);
       } finally {
         setExtractingLocalTasks(false);
       }
@@ -2605,8 +2613,12 @@ Rules:
             `Added ${interestKeywords.length} interest${interestKeywords.length > 1 ? "s" : ""} to feed`,
           );
         }
-      } catch {
-        // Interest extraction failed — non-fatal, do not block journal completion
+      } catch (error) {
+        // Interest extraction failed — surface the real reason instead of
+        // swallowing. This is especially important because nativeAiChat can
+        // fail at model load / inference time even when Settings says "ready".
+        const detail = error instanceof Error ? error.message : String(error);
+        holdJournalStatus(`Interests failed: ${detail.slice(0, 140)}`, 8000);
       }
     }
 
