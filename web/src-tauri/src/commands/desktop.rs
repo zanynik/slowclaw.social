@@ -305,8 +305,6 @@ pub(crate) fn generate_mobile_pairing_qr(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn check_ollama_fails_on_mobile_sim() {
         // Simple verification that our conditional compilation logic triggers
@@ -314,9 +312,12 @@ mod tests {
         // should return an error as simulated here.
         #[cfg(mobile)]
         {
-            let res = check_ollama().await;
+            let res = super::check_ollama().await;
             assert!(res.is_err());
-            assert_eq!(res.unwrap_err(), "Ollama integration is only supported on Desktop.");
+            assert_eq!(
+                res.unwrap_err(),
+                "Ollama integration is only supported on Desktop."
+            );
         }
     }
 }

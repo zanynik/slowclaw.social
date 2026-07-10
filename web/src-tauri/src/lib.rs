@@ -2266,7 +2266,7 @@ async fn clear_native_local_ai_impl(
 
     // 1. Unload the model from memory (frees the mmap'd GGUF + KV cache) so
     //    the frontend can safely delete the file without a held lock.
-    tauri::async_runtime::spawn_blocking(|| inference::unload_model())
+    tauri::async_runtime::spawn_blocking(inference::unload_model)
         .await
         .map_err(|e| format!("Model unload task failed: {e}"))?;
 
@@ -2441,11 +2441,10 @@ fn set_metal_mode(enabled: bool) {
     }
     eprintln!("[settings] Metal GPU mode set to: {enabled}");
     // Force model to reload on next inference to pick up the change
-    // (dropping loaded model so it reloads with new gpu_layers)
-    if enabled || !enabled {
-        // Clear loaded model so next call to load_model uses new settings
-        let _ = std::env::set_var("SLOWCLAW_METAL_CHANGED", "1");
-    }
+    // (dropping loaded model so it reloads with new gpu_layers). Toggling
+    // the setting in either direction always warrants a reload, so set the
+    // change flag unconditionally — `load_model` clears it once applied.
+    std::env::set_var("SLOWCLAW_METAL_CHANGED", "1");
 }
 
 #[tauri::command]
@@ -2755,20 +2754,16 @@ async fn lookup_target_event(event_id: &str) -> Result<nostr_sdk::Event, String>
     // Reconstruct a structurally-complete event. Signature correctness is
     // irrelevant here — `EventBuilder::reaction` / `text_note_reply` only read
     // `id`, `pubkey`, `kind`, tags (for coordinate), not the signature.
-    use nostr_sdk::prelude::{EventId, Keys, PublicKey, Signature, Timestamp};
+    use nostr_sdk::prelude::{EventId, PublicKey, Signature, Timestamp};
     use std::str::FromStr;
     let event_id = EventId::from_hex(&note.id).map_err(|e| format!("bad event id: {e}"))?;
     let public_key = PublicKey::from_hex(&note.pubkey).map_err(|e| format!("bad pubkey: {e}"))?;
     let created_at = Timestamp::from_secs(note.created_at.max(0) as u64);
     let kind = nostr_sdk::Kind::from(note.kind as u16);
-    let tags_parsed = nostr_sdk::Tags::parse(
-        note.tags
-            .iter()
-            .map(|t| t.iter().cloned().collect::<Vec<String>>()),
-    )
-    .map_err(|e| format!("bad tags: {e}"))?;
-    // A throwaway key + zero signature — never used for verification here.
-    let dummy_keys = Keys::generate();
+    let tags_parsed = nostr_sdk::Tags::parse(note.tags.iter().map(|t| t.to_vec()))
+        .map_err(|e| format!("bad tags: {e}"))?;
+    // A zero signature — never used for verification here (`EventBuilder`
+    // only reads id/pubkey/kind/tags, not the signature).
     let sig = Signature::from_str(
         "0000000000000000000000000000000000000000000000000000000000000000\
          0000000000000000000000000000000000000000000000000000000000000000",
@@ -2784,11 +2779,6 @@ async fn lookup_target_event(event_id: &str) -> Result<nostr_sdk::Event, String>
         String::new(),
         sig,
     ))
-    .map(|ev| {
-        // Silence unused warning for dummy_keys (kept for clarity).
-        let _ = &dummy_keys;
-        ev
-    })
 }
 
 /// Publish through the ingester's persistent client, then ingest our own event
