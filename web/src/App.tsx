@@ -264,7 +264,6 @@ const SYNC_PEER_GATEWAY_TOKEN_STORAGE_KEY = "slowclaw.sync.peer.gateway_token";
 const CHAT_PROVIDER_STORAGE_KEY = "slowclaw.settings.provider";
 const CHAT_MODEL_STORAGE_KEY = "slowclaw.settings.model";
 const PERSISTED_POSTS_KEY = "slowclaw.generated_posts";
-const PERSISTED_TODOS_KEY = "slowclaw.extracted_todos";
 const PROCESSED_JOURNALS_KEY = "slowclaw.processed_journals";
 const CHUNK_CHAR_LIMIT = 3200;
 
@@ -307,14 +306,6 @@ type TechNewsItem = {
   thumbnailUrl?: string;
 };
 
-type PersistedTodo = {
-  id: string;
-  title: string;
-  details: string;
-  done: boolean;
-  createdAt: number;
-};
-
 // ── Dev-mode sample data ─────────────────────────────────────────────────────
 const DEV_SAMPLE_POSTS: PersistedPost[] = [
   {
@@ -348,45 +339,6 @@ const DEV_SAMPLE_POSTS: PersistedPost[] = [
     createdAt: Date.now() - 1000 * 60 * 60 * 48,
   },
 ];
-
-const DEV_SAMPLE_TODOS: PersistedTodo[] = [
-  {
-    id: "dev-todo-1",
-    title: "Test Q3_K_M model on iPhone",
-    details: "Download the smaller quantization and verify stable CPU-only inference",
-    done: false,
-    createdAt: Date.now() - 1000 * 60 * 60,
-  },
-  {
-    id: "dev-todo-2",
-    title: "Write blog post about local-first AI",
-    details: "Cover the journey from cloud API to on-device inference",
-    done: false,
-    createdAt: Date.now() - 1000 * 60 * 60 * 3,
-  },
-  {
-    id: "dev-todo-3",
-    title: "Fix auto-transcription for audio journals",
-    details: "Speech.framework via Swift plugin instead of Rust ObjC FFI",
-    done: true,
-    createdAt: Date.now() - 1000 * 60 * 60 * 24,
-  },
-  {
-    id: "dev-todo-4",
-    title: "Design feed algorithm for Bluesky discovery",
-    details: "Interest-weighted ranking with local vector similarity",
-    done: false,
-    createdAt: Date.now() - 1000 * 60 * 60 * 48,
-  },
-  {
-    id: "dev-todo-5",
-    title: "Update TestFlight build with crash fixes",
-    details: "CPU-only inference, chunked decode, smaller context window",
-    done: true,
-    createdAt: Date.now() - 1000 * 60 * 60 * 72,
-  },
-];
-// ── End dev-mode sample data ─────────────────────────────────────────────────
 
 const DEV_SAMPLE_JOURNALS: LibraryItem[] = [
   {
@@ -462,20 +414,6 @@ function savePersistedPosts(posts: PersistedPost[]) {
   try { localStorage.setItem(PERSISTED_POSTS_KEY, JSON.stringify(posts)); } catch {}
 }
 
-function loadPersistedTodos(): PersistedTodo[] {
-  try {
-    const raw = localStorage.getItem(PERSISTED_TODOS_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {}
-  if (isDemoContext()) {
-    return DEV_SAMPLE_TODOS;
-  }
-  return [];
-}
-
-function savePersistedTodos(todos: PersistedTodo[]) {
-  try { localStorage.setItem(PERSISTED_TODOS_KEY, JSON.stringify(todos)); } catch {}
-}
 const LOCAL_JOURNAL_PATH_PREFIX = "journal://";
 const UI_THEME_STORAGE_KEY = "slowclaw.ui.theme";
 const UI_TAB_STORAGE_KEY = "slowclaw.ui.tab";
@@ -496,8 +434,8 @@ const ATOMIC_LOCAL_MODEL = "gemma-3n-e4b-it";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
-type MobileTab = "feed" | "reads" | "journal" | "queue" | "profile";
-const TAB_ORDER: MobileTab[] = ["feed", "reads", "journal", "queue", "profile"];
+type MobileTab = "feed" | "reads" | "journal" | "drafts" | "profile";
+const TAB_ORDER: MobileTab[] = ["feed", "reads", "journal", "drafts", "profile"];
 // Rotating seed prompts shown above the composer during first-run onboarding.
 // Indexed by the day-of-month so a returning first-time user sees variety.
 const FIRST_ENTRY_PROMPTS = [
@@ -537,16 +475,16 @@ function defaultMobileTab(): MobileTab {
   }
   const saved = window.localStorage.getItem(UI_TAB_STORAGE_KEY);
   // Migration: fold removed tabs into their successors.
-  //   productivity / todos / events  → queue (Tasks now lives in Queue)
-  //   news                            → feed   (Tech News is now a Feed toggle)
-  //   reels / media                   → feed   (video + images merged into the unified Feed)
-  if (saved === "todos" || saved === "events" || saved === "productivity") {
-    return "queue";
+  //   productivity / todos / events / queue → drafts (Tasks + old Queue folded into Drafts)
+  //   news                                   → feed   (Tech News is now in Reads)
+  //   reels / media                          → feed   (video + images merged into the unified Feed)
+  if (saved === "todos" || saved === "events" || saved === "productivity" || saved === "queue") {
+    return "drafts";
   }
   if (saved === "news" || saved === "reels" || saved === "media") {
     return "feed";
   }
-  if (saved === "feed" || saved === "reads" || saved === "journal" || saved === "queue" || saved === "profile") {
+  if (saved === "feed" || saved === "reads" || saved === "journal" || saved === "drafts" || saved === "profile") {
     return saved;
   }
   // Capture-first onboarding: a brand-new user (no saved tab, onboarding not
@@ -1526,8 +1464,6 @@ function App() {
   const [generatePostBusy, setGeneratePostBusy] = useState(false);
   const [generatePostStatus, setGeneratePostStatus] = useState("");
   const [persistedPosts, setPersistedPosts] = useState<PersistedPost[]>(loadPersistedPosts);
-  const [persistedTodos, setPersistedTodos] = useState<PersistedTodo[]>(loadPersistedTodos);
-  const [extractingLocalTasks, setExtractingLocalTasks] = useState(false);
   const [mobileScannerActive, setMobileScannerActive] = useState(() => {
     if (typeof window === "undefined") {
       return false;
@@ -1646,7 +1582,7 @@ function App() {
     spawnedCount: 0,
     ignoredCount: 0,
   });
-  const workspaceTabActive = mobileTab === "queue";
+  const workspaceTabActive = mobileTab === "drafts";
   const workspaceSynthArtifacts = [
     { key: "posts", label: "Posts", state: workspaceSynthStatus.artifactStates?.insightPosts },
     { key: "todos", label: "Todos", state: workspaceSynthStatus.artifactStates?.todos },
@@ -2732,53 +2668,6 @@ function App() {
         setGeneratePostStatus(`Generation failed: ${detail.slice(0, 200)}`);
       } finally {
         setGeneratePostBusy(false);
-      }
-    }
-
-    // 4. Extract tasks from this entry
-    if (isTauriMobileRuntime() && nativeLocalAiStatus?.available) {
-      try {
-        setExtractingLocalTasks(true);
-        const existingTitles = persistedTodos.slice(0, 10).map((t) => t.title);
-        const dedupeInstruction = existingTitles.length > 0
-          ? `\nDo NOT extract tasks similar to these existing ones:\n${existingTitles.map((t, i) => `${i + 1}. ${t}`).join("\n")}\n`
-          : "";
-        const taskPrompt = `You extract action items and tasks from journal entries. Output a JSON array of objects with "title" and "details" fields. Only real actionable tasks. Output ONLY valid JSON, no markdown fences. Example: [{"title":"Buy groceries","details":"Need milk and eggs"}]${dedupeInstruction}`;
-        const chunks = splitIntoChunks(content, CHUNK_CHAR_LIMIT);
-        const allParsed: Array<{ title: string; details?: string }> = [];
-        for (const chunk of chunks) {
-          for (let attempt = 0; attempt < 3; attempt++) {
-            const result = await nativeAiChat(chunk, taskPrompt, 512, 0.2 + attempt * 0.1);
-            const parsed = tryParseJsonArray<{ title: string; details?: string }>(result.text);
-            if (parsed && parsed.length > 0) { allParsed.push(...parsed); break; }
-            if (attempt === 2) {
-              const lines = result.text.split("\n").filter((l) => /^\s*[-*\d.]/.test(l));
-              allParsed.push(...lines.map((l) => ({ title: l.replace(/^\s*[-*\d.]+\s*/, "").trim() })));
-            }
-          }
-        }
-        if (allParsed.length > 0) {
-          const newTodos: PersistedTodo[] = allParsed
-            .filter((t) => t.title?.trim())
-            .map((t) => ({
-              id: `todo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-              title: t.title.trim(),
-              details: (t.details || "").trim(),
-              done: false,
-              createdAt: Date.now(),
-            }));
-          setPersistedTodos((prev) => {
-            const existingSet = new Set(prev.map((t) => t.title.toLowerCase()));
-            const unique = newTodos.filter((t) => !existingSet.has(t.title.toLowerCase()));
-            const next = [...unique, ...prev]; savePersistedTodos(next); return next;
-          });
-        }
-      } catch (error) {
-        // Task extraction failed — surface the real reason instead of swallowing.
-        const detail = error instanceof Error ? error.message : String(error);
-        setGeneratePostStatus(`Task extraction failed: ${detail.slice(0, 200)}`);
-      } finally {
-        setExtractingLocalTasks(false);
       }
     }
 
@@ -5984,7 +5873,7 @@ Rules:
   }, [blueskyFeedSnapshot?.refreshedAt, blueskyFeedSnapshot?.refreshState]);
 
   useEffect(() => {
-    if (mobileTab !== "queue") {
+    if (mobileTab !== "drafts") {
       setFeedSidebarOpen(false);
       setFeedCreateWorkflowOpen(false);
       return;
@@ -6985,67 +6874,8 @@ Rules:
     }
   }
 
-  async function extractTasksFromJournals() {
-    if (!requireModel()) return;
-    const allJournalText = journalItems
-      .slice(0, 20)
-      .map((item) => item.previewText || item.title || "")
-      .filter((t) => t.trim().length > 10)
-      .join("\n---\n")
-      .trim();
-    if (!allJournalText) { setGeneratePostStatus("No journal entries to extract tasks from."); return; }
-    setExtractingLocalTasks(true);
-    try {
-      const taskPrompt = `You extract action items and tasks from journal entries. Output a JSON array of objects with "title" and "details" fields. Only real actionable tasks. Output ONLY valid JSON, no markdown fences. Example: [{"title":"Buy groceries","details":"Need milk and eggs"}]`;
-      const chunks = splitIntoChunks(allJournalText, CHUNK_CHAR_LIMIT);
-      const allParsed: Array<{ title: string; details?: string }> = [];
-
-      for (let i = 0; i < chunks.length; i++) {
-        if (chunks.length > 1) setGeneratePostStatus(`Extracting tasks ${i + 1}/${chunks.length}...`);
-        // Retry up to 3 times for JSON output
-        for (let attempt = 0; attempt < 3; attempt++) {
-          const result = await nativeAiChat(chunks[i], taskPrompt, 512, 0.2 + attempt * 0.1);
-          const parsed = tryParseJsonArray<{ title: string; details?: string }>(result.text);
-          if (parsed && parsed.length > 0) {
-            allParsed.push(...parsed);
-            break;
-          }
-          // Fallback: try bullet-point parsing on last attempt
-          if (attempt === 2) {
-            const lines = result.text.split("\n").filter((l) => /^\s*[-*\d.]/.test(l));
-            allParsed.push(...lines.map((l) => ({ title: l.replace(/^\s*[-*\d.]+\s*/, "").trim() })));
-          }
-        }
-      }
-
-      if (allParsed.length > 0) {
-        const newTodos: PersistedTodo[] = allParsed
-          .filter((t) => t.title?.trim())
-          .map((t) => ({
-            id: `todo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-            title: t.title.trim(),
-            details: (t.details || "").trim(),
-            done: false,
-            createdAt: Date.now(),
-          }));
-        setPersistedTodos((prev) => {
-          const existingTitles = new Set(prev.map((t) => t.title.toLowerCase()));
-          const unique = newTodos.filter((t) => !existingTitles.has(t.title.toLowerCase()));
-          const next = [...unique, ...prev]; savePersistedTodos(next); return next;
-        });
-        setGeneratePostStatus(`Extracted ${allParsed.length} tasks from ${chunks.length} chunk${chunks.length > 1 ? 's' : ''}`);
-      } else {
-        setGeneratePostStatus("No tasks found in journal entries.");
-      }
-    } catch (error) {
-      setGeneratePostStatus(`Task extraction failed: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      setExtractingLocalTasks(false);
-    }
-  }
-
-  // ── Pull-to-refresh handlers for Feed and Tasks ───────────────────────────
-  // Finds the latest unprocessed journal and uses it for generation/extraction.
+  // ── Pull-to-refresh handlers ────────────────────────────────────────────
+  // Finds the latest unprocessed journal and uses it for generation.
   // If all journals are processed, picks a random one for reprocessing.
   function getNextJournalForProcessing(): { path: string; text: string } | null {
     const textItems = journalItems.filter((item) => item.kind === "text" && (item.previewText || "").trim().length > 10);
@@ -7969,134 +7799,6 @@ Rules:
    * button replaces the old tab-level pull-to-refresh (the Queue tab's pull is
    * wired to post generation, so Tasks needs its own trigger).
    */
-  function renderTasksSection() {
-    return (
-      <div className="stack" style={{ marginTop: '0.75rem' }}>
-        <div className="tasks-header-card">
-          <div className="row-between" style={{ alignItems: 'center' }}>
-            <h2 style={{ margin: 0 }}>Tasks</h2>
-            <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
-              {extractingLocalTasks ? (
-                <span className="row" style={{ gap: '0.3rem', alignItems: 'center' }}>
-                  <span className="btn-spinner" aria-hidden />
-                  <span className="text-sm muted">Extracting...</span>
-                </span>
-              ) : (
-                <button type="button" className="ghost text-sm" onClick={() => void handleTasksPullRefresh()} title="Extract tasks from journals">Extract</button>
-              )}
-            </div>
-          </div>
-          <p className="text-sm muted" style={{ margin: '0.15rem 0 0' }}>
-            Extracted from your journals
-          </p>
-        </div>
-
-        {persistedTodos.filter((t) => !t.done).length > 0 ? (
-          <div className="tasks-section">
-            <h3 className="tasks-section-title">Open · {persistedTodos.filter((t) => !t.done).length}</h3>
-            {persistedTodos.filter((t) => !t.done).map((todo) => (
-              <div key={todo.id} className="task-item">
-                <button
-                  type="button"
-                  className="task-checkbox"
-                  onClick={() => {
-                    setPersistedTodos((prev) => {
-                      const next = prev.map((t) => t.id === todo.id ? { ...t, done: true } : t);
-                      savePersistedTodos(next);
-                      return next;
-                    });
-                  }}
-                  aria-label="Mark done"
-                />
-                <div className="task-item-content">
-                  <input
-                    type="text"
-                    value={todo.title}
-                    className="task-title-input"
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      setPersistedTodos((prev) => {
-                        const next = prev.map((t) => t.id === todo.id ? { ...t, title: val } : t);
-                        savePersistedTodos(next);
-                        return next;
-                      });
-                    }}
-                  />
-                  {todo.details && (
-                    <input
-                      type="text"
-                      value={todo.details}
-                      className="task-detail-input"
-                      onChange={(e) => {
-                        const val = e.target.value;
-                        setPersistedTodos((prev) => {
-                          const next = prev.map((t) => t.id === todo.id ? { ...t, details: val } : t);
-                          savePersistedTodos(next);
-                          return next;
-                        });
-                      }}
-                    />
-                  )}
-                </div>
-                <span className="task-time">{getRelativeTime(todo.createdAt)}</span>
-              </div>
-            ))}
-          </div>
-        ) : null}
-
-        {persistedTodos.filter((t) => t.done).length > 0 ? (
-          <div className="tasks-section">
-            <h3 className="tasks-section-title" style={{ color: 'var(--muted)' }}>Completed · {persistedTodos.filter((t) => t.done).length}</h3>
-            {persistedTodos.filter((t) => t.done).map((todo) => (
-              <div key={todo.id} className="task-item task-item-done">
-                <button
-                  type="button"
-                  className="task-checkbox checked"
-                  onClick={() => {
-                    setPersistedTodos((prev) => {
-                      const next = prev.map((t) => t.id === todo.id ? { ...t, done: false } : t);
-                      savePersistedTodos(next);
-                      return next;
-                    });
-                  }}
-                  aria-label="Reopen"
-                >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-                </button>
-                <div className="task-item-content">
-                  <span className="task-title-done">{todo.title}</span>
-                </div>
-                <button
-                  type="button"
-                  className="ghost task-delete-btn"
-                  onClick={() => {
-                    setPersistedTodos((prev) => {
-                      const next = prev.filter((t) => t.id !== todo.id);
-                      savePersistedTodos(next);
-                      return next;
-                    });
-                  }}
-                  title="Delete"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                </button>
-              </div>
-            ))}
-          </div>
-        ) : null}
-
-        {persistedTodos.length === 0 ? (
-          <div className="tasks-empty">
-            <div className="tasks-empty-icon">✅</div>
-            <p className="text-sm muted" style={{ margin: 0 }}>
-              No tasks yet. Tap Extract to pull them from your journals.
-            </p>
-          </div>
-        ) : null}
-      </div>
-    );
-  }
-
   async function loadTechNews() {
     if (techNewsLoading) return;
     setTechNewsLoading(true);
@@ -8524,64 +8226,6 @@ Rules:
       setGeneratePostStatus(`Generation failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setGeneratePostBusy(false);
-    }
-  }
-
-  async function handleTasksPullRefresh() {
-    // Guard against concurrent calls
-    if (extractingLocalTasks) return;
-    const entry = getNextJournalForProcessing();
-    if (!entry) {
-      setGeneratePostStatus("Write a journal entry first, then pull to extract tasks.");
-      return;
-    }
-    if (!requireModel()) return;
-    setExtractingLocalTasks(true);
-    setGeneratePostStatus("🧠 Extracting tasks from your journal...");
-    try {
-      const existingTitles = persistedTodos.slice(0, 10).map((t) => t.title);
-      const dedupeNote = existingTitles.length > 0
-        ? `\nDo NOT extract tasks similar to these existing ones:\n${existingTitles.map((t, i) => `${i + 1}. ${t}`).join("\n")}\n`
-        : "";
-      const taskPrompt = `You extract action items and tasks from journal entries. Output a JSON array of objects with "title" and "details" fields. Only real actionable tasks. Output ONLY valid JSON, no markdown fences. Example: [{"title":"Buy groceries","details":"Need milk and eggs"}]${dedupeNote}`;
-      const chunks = splitIntoChunks(entry.text, CHUNK_CHAR_LIMIT);
-      const allParsed: Array<{ title: string; details?: string }> = [];
-      for (let i = 0; i < chunks.length; i++) {
-        for (let attempt = 0; attempt < 3; attempt++) {
-          const result = await nativeAiChat(chunks[i], taskPrompt, 512, 0.2 + attempt * 0.1);
-          const parsed = tryParseJsonArray<{ title: string; details?: string }>(result.text);
-          if (parsed && parsed.length > 0) { allParsed.push(...parsed); break; }
-          if (attempt === 2) {
-            const lines = result.text.split("\n").filter((l) => /^\s*[-*\d.]/.test(l));
-            allParsed.push(...lines.map((l) => ({ title: l.replace(/^\s*[-*\d.]+\s*/, "").trim() })));
-          }
-        }
-      }
-      if (allParsed.length > 0) {
-        const newTodos: PersistedTodo[] = allParsed
-          .filter((t) => t.title?.trim())
-          .map((t) => ({
-            id: `todo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-            title: t.title.trim(),
-            details: (t.details || "").trim(),
-            done: false,
-            createdAt: Date.now(),
-          }));
-        setPersistedTodos((prev) => {
-          const existingTitles = new Set(prev.map((t) => t.title.toLowerCase()));
-          const unique = newTodos.filter((t) => !existingTitles.has(t.title.toLowerCase()));
-          const next = [...unique, ...prev]; savePersistedTodos(next); return next;
-        });
-      }
-      markJournalProcessed(entry.path);
-      setGeneratePostStatus(allParsed.length > 0
-        ? `✅ Extracted ${allParsed.length} task${allParsed.length > 1 ? 's' : ''} from your journal`
-        : "No tasks found in this journal entry. Try pulling again."
-      );
-    } catch (error) {
-      setGeneratePostStatus(`Task extraction failed: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      setExtractingLocalTasks(false);
     }
   }
 
@@ -10047,14 +9691,6 @@ Rules:
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
               )}
             </button>
-            <button
-              type="button"
-              className={`ghost ${showSettings ? "active-icon-btn" : ""}`}
-              onClick={() => setShowSettings((prev) => !prev)}
-              title="Settings"
-            >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82L4.21 7.1a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-            </button>
           </div>
         </header>
       )}
@@ -10399,13 +10035,13 @@ Rules:
           </ViewErrorBoundary>
         ) : null}
 
-        {mobileTab === "queue" ? (
-          <ViewErrorBoundary title="Queue">
+        {mobileTab === "drafts" ? (
+          <ViewErrorBoundary title="Drafts">
             <PullToRefresh onRefresh={handleFeedPullRefresh} enabled={!generatePostBusy}>
             <div className="stack">
               <div className="feed-tab-container">
               <div className="row-between" style={{ padding: '0 0.25rem' }}>
-                <h2>Queue</h2>
+                <h2>Drafts</h2>
                 {generatePostBusy && (
                   <span className="row" style={{ gap: '0.3rem', alignItems: 'center' }}>
                     <span className="btn-spinner" aria-hidden />
@@ -10486,9 +10122,6 @@ Rules:
               {generatePostStatus && (
                 <p className="text-sm muted" style={{ padding: '0.5rem 0.25rem' }}>{generatePostStatus}</p>
               )}
-
-              {/* Tasks folded into Queue (was its own tab). */}
-              {renderTasksSection()}
               </div>
             </div>
             </PullToRefresh>

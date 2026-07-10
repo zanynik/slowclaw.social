@@ -2,20 +2,18 @@
  * BottomNav.tsx — Mobile tab bar (icons only).
  *
  * Minimal IA (5 tabs):
- *   Feed → Reads → Journal → Queue(+Tasks) → Profile
+ *   Feed → Reads → Journal → Drafts → Profile
  *
  * - Feed:   unified social stream (Nostr/Bluesky text + images + inline video,
- *           tap-to-fullscreen) + Tech News toggle.
- * - Reads:  long-form — Nostr NIP-23 articles (Habla) + RSS/Atom + Hacker News.
- * - Journal: capture/compose — grows the topics that curate the social surfaces.
- * - Queue:  AI drafts + Tasks (productivity) folded together.
+ *           tap-to-fullscreen). Social-only — news lives in Reads.
+ * - Reads:  long-form — Nostr NIP-23 articles (Habla) + RSS/Atom + Hacker News
+ *           + YouTube, all ranked by the journal lens.
+ * - Journal: capture/compose — grows the topics that curate the surfaces.
+ * - Drafts: AI post drafts (distill journals → publish to Nostr/Bluesky).
  * - Profile.
- *
- * Video and image content merged into the unified Feed; the dedicated Reels and
- * Media tabs were removed to reduce surface area and cognitive load.
  */
 
-type MobileTab = "feed" | "reads" | "journal" | "queue" | "profile";
+type MobileTab = "feed" | "reads" | "journal" | "drafts" | "profile";
 
 type BottomNavProps = {
   activeTab: MobileTab;
@@ -93,14 +91,14 @@ export function BottomNav({
         </svg>
       </button>
 
-      {/* Queue — AI drafts + Tasks folded together (sparkles/wand) */}
+      {/* Drafts — AI post drafts (sparkles/wand) */}
       <button
         type="button"
         role="tab"
-        aria-selected={activeTab === "queue"}
-        aria-label="Queue"
-        className={activeTab === "queue" ? "active" : ""}
-        onClick={() => handleTab("queue")}
+        aria-selected={activeTab === "drafts"}
+        aria-label="Drafts"
+        className={activeTab === "drafts" ? "active" : ""}
+        onClick={() => handleTab("drafts")}
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M12 2l1.09 3.26L16 6l-2.91.74L12 10l-1.09-3.26L8 6l2.91-.74L12 2z" />
