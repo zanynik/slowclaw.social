@@ -886,11 +886,20 @@ function isTauriMobileRuntime() {
 // True when running as the public in-browser demo (build-time flag) or on a local
 // dev host. In this context the app seeds sample journals/posts/todos for UI
 // preview and never expects a reachable gateway backend.
+// IMPORTANT: a Tauri native shell (iOS/Android/desktop) ALSO loads the webview
+// from a localhost origin, so we MUST exclude any __TAURI_INTERNALS__ context —
+// otherwise the real app shows "Demo mode" and seeds fake sample data over the
+// user's real workspace. The native shell always has a real gateway/backend.
 function isDemoContext() {
   if (typeof __SLOWCLAW_DEMO_BUILD__ !== "undefined" && __SLOWCLAW_DEMO_BUILD__) {
     return true;
   }
   if (typeof window === "undefined") {
+    return false;
+  }
+  // Running inside the Tauri native shell (mobile or desktop) ⇒ the real app,
+  // never a demo, regardless of the localhost webview origin.
+  if (Boolean((window as any).__TAURI_INTERNALS__)) {
     return false;
   }
   return /^localhost$|^127\.0\.0\.1$/.test(window.location.hostname);
