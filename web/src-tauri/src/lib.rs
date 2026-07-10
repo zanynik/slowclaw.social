@@ -1613,6 +1613,37 @@ async fn save_journal_text(title: String, content: String) -> Result<JournalEntr
         .ok_or_else(|| "Failed to read saved journal note.".to_string())
 }
 
+/// Write a text file to a workspace-relative path (native, iOS-first).
+///
+/// Used to persist media-journal transcripts (`journals/text/transcriptions/...`)
+/// WITHOUT routing through the desktop gateway HTTP API (`/api/library/save-text`),
+/// which is not reliably reachable from the mobile runtime and caused
+/// "Save failed (Load failed)" on iOS. Workspace-only: `resolve_journal_id`
+/// rejects `..` and any resolved path that escapes `workspace_dir`, and the
+/// transcript loader (`journal_entry_from_path`) reads back from this same path.
+#[tauri::command]
+async fn save_journal_text_file(path: String, content: String) -> Result<(), String> {
+    let config = load_workspace_config_for_ui("journal text file save failed").await?;
+    let resolved = resolve_journal_id(&config.workspace_dir, &path)?;
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ui_command_error(
+                "journal text file dir create failed",
+                "Failed to prepare the transcript storage folder.",
+                e,
+            )
+        })?;
+    }
+    std::fs::write(&resolved, format!("{content}\n")).map_err(|e| {
+        ui_command_error(
+            "journal text file write failed",
+            "Failed to save the transcript.",
+            e,
+        )
+    })?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn save_journal_media(
     kind: String,
@@ -2981,6 +3012,7 @@ pub fn run() {
             commands::desktop::restart_gateway_daemon,
             set_provider_api_key,
             save_journal_text,
+            save_journal_text_file,
             save_journal_media,
             list_journals,
             get_journal,

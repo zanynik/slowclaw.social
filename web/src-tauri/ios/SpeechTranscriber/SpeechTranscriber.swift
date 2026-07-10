@@ -136,26 +136,62 @@ public func slowclaw_transcribe_audio(
     }
 
     // 5. Run the recognition task, bridging the callback onto a semaphore.
+    //
+    // On-device recognition can deliver LONGER audio in SEGMENTS: the handler
+    // is invoked with isFinal=true once per segment, and each result's
+    // bestTranscription holds only THAT segment's text. Overwriting on each
+    // final left only the last segment (the "only the last line" bug for ~1min
+    // recordings). Fix: append every final segment, and signal completion via a
+    // short settle timer (0.8s of quiet after the last segment). For normal
+    // single-final audio this adds ~0.8s of latency to a background op, which
+    // is acceptable; the existing 600s timeout remains the ultimate safety net.
     let resultSemaphore = DispatchSemaphore(value: 0)
     final class ResultBox {
         var text: String?
         var error: Error?
     }
     let box = ResultBox()
+    let settleQueue = DispatchQueue.global(qos: .userInitiated)
+    let settleTimer = DispatchSource.makeTimerSource(queue: settleQueue)
+    var signaled = false
+    let signalOnce: () -> Void = {
+        if !signaled {
+            signaled = true
+            resultSemaphore.signal()
+        }
+    }
+    settleTimer.schedule(deadline: .now() + .seconds(600), repeating: .never)
+    settleTimer.setEventHandler { signalOnce() }
+    settleTimer.activate()
+    // Re-arm the settle timer to `delay` seconds from now (debounce: each new
+    // final segment pushes "done" out, so we only finish after the recognizer
+    // goes quiet).
+    func rearmSettle(_ delay: TimeInterval) {
+        settleTimer.schedule(deadline: .now() + delay, repeating: .never)
+    }
 
     let task = activeRecognizer.recognitionTask(with: request) { result, error in
         if let error = error {
             box.error = error
-            resultSemaphore.signal()
+            settleTimer.cancel()
+            signalOnce()
             return
         }
         guard let result = result else {
-            resultSemaphore.signal()
+            // Completion with no further result and no error: finish now.
+            settleTimer.cancel()
+            signalOnce()
             return
         }
         if result.isFinal {
-            box.text = result.bestTranscription.formattedString
-            resultSemaphore.signal()
+            let segment = result.bestTranscription.formattedString
+            if let existing = box.text, !existing.isEmpty {
+                box.text = existing + " " + segment
+            } else {
+                box.text = segment
+            }
+            // Debounce: wait a little in case another segment follows.
+            rearmSettle(0.8)
         }
     }
 

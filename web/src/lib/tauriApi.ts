@@ -103,6 +103,17 @@ export async function saveJournalText(title: string, content: string): Promise<J
   return invoke("save_journal_text", { title, content });
 }
 
+/**
+ * Write a text file to a workspace-relative path (native, iOS-first). Used to
+ * persist media-journal transcripts without the desktop gateway HTTP API, which
+ * is not reliably reachable on the mobile runtime. Workspace-only (enforced
+ * by the Rust `resolve_journal_id` guard). Resolves to the same transcript
+ * path the loader reads from.
+ */
+export async function saveJournalTextFile(path: string, content: string): Promise<void> {
+  return invoke("save_journal_text_file", { path, content });
+}
+
 export async function saveJournalMedia(
   kind: "audio" | "video" | "image",
   filename: string,

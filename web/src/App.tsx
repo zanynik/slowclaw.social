@@ -104,6 +104,7 @@ import {
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
   saveJournalText,
+  saveJournalTextFile,
   saveJournalMedia,
   importVoiceMemos,
   listJournals,
@@ -2292,6 +2293,38 @@ function App() {
     }
   }
 
+  /**
+   * Persist a media-journal transcript to the workspace. Native-first on iOS
+   * (the desktop gateway HTTP save-text endpoint isn't reliably reachable from
+   * the mobile runtime and caused "Save failed (Load failed)"). Falls back to
+   * the gateway path on desktop / web. Writes to the same path the transcript
+   * loader and the journal-as-lens ranker read from.
+   */
+  async function persistTranscript(
+    transcriptPath: string,
+    text: string,
+    token: string,
+  ): Promise<boolean> {
+    if (isNativeClient) {
+      try {
+        await saveJournalTextFile(transcriptPath, text);
+        return true;
+      } catch (nativeError) {
+        // Native unavailable (older build) — fall through to gateway.
+        if (!isMissingDesktopCommand(nativeError, "save_journal_text_file")) {
+          // A genuine native write failure shouldn't be masked.
+          return false;
+        }
+      }
+    }
+    try {
+      await saveLibraryText(transcriptPath, text, token || undefined, gatewayBaseUrl);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async function transcribeAfterSave(audioPath: string, entryId: string, token: string) {
     if (!audioPath) return;
     setJournalSaveStatus("Transcribing audio...");
@@ -2305,9 +2338,9 @@ function App() {
         // server transcribe path, which writes this file internally), so write
         // it ourselves to the same path the loader reads from.
         const transcriptPath = journalTranscriptPathForMediaPath(audioPath);
-        let persisted = true;
+        let persisted = false;
         try {
-          await saveLibraryText(transcriptPath, transcriptText, token || undefined, gatewayBaseUrl);
+          persisted = await persistTranscript(transcriptPath, transcriptText, token);
         } catch {
           persisted = false;
         }
@@ -2362,11 +2395,10 @@ function App() {
           const result = await transcribeAudio(audioPath);
           const text = result.text.trim();
           if (text) {
-            await saveLibraryText(
+            await persistTranscript(
               journalTranscriptPathForMediaPath(audioPath),
               text,
-              chatGatewayToken || undefined,
-              gatewayBaseUrl
+              chatGatewayToken,
             );
             transcribed += 1;
           }
@@ -2538,7 +2570,10 @@ function App() {
       } else if (selectedJournalItem && (selectedJournalItem.kind === "audio" || selectedJournalItem.kind === "video")) {
         const draftPath =
           loadedTextPathRef.current.trim() || journalTranscriptPathForMedia(selectedJournalItem);
-        await saveLibraryText(draftPath, content, token || undefined, gatewayBaseUrl);
+        // Native-first (iOS): the gateway save-text endpoint isn't reliably
+        // reachable from the mobile runtime and produced "Save failed (Load
+        // failed)". persistTranscript handles native-first + gateway fallback.
+        await persistTranscript(draftPath, content, token);
         resultPath = draftPath;
         nextSelectedPath = selectedJournalItem.path;
       } else {
@@ -10401,7 +10436,7 @@ Rules:
         {mobileTab === "feed" ? (
           <ViewErrorBoundary title="Feed">
             {/* New-posts pill (#4): surfaces when fresh social items arrive. */}
-            {newPostsCount > 0 && feedView === "social" ? (
+            {newPostsCount > 0 ? (
               <button
                 type="button"
                 className="new-posts-pill"
@@ -10410,32 +10445,12 @@ Rules:
                 ↑ {newPostsCount} new {newPostsCount === 1 ? "post" : "posts"}
               </button>
             ) : null}
-            <PullToRefresh onRefresh={withRefreshToast("Feed updated", () => feedView === "news" ? loadTechNews() : loadSocialFeed())} enabled={feedView === "news" ? !techNewsLoading : !(nostrFeedLoading || blueskyPublicLoading || followingLoading)}>
+            <PullToRefresh onRefresh={withRefreshToast("Feed updated", () => loadSocialFeed())} enabled={!(nostrFeedLoading || blueskyPublicLoading || followingLoading)}>
             <div className="stack">
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
                   <h2>Feed</h2>
-                  {/* Newspaper icon: toggles between social feed and tech news. */}
-                  <div className="feed-view-toggle" role="group" aria-label="Feed view">
-                    <button
-                      type="button"
-                      className={`feed-view-pill${feedView === "social" ? " active" : ""}`}
-                      onClick={() => setFeedView("social")}
-                      aria-label="Social feed"
-                      title="Social feed"
-                    >
-                      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 11l18-8-8 18-2-7-8-3z"/></svg>
-                    </button>
-                    <button
-                      type="button"
-                      className={`feed-view-pill${feedView === "news" ? " active" : ""}`}
-                      onClick={() => setFeedView("news")}
-                      aria-label="Tech news"
-                      title="Tech news"
-                    >
-                      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2"/><path d="M18 14h-8M15 18h-5M10 6h8v4h-8V6z"/></svg>
-                    </button>
-                  </div>
+                  {/* News lives in the Reads tab now — Feed is social-only (your follows + open-protocol channels). */}
                 </div>
 
                 {feedView === "news" ? (
