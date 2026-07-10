@@ -9813,7 +9813,13 @@ Rules:
                   className={`card ${expandSession ? "note-card-expanded" : ""}`}
                   style={{ flex: expandSession ? 1 : undefined }}
                 >
-                  <div className="row-between" style={{ padding: isWritingNote ? '0.5rem 0' : undefined }}>
+                  {/* Distraction-free writing: while the keyboard is up (isWritingNote)
+                      the title + Done button are hidden so the writing surface + keyboard
+                      own the screen. iOS otherwise auto-scrolls to keep the caret visible,
+                      which pushed the Done button half off-screen. Done returns the moment
+                      the keyboard dismisses (see textarea onBlur → setIsWritingNote(false)). */}
+                  {!isWritingNote && (
+                  <div className="row-between">
                     <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
                       <h2 style={{ margin: 0 }}>{isTextEntrySelected ? selectedJournalItem?.title || "Journal" : "Journal"}</h2>
                     </div>
@@ -9822,6 +9828,7 @@ Rules:
                       {(isWritingNote || isTextEntrySelected) && <button type="button" className="primary" style={{ padding: '0.5rem 1.2rem', fontSize: '0.95rem' }} onClick={() => void handleJournalDone()}>Done</button>}
                     </div>
                   </div>
+                  )}
                   {selectedJournalItem && selectedJournalItem.kind === "audio" && (
                     <div className="row" style={{ marginBottom: "0.6rem", alignItems: "center", gap: "0.5rem" }}>
                       {audioPlaybackUrl ? (
@@ -9888,6 +9895,12 @@ Rules:
                       const el = e.target;
                       el.style.height = "auto";
                       el.style.height = el.scrollHeight + "px";
+                    }}
+                    onBlur={() => {
+                      // Keyboard dismissed → exit distraction-free writing so the
+                      // title + Done button return. Done is only rendered while
+                      // !isWritingNote, so it's always tappable here (no blur/race).
+                      setIsWritingNote(false);
                     }}
                     placeholder={showFirstEntryPrompt ? "What's on your mind today?" : "Write your thoughts..."}
                   />
