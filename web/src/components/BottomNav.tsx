@@ -1,26 +1,27 @@
 /**
  * BottomNav.tsx — Mobile tab bar (icons only).
  *
- * Minimal IA (5 tabs):
- *   Feed → Reads → Journal → Drafts → Profile
+ * Minimal IA (4 tabs):
+ *   Reads → Journal → Drafts → Profile
  *
- * - Feed:   unified social stream (Nostr/Bluesky text + images + inline video,
- *           tap-to-fullscreen). Social-only — news lives in Reads.
- * - Reads:  long-form — Nostr NIP-23 articles (Habla) + RSS/Atom + Hacker News
- *           + YouTube, all ranked by the journal lens.
- * - Journal: capture/compose — grows the topics that curate the surfaces.
+ * The social Feed was folded INTO Reads: social posts (Nostr / Bluesky) pass a
+ * reputation gate (WoT / engagement) then rank alongside articles, news, and
+ * video by the journal lens. There is no free "Following" timeline — every
+ * item earns its slot through ranking.
+ *
+ * - Reads:  the unified "for me" stream — articles + news + video + gated
+ *           social, all ranked by what you've been writing about.
+ * - Journal: capture/compose (OUT) — grows the topics that curate Reads.
  * - Drafts: AI post drafts (distill journals → publish to Nostr/Bluesky).
  * - Profile.
  */
 
-type MobileTab = "feed" | "reads" | "journal" | "drafts" | "profile";
+type MobileTab = "reads" | "journal" | "drafts" | "profile";
 
 type BottomNavProps = {
   activeTab: MobileTab;
   onTabChange: (tab: MobileTab) => void;
   productivityBadgeCount?: number;
-  /** Unread count for the social Feed tab. */
-  feedBadgeCount?: number;
 };
 
 function triggerHaptic() {
@@ -33,7 +34,6 @@ export function BottomNav({
   activeTab,
   onTabChange,
   productivityBadgeCount = 0,
-  feedBadgeCount = 0,
 }: BottomNavProps) {
   const handleTab = (tab: MobileTab) => {
     if (tab !== activeTab) {
@@ -43,25 +43,8 @@ export function BottomNav({
   };
 
   return (
-    <nav className="bottom-nav bottom-nav-5" role="tablist" aria-label="Main navigation">
-      {/* Feed — unified social stream (text + images + inline video) + Tech News toggle */}
-      <button
-        type="button"
-        role="tab"
-        aria-selected={activeTab === "feed"}
-        aria-label="Feed"
-        className={activeTab === "feed" ? "active" : ""}
-        onClick={() => handleTab("feed")}
-      >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M3 11l18-8-8 18-2-7-8-3z" />
-        </svg>
-        {feedBadgeCount > 0 ? (
-          <span className="bottom-nav-badge">{feedBadgeCount}</span>
-        ) : null}
-      </button>
-
-      {/* Reads — long-form articles + RSS + Hacker News */}
+    <nav className="bottom-nav bottom-nav-4" role="tablist" aria-label="Main navigation">
+      {/* Reads — the unified "for me" stream (articles + news + video + gated social) */}
       <button
         type="button"
         role="tab"

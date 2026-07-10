@@ -54,7 +54,7 @@ import {
   type VideoStoreStatus,
 } from "./lib/videoLocalStore";
 // ── Nostr content-quality filter (language + spam + dedup) ───────────────────
-import { filterNostrFeed, type NostrFeedStats } from "./lib/feedFilter";
+import { filterNostrFeed } from "./lib/feedFilter";
 // ── RSS/Atom feeds (Reads tab) ────────────────────────────────────────────────
 import { fetchRssFeeds, RSS_FEEDS, type RssFeed, type RssItem } from "./lib/rss";
 // ── YouTube ingestion (keyless; journal-topic-driven) ─────────────────────
@@ -91,15 +91,12 @@ import {
 } from "./lib/interestProfile";
 // ── Local-first optimistic follows ─────────────────────────────────────────
 import { getFollowedIds, onFollowsChange, toggleFollow, nostrFollowKey, blueskyFollowKey } from "./lib/follows";
-// ── Following home timeline (merged Nostr + Bluesky) ───────────────────────
-import { loadFollowingFeed, type FollowingFeedItem } from "./lib/followingFeed";
 // ── Reads ranking + read-time (Google News / Substack-style "For You") ──────
-import { rankReads, chronologicalReads, type RankedRead } from "./lib/readsRanking";
+import { rankReads, chronologicalReads, gateSocialItems, type RankedRead } from "./lib/readsRanking";
 import {
   loadCachedWoTSet,
   refreshWoTSet,
   onWoTChange,
-  sortByWoTFirst,
 } from "./lib/wot";
 // ── Tauri API (replaces HTTP gateway calls) ──────────────────────────────────
 import {
@@ -434,8 +431,8 @@ const ATOMIC_LOCAL_MODEL = "gemma-3n-e4b-it";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
-type MobileTab = "feed" | "reads" | "journal" | "drafts" | "profile";
-const TAB_ORDER: MobileTab[] = ["feed", "reads", "journal", "drafts", "profile"];
+type MobileTab = "reads" | "journal" | "drafts" | "profile";
+const TAB_ORDER: MobileTab[] = ["reads", "journal", "drafts", "profile"];
 // Rotating seed prompts shown above the composer during first-run onboarding.
 // Indexed by the day-of-month so a returning first-time user sees variety.
 const FIRST_ENTRY_PROMPTS = [
@@ -471,20 +468,20 @@ function defaultThemeMode(): ThemeMode {
 
 function defaultMobileTab(): MobileTab {
   if (typeof window === "undefined") {
-    return "feed";
+    return "reads";
   }
   const saved = window.localStorage.getItem(UI_TAB_STORAGE_KEY);
   // Migration: fold removed tabs into their successors.
-  //   productivity / todos / events / queue → drafts (Tasks + old Queue folded into Drafts)
-  //   news                                   → feed   (Tech News is now in Reads)
-  //   reels / media                          → feed   (video + images merged into the unified Feed)
-  if (saved === "todos" || saved === "events" || saved === "productivity" || saved === "queue") {
-    return "drafts";
+  //   feed / productivity / todos / events / queue → drafts (Feed collapsed into Reads)
+  //   news                                          → reads   (news lives in Reads)
+  //   reels / media                                 → reads   (video lives in Reads)
+  if (saved === "feed" || saved === "todos" || saved === "events" || saved === "productivity" || saved === "queue") {
+    return "reads";
   }
   if (saved === "news" || saved === "reels" || saved === "media") {
-    return "feed";
+    return "reads";
   }
-  if (saved === "feed" || saved === "reads" || saved === "journal" || saved === "drafts" || saved === "profile") {
+  if (saved === "reads" || saved === "journal" || saved === "drafts" || saved === "profile") {
     return saved;
   }
   // Capture-first onboarding: a brand-new user (no saved tab, onboarding not
@@ -1645,10 +1642,10 @@ function App() {
   const [nostrCopiedKey, setNostrCopiedKey] = useState<"" | "npub" | "nsec">("");
   const [techNewsItems, setTechNewsItems] = useState<TechNewsItem[]>([]);
 
-  // ── Journal-driven topic curation (applies across News + Nostr tabs) ────────
-  // Topics are mined from journal entries; the user picks one to filter every
-  // social surface through a single universal predicate (lib/socialFeed.ts).
-  const [activeSocialTopic, setActiveSocialTopic] = useState<string>("");
+  // ── Journal-driven topic curation ────────────────────────────────────────
+  // Topics are mined from journal entries and feed the ranking lens directly
+  // (lib/socialFeed.ts `matchesTopic` via readsRanking). There is no separate
+  // "active topic" filter anymore — the lens ranks everything in Reads.
 
   // ── Social source + channel state (validated source-level filter levers) ────
   // `socialSource` picks the open-protocol source: Nostr (NIP-12 hashtags) or
@@ -1657,10 +1654,6 @@ function App() {
   // so content is guaranteed for popular terms (see lib/socialFeed.ts catalog).
   const [socialSource, setSocialSource] = useState<SocialSource>("nostr");
   const [activeChannelId, setActiveChannelId] = useState<string>("");
-  // Following home timeline (merged Nostr + Bluesky from the follows store).
-  const [followingItems, setFollowingItems] = useState<FollowingFeedItem[]>([]);
-  const [followingLoading, setFollowingLoading] = useState(false);
-  const [followingError, setFollowingError] = useState("");
   // Reposted-set (mirrors localStorage so FeedActionBar reflects optimistic state).
   const [repostedIds, setRepostedIds] = useState<string[]>(() => getRepostedIds());
   // Bluesky public posts cache + loading (separate from the authed blueskyFeedItems).
@@ -1668,10 +1661,8 @@ function App() {
   const [blueskyPublicLoading, setBlueskyPublicLoading] = useState(false);
   const [blueskyPublicError, setBlueskyPublicError] = useState("");
   const [socialFeedError, setSocialFeedError] = useState("");
-  // Nostr quality-filter stats (how many notes were dropped as spam/non-EN).
-  const [nostrFeedStats, setNostrFeedStats] = useState<NostrFeedStats | null>(null);
-  // Bluesky video posts for the unified Feed's inline videos + the
-  // tap-to-fullscreen overlay (the dedicated Reels tab was removed).
+  // Bluesky video posts for the inline videos + the tap-to-fullscreen overlay
+  // (video now lives in the Reads ranked stream via Bluesky cards).
   const [reelsPosts, setReelsPosts] = useState<BlueskyPublicPost[]>([]);
   const [reelsLoading, setReelsLoading] = useState(false);
   // Reads tab (long-form: Nostr NIP-23 articles + RSS/Atom blogs).
@@ -1690,12 +1681,10 @@ function App() {
     if (typeof window === "undefined") return "foryou";
     return window.localStorage.getItem("slowclaw.reads.rank") === "latest" ? "latest" : "foryou";
   });
-  // IA simplification: discovery/source filters are collapsed by default so the
-  // Feed + Reads open as plain "for me" streams. Discover/Sources expand on tap.
-  const [feedDiscoverOpen, setFeedDiscoverOpen] = useState(false);
+  // IA simplification: source/social filters are collapsed by default so Reads
+  // opens as a plain "for me" stream. Sources/Social expand on tap.
+  const [feedSocialOpen, setFeedSocialOpen] = useState(false);
   const [readsSourcesOpen, setReadsSourcesOpen] = useState(false);
-  // Feed/Reels "Show more" pagination (replaces the silent 40-item cliff).
-  const [feedVisibleCount, setFeedVisibleCount] = useState(20);
   const [readsVisibleCount, setReadsVisibleCount] = useState(12);
   // Local-first cache for Reads: the last-good ranked stream is persisted so
   // the Reads tab paints instantly on open (Damus-style), then refreshes in
@@ -1754,10 +1743,6 @@ function App() {
   const profileAvatarInputRef = useRef<HTMLInputElement | null>(null);
   // Refresh toast (#5): a tiny "Updated" confirmation shown after pull-to-refresh.
   const [refreshToast, setRefreshToast] = useState<string | null>(null);
-  // New-posts pill (#4): count of fresh social-feed items arrived since the user
-  // last viewed the top. Resets on tap (scrolls to top) or tab switch.
-  const [newPostsCount, setNewPostsCount] = useState(0);
-  const lastSeenTopPostIdRef = useRef<string | null>(null);
   const [techNewsLoading, setTechNewsLoading] = useState(false);
   const [techNewsError, setTechNewsError] = useState("");
   const [nostrPostConfirmPost, setNostrPostConfirmPost] = useState<PersistedPost | null>(null);
@@ -1905,7 +1890,6 @@ function App() {
   }
 
   // Reset feed pagination when the source/topic changes (so the list isn't empty).
-  useEffect(() => { setFeedVisibleCount(20); }, [socialSource, activeChannelId, activeSocialTopic]);
   // Reset Reads pagination when the rank mode / RSS filter changes.
   useEffect(() => { setReadsVisibleCount(12); }, [readsRankMode, activeRssFeedIds]);
 
@@ -5724,13 +5708,13 @@ Rules:
     }
   }
 
-  // seePersonalizedFeed dismisses the reveal and jumps to the Feed. Nostr works
+  // seePersonalizedFeed dismisses the reveal and jumps to Reads. Nostr works
   // account-free and is interest-matchable, so it gives the best shot at a
   // populated, personalized first Feed even before the user links Bluesky.
   function seePersonalizedFeed() {
     setDismissedInterestReveal(true);
     setShowFirstEntryPrompt(false);
-    setMobileTab("feed");
+    setMobileTab("reads");
     setSocialSource("nostr");
     void loadNostrFeed();
   }
@@ -6956,89 +6940,67 @@ Rules:
   );
 
 
-  /** Nostr notes for the active channel (source-level filter, not client-side). */
-  const visibleNostrNotes = useMemo(() => {
-    // Channels filter at the SOURCE (loadNostrFeed already applied the NIP-12
-    // subscription), so here we only apply the optional journal-derived topic
-    // refinement on top. Empty topic = show everything the channel returned.
-    const t = activeSocialTopic.trim().toLowerCase();
-    const afterTopic = t
-      ? nostrFeedNotes.filter((note) => {
-          const profile = nostrProfiles[note.pubkey];
-          const handle = profile?.name ?? profile?.displayName ?? undefined;
-          const avatar = profile?.picture ?? undefined;
-          const unified = toUnifiedFromNostr(note, handle, avatar);
-          return matchesTopic(unified, t);
-        })
-      : nostrFeedNotes;
-    // Web-of-Trust tier sort: trusted authors first, recency within each tier.
-    // An empty wotSet (no graph / cold start) leaves the chronological order
-    // unchanged.
-    return sortByWoTFirst(afterTopic, wotSet, {
-      pubkey: (n) => n.pubkey,
-      createdAt: (n) => n.createdAt,
-    });
-  }, [nostrFeedNotes, nostrProfiles, activeSocialTopic, wotSet]);
-
   /**
-   * Bluesky public posts for the text Feed, optionally filtered by the active
-   * journal topic. The Feed tab is text-first by product vision (it mirrors a
-   * Twitter timeline), so we also **prioritize text posts above media posts**:
-   * posts with no image/video/external embed sort first, then posts with media.
-   * This compensates for `searchPosts` returning image-heavy results for
-   * generic terms (Bluesky has no reliable server-side text-only filter).
+   * Social content (Nostr notes + Bluesky posts) gated through the reputation
+   * pipeline, then folded into the Reads ranked stream. This is the "hardest
+   * to rank" tier: social is noisy, so it earns a slot only if its author is
+   * trusted (WoT / follows) or it drew real engagement (likes + zaps). A
+   * cold-start floor keeps a modest stream alive before enrichment is warm.
+   *
+   * Everything admitted then competes in `rankedReads` on equal footing with
+   * articles / news / video — interest match (journal lens) dominates ordering
+   * from there. No free "Following" timeline: social fights for its place.
    */
-  const visibleBlueskyItems = useMemo(() => {
-    const t = activeSocialTopic.trim().toLowerCase();
-    const filtered = t
-      ? blueskyPublicPosts.filter((p) => matchesTopic(toUnifiedFromBluesky(p), t))
-      : blueskyPublicPosts;
-    const hasMedia = (p: BlueskyPublicPost) =>
-      blueskyImagesOf(p).length > 0 || !!blueskyVideoOf(p) || !!blueskyExternalOf(p);
-    // Stable text-first sort: preserve server order (top/relevance) within each bucket.
-    return [...filtered].sort((a, b) => {
-      const am = hasMedia(a) ? 1 : 0;
-      const bm = hasMedia(b) ? 1 : 0;
-      return am - bm;
+  const socialUnifiedForReads = useMemo<UnifiedItem[]>(() => {
+    const postEngagement = new Map<string, number>();
+    const authorEngagement = new Map<string, number>();
+    const bump = (id: string, author: string, engagement: number) => {
+      if (engagement > 0) {
+        postEngagement.set(id, engagement);
+        authorEngagement.set(author, (authorEngagement.get(author) || 0) + engagement);
+      }
+    };
+    const items: UnifiedItem[] = [];
+    for (const note of nostrFeedNotes) {
+      const profile = nostrProfiles[note.pubkey];
+      const handle = profile?.name ?? profile?.displayName ?? undefined;
+      const avatar = profile?.picture ?? undefined;
+      const u = toUnifiedFromNostr(note, handle, avatar);
+      items.push(u);
+      bump(u.id, u.author.id, nostrReactions[note.id] || 0);
+    }
+    for (const post of blueskyPublicPosts) {
+      const u = toUnifiedFromBluesky(post);
+      items.push(u);
+      bump(u.id, u.author.id, post.likeCount || 0);
+    }
+    return gateSocialItems(items, {
+      wotSet,
+      postEngagement,
+      authorEngagement,
+      authorId: (u) => u.author.id,
     });
-  }, [blueskyPublicPosts, activeSocialTopic]);
-
-  // New-posts pill (#4): when the social feed gains items newer than the last
-  // top item the user saw, surface a count. Snapshots the top id on first load;
-  // counts how many new ids land above that snapshot on subsequent loads.
-  useEffect(() => {
-    if (mobileTab !== "feed") return;
-    const topId = (socialSource === "nostr" ? visibleNostrNotes[0]?.id : visibleBlueskyItems[0]?.uri) || null;
-    if (topId === null) return;
-    if (lastSeenTopPostIdRef.current === null) {
-      lastSeenTopPostIdRef.current = topId;
-      return;
-    }
-    if (topId === lastSeenTopPostIdRef.current) return;
-    // New top item arrived — count how many sit above the last-seen snapshot.
-    const list: ReadonlyArray<{ id?: string; uri?: string }> =
-      socialSource === "nostr" ? visibleNostrNotes : visibleBlueskyItems;
-    const keyOf = (i: { id?: string; uri?: string }) =>
-      (socialSource === "nostr" ? i.id : i.uri) || "";
-    const idx = list.findIndex((i) => keyOf(i) === lastSeenTopPostIdRef.current);
-    const fresh = idx === -1 ? list.length : idx;
-    if (fresh > 0) setNewPostsCount((c) => c + fresh);
-    lastSeenTopPostIdRef.current = topId;
-  }, [mobileTab, socialSource, visibleNostrNotes, visibleBlueskyItems]);
-
-  // Reset the new-posts pill + snapshot when leaving/switching the social feed.
-  useEffect(() => {
-    if (mobileTab !== "feed") {
-      setNewPostsCount(0);
-      lastSeenTopPostIdRef.current = null;
-    }
-  }, [mobileTab, socialSource, activeChannelId, activeSocialTopic]);
+  }, [nostrFeedNotes, blueskyPublicPosts, nostrProfiles, nostrReactions, wotSet]);
 
   /**
-   * Reads tab unified stream: merges Nostr articles + RSS items into one
-   * `UnifiedItem[]`, then ranks ("For You") or sorts chronologically ("Latest").
-   * The existing Nostr/RSS toggle becomes an *additive source filter* on top of
-   * this unified stream, instead of a hard either/or.
+   * Index back from UnifiedItem.id → the original social object, so the Reads
+   * stream can render the full social card (with follow / like / reply affordances)
+   * instead of a flattened article card. Keyed by note.id / post.uri.
+   */
+  const socialSourceIndex = useMemo<
+    Map<string, NostrNote | BlueskyPublicPost>
+  >(() => {
+    const m = new Map<string, NostrNote | BlueskyPublicPost>();
+    for (const note of nostrFeedNotes) m.set(note.id, note);
+    for (const post of blueskyPublicPosts) m.set(post.uri, post);
+    return m;
+  }, [nostrFeedNotes, blueskyPublicPosts]);
+
+  /**
+   * Reads tab unified stream: merges Nostr articles + RSS items + Hacker News +
+   * YouTube + gated social into one `UnifiedItem[]`, then ranks ("For You") or
+   * sorts chronologically ("Latest"). Every source fights for a ranked slot;
+   * social already passed its reputation gate above before joining the stream.
    */
   const rankedReads = useMemo<RankedRead[]>(() => {
     const unified: UnifiedItem[] = [];
@@ -7058,10 +7020,12 @@ Rules:
     for (const v of readsYouTubeItems) {
       unified.push(toUnifiedFromYouTube(v));
     }
+    // Social posts (gated above) join the stream and rank by the same lens.
+    for (const s of socialUnifiedForReads) unified.push(s);
     return readsRankMode === "latest"
       ? chronologicalReads(unified)
       : rankReads(unified, journalTopics);
-  }, [readsArticles, readsRssItems, techNewsItems, readsYouTubeItems, readsRankMode, journalTopics]);
+  }, [readsArticles, readsRssItems, techNewsItems, readsYouTubeItems, socialUnifiedForReads, readsRankMode, journalTopics]);
 
   // Persist the ranked Reads stream so the next open paints instantly from
   // cache (local-first). Only the UnifiedItem[] is cached; ranking re-runs on
@@ -7121,10 +7085,8 @@ Rules:
       // QUALITY FILTER (Amethyst-style): drop non-English (non-Latin script),
       // spam, content-warnings, and dedupe flooding pubkeys. Validated live:
       // this roughly halves firehose noise (58 → ~26 usable English notes) and
-      // removes testnet bot spam. Stats surface in the feed header.
-      const stats: NostrFeedStats = { total: 0, droppedNonLanguage: 0, droppedSpam: {}, droppedDuplicate: 0 };
-      const filtered = filterNostrFeed(notes, { maxPerPubkey: 2, stats });
-      setNostrFeedStats(stats);
+      // removes testnet bot spam before it reaches the reputation gate.
+      const filtered = filterNostrFeed(notes, { maxPerPubkey: 2 });
       setNostrFeedNotes(filtered);
       // Enrich the feed in the background: real names/avatars (kind 0),
       // like counts (kind 7), and parent notes for reply context. Fire and
@@ -7182,40 +7144,12 @@ Rules:
     }
   }
 
-  /** Dispatcher: load whichever source is active. */
+  /** Dispatcher: load whichever social source is active (Nostr | Bluesky). */
   async function loadSocialFeed() {
-    if (socialSource === "following") {
-      await loadFollowingFeedApp();
-    } else if (socialSource === "bluesky") {
+    if (socialSource === "bluesky") {
       await loadBlueskyPublicFeed();
     } else {
       await loadNostrFeed();
-    }
-  }
-
-  /**
-   * Following home timeline: the newest posts from authors the user follows,
-   * merged across Nostr (one multi-author relay query) and Bluesky (per-author
-   * fan-out). This is the Twitter/Bluesky home-timeline experience.
-   */
-  async function loadFollowingFeedApp() {
-    if (followingLoading) return;
-    setFollowingLoading(true);
-    setFollowingError("");
-    try {
-      const result = await loadFollowingFeed(getFollowedIds(), {
-        nostrProfiles: useNostrLocalStore ? undefined : undefined, // profiles resolve lazily via card render
-      });
-      setFollowingItems(result.items);
-      if (result.items.length === 0 && getFollowedIds().length === 0) {
-        setFollowingError(""); // empty state handled in UI, not as error
-      }
-    } catch (e) {
-      setFollowingItems([]);
-      const msg = e instanceof Error ? e.message : String(e);
-      setFollowingError(`Couldn't load following feed: ${msg.slice(0, 100)}`);
-    } finally {
-      setFollowingLoading(false);
     }
   }
 
@@ -7424,90 +7358,52 @@ Rules:
   }
 
   /**
-   * Source + channel + journal chip system. This is the filtering control panel:
-   *   1. SOURCE row: Nostr | Bluesky (picks the open-protocol source)
-   *   2. CHANNEL row: preset source-level levers (validated to return content).
-   *      Switching a channel RE-FETCHES from the source — content is guaranteed
-   *      for popular terms (NIP-12 hashtags on Nostr, searchPosts on Bluesky).
-   *   3. JOURNAL refinement (optional): narrows the channel's results using
-   *      journal-derived topics via the client-side matchesTopic predicate.
+   * Social source + channel selector, shown inside the Reads "▸ Social"
+   * disclosure. Picks which open-protocol source (Nostr | Bluesky) feeds the
+   * gated social stream, and which channel (hashtag / search) scopes it at the
+   * SOURCE — so the reputation gate and ranker work on topic-relevant posts.
+   * No "Following" free timeline: followed people seed the WoT gate instead.
    */
   function renderSourceAndChannels() {
     const channels = channelsForSource(socialSource);
     return (
       <div className="filter-panel">
-        {/* Discovery filters collapsed by default — the home view is "Following"
-            (your timeline, "for me"). Tap Discover to open the Nostr/Bluesky
-            channel firehose for finding new people to follow. */}
-        <button
-          type="button"
-          className={`source-pill discover-toggle${feedDiscoverOpen ? " active" : ""}`}
-          onClick={() => setFeedDiscoverOpen((v) => !v)}
-          aria-expanded={feedDiscoverOpen}
-        >{feedDiscoverOpen ? "▾ Discover" : "▸ Discover"}</button>
-        {feedDiscoverOpen ? (
-          <>
-            <div className="source-toggle" role="group" aria-label="Content source">
-              <button
-                type="button"
-                className={`source-pill${socialSource === "following" ? " active" : ""}`}
-                onClick={() => { if (socialSource !== "following") { setSocialSource("following"); setActiveChannelId(""); } }}
-                title="Home timeline — newest posts from people you follow"
-              >Following</button>
-              <button
-                type="button"
-                className={`source-pill${socialSource === "nostr" ? " active" : ""}`}
-                onClick={() => { if (socialSource !== "nostr") { setSocialSource("nostr"); setActiveChannelId(""); } }}
-              >Nostr</button>
-              <button
-                type="button"
-                className={`source-pill${socialSource === "bluesky" ? " active" : ""}`}
-                onClick={() => { if (socialSource !== "bluesky") { setSocialSource("bluesky"); setActiveChannelId(""); } }}
-              >Bluesky</button>
-            </div>
+        <div className="source-toggle" role="group" aria-label="Social source">
+          <button
+            type="button"
+            className={`source-pill${socialSource === "nostr" ? " active" : ""}`}
+            onClick={() => { if (socialSource !== "nostr") { setSocialSource("nostr"); setActiveChannelId(""); } }}
+          >Nostr</button>
+          <button
+            type="button"
+            className={`source-pill${socialSource === "bluesky" ? " active" : ""}`}
+            onClick={() => { if (socialSource !== "bluesky") { setSocialSource("bluesky"); setActiveChannelId(""); } }}
+          >Bluesky</button>
+        </div>
 
-            <div className="topic-chips" role="group" aria-label="Content channels">
-              {channels.map((ch) => (
-                <button
-                  key={ch.id}
-                  type="button"
-                  className={`topic-chip${activeChannelId === ch.id ? " active" : ""}`}
-                  onClick={() => {
-                    const next = activeChannelId === ch.id ? "" : ch.id;
-                    setActiveChannelId(next);
-                    // Immediately fetch the newly-selected channel.
-                    // Defer via microtask so state is committed first.
-                    queueMicrotask(() => {
-                      if (next) {
-                        void (socialSource === "bluesky" ? loadBlueskyPublicFeed() : loadNostrFeed());
-                      } else {
-                        void loadSocialFeed();
-                      }
-                    });
-                  }}
-                  title={`${ch.lever}: ${ch.query || ch.label}`}
-                >{ch.emoji ? <span aria-hidden>{ch.emoji}</span> : null}{ch.label}</button>
-              ))}
-            </div>
-          </>
-        ) : null}
-
-        {/* Optional journal refinement — narrows results further. Always visible
-            because it IS the lens (the journal-is-the-lens thesis). */}
-        {journalTopics.length > 0 ? (
-          <div className="topic-chips journal-refine" role="group" aria-label="Refine by journal topic">
-            <span className="topic-chips-label">From journals:</span>
-            {journalTopics.slice(0, 6).map((topic) => (
-              <button
-                key={topic.label}
-                type="button"
-                className={`topic-chip small${activeSocialTopic === topic.label ? " active" : ""}`}
-                onClick={() => setActiveSocialTopic(activeSocialTopic === topic.label ? "" : topic.label)}
-                title={`${topic.weight} mentions in your journals`}
-              >{topic.label}</button>
-            ))}
-          </div>
-        ) : null}
+        <div className="topic-chips" role="group" aria-label="Content channels">
+          {channels.map((ch) => (
+            <button
+              key={ch.id}
+              type="button"
+              className={`topic-chip${activeChannelId === ch.id ? " active" : ""}`}
+              onClick={() => {
+                const next = activeChannelId === ch.id ? "" : ch.id;
+                setActiveChannelId(next);
+                // Immediately fetch the newly-selected channel.
+                // Defer via microtask so state is committed first.
+                queueMicrotask(() => {
+                  if (next) {
+                    void (socialSource === "bluesky" ? loadBlueskyPublicFeed() : loadNostrFeed());
+                  } else {
+                    void loadSocialFeed();
+                  }
+                });
+              }}
+              title={`${ch.lever}: ${ch.query || ch.label}`}
+            >{ch.emoji ? <span aria-hidden>{ch.emoji}</span> : null}{ch.label}</button>
+          ))}
+        </div>
       </div>
     );
   }
@@ -8676,30 +8572,29 @@ Rules:
   }, [chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
-    if (mobileTab !== "feed" && mobileTab !== "profile" && mobileTab !== "journal") {
+    if (mobileTab !== "reads" && mobileTab !== "profile" && mobileTab !== "journal") {
       return;
     }
     void loadRuntimeMediaCapabilities();
   }, [mobileTab, feedSource, chatGatewayToken, gatewayBaseUrl]);
 
-  // Auto-load social feed (Nostr / Bluesky / Following) when the Feed tab is shown and empty.
+  // Auto-load social content (Nostr / Bluesky channels) when the Reads tab is
+  // shown, so social posts pass through the reputation gate and fold into the
+  // ranked stream. (The Feed tab was collapsed into Reads.)
   useEffect(() => {
-    if (mobileTab === "feed") {
-      if (socialSource === "following") {
-        if (followingItems.length === 0 && !followingLoading) void loadFollowingFeedApp();
-      } else if (socialSource === "bluesky") {
-        if (blueskyPublicPosts.length === 0 && !blueskyPublicLoading) void loadBlueskyPublicFeed();
-      } else if (nostrFeedNotes.length === 0 && !nostrFeedLoading) {
-        void loadNostrFeed();
-      }
+    if (mobileTab !== "reads") return;
+    if (socialSource === "bluesky") {
+      if (blueskyPublicPosts.length === 0 && !blueskyPublicLoading) void loadBlueskyPublicFeed();
+    } else {
+      if (nostrFeedNotes.length === 0 && !nostrFeedLoading) void loadNostrFeed();
     }
-  }, [mobileTab, socialSource]);
+  }, [mobileTab, socialSource, activeChannelId]);
 
   // Load Bluesky video posts when the Feed tab opens, so the inline videos and
-  // the tap-to-fullscreen overlay have content to show. (The dedicated Reels tab
-  // was removed; video now lives in the unified Feed.)
+  // the tap-to-fullscreen overlay have content to show. Video now lives in the
+  // Reads stream (Bluesky video cards), so warm reels when Reads opens.
   useEffect(() => {
-    if (mobileTab === "feed" && reelsPosts.length === 0 && !reelsLoading) {
+    if (mobileTab === "reads" && reelsPosts.length === 0 && !reelsLoading) {
       void loadReelsFeed();
     }
   }, [mobileTab]);
@@ -10128,143 +10023,6 @@ Rules:
           </ViewErrorBoundary>
         ) : null}
 
-        {mobileTab === "feed" ? (
-          <ViewErrorBoundary title="Feed">
-            {/* New-posts pill (#4): surfaces when fresh social items arrive. */}
-            {newPostsCount > 0 ? (
-              <button
-                type="button"
-                className="new-posts-pill"
-                onClick={() => { window.scrollTo({ top: 0, behavior: "smooth" }); setNewPostsCount(0); }}
-              >
-                ↑ {newPostsCount} new {newPostsCount === 1 ? "post" : "posts"}
-              </button>
-            ) : null}
-            <PullToRefresh onRefresh={withRefreshToast("Feed updated", () => loadSocialFeed())} enabled={!(nostrFeedLoading || blueskyPublicLoading || followingLoading)}>
-            <div className="stack">
-              <div className="feed-tab-container">
-                <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
-                  <h2>Feed</h2>
-                  {/* News lives in the Reads tab now — Feed is social-only (your follows + open-protocol channels). */}
-                </div>
-
-                  <>
-                    <div className="social-section-label">{socialSource === "following" ? "Home · your follows" : "Channels · open-protocol feeds"}</div>
-                    {renderSourceAndChannels()}
-                    {/* Show how many notes the quality filter dropped (language/spam/dedup). */}
-                    {socialSource === "nostr" && nostrFeedStats && nostrFeedNotes.length > 0 ? (
-                      <p className="text-sm muted" style={{ padding: '0.2rem 0.25rem 0', fontSize: '0.72rem' }}>
-                        Filtered {nostrFeedStats.droppedNonLanguage + Object.values(nostrFeedStats.droppedSpam).reduce((a, b) => a + b, 0) + nostrFeedStats.droppedDuplicate} of {nostrFeedStats.total} (non-English, spam, duplicates)
-                      </p>
-                    ) : null}
-
-                    {socialSource === "following" ? (
-                      followingLoading && followingItems.length === 0 ? (
-                        <div style={{ padding: '2rem', textAlign: 'center' }}>
-                          <span className="btn-spinner" aria-hidden />
-                          <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Loading your timeline…</p>
-                        </div>
-                      ) : followingError ? (
-                        <div className="feed-empty-filtered">
-                          <p className="text-sm muted" style={{ margin: 0 }}>{followingError}</p>
-                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadFollowingFeedApp()}>Retry</button>
-                        </div>
-                      ) : getFollowedIds().length === 0 ? (
-                        <div className="feed-create-hero">
-                          <div className="feed-create-hero-icon">👥</div>
-                          <h3>Follow people to build your timeline</h3>
-                          <p className="text-sm muted">Tap any author's name in the Nostr or Bluesky feeds, then Follow. Their newest posts will appear here — your home timeline, across both protocols.</p>
-                          <button type="button" className="primary" onClick={() => { setSocialSource("nostr"); setActiveChannelId(""); }}>Discover on Nostr</button>
-                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => setMobileTab("journal")}>✍️ Write a journal entry</button>
-                        </div>
-                      ) : followingItems.length === 0 ? (
-                        <div className="feed-empty-filtered">
-                          <p className="text-sm muted" style={{ margin: 0 }}>No recent posts from the {getFollowedIds().length} {getFollowedIds().length === 1 ? "person" : "people"} you follow.</p>
-                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadFollowingFeedApp()}>Refresh</button>
-                        </div>
-                      ) : (
-                        <div className="feed-posts-list">
-                          {followingItems.slice(0, feedVisibleCount).map((item) =>
-                            item.nostrNote ? renderNostrNoteCard(item.nostrNote)
-                            : item.blueskyPost ? renderBlueskyCard(item.blueskyPost)
-                            : null
-                          )}
-                          {followingItems.length > feedVisibleCount ? (
-                            <button type="button" className="load-more-btn" onClick={() => setFeedVisibleCount((c) => c + 20)}>Show more</button>
-                          ) : null}
-                        </div>
-                      )
-                    ) : socialSource === "nostr" ? (
-                      nostrFeedLoading && nostrFeedNotes.length === 0 ? (
-                        <div style={{ padding: '2rem', textAlign: 'center' }}>
-                          <span className="btn-spinner" aria-hidden />
-                          <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Loading Nostr…</p>
-                        </div>
-                      ) : socialFeedError ? (
-                        <div className="feed-empty-filtered">
-                          <p className="text-sm muted" style={{ margin: 0 }}>{socialFeedError}</p>
-                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadNostrFeed()}>Retry</button>
-                        </div>
-                      ) : nostrFeedNotes.length === 0 ? (
-                        <div className="feed-create-hero">
-                          <div className="feed-create-hero-icon">🌐</div>
-                          <h3>Discover on Nostr</h3>
-                          <p className="text-sm muted">Pick a channel above to subscribe to a Nostr topic. Hashtags stream live from relays — try #nostr or #bitcoin.</p>
-                          <button type="button" className="primary" onClick={() => void loadNostrFeed()}>Load Feed</button>
-                        </div>
-                      ) : visibleNostrNotes.length === 0 ? (
-                        <div className="feed-empty-filtered">
-                          <p className="text-sm muted" style={{ margin: 0 }}>No notes match “{activeSocialTopic}” right now.</p>
-                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => setActiveSocialTopic("")}>Clear filter</button>
-                        </div>
-                      ) : (
-                        <div className="feed-posts-list">
-                          {visibleNostrNotes.slice(0, feedVisibleCount).map((note) => renderNostrNoteCard(note))}
-                          {visibleNostrNotes.length > feedVisibleCount ? (
-                            <button type="button" className="load-more-btn" onClick={() => setFeedVisibleCount((c) => c + 20)}>Show more</button>
-                          ) : null}
-                        </div>
-                      )
-                    ) : (
-                      // Bluesky source
-                      blueskyPublicLoading && blueskyPublicPosts.length === 0 ? (
-                        <div style={{ padding: '2rem', textAlign: 'center' }}>
-                          <span className="btn-spinner" aria-hidden />
-                          <p className="text-sm muted" style={{ marginTop: '0.5rem' }}>Searching Bluesky…</p>
-                        </div>
-                      ) : blueskyPublicError ? (
-                        <div className="feed-empty-filtered">
-                          <p className="text-sm muted" style={{ margin: 0 }}>{blueskyPublicError}</p>
-                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => void loadBlueskyPublicFeed()}>Retry</button>
-                        </div>
-                      ) : blueskyPublicPosts.length === 0 ? (
-                        <div className="feed-create-hero">
-                          <div className="feed-create-hero-icon">✨</div>
-                          <h3>Discover on Bluesky</h3>
-                          <p className="text-sm muted">Pick a channel above to search public Bluesky posts. Works for any term — try tech, art, or photography.</p>
-                          <button type="button" className="primary" onClick={() => void loadBlueskyPublicFeed()}>Search Bluesky</button>
-                        </div>
-                      ) : visibleBlueskyItems.length === 0 ? (
-                        <div className="feed-empty-filtered">
-                          <p className="text-sm muted" style={{ margin: 0 }}>No posts match “{activeSocialTopic}” right now.</p>
-                          <button type="button" className="ghost text-sm" style={{ marginTop: '0.5rem' }} onClick={() => setActiveSocialTopic("")}>Clear filter</button>
-                        </div>
-                      ) : (
-                        <div className="feed-posts-list">
-                          {visibleBlueskyItems.slice(0, feedVisibleCount).map((post) => renderBlueskyCard(post))}
-                          {visibleBlueskyItems.length > feedVisibleCount ? (
-                            <button type="button" className="load-more-btn" onClick={() => setFeedVisibleCount((c) => c + 20)}>Show more</button>
-                          ) : null}
-                        </div>
-                      )
-                    )}
-                  </>
-              </div>
-            </div>
-            </PullToRefresh>
-          </ViewErrorBoundary>
-        ) : null}
-
         {mobileTab === "reads" ? (
           <ViewErrorBoundary title="Reads">
             <PullToRefresh onRefresh={withRefreshToast("Reads updated", () => loadReadsFeed())} enabled={!readsLoading}>
@@ -10272,7 +10030,7 @@ Rules:
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
                   <h2>Reads</h2>
-                  <span className="text-sm muted">{displayReads.length} stories · Nostr + RSS + Hacker News{readsYouTubeEnabled ? " + YouTube" : ""}</span>
+                  <span className="text-sm muted">{displayReads.length} stories · ranked by your lens</span>
                 </div>
 
                 {/* Rank mode toggle: "For You" (scored) vs "Latest" (chronological),
@@ -10310,6 +10068,17 @@ Rules:
                   </div>
                 ) : null}
 
+                {/* Social disclosure: picks the Nostr/Bluesky channels that feed
+                    the gated social stream. Social posts pass a reputation gate
+                    (WoT / engagement) then rank alongside articles here. */}
+                <button
+                  type="button"
+                  className={`source-pill discover-toggle${feedSocialOpen ? " active" : ""}`}
+                  onClick={() => setFeedSocialOpen((v) => !v)}
+                  aria-expanded={feedSocialOpen}
+                >{feedSocialOpen ? "▾ Social" : "▸ Social"}</button>
+                {feedSocialOpen ? renderSourceAndChannels() : null}
+
                 {/* Subtle refresh indicator when content is already showing from cache. */}
                 {readsLoading && displayReads.length > 0 ? (
                   <div className="text-sm muted" style={{ padding: '0.25rem 0.25rem 0', fontSize: '0.72rem' }}>
@@ -10331,86 +10100,65 @@ Rules:
                   <div className="feed-create-hero">
                     <div className="feed-create-hero-icon">📰</div>
                     <h3>No articles yet</h3>
-                    <p className="text-sm muted">Long-form posts from Nostr (NIP-23), RSS blogs, and Hacker News. Pull to refresh, or toggle sources above.</p>
+                    <p className="text-sm muted">Long-form posts, news, video, and social — all ranked by what you've been writing about. Pull to refresh, or open Sources / Social to steer the stream.</p>
                   </div>
                 ) : (() => {
-                  // Apply pagination first, then split hero from the rest.
+                  // Flat ranked stream: every item earned its slot through the
+                  // journal lens. Social cards render with full affordances
+                  // (follow / like / reply); articles render as compact cards.
                   const visible = displayReads.slice(0, readsVisibleCount);
-                  const [hero, ...rest] = visible;
-                  const heroUrl = hero.item.content.linkUrl || "#";
-                  const heroHost = (() => { try { return heroUrl !== "#" ? new URL(heroUrl).hostname.replace(/^www\./, "") : ""; } catch { return ""; } })();
-                  // Group the remainder by sourceLabel, preserving rank order.
-                  const groups: { label: string; items: RankedRead[] }[] = [];
-                  for (const r of rest) {
-                    const last = groups[groups.length - 1];
-                    if (last && last.label === r.sourceLabel) last.items.push(r);
-                    else groups.push({ label: r.sourceLabel, items: [r] });
-                  }
                   return (
-                    <>
-                      {/* Top story (hero) card. */}
-                      <a
-                        className="reads-hero"
-                        href={heroUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={(e) => { if (heroUrl === "#") { e.preventDefault(); return; } e.preventDefault(); void openFeedLink(heroUrl); }}
-                      >
-                        {hero.item.media.thumbnailUrl ? <img src={hero.item.media.thumbnailUrl} alt="" className="reads-hero-cover" loading="lazy" /> : null}
-                        <div className="reads-hero-body">
-                          <div className="reads-card-source-row">
-                            <span className="reads-card-source">{hero.sourceLabel}{heroHost ? ` · ${heroHost}` : ""}</span>
-                            <span className="reads-readtime">{hero.item.sourcePlatform === "youtube" ? "▶ Video" : `⏱ ${hero.readMinutes} min`}</span>
-                          </div>
-                          <h3 className="reads-hero-title">{hero.item.content.title || "Untitled"}</h3>
-                          {hero.item.content.body ? <p className="reads-hero-summary">{hero.item.content.body.slice(0, 220)}</p> : null}
-                          {readsRankMode === "foryou" ? (() => {
-                            const m = journalTopics.find((t) => matchesTopic(hero.item, t.label));
-                            return m ? <span className="reads-rationale">✨ Because you wrote about {m.label}</span> : null;
-                          })() : null}
-                        </div>
-                      </a>
-
-                      {/* Source-grouped compact cards (Google News "by source" pattern). */}
-                      <div className="reads-list">
-                        {groups.map((g) => (
-                          <div key={g.label} className="reads-group">
-                            <div className="reads-group-header">{g.label} <span className="reads-group-count">· {g.items.length}</span></div>
-                            {g.items.map(({ item, readMinutes }) => {
-                              const url = item.content.linkUrl || "#";
-                              const host = (() => { try { return url !== "#" ? new URL(url).hostname.replace(/^www\./, "") : ""; } catch { return ""; } })();
-                              return (
-                                <a
-                                  key={item.id}
-                                  className="reads-card"
-                                  href={url}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  onClick={(e) => { if (url === "#") { e.preventDefault(); return; } e.preventDefault(); void openFeedLink(url); }}
-                                >
-                                  {item.media.thumbnailUrl ? <img src={item.media.thumbnailUrl} alt="" className="reads-card-cover" loading="lazy" /> : null}
-                                  <div className="reads-card-body">
-                                    <div className="reads-card-source-row">
-                                      <span className="reads-card-source">{host || item.sourcePlatform}</span>
-                                      <span className="reads-readtime">{item.sourcePlatform === "youtube" ? "▶ Video" : `⏱ ${readMinutes} min`}</span>
-                                    </div>
-                                    <h3 className="reads-card-title">{item.content.title || "Untitled"}</h3>
-                                    {item.content.body ? <p className="reads-card-summary">{item.content.body.slice(0, 200)}</p> : null}
-                                    {readsRankMode === "foryou" ? (() => {
-                                      const m = journalTopics.find((t) => matchesTopic(item, t.label));
-                                      return m ? <span className="reads-rationale">✨ {m.label}</span> : null;
-                                    })() : null}
-                                  </div>
-                                </a>
-                              );
-                            })}
-                          </div>
-                        ))}
-                        {displayReads.length > readsVisibleCount ? (
-                          <button type="button" className="load-more-btn" onClick={() => setReadsVisibleCount((c) => c + 12)}>Show more</button>
-                        ) : null}
-                      </div>
-                    </>
+                    <div className="reads-list">
+                      {visible.map(({ item, readMinutes, sourceLabel }) => {
+                        // Social item → full social card (preserves interactions).
+                        if (item.sourcePlatform === "nostr" || item.sourcePlatform === "atproto") {
+                          const src = socialSourceIndex.get(item.id);
+                          if (src) {
+                            return (
+                              <div key={item.id} className="reads-social-slot">
+                                {item.sourcePlatform === "nostr"
+                                  ? renderNostrNoteCard(src as NostrNote)
+                                  : renderBlueskyCard(src as BlueskyPublicPost)}
+                                {readsRankMode === "foryou" ? (() => {
+                                  const m = journalTopics.find((t) => matchesTopic(item, t.label));
+                                  return m ? <span className="reads-rationale">✨ {m.label}</span> : null;
+                                })() : null}
+                              </div>
+                            );
+                          }
+                        }
+                        // Article / news / video → compact card.
+                        const url = item.content.linkUrl || "#";
+                        const host = (() => { try { return url !== "#" ? new URL(url).hostname.replace(/^www\./, "") : ""; } catch { return ""; } })();
+                        return (
+                          <a
+                            key={item.id}
+                            className="reads-card"
+                            href={url}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => { if (url === "#") { e.preventDefault(); return; } e.preventDefault(); void openFeedLink(url); }}
+                          >
+                            {item.media.thumbnailUrl ? <img src={item.media.thumbnailUrl} alt="" className="reads-card-cover" loading="lazy" /> : null}
+                            <div className="reads-card-body">
+                              <div className="reads-card-source-row">
+                                <span className="reads-card-source">{host || sourceLabel}</span>
+                                <span className="reads-readtime">{item.sourcePlatform === "youtube" ? "▶ Video" : `⏱ ${readMinutes} min`}</span>
+                              </div>
+                              <h3 className="reads-card-title">{item.content.title || "Untitled"}</h3>
+                              {item.content.body ? <p className="reads-card-summary">{item.content.body.slice(0, 200)}</p> : null}
+                              {readsRankMode === "foryou" ? (() => {
+                                const m = journalTopics.find((t) => matchesTopic(item, t.label));
+                                return m ? <span className="reads-rationale">✨ {m.label}</span> : null;
+                              })() : null}
+                            </div>
+                          </a>
+                        );
+                      })}
+                      {displayReads.length > readsVisibleCount ? (
+                        <button type="button" className="load-more-btn" onClick={() => setReadsVisibleCount((c) => c + 12)}>Show more</button>
+                      ) : null}
+                    </div>
                   );
                 })()}
               </div>

@@ -14,7 +14,7 @@ import { useSyncExternalStore, useCallback } from "react";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
-export type MobileTab = "journal" | "feed" | "productivity" | "profile";
+export type MobileTab = "reads" | "journal" | "drafts" | "profile";
 export type ThemeMode = "light" | "dark";
 export type FeedSource = "local" | "bluesky";
 export type MeFeedTab = "drafts" | "published";
@@ -150,8 +150,9 @@ function deriveInitialTab(): MobileTab {
   if (typeof window === "undefined") return "journal";
   if (window.innerWidth > 900) return "journal";
   const saved = window.localStorage.getItem(UI_TAB_STORAGE_KEY);
-  if (saved === "todos" || saved === "events") return "productivity";
-  return saved === "feed" || saved === "productivity" || saved === "profile" ? saved as MobileTab : "journal";
+  // Legacy tabs (feed/productivity/todos/events/queue) collapsed into reads/drafts.
+  if (saved === "todos" || saved === "events" || saved === "productivity" || saved === "queue" || saved === "feed") return "reads";
+  return saved === "reads" || saved === "journal" || saved === "drafts" || saved === "profile" ? saved as MobileTab : "journal";
 }
 
 function deriveInitialGatewayUrl(): string {

@@ -156,6 +156,105 @@ export function chronologicalReads(items: UnifiedItem[]): RankedRead[] {
   return out;
 }
 
+/* ── Social quality gate (the reputation pipeline) ──────────────────────────
+ *
+ * Social content is the noisiest source: spam, bots, drive-by takes. Unlike
+ * articles (already curated by an editor/RSS feed) or YouTube (channel-curated),
+ * a Nostr/Bluesky firehose needs a quality gate BEFORE it competes for a ranked
+ * slot — otherwise noise floods the stream and drowns the journal-relevant
+ * signal. This is the "hardest to rank" tier from the product thesis.
+ *
+ * The gate is an admission filter, not a ranker. A social post earns a slot if
+ * its author is trusted (web-of-trust) OR it (or its author) drew real
+ * community engagement (likes + zaps). Everything admitted then goes through
+ * the same journal-driven `rankReads` as articles — interest match dominates
+ * ordering from there. This separates "is this worth a shot" (gate) from "how
+ * high" (ranker), which is the right separation for noisy sources.
+ */
+
+export interface SocialGateContext {
+  /** Trusted author ids (follow graph / WoT seed). Admits their posts outright. */
+  wotSet: ReadonlySet<string>;
+  /** Per-post engagement: UnifiedItem.id → likes + zaps count. */
+  postEngagement: ReadonlyMap<string, number>;
+  /** Per-author total engagement: author id → summed likes + zaps in batch. */
+  authorEngagement: ReadonlyMap<string, number>;
+  /** Author id accessor for a UnifiedItem. */
+  authorId: (item: UnifiedItem) => string;
+}
+
+export interface SocialGateOptions {
+  /** Min per-post engagement to admit on its own (community-vetted post). */
+  minPostEngagement?: number;
+  /** Min per-author engagement to admit ("reputed profile" by aggregate signal). */
+  minAuthorEngagement?: number;
+  /** Cold-start floor: if fewer than this pass, top up by engagement then recency
+   *  so the stream isn't empty before WoT/reactions are warm. */
+  coldStartCap?: number;
+}
+
+const DEFAULT_MIN_POST_ENGAGEMENT = 1;
+const DEFAULT_MIN_AUTHOR_ENGAGEMENT = 2;
+const DEFAULT_COLD_START_CAP = 12;
+
+/** Is a post admitted by the reputation gate (WoT or engagement)? */
+export function isSocialPostAdmitted(
+  item: UnifiedItem,
+  ctx: SocialGateContext,
+  minPostEngagement: number,
+  minAuthorEngagement: number,
+): boolean {
+  const author = ctx.authorId(item);
+  if (ctx.wotSet.has(author)) return true; // trusted author
+  if ((ctx.postEngagement.get(item.id) || 0) >= minPostEngagement) return true; // vetted post
+  if ((ctx.authorEngagement.get(author) || 0) >= minAuthorEngagement) return true; // reputed profile
+  return false;
+}
+
+/**
+ * Gate a list of social UnifiedItems through the reputation pipeline. Admits
+ * posts whose author is in the WoT, OR which earned engagement (post- or
+ * author-level). Applies a cold-start floor so an empty WoT / unloaded
+ * reactions don't blank the stream: if too few pass, top up by engagement then
+ * recency. Stable on ties.
+ */
+export function gateSocialItems(
+  items: UnifiedItem[],
+  ctx: SocialGateContext,
+  opts: SocialGateOptions = {},
+): UnifiedItem[] {
+  const minPost = opts.minPostEngagement ?? DEFAULT_MIN_POST_ENGAGEMENT;
+  const minAuthor = opts.minAuthorEngagement ?? DEFAULT_MIN_AUTHOR_ENGAGEMENT;
+  const coldCap = opts.coldStartCap ?? DEFAULT_COLD_START_CAP;
+
+  const admitted: UnifiedItem[] = [];
+  const dropped: UnifiedItem[] = [];
+  for (const item of items) {
+    if (isSocialPostAdmitted(item, ctx, minPost, minAuthor)) admitted.push(item);
+    else dropped.push(item);
+  }
+
+  // Cold-start top-up: keep a modest stream alive before enrichment is warm.
+  if (admitted.length < coldCap && dropped.length > 0) {
+    const need = coldCap - admitted.length;
+    const now = NOW();
+    const topup = dropped
+      .map((item) => ({
+        item,
+        key:
+          (ctx.postEngagement.get(item.id) || 0) * 1_000_000 +
+          (ctx.authorEngagement.get(ctx.authorId(item)) || 0) +
+          // tiebreak: recency (newer first) so a cold stream isn't all stale
+          (Math.max(0, now - item.timestamp) / 1_000_000),
+      }))
+      .sort((a, b) => b.key - a.key)
+      .slice(0, need)
+      .map((x) => x.item);
+    admitted.push(...topup);
+  }
+  return admitted;
+}
+
 /* ── Unified feed ranking (social: text / image / video) ──────────────────── */
 //
 // The Reads scorer above favors long-form (read-time Goldilocks). The unified

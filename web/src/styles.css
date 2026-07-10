@@ -4191,6 +4191,16 @@ button.local-ai-preset {
   width: 24px;
   height: 24px;
 }
+/* 4-button layout: the most spacious — Reads/Journal/Drafts/Profile. Fewer
+   destinations means larger touch targets and calmer spacing (the thesis).
+   Social folded into Reads, so there's no dedicated Feed tab anymore. */
+.bottom-nav-4 button {
+  padding: 12px 6px;
+}
+.bottom-nav-4 svg {
+  width: 26px;
+  height: 26px;
+}
 
 /* -- Bluesky card: video, external link card, quote -- */
 .bluesky-video-wrap {
@@ -4506,6 +4516,15 @@ button.local-ai-preset {
   flex-direction: column;
   gap: 0.6rem;
   padding: 0 0.25rem;
+}
+/* A social post (Nostr/Bluesky) rendered inline in the ranked Reads stream.
+   Social cards carry their own padding/affordances; this wrapper just gives
+   them spacing and surfaces the "because you wrote about X" rationale under them
+   so they read as part of the same ranked list as article cards. */
+.reads-social-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
 }
 .reads-card {
   display: flex;
