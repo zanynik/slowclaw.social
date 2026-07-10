@@ -3942,12 +3942,23 @@ button.local-ai-preset {
 }
 
 /* ── Liked state on tweet action ─────────────────────────────────────────── */
-.tweet-action.liked {
-  color: #e0245e;
+/* Publish action (paper-plane send) — replaces the misleading heart that
+   silently posted to Nostr. Drafts get a clear "Publish" button; published
+   drafts show a muted "✓ Published" badge instead of a tappable action. */
+.tweet-action.publish-btn {
+  gap: 0.3rem;
+  color: var(--accent);
+  font-weight: 600;
 }
-.tweet-action.liked svg {
-  fill: #e0245e;
-  stroke: #e0245e;
+.tweet-action.publish-btn svg {
+  width: 16px;
+  height: 16px;
+}
+.tweet-action.published-pill {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: default;
 }
 
 /* ── Modal overlay + dialog ──────────────────────────────────────────────── */

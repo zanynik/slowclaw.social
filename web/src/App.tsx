@@ -558,7 +558,9 @@ function defaultMobileTab(): MobileTab {
   if (!onboardingSeen) {
     return "journal";
   }
-  return "feed";
+  // Returning users land on Reads — the journal-curated stream is the heart of
+  // the app ("reads that are for me"). A saved last-tab still wins (above).
+  return "reads";
 }
 
 function useIsLargeScreen() {
@@ -1719,7 +1721,6 @@ function App() {
   // so content is guaranteed for popular terms (see lib/socialFeed.ts catalog).
   const [socialSource, setSocialSource] = useState<SocialSource>("nostr");
   const [activeChannelId, setActiveChannelId] = useState<string>("");
-  const [feedView, setFeedView] = useState<"social" | "news">("social");
   // Following home timeline (merged Nostr + Bluesky from the follows store).
   const [followingItems, setFollowingItems] = useState<FollowingFeedItem[]>([]);
   const [followingLoading, setFollowingLoading] = useState(false);
@@ -1807,7 +1808,7 @@ function App() {
   const [manualInterests, setManualInterests] = useState<string[]>(() => getManualInterests());
   const [interestDraft, setInterestDraft] = useState("");
   // Profile content tab: Posted | Drafts | Saved (Twitter/Instagram-style segmented control).
-  const [profileContentTab, setProfileContentTab] = useState<"posted" | "drafts" | "saved">("posted");
+  const [profileContentTab, setProfileContentTab] = useState<"posted" | "saved">("posted");
   // Profile follower/following counts (Bluesky via public AppView, Nostr via kind-3).
   const [blueskyCounts, setBlueskyCounts] = useState<BlueskyProfileCounts | null>(null);
   const [nostrFollowingCount, setNostrFollowingCount] = useState<number | null>(null);
@@ -1968,7 +1969,7 @@ function App() {
   }
 
   // Reset feed pagination when the source/topic changes (so the list isn't empty).
-  useEffect(() => { setFeedVisibleCount(20); }, [socialSource, activeChannelId, activeSocialTopic, feedView]);
+  useEffect(() => { setFeedVisibleCount(20); }, [socialSource, activeChannelId, activeSocialTopic]);
   // Reset Reads pagination when the rank mode / RSS filter changes.
   useEffect(() => { setReadsVisibleCount(12); }, [readsRankMode, activeRssFeedIds]);
 
@@ -7176,7 +7177,7 @@ Rules:
   // top item the user saw, surface a count. Snapshots the top id on first load;
   // counts how many new ids land above that snapshot on subsequent loads.
   useEffect(() => {
-    if (mobileTab !== "feed" || feedView !== "social") return;
+    if (mobileTab !== "feed") return;
     const topId = (socialSource === "nostr" ? visibleNostrNotes[0]?.id : visibleBlueskyItems[0]?.uri) || null;
     if (topId === null) return;
     if (lastSeenTopPostIdRef.current === null) {
@@ -7193,22 +7194,15 @@ Rules:
     const fresh = idx === -1 ? list.length : idx;
     if (fresh > 0) setNewPostsCount((c) => c + fresh);
     lastSeenTopPostIdRef.current = topId;
-  }, [mobileTab, feedView, socialSource, visibleNostrNotes, visibleBlueskyItems]);
+  }, [mobileTab, socialSource, visibleNostrNotes, visibleBlueskyItems]);
 
   // Reset the new-posts pill + snapshot when leaving/switching the social feed.
   useEffect(() => {
-    if (mobileTab !== "feed" || feedView !== "social") {
+    if (mobileTab !== "feed") {
       setNewPostsCount(0);
       lastSeenTopPostIdRef.current = null;
     }
-  }, [mobileTab, feedView, socialSource, activeChannelId, activeSocialTopic]);
-
-  /** Hacker News items normalized to UnifiedItem and filtered by the active topic. */
-  const visibleTechNews = useMemo(() => {
-    const t = activeSocialTopic.trim().toLowerCase();
-    if (!t) return techNewsItems;
-    return techNewsItems.filter((item) => matchesTopic(toUnifiedFromHN(item), t));
-  }, [techNewsItems, activeSocialTopic]);
+  }, [mobileTab, socialSource, activeChannelId, activeSocialTopic]);
 
   /**
    * Reads tab unified stream: merges Nostr articles + RSS items into one
@@ -9046,7 +9040,7 @@ Rules:
 
   // Auto-load social feed (Nostr / Bluesky / Following) when the Feed tab is shown and empty.
   useEffect(() => {
-    if (mobileTab === "feed" && feedView === "social") {
+    if (mobileTab === "feed") {
       if (socialSource === "following") {
         if (followingItems.length === 0 && !followingLoading) void loadFollowingFeedApp();
       } else if (socialSource === "bluesky") {
@@ -9055,14 +9049,7 @@ Rules:
         void loadNostrFeed();
       }
     }
-  }, [mobileTab, feedView, socialSource]);
-
-  // Auto-load tech news when the Feed's News view is shown and empty.
-  useEffect(() => {
-    if (mobileTab === "feed" && feedView === "news" && techNewsItems.length === 0 && !techNewsLoading) {
-      void loadTechNews();
-    }
-  }, [mobileTab, feedView]);
+  }, [mobileTab, socialSource]);
 
   // Load Bluesky video posts when the Feed tab opens, so the inline videos and
   // the tap-to-fullscreen overlay have content to show. (The dedicated Reels tab
@@ -10475,9 +10462,14 @@ Rules:
                             ref={(el) => { if (el) { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; } }}
                           />
                           <div className="tweet-actions">
-                            <button type="button" className={`tweet-action${post.liked ? " liked" : ""}`} onClick={() => handleLikePost(post)} title="Like">
-                              <svg viewBox="0 0 24 24" fill={post.liked ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
-                            </button>
+                            {post.liked ? (
+                              <span className="tweet-action published-pill" title="Published to Nostr">✓ Published</span>
+                            ) : (
+                              <button type="button" className="tweet-action publish-btn" onClick={() => handleLikePost(post)} title="Publish to Nostr" aria-label="Publish to Nostr">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                                <span>Publish</span>
+                              </button>
+                            )}
                             <button type="button" className="tweet-action" onClick={() => {
                               setPersistedPosts((prev) => { const next = prev.filter((p) => p.id !== post.id); savePersistedPosts(next); return next; });
                             }} title="Delete">
@@ -10523,59 +10515,6 @@ Rules:
                   {/* News lives in the Reads tab now — Feed is social-only (your follows + open-protocol channels). */}
                 </div>
 
-                {feedView === "news" ? (
-                  <>
-                    <div className="social-section-label">Hacker News · top stories</div>
-                    {techNewsLoading && techNewsItems.length === 0 ? (
-                      <div className="tech-news-list">
-                        {[0, 1, 2, 3, 4].map((i) => (
-                          <div key={i} className="tech-news-skeleton-card">
-                            <div className="tech-news-skeleton">
-                              <div className="tech-news-skeleton-row short" />
-                              <div className="tech-news-skeleton-row" />
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    ) : techNewsError && techNewsItems.length === 0 ? (
-                      <div>
-                        <p className="tech-news-error">{techNewsError}</p>
-                        <button type="button" className="ghost text-sm" onClick={() => void loadTechNews()}>Retry</button>
-                      </div>
-                    ) : techNewsItems.length > 0 ? (
-                      <div className="tech-news-list">
-                        {techNewsItems.map((item, idx) => (
-                          <a
-                            key={item.id}
-                            className="tech-news-card"
-                            href={item.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            onClick={(e) => {
-                              e.preventDefault();
-                              void openFeedLink(item.url);
-                            }}
-                          >
-                            {item.thumbnailUrl ? (
-                              <img src={item.thumbnailUrl} alt="" className="tech-news-card-thumb" loading="lazy" />
-                            ) : null}
-                            <div className="tech-news-card-rank">#{idx + 1} · <span className="tech-news-card-source">{item.source}</span></div>
-                            <p className="tech-news-card-title">{item.title}</p>
-                            <div className="tech-news-card-meta">
-                              <span className="tech-news-card-stat">▲ {item.score}</span>
-                              <span className="tech-news-card-dot">·</span>
-                              <span className="tech-news-card-stat">💬 {item.comments}</span>
-                              <span className="tech-news-card-dot">·</span>
-                              <span>{getRelativeTime(item.createdAt * 1000)}</span>
-                            </div>
-                          </a>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="text-sm muted" style={{ padding: '0.4rem 0' }}>No tech news right now.</p>
-                    )}
-                  </>
-                ) : (
                   <>
                     <div className="social-section-label">{socialSource === "following" ? "Home · your follows" : "Channels · open-protocol feeds"}</div>
                     {renderSourceAndChannels()}
@@ -10687,7 +10626,6 @@ Rules:
                       )
                     )}
                   </>
-                )}
               </div>
             </div>
             </PullToRefresh>
@@ -11045,15 +10983,11 @@ Rules:
               {/* Stats row (Twitter/Instagram signature) — tappable to switch tabs. */}
               {(() => {
                 const postedCount = persistedPosts.filter((p) => p.liked).length;
-                const draftsCount = persistedPosts.filter((p) => !p.liked).length;
                 const savedCount = savedItems.length;
                 return (
                   <div className="profile-stats">
                     <button type="button" className={`profile-stat${profileContentTab === "posted" ? " active" : ""}`} onClick={() => setProfileContentTab("posted")}>
                       <strong>{postedCount}</strong> Posts
-                    </button>
-                    <button type="button" className={`profile-stat${profileContentTab === "drafts" ? " active" : ""}`} onClick={() => setProfileContentTab("drafts")}>
-                      <strong>{draftsCount}</strong> Drafts
                     </button>
                     <button type="button" className={`profile-stat${profileContentTab === "saved" ? " active" : ""}`} onClick={() => setProfileContentTab("saved")}>
                       <strong>{savedCount}</strong> Saved
@@ -11065,14 +10999,13 @@ Rules:
               {/* Content tabs (segmented control). */}
               <div className="profile-tabs" role="tablist">
                 <button role="tab" type="button" className={`profile-tab${profileContentTab === "posted" ? " active" : ""}`} onClick={() => setProfileContentTab("posted")}>Posts</button>
-                <button role="tab" type="button" className={`profile-tab${profileContentTab === "drafts" ? " active" : ""}`} onClick={() => setProfileContentTab("drafts")}>Drafts</button>
                 <button role="tab" type="button" className={`profile-tab${profileContentTab === "saved" ? " active" : ""}`} onClick={() => setProfileContentTab("saved")}>Saved</button>
               </div>
 
               {/* Tab content. */}
               {profileContentTab === "posted" ? (
                 persistedPosts.filter((p) => p.liked).length === 0 ? (
-                  <p className="text-sm muted" style={{ padding: '1rem', textAlign: 'center' }}>No posts yet. Tap the heart on a draft in the Queue tab to publish it to Nostr.</p>
+                  <p className="text-sm muted" style={{ padding: '1rem', textAlign: 'center' }}>No posts yet. Tap Publish on a draft in the Queue tab to post it to Nostr.</p>
                 ) : (
                   <div className="feed-posts-list">
                     {persistedPosts.filter((p) => p.liked).map((post) => {
@@ -11093,30 +11026,6 @@ Rules:
                               <span className="tweet-time">{timeAgo}</span>
                             </div>
                             <p className="tweet-text">{post.text}</p>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )
-              ) : profileContentTab === "drafts" ? (
-                persistedPosts.filter((p) => !p.liked).length === 0 ? (
-                  <p className="text-sm muted" style={{ padding: '1rem', textAlign: 'center' }}>No drafts. Generate one from a journal in the Queue tab.</p>
-                ) : (
-                  <div className="feed-posts-list">
-                    {persistedPosts.filter((p) => !p.liked).map((post) => {
-                      const timeAgo = getRelativeTime(post.createdAt);
-                      return (
-                        <div key={post.id} className="tweet-card">
-                          <div className="tweet-avatar" aria-hidden>📝</div>
-                          <div className="tweet-body">
-                            <div className="tweet-header">
-                              <span className="tweet-name">Draft</span>
-                              <span className="tweet-dot">·</span>
-                              <span className="tweet-time">{timeAgo}</span>
-                            </div>
-                            <p className="tweet-text">{post.text}</p>
-                            <p className="text-sm muted" style={{ margin: '0.3rem 0 0', fontSize: '0.75rem' }}>Open Queue to review & publish →</p>
                           </div>
                         </div>
                       );
