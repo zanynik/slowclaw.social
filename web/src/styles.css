@@ -3318,6 +3318,27 @@ button.local-ai-preset {
   background: var(--accent);
   color: var(--accent-contrast, #fff);
 }
+/* Discover/Sources disclosure toggle (collapsed filter rows). */
+.discover-toggle {
+  align-self: flex-start;
+  padding: 0.3rem 0.8rem;
+  margin-bottom: 0.2rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--hairline, rgba(0, 0, 0, 0.12));
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.15s var(--ease-out), color 0.15s var(--ease-out);
+}
+.discover-toggle:hover {
+  border-color: var(--muted);
+}
+.discover-toggle.active {
+  background: var(--surface-strong, rgba(0, 0, 0, 0.05));
+  color: var(--ink);
+}
 .topic-chips.journal-refine {
   padding-top: 0.1rem;
   align-items: center;
@@ -4897,6 +4918,21 @@ button.local-ai-preset {
 .interest-profile-input:focus {
   outline: none;
   border-color: var(--accent);
+}
+/* ── Reads rationale note (the lens made visible) ──────────────────────── */
+.reads-rationale {
+  display: inline-block;
+  margin-top: 0.35rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--accent, #3b82f6);
+  background: color-mix(in srgb, var(--accent, #3b82f6) 12%, transparent);
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+  text-transform: capitalize;
+}
+.reads-hero .reads-rationale {
+  font-size: 0.74rem;
 }
 
 /* ── New-posts pill (#4) — Twitter/Bluesky "N new posts" banner ──────────── */

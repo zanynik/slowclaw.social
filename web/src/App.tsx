@@ -132,6 +132,7 @@ import {
   configureNativeLocalAi,
   getNativeLocalAiStatus,
   nativeAiChat,
+  nativeAiLoadModel,
   nativeAiEngineStatus,
   clearNativeLocalAi,
   deleteLocalModel,
@@ -1504,6 +1505,11 @@ function App() {
   const [localModelsEngineStatus, setLocalModelsEngineStatus] = useState("");
   const [localModelRuntime, setLocalModelRuntime] = useState<LocalModelRuntimeStatus | null>(null);
   const [nativeLocalAiStatus, setNativeLocalAiStatus] = useState<NativeLocalAiStatus | null>(null);
+  // Auto-warm guard: ensure the on-device model loads into memory once per cold
+  // start, so title-gen / keyword extraction / post generation actually run on
+  // Done (they otherwise gate on nativeLocalAiStatus.available and skip when the
+  // model is merely configured but not yet resident in memory).
+  const nativeAiWarmAttemptedRef = useRef(false);
   const [localModelBusyId, setLocalModelBusyId] = useState("");
   const [generatedPost, setGeneratedPost] = useState("");
   const [generatePostBusy, setGeneratePostBusy] = useState(false);
@@ -1738,6 +1744,10 @@ function App() {
     if (typeof window === "undefined") return "foryou";
     return window.localStorage.getItem("slowclaw.reads.rank") === "latest" ? "latest" : "foryou";
   });
+  // IA simplification: discovery/source filters are collapsed by default so the
+  // Feed + Reads open as plain "for me" streams. Discover/Sources expand on tap.
+  const [feedDiscoverOpen, setFeedDiscoverOpen] = useState(false);
+  const [readsSourcesOpen, setReadsSourcesOpen] = useState(false);
   // Feed/Reels "Show more" pagination (replaces the silent 40-item cliff).
   const [feedVisibleCount, setFeedVisibleCount] = useState(20);
   const [readsVisibleCount, setReadsVisibleCount] = useState(12);
@@ -2792,6 +2802,11 @@ Rules:
           holdJournalStatus(
             `Added ${interestKeywords.length} interest${interestKeywords.length > 1 ? "s" : ""} to feed`,
           );
+          // Feed the AI-extracted keywords into the LOCAL interest profile so
+          // they actually drive the iOS curation lens (Reads/YouTube/Nostr
+          // ranking), not just the desktop gateway feed system. They become
+          // first-class manual interests: boostable/mutable in Profile.
+          for (const kw of interestKeywords) addManualInterest(kw);
           // Surface the magic: reveal the extracted keywords inline so the user
           // can see — and correct — what the on-device AI inferred from their
           // writing. Drives the interest-reveal card in the Journal tab.
@@ -5787,6 +5802,9 @@ Rules:
   // common case — removing one or two of several — persists correctly.
   async function removeRevealedInterest(keyword: string) {
     const journalId = lastInterestJournalId;
+    // Also drop from the LOCAL interest profile so the iOS lens stops surfacing
+    // content for it immediately (mirrors the chip removal the user just did).
+    removeManualInterest(keyword);
     if (!journalId) return;
     const remaining = lastExtractedInterests.filter((k) => k !== keyword);
     setLastExtractedInterests(remaining);
@@ -7585,50 +7603,64 @@ Rules:
     const channels = channelsForSource(socialSource);
     return (
       <div className="filter-panel">
-        <div className="source-toggle" role="group" aria-label="Content source">
-          <button
-            type="button"
-            className={`source-pill${socialSource === "following" ? " active" : ""}`}
-            onClick={() => { if (socialSource !== "following") { setSocialSource("following"); setActiveChannelId(""); } }}
-            title="Home timeline — newest posts from people you follow"
-          >Following</button>
-          <button
-            type="button"
-            className={`source-pill${socialSource === "nostr" ? " active" : ""}`}
-            onClick={() => { if (socialSource !== "nostr") { setSocialSource("nostr"); setActiveChannelId(""); } }}
-          >Nostr</button>
-          <button
-            type="button"
-            className={`source-pill${socialSource === "bluesky" ? " active" : ""}`}
-            onClick={() => { if (socialSource !== "bluesky") { setSocialSource("bluesky"); setActiveChannelId(""); } }}
-          >Bluesky</button>
-        </div>
+        {/* Discovery filters collapsed by default — the home view is "Following"
+            (your timeline, "for me"). Tap Discover to open the Nostr/Bluesky
+            channel firehose for finding new people to follow. */}
+        <button
+          type="button"
+          className={`source-pill discover-toggle${feedDiscoverOpen ? " active" : ""}`}
+          onClick={() => setFeedDiscoverOpen((v) => !v)}
+          aria-expanded={feedDiscoverOpen}
+        >{feedDiscoverOpen ? "▾ Discover" : "▸ Discover"}</button>
+        {feedDiscoverOpen ? (
+          <>
+            <div className="source-toggle" role="group" aria-label="Content source">
+              <button
+                type="button"
+                className={`source-pill${socialSource === "following" ? " active" : ""}`}
+                onClick={() => { if (socialSource !== "following") { setSocialSource("following"); setActiveChannelId(""); } }}
+                title="Home timeline — newest posts from people you follow"
+              >Following</button>
+              <button
+                type="button"
+                className={`source-pill${socialSource === "nostr" ? " active" : ""}`}
+                onClick={() => { if (socialSource !== "nostr") { setSocialSource("nostr"); setActiveChannelId(""); } }}
+              >Nostr</button>
+              <button
+                type="button"
+                className={`source-pill${socialSource === "bluesky" ? " active" : ""}`}
+                onClick={() => { if (socialSource !== "bluesky") { setSocialSource("bluesky"); setActiveChannelId(""); } }}
+              >Bluesky</button>
+            </div>
 
-        <div className="topic-chips" role="group" aria-label="Content channels">
-          {channels.map((ch) => (
-            <button
-              key={ch.id}
-              type="button"
-              className={`topic-chip${activeChannelId === ch.id ? " active" : ""}`}
-              onClick={() => {
-                const next = activeChannelId === ch.id ? "" : ch.id;
-                setActiveChannelId(next);
-                // Immediately fetch the newly-selected channel.
-                // Defer via microtask so state is committed first.
-                queueMicrotask(() => {
-                  if (next) {
-                    void (socialSource === "bluesky" ? loadBlueskyPublicFeed() : loadNostrFeed());
-                  } else {
-                    void loadSocialFeed();
-                  }
-                });
-              }}
-              title={`${ch.lever}: ${ch.query || ch.label}`}
-            >{ch.emoji ? <span aria-hidden>{ch.emoji}</span> : null}{ch.label}</button>
-          ))}
-        </div>
+            <div className="topic-chips" role="group" aria-label="Content channels">
+              {channels.map((ch) => (
+                <button
+                  key={ch.id}
+                  type="button"
+                  className={`topic-chip${activeChannelId === ch.id ? " active" : ""}`}
+                  onClick={() => {
+                    const next = activeChannelId === ch.id ? "" : ch.id;
+                    setActiveChannelId(next);
+                    // Immediately fetch the newly-selected channel.
+                    // Defer via microtask so state is committed first.
+                    queueMicrotask(() => {
+                      if (next) {
+                        void (socialSource === "bluesky" ? loadBlueskyPublicFeed() : loadNostrFeed());
+                      } else {
+                        void loadSocialFeed();
+                      }
+                    });
+                  }}
+                  title={`${ch.lever}: ${ch.query || ch.label}`}
+                >{ch.emoji ? <span aria-hidden>{ch.emoji}</span> : null}{ch.label}</button>
+              ))}
+            </div>
+          </>
+        ) : null}
 
-        {/* Optional journal refinement — narrows channel results further. */}
+        {/* Optional journal refinement — narrows results further. Always visible
+            because it IS the lens (the journal-is-the-lens thesis). */}
         {journalTopics.length > 0 ? (
           <div className="topic-chips journal-refine" role="group" aria-label="Refine by journal topic">
             <span className="topic-chips-label">From journals:</span>
@@ -8925,6 +8957,35 @@ Rules:
       void setMetalModeBackend(true).catch(() => {});
     }
   }, [chatGatewayToken, gatewayBaseUrl]);
+
+  // Auto-warm the on-device model on launch. native_ai_chat already loads the
+  // model on demand, but the JS guards on nativeLocalAiStatus.available skip
+  // AI features (title-gen, interest extraction, post generation) when the
+  // model is merely configured — not resident in memory. Warming once per cold
+  // start flips `available` to true so those features actually run. Fire-and-
+  // forget on a blocking thread (the Rust command does the heavy lifting), then
+  // re-poll status so the UI reflects "ready".
+  useEffect(() => {
+    if (!isTauriMobileRuntime()) return;
+    const status = nativeLocalAiStatus;
+    if (!status?.configured || status.available || nativeAiWarmAttemptedRef.current) return;
+    nativeAiWarmAttemptedRef.current = true;
+    void (async () => {
+      try {
+        await nativeAiLoadModel();
+      } catch {
+        // Non-fatal: load can fail (RAM) — the user can still retry from Profile.
+        // Reset so a foreground resume can attempt again.
+        nativeAiWarmAttemptedRef.current = false;
+        return;
+      }
+      try {
+        setNativeLocalAiStatus(await getNativeLocalAiStatus());
+      } catch {
+        // status re-poll best-effort
+      }
+    })();
+  }, [nativeLocalAiStatus?.configured, nativeLocalAiStatus?.available]);
 
   // Seed journal items in local dev / public demo for UI preview (delayed to run after refresh attempts)
   useEffect(() => {
@@ -10643,22 +10704,31 @@ Rules:
                   <button type="button" className={`source-pill${readsYouTubeEnabled ? " active" : ""}`} onClick={() => setReadsYouTubeEnabled((v) => !v)} title="Include YouTube: your subscribed channels (reliable) plus best-effort topic discovery from your journals">▶ Videos</button>
                 </div>
 
-                {/* RSS feed chips now act as an additive filter on the unified stream. */}
-                <div className="topic-chips" style={{ paddingBottom: '0.4rem' }}>
-                  {RSS_FEEDS.map((f) => (
-                    <button
-                      key={f.id}
-                      type="button"
-                      className={`topic-chip small${activeRssFeedIds.includes(f.id) ? " active" : ""}`}
-                      onClick={() => {
-                        setActiveRssFeedIds((prev) => prev.includes(f.id) ? prev.filter((x) => x !== f.id) : [...prev, f.id]);
-                        setReadsRssItems([]);
-                      }}
-                    >
-                      {f.emoji ? `${f.emoji} ` : ""}{f.label}
-                    </button>
-                  ))}
-                </div>
+                {/* RSS source chips collapsed by default — Reads opens as a
+                    plain "For You" stream. Tap Sources to pick specific feeds. */}
+                <button
+                  type="button"
+                  className={`source-pill discover-toggle${readsSourcesOpen ? " active" : ""}`}
+                  onClick={() => setReadsSourcesOpen((v) => !v)}
+                  aria-expanded={readsSourcesOpen}
+                >{readsSourcesOpen ? "▾ Sources" : "▸ Sources"}</button>
+                {readsSourcesOpen ? (
+                  <div className="topic-chips" style={{ paddingBottom: '0.4rem' }}>
+                    {RSS_FEEDS.map((f) => (
+                      <button
+                        key={f.id}
+                        type="button"
+                        className={`topic-chip small${activeRssFeedIds.includes(f.id) ? " active" : ""}`}
+                        onClick={() => {
+                          setActiveRssFeedIds((prev) => prev.includes(f.id) ? prev.filter((x) => x !== f.id) : [...prev, f.id]);
+                          setReadsRssItems([]);
+                        }}
+                      >
+                        {f.emoji ? `${f.emoji} ` : ""}{f.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
 
                 {/* Subtle refresh indicator when content is already showing from cache. */}
                 {readsLoading && displayReads.length > 0 ? (
@@ -10714,6 +10784,10 @@ Rules:
                           </div>
                           <h3 className="reads-hero-title">{hero.item.content.title || "Untitled"}</h3>
                           {hero.item.content.body ? <p className="reads-hero-summary">{hero.item.content.body.slice(0, 220)}</p> : null}
+                          {readsRankMode === "foryou" ? (() => {
+                            const m = journalTopics.find((t) => matchesTopic(hero.item, t.label));
+                            return m ? <span className="reads-rationale">✨ Because you wrote about {m.label}</span> : null;
+                          })() : null}
                         </div>
                       </a>
 
@@ -10742,6 +10816,10 @@ Rules:
                                     </div>
                                     <h3 className="reads-card-title">{item.content.title || "Untitled"}</h3>
                                     {item.content.body ? <p className="reads-card-summary">{item.content.body.slice(0, 200)}</p> : null}
+                                    {readsRankMode === "foryou" ? (() => {
+                                      const m = journalTopics.find((t) => matchesTopic(item, t.label));
+                                      return m ? <span className="reads-rationale">✨ {m.label}</span> : null;
+                                    })() : null}
                                   </div>
                                 </a>
                               );
