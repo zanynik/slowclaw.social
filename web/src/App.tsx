@@ -6620,18 +6620,18 @@ Rules:
       }
       setLocalModelsStatus(response.models.length ? "" : "No local models are available yet.");
     } catch (error) {
-      // Gateway unreachable — but don't wipe native AI status if it was already set
-      setLocalModels([]);
-      setLocalModelsEngineStatus("");
+      // A failed refresh must NOT wipe the model catalog. The list is static-ish
+      // data (which models exist + install status); wiping it on a transient
+      // gateway blip made models "disappear" when the user merely navigated
+      // between tabs and returned to Settings — they only reappeared after a
+      // full app restart. Keep the last known good list visible; the
+      // visibility-resume + download-poll effects repopulate when the gateway
+      // recovers. Only surface an error if we genuinely have nothing to show.
       setLocalModelRuntime(null);
-      // Only wipe native status if we don't already have a valid one
-      if (!nativeLocalAiStatus?.configured) {
+      if (localModels.length === 0 && !nativeLocalAiStatus?.configured) {
         setLocalModelsStatus(
           `Local models unavailable (${error instanceof Error ? error.message : String(error)})`
         );
-      } else {
-        // Native AI is configured but gateway is down — still usable for inference
-        setLocalModelsStatus("");
       }
     }
   }
