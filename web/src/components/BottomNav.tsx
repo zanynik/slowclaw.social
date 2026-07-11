@@ -1,8 +1,8 @@
 /**
  * BottomNav.tsx — Mobile tab bar (icons only).
  *
- * Minimal IA (4 tabs):
- *   Reads → Journal → Drafts → Profile
+ * Minimal IA (5 tabs):
+ *   Reads → Journal → Drafts → Profile → Debug
  *
  * The social Feed was folded INTO Reads: social posts (Nostr / Bluesky) pass a
  * reputation gate (WoT / engagement) then rank alongside articles, news, and
@@ -14,9 +14,10 @@
  * - Journal: capture/compose (OUT) — grows the topics that curate Reads.
  * - Drafts: AI post drafts (distill journals → publish to Nostr/Bluesky).
  * - Profile.
+ * - Debug:  AI activity log (dev/debug; removable).
  */
 
-type MobileTab = "reads" | "journal" | "drafts" | "profile";
+type MobileTab = "reads" | "journal" | "drafts" | "profile" | "debug";
 
 type BottomNavProps = {
   activeTab: MobileTab;
@@ -43,7 +44,7 @@ export function BottomNav({
   };
 
   return (
-    <nav className="bottom-nav bottom-nav-4" role="tablist" aria-label="Main navigation">
+    <nav className="bottom-nav bottom-nav-5" role="tablist" aria-label="Main navigation">
       {/* Reads — the unified "for me" stream (articles + news + video + gated social) */}
       <button
         type="button"
@@ -105,6 +106,26 @@ export function BottomNav({
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
           <circle cx="12" cy="7" r="4" />
+        </svg>
+      </button>
+
+      {/* Debug — AI activity log (dev/debug; removable) */}
+      <button
+        type="button"
+        role="tab"
+        aria-selected={activeTab === "debug"}
+        aria-label="AI Activity"
+        className={activeTab === "debug" ? "active" : ""}
+        onClick={() => handleTab("debug")}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M8 2l1.5 2.5" />
+          <path d="M16 2l-1.5 2.5" />
+          <path d="M9.5 4.5h5" />
+          <rect x="6" y="6" width="12" height="12" rx="6" />
+          <path d="M12 10v4" />
+          <path d="M10 18l-1 4" />
+          <path d="M14 18l1 4" />
         </svg>
       </button>
     </nav>

@@ -195,6 +195,9 @@ import type {
   PostHistoryItem,
   StoredDraft,
 } from "./lib/types";
+// ── AI activity log (dev/debug; removable) ───────────────────────────────────
+import { logAiEvent } from "./lib/aiActivityLog";
+import { AiActivityView } from "./views/AiActivityView";
 import {
   archivePostedLibraryItem,
   createWorldFeedDummyInterest,
@@ -445,8 +448,8 @@ const ATOMIC_LOCAL_MODEL = "gemma-3n-e4b-it";
 let blueskyModulePromise: Promise<typeof import("./lib/bluesky")> | null = null;
 const QRCodeCanvas = lazy(() => import("qrcode.react").then(m => ({ default: m.QRCodeCanvas })));
 
-type MobileTab = "reads" | "journal" | "drafts" | "profile";
-const TAB_ORDER: MobileTab[] = ["reads", "journal", "drafts", "profile"];
+type MobileTab = "reads" | "journal" | "drafts" | "profile" | "debug";
+const TAB_ORDER: MobileTab[] = ["reads", "journal", "drafts", "profile", "debug"];
 // Rotating seed prompts shown above the composer during first-run onboarding.
 // Indexed by the day-of-month so a returning first-time user sees variety.
 const FIRST_ENTRY_PROMPTS = [
@@ -495,7 +498,7 @@ function defaultMobileTab(): MobileTab {
   if (saved === "news" || saved === "reels" || saved === "media") {
     return "reads";
   }
-  if (saved === "reads" || saved === "journal" || saved === "drafts" || saved === "profile") {
+  if (saved === "reads" || saved === "journal" || saved === "drafts" || saved === "profile" || saved === "debug") {
     return saved;
   }
   // Capture-first onboarding: a brand-new user (no saved tab, onboarding not
@@ -2597,6 +2600,8 @@ function App() {
 
     // 2. Generate AI title
     if (isTauriMobileRuntime() && nativeLocalAiStatus?.available && localId) {
+      const __aiTitleT0 = Date.now();
+      logAiEvent("title", "start", "Generating journal title");
       try {
         holdJournalStatus("Generating title...");
         const titleResult = await nativeAiChat(
@@ -2615,9 +2620,13 @@ function App() {
             selectedJournalPathRef.current = `local://journals/${renamed.id}`;
             setSelectedJournalPath(`local://journals/${renamed.id}`);
             holdJournalStatus(`Titled: ${aiTitle}`);
+            logAiEvent("title", "success", `Titled: ${aiTitle}`, titleResult.text, Date.now() - __aiTitleT0);
           } catch {
             // Rename failed — non-fatal, continue with processing
+            logAiEvent("title", "error", "Title rename failed (kept default)", aiTitle, Date.now() - __aiTitleT0);
           }
+        } else {
+          logAiEvent("title", "error", "Title rejected (length out of range)", aiTitle || "(empty)", Date.now() - __aiTitleT0);
         }
       } catch (error) {
         // AI title generation failed — surface the real reason. The Rust
@@ -2625,11 +2634,16 @@ function App() {
         // used to be silently swallowed here (the user saw "nothing happened").
         const detail = error instanceof Error ? error.message : String(error);
         holdJournalStatus(`AI title failed: ${detail.slice(0, 140)}`, 8000);
+        logAiEvent("title", "error", `Title failed: ${detail.slice(0, 160)}`, undefined, Date.now() - __aiTitleT0);
       }
+    } else {
+      logAiEvent("title", "skipped", "Skipped (AI unavailable or no local journal id)");
     }
 
     // 3. Generate posts from this entry
     if (isTauriMobileRuntime() && nativeLocalAiStatus?.available) {
+      const __aiPostsT0 = Date.now();
+      logAiEvent("tweetclaw", "start", "Generating posts from journal (Done)");
       try {
         setGeneratePostBusy(true);
         setGeneratePostStatus("✨ Generating posts...");
@@ -2663,21 +2677,28 @@ function App() {
           }));
           setPersistedPosts((prev) => { const next = [...newPosts, ...prev]; savePersistedPosts(next); return next; });
           setGeneratePostStatus(`✨ Generated ${posts.length} post${posts.length > 1 ? 's' : ''}`);
+          logAiEvent("tweetclaw", "success", `Generated ${posts.length} post${posts.length > 1 ? "s" : ""}`, posts.join("\n---\n"), Date.now() - __aiPostsT0);
         } else {
           // Model ran but produced no usable output — surface it instead of silence.
           setGeneratePostStatus("Model produced no output. It may need re-downloading (Settings → Delete Model).");
+          logAiEvent("tweetclaw", "error", "Model produced no usable output", undefined, Date.now() - __aiPostsT0);
         }
       } catch (error) {
         // Post generation failed — surface the real reason instead of swallowing.
         const detail = error instanceof Error ? error.message : String(error);
         setGeneratePostStatus(`Generation failed: ${detail.slice(0, 200)}`);
+        logAiEvent("tweetclaw", "error", `Generation failed: ${detail.slice(0, 160)}`, undefined, Date.now() - __aiPostsT0);
       } finally {
         setGeneratePostBusy(false);
       }
+    } else {
+      logAiEvent("tweetclaw", "skipped", "Skipped (AI unavailable)");
     }
 
     // 4.5. Extract interest keywords → feed (aggressive register bridge)
     if (isTauriMobileRuntime() && nativeLocalAiStatus?.available && localId) {
+      const __aiInterestT0 = Date.now();
+      logAiEvent("interests", "start", "Extracting interest keywords from journal");
       try {
         holdJournalStatus("Extracting interests...");
         const interestPrompt = `You extract the author's interests from a personal journal entry.
@@ -2717,6 +2738,9 @@ Rules:
           setLastExtractedInterests(interestKeywords);
           setLastInterestJournalId(localId);
           setDismissedInterestReveal(false);
+          logAiEvent("interests", "success", `Extracted ${interestKeywords.length} keyword${interestKeywords.length > 1 ? "s" : ""}`, interestKeywords.join(", "), Date.now() - __aiInterestT0);
+        } else {
+          logAiEvent("interests", "error", "No keywords parsed from model output", interestResult.text.slice(0, 200), Date.now() - __aiInterestT0);
         }
       } catch (error) {
         // Interest extraction failed — surface the real reason instead of
@@ -2724,7 +2748,10 @@ Rules:
         // fail at model load / inference time even when Settings says "ready".
         const detail = error instanceof Error ? error.message : String(error);
         holdJournalStatus(`Interests failed: ${detail.slice(0, 140)}`, 8000);
+        logAiEvent("interests", "error", `Interests failed: ${detail.slice(0, 160)}`, undefined, Date.now() - __aiInterestT0);
       }
+    } else {
+      logAiEvent("interests", "skipped", "Skipped (AI unavailable or no local journal id)");
     }
 
     // 5. Mark as processed and close
@@ -6241,9 +6268,17 @@ Rules:
    * TweetClaw to survive small-model JSON garbling.
    */
   async function extractCardKeywords(title: string, body: string): Promise<string[] | null> {
-    if (!isTauriMobileRuntime() || !nativeLocalAiStatus?.available) return null;
+    if (!isTauriMobileRuntime() || !nativeLocalAiStatus?.available) {
+      logAiEvent("card_keywords", "skipped", `Skipped (AI unavailable): "${(title || "").slice(0, 60)}"`);
+      return null;
+    }
     const userInput = `${title || ""}\n\n${body || ""}`.trim().slice(0, 2400);
-    if (userInput.length < 12) return null;
+    if (userInput.length < 12) {
+      logAiEvent("card_keywords", "skipped", `Skipped (input too short): "${(title || "").slice(0, 60)}"`);
+      return null;
+    }
+    const __aiCardT0 = Date.now();
+    logAiEvent("card_keywords", "start", `Extracting keywords: "${(title || "").slice(0, 60)}"`);
     const systemPrompt = `You extract the subject-matter keywords from an article, news story, or video.
 Rules:
 - Output a JSON array of short lowercase keyword phrases (1-3 words each).
@@ -6259,7 +6294,9 @@ Rules:
           .slice(0, 8);
         if (keywords && keywords.length > 0) {
           // Dedupe against itself.
-          return Array.from(new Set(keywords));
+          const deduped = Array.from(new Set(keywords));
+          logAiEvent("card_keywords", "success", `Extracted ${deduped.length} keyword${deduped.length > 1 ? "s" : ""}`, deduped.join(", "), Date.now() - __aiCardT0);
+          return deduped;
         }
       } catch (error) {
         // nativeAiChat can fail at model load / inference time. Retry once more
@@ -6268,10 +6305,12 @@ Rules:
         if (attempt === 2) {
           const detail = error instanceof Error ? error.message : String(error);
           holdJournalStatus(`Keyword extraction failed: ${detail.slice(0, 120)}`, 6000);
+          logAiEvent("card_keywords", "error", `Extraction failed: ${detail.slice(0, 160)}`, undefined, Date.now() - __aiCardT0);
           return null;
         }
       }
     }
+    logAiEvent("card_keywords", "error", "No keywords parsed after 3 attempts", undefined, Date.now() - __aiCardT0);
     return null;
   }
 
@@ -6879,7 +6918,12 @@ Rules:
   async function generatePostFromJournal() {
     const content = journalDraftText.trim();
     if (!content) { setGeneratePostStatus("Write or select a journal entry first."); return; }
-    if (!requireModel()) return;
+    if (!requireModel()) {
+      logAiEvent("tweetclaw", "skipped", "Manual generate skipped (no model)");
+      return;
+    }
+    const __aiGenT0 = Date.now();
+    logAiEvent("tweetclaw", "start", isTauriMobileRuntime() ? "Manual generate (on-device)" : "Manual generate (gateway)");
     setGeneratePostBusy(true);
     setGeneratePostStatus("Generating posts with local AI...");
     setGeneratedPost("");
@@ -6928,8 +6972,11 @@ Rules:
       if (newPosts.length > 0) {
         setPersistedPosts((prev) => { const next = [...newPosts, ...prev]; savePersistedPosts(next); return next; });
       }
+      logAiEvent("tweetclaw", "success", `Generated ${posts.length} post${posts.length > 1 ? "s" : ""}`, posts.join("\n---\n"), Date.now() - __aiGenT0);
     } catch (error) {
-      setGeneratePostStatus(`Generation failed: ${error instanceof Error ? error.message : String(error)}`);
+      const detail = error instanceof Error ? error.message : String(error);
+      setGeneratePostStatus(`Generation failed: ${detail}`);
+      logAiEvent("tweetclaw", "error", `Manual generate failed: ${detail.slice(0, 160)}`, undefined, Date.now() - __aiGenT0);
     } finally {
       setGeneratePostBusy(false);
     }
@@ -8257,7 +8304,12 @@ Rules:
       setGeneratePostStatus("Write a journal entry first, then pull to generate posts.");
       return;
     }
-    if (!requireModel()) return;
+    if (!requireModel()) {
+      logAiEvent("tweetclaw", "skipped", "Pull-to-generate skipped (no model)");
+      return;
+    }
+    const __aiPullT0 = Date.now();
+    logAiEvent("tweetclaw", "start", isTauriMobileRuntime() ? "Pull-to-generate (on-device)" : "Pull-to-generate (gateway)");
     setGeneratePostBusy(true);
     setGeneratePostStatus("✨ Generating posts from your journal...");
     try {
@@ -8314,11 +8366,15 @@ Rules:
         setGeneratePostStatus(
           "Model produced no output. The model may need re-downloading, or its chat template may not match this build. Try Settings → Delete Model, then re-download.",
         );
+        logAiEvent("tweetclaw", "error", "Pull-to-generate: model produced no usable output", undefined, Date.now() - __aiPullT0);
       } else {
         setGeneratePostStatus(`✨ Generated ${posts.length} post${posts.length > 1 ? 's' : ''} from your journal`);
+        logAiEvent("tweetclaw", "success", `Generated ${posts.length} post${posts.length > 1 ? "s" : ""}`, posts.join("\n---\n"), Date.now() - __aiPullT0);
       }
     } catch (error) {
-      setGeneratePostStatus(`Generation failed: ${error instanceof Error ? error.message : String(error)}`);
+      const detail = error instanceof Error ? error.message : String(error);
+      setGeneratePostStatus(`Generation failed: ${detail}`);
+      logAiEvent("tweetclaw", "error", `Pull-to-generate failed: ${detail.slice(0, 160)}`, undefined, Date.now() - __aiPullT0);
     } finally {
       setGeneratePostBusy(false);
     }
@@ -8712,19 +8768,25 @@ Rules:
     const status = nativeLocalAiStatus;
     if (!status?.configured || status.available || nativeAiWarmAttemptedRef.current) return;
     nativeAiWarmAttemptedRef.current = true;
+    const __aiWarmT0 = Date.now();
+    logAiEvent("warm", "start", "Warming model on launch");
     void (async () => {
       try {
         await nativeAiLoadModel();
-      } catch {
+      } catch (error) {
         // Non-fatal: load can fail (RAM) — the user can still retry from Profile.
         // Reset so a foreground resume can attempt again.
         nativeAiWarmAttemptedRef.current = false;
+        const detail = error instanceof Error ? error.message : String(error);
+        logAiEvent("warm", "error", `Warm-up failed: ${detail.slice(0, 160)}`, undefined, Date.now() - __aiWarmT0);
         return;
       }
       try {
         setNativeLocalAiStatus(await getNativeLocalAiStatus());
+        logAiEvent("warm", "success", "Model warmed & available", undefined, Date.now() - __aiWarmT0);
       } catch {
         // status re-poll best-effort
+        logAiEvent("warm", "success", "Model loaded (status re-poll failed)", undefined, Date.now() - __aiWarmT0);
       }
     })();
   }, [nativeLocalAiStatus?.configured, nativeLocalAiStatus?.available]);
@@ -10652,6 +10714,12 @@ Rules:
                 )
               )}
             </div>
+          </ViewErrorBoundary>
+        ) : null}
+
+        {mobileTab === "debug" ? (
+          <ViewErrorBoundary title="AI Activity">
+            <AiActivityView status={nativeLocalAiStatus} />
           </ViewErrorBoundary>
         ) : null}
       </main>

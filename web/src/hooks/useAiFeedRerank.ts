@@ -40,6 +40,7 @@ import type { RankedRead } from "../lib/readsRanking";
 import type { Topic } from "../lib/socialFeed";
 import { tryParseJsonArray } from "../lib/json";
 import { nativeAiChat } from "../lib/tauriApi";
+import { logAiEvent } from "../lib/aiActivityLog";
 
 export type AiRerankStatus = "idle" | "running" | "done" | "error" | "skipped";
 
@@ -113,6 +114,8 @@ export function useAiFeedRerank({
     const myToken = ++passTokenRef.current;
     lastRunRef.current = now;
     setResult((prev) => ({ ...prev, status: "running" }));
+    const __rerankT0 = Date.now();
+    logAiEvent("rerank", "start", `Re-ranking ${items.length} Reads item${items.length > 1 ? "s" : ""}`);
 
     void (async () => {
       try {
@@ -187,10 +190,16 @@ export function useAiFeedRerank({
           status,
           error: status === "error" ? `No scores parsed from model output (${lastText.length} chars)` : undefined,
         });
+        if (status === "done") {
+          logAiEvent("rerank", "success", `Scored ${boost.size} item${boost.size > 1 ? "s" : ""}`, undefined, Date.now() - __rerankT0);
+        } else {
+          logAiEvent("rerank", "error", "No scores parsed from model output", lastText.slice(0, 200), Date.now() - __rerankT0);
+        }
       } catch (e) {
         if (myToken !== passTokenRef.current) return;
         const detail = e instanceof Error ? e.message : String(e);
         setResult((prev) => ({ ...prev, status: "error", error: detail.slice(0, 160) }));
+        logAiEvent("rerank", "error", `Re-rank failed: ${detail.slice(0, 160)}`, undefined, Date.now() - __rerankT0);
       }
     })();
     // topics.join() keeps referential changes meaningful without deep-compare.
