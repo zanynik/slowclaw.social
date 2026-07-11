@@ -85,6 +85,34 @@ function journalTopicBoost(item: UnifiedItem, topics: Topic[]): number {
   return boost;
 }
 
+/* ── Dislike-driven penalty (the negative lens) ────────────────────────────
+ * Mirror of the positive boost, but subtractive. Sourced from keywords the
+ * user explicitly 👎'd (extracted on-device from the disliked card). Designed
+ * to DOWN-RANK, not hide: the cap is below the recency floor so a disliked
+ * item still appears (just sinks). Magnitudes are intentionally a touch lower
+ * than the positive boost so a single dislike can't outweigh strong relevance.
+ *   - matching the strongest disliked keyword → −0.7
+ *   - each additional match                    → −0.25
+ *   - total penalty capped at                  → −0.9
+ */
+const NEG_TOPIC_MATCH_TOP = 0.7;
+const NEG_TOPIC_MATCH_EACH = 0.25;
+const NEG_TOPIC_CAP = 0.9;
+
+function journalTopicPenalty(item: UnifiedItem, negativeTopics: Topic[]): number {
+  if (!negativeTopics.length) return 0;
+  let penalty = 0;
+  let first = true;
+  for (const t of negativeTopics) {
+    if (matchesTopic(item, t.label)) {
+      penalty += first ? NEG_TOPIC_MATCH_TOP : NEG_TOPIC_MATCH_EACH;
+      first = false;
+      if (penalty >= NEG_TOPIC_CAP) return NEG_TOPIC_CAP;
+    }
+  }
+  return penalty;
+}
+
 /**
  * Score a single item. Components:
  *   topicBoost   — journal-derived relevance (dominant; 0 when no topics given)
@@ -92,10 +120,13 @@ function journalTopicBoost(item: UnifiedItem, topics: Topic[]): number {
  *   imageBonus   — +0.15 if a cover/thumbnail is present
  *   readTimeBonus — +0.05..0.15 for a 3..15 min read (the Goldilocks zone)
  *   lengthTiebreak — tiny bonus for substantive summaries (proxy for depth)
+ *   topicPenalty — disliked-keyword down-rank (0 when no negativeTopics given;
+ *                  capped so the item still appears, just sinks)
  */
 export function scoreRead(
   item: UnifiedItem,
   topics?: Topic[],
+  negativeTopics?: Topic[],
 ): { score: number; readMinutes: number } {
   const now = NOW();
   const ageHours = Math.max(0, (now - item.timestamp) / 3600);
@@ -113,9 +144,11 @@ export function scoreRead(
 
   const lengthTiebreak = Math.min(0.05, item.content.body.length / 5000);
   const topicBoost = topics && topics.length ? journalTopicBoost(item, topics) : 0;
+  const topicPenalty =
+    negativeTopics && negativeTopics.length ? journalTopicPenalty(item, negativeTopics) : 0;
 
   return {
-    score: topicBoost + recency + imageBonus + readTimeBonus + lengthTiebreak,
+    score: topicBoost + recency + imageBonus + readTimeBonus + lengthTiebreak - topicPenalty,
     readMinutes,
   };
 }
@@ -123,11 +156,16 @@ export function scoreRead(
 /**
  * Rank a list of unified items, highest score first. Stable on ties (keeps
  * input order). Pass the user's journal `topics` to make "For You" journal-
- * driven; omit them for pure recency/quality ranking.
+ * driven; pass `negativeTopics` (disliked keywords) to down-rank matches.
+ * Omit either for pure recency/quality ranking.
  */
-export function rankReads(items: UnifiedItem[], topics?: Topic[]): RankedRead[] {
+export function rankReads(
+  items: UnifiedItem[],
+  topics?: Topic[],
+  negativeTopics?: Topic[],
+): RankedRead[] {
   const scored = items.map((item) => {
-    const { score, readMinutes } = scoreRead(item, topics);
+    const { score, readMinutes } = scoreRead(item, topics, negativeTopics);
     const sourceLabel =
       item.sourcePlatform === "rss"
         ? item.author.handle

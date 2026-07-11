@@ -8,6 +8,10 @@
  * Two independent namespaces:
  *   - "saved"  → bookmarked items (Profile tab → Saved list)
  *   - "liked"  → locally liked items (drives filled-heart UI)
+ *   - "disliked" → locally disliked Reads items (drives 👎 UI state)
+ *   - "liked.keywords" / "disliked.keywords" → on-device-AI-extracted phrases
+ *     from 👍/👎'd Reads cards, fed into the Reads ranker as positive/negative
+ *     steering topics.
  *
  * Each entry is keyed by a stable URI/id (Bluesky post uri, Nostr note id,
  * Reels post uri, Reads link). The stored record is intentionally minimal so
@@ -132,6 +136,88 @@ export function toggleReposted(id: string): boolean {
   const nowReposted = !isReposted(id);
   setReposted(id, nowReposted);
   return nowReposted;
+}
+
+/* ── Disliked (optimistic local dislike → ranking steering) ──────────────── */
+
+const DISLIKED_KEY = "slowclaw.disliked.v1";
+
+export function getDislikedIds(): string[] {
+  return readJSON<string[]>(DISLIKED_KEY, []);
+}
+
+export function isDisliked(id: string): boolean {
+  return getDislikedIds().includes(id);
+}
+
+export function setDisliked(id: string, disliked: boolean): void {
+  const ids = getDislikedIds();
+  const next = disliked
+    ? (ids.includes(id) ? ids : [...ids, id])
+    : ids.filter((x) => x !== id);
+  writeJSON(DISLIKED_KEY, next);
+}
+
+export function toggleDisliked(id: string): boolean {
+  const nowDisliked = !isDisliked(id);
+  setDisliked(id, nowDisliked);
+  return nowDisliked;
+}
+
+/* ── Steering keyword stores ─────────────────────────────────────────────── */
+//
+// Keywords extracted (on-device, via nativeAiChat) from 👍'd / 👎'd Reads
+// cards. Liked keywords feed the positive ranking lane (surface more like
+// this); disliked keywords feed the negative lane (down-rank, don't hide).
+// Both are localStorage-only, lowercase phrases. All writes reuse writeJSON
+// so onSavedChange listeners (incl. the ranking memos) recompute same-tab.
+
+const LIKED_KEYWORDS_KEY = "slowclaw.liked.keywords.v1";
+const DISLIKED_KEYWORDS_KEY = "slowclaw.disliked.keywords.v1";
+
+function readKeywordSet(key: string): string[] {
+  const arr = readJSON<string[]>(key, []);
+  // Defensive dedupe + lowercase so the stores stay clean regardless of input.
+  return Array.from(new Set(arr.map((k) => (k || "").trim().toLowerCase()).filter(Boolean)));
+}
+
+export function getLikedKeywords(): string[] {
+  return readKeywordSet(LIKED_KEYWORDS_KEY);
+}
+
+export function addLikedKeywords(keywords: string[]): void {
+  if (!keywords.length) return;
+  const next = readKeywordSet(LIKED_KEYWORDS_KEY);
+  for (const k of keywords) {
+    const clean = k.trim().toLowerCase();
+    if (clean && !next.includes(clean)) next.push(clean);
+  }
+  // Cap so the steering list can't grow unbounded over time.
+  writeJSON(LIKED_KEYWORDS_KEY, next.slice(-120));
+}
+
+export function removeLikedKeyword(keyword: string): void {
+  const clean = keyword.trim().toLowerCase();
+  writeJSON(LIKED_KEYWORDS_KEY, readKeywordSet(LIKED_KEYWORDS_KEY).filter((k) => k !== clean));
+}
+
+export function getDislikedKeywords(): string[] {
+  return readKeywordSet(DISLIKED_KEYWORDS_KEY);
+}
+
+export function addDislikedKeywords(keywords: string[]): void {
+  if (!keywords.length) return;
+  const next = readKeywordSet(DISLIKED_KEYWORDS_KEY);
+  for (const k of keywords) {
+    const clean = k.trim().toLowerCase();
+    if (clean && !next.includes(clean)) next.push(clean);
+  }
+  writeJSON(DISLIKED_KEYWORDS_KEY, next.slice(-120));
+}
+
+export function removeDislikedKeyword(keyword: string): void {
+  const clean = keyword.trim().toLowerCase();
+  writeJSON(DISLIKED_KEYWORDS_KEY, readKeywordSet(DISLIKED_KEYWORDS_KEY).filter((k) => k !== clean));
 }
 
 /* ── React subscription helper ──────────────────────────────────────────── */
