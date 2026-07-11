@@ -5264,3 +5264,95 @@ button.local-ai-preset {
 .interest-reveal-chip:hover .interest-reveal-x {
   opacity: 1;
 }
+
+/* ── AI Activity log (Debug tab, dev/debug surface) ──────────────────────── */
+.ai-log-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.ai-log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0 0.25rem;
+}
+.ai-log-toolbar .topic-chips {
+  flex: 1;
+  min-width: 0;
+}
+.ai-log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0 0.25rem;
+}
+.ai-log-row {
+  display: flex;
+  gap: 0.6rem;
+  padding: 0.6rem 0.7rem;
+  background: var(--surface-2, var(--bg, #fff));
+  border: 1px solid var(--border, #eee);
+  border-radius: 10px;
+  align-items: flex-start;
+}
+.ai-log-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.ai-log-row-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.ai-log-feature {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.ai-log-kind {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0.05rem 0.35rem;
+  border-radius: 6px;
+}
+.ai-log-kind-start { color: var(--muted); background: var(--surface-3, #eee); }
+.ai-log-kind-success { color: #138a36; background: rgba(20, 170, 80, 0.12); }
+.ai-log-kind-error { color: #c0392b; background: rgba(220, 60, 50, 0.12); }
+.ai-log-kind-skipped { color: var(--muted); background: var(--surface-3, #eee); }
+.ai-log-dur {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+.ai-log-msg {
+  font-size: 0.88rem;
+  word-break: break-word;
+}
+.ai-log-detail {
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 8rem;
+  overflow-y: auto;
+}
+.ai-log-ts {
+  font-size: 0.72rem !important;
+}
+.ai-log-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-top: 0.3rem;
+  flex-shrink: 0;
+  display: inline-block;
+}
+.ai-log-dot-start { background: #3b82f6; }
+.ai-log-dot-success { background: #16a34a; }
+.ai-log-dot-error { background: #dc3c32; }
+.ai-log-dot-skipped { background: var(--muted); }
