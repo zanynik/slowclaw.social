@@ -81,10 +81,6 @@ public func slowclaw_open_safari_vc(
         return controller
     }
 
-    let config = SFSafariViewController.Configuration()
-    config.entirelyDisabledDataTypes = []
-    config.barCollapsingEnabled = true
-
     DispatchQueue.main.async {
         let scenes = UIApplication.shared.connectedScenes
         let activeScene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
@@ -100,7 +96,8 @@ public func slowclaw_open_safari_vc(
         }
 
         let presenter = topController(from: root)
-        let safari = SFSafariViewController(url: url, configuration: config)
+        // Default configuration is fine — no custom Configuration needed.
+        let safari = SFSafariViewController(url: url)
         safari.modalPresentationStyle = .pageSheet
         presenter.present(safari, animated: true)
     }
