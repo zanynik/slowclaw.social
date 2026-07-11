@@ -102,22 +102,29 @@ pub(crate) fn open_in_app_webview(app: AppHandle, url: String) -> Result<(), Str
         return Err("only http(s) urls can be opened".to_string());
     }
 
-    // Close any existing reader window so we never stack webviews.
+    // Close any existing reader window so we never stack webviews. On desktop
+    // this uses WebviewWindow::close(); on mobile there is a single window so
+    // there is nothing to tear down (the new builder reuses the "reader" label).
+    #[cfg(not(mobile))]
     if let Some(existing) = app.get_webview_window("reader") {
         let _ = existing.close();
     }
 
-    WebviewWindowBuilder::new(&app, "reader", WebviewUrl::External(parsed))
-        .title("SlowClaw Reader")
-        .center()
-        .build()
-        .map_err(|e| {
-            crate::ui_command_error(
-                "in-app webview open failed",
-                "Failed to open the link in the app.",
-                e,
-            )
-        })?;
+    let mut builder = WebviewWindowBuilder::new(&app, "reader", WebviewUrl::External(parsed));
+    // Title + centering are desktop-only window-management options (there is no
+    // OS window chrome to title or center on iOS, where a webview is presented
+    // full-screen). Gating them keeps the iOS target compiling.
+    #[cfg(not(mobile))]
+    {
+        builder = builder.title("SlowClaw Reader").center();
+    }
+    builder.build().map_err(|e| {
+        crate::ui_command_error(
+            "in-app webview open failed",
+            "Failed to open the link in the app.",
+            e,
+        )
+    })?;
     Ok(())
 }
 
