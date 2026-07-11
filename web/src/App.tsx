@@ -6189,8 +6189,12 @@ Rules:
     const trimmed = url.trim();
     if (!trimmed) return;
     try {
-      if (isDesktopClient) {
-        await invokeDesktopCommandStrict("open_external_url", { url: trimmed });
+      if (isNativeClient) {
+        // Open inside the app as an in-app webview (iOS WKWebView / desktop
+        // WebView2). The OS-browser hand-off (open_external_url) actually
+        // errors out on mobile, so the in-app path is the correct one for the
+        // primary (iOS) target.
+        await invokeDesktopCommandStrict("open_in_app_webview", { url: trimmed });
       } else {
         window.open(trimmed, "_blank", "noopener,noreferrer");
       }

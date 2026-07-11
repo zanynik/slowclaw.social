@@ -3022,6 +3022,7 @@ pub fn run() {
             save_journal_interest_keywords,
             commands::desktop::open_workspace_journals_folder,
             commands::desktop::open_external_url,
+            commands::desktop::open_in_app_webview,
             get_openai_device_code_status,
             commands::desktop::start_openai_device_code_login,
             get_anthropic_token_status,

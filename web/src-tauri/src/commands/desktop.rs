@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::process::Command;
+use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindowBuilder};
 
 use crate::{
     GatewayState, GatewayQrPayload, DesktopGatewayBootstrap,
@@ -81,6 +82,43 @@ pub(crate) fn open_external_url(url: String) -> Result<(), String> {
             )
         })
     }
+}
+
+/// Open a link inside the app as an in-app browser (a webview window over the
+/// main window), instead of handing it off to the OS browser. Works on desktop
+/// and mobile — on iOS it renders a WKWebView, so links stay in-app (the
+/// `open_external_url` hand-off actually errors out on mobile). Only `http(s)`
+/// URLs are accepted (same guard as the external opener). Reuses a single
+/// `"reader"` window label so repeated opens replace, not stack.
+#[tauri::command]
+pub(crate) fn open_in_app_webview(app: AppHandle, url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("url is required".to_string());
+    }
+    // Parse + restrict to http(s). WebviewUrl::External takes a parsed Url.
+    let parsed = Url::parse(trimmed).map_err(|_| "invalid url".to_string())?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("only http(s) urls can be opened".to_string());
+    }
+
+    // Close any existing reader window so we never stack webviews.
+    if let Some(existing) = app.get_webview_window("reader") {
+        let _ = existing.close();
+    }
+
+    WebviewWindowBuilder::new(&app, "reader", WebviewUrl::External(parsed))
+        .title("SlowClaw Reader")
+        .center()
+        .build()
+        .map_err(|e| {
+            crate::ui_command_error(
+                "in-app webview open failed",
+                "Failed to open the link in the app.",
+                e,
+            )
+        })?;
+    Ok(())
 }
 
 #[tauri::command]
