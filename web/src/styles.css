@@ -5096,6 +5096,62 @@ button.local-ai-preset {
   border-radius: 999px;
 }
 
+/* ── Inline reply thread (Bluesky Reads card) ──────────────────────────────
+   Mirrors .nostr-reply-thread so Bluesky comments open in-place with the same
+   indentation/spacing as Nostr. Reused by the comment-bubble tap on a Bluesky
+   card: shows the loaded replies above the compose box. */
+.reply-thread {
+  margin-top: 0.6rem;
+  padding-left: 0.6rem;
+  border-left: 2px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.reply-thread-loading, .reply-thread-empty {
+  font-size: 0.82rem;
+  padding: 0.15rem 0;
+}
+.reply-thread-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.reply-thread-item {
+  display: flex;
+  gap: 0.5rem;
+}
+.reply-thread-avatar {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  border-radius: 50%;
+  object-fit: cover;
+  font-size: 0.7rem;
+}
+.reply-thread-avatar-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--line);
+  color: var(--text);
+  border-radius: 50%;
+}
+.reply-thread-body {
+  flex: 1;
+  min-width: 0;
+}
+.reply-thread-head {
+  display: flex;
+  gap: 0.35rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+.reply-thread-name { font-weight: 600; font-size: 0.82rem; }
+.reply-thread-handle { font-size: 0.75rem; color: var(--muted, var(--text)); }
+.reply-thread-text { font-size: 0.86rem; line-height: 1.4; margin: 0.1rem 0; word-wrap: break-word; }
+.reply-thread-time { font-size: 0.72rem; color: var(--muted, var(--text)); }
+
 /* Repost state on the action bar (mirrors .liked/.saved). */
 .feed-action.reposted { color: #22c55e; }
 .feed-action.reposted svg { stroke: currentColor; }

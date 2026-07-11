@@ -1637,6 +1637,11 @@ function App() {
   const [nostrParentNotes, setNostrParentNotes] = useState<Record<string, NostrNote>>({});
   const [nostrReplyThreads, setNostrReplyThreads] = useState<Record<string, NostrNote[]>>({});
   const [nostrRepliesLoading, setNostrRepliesLoading] = useState<Record<string, boolean>>({});
+  // Per-uri Bluesky thread caches for the Reads-stream cards (kept separate from
+  // the single-card expandedThreadUri/threadData used by the World-tab card so
+  // the two surfaces don't clobber each other's state). Keyed by post uri.
+  const [blueskyReplyThreads, setBlueskyReplyThreads] = useState<Record<string, BlueskyPublicPost[]>>({});
+  const [blueskyThreadLoading, setBlueskyThreadLoading] = useState<Record<string, boolean>>({});
   const [nostrProfileOverlay, setNostrProfileOverlay] = useState<NostrProfile | null>(null);
   const [nostrRevealPrivkey, setNostrRevealPrivkey] = useState(false);
   const [nostrCopiedKey, setNostrCopiedKey] = useState<"" | "npub" | "nsec">("");
@@ -5461,6 +5466,36 @@ Rules:
     }
   }
 
+  /**
+   * Lazy-load the reply thread for a Reads-stream Bluesky card and cache it by
+   * uri. Mirrors loadNostrReplies: marks loading, fetches via the existing
+   * fetchBlueskyThread (getPostThread?depth=6), and stashes the top-level
+   * `thread.replies` (each reply's `.post` is a BlueskyPublicPost-shaped object).
+   * Errors are swallowed into an empty list so the UI degrades gracefully
+   * (matching Nostr's behavior) rather than throwing into the render path.
+   */
+  async function loadBlueskyThread(postUri: string) {
+    setBlueskyThreadLoading((prev) => ({ ...prev, [postUri]: true }));
+    try {
+      const bluesky = await loadBlueskyModule();
+      const serviceUrl = creds.serviceUrl.trim() || "https://public.api.bsky.app";
+      const jwt = session?.accessJwt || "";
+      const data = await bluesky.fetchBlueskyThread(serviceUrl, jwt, postUri);
+      const rawReplies: any[] = data?.thread?.replies || [];
+      // Map the AppView thread reply nodes to BlueskyPublicPost shape (the .post
+      // field already carries author/record/embed/indexedAt/counts).
+      const replies: BlueskyPublicPost[] = rawReplies
+        .map((node: any) => node?.post)
+        .filter((p: any) => p && p.uri && p.record);
+      setBlueskyReplyThreads((prev) => ({ ...prev, [postUri]: replies }));
+    } catch (e) {
+      console.warn("[bluesky] thread fetch failed", e);
+      setBlueskyReplyThreads((prev) => ({ ...prev, [postUri]: [] }));
+    } finally {
+      setBlueskyThreadLoading((prev) => ({ ...prev, [postUri]: false }));
+    }
+  }
+
   async function handleReplyToBlueskyPost(parentUri: string, parentCid: string, rootUri: string, rootCid: string) {
     const text = replyDrafts[parentUri]?.trim();
     if (!text || !agent || !session) return;
@@ -7566,9 +7601,11 @@ Rules:
 
   /**
    * Render a Bluesky public post as a card. Mirrors renderNostrNoteCard's
-   * visual language (avatar, name, body, engagement footer). Rich features
-   * (reply threads, in-app reply/like) are follow-ups; this v1 surfaces the
-   * post, author, optional images, and like/repost counts from the AppView.
+   * visual language (avatar, name, body, engagement footer) and its inline
+   * reply-thread affordance: tapping the comment bubble loads the post's
+   * thread (fetchBlueskyThread) and expands the replies in-place, with a
+   * compose box to reply. Author, optional images/video, and like/repost
+   * counts come from the AppView.
    */
   function renderBlueskyCard(post: BlueskyPublicPost) {
     const handle = post.author?.handle || "unknown";
@@ -7670,28 +7707,72 @@ Rules:
           thumbnail={avatar}
           reposted={repostedIds.includes(post.uri)}
           onRepost={() => void handleRepost("bluesky", post.uri, post.author.did, post.cid)}
-          onReply={() => setBlueskyReplyExpanded((prev) => {
-            const next = new Set(prev);
-            if (next.has(post.uri)) next.delete(post.uri); else next.add(post.uri);
-            return next;
-          })}
+          onReply={() => {
+            // First tap: load + expand the reply thread (like Nostr). Second
+            // tap: collapse. Toggling the Set drives replyExpanded below.
+            if (blueskyReplyExpanded.has(post.uri)) {
+              setBlueskyReplyExpanded((prev) => { const n = new Set(prev); n.delete(post.uri); return n; });
+            } else {
+              setBlueskyReplyExpanded((prev) => { const n = new Set(prev); n.add(post.uri); return n; });
+              if (!blueskyReplyThreads[post.uri]) void loadBlueskyThread(post.uri);
+            }
+          }}
+          replyLoading={!!blueskyThreadLoading[post.uri]}
           replyExpanded={blueskyReplyExpanded.has(post.uri)}
         />
         {blueskyReplyExpanded.has(post.uri) ? (
-          <div className="reply-compose">
-            <textarea
-              className="reply-compose-input"
-              rows={1}
-              placeholder={session ? "Reply on Bluesky…" : "Sign in to Bluesky to reply…"}
-              value={replyDrafts[post.uri] || ""}
-              onChange={(e) => setReplyDrafts((prev) => ({ ...prev, [post.uri]: e.target.value }))}
-            />
-            <button
-              type="button"
-              className="primary reply-compose-send"
-              disabled={!replyDrafts[post.uri]?.trim() || !session}
-              onClick={() => void handleBlueskyReplyFromCard(post.uri, post.cid)}
-            >Reply</button>
+          <div className="reply-thread">
+            {/* Reply thread (loaded on first expand). Mirrors the Nostr inline
+                thread so Bluesky comments open in-place like any social app. */}
+            {blueskyThreadLoading[post.uri] ? (
+              <div className="reply-thread-loading muted">Loading comments…</div>
+            ) : (blueskyReplyThreads[post.uri]?.length ?? 0) > 0 ? (
+              <div className="reply-thread-list">
+                {blueskyReplyThreads[post.uri]!.slice(0, 20).map((reply, ri) => {
+                  const rHandle = reply.author?.handle || "unknown";
+                  const rName = reply.author?.displayName?.trim() || rHandle;
+                  const rAvatar = reply.author?.avatar || "";
+                  const rText = reply.record?.text || "";
+                  const rTsMs = Date.parse(reply.indexedAt || reply.record?.createdAt || "");
+                  return (
+                    <div key={reply.uri || ri} className="reply-thread-item">
+                      {rAvatar
+                        ? <img src={rAvatar} alt="" className="reply-thread-avatar" loading="lazy" />
+                        : <div className="reply-thread-avatar reply-thread-avatar-fallback" aria-hidden>{rName.slice(0, 1).toUpperCase()}</div>}
+                      <div className="reply-thread-body">
+                        <div className="reply-thread-head">
+                          <span className="reply-thread-name">{rName}</span>
+                          <span className="reply-thread-handle">@{rHandle}</span>
+                        </div>
+                        {rText ? <div className="reply-thread-text">{renderLinkedText(rText)}</div> : null}
+                        <span className="reply-thread-time">{Number.isFinite(rTsMs) ? getRelativeTime(rTsMs) : ""}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="reply-thread-empty muted">No replies yet.</div>
+            )}
+            <div className="reply-compose">
+              <textarea
+                className="reply-compose-input"
+                rows={1}
+                placeholder={session ? "Reply on Bluesky…" : "Sign in to Bluesky to reply…"}
+                value={replyDrafts[post.uri] || ""}
+                onChange={(e) => setReplyDrafts((prev) => ({ ...prev, [post.uri]: e.target.value }))}
+              />
+              <button
+                type="button"
+                className="primary reply-compose-send"
+                disabled={!replyDrafts[post.uri]?.trim() || !session}
+                onClick={() => {
+                  void handleBlueskyReplyFromCard(post.uri, post.cid);
+                  // Refresh the thread so a posted reply appears inline.
+                  void loadBlueskyThread(post.uri);
+                }}
+              >Reply</button>
+            </div>
           </div>
         ) : null}
       </article>
