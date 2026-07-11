@@ -13,6 +13,7 @@ use tauri::Manager;
 
 pub mod commands;
 mod inference;
+mod ios_safari;
 mod nostr_ingest;
 mod transcription;
 

@@ -11,6 +11,7 @@ on:
             - "src/**"
             - "web/**"
             - "scripts/ios-add-speech-plugin.rb"
+            - "scripts/ios-add-safari-opener.rb"
     workflow_dispatch:
         inputs:
             build_number:
@@ -299,6 +300,11 @@ jobs:
                   set -euo pipefail
                   sudo gem install xcodeproj --no-document
                   ruby scripts/ios-add-speech-plugin.rb
+
+            - name: Add SFSafariViewController Swift bridge to iOS project
+              run: |
+                  set -euo pipefail
+                  ruby scripts/ios-add-safari-opener.rb
 
             - name: Build signed iOS IPA
               working-directory: web

@@ -84,12 +84,18 @@ pub(crate) fn open_external_url(url: String) -> Result<(), String> {
     }
 }
 
-/// Open a link inside the app as an in-app browser (a webview window over the
-/// main window), instead of handing it off to the OS browser. Works on desktop
-/// and mobile — on iOS it renders a WKWebView, so links stay in-app (the
-/// `open_external_url` hand-off actually errors out on mobile). Only `http(s)`
-/// URLs are accepted (same guard as the external opener). Reuses a single
-/// `"reader"` window label so repeated opens replace, not stack.
+/// Open a link inside the app as an in-app browser, instead of handing it off
+/// to the OS browser. Only `http(s)` URLs are accepted (same guard as the
+/// external opener).
+///
+/// Platform split:
+///   - iOS: presents Apple's `SFSafariViewController` via the Swift bridge
+///     (`crate::ios_safari`). This gives a native Done button + swipe-to-dismiss
+///     so the user can return to the feed. Tauri 2 mobile is restricted to a
+///     single webview/window, so a desktop-style second `WebviewWindow` cannot
+///     be dismissed on iOS — the native Safari sheet is the correct primitive.
+///   - Desktop: opens a dedicated `"reader"` `WebviewWindow` over the main
+///     window. Reuses a single label so repeated opens replace, not stack.
 #[tauri::command]
 pub(crate) fn open_in_app_webview(app: AppHandle, url: String) -> Result<(), String> {
     let trimmed = url.trim();
@@ -102,30 +108,45 @@ pub(crate) fn open_in_app_webview(app: AppHandle, url: String) -> Result<(), Str
         return Err("only http(s) urls can be opened".to_string());
     }
 
-    // Close any existing reader window so we never stack webviews. On desktop
-    // this uses WebviewWindow::close(); on mobile there is a single window so
-    // there is nothing to tear down (the new builder reuses the "reader" label).
-    #[cfg(not(mobile))]
-    if let Some(existing) = app.get_webview_window("reader") {
-        let _ = existing.close();
+    // iOS: hand off to the native SFSafariViewController bridge (fire-and-forget
+    // present). No desktop-only window APIs are touched on this path.
+    #[cfg(target_os = "ios")]
+    {
+        let _ = app; // app unused on the iOS path
+        return crate::ios_safari::ios_open_safari_vc(parsed.as_str());
     }
 
-    let mut builder = WebviewWindowBuilder::new(&app, "reader", WebviewUrl::External(parsed));
-    // Title + centering are desktop-only window-management options (there is no
-    // OS window chrome to title or center on iOS, where a webview is presented
-    // full-screen). Gating them keeps the iOS target compiling.
+    // Android (and any other mobile target without a native bridge yet): we
+    // cannot open a desktop-style WebviewWindow here (mobile is single-webview),
+    // and there is no SFSafariViewController equivalent wired up. Surface an
+    // explicit error so the frontend fallback (OS browser) can take over rather
+    // than silently failing or attempting desktop-only window APIs.
+    #[cfg(all(mobile, not(target_os = "ios")))]
+    {
+        let _ = app;
+        let _ = parsed;
+        return Err("In-app article reader is not yet supported on this platform.".to_string());
+    }
+
+    // Desktop: close any existing reader window so we never stack webviews, then
+    // build a fresh one.
     #[cfg(not(mobile))]
     {
+        if let Some(existing) = app.get_webview_window("reader") {
+            let _ = existing.close();
+        }
+
+        let mut builder = WebviewWindowBuilder::new(&app, "reader", WebviewUrl::External(parsed));
         builder = builder.title("SlowClaw Reader").center();
+        builder.build().map_err(|e| {
+            crate::ui_command_error(
+                "in-app webview open failed",
+                "Failed to open the link in the app.",
+                e,
+            )
+        })?;
+        Ok(())
     }
-    builder.build().map_err(|e| {
-        crate::ui_command_error(
-            "in-app webview open failed",
-            "Failed to open the link in the app.",
-            e,
-        )
-    })?;
-    Ok(())
 }
 
 #[tauri::command]
