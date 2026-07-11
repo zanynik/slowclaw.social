@@ -92,7 +92,7 @@ import {
 // ── Local-first optimistic follows ─────────────────────────────────────────
 import { getFollowedIds, onFollowsChange, toggleFollow, nostrFollowKey, blueskyFollowKey } from "./lib/follows";
 // ── Reads ranking + read-time (Google News / Substack-style "For You") ──────
-import { rankReads, chronologicalReads, gateSocialItems, type RankedRead } from "./lib/readsRanking";
+import { rankReads, chronologicalReads, gateSocialItems, filterBlueskyByReplies, type RankedRead } from "./lib/readsRanking";
 import {
   loadCachedWoTSet,
   refreshWoTSet,
@@ -6947,6 +6947,10 @@ Rules:
    * trusted (WoT / follows) or it drew real engagement (likes + zaps). A
    * cold-start floor keeps a modest stream alive before enrichment is warm.
    *
+   * Bluesky posts additionally pass a reply-count gate (≥5 replies) so the
+   * stream surfaces discussion rather than lone posts; Nostr has no native
+   * build-time reply count, so it relies on the reputation gate alone.
+   *
    * Everything admitted then competes in `rankedReads` on equal footing with
    * articles / news / video — interest match (journal lens) dominates ordering
    * from there. No free "Following" timeline: social fights for its place.
@@ -6969,7 +6973,12 @@ Rules:
       items.push(u);
       bump(u.id, u.author.id, nostrReactions[note.id] || 0);
     }
-    for (const post of blueskyPublicPosts) {
+    // Bluesky: keep only posts whose server-supplied replyCount meets the floor
+    // (discussion-driven feed; replyCount is dropped by toUnifiedFromBluesky, so
+    // the gate must run on the raw post). Nostr has no native build-time count
+    // and is left to the reputation gate below.
+    const blueskyWithReplies = filterBlueskyByReplies(blueskyPublicPosts);
+    for (const post of blueskyWithReplies) {
       const u = toUnifiedFromBluesky(post);
       items.push(u);
       bump(u.id, u.author.id, post.likeCount || 0);

@@ -255,6 +255,34 @@ export function gateSocialItems(
   return admitted;
 }
 
+/* ── Bluesky reply-count admission (parent posts only) ────────────────────────
+ *
+ * The product intent is to keep the social stream discussion-driven: a lone
+ * Bluesky post with no community response adds noise to a journal-ranked Reads
+ * feed. Bluesky is the only social source that surfaces a reliable reply count
+ * at feed-build time (it's server-supplied on the AppView post object), so this
+ * is a Bluesky-specific gate. Nostr reply counts are only known after loading
+ * each thread on tap (no native count on the note itself), so pre-fetching them
+ * for the whole firehose would be a costly mobile hit; Nostr stays on its
+ * reputation gate (`gateSocialItems`) instead.
+ *
+ * This applies to ANY post (root or reply) whose replyCount meets the floor —
+ * a reply that itself sparked a sub-thread is still a discussion worth surfacing.
+ */
+export const DEFAULT_MIN_BLUESKY_REPLIES = 5;
+
+/**
+ * Keep only Bluesky posts whose server-supplied `replyCount` meets the floor.
+ * Posts without a replyCount are dropped (treated as 0). Pure + typed so it can
+ * be reasoned about independently of the fetch path.
+ */
+export function filterBlueskyByReplies<T extends { replyCount?: number }>(
+  posts: T[],
+  minReplies: number = DEFAULT_MIN_BLUESKY_REPLIES,
+): T[] {
+  return posts.filter((p) => (p.replyCount ?? 0) >= minReplies);
+}
+
 /* ── Unified feed ranking (social: text / image / video) ──────────────────── */
 //
 // The Reads scorer above favors long-form (read-time Goldilocks). The unified
