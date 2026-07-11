@@ -13,6 +13,8 @@
  * adding a `toUnifiedFromX()` converter; the filter chips work automatically.
  */
 
+import { encodeNaddr } from "./nostr";
+
 /** The normalized social item — every source collapses into this. */
 export interface UnifiedItem {
   id: string;
@@ -201,6 +203,23 @@ export function toUnifiedFromNostrArticle(
   const image = tags.find((t) => t[0] === "image")?.[1];
   const publishedRaw = tags.find((t) => t[0] === "published_at")?.[1];
   const published = publishedRaw ? Number(publishedRaw) : article.created_at;
+  // Habla News keys NIP-23 article pages by a bech32m naddr of the
+  // (kind, pubkey, d-identifier) coordinate — NOT the raw event id.
+  // See NIP-19. The d-tag falls back to "" when absent (NIP-23 default).
+  const dTag = tags.find((t) => t[0] === "d")?.[1] || "";
+  let linkUrl: string;
+  try {
+    const naddr = encodeNaddr({
+      pubkeyHex: article.pubkey,
+      kind: 30023,
+      identifier: dTag,
+    });
+    linkUrl = `https://habla.news/a/${naddr}`;
+  } catch {
+    // Malformed pubkey / tags — fall back to the hex id (may 404, but never
+    // crashes the feed render).
+    linkUrl = `https://habla.news/a/${article.id}`;
+  }
   return {
     id: article.id,
     sourcePlatform: "nostr",
@@ -209,7 +228,7 @@ export function toUnifiedFromNostrArticle(
     content: {
       title,
       body: summary || article.content.slice(0, 280),
-      linkUrl: `https://habla.news/a/${article.id}`,
+      linkUrl,
     },
     media: image
       ? { type: "image", urls: [image], thumbnailUrl: image }

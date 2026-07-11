@@ -139,9 +139,14 @@ function bech32HrpExpand(hrp: string): number[] {
   return ret;
 }
 
-function bech32CreateChecksum(hrp: string, data: number[]): number[] {
+// bech32 (BIP-173) constant is 1; bech32m (BIP-350) constant is 0x2bc830a3.
+// NIP-19 naddr uses bech32m; npub/nsec use plain bech32.
+const BECH32_CONST = 1;
+const BECH32M_CONST = 0x2bc830a3;
+
+function bech32CreateChecksum(hrp: string, data: number[], encConst: number = BECH32_CONST): number[] {
   const values = [...bech32HrpExpand(hrp), ...data, 0, 0, 0, 0, 0, 0];
-  const polymod = bech32Polymod(values) ^ 1;
+  const polymod = bech32Polymod(values) ^ encConst;
   const ret: number[] = [];
   for (let i = 0; i < 6; i++) ret.push((polymod >> (5 * (5 - i))) & 31);
   return ret;
@@ -237,6 +242,57 @@ export function decodeNpub(npub: string): string | null {
 
 export function decodeNsec(nsec: string): string | null {
   return decodeBech32(nsec, "nsec");
+}
+
+// ─── NIP-19 naddr (bech32m) for addressable events ──────────────────────────
+//
+// NIP-23 long-form articles (kind 30023) are addressed by a coordinate of
+// (kind, pubkey, d-identifier). Nostr clients and web mirrors like habla.news
+// key article pages by a bech32m-encoded `naddr` of that coordinate, NOT the
+// raw event id. Building `habla.news/a/<hex-id>` resolves to 404 — the naddr
+// is what actually routes.
+//
+// TLV layout (NIP-19): repeated [type:u8][length:u16 BE][value bytes].
+//   type 0 = identifier (d-tag value, utf8)
+//   type 1 = relay hint (utf8, optional)
+//   type 2 = kind (4-byte big-endian u32)
+//   type 3 = author (32-byte pubkey)
+// Encoded with bech32m under HRP "naddr".
+
+export interface NaddrParts {
+  /** 32-byte secp256k1 X-only pubkey as 64-char lowercase hex. */
+  pubkeyHex: string;
+  /** Event kind (e.g. 30023 for NIP-23 articles). */
+  kind: number;
+  /** The `d` tag value (addressable identifier). Empty string if absent. */
+  identifier: string;
+  /** Optional relay URL hint. Omitted if empty. */
+  relay?: string;
+}
+
+function pushTlv(bytes: number[], type: number, value: number[]): void {
+  bytes.push(type);
+  // 2-byte big-endian length.
+  bytes.push((value.length >> 8) & 0xff);
+  bytes.push(value.length & 0xff);
+  for (const b of value) bytes.push(b);
+}
+
+export function encodeNaddr(parts: NaddrParts): string {
+  const pkBytes = hexToBytes(parts.pubkeyHex);
+  if (pkBytes.length !== 32) throw new Error("naddr: pubkey must be 32 bytes");
+
+  const tlv: number[] = [];
+  // Order per NIP-19 reference: identifier, relay (optional), kind, author.
+  pushTlv(tlv, 0, Array.from(new TextEncoder().encode(parts.identifier || "")));
+  if (parts.relay) pushTlv(tlv, 1, Array.from(new TextEncoder().encode(parts.relay)));
+  const kind = parts.kind >>> 0;
+  pushTlv(tlv, 2, [(kind >> 24) & 0xff, (kind >> 16) & 0xff, (kind >> 8) & 0xff, kind & 0xff]);
+  pushTlv(tlv, 3, Array.from(pkBytes));
+
+  const data = convertBits(tlv, 8, 5, true);
+  const checksum = bech32CreateChecksum("naddr", data, BECH32M_CONST);
+  return "naddr" + "1" + [...data, ...checksum].map((v) => BECH32_CHARSET[v]).join("");
 }
 
 function generatePrivateKey(): string {
