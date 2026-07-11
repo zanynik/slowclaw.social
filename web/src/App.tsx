@@ -73,9 +73,17 @@ import {
   type UnifiedItem,
   type ContentChannel,
   type SocialSource,
+  type Topic,
 } from "./lib/socialFeed";
 // ── Local-first interactions: saved/liked/reposted items + native share ────
-import { getSavedItems, onSavedChange, type SavedItem, isReposted, toggleReposted, getRepostedIds } from "./lib/savedItems";
+import {
+  getSavedItems, onSavedChange, type SavedItem,
+  isReposted, toggleReposted, getRepostedIds,
+  isLiked, toggleLiked, getLikedIds,
+  isDisliked, toggleDisliked, getDislikedIds,
+  getLikedKeywords, addLikedKeywords,
+  getDislikedKeywords, addDislikedKeywords,
+} from "./lib/savedItems";
 // ── Local-first profile (name / bio / avatar) ──────────────────────────────
 import { getProfile, saveProfile, onProfileChange, fileToAvatarDataUrl, setAvatar, type LocalProfile } from "./lib/profile";
 // ── Editable interest profile (steers the journal-is-the-lens signal) ──────
@@ -1734,6 +1742,13 @@ function App() {
   const [interestOverrides, setInterestOverrides] = useState<Record<string, { multiplier: number }>>(() => getInterestOverrides());
   const [manualInterests, setManualInterests] = useState<string[]>(() => getManualInterests());
   const [interestDraft, setInterestDraft] = useState("");
+  // 👍/👎 on Reads cards: tracks which cards the user liked/disliked so the
+  // buttons render the correct active state, and so AI-extracted keywords from
+  // those cards steer ranking (liked → positive topics, disliked → penalty).
+  const [likedIds, setLikedIds] = useState<string[]>(() => getLikedIds());
+  const [dislikedIds, setDislikedIds] = useState<string[]>(() => getDislikedIds());
+  const [likedKeywordSeed, setLikedKeywordSeed] = useState<number>(0);
+  const [dislikedKeywordSeed, setDislikedKeywordSeed] = useState<number>(0);
   // Profile content tab: Posted | Drafts | Saved (Twitter/Instagram-style segmented control).
   const [profileContentTab, setProfileContentTab] = useState<"posted" | "saved">("posted");
   // Profile follower/following counts (Bluesky via public AppView, Nostr via kind-3).
@@ -1797,6 +1812,14 @@ function App() {
   useEffect(() => onFollowsChange(() => setFollowedIds(getFollowedIds())), []);
   // Mirror the reposted store so FeedActionBar re-renders on toggle.
   useEffect(() => onSavedChange(() => setRepostedIds(getRepostedIds())), []);
+  // 👍/👎 ids + keyword stores (all written via savedItems.writeJSON) re-sync on
+  // toggle so the Reads card buttons and the ranking memos refresh same-tab.
+  useEffect(() => onSavedChange(() => {
+    setLikedIds(getLikedIds());
+    setDislikedIds(getDislikedIds());
+    setLikedKeywordSeed((n) => n + 1);
+    setDislikedKeywordSeed((n) => n + 1);
+  }), []);
 
   // Fetch follower/following counts when the Profile tab opens (or accounts change).
   // Bluesky: anonymous public AppView getProfile. Nostr: kind-3 contact-list count.
@@ -6204,6 +6227,50 @@ Rules:
     }
   }
 
+  /**
+   * Extract steering keywords from a Reads card's title + body via on-device AI.
+   * Mirrors the interest-keyword extraction pattern (the AGENTS.md reference):
+   * gated on isTauriMobileRuntime() && nativeLocalAiStatus?.available, no
+   * desktop-gateway fallback. Returns null when AI is unavailable or the model
+   * produced no usable output — callers still record the 👍/👎, just skip
+   * keyword steering. Uses the 3-attempt retry + temperature-nudge tactic from
+   * TweetClaw to survive small-model JSON garbling.
+   */
+  async function extractCardKeywords(title: string, body: string): Promise<string[] | null> {
+    if (!isTauriMobileRuntime() || !nativeLocalAiStatus?.available) return null;
+    const userInput = `${title || ""}\n\n${body || ""}`.trim().slice(0, 2400);
+    if (userInput.length < 12) return null;
+    const systemPrompt = `You extract the subject-matter keywords from an article, news story, or video.
+Rules:
+- Output a JSON array of short lowercase keyword phrases (1-3 words each).
+- 3-8 keywords capturing the concrete topics/subjects (not moods, not filler).
+- No generic filler ("news", "article", "video", "the"). No quotes.
+- Output ONLY valid JSON, no markdown fences.`;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const result = await nativeAiChat(userInput, systemPrompt, 160, 0.3 + attempt * 0.1);
+        const keywords = tryParseJsonArray<string>(result.text)
+          ?.filter((k) => typeof k === "string" && k.trim())
+          .map((k) => k.trim().toLowerCase())
+          .slice(0, 8);
+        if (keywords && keywords.length > 0) {
+          // Dedupe against itself.
+          return Array.from(new Set(keywords));
+        }
+      } catch (error) {
+        // nativeAiChat can fail at model load / inference time. Retry once more
+        // unless this was the last attempt; surface on final failure (caller
+        // decides whether to show a status).
+        if (attempt === 2) {
+          const detail = error instanceof Error ? error.message : String(error);
+          holdJournalStatus(`Keyword extraction failed: ${detail.slice(0, 120)}`, 6000);
+          return null;
+        }
+      }
+    }
+    return null;
+  }
+
   async function openWorkspaceJournalsFolder() {
     if (!isDesktopClient) {
       return;
@@ -6923,9 +6990,30 @@ Rules:
         if (mult <= 0) continue;
         adjusted.push({ label, weight: MANUAL_WEIGHT * mult });
       }
+      // Fold in 👍-extracted keywords as positive steering topics. These come
+      // from on-device AI extraction of cards the user explicitly liked, so they
+      // represent confirmed interest. Modest weight (below a strong journal
+      // topic) so an explicit like steers but doesn't drown out the journal lens.
+      const LIKED_KW_WEIGHT = 1.5;
+      for (const kw of getLikedKeywords()) {
+        if (existing.has(kw)) continue;
+        adjusted.push({ label: kw, weight: LIKED_KW_WEIGHT });
+      }
       return adjusted.sort((a, b) => b.weight - a.weight).slice(0, 12);
     },
-    [journalItems, interestOverrides, manualInterests],
+    [journalItems, interestOverrides, manualInterests, likedKeywordSeed],
+  );
+
+  /**
+   * 👎-extracted keywords as negative steering topics. These come from on-device
+   * AI extraction of cards the user explicitly disliked. Passed to rankReads as
+   * the `negativeTopics` arg → matched items get a soft penalty (down-rank, not
+   * hide). Weight is unused by the penalty fn (it only checks membership via
+   * matchesTopic) but kept at 1 for Topic-shape parity.
+   */
+  const negativeTopics = useMemo<Topic[]>(
+    () => getDislikedKeywords().map((label) => ({ label, weight: 1 })),
+    [dislikedKeywordSeed],
   );
 
   /**
@@ -7039,8 +7127,8 @@ Rules:
     for (const s of socialUnifiedForReads) unified.push(s);
     // The Reads feed is a single journal-ranked stream ("For You"); the
     // chronological "Latest" mode was removed when the filter pills were cut.
-    return rankReads(unified, journalTopics);
-  }, [readsArticles, readsRssItems, techNewsItems, readsYouTubeItems, socialUnifiedForReads, journalTopics]);
+    return rankReads(unified, journalTopics, negativeTopics);
+  }, [readsArticles, readsRssItems, techNewsItems, readsYouTubeItems, socialUnifiedForReads, journalTopics, negativeTopics]);
 
   // Persist the ranked Reads stream so the next open paints instantly from
   // cache (local-first). Only the UnifiedItem[] is cached; ranking re-runs on
@@ -7082,7 +7170,7 @@ Rules:
   const baseDisplayReads: RankedRead[] =
     rankedReads.length > 0
       ? rankedReads
-      : rankReads(cachedReads, journalTopics);
+      : rankReads(cachedReads, journalTopics, negativeTopics);
   const displayReads: RankedRead[] =
     aiRerank.boost.size > 0
       ? applyAiRankBoost(baseDisplayReads, aiRerank.boost)
@@ -10158,6 +10246,48 @@ Rules:
                                 const m = journalTopics.find((t) => matchesTopic(item, t.label));
                                 return m ? <span className="reads-rationale">✨ {m.label}</span> : null;
                               })()}
+                              <div className="reads-card-actions">
+                                <button
+                                  type="button"
+                                  className={`reads-card-action ${likedIds.includes(item.id) ? "active liked" : ""}`}
+                                  aria-label={likedIds.includes(item.id) ? "Unlike" : "Like"}
+                                  aria-pressed={likedIds.includes(item.id)}
+                                  onClick={async (e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    const nowLiked = toggleLiked(item.id);
+                                    setLikedIds(getLikedIds());
+                                    if (nowLiked) {
+                                      // On-device AI extraction → positive steering keywords.
+                                      // No-op on desktop / cold start (the like is still recorded).
+                                      const kws = await extractCardKeywords(item.content.title || "", item.content.body || "");
+                                      if (kws && kws.length > 0) {
+                                        addLikedKeywords(kws);
+                                        setLikedKeywordSeed((n) => n + 1);
+                                      }
+                                    }
+                                  }}
+                                >👍</button>
+                                <button
+                                  type="button"
+                                  className={`reads-card-action ${dislikedIds.includes(item.id) ? "active disliked" : ""}`}
+                                  aria-label={dislikedIds.includes(item.id) ? "Remove dislike" : "Dislike"}
+                                  aria-pressed={dislikedIds.includes(item.id)}
+                                  onClick={async (e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    const nowDisliked = toggleDisliked(item.id);
+                                    setDislikedIds(getDislikedIds());
+                                    if (nowDisliked) {
+                                      const kws = await extractCardKeywords(item.content.title || "", item.content.body || "");
+                                      if (kws && kws.length > 0) {
+                                        addDislikedKeywords(kws);
+                                        setDislikedKeywordSeed((n) => n + 1);
+                                      }
+                                    }
+                                  }}
+                                >👎</button>
+                              </div>
                             </div>
                           </a>
                         );
