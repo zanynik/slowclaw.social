@@ -354,3 +354,42 @@ export function chronologicalFeed(items: UnifiedItem[]): RankedFeedItem[] {
   return out;
 }
 
+/* ── On-device AI re-rank blend ──────────────────────────────────────────────
+ *
+ * The base ranker (rankReads) is journal-driven but operates on keyword/topic
+ * matching alone — it can't read a post and judge semantic relevance. When the
+ * on-device model is available, a background pass scores each Reads item's
+ * relevance to the user's journals and produces a 0..1 boost per item id. This
+ * pure function blends that boost into the already-ranked list and re-sorts.
+ *
+ * Weight is tuned so a top AI score (1.0) can lift a stale-but-relevant item
+ * above a fresh-but-generic one (recency contributes ≤1.0), but cannot bury a
+ * strong journal-topic match (which contributes up to ~1.2). Items without a
+ * boost keep their base score untouched.
+ */
+export const AI_BOOST_WEIGHT = 0.6;
+
+/**
+ * Blend an async AI relevance boost (0..1 per item id) into a ranked list.
+ * Returns a new array, re-sorted by blended score descending, stable on ties.
+ * Items whose id isn't in `boost` keep their original score.
+ */
+export function applyAiRankBoost(
+  ranked: RankedRead[],
+  boost: ReadonlyMap<string, number>,
+  weight: number = AI_BOOST_WEIGHT,
+): RankedRead[] {
+  if (boost.size === 0) return ranked;
+  const blended = ranked.map((r) => ({
+    ...r,
+    score: r.score + weight * clamp01(boost.get(r.item.id) ?? 0),
+  }));
+  blended.sort((a, b) => b.score - a.score);
+  return blended;
+}
+
+function clamp01(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  return n < 0 ? 0 : n > 1 ? 1 : n;
+}
+

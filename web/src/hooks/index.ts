@@ -10,3 +10,5 @@ export { useKeyboardHeight, useIsKeyboardOpen } from "./useKeyboardHeight";
 export { useScrollDirection } from "./useScrollDirection";
 export { useLocalFirstList } from "./useLocalFirstList";
 export type { LocalFirstListState } from "./useLocalFirstList";
+export { useAiFeedRerank } from "./useAiFeedRerank";
+export type { AiRerankResult, AiRerankStatus } from "./useAiFeedRerank";

@@ -92,7 +92,9 @@ import {
 // ── Local-first optimistic follows ─────────────────────────────────────────
 import { getFollowedIds, onFollowsChange, toggleFollow, nostrFollowKey, blueskyFollowKey } from "./lib/follows";
 // ── Reads ranking + read-time (Google News / Substack-style "For You") ──────
-import { rankReads, chronologicalReads, gateSocialItems, filterBlueskyByReplies, type RankedRead } from "./lib/readsRanking";
+import { rankReads, chronologicalReads, gateSocialItems, filterBlueskyByReplies, applyAiRankBoost, type RankedRead } from "./lib/readsRanking";
+import { tryParseJsonArray } from "./lib/json";
+import { useAiFeedRerank } from "./hooks/useAiFeedRerank";
 import {
   loadCachedWoTSet,
   refreshWoTSet,
@@ -6803,28 +6805,6 @@ Rules:
   }
 
   /** Try to parse JSON from AI output with multiple format recovery attempts */
-  function tryParseJsonArray<T>(raw: string): T[] | null {
-    // Strip markdown fences
-    let cleaned = raw.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/m, "").trim();
-    // Try direct parse
-    try { const r = JSON.parse(cleaned); if (Array.isArray(r)) return r; } catch {}
-    // Try extracting first [...] block
-    const bracketMatch = cleaned.match(/\[\s*\{[\s\S]*\}\s*\]/);
-    if (bracketMatch) {
-      try { const r = JSON.parse(bracketMatch[0]); if (Array.isArray(r)) return r; } catch {}
-    }
-    // Try line-by-line JSON objects  {"title":...}
-    const objLines = cleaned.split('\n').filter((l) => l.trim().startsWith('{'));
-    if (objLines.length > 0) {
-      const arr: T[] = [];
-      for (const line of objLines) {
-        try { arr.push(JSON.parse(line.replace(/,\s*$/, ''))); } catch {}
-      }
-      if (arr.length > 0) return arr;
-    }
-    return null;
-  }
-
   function requireModel(): boolean {
     const hasModel = localModels.some((m) => m.installed) || nativeLocalAiStatus?.configured;
     if (!hasModel) {
@@ -7087,14 +7067,37 @@ Rules:
     }
   }, [rankedReads, READS_CACHE_KEY]);
 
+  // ── On-device AI background re-rank ─────────────────────────────────────────
+  // When the local model is available, continuously re-score the top Reads items
+  // for relevance to the user's journals and blend the boost into "For You". The
+  // hook skips while a foreground AI request (TweetClaw pull-to-generate, etc.)
+  // is busy so user-initiated work takes the model first. iOS-only; no-ops on
+  // desktop. See hooks/useAiFeedRerank.ts for the preference/limitation notes.
+  const aiRerank = useAiFeedRerank({
+    items: rankedReads,
+    topics: journalTopics,
+    enabled: isTauriMobileRuntime() && !!nativeLocalAiStatus?.available,
+    // generatePostBusy covers the long, user-visible generation paths (manual
+    // generate, pull-to-refresh, Done→post-gen). Quick steps (title/interest
+    // extraction) don't set it; combined with the hook's 60s cooldown + short
+    // token cap, this is sufficient foreground preference on the current engine.
+    busy: generatePostBusy,
+  });
+
   // What the Reads tab actually renders: the live ranked stream once it has
   // loaded, otherwise the cached stream so the tab is never blank on open.
-  const displayReads: RankedRead[] =
+  // In "For You" mode, blend the on-device AI relevance boost on top of the
+  // base journal ranking (additive, never overrides a strong topic match).
+  const baseDisplayReads: RankedRead[] =
     rankedReads.length > 0
       ? rankedReads
       : readsRankMode === "latest"
       ? chronologicalReads(cachedReads)
       : rankReads(cachedReads, journalTopics);
+  const displayReads: RankedRead[] =
+    readsRankMode === "foryou" && aiRerank.boost.size > 0
+      ? applyAiRankBoost(baseDisplayReads, aiRerank.boost)
+      : baseDisplayReads;
 
   async function loadNostrFeed() {
     if (nostrFeedLoading) return;
@@ -10133,7 +10136,10 @@ Rules:
               <div className="feed-tab-container">
                 <div className="row-between" style={{ padding: '0 0.25rem', alignItems: 'center' }}>
                   <h2>Reads</h2>
-                  <span className="text-sm muted">{displayReads.length} stories · ranked by your lens</span>
+                  <span className="text-sm muted">
+                    {displayReads.length} stories · ranked by your lens
+                    {aiRerank.status === "running" ? " · AI re-ranking…" : aiRerank.boost.size > 0 ? " · ✨ AI-ranked" : ""}
+                  </span>
                 </div>
 
                 {/* Rank mode toggle: "For You" (scored) vs "Latest" (chronological),
