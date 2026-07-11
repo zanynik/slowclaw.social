@@ -1678,20 +1678,15 @@ function App() {
   const [readsLoading, setReadsLoading] = useState(false);
   const [readsError, setReadsError] = useState("");
   const [readsSource, setReadsSource] = useState<"nostr" | "rss">("nostr");
-  // YouTube (keyless) folds into the ranked Reads stream when toggled on,
-  // searched by the user's journal topics — the lens applied to video.
-  const [readsYouTubeEnabled, setReadsYouTubeEnabled] = useState(false);
+  // YouTube (keyless) folds into the ranked Reads stream, searched by the
+  // user's journal topics — the lens applied to video. Off by default.
+  const [readsYouTubeEnabled] = useState(false);
   const [readsYouTubeItems, setReadsYouTubeItems] = useState<YouTubeVideo[]>([]);
-  const [activeRssFeedIds, setActiveRssFeedIds] = useState<string[]>(["hackernews", "stratechery", "verge"]);
-  // Reads ranking mode: "foryou" (scored merge) vs "latest" (chronological).
-  const [readsRankMode, setReadsRankMode] = useState<"foryou" | "latest">(() => {
-    if (typeof window === "undefined") return "foryou";
-    return window.localStorage.getItem("slowclaw.reads.rank") === "latest" ? "latest" : "foryou";
-  });
-  // IA simplification: source/social filters are collapsed by default so Reads
-  // opens as a plain "for me" stream. Sources/Social expand on tap.
-  const [feedSocialOpen, setFeedSocialOpen] = useState(false);
-  const [readsSourcesOpen, setReadsSourcesOpen] = useState(false);
+  const [activeRssFeedIds] = useState<string[]>(["hackernews", "stratechery", "verge"]);
+  // Reads is a single minimalistic journal-ranked stream ("For You"); the
+  // rank-mode toggle (For You / Latest) and the Sources / Social filter
+  // disclosures were removed. YouTube is off by default; RSS feeds use the
+  // default selection; social (Nostr/Bluesky) uses the default source.
   const [readsVisibleCount, setReadsVisibleCount] = useState(12);
   // Local-first cache for Reads: the last-good ranked stream is persisted so
   // the Reads tab paints instantly on open (Damus-style), then refreshes in
@@ -1781,15 +1776,11 @@ function App() {
   const feedPollTimerRef = useRef<number | undefined>(undefined);
   const pendingFeedItemsRef = useRef<PersonalizedFeedResponse | null>(null);
 
-  // Persist Reels global mute + Reads rank mode (survive tab switches / reloads).
+  // Persist Reels global mute (survive tab switches / reloads).
   useEffect(() => {
     if (typeof window === "undefined") return;
     window.localStorage.setItem("slowclaw.reels.muted", reelsMuted ? "true" : "false");
   }, [reelsMuted]);
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem("slowclaw.reads.rank", readsRankMode);
-  }, [readsRankMode]);
 
   // Mirror the localStorage saved-items store into state for the Profile list,
   // and re-sync when Feed/Reels/Reads mutate it (same-tab custom event + cross-tab storage).
@@ -1895,10 +1886,6 @@ function App() {
       }
     };
   }
-
-  // Reset feed pagination when the source/topic changes (so the list isn't empty).
-  // Reset Reads pagination when the rank mode / RSS filter changes.
-  useEffect(() => { setReadsVisibleCount(12); }, [readsRankMode, activeRssFeedIds]);
 
   useEffect(() => {
     let cancelled = false;
@@ -7046,10 +7033,10 @@ Rules:
     }
     // Social posts (gated above) join the stream and rank by the same lens.
     for (const s of socialUnifiedForReads) unified.push(s);
-    return readsRankMode === "latest"
-      ? chronologicalReads(unified)
-      : rankReads(unified, journalTopics);
-  }, [readsArticles, readsRssItems, techNewsItems, readsYouTubeItems, socialUnifiedForReads, readsRankMode, journalTopics]);
+    // The Reads feed is a single journal-ranked stream ("For You"); the
+    // chronological "Latest" mode was removed when the filter pills were cut.
+    return rankReads(unified, journalTopics);
+  }, [readsArticles, readsRssItems, techNewsItems, readsYouTubeItems, socialUnifiedForReads, journalTopics]);
 
   // Persist the ranked Reads stream so the next open paints instantly from
   // cache (local-first). Only the UnifiedItem[] is cached; ranking re-runs on
@@ -7086,16 +7073,14 @@ Rules:
 
   // What the Reads tab actually renders: the live ranked stream once it has
   // loaded, otherwise the cached stream so the tab is never blank on open.
-  // In "For You" mode, blend the on-device AI relevance boost on top of the
-  // base journal ranking (additive, never overrides a strong topic match).
+  // Blend the on-device AI relevance boost on top of the base journal ranking
+  // (additive, never overrides a strong topic match).
   const baseDisplayReads: RankedRead[] =
     rankedReads.length > 0
       ? rankedReads
-      : readsRankMode === "latest"
-      ? chronologicalReads(cachedReads)
       : rankReads(cachedReads, journalTopics);
   const displayReads: RankedRead[] =
-    readsRankMode === "foryou" && aiRerank.boost.size > 0
+    aiRerank.boost.size > 0
       ? applyAiRankBoost(baseDisplayReads, aiRerank.boost)
       : baseDisplayReads;
 
@@ -7404,56 +7389,11 @@ Rules:
     }
   }
 
-  /**
-   * Social source + channel selector, shown inside the Reads "▸ Social"
-   * disclosure. Picks which open-protocol source (Nostr | Bluesky) feeds the
-   * gated social stream, and which channel (hashtag / search) scopes it at the
-   * SOURCE — so the reputation gate and ranker work on topic-relevant posts.
-   * No "Following" free timeline: followed people seed the WoT gate instead.
-   */
-  function renderSourceAndChannels() {
-    const channels = channelsForSource(socialSource);
-    return (
-      <div className="filter-panel">
-        <div className="source-toggle" role="group" aria-label="Social source">
-          <button
-            type="button"
-            className={`source-pill${socialSource === "nostr" ? " active" : ""}`}
-            onClick={() => { if (socialSource !== "nostr") { setSocialSource("nostr"); setActiveChannelId(""); } }}
-          >Nostr</button>
-          <button
-            type="button"
-            className={`source-pill${socialSource === "bluesky" ? " active" : ""}`}
-            onClick={() => { if (socialSource !== "bluesky") { setSocialSource("bluesky"); setActiveChannelId(""); } }}
-          >Bluesky</button>
-        </div>
-
-        <div className="topic-chips" role="group" aria-label="Content channels">
-          {channels.map((ch) => (
-            <button
-              key={ch.id}
-              type="button"
-              className={`topic-chip${activeChannelId === ch.id ? " active" : ""}`}
-              onClick={() => {
-                const next = activeChannelId === ch.id ? "" : ch.id;
-                setActiveChannelId(next);
-                // Immediately fetch the newly-selected channel.
-                // Defer via microtask so state is committed first.
-                queueMicrotask(() => {
-                  if (next) {
-                    void (socialSource === "bluesky" ? loadBlueskyPublicFeed() : loadNostrFeed());
-                  } else {
-                    void loadSocialFeed();
-                  }
-                });
-              }}
-              title={`${ch.lever}: ${ch.query || ch.label}`}
-            >{ch.emoji ? <span aria-hidden>{ch.emoji}</span> : null}{ch.label}</button>
-          ))}
-        </div>
-      </div>
-    );
-  }
+  // NOTE: the Reads "▸ Social" disclosure + renderSourceAndChannels() selector
+  // was removed when the feed was simplified to a single minimalistic stream.
+  // socialSource / activeChannelId state are retained — they still scope the
+  // gated social fetch (loadNostrFeed / loadBlueskyPublicFeed) that folds into
+  // the ranked Reads stream, and Profile can still drive channel selection.
 
   /** Resolve the best display name for a pubkey (profile name, else truncated npub). */
   function nostrDisplayName(pubkey: string, profile?: NostrProfile | null): string {
@@ -10142,52 +10082,6 @@ Rules:
                   </span>
                 </div>
 
-                {/* Rank mode toggle: "For You" (scored) vs "Latest" (chronological),
-                    plus a YouTube (keyless) on/off — videos are searched by the
-                    user's journal topics and fold into the same ranked stream. */}
-                <div className="source-toggle">
-                  <button type="button" className={`source-pill${readsRankMode === "foryou" ? " active" : ""}`} onClick={() => setReadsRankMode("foryou")}>✨ For You</button>
-                  <button type="button" className={`source-pill${readsRankMode === "latest" ? " active" : ""}`} onClick={() => setReadsRankMode("latest")}>🕒 Latest</button>
-                  <button type="button" className={`source-pill${readsYouTubeEnabled ? " active" : ""}`} onClick={() => setReadsYouTubeEnabled((v) => !v)} title="Include YouTube: your subscribed channels (reliable) plus best-effort topic discovery from your journals">▶ Videos</button>
-                </div>
-
-                {/* RSS source chips collapsed by default — Reads opens as a
-                    plain "For You" stream. Tap Sources to pick specific feeds. */}
-                <button
-                  type="button"
-                  className={`source-pill discover-toggle${readsSourcesOpen ? " active" : ""}`}
-                  onClick={() => setReadsSourcesOpen((v) => !v)}
-                  aria-expanded={readsSourcesOpen}
-                >{readsSourcesOpen ? "▾ Sources" : "▸ Sources"}</button>
-                {readsSourcesOpen ? (
-                  <div className="topic-chips" style={{ paddingBottom: '0.4rem' }}>
-                    {RSS_FEEDS.map((f) => (
-                      <button
-                        key={f.id}
-                        type="button"
-                        className={`topic-chip small${activeRssFeedIds.includes(f.id) ? " active" : ""}`}
-                        onClick={() => {
-                          setActiveRssFeedIds((prev) => prev.includes(f.id) ? prev.filter((x) => x !== f.id) : [...prev, f.id]);
-                          setReadsRssItems([]);
-                        }}
-                      >
-                        {f.emoji ? `${f.emoji} ` : ""}{f.label}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-
-                {/* Social disclosure: picks the Nostr/Bluesky channels that feed
-                    the gated social stream. Social posts pass a reputation gate
-                    (WoT / engagement) then rank alongside articles here. */}
-                <button
-                  type="button"
-                  className={`source-pill discover-toggle${feedSocialOpen ? " active" : ""}`}
-                  onClick={() => setFeedSocialOpen((v) => !v)}
-                  aria-expanded={feedSocialOpen}
-                >{feedSocialOpen ? "▾ Social" : "▸ Social"}</button>
-                {feedSocialOpen ? renderSourceAndChannels() : null}
-
                 {/* Subtle refresh indicator when content is already showing from cache. */}
                 {readsLoading && displayReads.length > 0 ? (
                   <div className="text-sm muted" style={{ padding: '0.25rem 0.25rem 0', fontSize: '0.72rem' }}>
@@ -10209,7 +10103,7 @@ Rules:
                   <div className="feed-create-hero">
                     <div className="feed-create-hero-icon">📰</div>
                     <h3>No articles yet</h3>
-                    <p className="text-sm muted">Long-form posts, news, video, and social — all ranked by what you've been writing about. Pull to refresh, or open Sources / Social to steer the stream.</p>
+                    <p className="text-sm muted">Long-form posts, news, video, and social — all ranked by what you've been writing about. Pull to refresh to load more.</p>
                   </div>
                 ) : (() => {
                   // Flat ranked stream: every item earned its slot through the
@@ -10228,10 +10122,10 @@ Rules:
                                 {item.sourcePlatform === "nostr"
                                   ? renderNostrNoteCard(src as NostrNote)
                                   : renderBlueskyCard(src as BlueskyPublicPost)}
-                                {readsRankMode === "foryou" ? (() => {
+                                {(() => {
                                   const m = journalTopics.find((t) => matchesTopic(item, t.label));
                                   return m ? <span className="reads-rationale">✨ {m.label}</span> : null;
-                                })() : null}
+                                })()}
                               </div>
                             );
                           }
@@ -10256,10 +10150,10 @@ Rules:
                               </div>
                               <h3 className="reads-card-title">{item.content.title || "Untitled"}</h3>
                               {item.content.body ? <p className="reads-card-summary">{item.content.body.slice(0, 200)}</p> : null}
-                              {readsRankMode === "foryou" ? (() => {
+                              {(() => {
                                 const m = journalTopics.find((t) => matchesTopic(item, t.label));
                                 return m ? <span className="reads-rationale">✨ {m.label}</span> : null;
-                              })() : null}
+                              })()}
                             </div>
                           </a>
                         );
