@@ -70,6 +70,10 @@ import {
   extractJournalTopics,
   matchesTopic,
   channelsForSource,
+  extractNostrMedia,
+  stripMediaUrlsFromContent,
+  splitContentByLinks,
+  urlHostname,
   type UnifiedItem,
   type ContentChannel,
   type SocialSource,
@@ -7531,6 +7535,60 @@ Rules:
   }
 
   /**
+   * Render a Nostr note body as linkified text: plain-text runs are emitted
+   * verbatim, URL runs become anchor tags that open externally (and inside the
+   * in-app webview). `note.content` should already have its media URLs
+   * stripped via `stripMediaUrlsFromContent` so they aren't duplicated as text.
+   */
+  function renderNostrBody(content: string) {
+    const tokens = splitContentByLinks(content);
+    if (tokens.length === 0) return null;
+    return (
+      <>
+        {tokens.map((tok, i) =>
+          tok.type === "url" ? (
+            <a key={i} href={tok.value} target="_blank" rel="noreferrer" className="nostr-body-link">
+              {urlHostname(tok.value)}
+            </a>
+          ) : (
+            <span key={i}>{tok.value}</span>
+          ),
+        )}
+      </>
+    );
+  }
+
+  /**
+   * Render extracted media inline: an image grid (reusing the Bluesky grid CSS)
+   * for images, or a native HTML5 <video> for video URLs. Mirrors the Bluesky
+   * card's media block so the two feeds look consistent. Accepts pre-extracted
+   * media so callers can reuse the same value for body-stripping.
+   */
+  function renderMediaFromMedia(media: UnifiedItem["media"]) {
+    if (media.type === "image" && media.urls.length) {
+      const imgs = media.urls.slice(0, 4);
+      return (
+        <div className={`bluesky-image-grid count-${Math.min(imgs.length, 4)}`}>
+          {imgs.map((u, i) => (
+            <a key={i} href={u} target="_blank" rel="noreferrer">
+              <img src={u} alt="" className="bluesky-grid-image" loading="lazy" />
+            </a>
+          ))}
+        </div>
+      );
+    }
+    if (media.type === "video" && media.urls.length) {
+      const primary = media.urls[0];
+      return (
+        <video className="nostr-video" controls preload="metadata" playsInline>
+          <source src={primary} />
+        </video>
+      );
+    }
+    return null;
+  }
+
+  /**
    * Render a single Nostr note as a rich card: avatar + name, optional
    * "replying to @parent" context, content, and a footer with like count and
    * an expandable reply thread. Reused by both the Feed tab and profile overlay.
@@ -7546,6 +7604,10 @@ Rules:
     const reactionCount = nostrReactions[note.id] || 0;
     const replies = nostrReplyThreads[note.id];
     const repliesLoading = nostrRepliesLoading[note.id];
+    // Extract media once; the body strips those URLs so they render as media
+    // below, not as duplicate text.
+    const noteMedia = extractNostrMedia(note);
+    const noteBodyText = stripMediaUrlsFromContent(note.content, noteMedia);
     return (
       <div key={note.id} className="tweet-card">
         {renderNostrAvatar(note.pubkey, profile)}
@@ -7564,7 +7626,12 @@ Rules:
           {parent ? (
             <blockquote className="nostr-parent-quote">{parent.content.slice(0, 160)}{parent.content.length > 160 ? "…" : ""}</blockquote>
           ) : null}
-          <p className="tweet-text">{note.content}</p>
+          {/* Linkified body with media URLs stripped (they render below). */}
+          {noteBodyText.trim() ? (
+            <p className="tweet-text">{renderNostrBody(noteBodyText)}</p>
+          ) : null}
+          {/* Inline image grid / video, mirroring the Bluesky card. */}
+          {renderMediaFromMedia(noteMedia)}
           <FeedActionBar
             id={note.id}
             source="nostr"
@@ -7614,7 +7681,10 @@ Rules:
           {repliesLoading ? <p className="text-sm muted nostr-reply-meta">Loading replies…</p> : null}
           {replies && replies.length > 0 ? (
             <div className="nostr-reply-thread">
-              {replies.slice(0, 10).map((reply) => (
+              {replies.slice(0, 10).map((reply) => {
+                const replyMedia = extractNostrMedia(reply);
+                const replyBodyText = stripMediaUrlsFromContent(reply.content, replyMedia);
+                return (
                 <div key={reply.id} className="nostr-reply-item">
                   {renderNostrAvatar(reply.pubkey, nostrProfiles[reply.pubkey])}
                   <div className="nostr-reply-item-body">
@@ -7623,10 +7693,14 @@ Rules:
                       <span className="tweet-dot">·</span>
                       <span className="tweet-time">{getRelativeTime(reply.createdAt * 1000)}</span>
                     </div>
-                    <p className="tweet-text" style={{ fontSize: '0.88rem' }}>{reply.content}</p>
+                    {replyBodyText.trim() ? (
+                      <p className="tweet-text" style={{ fontSize: '0.88rem' }}>{renderNostrBody(replyBodyText)}</p>
+                    ) : null}
+                    {renderMediaFromMedia(replyMedia)}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           ) : null}
         </div>

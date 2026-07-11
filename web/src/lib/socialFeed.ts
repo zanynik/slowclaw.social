@@ -90,6 +90,60 @@ export function extractNostrMedia(note: NostrNoteLike): UnifiedItem["media"] {
   return { type: "none", urls: [] };
 }
 
+/**
+ * Remove the media URLs that `extractNostrMedia` already pulled out of a note's
+ * body so they aren't shown twice (once as text, once as rendered media).
+ * Also collapses the empty whitespace left behind. Pure string transform,
+ * framework-agnostic — no react-markdown/linkify dependency needed.
+ */
+export function stripMediaUrlsFromContent(
+  content: string,
+  media: UnifiedItem["media"],
+): string {
+  if (media.type === "none" || media.urls.length === 0) return content;
+  // Escape each URL for safe use in a RegExp, then strip it + trailing space.
+  let out = content;
+  for (const url of media.urls) {
+    const escaped = url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(escaped + "\\s*", "g"), "");
+  }
+  // Collapse runs of whitespace left where a URL used to sit.
+  return out.replace(/[ \t]{2,}/g, " ").replace(/\n[ \t]*\n[ \t]*\n+/g, "\n\n").trim();
+}
+
+/**
+ * Split free-form text into a sequence of text runs and URL runs so a renderer
+ * can wrap URL runs in anchor tags (linkify) without pulling in a dependency.
+ * Returns tokens with `type: "text" | "url"`.
+ */
+const GENERAL_URL_RE = /(https?:\/\/[^\s<>"']+)/g;
+
+export type ContentToken = { type: "text"; value: string } | { type: "url"; value: string };
+
+export function splitContentByLinks(content: string): ContentToken[] {
+  if (!content) return [];
+  const tokens: ContentToken[] = [];
+  let last = 0;
+  for (const match of content.matchAll(GENERAL_URL_RE)) {
+    const idx = match.index ?? 0;
+    const url = match[0];
+    if (idx > last) tokens.push({ type: "text", value: content.slice(last, idx) });
+    tokens.push({ type: "url", value: url });
+    last = idx + url.length;
+  }
+  if (last < content.length) tokens.push({ type: "text", value: content.slice(last) });
+  return tokens;
+}
+
+/** Best-effort hostname for link display, e.g. "https://a.co/x" → "a.co". */
+export function urlHostname(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
 /** Minimal shape of a Bluesky public post (matches lib/bluesky.ts). */
 interface BlueskyPostLike {
   uri: string;
