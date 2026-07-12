@@ -257,21 +257,27 @@ export function toUnifiedFromNostrArticle(
   const image = tags.find((t) => t[0] === "image")?.[1];
   const publishedRaw = tags.find((t) => t[0] === "published_at")?.[1];
   const published = publishedRaw ? Number(publishedRaw) : article.created_at;
-  // Habla News keys NIP-23 article pages by a bech32m naddr of the
+  // Habla News keys NIP-23 article pages by a `naddr` of the
   // (kind, pubkey, d-identifier) coordinate — NOT the raw event id.
-  // See NIP-19. The d-tag falls back to "" when absent (NIP-23 default).
+  // A non-empty d-tag is required: nostr-tools (what Habla uses to decode)
+  // rejects an naddr whose identifier TLV is empty ("malformed TLV 0"), so an
+  // article without a d-tag can't be linked via naddr. Fall back to the hex id
+  // (which may 404 on Habla, but never crashes the feed render and at least
+  // avoids emitting a guaranteed-broken URL).
   const dTag = tags.find((t) => t[0] === "d")?.[1] || "";
   let linkUrl: string;
-  try {
-    const naddr = encodeNaddr({
-      pubkeyHex: article.pubkey,
-      kind: 30023,
-      identifier: dTag,
-    });
-    linkUrl = `https://habla.news/a/${naddr}`;
-  } catch {
-    // Malformed pubkey / tags — fall back to the hex id (may 404, but never
-    // crashes the feed render).
+  if (dTag) {
+    try {
+      const naddr = encodeNaddr({
+        pubkeyHex: article.pubkey,
+        kind: 30023,
+        identifier: dTag,
+      });
+      linkUrl = `https://habla.news/a/${naddr}`;
+    } catch {
+      linkUrl = `https://habla.news/a/${article.id}`;
+    }
+  } else {
     linkUrl = `https://habla.news/a/${article.id}`;
   }
   return {

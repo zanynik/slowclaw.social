@@ -244,20 +244,21 @@ export function decodeNsec(nsec: string): string | null {
   return decodeBech32(nsec, "nsec");
 }
 
-// ─── NIP-19 naddr (bech32m) for addressable events ──────────────────────────
+// ─── NIP-19 naddr (bech32) for addressable events ───────────────────────────
 //
 // NIP-23 long-form articles (kind 30023) are addressed by a coordinate of
 // (kind, pubkey, d-identifier). Nostr clients and web mirrors like habla.news
-// key article pages by a bech32m-encoded `naddr` of that coordinate, NOT the
-// raw event id. Building `habla.news/a/<hex-id>` resolves to 404 — the naddr
-// is what actually routes.
+// key article pages by a `naddr` of that coordinate, NOT the raw event id.
+// Building `habla.news/a/<hex-id>` resolves to 404 — the naddr routes.
 //
-// TLV layout (NIP-19): repeated [type:u8][length:u16 BE][value bytes].
-//   type 0 = identifier (d-tag value, utf8)
-//   type 1 = relay hint (utf8, optional)
-//   type 2 = kind (4-byte big-endian u32)
-//   type 3 = author (32-byte pubkey)
-// Encoded with bech32m under HRP "naddr".
+// TLV layout (NIP-19): repeated [type:u8][length:u8][value bytes].
+//   type 0 = special   (d-tag identifier value, utf8)
+//   type 1 = relay     (utf8, optional)
+//   type 2 = author    (32-byte pubkey)
+//   type 3 = kind      (4-byte big-endian u32)
+// Encoded with PLAIN bech32 (constant 1) under HRP "naddr" — NOT bech32m,
+// despite the NIP-19 spec text. This matches nostr-tools (the library
+// habla.news uses to decode), verified for byte-exact equality.
 
 export interface NaddrParts {
   /** 32-byte secp256k1 X-only pubkey as 64-char lowercase hex. */
@@ -272,8 +273,7 @@ export interface NaddrParts {
 
 function pushTlv(bytes: number[], type: number, value: number[]): void {
   bytes.push(type);
-  // 2-byte big-endian length.
-  bytes.push((value.length >> 8) & 0xff);
+  // 1-byte length (NIP-19 TLV: [type:u8][length:u8][value bytes], NOT 2-byte).
   bytes.push(value.length & 0xff);
   for (const b of value) bytes.push(b);
 }
@@ -283,15 +283,24 @@ export function encodeNaddr(parts: NaddrParts): string {
   if (pkBytes.length !== 32) throw new Error("naddr: pubkey must be 32 bytes");
 
   const tlv: number[] = [];
-  // Order per NIP-19 reference: identifier, relay (optional), kind, author.
+  // TLV order per NIP-19: special(identifier), relay, author, kind.
+  // IMPORTANT: type 2 = author (pubkey), type 3 = kind. Length is a single
+  // byte (not 2-byte). These three details (field order, 1-byte length, and
+  // plain-bech32-not-bech32m checksum) were each wrong in earlier revisions,
+  // which produced strings that nostr-tools (what habla.news uses to decode)
+  // rejected → 404. Verified against nostr-tools nip19.naddrEncode for
+  // byte-exact equality across multiple inputs.
   pushTlv(tlv, 0, Array.from(new TextEncoder().encode(parts.identifier || "")));
   if (parts.relay) pushTlv(tlv, 1, Array.from(new TextEncoder().encode(parts.relay)));
+  pushTlv(tlv, 2, Array.from(pkBytes));
   const kind = parts.kind >>> 0;
-  pushTlv(tlv, 2, [(kind >> 24) & 0xff, (kind >> 16) & 0xff, (kind >> 8) & 0xff, kind & 0xff]);
-  pushTlv(tlv, 3, Array.from(pkBytes));
+  pushTlv(tlv, 3, [(kind >> 24) & 0xff, (kind >> 16) & 0xff, (kind >> 8) & 0xff, kind & 0xff]);
 
+  // nostr-tools encodes naddr with PLAIN bech32 (constant 1), not bech32m,
+  // despite the NIP-19 spec text. Matching the deployed library (which
+  // habla.news runs) is what makes the resulting URL resolve.
   const data = convertBits(tlv, 8, 5, true);
-  const checksum = bech32CreateChecksum("naddr", data, BECH32M_CONST);
+  const checksum = bech32CreateChecksum("naddr", data, BECH32_CONST);
   return "naddr" + "1" + [...data, ...checksum].map((v) => BECH32_CHARSET[v]).join("");
 }
 
