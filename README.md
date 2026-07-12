@@ -87,7 +87,7 @@ flowchart TB
 
 SlowClaw is iOS-first, so AI runs **on-device** by default. Capture-time intelligence — transcription, titles, post drafts, interest mining, feed re-ranking — goes through `nativeAiChat` (llama.cpp/GGUF in `web/src-tauri/src/inference.rs`) and `transcribeAudio` (Speech.framework in `web/src-tauri/src/transcription.rs`), gated by `isTauriMobileRuntime() && nativeLocalAiStatus?.available`. The iOS app embeds the Rust gateway in-process (bound to `127.0.0.1:42617`), so the personalized feed ranker (`src/feed/ranker.rs`), the feed store, and memory/embeddings all run **inside the app** — there is no separate desktop server to stand up.
 
-The on-device loop writes back into the embedded gateway's feed store: when you save a journal on iOS, on-device AI extracts interest keywords and persists them at `state/local_data.db`, which the Rust ranker then reads back to weight the personalized feed. This is the loop that makes the journal the lens.
+The on-device loop writes back into **one** store: `state/local_data.db`. When you save a journal on iOS, on-device AI extracts interest keywords and persists them there; when you 👍/👎 a Reads card, the extracted keywords go to the same place. Your editable lens — mute, boost, and manually-added interests — lives there too. The Rust ranker (`src/feed/ranker.rs`) and the client-side ranker (`readsRanking.ts`) both read from it, so the journal, your likes/dislikes, and your manual edits all shape the same lens. This is the loop that makes the journal the lens.
 
 ```mermaid
 flowchart TB
@@ -105,15 +105,19 @@ flowchart TB
         ON_WM["Model warm-up on launch"]
     end
 
-    ON_IN -.->|"extracted on-device"| IP[("Interest profile<br/>state/local_data.db<br/>embedded gateway")]
-    ON_CK -.->|"like / dislike"| LENS["Interest lens<br/>localStorage"]
-    IP --> RANK["Rust ranker<br/>src/feed/ranker.rs — runs in-app"]
-    LENS --> RANK
-    RANK --> FEED["For-You Reads feed"]
+    ON_IN -.->|"journal keywords (positive)"| STORE
+    ON_CK -.->|"liked → positive · disliked → negative"| STORE
+    LENS_UI["Editable lens<br/>mute · boost · manual add"] -.->|"overrides + manual"| STORE
+
+    STORE[("Single lens store<br/>state/local_data.db<br/>positives · negatives · overrides · manual")]
+    STORE --> RANK_RS["Rust ranker<br/>src/feed/ranker.rs — in-app"]
+    STORE --> RANK_TS["Client ranker<br/>readsRanking.ts — in-app"]
+    RANK_RS --> FEED["For-You Reads feed"]
+    RANK_TS --> FEED
     ON_TW --> PUB["Drafts → review → publish<br/>Bluesky short-form · Nostr long-form"]
 ```
 
-> **Two stores, one lens.** Interest keywords (AI-extracted from journals) persist in the embedded gateway's feed store at `state/local_data.db` and feed the Rust ranker. Card keywords (extracted on like / dislike) live client-side in `localStorage` and feed the editable interest lens in `readsRanking.ts`. Both steer what you read back — and both stay on-device.
+> **One store, one lens.** All curation-lens signals live in `state/local_data.db`: journal + liked-card keywords as positives, disliked-card keywords as persistent negatives (they don't decay — a dislike stays effective until you remove it), and the editable lens (mute/boost overrides + manual interests). Both rankers read from it, so what you write, what you like, and what you mute all steer the same feed — and it survives an iOS app reinstall (localStorage does not). A one-time migration carries any existing localStorage lens into SQLite on first launch.
 >
 > **Reference pattern.** TweetClaw (post generation) and on-device task/interest extraction in `web/src/App.tsx` are the template for any new AI feature on iOS: gate on `isTauriMobileRuntime() && nativeLocalAiStatus?.available`, request JSON from `nativeAiChat`, parse defensively with retries, log to the AI activity log, and degrade gracefully. Agentic tool-use features (ClawChat, workspace synthesizer) run on the embedded gateway and are reachable on iOS only via desktop QR pairing — they are not part of the default on-device loop. For any new capture or synthesis feature, build the on-device variant first.
 
