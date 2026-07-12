@@ -85,7 +85,7 @@ asyncio.run(main())
 
 | Tool | Description |
 |------|-------------|
-| `web_search` | Search the web (requires `BRAVE_API_KEY`) |
+| `web_search` | Search the open web via DuckDuckGo (no API key needed) |
 | `http_request` | Make HTTP requests |
 | `memory_store` | Store data in persistent memory |
 | `memory_recall` | Recall stored data |
@@ -179,7 +179,6 @@ bot.run()
 ```bash
 # Set environment variables
 export API_KEY="your-key"
-export BRAVE_API_KEY="your-brave-key"  # Optional, for web search
 
 # Single message
 zeroclaw-tools "What is the current date?"

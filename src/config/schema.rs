@@ -1160,27 +1160,22 @@ impl Default for WebFetchConfig {
 // ── Web search ───────────────────────────────────────────────────
 
 /// Web search tool configuration (`[web_search]` section).
+///
+/// Backed by DuckDuckGo's free HTML endpoint — no API key, no paid plan,
+/// no proprietary credential. Stays aligned with the open-protocol
+/// philosophy: web discovery is keyed off the user's own interests, not a
+/// third-party subscription.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
-    #[serde(default = "default_web_search_provider")]
-    pub provider: String,
-    /// Brave Search API key (required if provider is "brave")
-    #[serde(default)]
-    pub brave_api_key: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
     /// Request timeout in seconds
     #[serde(default = "default_web_search_timeout_secs")]
     pub timeout_secs: u64,
-}
-
-fn default_web_search_provider() -> String {
-    "duckduckgo".into()
 }
 
 fn default_web_search_max_results() -> usize {
@@ -1195,8 +1190,6 @@ impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: default_web_search_provider(),
-            brave_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
         }
@@ -4058,12 +4051,6 @@ impl Config {
 
             decrypt_optional_secret(
                 &store,
-                &mut config.web_search.brave_api_key,
-                "config.web_search.brave_api_key",
-            )?;
-
-            decrypt_optional_secret(
-                &store,
                 &mut config.storage.provider.config.db_url,
                 "config.storage.provider.config.db_url",
             )?;
@@ -4581,26 +4568,6 @@ impl Config {
             self.web_search.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
 
-        // Web search provider: ZEROCLAW_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
-        if let Ok(provider) = std::env::var("ZEROCLAW_WEB_SEARCH_PROVIDER")
-            .or_else(|_| std::env::var("WEB_SEARCH_PROVIDER"))
-        {
-            let provider = provider.trim();
-            if !provider.is_empty() {
-                self.web_search.provider = provider.to_string();
-            }
-        }
-
-        // Brave API key: ZEROCLAW_BRAVE_API_KEY or BRAVE_API_KEY
-        if let Ok(api_key) =
-            std::env::var("ZEROCLAW_BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY"))
-        {
-            let api_key = api_key.trim();
-            if !api_key.is_empty() {
-                self.web_search.brave_api_key = Some(api_key.to_string());
-            }
-        }
-
         // Web search max results: ZEROCLAW_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
         if let Ok(max_results) = std::env::var("ZEROCLAW_WEB_SEARCH_MAX_RESULTS")
             .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
@@ -4738,12 +4705,6 @@ impl Config {
             &store,
             &mut config_to_save.browser.computer_use.api_key,
             "config.browser.computer_use.api_key",
-        )?;
-
-        encrypt_optional_secret(
-            &store,
-            &mut config_to_save.web_search.brave_api_key,
-            "config.web_search.brave_api_key",
         )?;
 
         encrypt_optional_secret(
@@ -5447,7 +5408,6 @@ tool_dispatcher = "xml"
         config.api_key = Some("root-credential".into());
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
-        config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
 
         config.agents.insert(
@@ -5493,15 +5453,6 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(browser_encrypted).unwrap(),
             "browser-credential"
-        );
-
-        let web_search_encrypted = stored.web_search.brave_api_key.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(
-            web_search_encrypted
-        ));
-        assert_eq!(
-            store.decrypt(web_search_encrypted).unwrap(),
-            "brave-credential"
         );
 
         let worker = stored.agents.get("worker").unwrap();
@@ -7118,28 +7069,19 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("WEB_SEARCH_ENABLED", "false");
-        std::env::set_var("WEB_SEARCH_PROVIDER", "brave");
+        std::env::set_var("WEB_SEARCH_ENABLED", "true");
         std::env::set_var("WEB_SEARCH_MAX_RESULTS", "7");
         std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "20");
-        std::env::set_var("BRAVE_API_KEY", "brave-test-key");
 
         config.apply_env_overrides();
 
-        assert!(!config.web_search.enabled);
-        assert_eq!(config.web_search.provider, "brave");
+        assert!(config.web_search.enabled);
         assert_eq!(config.web_search.max_results, 7);
         assert_eq!(config.web_search.timeout_secs, 20);
-        assert_eq!(
-            config.web_search.brave_api_key.as_deref(),
-            Some("brave-test-key")
-        );
 
         std::env::remove_var("WEB_SEARCH_ENABLED");
-        std::env::remove_var("WEB_SEARCH_PROVIDER");
         std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
         std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
-        std::env::remove_var("BRAVE_API_KEY");
     }
 
     #[test]

@@ -12,25 +12,19 @@ pub struct WebSearchResultItem {
     pub provider: String,
 }
 
-/// Web search tool for searching the internet.
-/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key).
+/// Open-web search tool backed by DuckDuckGo's free HTML endpoint.
+///
+/// No API key, no paid plan, no proprietary credential — this stays aligned
+/// with the journal-first, open-protocol philosophy: discovery of web content
+/// is driven by the user's own interest keywords, not a third-party key.
 pub struct WebSearchTool {
-    provider: String,
-    brave_api_key: Option<String>,
     max_results: usize,
     timeout_secs: u64,
 }
 
 impl WebSearchTool {
-    pub fn new(
-        provider: String,
-        brave_api_key: Option<String>,
-        max_results: usize,
-        timeout_secs: u64,
-    ) -> Self {
+    pub fn new(max_results: usize, timeout_secs: u64) -> Self {
         Self {
-            provider: provider.trim().to_lowercase(),
-            brave_api_key,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
         }
@@ -40,15 +34,7 @@ impl WebSearchTool {
         if query.trim().is_empty() {
             anyhow::bail!("Search query cannot be empty");
         }
-
-        match self.provider.as_str() {
-            "duckduckgo" | "ddg" => self.search_duckduckgo_structured(query).await,
-            "brave" => self.search_brave_structured(query).await,
-            _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
-                self.provider
-            ),
-        }
+        self.search_duckduckgo_structured(query).await
     }
 
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
@@ -124,77 +110,6 @@ impl WebSearchTool {
 
         Ok(results)
     }
-
-    async fn search_brave(&self, query: &str) -> anyhow::Result<String> {
-        let results = self.search_brave_structured(query).await?;
-        Ok(format_search_results(query, "Brave", &results))
-    }
-
-    async fn search_brave_structured(&self, query: &str) -> anyhow::Result<Vec<WebSearchResultItem>> {
-        let api_key = self
-            .brave_api_key
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Brave API key not configured"))?;
-
-        let encoded_query = urlencoding::encode(query);
-        let search_url = format!(
-            "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
-            encoded_query, self.max_results
-        );
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .build()?;
-
-        let response = client
-            .get(&search_url)
-            .header("Accept", "application/json")
-            .header("X-Subscription-Token", api_key)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("Brave search failed with status: {}", response.status());
-        }
-
-        let json: serde_json::Value = response.json().await?;
-        self.parse_brave_results(&json)
-    }
-
-    fn parse_brave_results(&self, json: &serde_json::Value) -> anyhow::Result<Vec<WebSearchResultItem>> {
-        let results = json
-            .get("web")
-            .and_then(|w| w.get("results"))
-            .and_then(|r| r.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Invalid Brave API response"))?;
-
-        if results.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut items = Vec::with_capacity(results.len().min(self.max_results));
-
-        for result in results.iter().take(self.max_results) {
-            let title = result
-                .get("title")
-                .and_then(|t| t.as_str())
-                .unwrap_or("No title");
-            let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
-            let description = result
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or("");
-
-            items.push(WebSearchResultItem {
-                title: title.to_string(),
-                url: url.to_string(),
-                description: description.to_string(),
-                provider: "brave".to_string(),
-            });
-        }
-
-        Ok(items)
-    }
 }
 
 fn format_search_results(query: &str, provider_label: &str, items: &[WebSearchResultItem]) -> String {
@@ -237,7 +152,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web for information. Returns relevant search results with titles, URLs, and descriptions. Use this to find current information, news, or research topics."
+        "Search the open web via DuckDuckGo. Returns relevant search results with titles, URLs, and descriptions. Use this to find current information, news, or research topics."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -263,16 +178,9 @@ impl Tool for WebSearchTool {
             anyhow::bail!("Search query cannot be empty");
         }
 
-        tracing::info!("Searching web for: {}", query);
+        tracing::info!("Searching open web (DuckDuckGo) for: {}", query);
 
-        let result = match self.provider.as_str() {
-            "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
-            "brave" => self.search_brave(query).await?,
-            _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
-                self.provider
-            ),
-        };
+        let result = self.search_duckduckgo(query).await?;
 
         Ok(ToolResult {
             success: true,
@@ -288,19 +196,19 @@ mod tests {
 
     #[test]
     fn test_tool_name() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(5, 15);
         assert_eq!(tool.name(), "web_search_tool");
     }
 
     #[test]
     fn test_tool_description() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
-        assert!(tool.description().contains("Search the web"));
+        let tool = WebSearchTool::new(5, 15);
+        assert!(tool.description().contains("Search the open web"));
     }
 
     #[test]
     fn test_parameters_schema() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(5, 15);
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["query"].is_object());
@@ -314,14 +222,14 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_empty() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(5, 15);
         let result = tool.parse_duckduckgo_results("<html>No results here</html>").unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_parse_duckduckgo_results_with_data() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(5, 15);
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -334,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_decodes_redirect_url() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(5, 15);
         let html = r#"
             <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1&amp;rut=test">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -345,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_constructor_clamps_web_search_limits() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 0, 0);
+        let tool = WebSearchTool::new(0, 0);
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -356,23 +264,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_missing_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(5, 15);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_empty_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new(5, 15);
         let result = tool.execute(json!({"query": ""})).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_execute_brave_without_api_key() {
-        let tool = WebSearchTool::new("brave".to_string(), None, 5, 15);
-        let result = tool.execute(json!({"query": "test"})).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("API key"));
     }
 }

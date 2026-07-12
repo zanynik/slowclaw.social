@@ -147,8 +147,6 @@ pub(crate) fn build_full_tools(args: FullToolRegistryConfig<'_>) -> Vec<Box<dyn 
 
     if args.root_config.web_search.enabled {
         builder = builder.with_tool(Arc::new(WebSearchTool::new(
-            args.root_config.web_search.provider.clone(),
-            args.root_config.web_search.brave_api_key.clone(),
             args.root_config.web_search.max_results,
             args.root_config.web_search.timeout_secs,
         )));

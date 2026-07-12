@@ -32,7 +32,6 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::memory::vector::{bytes_to_vec, cosine_similarity, vec_to_bytes};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
-use crate::tools::web_search_tool::WebSearchTool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -9792,10 +9791,10 @@ const WORKSPACE_SYNTH_BATCH_WORD_LIMIT: usize = 500;
 const BLUESKY_PERSONALIZED_PAGE_SIZE: usize = 30;
 const FEED_WEB_SOURCE_KIND: &str = "hn-popular-blogs-2025";
 const FEED_WEB_PREVIEW_CACHE_TTL_SECS: i64 = 24 * 60 * 60;
-const FEED_WEB_INTEREST_QUERY_COUNT: usize = 3;
-const FEED_WEB_DOMAIN_BATCH_SIZE: usize = 5;
-const FEED_WEB_DOMAIN_BATCHES_PER_INTEREST: usize = 2;
-const FEED_WEB_RESULT_LIMIT_PER_QUERY: usize = 5;
+/// Max age of a content-source fetch before it is re-pulled.
+/// NOTE: `src/feed/mod.rs` runs a parallel RSS pipeline with the same
+/// 30-minute freshness gate — keep them in sync. The twin lives there as
+/// `RSS_CONTENT_REFRESH_TTL_SECS`.
 const CONTENT_SOURCE_REFRESH_TTL_SECS: i64 = 30 * 60;
 const CONTENT_SOURCE_REFRESH_BATCH_SIZE: usize = 6;
 const CONTENT_ITEM_EMBEDDING_BACKFILL_BATCH_SIZE: usize = 16;
@@ -10672,118 +10671,6 @@ fn seed_default_feed_web_sources(workspace_dir: &StdPath) -> Result<()> {
         )?;
     }
     Ok(())
-}
-
-fn build_feed_web_queries(
-    interests: &[ActiveInterest],
-    sources: &[local_store::FeedWebSourceRecord],
-) -> Vec<String> {
-    let top_interests: Vec<&ActiveInterest> = interests
-        .iter()
-        .filter(|interest| !interest.record.label.trim().is_empty())
-        .collect();
-    let mut top_interests = top_interests;
-    top_interests.sort_by(|left, right| {
-        right
-            .record
-            .health_score
-            .partial_cmp(&left.record.health_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    top_interests.truncate(FEED_WEB_INTEREST_QUERY_COUNT);
-
-    let domains: Vec<String> = sources
-        .iter()
-        .map(|source| normalize_feed_web_domain(&source.domain))
-        .filter(|domain| !domain.is_empty())
-        .collect();
-    if domains.is_empty() {
-        return Vec::new();
-    }
-
-    let batches: Vec<&[String]> = domains.chunks(FEED_WEB_DOMAIN_BATCH_SIZE).collect();
-    let mut queries = Vec::new();
-    for (interest_index, interest) in top_interests.iter().enumerate() {
-        for batch_offset in 0..FEED_WEB_DOMAIN_BATCHES_PER_INTEREST {
-            let batch_index = (interest_index * FEED_WEB_DOMAIN_BATCHES_PER_INTEREST + batch_offset)
-                % batches.len();
-            let batch = batches[batch_index];
-            let site_filters = batch
-                .iter()
-                .map(|domain| format!("site:{domain}"))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            queries.push(format!("{} ({site_filters})", interest.record.label));
-        }
-    }
-    queries
-}
-
-fn build_feed_web_search_tool(config: &Config) -> Option<WebSearchTool> {
-    if !config.web_search.enabled {
-        return None;
-    }
-
-    Some(WebSearchTool::new(
-        config.web_search.provider.clone(),
-        config.web_search.brave_api_key.clone(),
-        FEED_WEB_RESULT_LIMIT_PER_QUERY.min(config.web_search.max_results),
-        config.web_search.timeout_secs,
-    ))
-}
-
-async fn collect_web_search_candidates(
-    config: &Config,
-    interests: &[ActiveInterest],
-) -> Result<Vec<CandidateWebResult>> {
-    let Some(tool) = build_feed_web_search_tool(config) else {
-        return Ok(Vec::new());
-    };
-
-    let workspace_dir = &config.workspace_dir;
-    seed_default_feed_web_sources(workspace_dir)?;
-    let sources = local_store::list_feed_web_sources(workspace_dir)?;
-    if sources.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let allowed_domains: BTreeSet<String> = sources
-        .iter()
-        .map(|source| normalize_feed_web_domain(&source.domain))
-        .collect();
-    let mut candidates = Vec::new();
-    let mut seen_urls = BTreeSet::new();
-
-    for query in build_feed_web_queries(interests, &sources) {
-        let results = match tool.search_structured(&query).await {
-            Ok(results) => results,
-            Err(err) => {
-                tracing::debug!(query, error = %err, "Feed web search query failed");
-                continue;
-            }
-        };
-        for result in results {
-            let Some(domain) = resolve_feed_web_domain(&result.url) else {
-                continue;
-            };
-            if !is_allowed_feed_web_domain(&domain, &allowed_domains) {
-                continue;
-            }
-            if !seen_urls.insert(result.url.clone()) {
-                continue;
-            }
-            candidates.push(CandidateWebResult {
-                url: result.url,
-                title: result.title,
-                description: result.description,
-                domain,
-                provider: result.provider,
-                search_query: query.clone(),
-            });
-        }
-    }
-
-    Ok(candidates)
 }
 
 fn web_preview_cache_is_fresh(updated_at: &str) -> bool {

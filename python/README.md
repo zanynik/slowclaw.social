@@ -87,7 +87,7 @@ bot.run()
 | `shell` | Execute shell commands |
 | `file_read` | Read file contents |
 | `file_write` | Write content to files |
-| `web_search` | Search the web (requires Brave API key) |
+| `web_search` | Search the open web via DuckDuckGo (no API key needed) |
 | `http_request` | Make HTTP requests |
 | `memory_store` | Store data in memory |
 | `memory_recall` | Recall stored data |

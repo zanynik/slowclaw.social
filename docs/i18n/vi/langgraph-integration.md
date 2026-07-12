@@ -85,7 +85,7 @@ asyncio.run(main())
 
 | Tool | Mô tả |
 |------|-------|
-| `web_search` | Tìm kiếm web (yêu cầu `BRAVE_API_KEY`) |
+| `web_search` | Tìm kiếm web mở qua DuckDuckGo (không cần API key) |
 | `http_request` | Thực hiện HTTP request |
 | `memory_store` | Lưu dữ liệu vào bộ nhớ lâu dài |
 | `memory_recall` | Truy xuất dữ liệu đã lưu |
@@ -179,7 +179,6 @@ bot.run()
 ```bash
 # Set environment variables
 export API_KEY="your-key"
-export BRAVE_API_KEY="your-brave-key"  # Optional, for web search
 
 # Single message
 zeroclaw-tools "What is the current date?"

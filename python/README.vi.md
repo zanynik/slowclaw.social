@@ -87,7 +87,7 @@ bot.run()
 | `shell` | Thực thi lệnh shell |
 | `file_read` | Đọc nội dung file |
 | `file_write` | Ghi nội dung vào file |
-| `web_search` | Tìm kiếm web (cần Brave API key) |
+| `web_search` | Tìm kiếm web mở qua DuckDuckGo (không cần API key) |
 | `http_request` | Gửi yêu cầu HTTP |
 | `memory_store` | Lưu dữ liệu vào bộ nhớ |
 | `memory_recall` | Truy xuất dữ liệu đã lưu |

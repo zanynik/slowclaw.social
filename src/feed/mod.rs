@@ -54,6 +54,10 @@ const RSS_SOURCE_MATCH_THRESHOLD: f32 = 0.28;
 const RSS_SELECTED_SOURCE_LIMIT: usize = 10;
 const RSS_RECENT_SCAN_LIMIT: usize = 256;
 const RSS_CANDIDATE_PER_SOURCE_LIMIT: usize = 6;
+/// Max age of a per-source RSS/Atom fetch before it is re-pulled.
+/// NOTE: the gateway runs a parallel content-source pipeline with the same
+/// 30-minute freshness gate — keep them in sync. The twin lives at
+/// `src/gateway/mod.rs` → `CONTENT_SOURCE_REFRESH_TTL_SECS`.
 const RSS_CONTENT_REFRESH_TTL_SECS: i64 = 30 * 60;
 const RSS_CONTENT_FETCH_TIMEOUT_SECS: u64 = 8;
 const BLUESKY_FETCH_TIMEOUT_SECS: u64 = 8;
@@ -3305,8 +3309,6 @@ fn build_feed_web_search_tool(config: &Config) -> Option<WebSearchTool> {
         return None;
     }
     Some(WebSearchTool::new(
-        config.web_search.provider.clone(),
-        config.web_search.brave_api_key.clone(),
         WEB_SEARCH_RESULT_LIMIT_PER_QUERY.min(config.web_search.max_results),
         config.web_search.timeout_secs,
     ))
