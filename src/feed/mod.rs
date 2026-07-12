@@ -1426,14 +1426,18 @@ fn nostr_relay_search_text(
     parts.join("\n")
 }
 
-async fn fetch_nostr_text_notes(relay_url: &str, limit: usize) -> Result<Vec<NostrEvent>> {
+/// Fetch recent Nostr events — kind 1 text notes AND kind 30023 long-form
+/// articles — from a single relay. Articles and notes share the same pipeline
+/// so the journal-driven ranker treats them uniformly. The lookback and per-
+/// relay limit apply to the combined set.
+async fn fetch_nostr_events(relay_url: &str, limit: usize) -> Result<Vec<NostrEvent>> {
     let client = NostrClient::default();
     client.add_relay(relay_url).await?;
     client
         .try_connect_relay(relay_url, Duration::from_secs(NOSTR_RELAY_CONNECT_TIMEOUT_SECS))
         .await?;
     let filter = NostrFilter::new()
-        .kind(NostrKind::TextNote)
+        .kinds([NostrKind::TextNote, NostrKind::from(30023)])
         .since(NostrTimestamp::from_secs(
             Utc::now().timestamp().saturating_sub(NOSTR_LOOKBACK_SECS as i64) as u64,
         ))
@@ -1456,6 +1460,38 @@ fn nostr_event_permalink(event: &NostrEvent) -> String {
         .to_bech32()
         .map(|bech32| format!("https://njump.me/{bech32}"))
         .unwrap_or_else(|_| format!("https://njump.me/{}", event.id.to_hex()))
+}
+
+/// Permalink for a NIP-23 long-form article (kind 30023). Uses the SDK's
+/// `to_bech32()` which auto-produces an `naddr1...` for addressable kinds
+/// (30000..40000), then points at habla.news — the article reader the frontend
+/// already deep-links into. Falls back to njump if the bech32 encoding fails.
+fn nostr_article_permalink(event: &NostrEvent) -> String {
+    event
+        .to_bech32()
+        .map(|bech32| format!("https://habla.news/a/{bech32}"))
+        .unwrap_or_else(|_| format!("https://njump.me/{}", event.id.to_hex()))
+}
+
+/// Whether a Nostr event is a NIP-23 long-form article (kind 30023).
+fn is_long_form_article(event: &NostrEvent) -> bool {
+    event.kind.as_u16() == 30023
+}
+
+/// Extract the first value of a named tag (e.g. "title", "summary", "image",
+/// "published_at", "d") from a Nostr event. Returns `None` if absent.
+fn nostr_tag_value(event: &NostrEvent, name: &str) -> Option<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let parts = tag.clone().to_vec();
+            let key = parts.first()?;
+            let value = parts.get(1)?;
+            (key.as_str() == name).then(|| value.clone())
+        })
+        .next()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn nostr_timestamp_to_rfc3339(timestamp: NostrTimestamp) -> String {
@@ -2627,7 +2663,7 @@ impl FeedSource for NostrFeedSource {
                 continue;
             };
 
-            let events = match fetch_nostr_text_notes(relay_url, NOSTR_RECENT_NOTE_LIMIT_PER_RELAY).await {
+            let events = match fetch_nostr_events(relay_url, NOSTR_RECENT_NOTE_LIMIT_PER_RELAY).await {
                 Ok(events) => events,
                 Err(err) => {
                     tracing::debug!(relay = relay_url, error = %err, "Failed to fetch Nostr world-feed events");
@@ -2644,16 +2680,41 @@ impl FeedSource for NostrFeedSource {
                 if !seen.insert(dedupe_key.clone()) {
                     continue;
                 }
-                let permalink = nostr_event_permalink(&event);
                 let relay_domain = resolve_feed_web_domain(&nostr_relay_http_url(relay_url).unwrap_or_default())
                     .unwrap_or_else(|| relay_url.to_string());
-                let description = truncate_with_ellipsis(event.content.trim(), 220);
-                let title = derive_interest_label("Nostr note", &event.content);
-                let published_at = nostr_timestamp_to_rfc3339(event.created_at);
                 let author = event
                     .pubkey
                     .to_bech32()
                     .unwrap_or_else(|_| event.pubkey.to_string());
+
+                // Kind 30023 (NIP-23 long-form article): extract title/summary/
+                // image from tags and deeplink to habla.news. Kind 1 (text note):
+                // derive a label from content and deeplink to njump.
+                let (permalink, title, description, image_url, published_at) = if is_long_form_article(&event) {
+                    let article_title = nostr_tag_value(&event, "title")
+                        .unwrap_or_else(|| derive_interest_label("Nostr article", &event.content));
+                    let summary = nostr_tag_value(&event, "summary")
+                        .unwrap_or_else(|| truncate_with_ellipsis(event.content.trim(), 220));
+                    let image = nostr_tag_value(&event, "image");
+                    let published = nostr_tag_value(&event, "published_at")
+                        .unwrap_or_else(|| nostr_timestamp_to_rfc3339(event.created_at));
+                    (
+                        nostr_article_permalink(&event),
+                        article_title,
+                        summary,
+                        image,
+                        published,
+                    )
+                } else {
+                    (
+                        nostr_event_permalink(&event),
+                        derive_interest_label("Nostr note", &event.content),
+                        truncate_with_ellipsis(event.content.trim(), 220),
+                        None,
+                        nostr_timestamp_to_rfc3339(event.created_at),
+                    )
+                };
+
                 matched.push(FeedCandidate {
                     protocol: FeedProtocol::Nostr,
                     dedupe_key,
@@ -2675,7 +2736,7 @@ impl FeedSource for NostrFeedSource {
                             title,
                             description,
                             content_text: event.content.clone(),
-                            image_url: None,
+                            image_url,
                             domain: relay_domain,
                             provider: "Nostr".to_string(),
                             provider_snippet: Some(selected.label.clone()),
@@ -4115,6 +4176,90 @@ mod tests {
                 source.domain
             );
         }
+    }
+
+    /// Build a synthetic Nostr event for tag-extraction tests. Signature is a
+    /// dummy zero-sig (verification is irrelevant — we only test tag parsing).
+    fn make_nostr_event(kind: u16, content: &str, tags: &[&[&str]]) -> NostrEvent {
+        use nostr_sdk::prelude::{EventId, PublicKey, Signature, Tags};
+        use std::str::FromStr;
+        let id = EventId::from_hex(
+            "aa0000000000000000000000000000000000000000000000000000000000aa01",
+        )
+        .expect("id");
+        let pubkey = PublicKey::from_hex(
+            "3bf0c63fcb93463407af97ef5c6b13c30171b02d6b1fe9e9c1e4b4b4b4b4b4b4",
+        )
+        .expect("pubkey");
+        let parsed_tags: Vec<Vec<String>> = tags
+            .iter()
+            .map(|parts| parts.iter().map(|s| (*s).to_string()).collect())
+            .collect();
+        let tags_parsed = Tags::parse(parsed_tags).expect("tags");
+        let sig = Signature::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000000\
+             0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("sig");
+        NostrEvent::new(
+            id,
+            pubkey,
+            NostrTimestamp::from_secs(1_700_000_000),
+            NostrKind::from(kind),
+            tags_parsed,
+            content,
+            sig,
+        )
+    }
+
+    #[test]
+    fn nostr_tag_value_extracts_nip23_fields() {
+        let event = make_nostr_event(
+            30023,
+            "# Body markdown\n\nLong article content here.",
+            &[
+                &["title", "On Local-First Computing"],
+                &["summary", "Why your data should live on your device"],
+                &["image", "https://example.com/cover.png"],
+                &["published_at", "2026-01-15T10:00:00Z"],
+                &["d", "local-first-essay"],
+            ],
+        );
+        assert_eq!(
+            nostr_tag_value(&event, "title").as_deref(),
+            Some("On Local-First Computing")
+        );
+        assert_eq!(
+            nostr_tag_value(&event, "summary").as_deref(),
+            Some("Why your data should live on your device")
+        );
+        assert_eq!(
+            nostr_tag_value(&event, "image").as_deref(),
+            Some("https://example.com/cover.png")
+        );
+        assert_eq!(nostr_tag_value(&event, "d").as_deref(), Some("local-first-essay"));
+        // Absent tag returns None.
+        assert!(nostr_tag_value(&event, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn is_long_form_article_detects_kind_30023() {
+        let article = make_nostr_event(30023, "body", &[&["title", "T"], &["d", "id"]]);
+        let note = make_nostr_event(1, "hello world", &[]);
+        assert!(is_long_form_article(&article));
+        assert!(!is_long_form_article(&note));
+    }
+
+    #[test]
+    fn nostr_article_permalink_produces_habla_naddr() {
+        // Kind 30023 is addressable (30000..40000), so to_bech32() produces an
+        // naddr1... — the permalink should point at habla.news/a/<naddr>.
+        let article = make_nostr_event(30023, "body", &[&["title", "T"], &["d", "my-essay"]]);
+        let permalink = nostr_article_permalink(&article);
+        assert!(
+            permalink.starts_with("https://habla.news/a/naddr1"),
+            "expected habla.news naddr permalink, got: {permalink}"
+        );
     }
 
     struct MockEmbedder;
