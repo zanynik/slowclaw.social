@@ -6,13 +6,14 @@ pub enum FeedProtocol {
     Bluesky,
     Rss,
     Nostr,
+    Web,
 }
 
 impl FeedProtocol {
     pub fn source_type(&self) -> &'static str {
         match self {
             Self::Bluesky => "bluesky",
-            Self::Rss | Self::Nostr => "web",
+            Self::Rss | Self::Nostr | Self::Web => "web",
         }
     }
 }
@@ -155,6 +156,7 @@ pub struct FeedRefreshDiagnostics {
     pub rss: FeedProtocolDiagnostics,
     pub nostr: FeedProtocolDiagnostics,
     pub bluesky: FeedProtocolDiagnostics,
+    pub web: FeedProtocolDiagnostics,
     pub ranking: FeedRankingDiagnostics,
 }
 

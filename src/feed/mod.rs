@@ -211,9 +211,8 @@ pub fn mark_world_feed_dirty(workspace_dir: &Path) -> Result<()> {
 async fn build_prepared_world_feed_data(
     config: &Config,
     bluesky_auth: Option<BlueskyAuth>,
-    include_web_search: bool,
 ) -> Result<Option<PreparedWorldFeedData>> {
-    tracing::info!("World feed: building prepared data (include_web_search={include_web_search})");
+    tracing::info!("World feed: building prepared data");
     let profile = rebuild_interest_profile(config).await?;
     tracing::info!(
         status = %profile.status,
@@ -247,6 +246,7 @@ async fn build_prepared_world_feed_data(
 
     let rss_source = RssFeedSource::new(config);
     let nostr_source = NostrFeedSource::new(config);
+    let web_source = WebSearchFeedSource::new(config);
 
     // Use the freshest Bluesky auth: prefer the globally stored latest auth
     // (which may have been updated by a newer request while this task was running),
@@ -345,29 +345,50 @@ async fn build_prepared_world_feed_data(
         (selected, diagnostics, candidates)
     };
 
-    // Run all three protocol pipelines in parallel
+    let web_future = async {
+        let mut diagnostics = FeedProtocolDiagnostics::default();
+        let mut selected = Vec::new();
+        let mut candidates = Vec::new();
+        match web_source.discover_sources_with_diagnostics(&profile).await {
+            Ok((web_selected, mut discovered_diagnostics)) => {
+                match web_source.fetch_candidates(&profile, &web_selected, limit_for_candidates()).await {
+                    Ok(web_candidates) => {
+                        discovered_diagnostics.candidate_count = web_candidates.len();
+                        candidates = web_candidates;
+                    }
+                    Err(err) => {
+                        tracing::warn!("Web search candidate fetch failed: {err}");
+                        discovered_diagnostics.candidate_count = 0;
+                    }
+                }
+                selected = web_selected;
+                diagnostics = discovered_diagnostics;
+            }
+            Err(err) => {
+                tracing::warn!("Web search source discovery failed: {err}");
+                diagnostics.available = false;
+                diagnostics.error = Some(format!("{err}"));
+            }
+        }
+        (selected, diagnostics, candidates)
+    };
+
+    // Run all four source pipelines in parallel
     let (
         (rss_selected, rss_diagnostics, mut candidates, mut selected_sources),
         (nostr_selected, nostr_diagnostics, nostr_candidates),
         (bluesky_selected, bluesky_diagnostics, bluesky_candidates),
-    ) = tokio::join!(rss_future, nostr_future, bluesky_future);
+        (web_selected, web_diagnostics, web_candidates),
+    ) = tokio::join!(rss_future, nostr_future, bluesky_future, web_future);
 
     selected_sources.extend(nostr_selected);
     selected_sources.extend(bluesky_selected);
+    selected_sources.extend(web_selected);
     candidates.extend(nostr_candidates);
     candidates.extend(bluesky_candidates);
+    candidates.extend(web_candidates);
 
-    if include_web_search && config.web_search.enabled {
-        let mut web_aug = collect_web_search_augmented_candidates(
-            config,
-            &profile,
-            &rss_selected,
-            candidates.len(),
-        )
-        .await
-        .unwrap_or_default();
-        candidates.append(&mut web_aug);
-    }
+    let _ = rss_selected; // already merged into candidates/selected_sources above
 
     tracing::info!(
         rss_scanned = rss_diagnostics.scanned_count,
@@ -382,6 +403,10 @@ async fn build_prepared_world_feed_data(
         bluesky_shortlisted = bluesky_diagnostics.shortlisted_count,
         bluesky_candidates = bluesky_diagnostics.candidate_count,
         bluesky_error = bluesky_diagnostics.error.as_deref().unwrap_or("none"),
+        web_scanned = web_diagnostics.scanned_count,
+        web_shortlisted = web_diagnostics.shortlisted_count,
+        web_candidates = web_diagnostics.candidate_count,
+        web_error = web_diagnostics.error.as_deref().unwrap_or("none"),
         total_candidates = candidates.len(),
         selected_sources = selected_sources.len(),
         "World feed: source discovery complete"
@@ -394,6 +419,7 @@ async fn build_prepared_world_feed_data(
             rss: rss_diagnostics,
             nostr: nostr_diagnostics,
             bluesky: bluesky_diagnostics,
+            web: web_diagnostics,
             ranking: FeedRankingDiagnostics {
                 candidate_count_before_ranking: candidates.len(),
                 ranked_item_count: 0,
@@ -488,7 +514,7 @@ pub async fn load_world_feed(
 
     match tokio::time::timeout(
         Duration::from_secs(WORLD_FEED_STAGE1_PREVIEW_TIMEOUT_SECS),
-        build_prepared_world_feed_data(config, bluesky_auth.clone(), false),
+        build_prepared_world_feed_data(config, bluesky_auth.clone()),
     )
     .await
     {
@@ -676,7 +702,7 @@ fn write_progress_diagnostics(
 
 async fn refresh_world_feed(config: Config, bluesky_auth: Option<BlueskyAuth>) -> Result<()> {
     let workspace_dir = config.workspace_dir.clone();
-    let Some(mut prepared) = build_prepared_world_feed_data(&config, bluesky_auth, true).await? else {
+    let Some(mut prepared) = build_prepared_world_feed_data(&config, bluesky_auth).await? else {
         return Ok(());
     };
 
@@ -2778,6 +2804,180 @@ impl FeedSource for RssFeedSource {
     }
 }
 
+/// Open-web discovery source backed by DuckDuckGo.
+///
+/// Unlike RSS/Bluesky/Nostr (which match the user's interests against known
+/// source *metadata*), the web source turns the user's strongest interest
+/// terms directly into search queries — so it discovers content the curated
+/// catalog doesn't cover. Best-effort: DDG's HTML endpoint is rate-limited
+/// and not a stable API, so this source degrades to empty diagnostics on
+/// failure and never blocks the other sources.
+struct WebSearchFeedSource {
+    config: Config,
+}
+
+/// Cap on how many interest-term queries we issue per refresh. Kept small to
+/// stay rate-limit-friendly against DDG's unofficial HTML endpoint.
+const WEB_SEARCH_QUERY_LIMIT: usize = 3;
+
+impl WebSearchFeedSource {
+    fn new(config: &Config) -> Self {
+        Self {
+            config: config.clone(),
+        }
+    }
+
+    async fn discover_sources_with_diagnostics(
+        &self,
+        profile: &FeedProfile,
+    ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
+        // When web search is disabled there is nothing to discover — mirror
+        // the Nostr "no relays" pattern so the pipeline stays uniform.
+        if !self.config.web_search.enabled {
+            return Ok((
+                Vec::new(),
+                FeedProtocolDiagnostics {
+                    available: false,
+                    error: Some("Web search disabled".to_string()),
+                    ..Default::default()
+                },
+            ));
+        }
+
+        // Take the strongest interest terms and turn each into a synthetic
+        // Stage-1 source. No network here — discovery is just query planning,
+        // matching the RSS/Nostr "discovery is cheap, fetch is networked" split.
+        let keyword_weights = weighted_interest_keywords(profile);
+        let queries: Vec<String> = keyword_weights
+            .iter()
+            .map(|(term, _)| term.clone())
+            .take(WEB_SEARCH_QUERY_LIMIT)
+            .collect();
+        let mut diagnostics = FeedProtocolDiagnostics {
+            available: true,
+            scanned_count: queries.len(),
+            ..FeedProtocolDiagnostics::default()
+        };
+        if queries.is_empty() {
+            diagnostics.error = Some("No interest terms to search".to_string());
+            return Ok((Vec::new(), diagnostics));
+        }
+        let selected: Vec<SelectedSource> = queries
+            .into_iter()
+            .map(|query| SelectedSource {
+                protocol: FeedProtocol::Web,
+                key: query.clone(),
+                label: format!("Web: {query}"),
+                stage1_score: keyword_weights
+                    .iter()
+                    .find(|(term, _)| *term == query)
+                    .map(|(_, weight)| *weight)
+                    .unwrap_or(0.1),
+                description: Some(format!("Open-web search for \u{201c}{query}\u{201d}")),
+                matched_interest_label: Some(query.clone()),
+                matched_interest_score: None,
+                metadata_json: serde_json::json!({ "query": query }),
+            })
+            .collect();
+        diagnostics.shortlisted_count = selected.len();
+        diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
+        Ok((selected, diagnostics))
+    }
+}
+
+#[async_trait]
+impl FeedSource for WebSearchFeedSource {
+    async fn discover_sources(&self, profile: &FeedProfile) -> Result<Vec<SelectedSource>> {
+        Ok(self.discover_sources_with_diagnostics(profile).await?.0)
+    }
+
+    async fn fetch_candidates(
+        &self,
+        _profile: &FeedProfile,
+        selected_sources: &[SelectedSource],
+        _limit: usize,
+    ) -> Result<Vec<FeedCandidate>> {
+        if !self.config.web_search.enabled {
+            return Ok(Vec::new());
+        }
+        let tool = WebSearchTool::new(
+            WEB_SEARCH_RESULT_LIMIT_PER_QUERY.min(self.config.web_search.max_results),
+            self.config.web_search.timeout_secs,
+        );
+        let mut candidates = Vec::new();
+        let mut seen_urls = BTreeSet::new();
+        for selected in selected_sources {
+            let Some(query) = selected
+                .metadata_json
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let results = match tool.search_structured(query).await {
+                Ok(results) => results,
+                Err(err) => {
+                    tracing::debug!(query, error = %err, "Web search query failed");
+                    continue;
+                }
+            };
+            for result in results {
+                let Some(domain) = resolve_feed_web_domain(&result.url) else {
+                    continue;
+                };
+                if !seen_urls.insert(result.url.clone()) {
+                    continue;
+                }
+                let preview = WebFeedPreview {
+                    url: result.url.clone(),
+                    title: result.title.clone(),
+                    description: result.description.clone(),
+                    content_text: String::new(),
+                    image_url: None,
+                    domain: domain.clone(),
+                    provider: result.provider.clone(),
+                    provider_snippet: non_empty_string(result.description.clone()),
+                    discovered_at: Utc::now().to_rfc3339(),
+                };
+                candidates.push(FeedCandidate {
+                    protocol: FeedProtocol::Web,
+                    dedupe_key: result.url.clone(),
+                    stage1_score: selected.stage1_score,
+                    rank_text: format!("{}\n{}", result.title.trim(), result.description.trim()),
+                    item: PersonalizedFeedItem {
+                        source_type: FeedProtocol::Web.source_type().to_string(),
+                        feed_item: serde_json::json!({
+                            "url": result.url,
+                            "title": result.title,
+                            "description": result.description,
+                            "domain": domain,
+                        }),
+                        web_preview: Some(preview),
+                        feed_source: Some(FeedSourceContext {
+                            label: selected.label.clone(),
+                            description: selected.description.clone(),
+                            matched_interest_label: selected.matched_interest_label.clone(),
+                            matched_interest_score: selected.matched_interest_score,
+                            source_score: Some(selected.stage1_score),
+                        }),
+                        score: None,
+                        matched_interest_label: None,
+                        matched_interest_score: None,
+                        passed_threshold: false,
+                    },
+                    original_index: candidates.len(),
+                });
+                if candidates.len() >= WEB_SEARCH_RESULT_LIMIT_PER_QUERY * WEB_SEARCH_QUERY_LIMIT {
+                    return Ok(candidates);
+                }
+            }
+        }
+        Ok(candidates)
+    }
+}
+
 async fn ensure_catalog_metadata_embeddings(
     workspace_dir: &Path,
     embedder: SharedEmbedder,
@@ -3217,130 +3417,6 @@ fn build_content_item_id(source_key: &str, canonical_url: &str, external_id: &st
         "content_{}",
         content_hash_16(&format!("{source_key}\n{canonical_url}\n{external_id}"))
     )
-}
-
-async fn collect_web_search_augmented_candidates(
-    config: &Config,
-    profile: &FeedProfile,
-    selected_sources: &[SelectedSource],
-    starting_index: usize,
-) -> Result<Vec<FeedCandidate>> {
-    let Some(tool) = build_feed_web_search_tool(config) else {
-        return Ok(Vec::new());
-    };
-    let selected_domains: HashMap<String, &SelectedSource> = selected_sources
-        .iter()
-        .filter_map(|source| {
-            source
-                .metadata_json
-                .get("domain")
-                .and_then(serde_json::Value::as_str)
-                .map(|domain| (normalize_feed_web_domain(domain), source))
-        })
-        .collect();
-    if selected_domains.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let queries = build_selected_domain_queries(profile, selected_sources);
-    let mut seen_urls = BTreeSet::new();
-    let mut candidates = Vec::new();
-    for query in queries {
-        let results = tool.search_structured(&query).await.unwrap_or_default();
-        for result in results {
-            let Some(domain) = resolve_feed_web_domain(&result.url) else {
-                continue;
-            };
-            let Some(source) = selected_domains.get(&domain) else {
-                continue;
-            };
-            if !seen_urls.insert(result.url.clone()) {
-                continue;
-            }
-            let preview = WebFeedPreview {
-                url: result.url.clone(),
-                title: result.title.clone(),
-                description: result.description.clone(),
-                content_text: String::new(),
-                image_url: None,
-                domain: domain.clone(),
-                provider: result.provider.clone(),
-                provider_snippet: non_empty_string(result.description.clone()),
-                discovered_at: Utc::now().to_rfc3339(),
-            };
-            candidates.push(FeedCandidate {
-                protocol: FeedProtocol::Rss,
-                dedupe_key: result.url.clone(),
-                stage1_score: source.stage1_score * 0.92,
-                rank_text: format!("{}\n{}", result.title.trim(), result.description.trim()),
-                item: PersonalizedFeedItem {
-                    source_type: FeedProtocol::Rss.source_type().to_string(),
-                    feed_item: serde_json::json!({
-                        "url": result.url,
-                        "title": result.title,
-                        "description": result.description,
-                        "domain": domain,
-                    }),
-                    web_preview: Some(preview),
-                    feed_source: Some(FeedSourceContext {
-                        label: source.label.clone(),
-                        description: source.description.clone(),
-                        matched_interest_label: source.matched_interest_label.clone(),
-                        matched_interest_score: source.matched_interest_score,
-                        source_score: Some(source.stage1_score),
-                    }),
-                    score: None,
-                    matched_interest_label: None,
-                    matched_interest_score: None,
-                    passed_threshold: false,
-                },
-                original_index: starting_index + candidates.len(),
-            });
-            if candidates.len() >= WEB_SEARCH_RESULT_LIMIT_PER_QUERY * 3 {
-                return Ok(candidates);
-            }
-        }
-    }
-    Ok(candidates)
-}
-
-fn build_feed_web_search_tool(config: &Config) -> Option<WebSearchTool> {
-    if !config.web_search.enabled {
-        return None;
-    }
-    Some(WebSearchTool::new(
-        WEB_SEARCH_RESULT_LIMIT_PER_QUERY.min(config.web_search.max_results),
-        config.web_search.timeout_secs,
-    ))
-}
-
-fn build_selected_domain_queries(profile: &FeedProfile, selected_sources: &[SelectedSource]) -> Vec<String> {
-    let domains: Vec<String> = selected_sources
-        .iter()
-        .filter_map(|source| {
-            source
-                .metadata_json
-                .get("domain")
-                .and_then(serde_json::Value::as_str)
-                .map(normalize_feed_web_domain)
-        })
-        .collect();
-    let terms: Vec<String> = top_interest_terms(profile).into_iter().take(4).collect();
-    if domains.is_empty() || terms.is_empty() {
-        return Vec::new();
-    }
-    let batches: Vec<&[String]> = domains.chunks(4).collect();
-    let mut queries = Vec::new();
-    for (index, term) in terms.iter().enumerate() {
-        let batch = batches[index % batches.len()];
-        let site_filters = batch
-            .iter()
-            .map(|domain| format!("site:{domain}"))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        queries.push(format!("{term} ({site_filters})"));
-    }
-    queries
 }
 
 fn normalize_feed_web_domain(raw: &str) -> String {

@@ -24,7 +24,7 @@ SlowClaw is built around one idea: **what you write is the lens for what you rea
 
 ### 1. Feed sourcing — where the feed comes from
 
-The **world feed** (`src/feed/mod.rs`, served at `GET /api/feed/personalized`) is assembled from open-protocol sources, never closed silos. Your journals are mined into an **interest profile** that steers *which* sources get fetched (Stage 1) and *which* items rank (Stage 2). The three protocol sources run in parallel; one failing never kills the others.
+The **world feed** (`src/feed/mod.rs`, served at `GET /api/feed/personalized`) is assembled from open-protocol sources, never closed silos. Your journals are mined into an **interest profile** that steers *which* sources get fetched (Stage 1) and *which* items rank (Stage 2). The four sources run in parallel; one failing never kills the others.
 
 ```mermaid
 flowchart TB
@@ -35,22 +35,24 @@ flowchart TB
         BS["Bluesky — feed generators<br/>XRPC getTimeline / getFeed"]
         RSS["RSS / Atom — curated catalog<br/>~60 sites, ETag + Last-Modified"]
         NOS["Nostr — kind-1 text notes<br/>NIP-11 / NIP-66 relays"]
+        DDG["DuckDuckGo — open-web<br/>interest-keyword queries, free"]
     end
 
     S1 -->|"match generator descriptions"| BS
     S1 -->|"match catalog topic tags"| RSS
     S1 -->|"match relay metadata"| NOS
-    WSE["Optional web-search augmentation<br/>site: queries via Brave"] -.-> S2
+    S1 -->|"top interest terms → queries"| DDG
 
     BS --> S2["Stage 2 — candidate fetch<br/>parallel via tokio::join!"]
     RSS --> S2
     NOS --> S2
+    DDG --> S2
 
     S2 --> CACHE[("SQLite — on-device cache<br/>content_items + personalized_feed_cache<br/>RSS TTL 30m · feed TTL 5m")]
     CACHE --> SERVE["GET /api/feed/personalized<br/>→ Reads stream"]
 ```
 
-> **Scope note.** The backend world feed ingests **Bluesky, RSS/Atom, and Nostr** (+ optional web search). The frontend **Reads** stream additionally merges **Hacker News, YouTube/video, and web-of-trust-gated social** posts from on-device caches (`state/nostr.db`, `state/videos.db`) and re-ranks them client-side. Video/YouTube is a first-class *read-only* ingestion source, never a publishing surface.
+> **Scope note.** The backend world feed ingests **Bluesky, RSS/Atom, Nostr, and open-web (DuckDuckGo)**. The frontend **Reads** stream additionally merges **Hacker News, YouTube/video, and web-of-trust-gated social** posts from on-device caches (`state/nostr.db`, `state/videos.db`) and re-ranks them client-side. Video/YouTube is a first-class *read-only* ingestion source, never a publishing surface. DuckDuckGo web discovery is **off by default** — enable it under `[web_search]` to let your strongest journal interest terms drive open-web queries alongside the curated catalog.
 
 ### 2. Ranking — the journal is the lens
 
