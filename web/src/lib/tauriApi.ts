@@ -172,6 +172,71 @@ export async function saveJournalInterestKeywords(
 }
 
 // ─────────────────────────────────────────────
+// Unified interest profile (single store, single lens)
+// ─────────────────────────────────────────────
+//
+// All curation-lens signals live in state/local_data.db now: journal +
+// liked-card keywords (positives), disliked-card keywords (negatives), and the
+// editable lens (mute/boost overrides + manual interests). These wrappers are
+// the single read/write surface the TS ranker + lens UI use; the old
+// localStorage keyword stores are gone.
+
+/** One positive or negative steering term with its effective weight. */
+export type LensTerm = { label: string; weight: number };
+
+/** One override entry (term + multiplier) for lens UI hydration. */
+export type LensOverrideEntry = { term: string; multiplier: number };
+
+/** The full lens snapshot, read in one Tauri call on mount + on lens edits. */
+export type InterestProfileSnapshot = {
+  /** Positive terms (journal + liked-card + manual), lens multipliers applied. */
+  positives: LensTerm[];
+  /** Negative terms (disliked-card keywords). */
+  negatives: LensTerm[];
+  /** Raw override map for the lens UI (term → multiplier). */
+  overrides: LensOverrideEntry[];
+  /** Manual interests the journals haven't surfaced yet. */
+  manual: string[];
+};
+
+/**
+ * Persist on-device-extracted card keywords (from 👍/👎 on Reads cards) into
+ * the unified SQLite store. Liked → positives, disliked → persistent negatives.
+ * Replaces the old localStorage addLikedKeywords/addDislikedKeywords path.
+ */
+export async function saveCardKeywords(
+  liked: string[],
+  disliked: string[],
+): Promise<void> {
+  return invoke("save_card_keywords", { liked, disliked });
+}
+
+/** Read the full interest profile in one call. Hydrates ranker + lens UI. */
+export async function getInterestProfile(): Promise<InterestProfileSnapshot> {
+  return invoke("get_interest_profile");
+}
+
+/** Set a lens override (mute = 0, normal = 1, boost = 2). Persists to SQLite. */
+export async function setLensOverride(term: string, multiplier: number): Promise<void> {
+  return invoke("set_lens_override", { term, multiplier });
+}
+
+/** Remove a lens override so the term returns to its as-derived weight. */
+export async function removeLensOverride(term: string): Promise<void> {
+  return invoke("remove_lens_override", { term });
+}
+
+/** Add a manual interest (not yet in journals). Persists to SQLite. */
+export async function addManualInterestCmd(term: string): Promise<void> {
+  return invoke("add_manual_interest", { term });
+}
+
+/** Remove a manual interest. */
+export async function removeManualInterestCmd(term: string): Promise<void> {
+  return invoke("remove_manual_interest", { term });
+}
+
+// ─────────────────────────────────────────────
 // Summary / AI commands
 // ─────────────────────────────────────────────
 

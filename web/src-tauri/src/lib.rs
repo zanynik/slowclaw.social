@@ -1947,6 +1947,214 @@ async fn save_journal_interest_keywords(
     Ok(())
 }
 
+/// Persist on-device-extracted card keywords (from 👍/👎 on Reads cards) into
+/// the unified SQLite keyword store, replacing the old localStorage-only path.
+/// `liked` become positive steering terms (polarity 0), `disliked` become
+/// negative steering terms (polarity 1, persistent). Both then feed the Rust
+/// ranker and — via `get_interest_profile` — the TS ranker. Marks the world
+/// feed dirty so the ranker picks up the change on the next rebuild.
+#[tauri::command]
+async fn save_card_keywords(liked: Vec<String>, disliked: Vec<String>) -> Result<(), String> {
+    let config = load_workspace_config_for_ui("card keywords config load failed").await?;
+    let workspace_dir = &config.workspace_dir;
+    let now = unix_time_label();
+
+    // Liked → positive keywords. Modest weight (comparable to a strong
+    // journal-derived topic) so an explicit like steers without drowning the
+    // journal lens; re-liking reinforces.
+    for raw in liked.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let term = raw.to_ascii_lowercase();
+        let existing = zeroclaw::gateway::local_store::list_feed_keywords_by_polarity(
+            workspace_dir,
+            0,
+        )
+        .ok()
+        .into_iter()
+        .flatten()
+        .find(|r| r.term == term);
+        let (id, weight, first_seen, source_count) = match existing {
+            Some(r) => (Some(r.id), (r.weight + 1.5).min(4.5), r.first_seen_at, r.source_count + 1),
+            None => (None, 1.5_f64, now.clone(), 1),
+        };
+        zeroclaw::gateway::local_store::upsert_feed_keyword(
+            workspace_dir,
+            &zeroclaw::gateway::local_store::FeedKeywordUpsert {
+                id,
+                term,
+                weight,
+                first_seen_at: first_seen,
+                last_seen_at: now.clone(),
+                source_count,
+                polarity: 0,
+            },
+        )
+        .map_err(|e| format!("Failed to store liked keyword: {e}"))?;
+    }
+
+    // Disliked → negative keywords. Persistent (no decay); a fixed weight since
+    // the penalty fn only tests membership, not magnitude. Re-disliking is a
+    // no-op (INSERT ON CONFLICT overwrites with the same weight).
+    for raw in disliked.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let term = raw.to_ascii_lowercase();
+        zeroclaw::gateway::local_store::upsert_feed_keyword(
+            workspace_dir,
+            &zeroclaw::gateway::local_store::FeedKeywordUpsert {
+                id: None,
+                term,
+                weight: 1.0_f64,
+                first_seen_at: now.clone(),
+                last_seen_at: now.clone(),
+                source_count: 1,
+                polarity: 1,
+            },
+        )
+        .map_err(|e| format!("Failed to store disliked keyword: {e}"))?;
+    }
+
+    zeroclaw::feed::mark_world_feed_dirty(workspace_dir)
+        .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
+    Ok(())
+}
+
+/// The unified interest profile for the TS ranker + lens UI. One read hydrates
+/// everything: positive keywords (with lens multipliers applied), negative
+/// keywords, the raw overrides map, and manual interests. This is the single
+/// source the frontend reads on mount + on `slowclaw:lens-change`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InterestProfileSnapshot {
+    /// Positive steering terms with lens multipliers already applied.
+    positives: Vec<LensTerm>,
+    /// Negative (disliked) steering terms.
+    negatives: Vec<LensTerm>,
+    /// Raw override map: term → multiplier (for the lens UI state).
+    overrides: Vec<LensOverrideEntry>,
+    /// Manual interests the journals haven't surfaced yet.
+    manual: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LensTerm {
+    label: String,
+    /// Effective weight after lens multiplier (positives only).
+    weight: f64,
+}
+
+#[derive(serde::Serialize)]
+struct LensOverrideEntry {
+    term: String,
+    multiplier: f64,
+}
+
+#[tauri::command]
+async fn get_interest_profile() -> Result<InterestProfileSnapshot, String> {
+    let config = load_workspace_config_for_ui("interest profile config load failed").await?;
+    let workspace_dir = &config.workspace_dir;
+
+    let overrides_map: std::collections::HashMap<String, f64> =
+        zeroclaw::gateway::local_store::list_feed_lens_overrides(workspace_dir)
+            .map_err(|e| format!("Failed to read lens overrides: {e}"))?
+            .into_iter()
+            .map(|r| (r.term, r.multiplier))
+            .collect();
+    let manual: Vec<String> = zeroclaw::gateway::local_store::list_feed_manual_interests(workspace_dir)
+        .map_err(|e| format!("Failed to read manual interests: {e}"))?
+        .into_iter()
+        .map(|r| r.term)
+        .collect();
+    let manual_set: std::collections::HashSet<String> = manual.iter().cloned().collect();
+
+    // Positives: derived keywords + manual interests, with lens multipliers
+    // applied (mute drops, boost doubles). Mirrors rebuild_interest_profile.
+    let mut positives: Vec<LensTerm> = Vec::new();
+    for kw in zeroclaw::gateway::local_store::list_feed_keywords_by_polarity(workspace_dir, 0)
+        .map_err(|e| format!("Failed to read positive keywords: {e}"))?
+    {
+        let mult = overrides_map.get(&kw.term).copied().unwrap_or(1.0);
+        if mult <= 0.0 {
+            continue;
+        }
+        let effective = mult.clamp(0.0, 2.0);
+        positives.push(LensTerm {
+            label: kw.term,
+            weight: kw.weight * effective,
+        });
+    }
+    for term in &manual_set {
+        if positives.iter().any(|p| p.label.eq_ignore_ascii_case(term)) {
+            continue;
+        }
+        let mult = overrides_map.get(term).copied().unwrap_or(1.0);
+        if mult <= 0.0 {
+            continue;
+        }
+        let effective = mult.clamp(0.0, 2.0);
+        positives.push(LensTerm {
+            label: term.clone(),
+            weight: 3.0 * effective,
+        });
+    }
+
+    let negatives: Vec<LensTerm> = zeroclaw::gateway::local_store::list_feed_keywords_by_polarity(workspace_dir, 1)
+        .map_err(|e| format!("Failed to read negative keywords: {e}"))?
+        .into_iter()
+        .map(|kw| LensTerm { label: kw.term, weight: kw.weight })
+        .collect();
+
+    let overrides = overrides_map
+        .into_iter()
+        .map(|(term, multiplier)| LensOverrideEntry { term, multiplier })
+        .collect();
+
+    Ok(InterestProfileSnapshot {
+        positives,
+        negatives,
+        overrides,
+        manual,
+    })
+}
+
+#[tauri::command]
+async fn set_lens_override(term: String, multiplier: f64) -> Result<(), String> {
+    let config = load_workspace_config_for_ui("set lens override config load failed").await?;
+    zeroclaw::gateway::local_store::set_feed_lens_override(&config.workspace_dir, &term, multiplier)
+        .map_err(|e| format!("Failed to set lens override: {e}"))?;
+    zeroclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
+        .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn remove_lens_override(term: String) -> Result<(), String> {
+    let config = load_workspace_config_for_ui("remove lens override config load failed").await?;
+    zeroclaw::gateway::local_store::remove_feed_lens_override(&config.workspace_dir, &term)
+        .map_err(|e| format!("Failed to remove lens override: {e}"))?;
+    zeroclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
+        .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn add_manual_interest(term: String) -> Result<(), String> {
+    let config = load_workspace_config_for_ui("add manual interest config load failed").await?;
+    zeroclaw::gateway::local_store::add_feed_manual_interest(&config.workspace_dir, &term)
+        .map_err(|e| format!("Failed to add manual interest: {e}"))?;
+    zeroclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
+        .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn remove_manual_interest(term: String) -> Result<(), String> {
+    let config = load_workspace_config_for_ui("remove manual interest config load failed").await?;
+    zeroclaw::gateway::local_store::remove_feed_manual_interest(&config.workspace_dir, &term)
+        .map_err(|e| format!("Failed to remove manual interest: {e}"))?;
+    zeroclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
+        .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn rename_journal(id: String, new_title: String) -> Result<JournalEntry, String> {
     let config = load_workspace_config_for_ui("journal rename config load failed").await?;
@@ -3021,6 +3229,12 @@ pub fn run() {
             rename_journal,
             delete_journal,
             save_journal_interest_keywords,
+            save_card_keywords,
+            get_interest_profile,
+            set_lens_override,
+            remove_lens_override,
+            add_manual_interest,
+            remove_manual_interest,
             commands::desktop::open_workspace_journals_folder,
             commands::desktop::open_external_url,
             commands::desktop::open_in_app_webview,
