@@ -20,7 +20,7 @@ The binary name is `slowclaw`.
 
 ## How It Works
 
-SlowClaw is built around one idea: **what you write is the lens for what you read back.** The diagrams below show the three engines that make that real — feed sourcing, ranking, and the AI loops. Code references point at the Rust core (`src/`) and the web/Tauri shell (`web/src/`).
+SlowClaw is built around one idea: **what you write is the lens for what you read back.** The diagrams below show the three engines that make that real — feed sourcing, ranking, and the AI loop. Code references point at the Rust core (`src/`) and the web/Tauri shell (`web/src/`).
 
 ### 1. Feed sourcing — where the feed comes from
 
@@ -81,18 +81,19 @@ flowchart TB
 
 > **Why topics dominate.** A strong journal-topic match (~+1.2) is tuned to beat a near-max recency signal (≤1.0), so evergreen relevance surfaces. With no topics extracted, scoring degrades gracefully to pure recency + quality (cold start). The Rust world-feed ranker (`src/feed/ranker.rs`) uses the same journal-keyword signal plus a source-discovery bonus and source-diversity interleaving. Embeddings exist for **memory recall**, not the feed.
 
-### 3. AI loops — two planes, one brain-feeder
+### 3. AI loop — on-device, journal-steered
 
-AI runs on **two planes** that the app switches between with the `isTauriMobileRuntime()` guard. The **on-device plane** (iOS-first, private, offline) handles capture-time intelligence through `nativeAiChat` (llama.cpp/GGUF) and `transcribeAudio` (Speech.framework). The **gateway plane** (desktop/embedded) runs full agentic tool-use loops against remote LLM providers. The two are bridged: on-device interest and card-keyword extraction is written **into** the gateway feed store, so your phone steers your desktop ranking.
+SlowClaw is iOS-first, so AI runs **on-device** by default. Capture-time intelligence — transcription, titles, post drafts, interest mining, feed re-ranking — goes through `nativeAiChat` (llama.cpp/GGUF in `web/src-tauri/src/inference.rs`) and `transcribeAudio` (Speech.framework in `web/src-tauri/src/transcription.rs`), gated by `isTauriMobileRuntime() && nativeLocalAiStatus?.available`. The iOS app embeds the Rust gateway in-process (bound to `127.0.0.1:42617`), so the personalized feed ranker (`src/feed/ranker.rs`), the feed store, and memory/embeddings all run **inside the app** — there is no separate desktop server to stand up.
+
+The on-device loop writes back into the embedded gateway's feed store: when you save a journal on iOS, on-device AI extracts interest keywords and persists them at `state/local_data.db`, which the Rust ranker then reads back to weight the personalized feed. This is the loop that makes the journal the lens.
 
 ```mermaid
 flowchart TB
     CAP["Audio-first capture<br/>mic · share-sheet · video"] --> TR["Transcription<br/>Speech.framework — on-device"]
     TR --> J["Journal entry — text"]
     J --> ON
-    J --> GW
 
-    subgraph ON["On-device AI plane (iOS) — private, offline"]
+    subgraph ON["On-device AI (iOS) — private, offline"]
         direction TB
         ON_T["Title — 3 to 7 words"]
         ON_TW["TweetClaw — journal to post drafts"]
@@ -102,20 +103,17 @@ flowchart TB
         ON_WM["Model warm-up on launch"]
     end
 
-    subgraph GW["Gateway + remote LLM plane — agentic, tool-use"]
-        direction TB
-        GW_SY["Workspace synthesizer<br/>todos · events · insights · clips"]
-        GW_AR["Article synthesizer"]
-        GW_TR["Triage classifier"]
-        GW_CH["ClawChat — general agent loop"]
-        GW_EM["Embeddings — memory recall"]
-    end
-
-    ON -.->|"write interest + card keywords<br/>into feed store"| GW
-    GW --> PUB["Drafts → review → publish<br/>Bluesky short-form · Nostr long-form"]
+    ON_IN -.->|"extracted on-device"| IP[("Interest profile<br/>state/local_data.db<br/>embedded gateway")]
+    ON_CK -.->|"like / dislike"| LENS["Interest lens<br/>localStorage"]
+    IP --> RANK["Rust ranker<br/>src/feed/ranker.rs — runs in-app"]
+    LENS --> RANK
+    RANK --> FEED["For-You Reads feed"]
+    ON_TW --> PUB["Drafts → review → publish<br/>Bluesky short-form · Nostr long-form"]
 ```
 
-> **Reference pattern.** TweetClaw (post generation) and on-device task/interest extraction in `web/src/App.tsx` are the template for any new AI feature on iOS: gate on `isTauriMobileRuntime() && nativeLocalAiStatus?.available`, request JSON from `nativeAiChat`, parse defensively with retries, log to the AI activity log, and degrade gracefully. The gateway/skill path is for desktop and server-style workflows only — do not build new capture/synthesis features there when an on-device variant exists.
+> **Two stores, one lens.** Interest keywords (AI-extracted from journals) persist in the embedded gateway's feed store at `state/local_data.db` and feed the Rust ranker. Card keywords (extracted on like / dislike) live client-side in `localStorage` and feed the editable interest lens in `readsRanking.ts`. Both steer what you read back — and both stay on-device.
+>
+> **Reference pattern.** TweetClaw (post generation) and on-device task/interest extraction in `web/src/App.tsx` are the template for any new AI feature on iOS: gate on `isTauriMobileRuntime() && nativeLocalAiStatus?.available`, request JSON from `nativeAiChat`, parse defensively with retries, log to the AI activity log, and degrade gracefully. Agentic tool-use features (ClawChat, workspace synthesizer) run on the embedded gateway and are reachable on iOS only via desktop QR pairing — they are not part of the default on-device loop. For any new capture or synthesis feature, build the on-device variant first.
 
 ## What This Fork Keeps
 
