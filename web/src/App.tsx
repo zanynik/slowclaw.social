@@ -67,6 +67,7 @@ import {
   toUnifiedFromNostrArticle,
   toUnifiedFromRss,
   toUnifiedFromYouTube,
+  toUnifiedFromWorldFeed,
   extractJournalTopics,
   matchesTopic,
   channelsForSource,
@@ -7176,10 +7177,17 @@ Rules:
     }
     // Social posts (gated above) join the stream and rank by the same lens.
     for (const s of socialUnifiedForReads) unified.push(s);
+    // Backend world-feed items (/api/feed/personalized) — catalog-sourced RSS
+    // blogs, HN, YouTube channels, and Bluesky — flow through the same journal-
+    // driven ranker. This is the bridge that collapses the two-pipeline split:
+    // catalog content is ranked alongside frontend-direct sources by one lens.
+    for (const w of blueskyFeedItems) {
+      unified.push(toUnifiedFromWorldFeed(w));
+    }
     // The Reads feed is a single journal-ranked stream ("For You"); the
     // chronological "Latest" mode was removed when the filter pills were cut.
     return rankReads(unified, journalTopics, negativeTopics);
-  }, [readsArticles, readsRssItems, techNewsItems, readsYouTubeItems, socialUnifiedForReads, journalTopics, negativeTopics]);
+  }, [readsArticles, readsRssItems, techNewsItems, readsYouTubeItems, socialUnifiedForReads, blueskyFeedItems, journalTopics, negativeTopics]);
 
   // Persist the ranked Reads stream so the next open paints instantly from
   // cache (local-first). Only the UnifiedItem[] is cached; ranking re-runs on

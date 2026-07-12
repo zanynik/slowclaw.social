@@ -14,6 +14,7 @@
  */
 
 import { encodeNaddr } from "./nostr";
+import type { PersonalizedFeedItem } from "./gatewayApi";
 
 /** The normalized social item — every source collapses into this. */
 export interface UnifiedItem {
@@ -373,7 +374,40 @@ export function toUnifiedFromRss(item: RssItemLike, feedTitle: string): UnifiedI
   };
 }
 
-/* ── Journal → topic extraction (the curation engine) ────────────────────── */
+/**
+ * Convert a backend world-feed item (/api/feed/personalized) into the unified
+ * shape. This is the bridge that lets catalog-sourced content (RSS blogs, HN,
+ * YouTube channel feeds, Bluesky) flow into the same journal-driven Reads
+ * ranker as frontend-direct sources — collapsing the two-pipeline split.
+ */
+export function toUnifiedFromWorldFeed(item: PersonalizedFeedItem): UnifiedItem {
+  const preview = item.webPreview ?? null;
+  const feedItem = (item.feedItem ?? {}) as Record<string, unknown>;
+  const url = preview?.url || (feedItem.url as string) || "";
+  const title = preview?.title || (feedItem.title as string) || "";
+  const body = preview?.description || preview?.contentText || (feedItem.description as string) || "";
+  const tsRaw = preview?.discoveredAt || (feedItem.publishedAt as string) || "";
+  const tsMs = tsRaw ? Date.parse(tsRaw) : NaN;
+  const imageUrl = preview?.imageUrl ?? null;
+  const isVideo = /\byoutube\.com\/watch|youtu\.be\//i.test(url);
+  return {
+    id: `world-${url || JSON.stringify(feedItem)}`,
+    sourcePlatform: item.sourceType === "bluesky" ? "atproto" : "rss",
+    timestamp: Number.isFinite(tsMs) ? Math.floor(tsMs / 1000) : 0,
+    author: {
+      id: preview?.domain || (feedItem.domain as string) || "world",
+      handle: item.feedSource?.label || preview?.domain || "Web",
+    },
+    content: { title, body: body.slice(0, 320), linkUrl: url || undefined },
+    media: isVideo
+      ? { type: "video", urls: [url], thumbnailUrl: imageUrl || undefined }
+      : imageUrl
+        ? { type: "image", urls: [imageUrl], thumbnailUrl: imageUrl }
+        : { type: "none", urls: [] },
+  };
+}
+
+
 
 const STOP_WORDS = new Set([
   "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
