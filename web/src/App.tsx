@@ -55,18 +55,11 @@ import {
 } from "./lib/videoLocalStore";
 // ── Nostr content-quality filter (language + spam + dedup) ───────────────────
 import { filterNostrFeed } from "./lib/feedFilter";
-// ── RSS/Atom feeds (Reads tab) ────────────────────────────────────────────────
-import { fetchRssFeeds, RSS_FEEDS, type RssFeed, type RssItem } from "./lib/rss";
-// ── YouTube ingestion (keyless; journal-topic-driven) ─────────────────────
-import { loadYouTubeFeed, YOUTUBE_CHANNELS, type YouTubeVideo } from "./lib/youtube";
 // ── Unified social feed: normalization + journal-driven topic curation ───────
 import {
   toUnifiedFromNostr,
-  toUnifiedFromHN,
   toUnifiedFromBluesky,
   toUnifiedFromNostrArticle,
-  toUnifiedFromRss,
-  toUnifiedFromYouTube,
   toUnifiedFromWorldFeed,
   extractJournalTopics,
   matchesTopic,
@@ -310,17 +303,6 @@ type PersistedPost = {
   eventId?: string;
 };
 
-type TechNewsItem = {
-  id: number;
-  title: string;
-  url: string;
-  source: string;
-  score: number;
-  comments: number;
-  createdAt: number;
-  thumbnailUrl?: string;
-};
-
 // ── Dev-mode sample data ─────────────────────────────────────────────────────
 const DEV_SAMPLE_POSTS: PersistedPost[] = [
   {
@@ -561,14 +543,6 @@ function getRelativeTime(dateVal: string | number): string {
   if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
   if (diffSec < 604800) return `${Math.floor(diffSec / 86400)}d`;
   return new Date(then).toLocaleDateString([], { month: "short", day: "numeric" });
-}
-
-function domainFromUrl(url: string): string {
-  try {
-    return new URL(url).hostname.replace(/^www\./, "");
-  } catch {
-    return "news.ycombinator.com";
-  }
 }
 
 function parseDateValue(value?: string | null) {
@@ -1663,7 +1637,6 @@ function App() {
   const [nostrProfileOverlay, setNostrProfileOverlay] = useState<NostrProfile | null>(null);
   const [nostrRevealPrivkey, setNostrRevealPrivkey] = useState(false);
   const [nostrCopiedKey, setNostrCopiedKey] = useState<"" | "npub" | "nsec">("");
-  const [techNewsItems, setTechNewsItems] = useState<TechNewsItem[]>([]);
 
   // ── Journal-driven topic curation ────────────────────────────────────────
   // Topics are mined from journal entries and feed the ranking lens directly
@@ -1688,21 +1661,14 @@ function App() {
   // (video now lives in the Reads ranked stream via Bluesky cards).
   const [reelsPosts, setReelsPosts] = useState<BlueskyPublicPost[]>([]);
   const [reelsLoading, setReelsLoading] = useState(false);
-  // Reads tab (long-form: Nostr NIP-23 articles + RSS/Atom blogs).
+  // Reads tab (long-form: Nostr NIP-23 articles + backend world-feed catalog).
   const [readsArticles, setReadsArticles] = useState<NostrEvent[]>([]);
-  const [readsRssItems, setReadsRssItems] = useState<{ feed: RssFeed; items: RssItem[] }[]>([]);
   const [readsLoading, setReadsLoading] = useState(false);
   const [readsError, setReadsError] = useState("");
-  const [readsSource, setReadsSource] = useState<"nostr" | "rss">("nostr");
-  // YouTube (keyless) folds into the ranked Reads stream, searched by the
-  // user's journal topics — the lens applied to video. Off by default.
-  const [readsYouTubeEnabled] = useState(false);
-  const [readsYouTubeItems, setReadsYouTubeItems] = useState<YouTubeVideo[]>([]);
-  const [activeRssFeedIds] = useState<string[]>(["hackernews", "stratechery", "verge"]);
   // Reads is a single minimalistic journal-ranked stream ("For You"); the
   // rank-mode toggle (For You / Latest) and the Sources / Social filter
-  // disclosures were removed. YouTube is off by default; RSS feeds use the
-  // default selection; social (Nostr/Bluesky) uses the default source.
+  // disclosures were removed. Catalog content (RSS/HN/YouTube) arrives via the
+  // backend world feed; social (Nostr/Bluesky) uses the default source.
   const [readsVisibleCount, setReadsVisibleCount] = useState(12);
   // Local-first cache for Reads: the last-good ranked stream is persisted so
   // the Reads tab paints instantly on open (Damus-style), then refreshes in
@@ -1768,8 +1734,6 @@ function App() {
   const profileAvatarInputRef = useRef<HTMLInputElement | null>(null);
   // Refresh toast (#5): a tiny "Updated" confirmation shown after pull-to-refresh.
   const [refreshToast, setRefreshToast] = useState<string | null>(null);
-  const [techNewsLoading, setTechNewsLoading] = useState(false);
-  const [techNewsError, setTechNewsError] = useState("");
   const [nostrPostConfirmPost, setNostrPostConfirmPost] = useState<PersistedPost | null>(null);
   const [nostrPostConfirmStep, setNostrPostConfirmStep] = useState<"confirm" | "account" | null>(null);
 
@@ -7162,32 +7126,19 @@ Rules:
     for (const a of readsArticles) {
       unified.push(toUnifiedFromNostrArticle(a));
     }
-    for (const group of readsRssItems) {
-      for (const item of group.items) unified.push(toUnifiedFromRss(item, group.feed.label));
-    }
-    // Hacker News top stories fold into the same ranked stream so the Reads
-    // tab is the single home for all article / news / link content.
-    for (const hn of techNewsItems) {
-      unified.push(toUnifiedFromHN(hn, hn.thumbnailUrl));
-    }
-    // YouTube videos (keyless, journal-topic-driven) fold into the same stream.
-    // The journal-topic ranker promotes videos relevant to the user's writing.
-    for (const v of readsYouTubeItems) {
-      unified.push(toUnifiedFromYouTube(v));
-    }
     // Social posts (gated above) join the stream and rank by the same lens.
     for (const s of socialUnifiedForReads) unified.push(s);
     // Backend world-feed items (/api/feed/personalized) — catalog-sourced RSS
     // blogs, HN, YouTube channels, and Bluesky — flow through the same journal-
-    // driven ranker. This is the bridge that collapses the two-pipeline split:
-    // catalog content is ranked alongside frontend-direct sources by one lens.
+    // driven ranker. This is the single pipeline: catalog content + live social
+    // are ranked by one lens (the journal is the lens).
     for (const w of blueskyFeedItems) {
       unified.push(toUnifiedFromWorldFeed(w));
     }
     // The Reads feed is a single journal-ranked stream ("For You"); the
     // chronological "Latest" mode was removed when the filter pills were cut.
     return rankReads(unified, journalTopics, negativeTopics);
-  }, [readsArticles, readsRssItems, techNewsItems, readsYouTubeItems, socialUnifiedForReads, blueskyFeedItems, journalTopics, negativeTopics]);
+  }, [readsArticles, socialUnifiedForReads, blueskyFeedItems, journalTopics, negativeTopics]);
 
   // Persist the ranked Reads stream so the next open paints instantly from
   // cache (local-first). Only the UnifiedItem[] is cached; ranking re-runs on
@@ -7390,35 +7341,19 @@ Rules:
     setReadsLoading(true);
     setReadsError("");
     try {
-      // Fetch the primary reads source (Nostr articles OR RSS) and Hacker News
-      // in parallel. HN folds into the same ranked stream so the Reads tab is
-      // one unified surface for all article/news/link content.
-      const primaryPromise =
-        readsSource === "nostr"
-          ? fetchLongFormArticles({ limit: 20 }).then((articles) => {
-              // Language-filter the articles (drop non-Latin titles/bodies).
-              return articles.filter((a) => {
-                const title = (a.tags || []).find((t) => t[0] === "title")?.[1] || "";
-                return filterNostrFeed([{ id: a.id, pubkey: a.pubkey, content: title + " " + a.content.slice(0, 200), createdAt: a.created_at, tags: a.tags || [] }], { maxPerPubkey: 99 }).length > 0;
-              });
-            })
-          : (() => {
-              const selected = RSS_FEEDS.filter((f) => activeRssFeedIds.includes(f.id));
-              const feeds = selected.length > 0 ? selected : RSS_FEEDS.slice(0, 3);
-              return fetchRssFeeds(feeds, { limitPerFeed: 8 });
-            })();
-      // Kick off HN alongside; it sets its own state and is best-effort, so we
-      // don't await it — it folds into the ranked stream as it lands.
-      if (techNewsItems.length === 0) void loadTechNews();
-      // YouTube (keyless) is likewise best-effort: searched by the user's
-      // journal topics so the videos are "what feeds this user's mind".
-      if (readsYouTubeEnabled) void loadYouTubeReads();
-      const primary = await primaryPromise;
-      if (readsSource === "nostr") {
-        setReadsArticles(primary as NostrEvent[]);
-      } else {
-        setReadsRssItems(primary as { feed: RssFeed; items: RssItem[] }[]);
-      }
+      // The Reads stream is now a single pipeline: Nostr long-form articles
+      // are fetched frontend-direct (real-time social), while catalog content
+      // (RSS blogs, HN, YouTube channels, Bluesky) arrives via the backend
+      // world feed and is merged in the rankedReads memo. Both pass through
+      // the same journal-driven ranker.
+      const articles = await fetchLongFormArticles({ limit: 20 }).then((arts) =>
+        // Language-filter the articles (drop non-Latin titles/bodies).
+        arts.filter((a) => {
+          const title = (a.tags || []).find((t) => t[0] === "title")?.[1] || "";
+          return filterNostrFeed([{ id: a.id, pubkey: a.pubkey, content: title + " " + a.content.slice(0, 200), createdAt: a.created_at, tags: a.tags || [] }], { maxPerPubkey: 99 }).length > 0;
+        }),
+      );
+      setReadsArticles(articles);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setReadsError(`Couldn't load reads: ${msg.slice(0, 120)}`);
@@ -7427,34 +7362,6 @@ Rules:
     }
   }
 
-  /**
-   * Load YouTube videos into the Reads stream. The reliable base is the
-   * curated channel catalog (YouTube RSS via the same rss2json proxy RSS blogs
-   * use — robust, keyless, webview-safe). On top of that, a best-effort
-   * topic search (Invidious) adds interest-driven discovery using the user's
-   * journal topics. Channel videos always load; topic search degrades to
-   * nothing on failure without dropping the channels. The journal-driven
-   * ranker then promotes the most relevant videos of either kind.
-   */
-  async function loadYouTubeReads() {
-    if (!readsYouTubeEnabled) {
-      setReadsYouTubeItems([]);
-      return;
-    }
-    try {
-      const videos = await loadYouTubeFeed({
-        channels: YOUTUBE_CHANNELS,
-        topics: journalTopics.map((t) => t.label),
-        perTopic: 4,
-        limitPerChannel: 6,
-      });
-      setReadsYouTubeItems(videos);
-    } catch {
-      // Total failure (network down): keep the tab empty of videos; the rest
-      // of the Reads stream (articles/HN) is unaffected.
-      setReadsYouTubeItems([]);
-    }
-  }
   /** Resolve profiles + reactions + reply-parents for a set of notes. */
   async function enrichNostrFeed(notes: NostrNote[]) {
     if (notes.length === 0) return;
@@ -7941,92 +7848,6 @@ Rules:
         ) : null}
       </article>
     );
-  }
-
-  /**
-   * Reusable Tasks section (extracted from the former standalone Tasks tab so it
-   * can be folded into the Queue tab). Same UI + behavior; an explicit "Extract"
-   * button replaces the old tab-level pull-to-refresh (the Queue tab's pull is
-   * wired to post generation, so Tasks needs its own trigger).
-   */
-  async function loadTechNews() {
-    if (techNewsLoading) return;
-    setTechNewsLoading(true);
-    setTechNewsError("");
-    try {
-      const res = await fetch("https://hacker-news.firebaseio.com/v0/topstories.json", { cache: "no-store" });
-      if (!res.ok) throw new Error(`Tech news service responded ${res.status}.`);
-      const ids: number[] = await res.json();
-      type HnItem = {
-        id: number; title?: string; url?: string;
-        score?: number; descendants?: number;
-        time?: number; type?: string;
-      } | null;
-      // Fetch a few more than 5 so the strongest stories survive even when
-      // some are job posts or missing fields.
-      const fetched: HnItem[] = await Promise.all(
-        ids.slice(0, 12).map(async (id) => {
-          try {
-            const r = await fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`, { cache: "no-store" });
-            return r.ok ? ((await r.json()) as HnItem) : null;
-          } catch {
-            return null;
-          }
-        })
-      );
-      const stories: TechNewsItem[] = fetched
-        .filter((it): it is NonNullable<HnItem> =>
-          Boolean(it && it.type === "story" && typeof it.title === "string")
-        )
-        .map((it) => {
-          const url: string = it.url || `https://news.ycombinator.com/item?id=${it.id}`;
-          return {
-            id: it.id,
-            title: it.title as string,
-            url,
-            source: domainFromUrl(url),
-            score: typeof it.score === "number" ? it.score : 0,
-            comments: typeof it.descendants === "number" ? it.descendants : 0,
-            createdAt: typeof it.time === "number" ? it.time : 0,
-          };
-        })
-        .slice(0, 5);
-      setTechNewsItems(stories);
-
-      // Best-effort thumbnail enrichment for external article URLs. HN stories
-      // carry no images, so derive an OG image via the gateway preview route.
-      // Self-links (news.ycombinator.com) have nothing useful to preview.
-      const token = chatGatewayToken.trim() || undefined;
-      Promise.allSettled(
-        stories.map(async (story) => {
-          if (!story.url || story.source === "news.ycombinator.com") return null;
-          const preview = await fetchWebPreview(story.url, token, gatewayBaseUrl);
-          if (!preview?.imageUrl) return null;
-          return { id: story.id, thumbnailUrl: preview.imageUrl } as const;
-        })
-      )
-        .then((results) => {
-          const updates = new Map<number, string>();
-          for (const r of results) {
-            if (r.status === "fulfilled" && r.value) {
-              updates.set(r.value.id, r.value.thumbnailUrl);
-            }
-          }
-          if (updates.size === 0) return;
-          setTechNewsItems((prev) =>
-            prev.map((item) =>
-              updates.has(item.id) ? { ...item, thumbnailUrl: updates.get(item.id) } : item
-            )
-          );
-        })
-        .catch(() => {
-          // Enrichment is best-effort; ignore failures.
-        });
-    } catch (error) {
-      setTechNewsError(error instanceof Error ? error.message : "Failed to load tech news.");
-    } finally {
-      setTechNewsLoading(false);
-    }
   }
 
   async function openNostrProfile(pubkey: string) {
@@ -8868,16 +8689,15 @@ Rules:
     }
   }, [mobileTab]);
 
-  // Auto-load Reads when the Reads tab is shown and empty (or when source/feed selection changes).
+  // Auto-load Reads (Nostr articles) when the Reads tab is shown and empty.
+  // Catalog content (RSS/HN/YouTube/Bluesky) arrives via the backend world feed,
+  // which is polled independently — this effect only covers the frontend-direct
+  // Nostr articles that haven't moved to the backend.
   useEffect(() => {
-    if (mobileTab === "reads") {
-      if (readsSource === "nostr" && readsArticles.length === 0 && !readsLoading) void loadReadsFeed();
-      else if (readsSource === "rss" && readsRssItems.length === 0 && !readsLoading) void loadReadsFeed();
-      // YouTube (keyless) fetches by journal topics when toggled on; clear on off.
-      if (readsYouTubeEnabled && readsYouTubeItems.length === 0) void loadYouTubeReads();
-      if (!readsYouTubeEnabled && readsYouTubeItems.length > 0) setReadsYouTubeItems([]);
+    if (mobileTab === "reads" && readsArticles.length === 0 && !readsLoading) {
+      void loadReadsFeed();
     }
-  }, [mobileTab, readsSource, activeRssFeedIds, readsYouTubeEnabled]);
+  }, [mobileTab]);
 
   useEffect(() => {
     let cancelled = false;

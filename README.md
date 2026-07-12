@@ -52,7 +52,7 @@ flowchart TB
     CACHE --> SERVE["GET /api/feed/personalized<br/>→ Reads stream"]
 ```
 
-> **Scope note.** The backend world feed ingests **Bluesky, RSS/Atom, Nostr, and open-web (DuckDuckGo)**. The frontend **Reads** stream additionally merges **Hacker News, YouTube/video, and web-of-trust-gated social** posts from on-device caches (`state/nostr.db`, `state/videos.db`) and re-ranks them client-side. Video/YouTube is a first-class *read-only* ingestion source, never a publishing surface. DuckDuckGo web discovery is **off by default** — enable it under `[web_search]` to let your strongest journal interest terms drive open-web queries alongside the curated catalog.
+> **Scope note.** The backend world feed ingests **RSS/Atom blogs (110+ catalog entries incl. Hacker News), YouTube channel feeds, Bluesky, Nostr, and open-web (DuckDuckGo)** — all cached in SQLite and ranked by the journal-driven Rust ranker. The frontend **Reads** stream merges these backend-ranked items with **live Nostr articles and web-of-trust-gated social posts** (fetched frontend-direct for real-time freshness), then applies the client-side journal-topic ranker on top. There is one pipeline, one lens. DuckDuckGo web discovery is **off by default** — enable it under `[web_search]` to let your strongest journal interest terms drive open-web queries alongside the curated catalog.
 
 ### 2. Ranking — the journal is the lens
 
