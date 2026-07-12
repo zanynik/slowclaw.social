@@ -76,7 +76,7 @@ flowchart TB
     end
 
     SCORE --> SORT["Sort by score"]
-    GATE["Social admission gate<br/>web-of-trust + engagement<br/>Bluesky replies ≥ 5"] -.-> SORT
+    GATE["Social admission gate<br/>web-of-trust + engagement<br/>Bluesky replies ≥ 5"] -.-> ITEMS
     SORT --> AI["On-device AI re-rank<br/>top-10 relevance boost (×0.6)<br/>iOS only"]
     AI --> FEED["For-You Reads feed"]
 ```
