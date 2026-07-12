@@ -18,6 +18,105 @@ The binary name is `slowclaw`.
 
 > The authoritative, enforceable vision is [`docs/vision-contract.md`](docs/vision-contract.md).
 
+## How It Works
+
+SlowClaw is built around one idea: **what you write is the lens for what you read back.** The diagrams below show the three engines that make that real — feed sourcing, ranking, and the AI loops. Code references point at the Rust core (`src/`) and the web/Tauri shell (`web/src/`).
+
+### 1. Feed sourcing — where the feed comes from
+
+The **world feed** (`src/feed/mod.rs`, served at `GET /api/feed/personalized`) is assembled from open-protocol sources, never closed silos. Your journals are mined into an **interest profile** that steers *which* sources get fetched (Stage 1) and *which* items rank (Stage 2). The three protocol sources run in parallel; one failing never kills the others.
+
+```mermaid
+flowchart TB
+    J["Your journals + notes<br/>posts/ and journals/"] --> IP["Interest profile<br/>weighted keywords + decay 0.94<br/>top 200 terms"]
+    IP --> S1{"Stage 1 — discovery<br/>keyword-match source metadata"}
+
+    subgraph SRC["Open-protocol sources"]
+        BS["Bluesky — feed generators<br/>XRPC getTimeline / getFeed"]
+        RSS["RSS / Atom — curated catalog<br/>~60 sites, ETag + Last-Modified"]
+        NOS["Nostr — kind-1 text notes<br/>NIP-11 / NIP-66 relays"]
+    end
+
+    S1 -->|"match generator descriptions"| BS
+    S1 -->|"match catalog topic tags"| RSS
+    S1 -->|"match relay metadata"| NOS
+    WSE["Optional web-search augmentation<br/>site: queries via Brave"] -.-> S2
+
+    BS --> S2["Stage 2 — candidate fetch<br/>parallel via tokio::join!"]
+    RSS --> S2
+    NOS --> S2
+
+    S2 --> CACHE[("SQLite — on-device cache<br/>content_items + personalized_feed_cache<br/>RSS TTL 30m · feed TTL 5m")]
+    CACHE --> SERVE["GET /api/feed/personalized<br/>→ Reads stream"]
+```
+
+> **Scope note.** The backend world feed ingests **Bluesky, RSS/Atom, and Nostr** (+ optional web search). The frontend **Reads** stream additionally merges **Hacker News, YouTube/video, and web-of-trust-gated social** posts from on-device caches (`state/nostr.db`, `state/videos.db`) and re-ranks them client-side. Video/YouTube is a first-class *read-only* ingestion source, never a publishing surface.
+
+### 2. Ranking — the journal is the lens
+
+Ranking is **journal-driven**, not popularity-driven. Journal text becomes weighted topics; those topics are the dominant score signal, so a relevant older piece can outrank a generic fresh one. This happens client-side in `web/src/lib/readsRanking.ts`, with an on-device AI re-rank pass on top.
+
+```mermaid
+flowchart TB
+    J["Journals + notes<br/>(incl. audio/video transcripts)"] --> TOPICS["Journal topics<br/>word frequency + bigrams<br/>+ AI-extracted interests<br/>+ liked / disliked keywords"]
+    TOPICS --> LENS["Editable interest lens<br/>mute x0 · boost x2 · manual add"]
+    LENS --> SCORE
+
+    ITEMS["Candidate items<br/>articles · news · video · social"] --> SCORE
+
+    subgraph SCORE["Score = sum of signals"]
+        direction TB
+        TB1["+ Topic boost — DOMINANT<br/>+0.8 strong, +0.3 each, cap +1.2"]
+        TB2["+ Recency decay<br/>0.5^(ageHours / 36)"]
+        TB3["+ Quality<br/>image +0.15 · read-time Goldilocks"]
+        TB4["− Disliked-topic penalty<br/>cap −0.9"]
+        TB1 --> TB2 --> TB3 --> TB4
+    end
+
+    SCORE --> SORT["Sort by score"]
+    GATE["Social admission gate<br/>web-of-trust + engagement<br/>Bluesky replies ≥ 5"] -.-> SORT
+    SORT --> AI["On-device AI re-rank<br/>top-10 relevance boost (×0.6)<br/>iOS only"]
+    AI --> FEED["For-You Reads feed"]
+```
+
+> **Why topics dominate.** A strong journal-topic match (~+1.2) is tuned to beat a near-max recency signal (≤1.0), so evergreen relevance surfaces. With no topics extracted, scoring degrades gracefully to pure recency + quality (cold start). The Rust world-feed ranker (`src/feed/ranker.rs`) uses the same journal-keyword signal plus a source-discovery bonus and source-diversity interleaving. Embeddings exist for **memory recall**, not the feed.
+
+### 3. AI loops — two planes, one brain-feeder
+
+AI runs on **two planes** that the app switches between with the `isTauriMobileRuntime()` guard. The **on-device plane** (iOS-first, private, offline) handles capture-time intelligence through `nativeAiChat` (llama.cpp/GGUF) and `transcribeAudio` (Speech.framework). The **gateway plane** (desktop/embedded) runs full agentic tool-use loops against remote LLM providers. The two are bridged: on-device interest and card-keyword extraction is written **into** the gateway feed store, so your phone steers your desktop ranking.
+
+```mermaid
+flowchart TB
+    CAP["Audio-first capture<br/>mic · share-sheet · video"] --> TR["Transcription<br/>Speech.framework — on-device"]
+    TR --> J["Journal entry — text"]
+    J --> ON
+    J --> GW
+
+    subgraph ON["On-device AI plane (iOS) — private, offline"]
+        direction TB
+        ON_T["Title — 3 to 7 words"]
+        ON_TW["TweetClaw — journal to post drafts"]
+        ON_IN["Interests — private to public vocab"]
+        ON_CK["Card keywords — on like / dislike"]
+        ON_RR["Feed re-rank — top-10 relevance"]
+        ON_WM["Model warm-up on launch"]
+    end
+
+    subgraph GW["Gateway + remote LLM plane — agentic, tool-use"]
+        direction TB
+        GW_SY["Workspace synthesizer<br/>todos · events · insights · clips"]
+        GW_AR["Article synthesizer"]
+        GW_TR["Triage classifier"]
+        GW_CH["ClawChat — general agent loop"]
+        GW_EM["Embeddings — memory recall"]
+    end
+
+    ON -.->|"write interest + card keywords<br/>into feed store"| GW
+    GW --> PUB["Drafts → review → publish<br/>Bluesky short-form · Nostr long-form"]
+```
+
+> **Reference pattern.** TweetClaw (post generation) and on-device task/interest extraction in `web/src/App.tsx` are the template for any new AI feature on iOS: gate on `isTauriMobileRuntime() && nativeLocalAiStatus?.available`, request JSON from `nativeAiChat`, parse defensively with retries, log to the AI activity log, and degrade gracefully. The gateway/skill path is for desktop and server-style workflows only — do not build new capture/synthesis features there when an on-device variant exists.
+
 ## What This Fork Keeps
 
 - Workspace-only file access policy (hard-enforced in app config/policy)
