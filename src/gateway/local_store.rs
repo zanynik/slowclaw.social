@@ -164,6 +164,9 @@ pub struct FeedKeywordRecord {
     pub last_seen_at: String,
     pub source_count: i64,
     pub updated_at: String,
+    /// 0 = positive (journal / liked-card), 1 = negative (disliked-card).
+    /// Negative keywords persist (no decay) and down-rank, never hide.
+    pub polarity: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +177,8 @@ pub struct FeedKeywordUpsert {
     pub first_seen_at: String,
     pub last_seen_at: String,
     pub source_count: i64,
+    /// 0 = positive, 1 = negative. See `FeedKeywordRecord::polarity`.
+    pub polarity: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1301,7 +1306,7 @@ pub fn list_feed_interests(workspace_dir: &Path) -> Result<Vec<FeedInterestRecor
 pub fn list_feed_keywords(workspace_dir: &Path) -> Result<Vec<FeedKeywordRecord>> {
     let conn = open_conn(&db_path(workspace_dir))?;
     let mut stmt = conn.prepare(
-        "SELECT id, term, weight, first_seen_at, last_seen_at, source_count, updated_at
+        "SELECT id, term, weight, first_seen_at, last_seen_at, source_count, updated_at, polarity
          FROM feed_profile_keywords
          ORDER BY weight DESC, last_seen_at DESC, term ASC",
     )?;
@@ -1314,6 +1319,40 @@ pub fn list_feed_keywords(workspace_dir: &Path) -> Result<Vec<FeedKeywordRecord>
             last_seen_at: row.get(4)?,
             source_count: row.get(5)?,
             updated_at: row.get(6)?,
+            polarity: row.get(7)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// List feed keywords filtered by polarity (0 = positive, 1 = negative).
+/// Same ordering as `list_feed_keywords`.
+pub fn list_feed_keywords_by_polarity(
+    workspace_dir: &Path,
+    polarity: i64,
+) -> Result<Vec<FeedKeywordRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, term, weight, first_seen_at, last_seen_at, source_count, updated_at, polarity
+         FROM feed_profile_keywords
+         WHERE polarity = ?1
+         ORDER BY weight DESC, last_seen_at DESC, term ASC",
+    )?;
+    let rows = stmt.query_map(params![polarity], |row| {
+        Ok(FeedKeywordRecord {
+            id: row.get(0)?,
+            term: row.get(1)?,
+            weight: row.get(2)?,
+            first_seen_at: row.get(3)?,
+            last_seen_at: row.get(4)?,
+            source_count: row.get(5)?,
+            updated_at: row.get(6)?,
+            polarity: row.get(7)?,
         })
     })?;
 
@@ -1337,16 +1376,18 @@ pub fn upsert_feed_keyword(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("lc_{}", Uuid::new_v4().simple()));
+    let polarity = keyword.polarity.clamp(0, 1);
     conn.execute(
         "INSERT INTO feed_profile_keywords (
-            id, term, weight, first_seen_at, last_seen_at, source_count, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            id, term, weight, first_seen_at, last_seen_at, source_count, updated_at, polarity
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(term) DO UPDATE SET
             weight = excluded.weight,
             first_seen_at = excluded.first_seen_at,
             last_seen_at = excluded.last_seen_at,
             source_count = excluded.source_count,
-            updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at,
+            polarity = excluded.polarity",
         params![
             id,
             keyword.term.trim(),
@@ -1355,12 +1396,13 @@ pub fn upsert_feed_keyword(
             keyword.last_seen_at.trim(),
             keyword.source_count,
             now,
+            polarity,
         ],
     )
     .context("Failed to upsert feed profile keyword")?;
 
     let mut stmt = conn.prepare(
-        "SELECT id, term, weight, first_seen_at, last_seen_at, source_count, updated_at
+        "SELECT id, term, weight, first_seen_at, last_seen_at, source_count, updated_at, polarity
          FROM feed_profile_keywords
          WHERE term = ?1
          LIMIT 1",
@@ -1374,6 +1416,7 @@ pub fn upsert_feed_keyword(
             last_seen_at: row.get(4)?,
             source_count: row.get(5)?,
             updated_at: row.get(6)?,
+            polarity: row.get(7)?,
         })
     })?;
     Ok(record)
@@ -1382,10 +1425,13 @@ pub fn upsert_feed_keyword(
 pub fn decay_feed_keywords(workspace_dir: &Path, decay_rate: f64) -> Result<usize> {
     let conn = open_conn(&db_path(workspace_dir))?;
     let now = Utc::now().to_rfc3339();
+    // Decay positives only (polarity = 0). Disliked keywords (polarity = 1) are
+    // explicit negative signals and must persist until the user removes them.
     let updated = conn.execute(
         "UPDATE feed_profile_keywords
          SET weight = MAX(0.0, weight * ?1),
-             updated_at = ?2",
+             updated_at = ?2
+         WHERE polarity = 0",
         params![decay_rate, now],
     )?;
     Ok(updated)
@@ -1397,8 +1443,11 @@ pub fn prune_feed_keywords(
     keep_limit: usize,
 ) -> Result<usize> {
     let conn = open_conn(&db_path(workspace_dir))?;
+    // Weight-floor pruning applies to positives only: an un-reinforced interest
+    // that has decayed below the floor is forgotten. Disliked keywords carry no
+    // decay, so they never hit this floor; they are bounded by `keep_limit`.
     let mut removed = conn.execute(
-        "DELETE FROM feed_profile_keywords WHERE weight < ?1",
+        "DELETE FROM feed_profile_keywords WHERE weight < ?1 AND polarity = 0",
         params![min_weight],
     )?;
     let keep_limit = i64::try_from(keep_limit.max(1)).unwrap_or(300);
@@ -1436,6 +1485,131 @@ pub fn update_feed_keyword_term(
         params![term.trim(), now, keyword_id.trim()],
     )?;
     Ok(updated > 0)
+}
+
+/* ── Lens overrides (mute / boost multipliers) ────────────────────────────
+ * Persisted in SQLite so both the TS ranker and the Rust world-feed ranker
+ * honor the same editable lens, and so it survives an iOS app reinstall
+ * (localStorage does not). Mirrors the old `interestProfile.ts` overrides.
+ */
+
+#[derive(Debug, Clone)]
+pub struct FeedLensOverrideRecord {
+    pub term: String,
+    pub multiplier: f64,
+    pub updated_at: String,
+}
+
+pub fn list_feed_lens_overrides(workspace_dir: &Path) -> Result<Vec<FeedLensOverrideRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT term, multiplier, updated_at
+         FROM feed_lens_overrides
+         ORDER BY term ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(FeedLensOverrideRecord {
+            term: row.get(0)?,
+            multiplier: row.get(1)?,
+            updated_at: row.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Upsert a lens override for a term. `multiplier` is clamped to a sane range
+/// (0 = mute, 1 = normal, 2 = boost) to mirror the discrete UI states.
+pub fn set_feed_lens_override(
+    workspace_dir: &Path,
+    term: &str,
+    multiplier: f64,
+) -> Result<()> {
+    let key = term.trim().to_lowercase();
+    if key.is_empty() {
+        return Ok(());
+    }
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    // Clamp to [0, 4]: the UI emits 0/1/2 but a small headroom avoids silently
+    // dropping an extreme value while still rejecting garbage.
+    let mult = multiplier.clamp(0.0, 4.0);
+    conn.execute(
+        "INSERT INTO feed_lens_overrides (term, multiplier, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(term) DO UPDATE SET
+            multiplier = excluded.multiplier,
+            updated_at = excluded.updated_at",
+        params![key, mult, now],
+    )
+    .context("Failed to upsert feed lens override")?;
+    Ok(())
+}
+
+pub fn remove_feed_lens_override(workspace_dir: &Path, term: &str) -> Result<bool> {
+    let key = term.trim().to_lowercase();
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let deleted = conn.execute(
+        "DELETE FROM feed_lens_overrides WHERE term = ?1",
+        params![key],
+    )?;
+    Ok(deleted > 0)
+}
+
+/* ── Manual interests (user-added, not yet in journals) ────────────────── */
+
+#[derive(Debug, Clone)]
+pub struct FeedManualInterestRecord {
+    pub term: String,
+    pub added_at: String,
+}
+
+pub fn list_feed_manual_interests(workspace_dir: &Path) -> Result<Vec<FeedManualInterestRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT term, added_at
+         FROM feed_manual_interests
+         ORDER BY added_at DESC, term ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(FeedManualInterestRecord {
+            term: row.get(0)?,
+            added_at: row.get(1)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn add_feed_manual_interest(workspace_dir: &Path, term: &str) -> Result<bool> {
+    let key = term.trim().to_lowercase();
+    if key.is_empty() {
+        return Ok(false);
+    }
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    // INSERT OR IGNORE so re-adding is a no-op; returns whether a row was added.
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO feed_manual_interests (term, added_at) VALUES (?1, ?2)",
+        params![key, now],
+    )?;
+    Ok(inserted > 0)
+}
+
+pub fn remove_feed_manual_interest(workspace_dir: &Path, term: &str) -> Result<bool> {
+    let key = term.trim().to_lowercase();
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let deleted = conn.execute(
+        "DELETE FROM feed_manual_interests WHERE term = ?1",
+        params![key],
+    )?;
+    Ok(deleted > 0)
 }
 
 pub fn upsert_feed_interest(
@@ -2501,6 +2675,17 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_feed_profile_keywords_weight
             ON feed_profile_keywords(weight DESC, last_seen_at DESC, updated_at DESC);
 
+        CREATE TABLE IF NOT EXISTS feed_lens_overrides (
+            term TEXT PRIMARY KEY,
+            multiplier REAL NOT NULL DEFAULT 1.0,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS feed_manual_interests (
+            term TEXT PRIMARY KEY,
+            added_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS feed_web_sources (
             domain TEXT PRIMARY KEY,
             title TEXT NOT NULL DEFAULT '',
@@ -2658,6 +2843,15 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "triage_keywords_json",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    // Polarity on feed keywords: 0 = positive (journal / liked-card), 1 =
+    // negative (disliked-card). Additive migration; existing rows default to 0
+    // (their pre-polarity positive-only behavior). See `FeedKeywordRecord`.
+    ensure_column(
+        &conn,
+        "feed_profile_keywords",
+        "polarity",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
 
     Ok(())
 }
@@ -2720,6 +2914,7 @@ fn normalize_role(value: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn test_workspace() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -2742,6 +2937,8 @@ mod tests {
         assert!(table_exists(&conn, "feed_interests").unwrap());
         assert!(table_exists(&conn, "feed_interest_sources").unwrap());
         assert!(table_exists(&conn, "feed_profile_keywords").unwrap());
+        assert!(table_exists(&conn, "feed_lens_overrides").unwrap());
+        assert!(table_exists(&conn, "feed_manual_interests").unwrap());
         assert!(table_exists(&conn, "feed_web_sources").unwrap());
         assert!(table_exists(&conn, "feed_web_cache").unwrap());
         assert!(table_exists(&conn, "personalized_feed_cache").unwrap());
@@ -3693,6 +3890,131 @@ mod tests {
             .unwrap()
             .expect("dirty state should exist");
         assert!(dirty_state.dirty);
+    }
+
+    fn upsert_test_keyword(workspace: &Path, term: &str, weight: f64, polarity: i64) {
+        let now = "2026-03-12T12:00:00Z";
+        upsert_feed_keyword(
+            workspace,
+            &FeedKeywordUpsert {
+                id: None,
+                term: term.into(),
+                weight,
+                first_seen_at: now.into(),
+                last_seen_at: now.into(),
+                source_count: 1,
+                polarity,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn feed_keyword_polarity_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        upsert_test_keyword(tmp.path(), "ranking", 2.0, 0);
+        upsert_test_keyword(tmp.path(), "celebrity gossip", 1.0, 1);
+
+        let all = list_feed_keywords(tmp.path()).unwrap();
+        assert_eq!(all.len(), 2);
+
+        let pos = list_feed_keywords_by_polarity(tmp.path(), 0).unwrap();
+        let neg = list_feed_keywords_by_polarity(tmp.path(), 1).unwrap();
+        assert_eq!(pos.len(), 1);
+        assert_eq!(pos[0].term, "ranking");
+        assert_eq!(pos[0].polarity, 0);
+        assert_eq!(neg.len(), 1);
+        assert_eq!(neg[0].term, "celebrity gossip");
+        assert_eq!(neg[0].polarity, 1);
+    }
+
+    #[test]
+    fn decay_skips_disliked_keywords() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        upsert_test_keyword(tmp.path(), "ranking", 2.0, 0);
+        upsert_test_keyword(tmp.path(), "celebrity gossip", 2.0, 1);
+
+        let decayed = decay_feed_keywords(tmp.path(), 0.5).unwrap();
+        // Only the positive row should have been touched.
+        assert_eq!(decayed, 1);
+
+        let all: HashMap<String, FeedKeywordRecord> = list_feed_keywords(tmp.path())
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.term.clone(), r))
+            .collect();
+        assert!((all["ranking"].weight - 1.0).abs() < 1e-9); // decayed
+        assert!((all["celebrity gossip"].weight - 2.0).abs() < 1e-9); // untouched
+    }
+
+    #[test]
+    fn prune_keeps_disliked_below_floor() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        // Positive keyword that has decayed below the prune floor → pruned.
+        upsert_test_keyword(tmp.path(), "ranking", 0.05, 0);
+        // Disliked keyword below the floor → must survive (no decay means the
+        // floor is meaningless for it; bounded only by keep_limit).
+        upsert_test_keyword(tmp.path(), "celebrity gossip", 0.02, 1);
+
+        let removed = prune_feed_keywords(tmp.path(), 0.1, 300).unwrap();
+        assert_eq!(removed, 1);
+
+        let remaining: Vec<String> =
+            list_feed_keywords(tmp.path()).unwrap().into_iter().map(|r| r.term).collect();
+        assert!(remaining.contains(&"celebrity gossip".to_string()));
+        assert!(!remaining.contains(&"ranking".to_string()));
+    }
+
+    #[test]
+    fn feed_lens_override_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        set_feed_lens_override(tmp.path(), "Philosophy", 2.0).unwrap();
+        set_feed_lens_override(tmp.path(), "  Spam  ", 0.0).unwrap();
+
+        let overrides = list_feed_lens_overrides(tmp.path()).unwrap();
+        assert_eq!(overrides.len(), 2);
+        // Terms are normalized to lowercase on write.
+        let by_term: HashMap<String, f64> = overrides
+            .into_iter()
+            .map(|o| (o.term, o.multiplier))
+            .collect();
+        assert!((by_term["philosophy"] - 2.0).abs() < 1e-9);
+        assert!((by_term["spam"] - 0.0).abs() < 1e-9);
+
+        // Upsert replaces, not appends.
+        set_feed_lens_override(tmp.path(), "philosophy", 1.0).unwrap();
+        assert_eq!(list_feed_lens_overrides(tmp.path()).unwrap().len(), 2);
+
+        assert!(remove_feed_lens_override(tmp.path(), "SPAM").unwrap());
+        assert_eq!(list_feed_lens_overrides(tmp.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn feed_manual_interest_roundtrip() {
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+
+        assert!(add_feed_manual_interest(tmp.path(), "Existentialism").unwrap());
+        // Re-adding the same term (even different case) is a no-op.
+        assert!(!add_feed_manual_interest(tmp.path(), "  existentialism  ").unwrap());
+        assert!(add_feed_manual_interest(tmp.path(), "Stoicism").unwrap());
+
+        let interests = list_feed_manual_interests(tmp.path()).unwrap();
+        assert_eq!(interests.len(), 2);
+        let terms: Vec<String> = interests.into_iter().map(|i| i.term).collect();
+        assert!(terms.contains(&"existentialism".to_string()));
+        assert!(terms.contains(&"stoicism".to_string()));
+
+        assert!(remove_feed_manual_interest(tmp.path(), "stoicism").unwrap());
+        assert_eq!(list_feed_manual_interests(tmp.path()).unwrap().len(), 1);
     }
 
 }
