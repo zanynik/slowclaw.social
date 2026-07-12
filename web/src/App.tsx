@@ -101,6 +101,7 @@ import { getFollowedIds, onFollowsChange, toggleFollow, nostrFollowKey, blueskyF
 import { rankReads, chronologicalReads, gateSocialItems, filterBlueskyByReplies, applyAiRankBoost, type RankedRead } from "./lib/readsRanking";
 import { tryParseJsonArray } from "./lib/json";
 import { useAiFeedRerank } from "./hooks/useAiFeedRerank";
+import { useLensProfile, notifyLensChange } from "./hooks/useLensProfile";
 import {
   loadCachedWoTSet,
   refreshWoTSet,
@@ -118,6 +119,12 @@ import {
   renameJournal,
   deleteJournal,
   saveJournalInterestKeywords,
+  saveCardKeywords,
+  getInterestProfile,
+  setLensOverride,
+  removeLensOverride,
+  addManualInterestCmd,
+  removeManualInterestCmd,
   summarizeJournal,
   listSummaries,
   generateWeeklyDigest,
@@ -1713,9 +1720,15 @@ function App() {
   const [localProfile, setLocalProfile] = useState<LocalProfile | null>(() => getProfile());
   // Editable interest overrides + manual interests steer the curation lens.
   // Kept in state so the journalTopics memo recomputes when the user edits them.
+  // These mirror localStorage (instant first paint); on Tauri mobile the SQLite
+  // lens profile (lensProfile below) is the authoritative source and overrides
+  // these once hydrated.
   const [interestOverrides, setInterestOverrides] = useState<Record<string, { multiplier: number }>>(() => getInterestOverrides());
   const [manualInterests, setManualInterests] = useState<string[]>(() => getManualInterests());
   const [interestDraft, setInterestDraft] = useState("");
+  // Unified SQLite lens profile (positives + negatives + overrides + manual).
+  // Null on non-Tauri runtimes → callers fall back to localStorage above.
+  const { state: lensProfile } = useLensProfile();
   // 👍/👎 on Reads cards: tracks which cards the user liked/disliked so the
   // buttons render the correct active state, and so AI-extracted keywords from
   // those cards steer ranking (liked → positive topics, disliked → penalty).
@@ -6974,6 +6987,22 @@ Rules:
    */
   const journalTopics = useMemo(
     () => {
+      // On Tauri mobile the SQLite store is authoritative: the lens profile
+      // already has overrides applied and folds in liked-card keywords + manual
+      // interests. We still mine journal text client-side for the frequency
+      // signal (extractJournalTopics) since that's richer than the AI-extracted
+      // keywords alone, then merge the SQLite positives on top.
+      const useSQLite = !!lensProfile;
+      const overridesMap = useSQLite
+        ? lensProfile!.overrides
+        : Object.fromEntries(
+            Object.entries(interestOverrides).map(([k, v]) => [k, v.multiplier]),
+          );
+      const manual = useSQLite ? lensProfile!.manual : manualInterests;
+      const likedKws = useSQLite
+        ? lensProfile!.positives.map((p) => p.label)
+        : getLikedKeywords();
+
       // Voice/video journals carry their transcript in `previewText` (the Rust
       // host surfaces the sidecar transcript as `content`), so feed every
       // entry with substantive text into the lens — not just written notes.
@@ -6990,7 +7019,7 @@ Rules:
       // it's prioritized in the Reads/YouTube/Nostr rankers.
       const adjusted = derived
         .map((t) => {
-          const mult = interestOverrides[t.label.toLowerCase()]?.multiplier ?? INTEREST_MULT.NORMAL;
+          const mult = overridesMap[t.label.toLowerCase()] ?? INTEREST_MULT.NORMAL;
           return { label: t.label, weight: t.weight * mult };
         })
         .filter((t) => t.weight > 0);
@@ -6999,10 +7028,10 @@ Rules:
       // muted manual interest is dropped here too.
       const existing = new Set(adjusted.map((t) => t.label.toLowerCase()));
       const MANUAL_WEIGHT = 3; // comparable to a strong journal-derived topic
-      for (const label of manualInterests) {
+      for (const label of manual) {
         const key = label.toLowerCase();
         if (existing.has(key)) continue;
-        const mult = interestOverrides[key]?.multiplier ?? INTEREST_MULT.NORMAL;
+        const mult = overridesMap[key] ?? INTEREST_MULT.NORMAL;
         if (mult <= 0) continue;
         adjusted.push({ label, weight: MANUAL_WEIGHT * mult });
       }
@@ -7011,13 +7040,13 @@ Rules:
       // represent confirmed interest. Modest weight (below a strong journal
       // topic) so an explicit like steers but doesn't drown out the journal lens.
       const LIKED_KW_WEIGHT = 1.5;
-      for (const kw of getLikedKeywords()) {
-        if (existing.has(kw)) continue;
+      for (const kw of likedKws) {
+        if (existing.has(kw.toLowerCase())) continue;
         adjusted.push({ label: kw, weight: LIKED_KW_WEIGHT });
       }
       return adjusted.sort((a, b) => b.weight - a.weight).slice(0, 12);
     },
-    [journalItems, interestOverrides, manualInterests, likedKeywordSeed],
+    [journalItems, interestOverrides, manualInterests, likedKeywordSeed, lensProfile],
   );
 
   /**
@@ -7028,8 +7057,15 @@ Rules:
    * matchesTopic) but kept at 1 for Topic-shape parity.
    */
   const negativeTopics = useMemo<Topic[]>(
-    () => getDislikedKeywords().map((label) => ({ label, weight: 1 })),
-    [dislikedKeywordSeed],
+    () => {
+      // Prefer the SQLite negative set (disliked-card keywords, persistent)
+      // when the lens profile is hydrated; fall back to localStorage elsewhere.
+      if (lensProfile) {
+        return lensProfile.negatives.map((t) => ({ label: t.label, weight: 1 }));
+      }
+      return getDislikedKeywords().map((label) => ({ label, weight: 1 }));
+    },
+    [dislikedKeywordSeed, lensProfile],
   );
 
   /**
