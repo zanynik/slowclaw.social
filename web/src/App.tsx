@@ -2709,6 +2709,14 @@ Rules:
           // they actually drive the iOS curation lens (Reads/YouTube/Nostr
           // ranking), not just the desktop gateway feed system. They become
           // first-class manual interests: boostable/mutable in Profile.
+          // On mobile the SQLite store is authoritative (survives reinstall);
+          // localStorage mirrors it as the non-Tauri fallback.
+          if (isTauriMobileRuntime()) {
+            for (const kw of interestKeywords) {
+              addManualInterestCmd(kw).catch(() => {});
+            }
+            notifyLensChange();
+          }
           for (const kw of interestKeywords) addManualInterest(kw);
           // Surface the magic: reveal the extracted keywords inline so the user
           // can see — and correct — what the on-device AI inferred from their
@@ -5743,6 +5751,10 @@ Rules:
     const journalId = lastInterestJournalId;
     // Also drop from the LOCAL interest profile so the iOS lens stops surfacing
     // content for it immediately (mirrors the chip removal the user just did).
+    // Dual-write: SQLite on mobile (authoritative), localStorage fallback.
+    if (isTauriMobileRuntime()) {
+      removeManualInterestCmd(keyword).then(notifyLensChange).catch(() => {});
+    }
     removeManualInterest(keyword);
     if (!journalId) return;
     const remaining = lastExtractedInterests.filter((k) => k !== keyword);
@@ -10268,8 +10280,13 @@ Rules:
                                       // No-op on desktop / cold start (the like is still recorded).
                                       const kws = await extractCardKeywords(item.content.title || "", item.content.body || "");
                                       if (kws && kws.length > 0) {
-                                        addLikedKeywords(kws);
-                                        setLikedKeywordSeed((n) => n + 1);
+                                        // Unified SQLite store on mobile; localStorage fallback elsewhere.
+                                        if (isTauriMobileRuntime()) {
+                                          saveCardKeywords(kws, []).then(notifyLensChange).catch(() => {});
+                                        } else {
+                                          addLikedKeywords(kws);
+                                          setLikedKeywordSeed((n) => n + 1);
+                                        }
                                       }
                                     }
                                   }}
@@ -10287,8 +10304,12 @@ Rules:
                                     if (nowDisliked) {
                                       const kws = await extractCardKeywords(item.content.title || "", item.content.body || "");
                                       if (kws && kws.length > 0) {
-                                        addDislikedKeywords(kws);
-                                        setDislikedKeywordSeed((n) => n + 1);
+                                        if (isTauriMobileRuntime()) {
+                                          saveCardKeywords([], kws).then(notifyLensChange).catch(() => {});
+                                        } else {
+                                          addDislikedKeywords(kws);
+                                          setDislikedKeywordSeed((n) => n + 1);
+                                        }
                                       }
                                     }
                                   }}
@@ -10393,6 +10414,38 @@ Rules:
 
               {/* Editable interest profile — steer the curation lens. */}
               {(() => {
+                // On Tauri mobile the SQLite store is authoritative; we display
+                // + mutate through it (and fire notifyLensChange so the hook
+                // re-hydrates). localStorage stays as the non-Tauri fallback.
+                const useSQLite = !!lensProfile;
+                const overridesMap = useSQLite
+                  ? lensProfile!.overrides
+                  : Object.fromEntries(
+                      Object.entries(interestOverrides).map(([k, v]) => [k, v.multiplier]),
+                    );
+                const manualList = useSQLite ? lensProfile!.manual : manualInterests;
+
+                // Dual-write mutator: persist to the active store AND update
+                // local React state for instant UI feedback. On mobile the
+                // notifyLensChange call re-hydrates the hook's snapshot.
+                const applyOverride = (label: string, next: number) => {
+                  if (next === INTEREST_MULT.NORMAL) {
+                    if (useSQLite) { removeLensOverride(label).then(notifyLensChange).catch(() => {}); }
+                    removeInterestOverride(label);
+                  } else {
+                    if (useSQLite) { setLensOverride(label, next).then(notifyLensChange).catch(() => {}); }
+                    setInterestMultiplier(label, next);
+                  }
+                };
+                const applyAddManual = (v: string) => {
+                  if (useSQLite) { addManualInterestCmd(v).then(notifyLensChange).catch(() => {}); }
+                  addManualInterest(v);
+                };
+                const applyRemoveManual = (label: string) => {
+                  if (useSQLite) { removeManualInterestCmd(label).then(notifyLensChange).catch(() => {}); }
+                  removeManualInterest(label);
+                };
+
                 // Union of journal-derived labels (pre-override) + manual interests,
                 // so muted topics stay visible and restorable.
                 const seen = new Set<string>();
@@ -10403,7 +10456,7 @@ Rules:
                   seen.add(key);
                   displayTopics.push({ label, manual: false });
                 }
-                for (const label of manualInterests) {
+                for (const label of manualList) {
                   if (seen.has(label)) continue;
                   seen.add(label);
                   displayTopics.push({ label, manual: true });
@@ -10422,22 +10475,18 @@ Rules:
                       <div className="interest-profile-list">
                         {displayTopics.map(({ label, manual }) => {
                           const key = label.toLowerCase();
-                          const mult = interestOverrides[key]?.multiplier ?? INTEREST_MULT.NORMAL;
+                          const mult = overridesMap[key] ?? INTEREST_MULT.NORMAL;
                           const isMuted = mult === INTEREST_MULT.MUTE;
                           const isBoosted = mult === INTEREST_MULT.BOOST;
-                          const setState = (next: number) => {
-                            if (next === INTEREST_MULT.NORMAL) removeInterestOverride(label);
-                            else setInterestMultiplier(label, next);
-                          };
                           return (
                             <div key={key} className="interest-profile-row">
                               <span className={`interest-profile-label${isMuted ? " muted" : ""}`}>{label}{manual ? <span className="interest-profile-tag" aria-hidden>added</span> : null}</span>
                               <div className="interest-profile-controls" role="group" aria-label={`Steer topic ${label}`}>
-                                <button type="button" className={`interest-pill${isMuted ? " active danger" : ""}`} onClick={() => setState(INTEREST_MULT.MUTE)} title="Mute this topic">Mute</button>
-                                <button type="button" className={`interest-pill${!isMuted && !isBoosted ? " active" : ""}`} onClick={() => setState(INTEREST_MULT.NORMAL)} title="Use as-derived weight">Normal</button>
-                                <button type="button" className={`interest-pill${isBoosted ? " active success" : ""}`} onClick={() => setState(INTEREST_MULT.BOOST)} title="Boost this topic">Boost</button>
+                                <button type="button" className={`interest-pill${isMuted ? " active danger" : ""}`} onClick={() => applyOverride(label, INTEREST_MULT.MUTE)} title="Mute this topic">Mute</button>
+                                <button type="button" className={`interest-pill${!isMuted && !isBoosted ? " active" : ""}`} onClick={() => applyOverride(label, INTEREST_MULT.NORMAL)} title="Use as-derived weight">Normal</button>
+                                <button type="button" className={`interest-pill${isBoosted ? " active success" : ""}`} onClick={() => applyOverride(label, INTEREST_MULT.BOOST)} title="Boost this topic">Boost</button>
                                 {manual ? (
-                                  <button type="button" className="interest-pill ghost" onClick={() => removeManualInterest(label)} title="Remove this interest">✕</button>
+                                  <button type="button" className="interest-pill ghost" onClick={() => applyRemoveManual(label)} title="Remove this interest">✕</button>
                                 ) : null}
                               </div>
                             </div>
@@ -10451,7 +10500,7 @@ Rules:
                         e.preventDefault();
                         const v = interestDraft.trim();
                         if (!v) return;
-                        addManualInterest(v);
+                        applyAddManual(v);
                         setInterestDraft("");
                       }}
                     >
