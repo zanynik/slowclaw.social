@@ -16,9 +16,20 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   getInterestProfile,
+  saveCardKeywords,
+  setLensOverride,
+  addManualInterestCmd,
   type InterestProfileSnapshot,
   type LensTerm,
 } from "../lib/tauriApi";
+import {
+  getLikedKeywords,
+  getDislikedKeywords,
+} from "../lib/savedItems";
+import {
+  getInterestOverrides,
+  getManualInterests,
+} from "../lib/interestProfile";
 
 export type { LensTerm };
 
@@ -85,21 +96,75 @@ function snapshotToState(snapshot: InterestProfileSnapshot, seed: number): LensP
   };
 }
 
+// ── One-time localStorage → SQLite migration ──────────────────────────────
+//
+// Before the unification, the lens lived in three localStorage namespaces
+// (liked/disliked keywords + interestProfile overrides/manual). On the first
+// launch after the upgrade, copy them into the SQLite store so the user's
+// existing lens survives. Guarded by a sentinel so it runs at most once per
+// device; idempotent on the SQLite side (INSERT OR IGNORE / ON CONFLICT).
+const MIGRATION_SENTINEL = "slowclaw.lens.migrated.v1";
+
+async function migrateLensFromLocalStorage(): Promise<void> {
+  if (!isBrowser()) return;
+  if (window.localStorage.getItem(MIGRATION_SENTINEL)) return;
+
+  const liked = getLikedKeywords();
+  const disliked = getDislikedKeywords();
+  const overrides = getInterestOverrides();
+  const manual = getManualInterests();
+
+  const hasData =
+    liked.length > 0 ||
+    disliked.length > 0 ||
+    Object.keys(overrides).length > 0 ||
+    manual.length > 0;
+
+  if (hasData) {
+    try {
+      if (liked.length || disliked.length) {
+        await saveCardKeywords(liked, disliked);
+      }
+      for (const [term, ov] of Object.entries(overrides)) {
+        await setLensOverride(term, ov.multiplier);
+      }
+      for (const term of manual) {
+        await addManualInterestCmd(term);
+      }
+    } catch (err) {
+      // Don't set the sentinel on failure so a transient SQLite error retries
+      // next launch rather than silently dropping the user's lens.
+      console.warn("[useLensProfile] lens migration failed (will retry)", err);
+      return;
+    }
+  }
+
+  // Mark migrated regardless of whether there was data, so an empty lens
+  // doesn't re-check every launch.
+  window.localStorage.setItem(MIGRATION_SENTINEL, "1");
+}
+
 export function useLensProfile(): { state: LensProfileState | null; refresh: () => void } {
   const [state, setState] = useState<LensProfileState | null>(null);
   const [seed, setSeed] = useState(0);
 
   const refresh = useCallback(() => {
     if (!isTauriMobileRuntime()) return;
-    getInterestProfile()
-      .then((snapshot) => {
-        setSeed((n) => n + 1);
-        setState(snapshotToState(snapshot, seed + 1));
-      })
-      .catch((err) => {
-        // Non-fatal: the lens falls back to the localStorage path. Logged so
-        // a broken SQLite read doesn't silently degrade ranking.
-        console.warn("[useLensProfile] getInterestProfile failed", err);
+    // Run the one-time migration before reading, so the first snapshot
+    // includes any carried-over localStorage lens data.
+    migrateLensFromLocalStorage()
+      .catch((err) => console.warn("[useLensProfile] migration error", err))
+      .finally(() => {
+        getInterestProfile()
+          .then((snapshot) => {
+            setSeed((n) => n + 1);
+            setState(snapshotToState(snapshot, seed + 1));
+          })
+          .catch((err) => {
+            // Non-fatal: the lens falls back to the localStorage path. Logged so
+            // a broken SQLite read doesn't silently degrade ranking.
+            console.warn("[useLensProfile] getInterestProfile failed", err);
+          });
       });
   }, [seed]);
 
