@@ -33,8 +33,8 @@ flowchart TB
 
     subgraph SRC["Open-protocol sources"]
         BS["Bluesky — feed generators<br/>XRPC getTimeline / getFeed"]
-        RSS["RSS / Atom — curated catalog<br/>~60 sites, ETag + Last-Modified"]
-        NOS["Nostr — kind-1 text notes<br/>NIP-11 / NIP-66 relays"]
+        RSS["RSS / Atom — curated catalog<br/>110+ sites, ETag + Last-Modified"]
+        NOS["Nostr — kind 1 notes + 30023 articles<br/>NIP-11 / NIP-66 relays"]
         DDG["DuckDuckGo — open-web<br/>interest-keyword queries, free"]
     end
 
@@ -52,7 +52,7 @@ flowchart TB
     CACHE --> SERVE["GET /api/feed/personalized<br/>→ Reads stream"]
 ```
 
-> **Scope note.** The backend world feed ingests **RSS/Atom blogs (110+ catalog entries incl. Hacker News), YouTube channel feeds, Bluesky, Nostr, and open-web (DuckDuckGo)** — all cached in SQLite and ranked by the journal-driven Rust ranker. The frontend **Reads** stream merges these backend-ranked items with **live Nostr articles and web-of-trust-gated social posts** (fetched frontend-direct for real-time freshness), then applies the client-side journal-topic ranker on top. There is one pipeline, one lens. DuckDuckGo web discovery is **off by default** — enable it under `[web_search]` to let your strongest journal interest terms drive open-web queries alongside the curated catalog.
+> **Scope note.** The backend world feed ingests **RSS/Atom blogs (110+ catalog entries incl. Hacker News), YouTube channel feeds, Nostr (kind 1 text notes + kind 30023 long-form articles), Bluesky, and open-web (DuckDuckGo)** — all cached in SQLite and ranked by the journal-driven Rust ranker. The frontend **Reads** stream merges these backend-ranked items with **web-of-trust-gated social posts** (live Nostr notes + anonymous Bluesky search, fetched frontend-direct for the WoT gate), then applies the client-side journal-topic ranker on top. All article content flows through one backend pipeline; only the social gate stays client-side. DuckDuckGo web discovery is **off by default** — enable it under `[web_search]` to let your strongest journal interest terms drive open-web queries alongside the curated catalog.
 
 ### 2. Ranking — the journal is the lens
 
