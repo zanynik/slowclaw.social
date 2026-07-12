@@ -19,7 +19,6 @@ import {
   fetchRepliesForEvent,
   fetchNotesByIds,
   fetchNotesByHashtag,
-  fetchLongFormArticles,
   getReplyParentId,
   npubFromHex,
   publishNote,
@@ -31,7 +30,6 @@ import {
   fetchNostrFollowingCount,
   type NostrNote,
   type NostrProfile,
-  type NostrEvent,
 } from "./lib/nostr";
 // ── On-device Nostr store (Tauri-only; null outside the native runtime) ──────
 import {
@@ -59,7 +57,6 @@ import { filterNostrFeed } from "./lib/feedFilter";
 import {
   toUnifiedFromNostr,
   toUnifiedFromBluesky,
-  toUnifiedFromNostrArticle,
   toUnifiedFromWorldFeed,
   extractJournalTopics,
   matchesTopic,
@@ -1668,8 +1665,8 @@ function App() {
   // (video now lives in the Reads ranked stream via Bluesky cards).
   const [reelsPosts, setReelsPosts] = useState<BlueskyPublicPost[]>([]);
   const [reelsLoading, setReelsLoading] = useState(false);
-  // Reads tab (long-form: Nostr NIP-23 articles + backend world-feed catalog).
-  const [readsArticles, setReadsArticles] = useState<NostrEvent[]>([]);
+  // Reads tab: loading/error state for the social arm (Nostr notes + Bluesky).
+  // Article content (RSS/HN/YT/Nostr articles) arrives via the backend world feed.
   const [readsLoading, setReadsLoading] = useState(false);
   const [readsError, setReadsError] = useState("");
   // Reads is a single minimalistic journal-ranked stream ("For You"); the
@@ -7164,29 +7161,23 @@ Rules:
   }, [nostrFeedNotes, blueskyPublicPosts]);
 
   /**
-   * Reads tab unified stream: merges Nostr articles + RSS items + Hacker News +
-   * YouTube + gated social into one `UnifiedItem[]`, then ranks ("For You") or
-   * sorts chronologically ("Latest"). Every source fights for a ranked slot;
-   * social already passed its reputation gate above before joining the stream.
+   * Reads tab unified stream: merges backend world-feed items (catalog content:
+   * RSS, HN, YouTube, Nostr articles + notes, Bluesky) with live social posts
+   * (Nostr notes + Bluesky search, gated by web-of-trust) into one stream, then
+   * ranks by the journal lens. One pipeline, one ranker.
    */
   const rankedReads = useMemo<RankedRead[]>(() => {
     const unified: UnifiedItem[] = [];
-    for (const a of readsArticles) {
-      unified.push(toUnifiedFromNostrArticle(a));
-    }
     // Social posts (gated above) join the stream and rank by the same lens.
     for (const s of socialUnifiedForReads) unified.push(s);
-    // Backend world-feed items (/api/feed/personalized) — catalog-sourced RSS
-    // blogs, HN, YouTube channels, and Bluesky — flow through the same journal-
-    // driven ranker. This is the single pipeline: catalog content + live social
-    // are ranked by one lens (the journal is the lens).
+    // Backend world-feed items (/api/feed/personalized) — all catalog content
+    // (RSS blogs, HN, YouTube, Nostr articles + notes, Bluesky) — flow through
+    // the same journal-driven ranker. This is the single pipeline.
     for (const w of blueskyFeedItems) {
       unified.push(toUnifiedFromWorldFeed(w));
     }
-    // The Reads feed is a single journal-ranked stream ("For You"); the
-    // chronological "Latest" mode was removed when the filter pills were cut.
     return rankReads(unified, journalTopics, negativeTopics);
-  }, [readsArticles, socialUnifiedForReads, blueskyFeedItems, journalTopics, negativeTopics]);
+  }, [socialUnifiedForReads, blueskyFeedItems, journalTopics, negativeTopics]);
 
   // Persist the ranked Reads stream so the next open paints instantly from
   // cache (local-first). Only the UnifiedItem[] is cached; ranking re-runs on
@@ -7389,19 +7380,13 @@ Rules:
     setReadsLoading(true);
     setReadsError("");
     try {
-      // The Reads stream is now a single pipeline: Nostr long-form articles
-      // are fetched frontend-direct (real-time social), while catalog content
-      // (RSS blogs, HN, YouTube channels, Bluesky) arrives via the backend
-      // world feed and is merged in the rankedReads memo. Both pass through
-      // the same journal-driven ranker.
-      const articles = await fetchLongFormArticles({ limit: 20 }).then((arts) =>
-        // Language-filter the articles (drop non-Latin titles/bodies).
-        arts.filter((a) => {
-          const title = (a.tags || []).find((t) => t[0] === "title")?.[1] || "";
-          return filterNostrFeed([{ id: a.id, pubkey: a.pubkey, content: title + " " + a.content.slice(0, 200), createdAt: a.created_at, tags: a.tags || [] }], { maxPerPubkey: 99 }).length > 0;
-        }),
-      );
-      setReadsArticles(articles);
+      // All article content (RSS, HN, YouTube, Nostr articles + notes) now
+      // arrives via the backend world feed (polled independently by
+      // startFeedPoll). The only frontend-direct Reads content is live social
+      // posts (Nostr notes + Bluesky search), which feed the web-of-trust gate.
+      // This loader refreshes the social arm; the backend arm refreshes on its
+      // own schedule and merges in the rankedReads memo.
+      await loadSocialFeed();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setReadsError(`Couldn't load reads: ${msg.slice(0, 120)}`);
@@ -8739,10 +8724,15 @@ Rules:
 
   // Auto-load Reads (Nostr articles) when the Reads tab is shown and empty.
   // Catalog content (RSS/HN/YouTube/Bluesky) arrives via the backend world feed,
-  // which is polled independently — this effect only covers the frontend-direct
-  // Nostr articles that haven't moved to the backend.
+  // Auto-load the Reads social arm (Nostr notes + Bluesky search) when the
+  // Reads tab opens and the social stream is empty. Catalog content (articles,
+  // RSS, HN, YT) arrives via the backend world feed, polled independently.
   useEffect(() => {
-    if (mobileTab === "reads" && readsArticles.length === 0 && !readsLoading) {
+    if (
+      mobileTab === "reads" &&
+      socialUnifiedForReads.length === 0 &&
+      !readsLoading
+    ) {
       void loadReadsFeed();
     }
   }, [mobileTab]);
