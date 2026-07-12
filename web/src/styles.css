@@ -5008,15 +5008,14 @@ button.local-ai-preset {
   background: var(--surface-3, color-mix(in srgb, var(--text) 6%, transparent));
 }
 .reads-card-action.liked {
-  color: #ff3b5c;
-  border-color: color-mix(in srgb, #ff3b5c 35%, transparent);
-  background: color-mix(in srgb, #ff3b5c 10%, transparent);
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 .reads-card-action.disliked {
-  color: var(--muted);
-  border-color: color-mix(in srgb, var(--muted) 30%, transparent);
-  background: color-mix(in srgb, var(--muted) 12%, transparent);
-  opacity: 0.75;
+  color: var(--accent-2);
+  border-color: color-mix(in srgb, var(--accent-2) 35%, transparent);
+  background: color-mix(in srgb, var(--accent-2) 10%, transparent);
 }
 
 /* ── New-posts pill (#4) — Twitter/Bluesky "N new posts" banner ──────────── */

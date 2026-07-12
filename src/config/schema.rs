@@ -2289,7 +2289,8 @@ pub struct ReliabilityConfig {
     /// Max backoff for channel/daemon restarts.
     #[serde(default = "default_channel_backoff_max_secs")]
     pub channel_max_backoff_secs: u64,
-    /// Scheduler polling cadence in seconds.
+    /// Scheduler polling cadence in seconds (CLI cron path only; no
+    /// background loop consumes this in the running gateway/daemon today).
     #[serde(default = "default_scheduler_poll_secs")]
     pub scheduler_poll_secs: u64,
     /// Max retries for cron job execution attempts.
@@ -2340,6 +2341,12 @@ impl Default for ReliabilityConfig {
 // ── Scheduler ────────────────────────────────────────────────────
 
 /// Scheduler configuration for periodic task execution (`[scheduler]` section).
+///
+/// NOTE: in this fork the scheduler has **no always-running background loop** —
+/// neither `src/daemon/` nor `src/main.rs` spawns one. Cron is invoked as a CLI
+/// subcommand only (`slowclaw cron list/run`). These keys are retained as public
+/// API for the CLI path and for forward compatibility; setting them does not start
+/// a periodic loop in the running gateway/daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SchedulerConfig {
     /// Enable the built-in scheduler loop.

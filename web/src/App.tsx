@@ -10337,7 +10337,13 @@ Rules:
                   // Flat ranked stream: every item earned its slot through the
                   // journal lens. Social cards render with full affordances
                   // (follow / like / reply); articles render as compact cards.
-                  const visible = displayReads.slice(0, readsVisibleCount);
+                  // Disliked cards are hidden from the list immediately — dislike
+                  // is persisted in `dislikedIds`, so the filter is reactive and
+                  // the card stays hidden on reload (un-dislike brings it back).
+                  const dislikedSet = new Set(dislikedIds);
+                  const visible = displayReads
+                    .filter(({ item }) => !dislikedSet.has(item.id))
+                    .slice(0, readsVisibleCount);
                   return (
                     <div className="reads-list">
                       {visible.map(({ item, readMinutes, sourceLabel }) => {
