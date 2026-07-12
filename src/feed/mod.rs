@@ -51,7 +51,10 @@ const BLUESKY_FEED_SOURCE_MATCH_THRESHOLD: f32 = 0.55;
 const BLUESKY_PERSONALIZED_PAGE_LIMIT_PER_SOURCE: usize = 4;
 const BLUESKY_PERSONALIZED_PAGE_SIZE: usize = 20;
 const RSS_SOURCE_MATCH_THRESHOLD: f32 = 0.28;
-const RSS_SELECTED_SOURCE_LIMIT: usize = 10;
+/// How many catalog sources are fetched per refresh, selected by keyword
+/// relevance to the user's journal interests. Fetch is sequential (8s timeout
+/// each), so worst case ≈ limit × 8s — kept background-only (not user-blocking).
+const RSS_SELECTED_SOURCE_LIMIT: usize = 20;
 const RSS_RECENT_SCAN_LIMIT: usize = 256;
 const RSS_CANDIDATE_PER_SOURCE_LIMIT: usize = 6;
 /// Max age of a per-source RSS/Atom fetch before it is re-pulled.
@@ -1542,6 +1545,7 @@ pub async fn create_dummy_world_feed_interest(
             first_seen_at: now.clone(),
             last_seen_at: now,
             source_count: 1,
+            polarity: 0,
         },
     )?;
     mark_world_feed_dirty(&config.workspace_dir)?;
@@ -1719,6 +1723,7 @@ async fn rebuild_interest_profile(config: &Config) -> Result<FeedProfile> {
                     first_seen_at,
                     last_seen_at: now.clone(),
                     source_count,
+                    polarity: 0,
                 },
             )?;
             active_keywords.insert(term, saved);
@@ -3176,6 +3181,16 @@ fn infer_default_feed_source_metadata(domain: &str, title: &str) -> (String, Str
     if combined.contains("farnam") || combined.contains("fs.blog") {
         topics.extend(["mental-models", "decision-making", "philosophy", "psychology"]);
     }
+    // Hacker News: front-page aggregation spanning startups, tech, science.
+    if combined.contains("ycombinator") || combined.contains("hacker news") {
+        topics.extend([
+            "startup", "technology", "news", "engineering", "founder", "ai", "science",
+        ]);
+    }
+    // YouTube channel feeds: video-format education/media across tech + science.
+    if combined.contains("youtube.com") {
+        topics.extend(["video", "technology", "education", "media", "science"]);
+    }
 
     // Most tech blogs cover general software/technology even if not keyword-matched.
     // Add broad coverage topics so semantic matching has more to work with.
@@ -4018,6 +4033,19 @@ fn parse_feed_entries(xml: &str, base_url: &str) -> Vec<ParsedFeedEntry> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn catalog_domains_are_unique() {
+        // feed_web_sources PK is `domain` — collisions silently drop entries.
+        let mut seen = std::collections::HashSet::new();
+        for source in crate::gateway::feed_web_sources::DEFAULT_FEED_WEB_SOURCES {
+            assert!(
+                seen.insert(source.domain),
+                "duplicate domain in DEFAULT_FEED_WEB_SOURCES: {}",
+                source.domain
+            );
+        }
+    }
 
     struct MockEmbedder;
 
