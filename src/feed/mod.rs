@@ -4262,6 +4262,69 @@ mod tests {
         );
     }
 
+    /// Verify that a kind-30023 article event, converted the way
+    /// NostrFeedSource::fetch_candidates does it, produces a PersonalizedFeedItem
+    /// with the fields the frontend needs (title from tags, image, habla.news
+    /// link, web_preview). This is the contract that determines whether cached
+    /// Nostr articles render correctly in the Reads tab via toUnifiedFromWorldFeed.
+    #[test]
+    fn nostr_article_candidate_carries_nip23_fields_to_personalized_item() {
+        let event = make_nostr_event(
+            30023,
+            "Article body markdown that is long enough to pass the rank_text guard.",
+            &[
+                &["title", "On Local-First Computing"],
+                &["summary", "Why your data should live on your device"],
+                &["image", "https://example.com/cover.png"],
+                &["published_at", "2026-01-15T10:00:00Z"],
+                &["d", "local-first-essay"],
+            ],
+        );
+
+        // Replicate the conversion logic from fetch_candidates for kind 30023.
+        let permalink = nostr_article_permalink(&event);
+        let title = nostr_tag_value(&event, "title")
+            .unwrap_or_else(|| derive_interest_label("Nostr article", &event.content));
+        let description = nostr_tag_value(&event, "summary")
+            .unwrap_or_else(|| truncate_with_ellipsis(event.content.trim(), 220));
+        let image_url = nostr_tag_value(&event, "image");
+
+        // The PersonalizedFeedItem that would be built and cached:
+        let item = PersonalizedFeedItem {
+            source_type: FeedProtocol::Nostr.source_type().to_string(),
+            feed_item: serde_json::json!({
+                "url": permalink.clone(),
+                "title": title.clone(),
+                "description": description.clone(),
+            }),
+            web_preview: Some(WebFeedPreview {
+                url: permalink.clone(),
+                title: title.clone(),
+                description: description.clone(),
+                content_text: event.content.clone(),
+                image_url: image_url.clone(),
+                domain: "relay.example.com".to_string(),
+                provider: "Nostr".to_string(),
+                provider_snippet: None,
+                discovered_at: "2026-01-15T10:00:00Z".to_string(),
+            }),
+            feed_source: None,
+            score: None,
+            matched_interest_label: None,
+            matched_interest_score: None,
+            passed_threshold: false,
+        };
+
+        // Assertions: the fields the frontend bridge (toUnifiedFromWorldFeed)
+        // reads must be present and correct.
+        let preview = item.web_preview.as_ref().expect("web_preview");
+        assert_eq!(preview.title, "On Local-First Computing");
+        assert_eq!(preview.description, "Why your data should live on your device");
+        assert_eq!(preview.image_url.as_deref(), Some("https://example.com/cover.png"));
+        assert!(preview.url.starts_with("https://habla.news/a/naddr1"));
+        assert_eq!(item.source_type, "web");
+    }
+
     struct MockEmbedder;
 
     #[async_trait]
