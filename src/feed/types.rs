@@ -104,6 +104,10 @@ pub struct FeedProfile {
     pub status: String,
     pub stats: InterestProfileStats,
     pub interests: Vec<InterestVector>,
+    /// Negative steering terms (disliked-card keywords, polarity = 1). The
+    /// ranker applies a subtractive penalty for matches — down-rank, never
+    /// hide — mirroring the client-side `journalTopicPenalty` policy.
+    pub negative_interests: Vec<InterestVector>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

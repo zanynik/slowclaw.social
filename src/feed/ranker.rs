@@ -19,6 +19,12 @@ const STAGE2_ITEM_WEIGHT: f32 = 0.72;
 const STAGE1_KEYWORD_LIMIT: usize = 15;
 const KEYWORD_PROFILE_FRESHNESS_BONUS_MAX: f32 = 0.18;
 const KEYWORD_PROFILE_SOURCE_BONUS: f32 = 0.15;
+// Negative-lens penalty (mirrors the TS `journalTopicPenalty` in
+// readsRanking.ts): down-rank disliked-topic matches, never hide. A single
+// dislike can't outweigh a strong positive match.
+const NEG_MATCH_TOP: f32 = 0.7;
+const NEG_MATCH_EACH: f32 = 0.25;
+const NEG_MATCH_CAP: f32 = 0.9;
 
 #[derive(Debug, Clone)]
 pub struct RankedCandidate {
@@ -64,13 +70,16 @@ impl FeedRanker {
         }
 
         let embeddings = embed_text_batch(embedder, &texts).await?;
+        let negatives = &profile.negative_interests;
         let mut ranked = Vec::new();
         let mut has_strong_match = false;
         for (candidate, embedding) in candidates_to_embed.into_iter().zip(embeddings.into_iter()) {
             let (weighted_score, similarity, matched_label) =
                 best_interest_match(&embedding, &profile.interests);
-            let final_score =
-                STAGE1_SOURCE_WEIGHT * candidate.stage1_score + STAGE2_ITEM_WEIGHT * weighted_score;
+            let penalty = negative_keyword_penalty(&candidate.rank_text, negatives);
+            let final_score = STAGE1_SOURCE_WEIGHT * candidate.stage1_score
+                + STAGE2_ITEM_WEIGHT * weighted_score
+                - penalty;
             let mut item = candidate.item;
             item.score = Some(final_score);
             item.matched_interest_label = matched_label;
@@ -116,13 +125,16 @@ pub fn rank_candidates_stage2(
     limit: usize,
 ) -> Vec<PersonalizedFeedItem> {
     let keyword_weights = weighted_interest_keywords(profile);
+    let negatives = &profile.negative_interests;
     let mut ranked = Vec::new();
     for candidate in candidates {
         let (keyword_score, matched_keyword) =
             keyword_weight_sum(&candidate.rank_text, &keyword_weights);
         let freshness_bonus = candidate_freshness_bonus(&candidate.item);
-        let final_score =
-            keyword_score + freshness_bonus + (candidate.stage1_score * KEYWORD_PROFILE_SOURCE_BONUS);
+        let penalty = negative_keyword_penalty(&candidate.rank_text, negatives);
+        let final_score = keyword_score + freshness_bonus
+            + (candidate.stage1_score * KEYWORD_PROFILE_SOURCE_BONUS)
+            - penalty;
         let mut item = candidate.item;
         item.score = Some(final_score);
         item.matched_interest_label = matched_keyword;
@@ -250,6 +262,38 @@ pub fn keyword_weight_sum(text: &str, keyword_weights: &[(String, f32)]) -> (f32
         }
     }
     (matched_weight, best_match.map(|(keyword, _)| keyword))
+}
+
+/// Negative-lens penalty for disliked keywords. Returns a positive penalty
+/// magnitude to subtract from a candidate's score (0 when no negatives match).
+/// Matches the TS `journalTopicPenalty` policy: strongest match contributes
+/// most, additional matches stack, capped — so the item sinks but stays.
+pub fn negative_keyword_penalty(text: &str, negatives: &[InterestVector]) -> f32 {
+    if negatives.is_empty() {
+        return 0.0;
+    }
+    let lower = text.to_ascii_lowercase();
+    let stemmed_tokens: Vec<String> = tokenize_and_stem(&lower);
+    let mut penalty = 0.0_f32;
+    let mut first = true;
+    for interest in negatives {
+        let keyword = interest
+            .keywords
+            .first()
+            .cloned()
+            .unwrap_or_else(|| interest.label.clone());
+        let matched = lower.contains(keyword.as_str())
+            || stemmed_tokens.iter().any(|token| token == keyword.as_str());
+        if !matched {
+            continue;
+        }
+        penalty += if first { NEG_MATCH_TOP } else { NEG_MATCH_EACH };
+        first = false;
+        if penalty >= NEG_MATCH_CAP {
+            return NEG_MATCH_CAP;
+        }
+    }
+    penalty
 }
 
 pub fn candidate_freshness_bonus(item: &PersonalizedFeedItem) -> f32 {
@@ -499,5 +543,62 @@ pub fn first_matched_keyword<'a>(text: &str, keywords: &'a [String]) -> Option<&
                 || stemmed_tokens.iter().any(|token| token == keyword.as_str())
         })
         .map(|keyword| keyword.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feed::types::InterestVector;
+
+    fn neg(label: &str) -> InterestVector {
+        InterestVector {
+            id: String::new(),
+            label: label.into(),
+            embedding: Vec::new(),
+            health_score: 1.0,
+            source_path: String::new(),
+            keywords: vec![label.into()],
+        }
+    }
+
+    #[test]
+    fn negative_keyword_penalty_zero_when_no_negatives_or_no_match() {
+        assert_eq!(negative_keyword_penalty("a post about rust", &[]), 0.0);
+        assert_eq!(
+            negative_keyword_penalty(
+                "a post about rust",
+                &[neg("celebrity gossip"), neg("sports")]
+            ),
+            0.0
+        );
+    }
+
+    #[test]
+    fn negative_keyword_penalty_stacked_and_capped() {
+        // Single match → top penalty (0.7).
+        let p1 = negative_keyword_penalty("celebrity gossip drama", &[neg("celebrity gossip")]);
+        assert!((p1 - 0.7).abs() < 1e-6);
+
+        // Two matches → top + each (0.7 + 0.25 = 0.95) → capped at 0.9.
+        let p2 = negative_keyword_penalty(
+            "celebrity gossip and sports news",
+            &[neg("celebrity gossip"), neg("sports")],
+        );
+        assert!((p2 - 0.9).abs() < 1e-6);
+
+        // Three matches still capped at 0.9 (down-rank, never hide).
+        let p3 = negative_keyword_penalty(
+            "celebrity gossip, sports, and reality tv",
+            &[neg("celebrity gossip"), neg("sports"), neg("reality tv")],
+        );
+        assert!((p3 - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn negative_keyword_penalty_case_insensitive_substring() {
+        // Uppercase in the candidate text still matches the lowercase keyword.
+        let p = negative_keyword_penalty("CELEBRITY GOSSIP overload", &[neg("celebrity gossip")]);
+        assert!((p - 0.7).abs() < 1e-6);
+    }
 }
 

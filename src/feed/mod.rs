@@ -84,6 +84,13 @@ const KEYWORD_PROFILE_MIN_WEIGHT: f64 = 0.12;
 const KEYWORD_PROFILE_MAX_WEIGHT: f64 = 4.5;
 const KEYWORD_PROFILE_SOURCE_BONUS: f32 = 0.15;
 const KEYWORD_PROFILE_FRESHNESS_BONUS_MAX: f32 = 0.18;
+// Editable lens (mirrors the TS interestProfile.ts discrete states): mute drops
+// a term from the profile entirely, normal leaves the derived weight, boost
+// doubles it. Manual interests (not yet in journals) get a baseline weight
+// comparable to a strong journal-derived topic.
+const LENS_MULTIPLIER_MUTE: f64 = 0.0;
+const LENS_MULTIPLIER_BOOST: f64 = 2.0;
+const LENS_MANUAL_INTEREST_WEIGHT: f64 = 3.0;
 
 pub mod types;
 pub mod ranker;
@@ -1751,16 +1758,68 @@ async fn rebuild_interest_profile(config: &Config) -> Result<FeedProfile> {
         KEYWORD_PROFILE_MIN_WEIGHT,
         KEYWORD_PROFILE_LIMIT,
     )?;
-    let active_keywords = local_store::list_feed_keywords(workspace_dir)?;
-    stats.interest_count = active_keywords.len();
-    Ok(FeedProfile {
-        status: if active_keywords.is_empty() {
-            "noInterests".to_string()
-        } else {
-            "ready".to_string()
-        },
-        stats,
-        interests: active_keywords
+
+    // Read the editable lens (overrides + manual interests) from SQLite so the
+    // Rust world-feed ranker honors the same steering the TS ranker does, and
+    // survives an iOS app reinstall (localStorage does not).
+    let lens_overrides: HashMap<String, f64> = local_store::list_feed_lens_overrides(workspace_dir)?
+        .into_iter()
+        .map(|record| (record.term, record.multiplier))
+        .collect();
+    let manual_interests = local_store::list_feed_manual_interests(workspace_dir)?;
+    let manual_terms: HashSet<String> = manual_interests
+        .iter()
+        .map(|record| record.term.clone())
+        .collect();
+
+    // Build the effective positive-interest set: derived keywords (polarity 0)
+    // with lens multipliers applied (mute → dropped, boost → ×2), plus manual
+    // interests the journals haven't surfaced yet.
+    let mut interests: Vec<InterestVector> = Vec::new();
+    for keyword in local_store::list_feed_keywords_by_polarity(workspace_dir, 0)? {
+        let multiplier = lens_overrides
+            .get(&keyword.term)
+            .copied()
+            .unwrap_or(1.0);
+        if (multiplier - LENS_MULTIPLIER_MUTE).abs() < f64::EPSILON {
+            continue; // muted — drop from the lens entirely
+        }
+        // Clamp non-mute multipliers to the boost ceiling so a stray large value
+        // can't dominate. Normal (1.0) and boost (2.0) are the UI states.
+        let effective_mult = multiplier.clamp(0.0, LENS_MULTIPLIER_BOOST);
+        interests.push(InterestVector {
+            id: keyword.id,
+            label: keyword.term.clone(),
+            embedding: Vec::new(),
+            health_score: (keyword.weight * effective_mult) as f32,
+            source_path: String::new(),
+            keywords: vec![keyword.term],
+        });
+    }
+    for term in &manual_terms {
+        // Skip manual interests already covered by a derived keyword above.
+        if interests.iter().any(|iv| iv.label.eq_ignore_ascii_case(term)) {
+            continue;
+        }
+        let multiplier = lens_overrides.get(term).copied().unwrap_or(1.0);
+        if (multiplier - LENS_MULTIPLIER_MUTE).abs() < f64::EPSILON {
+            continue;
+        }
+        let effective_mult = multiplier.clamp(0.0, LENS_MULTIPLIER_BOOST);
+        interests.push(InterestVector {
+            id: format!("manual_{}", term),
+            label: term.clone(),
+            embedding: Vec::new(),
+            health_score: (LENS_MANUAL_INTEREST_WEIGHT * effective_mult) as f32,
+            source_path: String::new(),
+            keywords: vec![term.clone()],
+        });
+    }
+
+    // Negative steering set: disliked-card keywords (polarity 1). These persist
+    // (no decay) and the ranker down-ranks matches — never hides them.
+    let negative_interests: Vec<InterestVector> =
+        local_store::list_feed_keywords_by_polarity(workspace_dir, 1)?
             .into_iter()
             .map(|keyword| InterestVector {
                 id: keyword.id,
@@ -1770,7 +1829,18 @@ async fn rebuild_interest_profile(config: &Config) -> Result<FeedProfile> {
                 source_path: String::new(),
                 keywords: vec![keyword.term],
             })
-            .collect(),
+            .collect();
+
+    stats.interest_count = interests.len();
+    Ok(FeedProfile {
+        status: if interests.is_empty() {
+            "noInterests".to_string()
+        } else {
+            "ready".to_string()
+        },
+        stats,
+        interests,
+        negative_interests,
     })
 }
 
@@ -4091,6 +4161,7 @@ mod tests {
                 source_path: "posts/rust-systems.md".into(),
                 keywords: vec!["rust".into(), "systems".into()],
             }],
+            negative_interests: Vec::new(),
         }
     }
 
@@ -4109,6 +4180,7 @@ mod tests {
                 source_path: "posts/rust-systems.md".into(),
                 keywords: vec!["rust".into(), "systems".into()],
             }],
+            negative_interests: Vec::new(),
         }
     }
 
