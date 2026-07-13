@@ -42,6 +42,35 @@ on-device audio transcription feature in the SlowClaw iOS app.
   already registered in `tauri::generate_handler!`, so it is invokable under
   the existing `core:default` capability without additional permissions.
 
+## Dual-engine design (iOS 26 SpeechAnalyzer + legacy SFSpeechRecognizer)
+
+As of iOS 26, the bridge runs **two** on-device engines and picks one at runtime
+by OS version. Both share the same C-ABI contract, so the Rust core and the
+frontend are unaware of which engine ran.
+
+| iOS version | Engine | Notes |
+| --- | --- | --- |
+| **iOS 26+** | `SpeechAnalyzer` + `SpeechTranscriber` (WWDC25 Session 277) | Modern Swift concurrency; newer Apple on-device model; no legacy ~1-minute segment quirks; better long-form/distant audio. Chosen first. |
+| **iOS < 26** | `SFSpeechRecognizer` (`requiresOnDeviceRecognition = true`) | Unchanged legacy path. |
+
+Behavior of the iOS 26+ branch:
+
+- **Authorization** reuses the shared Speech-framework authorization
+  (`SFSpeechRecognizer.requestAuthorization`). The same
+  `NSSpeechRecognitionUsageDescription` Info.plist key applies; no new prompt.
+- **On-device model** is requested via `AssetInventory.assetInstallationRequest`
+  and may **download on first use** for a locale (subsequent runs are fully
+  local). Check Console.app (`subsystem: com.slowclaw.app`, `category:
+  SpeechAnalyzer`) for the "Downloading SpeechAnalyzer on-device model…" log.
+- **Fallback is automatic and non-fatal.** If the iOS 26 path cannot start,
+  cannot get a compatible audio format, cannot install/reserve the model, or
+  times out, it returns without writing a hard error and the legacy
+  `SFSpeechRecognizer` path runs next. The only cases that **do not** fall back
+  are hard failures the user must resolve in Settings: permission denied,
+  restricted, or not-determined authorization.
+- **No deployment-target bump.** The iOS 26 code is gated with
+  `if #available(iOS 26.0, *)`, so the app still supports iOS 16+.
+
 ## One-time Mac setup (local builds only)
 
 TestFlight builds do NOT require any manual Mac step: the
@@ -189,6 +218,31 @@ npm run tauri -- ios dev --open --host
 
 Then record an audio journal entry in the app, tap **Transcribe**, and
 confirm the transcript appears without a network round-trip.
+
+### Verifying the iOS 26 SpeechAnalyzer path
+
+On an **iOS 26** simulator or device:
+
+1. `cd web && npm run tauri -- ios dev --open --host` (or
+   `npm run tauri:ios:dev`).
+2. Record an audio journal entry and tap **Transcribe**.
+3. Confirm the transcript appears. On the **first** transcription for a locale,
+   expect a short delay while the on-device model downloads — watch Console.app
+   (filter `subsystem == com.slowclaw.app`, `category == SpeechAnalyzer`) for
+   the "Downloading SpeechAnalyzer on-device model…" log line.
+4. Record a **longer** entry (well over 1 minute) and confirm the *full*
+   transcript appears (not just the last segment). This is the regression that
+   the modern API removes vs. the legacy segment handling.
+
+On an **iOS < 26** simulator/device, repeat steps 1–2 and confirm the legacy
+`SFSpeechRecognizer` path still produces a transcript (the `if #available`
+branch is skipped entirely).
+
+To verify the **automatic fallback**, you can force the iOS 26 path to fail
+softly (e.g. by testing a locale with no available model before it is
+downloaded) and confirm a transcript still appears via the legacy engine.
+Hard failures (deny Speech Recognition in Settings) should surface the
+permission error and **not** retry via the legacy path.
 
 ## Rollback
 

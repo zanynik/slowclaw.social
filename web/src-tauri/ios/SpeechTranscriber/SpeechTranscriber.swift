@@ -2,11 +2,19 @@
 // SlowClaw iOS app.
 //
 // Exposes a C-callable function (`slowclaw_transcribe_audio`) that the Rust
-// core in `web/src-tauri/src/transcription.rs` calls via the C ABI. The
-// implementation uses Apple's SFSpeechRecognizer with
-// `requiresOnDeviceRecognition = true`, so audio never leaves the device.
+// core in `web/src-tauri/src/transcription.rs` calls via the C ABI. All
+// recognition is on-device; audio never leaves the device.
 //
-// Threading: this function BLOCKS the calling thread. It is intended to be
+// Two engines are wired, chosen at runtime by iOS version:
+//   - iOS 26+:  the modern `SpeechAnalyzer` + `SpeechTranscriber` API
+//               (WWDC25 Session 277). Faster, more accurate, no legacy
+//               ~1-minute segment quirks, better long-form/distant audio.
+//               On a non-fatal failure it falls through to the legacy path
+//               so a missing model never leaves the user without a transcript.
+//   - iOS < 26: the legacy `SFSpeechRecognizer` with
+//               `requiresOnDeviceRecognition = true`.
+//
+// Threading: the entry point BLOCKS the calling thread. It is intended to be
 // called from `tauri::async_runtime::spawn_blocking` (see `lib.rs`), which
 // matches the "iOS API uses a sync wait" comment in the Tauri command
 // registration. Authorization and the recognition task are bridged from
@@ -25,6 +33,7 @@
 import Foundation
 import Speech
 import AVFoundation
+import os
 
 @_cdecl("slowclaw_transcribe_audio")
 public func slowclaw_transcribe_audio(
@@ -79,6 +88,34 @@ public func slowclaw_transcribe_audio(
     guard FileManager.default.fileExists(atPath: fileURL.path) else {
         writeError("audio file does not exist: \(fileURL.path)")
         return -1
+    }
+
+    // iOS 26+ path: prefer the modern SpeechAnalyzer API (WWDC25). It removes
+    // the legacy ~1-minute segment quirks, uses a newer on-device Apple model,
+    // and is faster/more accurate for long-form and distant audio. On any
+    // non-fatal failure we write a diagnostic and fall through to the legacy
+    // SFSpeechRecognizer path below so iOS 26 users still get a transcript if
+    // the new model isn't downloaded/available. Earlier iOS versions skip this
+    // branch entirely and use SFSpeechRecognizer as before.
+    if #available(iOS 26.0, *) {
+        let wroteError = ErrorWrittenFlag()
+        let analyzerStatus = slowclaw_transcribe_with_speech_analyzer(
+            fileURL,
+            outText, outTextLen,
+            outError, outErrorLen,
+            wroteError
+        )
+        if analyzerStatus >= 0 {
+            return analyzerStatus // success: transcript written to outText
+        }
+        // Non-fatal fallback: only proceed to the legacy path if the new path
+        // did NOT already write a hard error (e.g. permission denied). A hard
+        // error means the user must act in Settings; retrying via the legacy
+        // path would just produce a duplicate prompt or a confusing second
+        // failure.
+        if wroteError.value {
+            return -1
+        }
     }
 
     // 2. Request speech recognition authorization synchronously.
@@ -220,4 +257,355 @@ public func slowclaw_transcribe_audio(
     }
 
     return writeText(transcript)
+}
+
+// MARK: - iOS 26 SpeechAnalyzer path
+
+/// Box so the caller can tell whether a hard error was already written into
+/// `outError` (and thus the legacy fallback should not run).
+final class ErrorWrittenFlag {
+    var value = false
+}
+
+/// Transcribes `fileURL` using the iOS 26 `SpeechAnalyzer` + `SpeechTranscriber`
+/// API (WWDC25 Session 277). Same return contract as the entry point:
+///   >= 0 : bytes written to `outText`
+///   -1   : failure, with a diagnostic in `outError` when `wroteError` is set.
+///
+/// On a NON-fatal failure (engine unavailable, model missing), this returns -1
+/// WITHOUT writing an error and WITHOUT setting `wroteError`, so the caller can
+/// fall back to the legacy `SFSpeechRecognizer` path. On a fatal failure
+/// (permission denied), it writes the error and sets `wroteError = true`.
+///
+/// The async work runs on a detached `Task`; the C entry point blocks this
+/// thread on a `DispatchSemaphore` (it is always called from
+/// `tauri::async_runtime::spawn_blocking`). Pointer writes happen here, on the
+/// calling thread, after the task completes — never from the async context.
+@available(iOS 26.0, *)
+func slowclaw_transcribe_with_speech_analyzer(
+    _ fileURL: URL,
+    _ outText: UnsafeMutablePointer<CChar>,
+    _ outTextLen: Int32,
+    _ outError: UnsafeMutablePointer<CChar>,
+    _ outErrorLen: Int32,
+    _ wroteError: ErrorWrittenFlag
+) -> Int32 {
+    let logger = OSLog(subsystem: "com.slowclaw.app", category: "SpeechAnalyzer")
+
+    // Capture out-pointers in a closure that only the CALLING thread runs, and
+    // only after the async work is done. This keeps all C-pointer writes off the
+    // concurrent async executor (strict aliasing / Sendable safety).
+    func finalize(with result: Result<String, TranscribeFailure>) -> Int32 {
+        switch result {
+        case .success(let transcript):
+            // If the transcript didn't fit, surface a truncation note in the
+            // error buffer (mirrors the legacy writeText overflow behavior).
+            let byteLen = Int32((transcript + "\0").utf8.count)
+            if byteLen > outTextLen {
+                writeCString(
+                    "transcript exceeded internal buffer (\(outTextLen) bytes)",
+                    into: outError,
+                    capacity: outErrorLen
+                )
+            }
+            return writeCString(transcript, into: outText, capacity: outTextLen)
+        case .failure(let failure):
+            if failure.isHard {
+                wroteError.value = true
+                writeCString(
+                    failure.message,
+                    into: outError,
+                    capacity: outErrorLen
+                )
+            }
+            return -1
+        }
+    }
+
+    // Bridge async → sync with the same 600s ultimate safety net the legacy
+    // path uses, so a misbehaving recognizer can never wedge the command thread.
+    let done = DispatchSemaphore(value: 0)
+    var outcome: Result<String, TranscribeFailure> = .failure(
+        TranscribeFailure(message: "SpeechAnalyzer did not complete.", isHard: false)
+    )
+
+    let task = Task.detached(priority: .userInitiated) {
+        let result = transcribeFileWithSpeechAnalyzer(fileURL: fileURL, logger: logger)
+        outcome = result
+        done.signal()
+    }
+
+    let waitResult = done.wait(timeout: .now() + .seconds(600))
+    if waitResult == .timedOut {
+        task.cancel()
+        // Soft-fail so the legacy path gets a chance to produce a transcript.
+        return finalize(with: .failure(
+            TranscribeFailure(message: "SpeechAnalyzer timed out after 600s.", isHard: false)
+        ))
+    }
+    return finalize(with: outcome)
+}
+
+/// Distinguishes failures that should abort (hard) from those that should fall
+/// back to the legacy path (soft). Permission denial is hard; engine/model/
+/// decode availability issues are soft.
+struct TranscribeFailure {
+    let message: String
+    let isHard: Bool
+}
+
+/// Reference type so a `Task` can write a thrown error out for the caller to
+/// inspect after the task completes.
+final class ErrorBox {
+    var error: Error?
+}
+
+/// The actual iOS 26 transcription engine. Reads the audio file as PCM buffers,
+/// feeds them to a `SpeechAnalyzer` via an `AsyncStream`, accumulates finalized
+/// transcript segments, and finalizes the session. Mirrors the proven pattern
+/// from the Swift Scribe reference app, adapted for whole-file input.
+@available(iOS 26.0, *)
+private func transcribeFileWithSpeechAnalyzer(
+    fileURL: URL,
+    logger: OSLog
+) async -> Result<String, TranscribeFailure> {
+    // Authorization: SpeechAnalyzer reuses the shared Speech-framework
+    // authorization (see developer.apple.com/documentation/speech/asking-
+    // permission-to-use-speech-recognition). Request it once up front.
+    let authStatus = await withCheckedContinuation {
+        (continuation: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
+        SFSpeechRecognizer.requestAuthorization { status in
+            continuation.resume(returning: status)
+        }
+    }
+    switch authStatus {
+    case .authorized:
+        break
+    case .denied:
+        return .failure(TranscribeFailure(
+            message: "Speech recognition permission was denied. Enable it in Settings.",
+            isHard: true
+        ))
+    case .restricted:
+        return .failure(TranscribeFailure(
+            message: "Speech recognition is restricted on this device.",
+            isHard: true
+        ))
+    case .notDetermined:
+        return .failure(TranscribeFailure(
+            message: "Speech recognition permission was not determined.",
+            isHard: true
+        ))
+    @unknown default:
+        return .failure(TranscribeFailure(
+            message: "Speech recognition returned an unknown authorization status.",
+            isHard: true
+        ))
+    }
+
+    let localeIdentifier = Locale.preferredLanguages.first ?? "en-US"
+    let locale = Locale(identifier: localeIdentifier)
+
+    // Build the SpeechTranscriber module + the analyzer that owns it.
+    let transcriber = SpeechTranscriber(
+        locale: locale,
+        transcriptionOptions: [],
+        reportingOptions: [.volatileResults],
+        attributeOptions: [.audioTimeRange]
+    )
+
+    // Ensure the on-device model is available. First use for a locale may
+    // download it (later runs are fully local). Treat unavailable/unsupported
+    // as a SOFT failure so the legacy SFSpeechRecognizer path can try instead.
+    do {
+        if let installer = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+            os_log("Downloading SpeechAnalyzer on-device model…", log: logger)
+            try await installer.downloadAndInstall()
+        }
+        try await AssetInventory.reserve(locale: locale)
+    } catch {
+        return .failure(TranscribeFailure(
+            message: "SpeechAnalyzer model unavailable for \(locale.identifier): \(error.localizedDescription)",
+            isHard: false
+        ))
+    }
+
+    let analyzer = SpeechAnalyzer(modules: [transcriber])
+
+    guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+        return .failure(TranscribeFailure(
+            message: "SpeechAnalyzer reported no compatible audio format.",
+            isHard: false
+        ))
+    }
+
+    // Open the file and prepare conversion into the analyzer's expected format.
+    let audioFile: AVAudioFile
+    do {
+        audioFile = try AVAudioFile(forReading: fileURL)
+    } catch {
+        return .failure(TranscribeFailure(
+            message: "Could not open audio file: \(error.localizedDescription)",
+            isHard: false
+        ))
+    }
+
+    let converter = AVAudioConverter(from: audioFile.processingFormat, to: analyzerFormat)
+
+    // AsyncStream the converted PCM buffers into the analyzer.
+    let (inputStream, inputContinuation) = AsyncStream<AnalyzerInput>.makeStream()
+
+    // Accumulate finalized transcript segments on a single actor to avoid data
+    // races across the async result stream. Volatile (non-final) results are
+    // ignored — we only want the committed text, matching the legacy contract.
+    actor TranscriptAccumulator {
+        var parts: [String] = []
+        func append(_ text: String) { parts.append(text) }
+        func joined() -> String { parts.joined(separator: " ") }
+    }
+    let accumulator = TranscriptAccumulator()
+
+    // Capture any error thrown from the result stream so a mid-stream
+    // recognition failure surfaces as a real diagnostic rather than an
+    // empty-transcript failure.
+    let errorBox = ErrorBox()
+    let collectTask = Task {
+        do {
+            for try await result in transcriber.results {
+                if result.isFinal {
+                    await accumulator.append(String(result.text))
+                }
+            }
+        } catch {
+            errorBox.error = error
+        }
+    }
+
+    do {
+        try await analyzer.start(inputSequence: inputStream)
+    } catch {
+        inputContinuation.finish()
+        collectTask.cancel()
+        return .failure(TranscribeFailure(
+            message: "SpeechAnalyzer failed to start: \(error.localizedDescription)",
+            isHard: false
+        ))
+    }
+
+    // Read the whole file and pump converted buffers into the stream.
+    let readFrameCapacity = AVAudioFrameCount(audioFile.length)
+    guard readFrameCapacity > 0,
+          let readBuffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: readFrameCapacity)
+    else {
+        inputContinuation.finish()
+        return .failure(TranscribeFailure(
+            message: "Audio file appears empty or unreadable.",
+            isHard: false
+        ))
+    }
+
+    do {
+        try audioFile.read(into: readBuffer)
+    } catch {
+        inputContinuation.finish()
+        return .failure(TranscribeFailure(
+            message: "Failed reading audio samples: \(error.localizedDescription)",
+            isHard: false
+        ))
+    }
+
+    if let converter {
+        // Convert the single read buffer into the analyzer format, then yield.
+        // (Journal recordings are short; a single whole-file conversion is fine.
+        // If this ever needs to stream very long files, switch to chunked reads
+        // feeding AVAudioConverter's render callback — same as the reference.)
+        let ratio = analyzerFormat.sampleRate / audioFile.processingFormat.sampleRate
+        let outFrames = AVAudioFrameCount((Double(readBuffer.frameLength) * ratio).rounded(.up))
+        guard outFrames > 0,
+              let outBuffer = AVAudioPCMBuffer(pcmFormat: analyzerFormat, frameCapacity: outFrames)
+        else {
+            inputContinuation.finish()
+            return .failure(TranscribeFailure(message: "Audio format conversion produced no samples.", isHard: false))
+        }
+        var conversionError: NSError?
+        var consumed = false
+        let convStatus = converter.convert(to: outBuffer, error: &conversionError) { _, status in
+            if consumed {
+                status.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            status.pointee = .haveData
+            return readBuffer
+        }
+        if convStatus == .error {
+            inputContinuation.finish()
+            return .failure(TranscribeFailure(
+                message: "Audio format conversion failed: \(conversionError?.localizedDescription ?? "unknown")",
+                isHard: false
+            ))
+        }
+        inputContinuation.yield(AnalyzerInput(buffer: outBuffer))
+    } else {
+        // Processing format already matches the analyzer format.
+        inputContinuation.yield(AnalyzerInput(buffer: readBuffer))
+    }
+
+    // Signal end-of-input, then finalize so the last segment is committed.
+    inputContinuation.finish()
+    do {
+        try await analyzer.finalizeAndFinishThroughEndOfInput()
+    } catch {
+        collectTask.cancel()
+        return .failure(TranscribeFailure(
+            message: "SpeechAnalyzer failed to finalize: \(error.localizedDescription)",
+            isHard: false
+        ))
+    }
+
+    // Drain any remaining results.
+    await collectTask.value
+
+    if let streamError = errorBox.error {
+        return .failure(TranscribeFailure(
+            message: "SpeechAnalyzer result stream failed: \(streamError.localizedDescription)",
+            isHard: false
+        ))
+    }
+
+    let transcript = await accumulator.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+    if transcript.isEmpty {
+        return .failure(TranscribeFailure(
+            message: "SpeechAnalyzer produced no transcript (silent audio or unrecognized speech).",
+            isHard: false
+        ))
+    }
+    return .success(transcript)
+}
+
+// MARK: - C-buffer write helpers (shared)
+
+/// Writes a NUL-terminated UTF-8 string into a C char buffer.
+/// Returns the byte count written (excluding the NUL), or 0 if the buffer has
+/// no capacity. Always NUL-terminates if there is room (truncating safely).
+@inline(__always)
+private func writeCString(
+    _ text: String,
+    into buffer: UnsafeMutablePointer<CChar>,
+    capacity: Int32
+) -> Int32 {
+    guard capacity > 0 else { return 0 }
+    let nulTerminated = text + "\0"
+    let bytes = Array(nulTerminated.utf8)
+    let cap = Int(capacity)
+    let copyCount = min(bytes.count, cap)
+    for i in 0..<copyCount {
+        buffer[i] = CChar(bitPattern: bytes[i])
+    }
+    if copyCount < cap {
+        buffer[copyCount] = 0
+    } else {
+        buffer[cap - 1] = 0
+    }
+    return Int32(copyCount)
 }
