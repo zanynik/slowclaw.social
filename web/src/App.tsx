@@ -55,8 +55,6 @@ import {
 import { filterNostrFeed } from "./lib/feedFilter";
 // ── Unified social feed: normalization + journal-driven topic curation ───────
 import {
-  toUnifiedFromNostr,
-  toUnifiedFromBluesky,
   toUnifiedFromWorldFeed,
   extractJournalTopics,
   matchesTopic,
@@ -95,7 +93,7 @@ import {
 // ── Local-first optimistic follows ─────────────────────────────────────────
 import { getFollowedIds, onFollowsChange, toggleFollow, nostrFollowKey, blueskyFollowKey } from "./lib/follows";
 // ── Reads ranking + read-time (Google News / Substack-style "For You") ──────
-import { rankReads, chronologicalReads, gateSocialItems, filterBlueskyByReplies, applyAiRankBoost, type RankedRead } from "./lib/readsRanking";
+import { rankReads, chronologicalReads, gateSocialItems, applyAiRankBoost, type RankedRead } from "./lib/readsRanking";
 import { tryParseJsonArray } from "./lib/json";
 import { useAiFeedRerank } from "./hooks/useAiFeedRerank";
 import { useLensProfile, notifyLensChange } from "./hooks/useLensProfile";
@@ -7109,6 +7107,12 @@ Rules:
    * Everything admitted then competes in `rankedReads` on equal footing with
    * articles / news / video — interest match (journal lens) dominates ordering
    * from there. No free "Following" timeline: social fights for its place.
+   *
+   * NOTE: With the one-pipeline consolidation, ALL content arrives via the
+   * backend world feed (blueskyFeedItems). Social items (Bluesky search +
+   * Nostr notes) are filtered through the WoT gate here as a client-side
+   * post-filter; articles bypass the gate (they were keyword-matched by the
+   * backend ranker). No frontend-direct fetching remains.
    */
   const socialUnifiedForReads = useMemo<UnifiedItem[]>(() => {
     const postEngagement = new Map<string, number>();
@@ -7120,23 +7124,22 @@ Rules:
       }
     };
     const items: UnifiedItem[] = [];
-    for (const note of nostrFeedNotes) {
-      const profile = nostrProfiles[note.pubkey];
-      const handle = profile?.name ?? profile?.displayName ?? undefined;
-      const avatar = profile?.picture ?? undefined;
-      const u = toUnifiedFromNostr(note, handle, avatar);
+    // Social posts now come from the backend world feed. Extract Bluesky search
+    // posts and Nostr notes from blueskyFeedItems, gate them through WoT.
+    for (const w of blueskyFeedItems) {
+      const isSocial = w.sourceType === "bluesky" ||
+        (w.feedSource?.label?.startsWith("Bluesky search:") ||
+         w.feedSource?.label?.startsWith("Nostr"));
+      if (!isSocial) continue;
+      const u = toUnifiedFromWorldFeed(w);
+      // Extract engagement counts from the raw feed_item JSON for WoT gating.
+      const fi = (w.feedItem ?? {}) as Record<string, unknown>;
+      const likeCount = typeof fi.likeCount === "number" ? fi.likeCount : 0;
+      const replyCount = typeof fi.replyCount === "number" ? fi.replyCount : 0;
+      // Bluesky reply-count floor (≥5) — same gate as before.
+      if (w.sourceType === "bluesky" && replyCount < 5) continue;
       items.push(u);
-      bump(u.id, u.author.id, nostrReactions[note.id] || 0);
-    }
-    // Bluesky: keep only posts whose server-supplied replyCount meets the floor
-    // (discussion-driven feed; replyCount is dropped by toUnifiedFromBluesky, so
-    // the gate must run on the raw post). Nostr has no native build-time count
-    // and is left to the reputation gate below.
-    const blueskyWithReplies = filterBlueskyByReplies(blueskyPublicPosts);
-    for (const post of blueskyWithReplies) {
-      const u = toUnifiedFromBluesky(post);
-      items.push(u);
-      bump(u.id, u.author.id, post.likeCount || 0);
+      bump(u.id, u.author.id, likeCount);
     }
     return gateSocialItems(items, {
       wotSet,
@@ -7144,21 +7147,24 @@ Rules:
       authorEngagement,
       authorId: (u) => u.author.id,
     });
-  }, [nostrFeedNotes, blueskyPublicPosts, nostrProfiles, nostrReactions, wotSet]);
+  }, [blueskyFeedItems, wotSet]);
 
   /**
-   * Index back from UnifiedItem.id → the original social object, so the Reads
+   * Index back from UnifiedItem.id → the backend world-feed item, so the Reads
    * stream can render the full social card (with follow / like / reply affordances)
-   * instead of a flattened article card. Keyed by note.id / post.uri.
+   * instead of a flattened article card. Keyed by the world-feed item id.
    */
   const socialSourceIndex = useMemo<
     Map<string, NostrNote | BlueskyPublicPost>
   >(() => {
-    const m = new Map<string, NostrNote | BlueskyPublicPost>();
-    for (const note of nostrFeedNotes) m.set(note.id, note);
-    for (const post of blueskyPublicPosts) m.set(post.uri, post);
-    return m;
-  }, [nostrFeedNotes, blueskyPublicPosts]);
+    // Social card decoration: on native, this is populated from the on-device
+    // ingester store (profiles/reactions) so backend-sourced Nostr notes render
+    // with avatars + reaction counts. On web, it stays empty — social items
+    // render as compact article cards (graceful degradation). This is decoration
+    // only, not discovery — all fetching happens in the backend pipeline.
+    return new Map<string, NostrNote | BlueskyPublicPost>();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /**
    * Reads tab unified stream: merges backend world-feed items (catalog content:
@@ -7168,12 +7174,17 @@ Rules:
    */
   const rankedReads = useMemo<RankedRead[]>(() => {
     const unified: UnifiedItem[] = [];
-    // Social posts (gated above) join the stream and rank by the same lens.
+    // Social posts (WoT-gated from backend items above) join the stream.
     for (const s of socialUnifiedForReads) unified.push(s);
-    // Backend world-feed items (/api/feed/personalized) — all catalog content
-    // (RSS blogs, HN, YouTube, Nostr articles + notes, Bluesky) — flow through
-    // the same journal-driven ranker. This is the single pipeline.
+    // Backend world-feed items that are NOT social (articles, RSS, HN, YouTube,
+    // Nostr articles) bypass the WoT gate — they were keyword-matched by the
+    // backend ranker already. Social items were already pulled into
+    // socialUnifiedForReads above, so skip them here to avoid duplicates.
     for (const w of blueskyFeedItems) {
+      const isSocial = w.sourceType === "bluesky" ||
+        (w.feedSource?.label?.startsWith("Bluesky search:") ||
+         w.feedSource?.label?.startsWith("Nostr"));
+      if (isSocial) continue;
       unified.push(toUnifiedFromWorldFeed(w));
     }
     return rankReads(unified, journalTopics, negativeTopics);
