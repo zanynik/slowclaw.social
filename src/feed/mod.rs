@@ -1507,13 +1507,17 @@ fn build_content_preview(item: &local_store::ContentItemRecord) -> WebFeedPrevie
     } else {
         truncate_with_ellipsis(item.content_text.trim(), 220)
     };
+    // When the title is empty (some feeds omit it, or a dedup collision
+    // clobbered it), fall back to the first meaningful line of content —
+    // never the raw URL, which renders as an ugly link instead of a headline.
+    let title = if item.title.trim().is_empty() {
+        derive_interest_label(&item.source_title, &item.content_text)
+    } else {
+        item.title.clone()
+    };
     WebFeedPreview {
         url: item.canonical_url.clone(),
-        title: if item.title.trim().is_empty() {
-            item.canonical_url.clone()
-        } else {
-            item.title.clone()
-        },
+        title,
         description,
         content_text: item.content_text.trim().to_string(),
         image_url: None,
@@ -3990,14 +3994,19 @@ fn collapse_whitespace(raw: &str) -> String {
 }
 
 fn sanitize_feed_text(raw: &str) -> String {
-    let without_breaks = html_break_regex().replace_all(raw, "\n");
+    // Strip CDATA delimiters FIRST, before HTML tag stripping. If we strip
+    // tags first, the regex `<[^>]+>` consumes the entire `<![CDATA[...]]>`
+    // block (it sees the whole thing as one "tag" from `<` to `>`), eating
+    // the content inside — including titles. This is why HN items (which use
+    // CDATA for titles) showed URLs instead of headlines.
+    let without_cdata = raw
+        .replace("<![CDATA[", "")
+        .replace("]]>", "");
+    let without_breaks = html_break_regex().replace_all(&without_cdata, "\n");
     let with_paragraphs = html_paragraph_regex().replace_all(&without_breaks, "\n");
     let without_tags = html_tag_regex().replace_all(&with_paragraphs, " ");
-    let without_cdata = without_tags
-        .replace("<![CDATA[", "")
-        .replace("]]>", "")
-        .replace("&apos;", "'");
-    collapse_whitespace(&html_unescape_basic(&without_cdata))
+    let decoded = without_tags.replace("&apos;", "'");
+    collapse_whitespace(&html_unescape_basic(&decoded))
 }
 
 fn extract_xml_tag_text(fragment: &str, tags: &[&str]) -> Option<String> {
@@ -4323,6 +4332,31 @@ mod tests {
         assert_eq!(preview.image_url.as_deref(), Some("https://example.com/cover.png"));
         assert!(preview.url.starts_with("https://habla.news/a/naddr1"));
         assert_eq!(item.source_type, "web");
+    }
+
+    /// Verify that an HN-shaped RSS item (CDATA title, CDATA description with
+    /// HTML inside) parses correctly — the title must be extracted, not lost.
+    /// This guards against the bug where HN items showed URLs instead of titles.
+    #[test]
+    fn rss_parse_extracts_cdata_title_from_hn_feed() {
+        let hn_xml = r#"<?xml version="1.0"?>
+<rss version="2.0"><channel>
+<item>
+<title><![CDATA[Zig Creator Calls Spade a Spade]]></title>
+<description><![CDATA[<p>Article URL: <a href="https://raymyers.org/post/zed/">https://raymyers.org/post/zed/</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=123">https://news.ycombinator.com/item?id=123</a></p>
+<p>Points: 182</p>]]></description>
+<link>https://raymyers.org/post/zed/</link>
+<guid isPermaLink="false">https://news.ycombinator.com/item?id=123</guid>
+</item>
+</channel></rss>"#;
+        let entries = parse_rss_feed_entries(hn_xml, "https://news.ycombinator.com");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Zig Creator Calls Spade a Spade");
+        assert_eq!(entries[0].canonical_url, "https://raymyers.org/post/zed/");
+        // Description should be the sanitized text (HTML stripped), not raw CDATA.
+        assert!(!entries[0].summary.contains("<p>"));
+        assert!(!entries[0].summary.contains("<![CDATA["));
     }
 
     struct MockEmbedder;
