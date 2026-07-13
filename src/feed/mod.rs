@@ -1467,18 +1467,29 @@ fn nostr_relay_search_text(
 /// articles — from a single relay. Articles and notes share the same pipeline
 /// so the journal-driven ranker treats them uniformly. The lookback and per-
 /// relay limit apply to the combined set.
-async fn fetch_nostr_events(relay_url: &str, limit: usize) -> Result<Vec<NostrEvent>> {
+/// Fetch recent Nostr events — kind 1 text notes AND kind 30023 long-form
+/// articles — from a single relay. When `hashtags` is non-empty, the filter is
+/// scoped to NIP-12 `#t` tag matches (channel-based discovery); when empty,
+/// firehose-style (all recent notes in the lookback window).
+async fn fetch_nostr_events(
+    relay_url: &str,
+    limit: usize,
+    hashtags: &[String],
+) -> Result<Vec<NostrEvent>> {
     let client = NostrClient::default();
     client.add_relay(relay_url).await?;
     client
         .try_connect_relay(relay_url, Duration::from_secs(NOSTR_RELAY_CONNECT_TIMEOUT_SECS))
         .await?;
-    let filter = NostrFilter::new()
+    let mut filter = NostrFilter::new()
         .kinds([NostrKind::TextNote, NostrKind::from(30023)])
         .since(NostrTimestamp::from_secs(
             Utc::now().timestamp().saturating_sub(NOSTR_LOOKBACK_SECS as i64) as u64,
         ))
         .limit(limit);
+    if !hashtags.is_empty() {
+        filter = filter.hashtags(hashtags.iter().map(|s| s.as_str()));
+    }
     let events = client
         .fetch_events_from(
             [relay_url],
@@ -2891,12 +2902,20 @@ impl FeedSource for NostrFeedSource {
 
     async fn fetch_candidates(
         &self,
-        _profile: &FeedProfile,
+        profile: &FeedProfile,
         selected_sources: &[SelectedSource],
         limit: usize,
     ) -> Result<Vec<FeedCandidate>> {
         let mut matched = Vec::new();
         let mut seen = BTreeSet::new();
+        // Use the top interest keywords as NIP-12 #t hashtags so the relay
+        // can filter server-side (more relevant notes, less noise). Falls
+        // back to firehose when the profile has no keywords.
+        let hashtags: Vec<String> = weighted_interest_keywords(profile)
+            .iter()
+            .map(|(term, _)| term.clone())
+            .take(3)
+            .collect();
         for selected in selected_sources {
             let Some(relay_url) = selected
                 .metadata_json
@@ -2908,7 +2927,7 @@ impl FeedSource for NostrFeedSource {
                 continue;
             };
 
-            let events = match fetch_nostr_events(relay_url, NOSTR_RECENT_NOTE_LIMIT_PER_RELAY).await {
+            let events = match fetch_nostr_events(relay_url, NOSTR_RECENT_NOTE_LIMIT_PER_RELAY, &hashtags).await {
                 Ok(events) => events,
                 Err(err) => {
                     tracing::debug!(relay = relay_url, error = %err, "Failed to fetch Nostr world-feed events");
