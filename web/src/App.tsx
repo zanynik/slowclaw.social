@@ -548,6 +548,11 @@ function getRelativeTime(dateVal: string | number): string {
   if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
   if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
   if (diffSec < 604800) return `${Math.floor(diffSec / 86400)}d`;
+  // Beyond a week: show compact week/month counts before falling back to a
+  // calendar date. Keeps the sidebar style (e.g. "3w", "2mo") rather than
+  // jumping straight to "Jul 3" for anything older than 7 days.
+  if (diffSec < 2592000) return `${Math.floor(diffSec / 604800)}w`; // < ~30d
+  if (diffSec < 31536000) return `${Math.floor(diffSec / 2592000)}mo`; // < ~365d
   return new Date(then).toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
@@ -2145,22 +2150,32 @@ function App() {
   async function refreshLibrary(scope: "journal" | "feed" | "all") {
     const refreshLocalJournalLibrary = async () => {
       const entries = await listJournals(300, 0);
-      const items: LibraryItem[] = entries.map((entry) => ({
+      const items: LibraryItem[] = entries.map((entry) => {
+        // The Tauri backend emits `updated_at` as a bare Unix-seconds string
+        // (e.g. "1720900000"), which `Date.parse` cannot interpret (returns NaN)
+        // and previously made every journal fall back to Date.now() — the cause
+        // of every journal showing "now" in the sidebar. Treat a numeric value
+        // as unix seconds; fall back to Date.parse for any ISO string.
+        const numericUpdated = Number(entry.updatedAt);
+        const parsedUpdatedMs =
+          Number.isFinite(numericUpdated) && numericUpdated > 0
+            ? numericUpdated * 1000
+            : Date.parse(entry.updatedAt);
+        return {
         id: entry.id,
         path: localJournalPath(entry.id),
         title: entry.title || "Journal entry",
         kind: entry.kind,
         sizeBytes: entry.content?.length ?? 0,
         modifiedAt: Math.floor(
-          (Number.isFinite(Date.parse(entry.updatedAt))
-            ? Date.parse(entry.updatedAt)
-            : Date.now()) / 1000
+          (Number.isFinite(parsedUpdatedMs) ? parsedUpdatedMs : Date.now()) / 1000
         ),
         previewText: entry.content?.slice(0, 280) || "",
         mediaUrl: null,
         editableText: entry.kind === "text",
         scope: "journal"
-      }));
+      };
+      });
       setJournalItems(items);
       if (items.length > 0 && !selectedJournalPath) {
         setSelectedJournalPath(items[0].path);
