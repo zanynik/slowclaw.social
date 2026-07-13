@@ -1,12 +1,13 @@
 /**
- * aiActivityLog.ts — in-memory activity log for on-device AI calls.
+ * aiActivityLog.ts — in-memory activity log for on-device AI + transcription calls.
  *
  * Dev/debug surface. Every nativeAiChat / nativeAiLoadModel call site in the app
  * pushes structured events here (start / success / error / skipped). The Debug
  * tab subscribes via `useAiLog()` and renders the ring buffer.
  *
- * Scope: the `nativeAiChat` + `nativeAiLoadModel` bridge only (transcription is
- * a separate native bridge and is out of scope for this pass).
+ * Scope: the `nativeAiChat` + `nativeAiLoadModel` bridge, plus the iOS Speech
+ * transcription bridge (the enrichment loop drives transcription through the
+ * same log so its progress is visible alongside the AI tasks).
  *
  * Designed to be removable: every call site uses additive `logAiEvent(...)`
  * one-liners, so deleting this file + the view + the log lines reverts cleanly.
@@ -18,11 +19,13 @@ import { useSyncExternalStore } from "react";
 
 /** Which on-device AI feature the event concerns. */
 export type AiFeature =
-  | "title" // journal entry → AI-generated title (handleJournalDone)
-  | "tweetclaw" // journal entry → post drafts (Done / manual / pull-to-refresh)
-  | "interests" // journal entry → feed steering keywords
+  | "title" // journal entry → AI-generated title (handleJournalDone / loop)
+  | "tweetclaw" // journal entry → post drafts (Done / manual / pull-to-refresh / loop)
+  | "interests" // journal entry → feed steering keywords (handleJournalDone / loop)
   | "card_keywords" // liked/disliked Reads card → keyword extraction
   | "rerank" // background Reads re-rank (useAiFeedRerank)
+  | "transcription" // audio/video journal → iOS Speech transcript (loop)
+  | "enrichment" // the convergence loop itself (useJournalEnrichmentLoop)
   | "warm"; // auto-warm the model on launch (nativeAiLoadModel)
 
 /** Lifecycle phase of a single feature invocation. */
@@ -114,5 +117,7 @@ export const AI_FEATURE_LABELS: Record<AiFeature, string> = {
   interests: "Interest keywords",
   card_keywords: "Card keywords",
   rerank: "Reads re-rank",
+  transcription: "Transcription",
+  enrichment: "Enrichment loop",
   warm: "Model warm-up",
 };

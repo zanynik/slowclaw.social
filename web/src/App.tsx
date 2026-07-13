@@ -1,4 +1,4 @@
-import { lazy, Suspense, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AtpAgent, AppBskyFeedDefs } from "@atproto/api";
 import { blueskyImagesOf, blueskyVideoOf, blueskyExternalOf, blueskyQuotedRecordOf, fetchBlueskyReelsFeed, REELS_VIDEO_TOPICS, getBlueskyProfileCounts, getBlueskyProfile, getPublicBlueskyAuthorFeed, followBlueskyAuthor, unfollowBlueskyAuthor, repostBlueskyPost, unrepostBlueskyPost, quoteBlueskyPost } from "./lib/bluesky";
 import type { BlueskySession, BlueskyPublicPost, BlueskyProfileCounts, BlueskyProfile } from "./lib/bluesky";
@@ -96,6 +96,7 @@ import { getFollowedIds, onFollowsChange, toggleFollow, nostrFollowKey, blueskyF
 import { rankReads, chronologicalReads, gateSocialItems, applyAiRankBoost, type RankedRead } from "./lib/readsRanking";
 import { tryParseJsonArray } from "./lib/json";
 import { useAiFeedRerank } from "./hooks/useAiFeedRerank";
+import { useJournalEnrichmentLoop } from "./hooks/useJournalEnrichmentLoop";
 import { useLensProfile, notifyLensChange } from "./hooks/useLensProfile";
 import {
   loadCachedWoTSet,
@@ -114,6 +115,9 @@ import {
   renameJournal,
   deleteJournal,
   saveJournalInterestKeywords,
+  ensureJournalEnrichment,
+  setJournalEnrichment,
+  deleteJournalEnrichment,
   saveCardKeywords,
   getInterestProfile,
   setLensOverride,
@@ -2735,6 +2739,34 @@ Rules:
       logAiEvent("interests", "skipped", "Skipped (AI unavailable or no local journal id)");
     }
 
+    // 4.6. Seed the enrichment task map for this journal and record what this
+    // on-save pass already completed. The text tasks (title/interests/tweet)
+    // ran above when AI was available; the transcription task (audio/video) is
+    // handled by the transcribe-on-save path + the background loop. This keeps
+    // the table in sync so the loop only backfills what on-save missed (e.g.
+    // AI was unavailable at capture time).
+    if (localId) {
+      const kind = (selectedJournalItem?.kind || "text") as "text" | "audio" | "video" | "image";
+      const tasks: import("./lib/tauriApi").EnrichmentTask[] =
+        kind === "audio" || kind === "video"
+          ? ["transcription", "title", "interests", "tweet"]
+          : ["title", "interests", "tweet"];
+      const aiWasOn = isTauriMobileRuntime() && !!nativeLocalAiStatus?.available;
+      try {
+        await ensureJournalEnrichment(localId, tasks);
+        if (aiWasOn) {
+          // These three ran above; mark done so the loop doesn't redo them.
+          await Promise.all([
+            setJournalEnrichment(localId, "title", "done"),
+            setJournalEnrichment(localId, "interests", "done"),
+            setJournalEnrichment(localId, "tweet", "done"),
+          ]);
+        }
+      } catch {
+        // Seeding/marking is best-effort; the loop re-derives state each tick.
+      }
+    }
+
     // 5. Mark as processed and close
     if (currentPath) {
       markJournalProcessed(currentPath);
@@ -2750,6 +2782,14 @@ Rules:
       setJournalSaveStatus(`Deleting ${item.title}...`);
       try {
         await deleteJournal(localId);
+        // Best-effort: clear the enrichment task map for the removed journal.
+        // The Rust delete_journal command already does this on the Tauri path;
+        // this covers any code path that reaches here without going through it.
+        try {
+          await deleteJournalEnrichment(localId);
+        } catch {
+          /* best-effort */
+        }
         setPendingDeleteJournalItem(null);
         if (selectedJournalPath === item.path) {
           journalLoadRequestRef.current += 1;
@@ -7223,6 +7263,93 @@ Rules:
     busy: generatePostBusy,
   });
 
+  // ── Journal enrichment loop ──────────────────────────────────────────────
+  // Drives the per-journal AI/transcription task map to completion in the
+  // background: transcription → title → interests → tweet, one task per pass,
+  // foreground-preference (skips while generatePostBusy), 30s cooldown. The
+  // table is the source of truth for "is this journal enriched?". iOS-only;
+  // no-ops on desktop. See hooks/useJournalEnrichmentLoop.ts.
+  const resolveJournalBody = useCallback(
+    async (item: LibraryItem): Promise<string> => {
+      // Text journals: read the stored content directly.
+      if (item.kind === "text") {
+        const localId = localJournalIdFromPath(item.path);
+        if (!localId) return "";
+        try {
+          const j = await getJournal(localId);
+          return j.content || "";
+        } catch {
+          return "";
+        }
+      }
+      // Audio/video: the body is the transcript, read via the status endpoint.
+      try {
+        const status = await getJournalTranscriptionStatus(
+          item.path,
+          chatGatewayToken,
+          gatewayBaseUrl,
+        );
+        return String(status.text || "");
+      } catch {
+        return "";
+      }
+    },
+    [chatGatewayToken, gatewayBaseUrl],
+  );
+
+  const enrichmentDeps = useMemo(
+    () => ({
+      chat: nativeAiChat,
+      transcribe: transcribeJournalMediaNative,
+      renameJournal,
+      saveInterests: saveJournalInterestKeywords,
+      onPostsGenerated: (journalPath: string, posts: string[], sourceExcerpt: string) => {
+        // Mirror handleJournalDone's persistence: prepend new posts, save, so
+        // they surface in Feed > Create exactly like on-save-generated posts.
+        const newPosts: PersistedPost[] = posts.map((t) => ({
+          id: `enrich_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          text: t.trim(),
+          sourceExcerpt,
+          createdAt: Date.now(),
+        }));
+        setPersistedPosts((prev) => {
+          const next = [...newPosts, ...prev];
+          savePersistedPosts(next);
+          return next;
+        });
+        // Mark the tweet task done for THIS journal so the loop tracks which
+        // journal the new posts belong to (sourceJournalId is not on PersistedPost).
+        void journalPath;
+      },
+      onInterestsExtracted: (keywords: string[]) => {
+        // Seed the local lens so extracted keywords actually drive iOS ranking.
+        for (const kw of keywords) addManualInterest(kw);
+        if (isTauriMobileRuntime()) {
+          for (const kw of keywords) addManualInterestCmd(kw).catch(() => {});
+          notifyLensChange();
+        }
+      },
+    }),
+    // tweetClawPrompt is consumed by the hook directly (not deps); deps holds
+    // stable fns. Rename/saveInterests are module-level imports. addManualInterest
+    // is from the lens hook (stable). Re-memo only if the setters change (never).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  const enrichmentProgress = useJournalEnrichmentLoop({
+    journals: journalItems,
+    enabled: isTauriMobileRuntime() && !!nativeLocalAiStatus?.available,
+    busy: generatePostBusy,
+    resolveBody: resolveJournalBody,
+    existingPostsFor: () => persistedPosts.slice(0, 10).map((p) => p.text),
+    tweetPrompt: tweetClawPrompt,
+    deps: enrichmentDeps,
+  });
+  // Expose enrichment progress to the AI Activity panel via a ref the view reads.
+  const enrichmentProgressRef = useRef(enrichmentProgress);
+  enrichmentProgressRef.current = enrichmentProgress;
+
   // What the Reads tab actually renders: the live ranked stream once it has
   // loaded, otherwise the cached stream so the tab is never blank on open.
   // Blend the on-device AI relevance boost on top of the base journal ranking
@@ -10652,7 +10779,7 @@ Rules:
 
         {mobileTab === "debug" ? (
           <ViewErrorBoundary title="AI Activity">
-            <AiActivityView status={nativeLocalAiStatus} />
+            <AiActivityView status={nativeLocalAiStatus} enrichmentProgress={enrichmentProgressRef.current} />
           </ViewErrorBoundary>
         ) : null}
       </main>

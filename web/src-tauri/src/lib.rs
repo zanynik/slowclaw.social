@@ -1877,7 +1877,18 @@ async fn delete_journal(id: String) -> Result<(), String> {
             "Failed to delete the journal entry.",
             e,
         )
-    })
+    })?;
+    // Best-effort: clear the enrichment task map for the removed journal so the
+    // loop never references a deleted file. Failure is non-fatal (the file is
+    // already gone); a stale row would only re-seed a `pending` task that the
+    // loop then skips when it can't read the file.
+    if let Some(source_path) = rel_path_to_id(&config.workspace_dir, &path) {
+        let _ = zeroclaw::gateway::local_store::delete_journal_enrichment(
+            &config.workspace_dir,
+            &source_path,
+        );
+    }
+    Ok(())
 }
 
 /// Stores AI-extracted interest keywords for a journal entry into the feed's
@@ -1933,6 +1944,135 @@ async fn save_journal_interest_keywords(
     .map_err(|e| format!("Failed to store interest keywords: {e}"))?;
     zeroclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
         .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
+    Ok(())
+}
+
+// ── journal_enrichment: per-journal AI/transcription task-status map ─────────
+// The on-device enrichment loop (web/src/hooks/useJournalEnrichmentLoop.ts) is
+// the primary writer. `source_path` is the workspace-relative journal key (the
+// same key used by `feed_interest_sources`); these commands do no filesystem
+// access, so traversal is moot, but `..` is rejected defensively.
+
+/// Reject workspace-relative keys that look like an escape attempt. The
+/// enrichment table uses `source_path` purely as a string PK (no fs access),
+/// but we keep the defensive guard for consistency with other journal commands.
+fn validate_enrichment_source_path(source_path: &str) -> Result<(), String> {
+    if source_path.trim().is_empty() {
+        return Err("source_path is required".to_string());
+    }
+    if source_path.contains("..") {
+        return Err("Invalid journal path.".to_string());
+    }
+    Ok(())
+}
+
+/// The set of tasks the enrichment pipeline tracks per journal. Kept in sync
+/// with the TS `EnrichmentTask` type and the table's `task` column.
+const ENRICHMENT_TASKS: &[&str] = &["transcription", "title", "interests", "tweet"];
+
+/// Validate that `task` is one of the known enrichment tasks.
+fn validate_enrichment_task(task: &str) -> Result<(), String> {
+    if !ENRICHMENT_TASKS.contains(&task) {
+        return Err(format!("Unknown enrichment task: {task}"));
+    }
+    Ok(())
+}
+
+/// Insert a `pending` row for each task that does not yet exist for this journal
+/// (idempotent — existing rows are preserved). This is how a new capture seeds
+/// its task map and how the loop discovers work.
+#[tauri::command]
+async fn ensure_journal_enrichment(
+    source_path: String,
+    tasks: Option<Vec<String>>,
+) -> Result<(), String> {
+    validate_enrichment_source_path(&source_path)?;
+    let config =
+        load_workspace_config_for_ui("journal enrichment ensure config load failed").await?;
+    // Validate caller-supplied tasks, or default to the full set. Own the
+    // Strings here (borrowing across the match arm doesn't live long enough)
+    // and map to &str for the accessor at the call site.
+    let task_list: Vec<String> = match tasks {
+        Some(ts) => {
+            for t in &ts {
+                validate_enrichment_task(t)?;
+            }
+            ts
+        }
+        None => ENRICHMENT_TASKS.iter().map(|s| s.to_string()).collect(),
+    };
+    let task_refs: Vec<&str> = task_list.iter().map(|s| s.as_str()).collect();
+    zeroclaw::gateway::local_store::ensure_journal_enrichment(
+        &config.workspace_dir,
+        &source_path,
+        &task_refs,
+    )
+    .map_err(|e| format!("Failed to seed enrichment tasks: {e}"))?;
+    Ok(())
+}
+
+/// Record the outcome of one task: `status` ∈ {pending, done, error, skipped},
+/// with an optional `last_error` for failure diagnostics. Bumps `attempts` on
+/// every non-`done` write so the loop's retry cap is enforceable.
+#[tauri::command]
+async fn set_journal_enrichment(
+    source_path: String,
+    task: String,
+    status: String,
+    last_error: Option<String>,
+) -> Result<(), String> {
+    validate_enrichment_source_path(&source_path)?;
+    validate_enrichment_task(&task)?;
+    match status.as_str() {
+        "pending" | "done" | "error" | "skipped" => {}
+        other => return Err(format!("Invalid enrichment status: {other}")),
+    }
+    let config =
+        load_workspace_config_for_ui("journal enrichment set config load failed").await?;
+    zeroclaw::gateway::local_store::set_journal_enrichment(
+        &config.workspace_dir,
+        &source_path,
+        &task,
+        &status,
+        last_error.as_deref(),
+    )
+    .map_err(|e| format!("Failed to set enrichment status: {e}"))?;
+    Ok(())
+}
+
+/// Every enrichment row in the table — drives the AI Activity "Enrichment
+/// progress" summary. Returns JSON objects with camelCase keys for the TS layer.
+#[tauri::command]
+async fn list_journal_enrichment() -> Result<Vec<serde_json::Value>, String> {
+    let config =
+        load_workspace_config_for_ui("journal enrichment list config load failed").await?;
+    let rows = zeroclaw::gateway::local_store::list_all_journal_enrichment(&config.workspace_dir)
+        .map_err(|e| format!("Failed to list enrichment rows: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "sourcePath": r.source_path,
+                "task": r.task,
+                "status": r.status,
+                "attempts": r.attempts,
+                "lastError": r.last_error,
+                "lastRunAt": r.last_run_at,
+                "updatedAt": r.updated_at,
+            })
+        })
+        .collect())
+}
+
+/// Delete every enrichment row for a journal — invoked when the journal itself
+/// is deleted, so the status map never references a removed file.
+#[tauri::command]
+async fn delete_journal_enrichment(source_path: String) -> Result<(), String> {
+    validate_enrichment_source_path(&source_path)?;
+    let config =
+        load_workspace_config_for_ui("journal enrichment delete config load failed").await?;
+    zeroclaw::gateway::local_store::delete_journal_enrichment(&config.workspace_dir, &source_path)
+        .map_err(|e| format!("Failed to delete enrichment rows: {e}"))?;
     Ok(())
 }
 
@@ -3224,6 +3364,10 @@ pub fn run() {
             remove_lens_override,
             add_manual_interest,
             remove_manual_interest,
+            ensure_journal_enrichment,
+            set_journal_enrichment,
+            list_journal_enrichment,
+            delete_journal_enrichment,
             commands::desktop::open_workspace_journals_folder,
             commands::desktop::open_external_url,
             commands::desktop::open_in_app_webview,

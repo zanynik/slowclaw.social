@@ -172,6 +172,80 @@ export async function saveJournalInterestKeywords(
 }
 
 // ─────────────────────────────────────────────
+// Journal enrichment task-status map (journal_enrichment table)
+// ─────────────────────────────────────────────
+//
+// Per-journal AI/transcription task tracking. Each journal has up to four
+// tasks (transcription, title, interests, tweet) that the on-device enrichment
+// loop (web/src/hooks/useJournalEnrichmentLoop.ts) drives from `pending` to a
+// terminal state. The table is the single source of truth for "is this journal
+// fully enriched?" — see the AI Activity panel for a live view.
+
+/** The four enrichment tasks tracked per journal. Must match the Rust const. */
+export type EnrichmentTask = "transcription" | "title" | "interests" | "tweet";
+
+/** Lifecycle of a single (journal, task) pair. Terminal = done|error|skipped. */
+export type EnrichmentStatus = "pending" | "done" | "error" | "skipped";
+
+/** One row of the task-status map (camelCase, as returned by the Rust command). */
+export type JournalEnrichmentRow = {
+  sourcePath: string;
+  task: EnrichmentTask;
+  status: EnrichmentStatus;
+  attempts: number;
+  lastError: string;
+  lastRunAt: string;
+  updatedAt: string;
+};
+
+/** The full task set, in canonical order. Kept in sync with ENRICHMENT_TASKS. */
+export const ENRICHMENT_TASKS: EnrichmentTask[] = ["transcription", "title", "interests", "tweet"];
+
+/**
+ * Seed `pending` rows for any of the journal's tasks that don't yet exist.
+ * Idempotent — existing rows (e.g. already `done`) are preserved. Omit `tasks`
+ * to seed the full set. Called on journal capture and at the start of each loop
+ * tick so a journal is always trackable.
+ */
+export async function ensureJournalEnrichment(
+  sourcePath: string,
+  tasks?: EnrichmentTask[],
+): Promise<void> {
+  return invoke("ensure_journal_enrichment", {
+    sourcePath,
+    tasks: tasks ?? null,
+  });
+}
+
+/**
+ * Record the outcome of one task. The Rust side bumps `attempts` on every
+ * non-`done` write so the loop's retry cap is enforceable.
+ */
+export async function setJournalEnrichment(
+  sourcePath: string,
+  task: EnrichmentTask,
+  status: EnrichmentStatus,
+  lastError?: string,
+): Promise<void> {
+  return invoke("set_journal_enrichment", {
+    sourcePath,
+    task,
+    status,
+    lastError: lastError ?? null,
+  });
+}
+
+/** Every enrichment row in the table — drives the AI Activity progress summary. */
+export async function listJournalEnrichment(): Promise<JournalEnrichmentRow[]> {
+  return invoke("list_journal_enrichment");
+}
+
+/** Delete every enrichment row for a journal (called on journal delete). */
+export async function deleteJournalEnrichment(sourcePath: string): Promise<void> {
+  return invoke("delete_journal_enrichment", { sourcePath });
+}
+
+// ─────────────────────────────────────────────
 // Unified interest profile (single store, single lens)
 // ─────────────────────────────────────────────
 //

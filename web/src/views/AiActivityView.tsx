@@ -1,14 +1,17 @@
 /**
- * AiActivityView.tsx — Debug tab: live log of on-device AI activity.
+ * AiActivityView.tsx — Debug tab: live log of on-device AI activity + enrichment progress.
  *
  * Dev/debug surface. Subscribes to the in-memory AI activity log
  * (lib/aiActivityLog) and renders a reverse-chronological list of every
- * on-device AI event — start / success / error / skipped — across the six
- * feature surfaces (title, tweetclaw, interests, card_keywords, rerank, warm).
+ * on-device AI event — start / success / error / skipped — across the feature
+ * surfaces (title, tweetclaw, interests, card_keywords, rerank, transcription,
+ * enrichment, warm). Also shows a live "Enrichment progress" summary card fed
+ * by the journal enrichment loop (per-journal task map convergence).
  *
  * Pure-presentational props-in: App.tsx passes the live nativeLocalAiStatus
- * snapshot so the header shows *why* calls skip (unavailable / not configured /
- * not running) at a glance. The event stream comes from the logger's own hook.
+ * snapshot and the enrichment-loop progress so the header shows *why* calls
+ * skip (unavailable / not configured / not running) and how close the task map
+ * is to complete. The event stream comes from the logger's own hook.
  *
  * Designed to be removable: delete this file, the logger, the nav plumbing in
  * App.tsx, and the additive logAiEvent call lines.
@@ -23,9 +26,12 @@ import {
   type AiFeature,
 } from "../lib/aiActivityLog";
 import type { NativeLocalAiStatus } from "../lib/tauriApi";
+import type { EnrichmentProgress } from "../hooks/useJournalEnrichmentLoop";
 
 type AiActivityViewProps = {
   status: NativeLocalAiStatus | null;
+  /** Live enrichment-loop progress (optional — only present on mobile runtime). */
+  enrichmentProgress?: EnrichmentProgress;
 };
 
 const KIND_DOT_CLASS: Record<AiEventKind, string> = {
@@ -60,11 +66,12 @@ function formatRelative(ts: number, now: number): string {
   return `${hrs}h ago`;
 }
 
-export function AiActivityView({ status }: AiActivityViewProps) {
+export function AiActivityView({ status, enrichmentProgress }: AiActivityViewProps) {
   const events = useAiLog();
   const [filter, setFilter] = useState<"all" | "errors" | AiFeature>("all");
 
-  // Re-render every 5s so relative timestamps ("3s ago") stay fresh.
+  // Re-render every 5s so relative timestamps ("3s ago") stay fresh AND the
+  // enrichment progress (passed by ref from App) re-renders.
   const [, setTick] = useState(0);
   useEffect(() => {
     const id = window.setInterval(() => setTick((n) => n + 1), 5000);
@@ -78,6 +85,11 @@ export function AiActivityView({ status }: AiActivityViewProps) {
   });
 
   const featureKeys = Object.keys(AI_FEATURE_LABELS) as AiFeature[];
+
+  // Enrichment progress: only render when the loop has tracked at least one
+  // task (i.e. on the mobile runtime with journals present).
+  const ep = enrichmentProgress;
+  const showEnrichment = ep && ep.total > 0;
 
   return (
     <div className="stack" style={{ padding: "0.5rem 0" }}>
@@ -103,6 +115,51 @@ export function AiActivityView({ status }: AiActivityViewProps) {
           ) : null}
         </div>
       </div>
+
+      {/* Enrichment progress — per-journal task map convergence. */}
+      {showEnrichment ? (
+        <div className="card">
+          <div className="stack-sm">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "0.5rem" }}>
+              <h3 style={{ margin: 0 }}>Enrichment progress</h3>
+              <span className={`status-pill enrichment-pill-${ep!.status}`}>
+                {ep!.status}
+                {ep!.current ? ` · ${ep!.current}` : ""}
+              </span>
+            </div>
+            <p className="text-sm muted" style={{ margin: 0 }}>
+              Per-journal AI task map (transcription → title → interests → tweet). The loop fills this
+              until every task is terminal.
+            </p>
+            <div className="ai-log-status-row">
+              <span className="status-pill">done {ep!.done}</span>
+              <span className="status-pill status-pill-warning">pending {ep!.pending}</span>
+              <span className="status-pill status-pill-error" style={{ color: "var(--danger, #d33)" }}>error {ep!.error}</span>
+              <span className="status-pill">skipped {ep!.skipped}</span>
+              <span className="status-pill">total {ep!.total}</span>
+            </div>
+            {/* Convergence bar: done fraction of all terminal+pending work. */}
+            {ep!.total > 0 ? (
+              <div className="enrichment-bar" title={`${ep!.done}/${ep!.total} tasks complete`}>
+                <div
+                  className="enrichment-bar-fill"
+                  style={{ width: `${Math.round((ep!.done / ep!.total) * 100)}%` }}
+                />
+              </div>
+            ) : null}
+            {ep!.error_message ? (
+              <p className="text-sm" style={{ margin: 0, color: "var(--danger, #d33)" }}>
+                {ep!.error_message}
+              </p>
+            ) : null}
+            {ep!.lastTickAt ? (
+              <p className="text-sm muted" style={{ margin: 0 }}>
+                last sweep {formatRelative(ep!.lastTickAt, Date.now())}
+              </p>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
 
       {/* Filters + clear. */}
       <div className="ai-log-toolbar">

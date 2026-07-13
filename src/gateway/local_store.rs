@@ -121,6 +121,29 @@ pub struct WorkspaceSynthSourceUpsert {
     pub last_batch_id: String,
 }
 
+/// One row of the `journal_enrichment` task-status map.
+///
+/// A journal's enrichment pipeline is modelled as four independent tasks
+/// (`transcription`, `title`, `interests`, `tweet`). Each task has its own
+/// status in this table; the on-device loop (see
+/// `web/src/hooks/useJournalEnrichmentLoop.ts`) drives each one from `pending`
+/// to a terminal state (`done` / `error` / `skipped`). Once all of a journal's
+/// tasks are terminal, the loop stops touching it — that is the convergence
+/// guarantee.
+#[derive(Debug, Clone)]
+pub struct JournalEnrichmentRecord {
+    pub source_path: String,
+    /// One of `transcription` | `title` | `interests` | `tweet`.
+    pub task: String,
+    /// One of `pending` | `done` | `error` | `skipped`.
+    pub status: String,
+    /// Number of times the loop has attempted this task (capped in TS).
+    pub attempts: i64,
+    pub last_error: String,
+    pub last_run_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct FeedInterestRecord {
     pub id: String,
@@ -1770,6 +1793,179 @@ pub fn upsert_feed_interest_source(
     Ok(())
 }
 
+// ── journal_enrichment: per-journal task-status map ─────────────────────────
+// The on-device enrichment loop is the primary writer; `ensure_journal_enrichment`
+// seeds pending rows (idempotent), `set_journal_enrichment` records outcomes,
+// `list_pending_journal_enrichment` / `list_all_journal_enrichment` feed the loop
+// and the AI Activity panel, and `delete_journal_enrichment` clears stale rows
+// when a journal is deleted.
+
+/// Insert a `pending` row for each task in `tasks` that does not already have a
+/// row for `source_path`. Existing rows are left untouched (idempotent — safe to
+/// call on every capture / every loop tick). Returns nothing; callers re-query.
+pub fn ensure_journal_enrichment(
+    workspace_dir: &Path,
+    source_path: &str,
+    tasks: &[&str],
+) -> Result<()> {
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    for task in tasks {
+        // INSERT ... ON CONFLICT DO NOTHING keeps any existing row (done/error
+        // from a prior pass) intact — we never clobber progress by re-seeding.
+        conn.execute(
+            "INSERT INTO journal_enrichment
+                (source_path, task, status, attempts, last_error, last_run_at, updated_at)
+             VALUES (?1, ?2, 'pending', 0, '', '', ?3)
+             ON CONFLICT(source_path, task) DO NOTHING",
+            params![source_path, task, now],
+        )
+        .context("Failed to ensure journal_enrichment row")?;
+    }
+    Ok(())
+}
+
+/// Set the status of a single (source_path, task) row, bumping `attempts` on
+/// every non-`done` write and stamping `last_run_at` / `updated_at`. Creates
+/// the row if it does not exist (defensive — matches how the loop calls it).
+pub fn set_journal_enrichment(
+    workspace_dir: &Path,
+    source_path: &str,
+    task: &str,
+    status: &str,
+    last_error: Option<&str>,
+) -> Result<()> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let now = Utc::now().to_rfc3339();
+    let err = last_error.unwrap_or("").trim();
+    // attempts increments on every write that is not a clean `done`, so a
+    // flaky task's retry count is visible in the panel and the TS cap applies.
+    let attempt_bump = if status == "done" { 0 } else { 1 };
+    conn.execute(
+        "INSERT INTO journal_enrichment
+            (source_path, task, status, attempts, last_error, last_run_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+         ON CONFLICT(source_path, task) DO UPDATE SET
+            status = excluded.status,
+            attempts = journal_enrichment.attempts + excluded.attempts,
+            last_error = excluded.last_error,
+            last_run_at = excluded.last_run_at,
+            updated_at = excluded.updated_at",
+        params![source_path, task, status, attempt_bump, err, now],
+    )
+    .context("Failed to set journal_enrichment status")?;
+    Ok(())
+}
+
+/// All enrichment rows for one journal (used by the loop's per-journal checks).
+pub fn get_journal_enrichment(
+    workspace_dir: &Path,
+    source_path: &str,
+) -> Result<Vec<JournalEnrichmentRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT source_path, task, status, attempts, last_error, last_run_at, updated_at
+         FROM journal_enrichment
+         WHERE source_path = ?1
+         ORDER BY task ASC",
+    )?;
+    let rows = stmt.query_map(params![source_path], |row| {
+        Ok(JournalEnrichmentRecord {
+            source_path: row.get(0)?,
+            task: row.get(1)?,
+            status: row.get(2)?,
+            attempts: row.get(3)?,
+            last_error: row.get(4)?,
+            last_run_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Up to `limit` rows still in `pending` status, oldest-updated first — the
+/// loop's work queue. `limit` keeps a single pass bounded on a phone.
+pub fn list_pending_journal_enrichment(
+    workspace_dir: &Path,
+    limit: usize,
+) -> Result<Vec<JournalEnrichmentRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let lim = i64::try_from(limit.max(1)).unwrap_or(64);
+    let mut stmt = conn.prepare(
+        "SELECT source_path, task, status, attempts, last_error, last_run_at, updated_at
+         FROM journal_enrichment
+         WHERE status = 'pending'
+         ORDER BY updated_at ASC, source_path ASC, task ASC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![lim], |row| {
+        Ok(JournalEnrichmentRecord {
+            source_path: row.get(0)?,
+            task: row.get(1)?,
+            status: row.get(2)?,
+            attempts: row.get(3)?,
+            last_error: row.get(4)?,
+            last_run_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Every row — drives the AI Activity "Enrichment progress" summary.
+pub fn list_all_journal_enrichment(
+    workspace_dir: &Path,
+) -> Result<Vec<JournalEnrichmentRecord>> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    let mut stmt = conn.prepare(
+        "SELECT source_path, task, status, attempts, last_error, last_run_at, updated_at
+         FROM journal_enrichment
+         ORDER BY source_path ASC, task ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(JournalEnrichmentRecord {
+            source_path: row.get(0)?,
+            task: row.get(1)?,
+            status: row.get(2)?,
+            attempts: row.get(3)?,
+            last_error: row.get(4)?,
+            last_run_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Delete every row for a journal — called when the journal itself is deleted,
+/// so the status map never references a removed file.
+pub fn delete_journal_enrichment(workspace_dir: &Path, source_path: &str) -> Result<()> {
+    let conn = open_conn(&db_path(workspace_dir))?;
+    conn.execute(
+        "DELETE FROM journal_enrichment WHERE source_path = ?1",
+        params![source_path],
+    )
+    .context("Failed to delete journal_enrichment rows")?;
+    Ok(())
+}
+
 pub fn list_feed_web_sources(workspace_dir: &Path) -> Result<Vec<FeedWebSourceRecord>> {
     let conn = open_conn(&db_path(workspace_dir))?;
     let mut stmt = conn.prepare(
@@ -2638,6 +2834,24 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_workspace_synth_sources_updated
             ON workspace_synth_sources(updated_at);
 
+        -- Per-journal AI/transcription task status. One row per (journal path,
+        -- task). Seeded `pending` on capture; moved to `done`/`error`/`skipped`
+        -- by the on-device enrichment loop as each task's precondition is met.
+        -- The loop converges: once all of a journal's tasks are terminal it is
+        -- never revisited. See web/src/hooks/useJournalEnrichmentLoop.ts.
+        CREATE TABLE IF NOT EXISTS journal_enrichment (
+            source_path TEXT NOT NULL,
+            task TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            last_run_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source_path, task)
+        );
+        CREATE INDEX IF NOT EXISTS idx_journal_enrichment_status
+            ON journal_enrichment(status, updated_at);
+
         CREATE TABLE IF NOT EXISTS feed_interests (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
@@ -2945,6 +3159,7 @@ mod tests {
         assert!(table_exists(&conn, "personalized_feed_state").unwrap());
         assert!(table_exists(&conn, "content_sources").unwrap());
         assert!(table_exists(&conn, "content_items").unwrap());
+        assert!(table_exists(&conn, "journal_enrichment").unwrap());
     }
 
     #[test]
@@ -4015,6 +4230,69 @@ mod tests {
 
         assert!(remove_feed_manual_interest(tmp.path(), "stoicism").unwrap());
         assert_eq!(list_feed_manual_interests(tmp.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn journal_enrichment_converges() {
+        // The convergence contract: ensure seeds pending rows; set moves them
+        // terminal; list_pending stops returning them; get shows the full map.
+        let tmp = test_workspace();
+        initialize(tmp.path()).unwrap();
+        let path = "journals/2026-07-13/converges.md";
+
+        let tasks = ["transcription", "title", "interests", "tweet"];
+        // Seed — idempotent: re-seeding must NOT reset progress.
+        ensure_journal_enrichment(tmp.path(), path, &tasks).unwrap();
+        ensure_journal_enrichment(tmp.path(), path, &tasks).unwrap();
+        let all = get_journal_enrichment(tmp.path(), path).unwrap();
+        assert_eq!(all.len(), 4);
+        assert!(all.iter().all(|r| r.status == "pending" && r.attempts == 0));
+
+        // All four are pending work.
+        let pending = list_pending_journal_enrichment(tmp.path(), 64).unwrap();
+        assert_eq!(pending.len(), 4);
+
+        // Drive three to done, one to error — simulating a loop pass each.
+        set_journal_enrichment(tmp.path(), path, "transcription", "done", None).unwrap();
+        set_journal_enrichment(tmp.path(), path, "title", "done", None).unwrap();
+        set_journal_enrichment(tmp.path(), path, "interests", "done", None).unwrap();
+        set_journal_enrichment(tmp.path(), path, "tweet", "error", Some("no output"))
+            .unwrap();
+
+        // The errored task is terminal `error`, so the work queue is now EMPTY.
+        // That is convergence: terminal rows leave the queue regardless of
+        // success/error/skip.
+        let pending_after = list_pending_journal_enrichment(tmp.path(), 64).unwrap();
+        assert!(pending_after.is_empty(), "terminal tasks must leave the queue");
+
+        // attempts only bumps on non-done writes (the error task, once).
+        let tweet_row = get_journal_enrichment(tmp.path(), path)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.task == "tweet")
+            .unwrap();
+        assert_eq!(tweet_row.status, "error");
+        assert_eq!(tweet_row.attempts, 1);
+        assert_eq!(tweet_row.last_error, "no output");
+
+        // A retry bumps attempts again and clears the error.
+        set_journal_enrichment(tmp.path(), path, "tweet", "done", None).unwrap();
+        let tweet_after = get_journal_enrichment(tmp.path(), path)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.task == "tweet")
+            .unwrap();
+        assert_eq!(tweet_after.status, "done");
+        assert_eq!(tweet_after.attempts, 1); // done does not bump
+        assert_eq!(tweet_after.last_error, ""); // cleared on success
+
+        // list_all returns every row for the panel.
+        assert_eq!(list_all_journal_enrichment(tmp.path()).unwrap().len(), 4);
+
+        // Deleting the journal cleans up its rows.
+        delete_journal_enrichment(tmp.path(), path).unwrap();
+        assert!(get_journal_enrichment(tmp.path(), path).unwrap().is_empty());
+        assert!(list_all_journal_enrichment(tmp.path()).unwrap().is_empty());
     }
 
 }
