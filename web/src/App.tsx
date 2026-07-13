@@ -8722,11 +8722,8 @@ Rules:
     }
   }, [mobileTab]);
 
-  // Auto-load Reads (Nostr articles) when the Reads tab is shown and empty.
-  // Catalog content (RSS/HN/YouTube/Bluesky) arrives via the backend world feed,
   // Auto-load the Reads social arm (Nostr notes + Bluesky search) when the
-  // Reads tab opens and the social stream is empty. Catalog content (articles,
-  // RSS, HN, YT) arrives via the backend world feed, polled independently.
+  // Reads tab opens and the social stream is empty.
   useEffect(() => {
     if (
       mobileTab === "reads" &&
@@ -8736,6 +8733,22 @@ Rules:
       void loadReadsFeed();
     }
   }, [mobileTab]);
+
+  // Trigger the backend world-feed fetch + background poll when the Reads tab
+  // opens. The world feed (/api/feed/personalized) carries ALL catalog content
+  // (RSS, HN, YouTube, Nostr articles + notes, Bluesky) through the Rust ranker.
+  // Without this, blueskyFeedItems stays empty on Reads and zero backend content
+  // reaches the rankedReads stream. fetchBlueskyFeed starts the poll itself when
+  // a refresh is in progress, so we only need to kick it off here.
+  useEffect(() => {
+    if (mobileTab === "reads" && chatGatewayToken && gatewayBaseUrl) {
+      void fetchBlueskyFeed();
+    }
+    // Stop the poll when leaving Reads (the Feed tab manages its own poll).
+    return () => {
+      if (mobileTab === "reads") stopFeedPoll();
+    };
+  }, [mobileTab, chatGatewayToken, gatewayBaseUrl]);
 
   useEffect(() => {
     let cancelled = false;
