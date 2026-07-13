@@ -161,6 +161,7 @@ pub struct FeedRefreshDiagnostics {
     pub nostr: FeedProtocolDiagnostics,
     pub bluesky: FeedProtocolDiagnostics,
     pub web: FeedProtocolDiagnostics,
+    pub bluesky_search: FeedProtocolDiagnostics,
     pub ranking: FeedRankingDiagnostics,
 }
 

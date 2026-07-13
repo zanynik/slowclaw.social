@@ -257,6 +257,7 @@ async fn build_prepared_world_feed_data(
     let rss_source = RssFeedSource::new(config);
     let nostr_source = NostrFeedSource::new(config);
     let web_source = WebSearchFeedSource::new(config);
+    let bluesky_search_source = BlueskySearchSource::new(config);
 
     // Use the freshest Bluesky auth: prefer the globally stored latest auth
     // (which may have been updated by a newer request while this task was running),
@@ -383,20 +384,51 @@ async fn build_prepared_world_feed_data(
         (selected, diagnostics, candidates)
     };
 
-    // Run all four source pipelines in parallel
+    let bluesky_search_future = async {
+        let mut diagnostics = FeedProtocolDiagnostics::default();
+        let mut selected = Vec::new();
+        let mut candidates = Vec::new();
+        match bluesky_search_source.discover_sources_with_diagnostics(&profile).await {
+            Ok((search_selected, mut discovered_diagnostics)) => {
+                match bluesky_search_source.fetch_candidates(&profile, &search_selected, limit_for_candidates()).await {
+                    Ok(search_candidates) => {
+                        discovered_diagnostics.candidate_count = search_candidates.len();
+                        candidates = search_candidates;
+                    }
+                    Err(err) => {
+                        tracing::warn!("Bluesky search candidate fetch failed: {err}");
+                        discovered_diagnostics.candidate_count = 0;
+                    }
+                }
+                selected = search_selected;
+                diagnostics = discovered_diagnostics;
+            }
+            Err(err) => {
+                tracing::warn!("Bluesky search source discovery failed: {err}");
+                diagnostics.available = false;
+                diagnostics.error = Some(format!("{err}"));
+            }
+        }
+        (selected, diagnostics, candidates)
+    };
+
+    // Run all five source pipelines in parallel
     let (
         (rss_selected, rss_diagnostics, mut candidates, mut selected_sources),
         (nostr_selected, nostr_diagnostics, nostr_candidates),
         (bluesky_selected, bluesky_diagnostics, bluesky_candidates),
         (web_selected, web_diagnostics, web_candidates),
-    ) = tokio::join!(rss_future, nostr_future, bluesky_future, web_future);
+        (bsky_search_selected, bsky_search_diagnostics, bsky_search_candidates),
+    ) = tokio::join!(rss_future, nostr_future, bluesky_future, web_future, bluesky_search_future);
 
     selected_sources.extend(nostr_selected);
     selected_sources.extend(bluesky_selected);
     selected_sources.extend(web_selected);
+    selected_sources.extend(bsky_search_selected);
     candidates.extend(nostr_candidates);
     candidates.extend(bluesky_candidates);
     candidates.extend(web_candidates);
+    candidates.extend(bsky_search_candidates);
 
     let _ = rss_selected; // already merged into candidates/selected_sources above
 
@@ -417,6 +449,10 @@ async fn build_prepared_world_feed_data(
         web_shortlisted = web_diagnostics.shortlisted_count,
         web_candidates = web_diagnostics.candidate_count,
         web_error = web_diagnostics.error.as_deref().unwrap_or("none"),
+        bsky_search_scanned = bsky_search_diagnostics.scanned_count,
+        bsky_search_shortlisted = bsky_search_diagnostics.shortlisted_count,
+        bsky_search_candidates = bsky_search_diagnostics.candidate_count,
+        bsky_search_error = bsky_search_diagnostics.error.as_deref().unwrap_or("none"),
         total_candidates = candidates.len(),
         selected_sources = selected_sources.len(),
         "World feed: source discovery complete"
@@ -430,6 +466,7 @@ async fn build_prepared_world_feed_data(
             nostr: nostr_diagnostics,
             bluesky: bluesky_diagnostics,
             web: web_diagnostics,
+            bluesky_search: bsky_search_diagnostics,
             ranking: FeedRankingDiagnostics {
                 candidate_count_before_ranking: candidates.len(),
                 ranked_item_count: 0,
@@ -2544,6 +2581,210 @@ impl FeedSource for BlueskyFeedSource {
     }
 }
 
+/// Anonymous Bluesky search source — hits the public AppView
+/// (`api.bsky.app/xrpc/app.bsky.feed.searchPosts`) with NO bearer auth,
+/// same as the frontend's `searchPublicBlueskyPosts`. This lets the world
+/// feed discover Bluesky social posts even when the user hasn't authenticated
+/// Bluesky (no `BlueskyAuth`). Keyword-driven: the user's strongest journal
+/// interest terms become search queries.
+struct BlueskySearchSource {
+    config: Config,
+}
+
+/// Cap on search queries per refresh (rate-limit-friendly for the anonymous
+/// public AppView endpoint).
+const BLUESKY_SEARCH_QUERY_LIMIT: usize = 3;
+/// Max posts per search query.
+const BLUESKY_SEARCH_RESULTS_PER_QUERY: usize = 30;
+/// The anonymous public AppView base URL (no auth required).
+const BLUESKY_PUBLIC_APPVIEW: &str = "https://api.bsky.app";
+
+impl BlueskySearchSource {
+    fn new(config: &Config) -> Self {
+        Self {
+            config: config.clone(),
+        }
+    }
+
+    async fn discover_sources_with_diagnostics(
+        &self,
+        profile: &FeedProfile,
+    ) -> Result<(Vec<SelectedSource>, FeedProtocolDiagnostics)> {
+        let keyword_weights = weighted_interest_keywords(profile);
+        let queries: Vec<String> = keyword_weights
+            .iter()
+            .map(|(term, _)| term.clone())
+            .take(BLUESKY_SEARCH_QUERY_LIMIT)
+            .collect();
+        let mut diagnostics = FeedProtocolDiagnostics {
+            available: true,
+            scanned_count: queries.len(),
+            ..FeedProtocolDiagnostics::default()
+        };
+        if queries.is_empty() {
+            diagnostics.error = Some("No interest terms to search Bluesky".to_string());
+            return Ok((Vec::new(), diagnostics));
+        }
+        let selected: Vec<SelectedSource> = queries
+            .into_iter()
+            .map(|query| SelectedSource {
+                protocol: FeedProtocol::Bluesky,
+                key: query.clone(),
+                label: format!("Bluesky search: {query}"),
+                stage1_score: keyword_weights
+                    .iter()
+                    .find(|(term, _)| *term == query)
+                    .map(|(_, weight)| *weight)
+                    .unwrap_or(0.1),
+                description: Some(format!("Bluesky posts about \u{201c}{query}\u{201d}")),
+                matched_interest_label: Some(query.clone()),
+                matched_interest_score: None,
+                metadata_json: serde_json::json!({ "query": query }),
+            })
+            .collect();
+        diagnostics.shortlisted_count = selected.len();
+        diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
+        Ok((selected, diagnostics))
+    }
+}
+
+#[async_trait]
+impl FeedSource for BlueskySearchSource {
+    async fn discover_sources(&self, profile: &FeedProfile) -> Result<Vec<SelectedSource>> {
+        Ok(self.discover_sources_with_diagnostics(profile).await?.0)
+    }
+
+    async fn fetch_candidates(
+        &self,
+        _profile: &FeedProfile,
+        selected_sources: &[SelectedSource],
+        _limit: usize,
+    ) -> Result<Vec<FeedCandidate>> {
+        let limit = BLUESKY_SEARCH_RESULTS_PER_QUERY.min(limit_for_candidates());
+        let mut candidates = Vec::new();
+        let mut seen_uris = BTreeSet::new();
+        for selected in selected_sources {
+            let Some(query) = selected
+                .metadata_json
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let posts = match fetch_bluesky_search_page(query, limit).await {
+                Ok(posts) => posts,
+                Err(err) => {
+                    tracing::debug!(query, error = %err, "Bluesky search query failed");
+                    continue;
+                }
+            };
+            for post_json in posts {
+                let uri = post_json
+                    .get("uri")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if uri.is_empty() || !seen_uris.insert(uri.clone()) {
+                    continue;
+                }
+                let text = post_json
+                    .get("record")
+                    .and_then(|r| r.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let author_handle = post_json
+                    .get("author")
+                    .and_then(|a| a.get("handle"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let created_at = post_json
+                    .get("record")
+                    .and_then(|r| r.get("createdAt"))
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| post_json.get("indexedAt").and_then(serde_json::Value::as_str))
+                    .unwrap_or("");
+                candidates.push(FeedCandidate {
+                    protocol: FeedProtocol::Bluesky,
+                    dedupe_key: uri.clone(),
+                    stage1_score: selected.stage1_score,
+                    rank_text: truncate_with_ellipsis(text.trim(), FEED_PROFILE_MAX_CHARS),
+                    item: PersonalizedFeedItem {
+                        source_type: FeedProtocol::Bluesky.source_type().to_string(),
+                        feed_item: post_json.clone(),
+                        web_preview: Some(WebFeedPreview {
+                            url: uri.clone(),
+                            title: author_handle.to_string(),
+                            description: truncate_with_ellipsis(text.trim(), 220),
+                            content_text: text.to_string(),
+                            image_url: None,
+                            domain: "bsky.app".to_string(),
+                            provider: "Bluesky".to_string(),
+                            provider_snippet: Some(selected.label.clone()),
+                            discovered_at: created_at.to_string(),
+                        }),
+                        feed_source: Some(FeedSourceContext {
+                            label: selected.label.clone(),
+                            description: selected.description.clone(),
+                            matched_interest_label: selected.matched_interest_label.clone(),
+                            matched_interest_score: selected.matched_interest_score,
+                            source_score: Some(selected.stage1_score),
+                        }),
+                        score: None,
+                        matched_interest_label: None,
+                        matched_interest_score: None,
+                        passed_threshold: false,
+                    },
+                    original_index: candidates.len(),
+                });
+            }
+        }
+        Ok(candidates)
+    }
+}
+
+/// Fetch a page of public Bluesky posts matching `query` via the anonymous
+/// AppView searchPosts endpoint. No auth required — same path the frontend uses.
+async fn fetch_bluesky_search_page(
+    query: &str,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let encoded_query = urlencoding::encode(query);
+    let url = format!(
+        "{base}/xrpc/app.bsky.feed.searchPosts?q={q}&limit={limit}&sort=top&lang=en",
+        base = BLUESKY_PUBLIC_APPVIEW,
+        q = encoded_query,
+        limit = limit.min(100),
+    );
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(BLUESKY_FETCH_TIMEOUT_SECS))
+        .user_agent("slowclaw-social/1.0")
+        .build()?
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .with_context(|| format!("Failed to search Bluesky posts for \"{query}\""))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Bluesky searchPosts failed ({status}): {body}");
+    }
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .with_context(|| "Failed to decode Bluesky searchPosts response")?;
+    Ok(json
+        .get("posts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
 #[derive(Clone)]
 struct NostrFeedSource {
     config: Config,
@@ -4357,6 +4598,83 @@ mod tests {
         // Description should be the sanitized text (HTML stripped), not raw CDATA.
         assert!(!entries[0].summary.contains("<p>"));
         assert!(!entries[0].summary.contains("<![CDATA["));
+    }
+
+    /// Verify that a Bluesky searchPosts response item maps correctly to a
+    /// PersonalizedFeedItem carrying the author handle, post text, and reply
+    /// count — the fields the frontend needs for social-card rendering.
+    #[test]
+    fn bluesky_search_candidate_carries_post_fields() {
+        let post_json = serde_json::json!({
+            "uri": "at://did:plc:abc/app.bsky.feed.post/123",
+            "cid": "bafy123",
+            "author": {
+                "did": "did:plc:abc",
+                "handle": "user.bsky.social",
+                "displayName": "Test User",
+                "avatar": "https://avt.bsky.app/test.png"
+            },
+            "record": {
+                "text": "Just shipped a local-first app that ranks content by journal relevance!",
+                "createdAt": "2026-07-13T10:00:00Z"
+            },
+            "likeCount": 42,
+            "repostCount": 5,
+            "replyCount": 12,
+            "indexedAt": "2026-07-13T10:01:00Z"
+        });
+
+        // Simulate the mapping BlueskySearchSource::fetch_candidates does.
+        let text = post_json
+            .get("record")
+            .and_then(|r| r.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let author_handle = post_json
+            .get("author")
+            .and_then(|a| a.get("handle"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+
+        let item = PersonalizedFeedItem {
+            source_type: FeedProtocol::Bluesky.source_type().to_string(),
+            feed_item: post_json.clone(),
+            web_preview: Some(WebFeedPreview {
+                url: "at://did:plc:abc/app.bsky.feed.post/123".to_string(),
+                title: author_handle.to_string(),
+                description: truncate_with_ellipsis(text.trim(), 220),
+                content_text: text.to_string(),
+                image_url: None,
+                domain: "bsky.app".to_string(),
+                provider: "Bluesky".to_string(),
+                provider_snippet: None,
+                discovered_at: "2026-07-13T10:00:00Z".to_string(),
+            }),
+            feed_source: None,
+            score: None,
+            matched_interest_label: None,
+            matched_interest_score: None,
+            passed_threshold: false,
+        };
+
+        // The feed_item JSON must carry author + counts for frontend rendering.
+        assert_eq!(item.source_type, "bluesky");
+        assert_eq!(
+            item.feed_item.get("author").and_then(|a| a.get("handle")).and_then(serde_json::Value::as_str),
+            Some("user.bsky.social")
+        );
+        assert_eq!(
+            item.feed_item.get("replyCount").and_then(serde_json::Value::as_u64),
+            Some(12)
+        );
+        assert_eq!(
+            item.feed_item.get("likeCount").and_then(serde_json::Value::as_u64),
+            Some(42)
+        );
+        // The preview must carry the post text for ranking + rendering.
+        let preview = item.web_preview.as_ref().expect("web_preview");
+        assert_eq!(preview.title, "user.bsky.social");
+        assert!(preview.description.contains("local-first app"));
     }
 
     struct MockEmbedder;
