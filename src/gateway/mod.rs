@@ -465,9 +465,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         openrouter_oauth: Arc::new(Mutex::new(None)),
     };
 
+    // Journal-inbox maintenance ensures the drop folders exist and queues any
+    // pending audio transcriptions on every surface. The workspace-synthesizer
+    // auto-trigger at the tail of the loop is desktop-only (mobile runs AI
+    // on-device via native bridges) — it is gated inside the loop body.
     start_journal_inbox_maintenance(state.clone());
 
-    // Core API/UI router (small request bodies)
+    // Core API/UI router (small request bodies). These routes are always
+    // registered on every surface, including the iOS/Android embedded gateway.
     let core_router = Router::new()
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
@@ -492,11 +497,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/chat/stream", get(handle_chat_stream))
         .route("/api/chat/result/stream", get(handle_chat_result_stream))
         .route(
-            "/api/feed/workflow-comment",
-            post(handle_feed_workflow_comment),
-        )
-        .route("/api/feed/workflow-settings", get(handle_feed_workflow_settings))
-        .route(
             "/api/feed/bluesky/personalized",
             post(handle_feed_personalized),
         )
@@ -504,28 +504,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/feed/web-preview", get(handle_feed_web_preview))
         .route("/api/sync/export", get(handle_sync_export))
         .route("/api/sync/import", post(handle_sync_import))
-        .route("/api/feed/workflow-run", post(handle_feed_workflow_run))
-        .route("/api/feed/workflow-auto-run", post(handle_feed_workflow_auto_run))
-        .route(
-            "/api/workspace/synthesizer/status",
-            get(handle_workspace_synthesizer_status),
-        )
-        .route(
-            "/api/workspace/synthesizer/skills",
-            get(handle_workspace_synthesizer_skills).patch(handle_workspace_synthesizer_skills_update),
-        )
-        .route(
-            "/api/workspace/synthesizer/stream",
-            get(handle_workspace_synthesizer_stream),
-        )
-        .route(
-            "/api/workspace/synthesizer/run",
-            post(handle_workspace_synthesizer_run),
-        )
-        .route(
-            "/api/workspace/synthesizer/auto-run",
-            post(handle_workspace_synthesizer_auto_run),
-        )
         .route(
             "/api/workspace/world-feed/interests",
             get(handle_world_feed_interests_list).post(handle_world_feed_interest_create),
@@ -565,7 +543,51 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ));
 
+    // Desktop-only router: workspace/article synthesizer + feed content-agent
+    // surface. Gated behind `desktop-synthesis` so the mobile embedded gateway
+    // does not register these routes. Mobile AI runs on-device instead.
+    #[cfg(feature = "desktop-synthesis")]
+    let desktop_synth_router = Router::new()
+        .route(
+            "/api/feed/workflow-comment",
+            post(handle_feed_workflow_comment),
+        )
+        .route("/api/feed/workflow-settings", get(handle_feed_workflow_settings))
+        .route("/api/feed/workflow-run", post(handle_feed_workflow_run))
+        .route(
+            "/api/feed/workflow-auto-run",
+            post(handle_feed_workflow_auto_run),
+        )
+        .route(
+            "/api/workspace/synthesizer/status",
+            get(handle_workspace_synthesizer_status),
+        )
+        .route(
+            "/api/workspace/synthesizer/skills",
+            get(handle_workspace_synthesizer_skills).patch(handle_workspace_synthesizer_skills_update),
+        )
+        .route(
+            "/api/workspace/synthesizer/stream",
+            get(handle_workspace_synthesizer_stream),
+        )
+        .route(
+            "/api/workspace/synthesizer/run",
+            post(handle_workspace_synthesizer_run),
+        )
+        .route(
+            "/api/workspace/synthesizer/auto-run",
+            post(handle_workspace_synthesizer_auto_run),
+        )
+        .with_state(state.clone())
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ));
+
     // Content-agent creation can take longer because it invokes the agent to author skills.
+    // Desktop-only (same gate as the synthesizer surface above).
+    #[cfg(feature = "desktop-synthesis")]
     let workflow_template_router = Router::new()
         .route(
             "/api/feed/workflow-settings",
@@ -609,8 +631,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     let app = Router::new()
         .merge(core_router)
-        .merge(workflow_template_router)
-        .merge(media_router)
+        .merge(media_router);
+    #[cfg(feature = "desktop-synthesis")]
+    let app = app
+        .merge(desktop_synth_router)
+        .merge(workflow_template_router);
+    let app = app
         .route("/_app/{*path}", get(static_files::handle_static))
         .fallback(get(static_files::handle_spa_fallback))
         .layer(desktop_cors_layer(&config));
@@ -2481,13 +2507,19 @@ fn start_journal_inbox_maintenance(state: AppState) {
                 );
             }
 
-            let (provider_ready, _) = workspace_synth_provider_readiness(&state).await;
-            if !provider_ready {
-                continue;
-            }
+            // Workspace-synthesizer background auto-trigger is desktop-only.
+            // The mobile embedded gateway opts out of `desktop-synthesis` and
+            // runs AI on-device via native bridges instead.
+            #[cfg(feature = "desktop-synthesis")]
+            {
+                let (provider_ready, _) = workspace_synth_provider_readiness(&state).await;
+                if !provider_ready {
+                    continue;
+                }
 
-            if let Err(err) = queue_workspace_synthesizer_for_trigger(&state, "app-open") {
-                tracing::warn!("Failed to queue workspace synth from inbox maintenance: {err}");
+                if let Err(err) = queue_workspace_synthesizer_for_trigger(&state, "app-open") {
+                    tracing::warn!("Failed to queue workspace synth from inbox maintenance: {err}");
+                }
             }
         }
     });

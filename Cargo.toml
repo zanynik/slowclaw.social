@@ -149,6 +149,16 @@ sandbox-bubblewrap = []
 landlock = ["sandbox-landlock"]
 # No-op feature flag referenced by cfg attributes in src/tools/file_read.rs
 rag-pdf = []
+# Workspace/article synthesizer + feed content-agent pipeline.
+#
+# Enabled by default for the desktop/CLI/daemon surfaces. The iOS and Android
+# Tauri crates opt out (see web/src-tauri/Cargo.toml) so the embedded gateway
+# that ships in the mobile app does not register the synthesizer routes
+# (`/api/workspace/synthesizer/*`), the feed content-agent routes
+# (`/api/feed/workflow-*`), or the background synthesizer auto-spawns.
+# Mobile AI features run on-device via the native bridges
+# (`nativeAiChat`, `transcribeAudio`) instead.
+desktop-synthesis = []
 
 [profile.release]
 opt-level = "z"      # Optimize for size

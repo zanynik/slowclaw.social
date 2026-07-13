@@ -30,6 +30,15 @@ nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 anyhow = "1"
 
+# Mobile targets (iOS, Android) opt the core crate OUT of `desktop-synthesis`
+# so the embedded gateway that ships in the mobile app does not register the
+# workspace/article synthesizer routes, the feed content-agent routes, or the
+# background synthesizer auto-spawns. Mobile AI features run on-device via the
+# native bridges (`nativeAiChat`, `transcribeAudio`) instead. Desktop (macOS,
+# Windows, Linux) keeps the default-on `desktop-synthesis` feature.
+[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
+zeroclaw = { package = "slowclaw", path = "../..", default-features = false }
+
 [features]
 default = []
 native-inference = ["dep:llama-cpp-2"]
