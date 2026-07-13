@@ -32,15 +32,15 @@ flowchart TB
     IP --> S1{"Stage 1 — discovery<br/>keyword-match source metadata"}
 
     subgraph SRC["Open-protocol sources"]
-        BS["Bluesky — feed generators<br/>XRPC getTimeline / getFeed"]
+        BS["Bluesky — authed timeline<br/>+ anonymous searchPosts"]
         RSS["RSS / Atom — curated catalog<br/>110+ sites, ETag + Last-Modified"]
-        NOS["Nostr — kind 1 notes + 30023 articles<br/>NIP-11 / NIP-66 relays"]
+        NOS["Nostr — kind 1 notes + 30023 articles<br/>hashtag-filtered, NIP-66 relays"]
         DDG["DuckDuckGo — open-web<br/>interest-keyword queries, free"]
     end
 
-    S1 -->|"match generator descriptions"| BS
+    S1 -->|"match generators + keyword search"| BS
     S1 -->|"match catalog topic tags"| RSS
-    S1 -->|"match relay metadata"| NOS
+    S1 -->|"match relay metadata + hashtags"| NOS
     S1 -->|"top interest terms → queries"| DDG
 
     BS --> S2["Stage 2 — candidate fetch<br/>parallel via tokio::join!"]
@@ -52,7 +52,7 @@ flowchart TB
     CACHE --> SERVE["GET /api/feed/personalized<br/>→ Reads stream"]
 ```
 
-> **Scope note.** The backend world feed ingests **RSS/Atom blogs (110+ catalog entries incl. Hacker News), YouTube channel feeds, Nostr (kind 1 text notes + kind 30023 long-form articles), Bluesky, and open-web (DuckDuckGo)** — all cached in SQLite and ranked by the journal-driven Rust ranker. The frontend **Reads** stream merges these backend-ranked items with **web-of-trust-gated social posts** (live Nostr notes + anonymous Bluesky search, fetched frontend-direct for the WoT gate), then applies the client-side journal-topic ranker on top. All article content flows through one backend pipeline; only the social gate stays client-side. DuckDuckGo web discovery is **off by default** — enable it under `[web_search]` to let your strongest journal interest terms drive open-web queries alongside the curated catalog.
+> **Scope note.** ALL content — **RSS/Atom blogs (110+ entries incl. Hacker News), YouTube channels, Nostr (kind 1 notes + 30023 articles), anonymous Bluesky search, and open-web (DuckDuckGo)** — flows through **one backend pipeline**: fetched by Rust, cached in SQLite, ranked by the journal-driven Rust ranker, served at `/api/feed/personalized`. The frontend **Reads** stream applies two client-side layers on top: a **web-of-trust post-filter** (social items only — built from your follows + contact list) and the **journal-topic ranker + on-device AI re-rank**. No frontend-direct fetching remains. DuckDuckGo web discovery is **off by default** — enable it under `[web_search]`.
 
 ### 2. Ranking — the journal is the lens
 
