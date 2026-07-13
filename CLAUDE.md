@@ -232,6 +232,9 @@ All contributors (human or agent) must follow the same collaboration flow:
 - Merge via PR controls (squash/rebase/merge as repository policy allows).
 - Branch deletion after merge is optional; long-lived branches are allowed when intentionally maintained.
 
+### 6.1.2 Never Trigger CI/CD or TestFlight Automatically (Required)
+**Agents must NEVER trigger release workflows (TestFlight, Docker, Homebrew, release publishes) or any `.github/workflows/*` run automatically.** Triggering a build is an explicit, human-only decision. This includes `gh workflow run`, `workflow_dispatch`, or intentionally pushing to trigger a `push:`-gated workflow. Builds cost real money, consume Apple signing slots, and land in TestFlight visibly to testers. Only trigger when the user explicitly asks. See `AGENTS.md` §6.1.2 (canonical).
+
 ### 6.2 Worktree Workflow (Required for Multi-Track Agent Work)
 
 Use Git worktrees to isolate concurrent agent/human tracks safely and predictably:

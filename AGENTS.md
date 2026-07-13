@@ -229,6 +229,13 @@ All contributors (human or agent) follow the same flow:
 - If the change is large, split it into multiple small commits before pushing (each independently buildable), per the reversibility principle in §3.8.
 - Re-confirm the current branch with `git rev-parse --abbrev-ref HEAD` before committing if there is any doubt; never accidentally commit onto `main`.
 
+### 6.1.2 Never Trigger CI/CD or TestFlight Automatically (Required)
+**Agents must NEVER trigger release workflows (TestFlight, Docker, Homebrew, release publishes) or any `.github/workflows/*` run automatically — not after a commit, not after a push, not as a "convenience".** Triggering a build is an explicit, human-only decision.
+- This includes `gh workflow run`, `workflow_dispatch`, pushing to trigger a `push:`-gated workflow intentionally, or any equivalent.
+- Builds cost real money (macOS runners), consume Apple signing-certificate slots, and land in TestFlight where they're visible to testers. An accidental trigger is a real-world side effect, not a local action.
+- If the user says "ship it", "deploy", "release", "trigger TestFlight", or explicitly names a workflow, that is authorization for that one run only. Approval in one session does not carry forward.
+- Pushing the branch is the checkpoint (per §6.1.1). The human decides when to build/release from that branch.
+
 ### 6.2 Worktree Workflow (Required for Multi-Track Agent Work)
 Use Git worktrees to isolate concurrent agent/human tracks safely:
 - One worktree per active branch/PR stream; do not mix unrelated edits in one worktree.
