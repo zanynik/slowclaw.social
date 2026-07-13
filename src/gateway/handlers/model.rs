@@ -21,7 +21,7 @@ use crate::gateway::{
     reset_workspace_synthesizer_status_for_provider_change,
 };
 
-const LOCAL_MODEL_DIR: &str = "local-models/llamacpp";
+pub const LOCAL_MODEL_DIR: &str = "local-models/llamacpp";
 
 #[derive(Clone, Copy, Debug)]
 pub struct LocalModelSpec {

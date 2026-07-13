@@ -406,48 +406,33 @@ async fn load_native_local_ai_state(
 }
 
 /// On iOS, the app container UUID changes on update/reinstall, making
-/// previously saved absolute model paths stale. This function tries to
-/// reconstruct the path under the current workspace directory.
+/// previously saved absolute model paths stale. On desktop the workspace root
+/// can likewise move. This function tries to reconstruct the path under the
+/// *current* `workspace_dir` rather than a hardcoded home layout.
 ///
 /// It also scans the models directory for any `.gguf` file matching the
 /// model_id pattern as a last resort.
-fn try_repair_model_path(model_id: &str, old_path: &str) -> Option<String> {
-    // Extract the relative suffix after workspace marker
-    // e.g. ".zeroclaw/workspace/local-models/llamacpp/<dir>/<file>.gguf"
-    let workspace_marker = ".zeroclaw/workspace/";
-    let relative_suffix = old_path
-        .find(workspace_marker)
-        .map(|i| &old_path[i + workspace_marker.len()..]);
+fn try_repair_model_path(model_id: &str, old_path: &str, workspace_dir: &Path) -> Option<String> {
+    use zeroclaw::gateway::handlers::model::{safe_local_model_dir_name, LOCAL_MODEL_DIR};
 
-    // Get the current home directory (works on iOS + macOS + Linux)
-    let home = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let workspace_dir = home.join(".zeroclaw").join("workspace");
+    // Reuse the canonical layout the catalog/downloader writes to so the
+    // repair search stays in sync with the writer.
+    let models_root = workspace_dir.join(LOCAL_MODEL_DIR);
 
-    // Strategy 1: reconstruct from the relative suffix
-    if let Some(suffix) = relative_suffix {
-        let candidate = workspace_dir.join(suffix);
+    // Strategy 1: re-root the layout-relative suffix under the current
+    // workspace. The marker is the models dir itself so this works on every
+    // platform (iOS `…/zeroclaw/workspace/local-models/…`,
+    // desktop `~/.zeroclaw/workspace/local-models/…`, custom `ZEROCLAW_*`).
+    if let Some(idx) = old_path.find(LOCAL_MODEL_DIR) {
+        let suffix = &old_path[idx + LOCAL_MODEL_DIR.len()..];
+        let candidate = models_root.join(suffix.trim_start_matches('/'));
         if candidate.is_file() {
             return Some(candidate.display().to_string());
         }
     }
 
-    // Strategy 2: look for the GGUF by model_id in the models directory
-    let model_dir_name: String = model_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let search_dir = workspace_dir
-        .join("local-models")
-        .join("llamacpp")
-        .join(&model_dir_name);
+    // Strategy 2: look for the GGUF by model_id in its models directory.
+    let search_dir = models_root.join(safe_local_model_dir_name(model_id));
     if search_dir.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&search_dir) {
             for entry in entries.flatten() {
@@ -459,8 +444,7 @@ fn try_repair_model_path(model_id: &str, old_path: &str) -> Option<String> {
         }
     }
 
-    // Strategy 3: scan ALL model directories for any .gguf file
-    let models_root = workspace_dir.join("local-models").join("llamacpp");
+    // Strategy 3: scan ALL model directories for any .gguf file.
     if models_root.is_dir() {
         if let Ok(dirs) = std::fs::read_dir(&models_root) {
             for dir_entry in dirs.flatten() {
@@ -482,7 +466,10 @@ fn try_repair_model_path(model_id: &str, old_path: &str) -> Option<String> {
     None
 }
 
-fn status_from_native_local_ai_state(saved: NativeLocalAiPersistedState) -> NativeLocalAiStatus {
+fn status_from_native_local_ai_state(
+    saved: NativeLocalAiPersistedState,
+    workspace_dir: &Path,
+) -> NativeLocalAiStatus {
     let mut model_path = saved.model_path.clone();
     let mut model_exists = std::path::Path::new(&model_path).is_file();
 
@@ -490,7 +477,7 @@ fn status_from_native_local_ai_state(saved: NativeLocalAiPersistedState) -> Nati
     // If the saved absolute path is stale, try to reconstruct it
     // from the current workspace directory.
     if !model_exists {
-        if let Some(repaired) = try_repair_model_path(&saved.model_id, &saved.model_path) {
+        if let Some(repaired) = try_repair_model_path(&saved.model_id, &saved.model_path, workspace_dir) {
             eprintln!(
                 "[native-ai] repaired stale model path: {} -> {}",
                 saved.model_path, repaired
@@ -804,7 +791,9 @@ pub(crate) async fn restart_embedded_gateway(
                 let mut model_path = saved.model_path.clone();
                 // Auto-repair stale model path (iOS container UUID changes)
                 if !std::path::Path::new(&model_path).is_file() {
-                    if let Some(repaired) = try_repair_model_path(&saved.model_id, &model_path) {
+                    if let Some(repaired) =
+                        try_repair_model_path(&saved.model_id, &model_path, &config.workspace_dir)
+                    {
                         eprintln!(
                             "[startup] repaired stale model path: {} -> {}",
                             model_path, repaired
@@ -2382,7 +2371,7 @@ async fn get_native_local_ai_status(
         )
     })? {
         sync_native_local_ai_env(&saved.model_id, &saved.model_path);
-        let restored = status_from_native_local_ai_state(saved);
+        let restored = status_from_native_local_ai_state(saved, &config.workspace_dir);
         {
             let mut guard = lock_native_local_ai_state(&state.inner)?;
             guard.status = restored.clone();
@@ -3278,4 +3267,98 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Build an isolated temp workspace under std's temp dir. The path is
+    /// unique per-test via the test's `&str` name so parallel runs don't clash.
+    fn temp_workspace(test_name: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("slowclaw-repair-tests-{}", std::process::id()));
+        dir.push(test_name);
+        fs::create_dir_all(&dir).expect("create temp workspace");
+        dir
+    }
+
+    /// Write an empty marker file shaped like a valid GGUF (magic header only).
+    /// `try_repair_model_path` only checks `.is_file()` + extension, so this is
+    /// enough for the test without shipping a real multi-GB model.
+    fn write_fake_gguf(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create model dir");
+        }
+        fs::write(path, b"GGUF").expect("write fake gguf");
+    }
+
+    /// Assert that a repaired path points to the same file as the canonical
+    /// gguf. Compares canonicalized forms so path-separator differences (e.g.
+    /// `/` in a stale iOS path vs `\` on Windows hosts) don't cause spurious
+    /// failures — what matters is that repair resolves to the right file.
+    fn assert_resolves_same_file(repaired: Option<String>, expected: &Path) {
+        let repaired = repaired.expect("repair should have found the gguf");
+        let repaired_path = Path::new(&repaired);
+        assert!(repaired_path.is_file(), "repaired path is not a file: {repaired}");
+        let repaired_canon = fs::canonicalize(repaired_path).expect("canonicalize repaired");
+        let expected_canon = fs::canonicalize(expected).expect("canonicalize expected");
+        assert_eq!(
+            repaired_canon, expected_canon,
+            "repaired path must resolve to the same file as the canonical gguf"
+        );
+    }
+
+    /// Repair by model_id: a stale old_path pointing nowhere is recovered by
+    /// scanning the model's directory under the current workspace.
+    #[test]
+    fn try_repair_finds_gguf_by_model_id() {
+        let workspace = temp_workspace("by_model_id");
+        let model_dir = workspace
+            .join(zeroclaw::gateway::handlers::model::LOCAL_MODEL_DIR)
+            .join(safe_local_model_id_dir("gemma-3-4b"));
+        let gguf = model_dir.join("model.gguf");
+        write_fake_gguf(&gguf);
+
+        // old_path is intentionally stale (wrong container UUID on iOS).
+        let old_path = "/var/mobile/Containers/Data/OLD-UUID/.../gemma-3-4b/model.gguf";
+        let repaired = try_repair_model_path("gemma-3-4b", old_path, &workspace);
+        assert_resolves_same_file(repaired, &gguf);
+    }
+
+    /// Repair by re-rooting the layout-relative suffix: the old path carries the
+    /// `local-models/llamacpp/<dir>/<file>.gguf` suffix under a different root,
+    /// and repair re-roots it under the current workspace.
+    #[test]
+    fn try_repair_reroots_relative_suffix() {
+        let workspace = temp_workspace("reroot_suffix");
+        let gguf = workspace
+            .join(zeroclaw::gateway::handlers::model::LOCAL_MODEL_DIR)
+            .join("qwen-2.5-1.5b")
+            .join("qwen.gguf");
+        write_fake_gguf(&gguf);
+
+        // Same layout, different root prefix (stale container UUID).
+        let old_path = "/var/mobile/Containers/Data/OLD-UUID/Library/Application Support/\
+                        com.slowclaw.app/zeroclaw/workspace/local-models/llamacpp/\
+                        qwen-2.5-1.5b/qwen.gguf";
+        let repaired = try_repair_model_path("qwen-2.5-1.5b", old_path, &workspace);
+        assert_resolves_same_file(repaired, &gguf);
+    }
+
+    /// When no GGUF exists anywhere under the workspace, repair returns None.
+    #[test]
+    fn try_repair_returns_none_when_no_gguf() {
+        let workspace = temp_workspace("no_gguf");
+        let repaired = try_repair_model_path("gemma-3-4b", "/stale/path/model.gguf", &workspace);
+        assert!(repaired.is_none());
+    }
+
+    /// Local copy of the model-id sanitizer so tests don't depend on the
+    /// private internals of the gateway handler beyond the public constant.
+    fn safe_local_model_id_dir(model_id: &str) -> String {
+        zeroclaw::gateway::handlers::model::safe_local_model_dir_name(model_id)
+    }
 }
