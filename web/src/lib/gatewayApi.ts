@@ -14,6 +14,36 @@ function isTauriDesktopRuntime(): boolean {
   return Boolean((window as any).__TAURI_INTERNALS__);
 }
 
+/**
+ * Detect the Tauri *mobile* runtime (iOS/Android app shell).
+ *
+ * Used as the runtime boundary for desktop/server-only gateway surfaces.
+ * The embedded gateway in the mobile build does not register the workspace
+ * synthesizer routes, the feed content-agent routes, or the background
+ * synthesizer auto-spawn (see the `desktop-synthesis` Cargo feature in the
+ * Rust core). Mobile AI features run on-device via native bridges
+ * (`nativeAiChat`, `transcribeAudio`) instead. The functions below use this
+ * guard to return idle/empty values rather than hitting routes that do not
+ * exist in the mobile gateway — keeping callers in App.tsx unchanged.
+ *
+ * Mirrors the detector in App.tsx / useAppStore.ts. Kept local to avoid a
+ * cross-module import cycle.
+ */
+function isTauriMobileRuntime(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return (
+    Boolean((window as any).__TAURI_MOBILE__) ||
+    (Boolean((window as any).__TAURI_INTERNALS__) && isMobileUserAgent())
+  );
+}
+
+function isMobileUserAgent(): boolean {
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+  return /iphone|ipad|ipod|android/i.test(ua);
+}
+
 function defaultGatewayBaseUrl(): string {
   if (typeof window === "undefined") {
     return "http://127.0.0.1:42617";
@@ -1401,6 +1431,10 @@ export async function submitFeedContentAgentComment(
   bearerToken?: string,
   gatewayBaseUrl?: string
 ): Promise<FeedContentAgentCommentResult> {
+  // Desktop/server-only route — no-op on mobile.
+  if (isTauriMobileRuntime()) {
+    return { queued: false, threadId: "", workflowKey: "", workflowBot: "" };
+  }
   const trimmedPath = path.trim();
   const trimmedComment = comment.trim();
   if (!trimmedPath || !trimmedComment) {
@@ -1467,6 +1501,10 @@ export async function listFeedContentAgents(
   bearerToken?: string,
   gatewayBaseUrl?: string
 ): Promise<FeedContentAgentItem[]> {
+  // Desktop/server-only route — no content agents configured on mobile.
+  if (isTauriMobileRuntime()) {
+    return [];
+  }
   const res = await fetch(resolveGatewayEndpoint("/api/feed/workflow-settings", gatewayBaseUrl), {
     headers: authHeaders(bearerToken)
   });
@@ -1480,6 +1518,10 @@ export async function updateFeedContentAgent(
   bearerToken?: string,
   gatewayBaseUrl?: string
 ): Promise<FeedContentAgentUpdateResult> {
+  // Desktop/server-only route — no-op on mobile.
+  if (isTauriMobileRuntime()) {
+    throw new Error("Feed content agents are not available on mobile.");
+  }
   const res = await fetch(resolveGatewayEndpoint("/api/feed/workflow-settings", gatewayBaseUrl), {
     method: "POST",
     headers: authHeaders(bearerToken, "application/json"),
@@ -1498,6 +1540,10 @@ export async function runFeedContentAgentNow(
   bearerToken?: string,
   gatewayBaseUrl?: string
 ): Promise<FeedContentAgentRunResult> {
+  // Desktop/server-only route — no-op on mobile.
+  if (isTauriMobileRuntime()) {
+    return { queued: false, threadId: "", workflowKey: "", workflowBot: "" };
+  }
   const key = workflowKey.trim();
   if (!key) {
     throw new Error("workflowKey is required");
@@ -1521,6 +1567,10 @@ export async function autoRunEligibleFeedContentAgents(
   bearerToken?: string,
   gatewayBaseUrl?: string
 ): Promise<FeedContentAgentAutoRunResult> {
+  // Desktop/server-only route — no background auto-run on mobile.
+  if (isTauriMobileRuntime()) {
+    return { queuedCount: 0, items: [] };
+  }
   const res = await fetch(resolveGatewayEndpoint("/api/feed/workflow-auto-run", gatewayBaseUrl), {
     method: "POST",
     headers: authHeaders(bearerToken, "application/json"),
@@ -1651,6 +1701,10 @@ export async function listWorkspaceSynthSkills(
   bearerToken?: string,
   gatewayBaseUrl?: string
 ): Promise<WorkspaceSynthSkillItem[]> {
+  // Desktop/server-only route — not registered in the mobile embedded gateway.
+  if (isTauriMobileRuntime()) {
+    return [];
+  }
   const res = await fetch(resolveGatewayEndpoint("/api/workspace/synthesizer/skills", gatewayBaseUrl), {
     headers: authHeaders(bearerToken)
   });
@@ -1664,6 +1718,10 @@ export async function updateWorkspaceSynthSkill(
   bearerToken?: string,
   gatewayBaseUrl?: string
 ): Promise<{ item: WorkspaceSynthSkillItem }> {
+  // Desktop/server-only route — no-op on mobile (no skill store to update).
+  if (isTauriMobileRuntime()) {
+    throw new Error("Workspace synthesizer skills are not available on mobile.");
+  }
   const res = await fetch(resolveGatewayEndpoint("/api/workspace/synthesizer/skills", gatewayBaseUrl), {
     method: "PATCH",
     headers: authHeaders(bearerToken, "application/json"),
@@ -1679,6 +1737,11 @@ export async function getWorkspaceSynthesizerStatus(
   bearerToken?: string,
   gatewayBaseUrl?: string
 ): Promise<WorkspaceSynthesizerStatus> {
+  // Desktop/server-only route — report idle on mobile so the UI shows a
+  // harmless empty state instead of erroring against a route that isn't there.
+  if (isTauriMobileRuntime()) {
+    return mapWorkspaceSynthStatusPayload({ status: "idle" });
+  }
   const res = await fetch(
     resolveGatewayEndpoint("/api/workspace/synthesizer/status", gatewayBaseUrl),
     {
@@ -1695,6 +1758,15 @@ export function streamWorkspaceSynthesizerStatus(
   gatewayBaseUrl?: string,
   onError?: (error: Error) => void
 ): GatewayEventStreamHandle {
+  // Desktop/server-only route — on mobile, emit a single idle snapshot and
+  // resolve immediately rather than opening an SSE stream to a missing route.
+  if (isTauriMobileRuntime()) {
+    onStatus(mapWorkspaceSynthStatusPayload({ status: "idle" }));
+    return {
+      close: () => {},
+      done: Promise.resolve()
+    };
+  }
   return openGatewayEventStream("/api/workspace/synthesizer/stream", {
     bearerToken,
     gatewayBaseUrl,
@@ -1710,6 +1782,10 @@ export async function runWorkspaceSynthesizerNow(
   bearerToken?: string,
   gatewayBaseUrl?: string
 ) : Promise<{ queued: boolean; threadId?: string; message?: string }> {
+  // Desktop/server-only route — no-op on mobile; AI generation runs on-device.
+  if (isTauriMobileRuntime()) {
+    return { queued: false, message: "Workspace synthesizer runs on desktop only." };
+  }
   const res = await fetch(resolveGatewayEndpoint("/api/workspace/synthesizer/run", gatewayBaseUrl), {
     method: "POST",
     headers: authHeaders(bearerToken, "application/json"),
@@ -1731,6 +1807,10 @@ export async function autoRunWorkspaceSynthesizer(
   bearerToken?: string,
   gatewayBaseUrl?: string
 ): Promise<{ queued: boolean; threadId?: string }> {
+  // Desktop/server-only route — no background auto-run on mobile.
+  if (isTauriMobileRuntime()) {
+    return { queued: false };
+  }
   const res = await fetch(
     resolveGatewayEndpoint("/api/workspace/synthesizer/auto-run", gatewayBaseUrl),
     {
@@ -1840,6 +1920,11 @@ export async function createFeedContentAgent(
   bearerToken?: string,
   gatewayBaseUrl?: string
 ): Promise<FeedContentAgentCreateResult> {
+  // Desktop/server-only route (content-agent authoring invokes the LLM to
+  // write a skill). Not available on mobile.
+  if (isTauriMobileRuntime()) {
+    throw new Error("Feed content agents are not available on mobile.");
+  }
   const name = String(payload?.name || "").trim();
   const goal = String(payload?.goal || "").trim();
   if (!name) {
