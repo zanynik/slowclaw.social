@@ -97,6 +97,7 @@ import { rankReads, chronologicalReads, gateSocialItems, applyAiRankBoost, type 
 import { tryParseJsonArray } from "./lib/json";
 import { useAiFeedRerank } from "./hooks/useAiFeedRerank";
 import { useJournalEnrichmentLoop } from "./hooks/useJournalEnrichmentLoop";
+import { useReadsThumbnails } from "./hooks/useReadsThumbnails";
 import { useLensProfile, notifyLensChange } from "./hooks/useLensProfile";
 import {
   loadCachedWoTSet,
@@ -7378,6 +7379,18 @@ Rules:
       ? applyAiRankBoost(baseDisplayReads, aiRerank.boost)
       : baseDisplayReads;
 
+  // Lazily resolve cover thumbnails for Reads cards that have a link but no
+  // image (notably RSS/blog articles from the content_items cache, which arrive
+  // without an OG image). Calls the existing /api/feed/web-preview endpoint,
+  // which is backed by feed_web_cache + an og:image fetcher. See
+  // hooks/useReadsThumbnails.ts. Returns a Map<itemId, imageUrl> merged onto
+  // each item's media.thumbnailUrl at render time.
+  const readsThumbnails = useReadsThumbnails({
+    items: displayReads,
+    bearerToken: chatGatewayToken,
+    gatewayBaseUrl,
+  });
+
   async function loadNostrFeed() {
     if (nostrFeedLoading) return;
     setNostrFeedLoading(true);
@@ -10408,7 +10421,12 @@ Rules:
                             rel="noreferrer"
                             onClick={(e) => { if (url === "#") { e.preventDefault(); return; } e.preventDefault(); void openFeedLink(url); }}
                           >
-                            {item.media.thumbnailUrl ? <img src={item.media.thumbnailUrl} alt="" className="reads-card-cover" loading="lazy" /> : null}
+                            {(() => {
+                              // Prefer the source-provided thumbnail; fall back to the
+                              // lazily-resolved OG image (see useReadsThumbnails).
+                              const cover = item.media.thumbnailUrl || readsThumbnails.get(item.id);
+                              return cover ? <img src={cover} alt="" className="reads-card-cover" loading="lazy" /> : null;
+                            })()}
                             <div className="reads-card-body">
                               <div className="reads-card-source-row">
                                 <span className="reads-card-source">{host || sourceLabel}</span>
