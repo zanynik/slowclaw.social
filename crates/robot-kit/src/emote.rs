@@ -139,14 +139,14 @@ impl EmoteTool {
 
         // Try to write to LED controller
         // Option 1: Write to FIFO/socket if LED daemon is running
-        let led_fifo = PathBuf::from("/tmp/zeroclaw_led.fifo");
+        let led_fifo = PathBuf::from("/tmp/slowclaw_led.fifo");
         if led_fifo.exists() {
             tokio::fs::write(&led_fifo, pattern_json).await?;
             return Ok(());
         }
 
         // Option 2: Shell out to LED control script
-        let output = tokio::process::Command::new("zeroclaw-led")
+        let output = tokio::process::Command::new("slowclaw-led")
             .args(["--pattern", &format!("{:?}", expr)])
             .output()
             .await;

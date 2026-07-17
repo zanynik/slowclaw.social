@@ -3607,6 +3607,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "slowclaw-robot-kit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "directories",
+ "reqwest",
+ "rppal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5175,27 +5196,6 @@ dependencies = [
  "quote",
  "syn 2.0.116",
  "synstructure",
-]
-
-[[package]]
-name = "zeroclaw-robot-kit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "directories",
- "reqwest",
- "rppal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "toml",
- "tracing",
 ]
 
 [[package]]
