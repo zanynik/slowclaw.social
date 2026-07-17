@@ -57,11 +57,11 @@ RUN --mount=type=cache,id=slowclaw-cargo-registry,target=/usr/local/cargo/regist
     strip /app/slowclaw
 
 # Prepare runtime directory structure and default config inline (no extra stage)
-RUN mkdir -p /slowclaw-data/.zeroclaw /slowclaw-data/workspace && \
-    cat > /slowclaw-data/.zeroclaw/config.toml <<EOF && \
+RUN mkdir -p /slowclaw-data/.slowclaw /slowclaw-data/workspace && \
+    cat > /slowclaw-data/.slowclaw/config.toml <<EOF && \
     chown -R 65534:65534 /slowclaw-data
 workspace_dir = "/slowclaw-data/workspace"
-config_path = "/slowclaw-data/.zeroclaw/config.toml"
+config_path = "/slowclaw-data/.slowclaw/config.toml"
 api_key = ""
 default_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4-20250514"
@@ -93,8 +93,8 @@ COPY --from=builder /slowclaw-data /slowclaw-data
 COPY --from=builder /app/slowclaw /usr/local/bin/slowclaw
 
 # Overwrite minimal config with DEV template (Ollama defaults)
-COPY dev/config.template.toml /slowclaw-data/.zeroclaw/config.toml
-RUN chown 65534:65534 /slowclaw-data/.zeroclaw/config.toml
+COPY dev/config.template.toml /slowclaw-data/.slowclaw/config.toml
+RUN chown 65534:65534 /slowclaw-data/.slowclaw/config.toml
 
 # Environment setup
 # Use consistent workspace path
