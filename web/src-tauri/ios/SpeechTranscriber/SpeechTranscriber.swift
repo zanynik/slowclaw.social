@@ -330,7 +330,7 @@ func slowclaw_transcribe_with_speech_analyzer(
     )
 
     let task = Task.detached(priority: .userInitiated) {
-        let result = transcribeFileWithSpeechAnalyzer(fileURL: fileURL, logger: logger)
+        let result = await transcribeFileWithSpeechAnalyzer(fileURL: fileURL, logger: logger)
         outcome = result
         done.signal()
     }
