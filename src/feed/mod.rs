@@ -1573,7 +1573,7 @@ async fn fetch_nostr_events(
         .await?;
     let _ = tokio::time::timeout(Duration::from_secs(2), client.shutdown()).await;
     let mut out: Vec<NostrEvent> = events.into_iter().collect();
-    out.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    out.sort_by_key(|e| std::cmp::Reverse(e.created_at));
     Ok(out)
 }
 
@@ -1606,13 +1606,12 @@ fn nostr_tag_value(event: &NostrEvent, name: &str) -> Option<String> {
     event
         .tags
         .iter()
-        .filter_map(|tag| {
+        .find_map(|tag| {
             let parts = tag.clone().to_vec();
             let key = parts.first()?;
             let value = parts.get(1)?;
             (key.as_str() == name).then(|| value.clone())
         })
-        .next()
         .filter(|value| !value.trim().is_empty())
 }
 

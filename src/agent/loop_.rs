@@ -1092,9 +1092,9 @@ fn default_param_for_tool(tool: &str) -> &'static str {
         | "edit_file" | "file_list" | "filelist" | "listfiles" | "list_files" => "path",
         // Memory recall and forget both default to "query"
         "memory_recall" | "memoryrecall" | "recall" | "memrecall" | "memory_forget"
-        | "memoryforget" | "forget" | "memforget" => "query",
+        | "memoryforget" | "forget" | "memforget" | "web_search_tool" | "web_search"
+        | "websearch" | "search_web" => "query",
         "memory_store" | "memorystore" | "store" | "memstore" => "content",
-        "web_search_tool" | "web_search" | "websearch" | "search_web" => "query",
         _ => "input",
     }
 }

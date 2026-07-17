@@ -45,6 +45,7 @@ pub async fn handle_openrouter_oauth_start(
 }
 
 /// GET /api/auth/openrouter/callback — browser redirect from OpenRouter.
+#[allow(clippy::implicit_hasher)] // axum Query extractor over the default HashMap hasher
 pub async fn handle_openrouter_oauth_callback(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,

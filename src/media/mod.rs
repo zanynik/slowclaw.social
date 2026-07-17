@@ -84,6 +84,7 @@ pub struct ComposeSimpleClipResult {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)] // capability flags: a bool per capability is the clear model
 pub struct MediaToolCapabilities {
     pub transcribe_media: bool,
     pub clean_audio: bool,

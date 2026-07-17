@@ -726,10 +726,7 @@ pub fn scrub_secret_patterns(input: &str) -> String {
 
     for prefix in PREFIXES {
         let mut search_from = 0;
-        loop {
-            let Some(rel) = scrubbed[search_from..].find(prefix) else {
-                break;
-            };
+        while let Some(rel) = scrubbed[search_from..].find(prefix) {
 
             let start = search_from + rel;
             let content_start = start + prefix.len();
@@ -850,7 +847,6 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
-        "slowclaw-local" | "local-native" | "native-local" => vec![],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
         "osaurus" => vec!["OSAURUS_API_KEY"],

@@ -6978,7 +6978,7 @@ async fn handle_workspace_synthesizer_run(
     let selection = match requested_path.clone() {
         Some(path) => match select_workspace_synth_sources(
             &workspace_dir,
-            &[path.clone()],
+            std::slice::from_ref(&path),
             body.force.unwrap_or(false),
         ) {
             Ok(selection) => selection,
@@ -10264,7 +10264,7 @@ fn collect_workspace_synth_source_candidates(
             });
         }
     }
-    items.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    items.sort_by_key(|i| std::cmp::Reverse(i.modified_at));
     items
 }
 

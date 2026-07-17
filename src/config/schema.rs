@@ -2600,6 +2600,7 @@ pub struct CustomTunnelConfig {
 struct ConfigWrapper<T: ChannelConfig>(std::marker::PhantomData<T>);
 
 impl<T: ChannelConfig> ConfigWrapper<T> {
+    #[allow(clippy::ref_option)] // param is unused (PhantomData type inference helper)
     fn new(_: &Option<T>) -> Self {
         Self(std::marker::PhantomData)
     }
