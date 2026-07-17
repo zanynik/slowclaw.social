@@ -34,3 +34,6 @@ venv/
 AuthKey_*.p8
 credentials.json
 .worktrees/
+
+# Agent-local working state (transient session plans, scratch)
+.zcode/
