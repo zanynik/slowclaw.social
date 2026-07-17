@@ -1,5 +1,5 @@
 """
-CLI entry point for zeroclaw-tools.
+CLI entry point for slowclaw-tools.
 """
 
 import argparse

@@ -422,7 +422,7 @@ fn try_repair_model_path(model_id: &str, old_path: &str, workspace_dir: &Path) -
     // Strategy 1: re-root the layout-relative suffix under the current
     // workspace. The marker is the models dir itself so this works on every
     // platform (iOS `…/zeroclaw/workspace/local-models/…`,
-    // desktop `~/.zeroclaw/workspace/local-models/…`, custom `ZEROCLAW_*`).
+    // desktop `~/.slowclaw/workspace/local-models/…`, custom `ZEROCLAW_*`).
     if let Some(idx) = old_path.find(LOCAL_MODEL_DIR) {
         let suffix = &old_path[idx + LOCAL_MODEL_DIR.len()..];
         let candidate = models_root.join(suffix.trim_start_matches('/'));

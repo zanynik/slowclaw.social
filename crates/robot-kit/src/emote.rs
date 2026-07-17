@@ -123,7 +123,7 @@ pub struct EmoteTool {
 impl EmoteTool {
     pub fn new(config: RobotConfig) -> Self {
         let sounds_dir = directories::UserDirs::new()
-            .map(|d| d.home_dir().join(".zeroclaw/sounds"))
+            .map(|d| d.home_dir().join(".slowclaw/sounds"))
             .unwrap_or_else(|| PathBuf::from("/usr/local/share/zeroclaw/sounds"));
 
         Self { config, sounds_dir }

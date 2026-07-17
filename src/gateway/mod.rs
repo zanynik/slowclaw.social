@@ -14115,7 +14115,7 @@ mod tests {
         let workspace = temp.path();
         let mut config = Config::default();
         config.workspace_dir = workspace.join("workspace");
-        config.config_path = workspace.join(".zeroclaw").join("config.toml");
+        config.config_path = workspace.join(".slowclaw").join("config.toml");
         config.default_provider = Some("openai-codex".to_string());
         config.api_key = None;
 
@@ -14132,7 +14132,7 @@ mod tests {
         let workspace = temp.path();
         let mut config = Config::default();
         config.workspace_dir = workspace.join("workspace");
-        config.config_path = workspace.join(".zeroclaw").join("config.toml");
+        config.config_path = workspace.join(".slowclaw").join("config.toml");
         config.default_provider = Some("ollama".to_string());
         config.api_key = None;
 

@@ -18,7 +18,7 @@ pub struct LookTool {
 impl LookTool {
     pub fn new(config: RobotConfig) -> Self {
         let capture_dir = directories::UserDirs::new()
-            .map(|d| d.home_dir().join(".zeroclaw/captures"))
+            .map(|d| d.home_dir().join(".slowclaw/captures"))
             .unwrap_or_else(|| PathBuf::from("/tmp/zeroclaw_captures"));
 
         // Ensure capture directory exists

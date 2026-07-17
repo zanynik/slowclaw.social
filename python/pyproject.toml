@@ -3,21 +3,21 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "zeroclaw-tools"
+name = "slowclaw-tools"
 version = "0.1.0"
-description = "Python companion package for ZeroClaw - LangGraph-based tool calling for consistent LLM agent execution"
+description = "Python companion package for SlowClaw - LangGraph-based tool calling for consistent LLM agent execution"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
-    { name = "ZeroClaw Community" }
+    { name = "SlowClaw Community" }
 ]
 keywords = [
     "ai",
     "llm",
     "agent",
     "langgraph",
-    "zeroclaw",
+    "slowclaw",
     "tool-calling",
 ]
 classifiers = [
@@ -39,7 +39,7 @@ dependencies = [
 ]
 
 [project.scripts]
-zeroclaw-tools = "zeroclaw_tools.__main__:main"
+slowclaw-tools = "slowclaw_tools.__main__:main"
 
 [project.optional-dependencies]
 discord = ["discord.py>=2.3.0"]
@@ -57,7 +57,7 @@ Repository = "https://github.com/zanynik/slowclaw.social"
 Issues = "https://github.com/zanynik/slowclaw.social/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["zeroclaw_tools"]
+packages = ["slowclaw_tools"]
 
 [tool.ruff]
 line-length = 100

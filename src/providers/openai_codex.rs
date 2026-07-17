@@ -114,10 +114,7 @@ impl OpenAiCodexProvider {
 }
 
 fn default_zeroclaw_dir() -> PathBuf {
-    directories::UserDirs::new().map_or_else(
-        || PathBuf::from(".zeroclaw"),
-        |dirs| dirs.home_dir().join(".zeroclaw"),
-    )
+    crate::config::schema::home_data_dir()
 }
 
 fn build_responses_url(base_or_endpoint: &str) -> anyhow::Result<String> {

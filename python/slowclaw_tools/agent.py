@@ -144,7 +144,7 @@ def create_agent(
 
     Example:
         ```python
-        from zeroclaw_tools import create_agent, shell, file_read
+        from slowclaw_tools import create_agent, shell, file_read
         from langchain_core.messages import HumanMessage
 
         agent = create_agent(

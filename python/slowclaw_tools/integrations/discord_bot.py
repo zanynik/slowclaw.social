@@ -26,7 +26,7 @@ class DiscordBot:
     Example:
         ```python
         import os
-        from zeroclaw_tools.integrations import DiscordBot
+        from slowclaw_tools.integrations import DiscordBot
 
         bot = DiscordBot(
             token=os.environ["DISCORD_TOKEN"],
@@ -52,7 +52,7 @@ class DiscordBot:
         if not DISCORD_AVAILABLE:
             raise ImportError(
                 "discord.py is required for Discord integration. "
-                "Install with: pip install zeroclaw-tools[discord]"
+                "Install with: pip install slowclaw-tools[discord]"
             )
 
         self.token = token

@@ -18,7 +18,7 @@ pub struct SpeakTool {
 impl SpeakTool {
     pub fn new(config: RobotConfig) -> Self {
         let audio_dir = directories::UserDirs::new()
-            .map(|d| d.home_dir().join(".zeroclaw/tts_cache"))
+            .map(|d| d.home_dir().join(".slowclaw/tts_cache"))
             .unwrap_or_else(|| PathBuf::from("/tmp/zeroclaw_tts"));
 
         let _ = std::fs::create_dir_all(&audio_dir);
@@ -36,7 +36,7 @@ impl SpeakTool {
         let model_path = directories::UserDirs::new()
             .map(|d| {
                 d.home_dir()
-                    .join(format!(".zeroclaw/models/piper/{}.onnx", voice))
+                    .join(format!(".slowclaw/models/piper/{}.onnx", voice))
             })
             .unwrap_or_else(|| PathBuf::from(format!("/usr/local/share/piper/{}.onnx", voice)));
 
@@ -100,7 +100,7 @@ impl SpeakTool {
     /// Play a sound effect
     async fn play_sound(&self, sound: &str) -> Result<()> {
         let sounds_dir = directories::UserDirs::new()
-            .map(|d| d.home_dir().join(".zeroclaw/sounds"))
+            .map(|d| d.home_dir().join(".slowclaw/sounds"))
             .unwrap_or_else(|| PathBuf::from("/usr/local/share/zeroclaw/sounds"));
 
         let sound_file = sounds_dir.join(format!("{}.wav", sound));

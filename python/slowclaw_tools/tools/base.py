@@ -29,7 +29,7 @@ def tool(
 
     Example:
         ```python
-        from zeroclaw_tools import tool
+        from slowclaw_tools import tool
 
         @tool
         def my_tool(query: str) -> str:

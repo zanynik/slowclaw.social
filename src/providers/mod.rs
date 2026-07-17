@@ -996,12 +996,7 @@ fn create_provider_with_url_and_options(
             let state_dir = options
                 .zeroclaw_dir
                 .clone()
-                .unwrap_or_else(|| {
-                    directories::UserDirs::new().map_or_else(
-                        || PathBuf::from(".zeroclaw"),
-                        |dirs| dirs.home_dir().join(".zeroclaw"),
-                    )
-                });
+                .unwrap_or_else(crate::config::schema::home_data_dir);
             let auth_service = AuthService::new(&state_dir, options.secrets_encrypt);
             Ok(Box::new(gemini::GeminiProvider::new_with_auth(
                 key,

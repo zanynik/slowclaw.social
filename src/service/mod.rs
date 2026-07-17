@@ -678,7 +678,7 @@ fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
                 let entry = String::from_utf8_lossy(&output.stdout);
                 let fields: Vec<&str> = entry.trim().split(':').collect();
                 if fields.len() >= 6 {
-                    return Some(PathBuf::from(fields[5]).join(".zeroclaw"));
+                    return Some(data_dir_under_home(PathBuf::from(fields[5])));
                 }
             }
         }
@@ -687,7 +687,24 @@ fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(PathBuf::from)
-        .map(|home| home.join(".zeroclaw"))
+        .map(data_dir_under_home)
+}
+
+/// Resolve the data dir under an explicit home, applying the same
+/// prefer-`~/.slowclaw` / fallback-`~/.zeroclaw` precedence as
+/// `config::schema::home_data_dir`. Used for resolving another user's
+/// config dir (e.g. via `SUDO_USER`), where the process home is not the
+/// target home.
+fn data_dir_under_home(home: PathBuf) -> PathBuf {
+    let slowclaw_dir = home.join(".slowclaw");
+    if slowclaw_dir.exists() {
+        return slowclaw_dir;
+    }
+    let legacy_dir = home.join(".zeroclaw");
+    if legacy_dir.exists() {
+        return legacy_dir;
+    }
+    slowclaw_dir
 }
 
 fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {

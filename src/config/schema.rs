@@ -3735,6 +3735,29 @@ fn default_config_dir() -> Result<PathBuf> {
     Ok(slowclaw_dir)
 }
 
+/// Resolve the on-disk data directory under the user's home, applying the
+/// same prefer-`~/.slowclaw` / fallback-`~/.zeroclaw` precedence as
+/// [`default_config_dir`]. Use this for any per-home path that must stay
+/// reachable across the legacy-name migration (provider auth, runtime state,
+/// service config).
+///
+/// Falls back to a relative `.slowclaw` when the home directory cannot be
+/// determined (mirrors the historical degenerate fallback).
+pub fn home_data_dir() -> PathBuf {
+    let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) else {
+        return PathBuf::from(".slowclaw");
+    };
+    let slowclaw_dir = home.join(".slowclaw");
+    if slowclaw_dir.exists() {
+        return slowclaw_dir;
+    }
+    let legacy_dir = home.join(".zeroclaw");
+    if legacy_dir.exists() {
+        return legacy_dir;
+    }
+    slowclaw_dir
+}
+
 /// Returns `true` if `path` lives under the OS temp directory.
 fn is_temp_directory(path: &Path) -> bool {
     let temp = std::env::temp_dir();
@@ -3770,15 +3793,18 @@ pub(crate) fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf
     }
 
     // Prefer a sibling `~/.slowclaw`; fall back to the legacy `~/.zeroclaw`
-    // for installs migrated from the legacy name.
+    // for installs migrated from the legacy name. Fresh installs resolve to
+    // the new `~/.slowclaw`.
     let parent = workspace_dir.parent();
     if let Some(parent) = parent {
         let slowclaw_dir = parent.join(".slowclaw");
         let legacy_dir = parent.join(".zeroclaw");
         let resolved_dir = if slowclaw_dir.exists() {
             slowclaw_dir
-        } else {
+        } else if legacy_dir.exists() {
             legacy_dir
+        } else {
+            slowclaw_dir
         };
         if resolved_dir.join("config.toml").exists() {
             return (resolved_dir, workspace_config_dir);
@@ -6817,12 +6843,12 @@ requires_openai_auth = true
     }
 
     #[test]
-    async fn load_or_init_workspace_suffix_uses_legacy_config_layout() {
+    async fn load_or_init_workspace_suffix_uses_default_config_layout() {
         let _env_guard = env_override_lock().await;
         let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("slowclaw_test_home_{}", uuid::Uuid::new_v4()));
         let workspace_dir = temp_home.join("workspace");
-        let legacy_config_path = temp_home.join(".zeroclaw").join("config.toml");
+        let default_config_path = temp_home.join(".slowclaw").join("config.toml");
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
@@ -6832,7 +6858,7 @@ requires_openai_auth = true
         let config = Config::load_or_init().await.unwrap();
 
         assert_eq!(config.workspace_dir, workspace_dir);
-        assert_eq!(config.config_path, legacy_config_path);
+        assert_eq!(config.config_path, default_config_path);
         assert!(config.config_path.exists());
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
