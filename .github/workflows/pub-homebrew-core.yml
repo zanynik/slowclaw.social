@@ -153,7 +153,7 @@ jobs:
                   perl -0pi -e "s|^  url \".*\"|  url \"${tarball_url}\"|m" "$formula_file"
                   perl -0pi -e "s|^  sha256 \".*\"|  sha256 \"${tarball_sha}\"|m" "$formula_file"
                   perl -0pi -e "s|^  license \".*\"|  license \"Apache-2.0 OR MIT\"|m" "$formula_file"
-                  perl -0pi -e 's|^  head "https://github\.com/zeroclaw-labs/zeroclaw\.git".*|  head "https://github.com/zeroclaw-labs/zeroclaw.git"|m' "$formula_file"
+                  perl -0pi -e 's|^  head "https://github\.com/zeroclaw-labs/zeroclaw\.git".*|  head "https://github.com/zanynik/slowclaw.social.git"|m' "$formula_file"
 
                   git -C "$repo_dir" diff -- "$FORMULA_PATH" > "$tmp_repo/formula.diff"
                   if [[ ! -s "$tmp_repo/formula.diff" ]]; then
