@@ -3,8 +3,6 @@
 This file defines the default working protocol for **all** coding agents (Claude, Codex, and any other automated contributor) in this repository.
 Scope: entire repository (`slowclaw.social`).
 
-> Note: A parallel `CLAUDE.md` exists for historical reasons and still uses the legacy "ZeroClaw" framing. `AGENTS.md` is the canonical, repo-wide protocol. Keep `CLAUDE.md` reconciled with this file when you touch shared guidance (see §4.2).
-
 ---
 
 ## 1) Project Snapshot (Read First)
@@ -13,7 +11,7 @@ Scope: entire repository (`slowclaw.social`).
 
 1. **Capture loop** — one workspace for journals, **audio-first** (the default), plus video and text. Capture stays on-device (transcription via the native iOS speech bridge, AI via on-device inference).
 2. **Feed loop (journal-driven curation)** — articles, news, and video flow *into* the user through curated surfaces ranked by **relevance to the user's own journals**, not generic popularity. This replaces third-party readers/aggregators and is the core differentiator: **the journal is the lens.**
-3. **Share/Connect loop** — the user distills their thinking into drafts, reviews them, and publishes out to open protocols (Bluesky short-form, Nostr long-form); discovery of people whose insights resonate flows back into the Feed loop.
+3. **Share/Connect loop** — Thoughts in Journals are distilled into drafts using on-device local AI and then user reviews them, and publishes out to open protocols (Bluesky/Nostr short-form, Nostr long-form); discovery of people whose insights resonate flows back into the Feed loop.
 
 The workspace lets a single user:
 
@@ -22,7 +20,7 @@ The workspace lets a single user:
 - curate personalized Bluesky/Nostr and web/article/**video** (incl. YouTube) feeds from local interests and cached sources
 - keep the core runtime, storage, and AI workflows on their own machine
 
-**Primary product surface:** a desktop + mobile app (macOS, iOS today; Android in progress) built with **Tauri 2** wrapping a **React + TypeScript** web UI, which embeds a **Rust** gateway/core. The same Rust + web codebase also ships a CLI, gateway, and daemon.
+**Primary product surface:** mobile app (iOS today; Minimal Mac/Desktop version in progress; Android maybe in the future) built with **Tauri 2** wrapping a **React + TypeScript** web UI, which embeds a **Rust** gateway/core. The same Rust + web codebase also ships a CLI, gateway, and daemon.
 
 > **🎯 iOS is the primary target.** This is first and foremost an **iOS app**. macOS/desktop, the CLI, gateway, and daemon are secondary surfaces. When adding AI-powered features (generation, extraction, synthesis, summarization, transcription), **default to the on-device path** — `web/src-tauri/src/inference.rs` (llama.cpp/GGUF on iPhone, exposed to JS as `nativeAiChat`) and `web/src-tauri/src/transcription.rs` (Speech.framework on iOS, exposed as `transcribeAudio`). Do **not** build new capture/synthesis features on the desktop gateway + remote-LLM-provider path (`src/gateway/workspace_synthesizer.rs`, skills, `posts/` materialization) when an on-device variant exists — the gateway/skill path is for desktop and server-style workflows only. Frontend on-device features gate on `isTauriMobileRuntime() && nativeLocalAiStatus?.available`. Treat the existing TweetClaw (post generation) and Task Extraction features in `web/src/App.tsx` as the **reference pattern** for any new AI feature on this app.
 
@@ -30,7 +28,6 @@ The workspace lets a single user:
 
 - Repo / binary: `slowclaw.social` / binary `slowclaw` (crate `slowclaw`, package `slowclaw`)
 - Tauri bundle id: `com.slowclaw.app`, product name **SlowClaw Social**
-- Fork lineage: forked from the "ZeroClaw" runtime. This fork intentionally **removed** external chat channels (Telegram/Discord/Slack/etc.), the old dashboard REST/SSE/WebSocket API, and full-system file access. It **kept** workspace-only file policy, journals, feed generation, todos, events, transcript/clip planning, personalized feed surfaces, the CLI/gateway/daemon, cron + `workspace-script`, and the `memory/` folder structure.
 
 ### Architecture shape (three layers)
 
@@ -167,11 +164,11 @@ Treat documentation as a first-class product surface, not a post-merge artifact.
 > **Migration note:** Most doc *content* and several README/hub titles still say "ZeroClaw" (legacy from the fork). The full content rename + locale sync is a **separate, tracked migration**. This protocol governs *how* docs changes are made; do not opportunistically mass-rename "ZeroClaw" → "SlowClaw" inside unrelated PRs.
 
 Canonical entry points:
-- root READMEs: `README.md`, `README.zh-CN.md`, `README.ja.md`, `README.ru.md`, `README.fr.md`, `README.vi.md`
-- docs hubs: `docs/README.md`, `docs/README.zh-CN.md`, `docs/README.ja.md`, `docs/README.ru.md`, `docs/README.fr.md`, `docs/i18n/vi/README.md`
+- root READMEs: `README.md`
+- docs hubs: `docs/README.md`,
 - unified TOC: `docs/SUMMARY.md`
 
-Supported locales (current contract): `en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`.
+Supported locales (current contract): `en`
 
 Collection indexes: `docs/getting-started/README.md`, `docs/reference/README.md`, `docs/operations/README.md`, `docs/security/README.md`, `docs/hardware/README.md`, `docs/contributing/README.md`, `docs/project/README.md`.
 
@@ -180,12 +177,8 @@ Runtime-contract references (must track behavior changes): `docs/commands-refere
 Required docs governance rules:
 - Keep README/hub top navigation and quick routes intuitive and non-duplicative.
 - Keep entry-point parity across all supported locales when changing navigation architecture.
-- If a change touches docs IA, runtime-contract references, or user-facing wording in shared docs, perform i18n follow-through for currently supported locales **in the same PR** (update locale nav links + at minimum `commands-reference`, `config-reference`, `troubleshooting` for `fr` and `vi`; for Vietnamese treat `docs/i18n/vi/**` as canonical).
 - Keep proposal/roadmap docs explicitly labeled; avoid mixing proposal text into runtime-contract docs.
 - Keep project snapshots date-stamped and immutable once superseded.
-
-### 4.2 CLAUDE.md Reconciliation
-`CLAUDE.md` is a legacy per-tool agent file that still uses the "ZeroClaw" framing. When you change shared agent guidance in this `AGENTS.md`, mirror the substance in `CLAUDE.md` (or open a follow-up to do so). Do not let the two files drift on normative rules.
 
 ---
 
@@ -312,7 +305,6 @@ This is the primary user surface — treat it as first-class.
 - Treat docs navigation as product UX: preserve clear pathing README → docs hub → SUMMARY → category index.
 - Keep top-level nav concise; avoid duplicative links across adjacent nav blocks.
 - When runtime surfaces change, update related references (`commands/providers/channels/config/runbook/troubleshooting`).
-- Keep multilingual entry-point parity for all supported locales when nav or key wording changes (see §4.1).
 - For docs snapshots, add new date-stamped files for new sprints rather than rewriting historical context.
 
 ---
@@ -471,7 +463,6 @@ When working in fast iterative mode:
 ---
 
 ## 13) Reference Docs
-- [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - [`SECURITY.md`](SECURITY.md)
 - [`docs/vision-contract.md`](docs/vision-contract.md)
 - [`docs/README.md`](docs/README.md) · [`docs/SUMMARY.md`](docs/SUMMARY.md) · [`docs/docs-inventory.md`](docs/docs-inventory.md)
