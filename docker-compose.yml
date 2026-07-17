@@ -8,11 +8,11 @@
 # For more info: https://github.com/zeroclaw-labs/zeroclaw
 
 services:
-  zeroclaw:
+  slowclaw:
     image: ghcr.io/zeroclaw-labs/zeroclaw:latest
     # Or build locally:
     # build: .
-    container_name: zeroclaw
+    container_name: slowclaw
     restart: unless-stopped
     
     environment:
@@ -35,7 +35,7 @@ services:
       
     volumes:
       # Persist workspace and config (must match WORKDIR/HOME in Dockerfile)
-      - zeroclaw-data:/zeroclaw-data
+      - slowclaw-data:/slowclaw-data
       
     ports:
       # Gateway API port (override HOST_PORT if 42617 is taken)
@@ -54,11 +54,11 @@ services:
     # Health check — uses lightweight status instead of full diagnostics.
     # For images with curl, prefer: curl -f http://localhost:42617/health
     healthcheck:
-      test: ["CMD", "zeroclaw", "status"]
+      test: ["CMD", "slowclaw", "status"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 10s
 
 volumes:
-  zeroclaw-data:
+  slowclaw-data:
