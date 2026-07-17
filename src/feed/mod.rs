@@ -1046,7 +1046,7 @@ fn state_is_stale(refreshed_at: &str) -> bool {
                 .signed_duration_since(value.with_timezone(&Utc))
                 .num_seconds()
         })
-        .map(|age| age < 0 || age > WORLD_FEED_CACHE_TTL_SECS)
+        .map(|age| !(0..=WORLD_FEED_CACHE_TTL_SECS).contains(&age))
         .unwrap_or(true)
 }
 
@@ -1361,9 +1361,12 @@ async fn fetch_nip66_relay_candidates(
     let filter = NostrFilter::new()
         .kind(NostrKind::from(NOSTR_NIP66_DISCOVERY_KIND))
         .since(NostrTimestamp::from_secs(
-            Utc::now()
-                .timestamp()
-                .saturating_sub(NOSTR_LOOKBACK_SECS as i64) as u64,
+            u64::try_from(
+                Utc::now()
+                    .timestamp()
+                    .saturating_sub(NOSTR_LOOKBACK_SECS as i64),
+            )
+            .unwrap_or(0),
         ))
         .limit(NOSTR_NIP66_DISCOVERY_EVENT_LIMIT);
     let events = client
@@ -1550,9 +1553,12 @@ async fn fetch_nostr_events(
     let mut filter = NostrFilter::new()
         .kinds([NostrKind::TextNote, NostrKind::from(30023)])
         .since(NostrTimestamp::from_secs(
-            Utc::now()
-                .timestamp()
-                .saturating_sub(NOSTR_LOOKBACK_SECS as i64) as u64,
+            u64::try_from(
+                Utc::now()
+                    .timestamp()
+                    .saturating_sub(NOSTR_LOOKBACK_SECS as i64),
+            )
+            .unwrap_or(0),
         ))
         .limit(limit);
     if !hashtags.is_empty() {
@@ -1618,10 +1624,10 @@ fn nostr_timestamp_to_rfc3339(timestamp: NostrTimestamp) -> String {
 }
 
 fn build_content_preview(item: &local_store::ContentItemRecord) -> WebFeedPreview {
-    let description = if !item.summary.trim().is_empty() {
-        item.summary.trim().to_string()
-    } else {
+    let description = if item.summary.trim().is_empty() {
         truncate_with_ellipsis(item.content_text.trim(), 220)
+    } else {
+        item.summary.trim().to_string()
     };
     // When the title is empty (some feeds omit it, or a dedup collision
     // clobbered it), fall back to the first meaningful line of content —
@@ -1816,6 +1822,7 @@ async fn resolve_feed_embedder(
     ))
 }
 
+#[allow(clippy::cast_possible_truncation)] // interest weights are small f64 narrowed to f32 score
 async fn rebuild_interest_profile(config: &Config) -> Result<FeedProfile> {
     let workspace_dir = &config.workspace_dir;
     let _ = local_store::decay_feed_keywords(workspace_dir, KEYWORD_PROFILE_DECAY_RATE)?;
@@ -2353,7 +2360,7 @@ fn extract_weighted_profile_keywords(label: &str, content: &str) -> Vec<(String,
         .take(KEYWORD_PROFILE_BATCH_LIMIT)
         .enumerate()
         .map(|(index, (term, score))| {
-            let normalized = (score / 6.0).clamp(0.2, 1.0) as f64;
+            let normalized = f64::from((score / 6.0).clamp(0.2, 1.0));
             let rank_bonus = (KEYWORD_PROFILE_BATCH_LIMIT.saturating_sub(index) as f64)
                 / (KEYWORD_PROFILE_BATCH_LIMIT as f64)
                 * 0.08;
@@ -2431,8 +2438,7 @@ fn sanitize_text_for_keyword_extraction(raw: &str) -> String {
                 .replace("https://", " ")
                 .replace("www.", " ")
                 .replace("```", " ")
-                .replace('`', " ")
-                .replace('|', " ")
+                .replace(['`', '|'], " ")
         })
         .filter(|line| {
             let trimmed = line.trim();
@@ -2597,11 +2603,11 @@ impl BlueskyFeedSource {
                 .partial_cmp(&left.stage1_score)
                 .unwrap_or(Ordering::Equal)
         });
-        let selected = if !ranked.is_empty() {
+        let selected = if ranked.is_empty() {
+            fallback_bluesky_selected_sources()
+        } else {
             ranked.truncate(BLUESKY_FEED_GENERATOR_MATCH_LIMIT);
             ranked
-        } else {
-            fallback_bluesky_selected_sources()
         };
         diagnostics.shortlisted_count = selected.len();
         diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
@@ -3211,10 +3217,7 @@ impl RssFeedSource {
         });
         // When both keyword and semantic matching fail, guarantee at least some
         // sources are shortlisted so the rest of the pipeline can produce items.
-        let selected = if !ranked.is_empty() {
-            ranked.truncate(RSS_SELECTED_SOURCE_LIMIT);
-            ranked
-        } else {
+        let selected = if ranked.is_empty() {
             tracing::info!(
                 "RSS source discovery: no keyword or semantic matches, using unranked fallback sources"
             );
@@ -3236,6 +3239,9 @@ impl RssFeedSource {
                     }),
                 })
                 .collect()
+        } else {
+            ranked.truncate(RSS_SELECTED_SOURCE_LIMIT);
+            ranked
         };
         diagnostics.shortlisted_count = selected.len();
         diagnostics.sampled_sources = selected.iter().take(6).cloned().collect();
@@ -3832,7 +3838,7 @@ async fn upsert_feed_entries(
     entries: Vec<ParsedFeedEntry>,
     discovered_at: &str,
 ) -> Result<()> {
-    for entry in entries.into_iter() {
+    for entry in entries {
         let embedding_text = content_item_embedding_text(&entry);
         if embedding_text.trim().is_empty() {
             continue;
@@ -3876,7 +3882,7 @@ fn content_source_is_stale(last_fetch_at: &str) -> bool {
                 .signed_duration_since(value.with_timezone(&Utc))
                 .num_seconds()
         })
-        .map(|age| age < 0 || age > RSS_CONTENT_REFRESH_TTL_SECS)
+        .map(|age| !(0..=RSS_CONTENT_REFRESH_TTL_SECS).contains(&age))
         .unwrap_or(true)
 }
 
@@ -5351,7 +5357,7 @@ mod tests {
             items[0].matched_interest_label.as_deref(),
             Some("Rust systems")
         );
-        assert_eq!(items[0].passed_threshold, false);
+        assert!(!items[0].passed_threshold);
         assert!(items[0].score.unwrap_or_default() > 0.0);
     }
 

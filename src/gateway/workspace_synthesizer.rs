@@ -146,18 +146,15 @@ pub struct WorkspaceSynthExtractorSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum WorkspaceSynthSkillHandlerKind {
+    #[default]
     SplitHandoff,
     ArticleHandoff,
     DirectPostOutput,
     DirectMediaOutput,
 }
 
-impl Default for WorkspaceSynthSkillHandlerKind {
-    fn default() -> Self {
-        Self::SplitHandoff
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkspaceSynthSkillSpec {
@@ -1273,10 +1270,10 @@ pub fn artifact_rules_from_markdown(markdown: &str) -> String {
 
 pub fn effective_artifact_rules(markdown: &str, override_text: &str) -> String {
     let trimmed_override = override_text.trim();
-    if !trimmed_override.is_empty() {
-        trimmed_override.to_string()
-    } else {
+    if trimmed_override.is_empty() {
         artifact_rules_from_markdown(markdown)
+    } else {
+        trimmed_override.to_string()
     }
 }
 
@@ -3524,10 +3521,10 @@ fn apply_source_path_renames(
             &title_for_record,
         ) {
             Ok(0) => {
-                tracing::warn!(old = old_rel, new = %candidate_rel, "journal rename: no DB rows matched")
+                tracing::warn!(old = old_rel, new = %candidate_rel, "journal rename: no DB rows matched");
             }
             Err(e) => {
-                tracing::warn!(old = old_rel, new = %candidate_rel, err = %e, "journal rename failed")
+                tracing::warn!(old = old_rel, new = %candidate_rel, err = %e, "journal rename failed");
             }
             _ => {}
         }

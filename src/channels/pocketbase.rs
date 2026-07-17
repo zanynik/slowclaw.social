@@ -271,7 +271,7 @@ impl Channel for PocketBaseChannel {
                     reply_target: thread_id.clone(),
                     content,
                     channel: "pocketbase".to_string(),
-                    timestamp: Utc::now().timestamp().max(0) as u64,
+                    timestamp: u64::try_from(Utc::now().timestamp()).unwrap_or(0),
                     // For PocketBase, `reply_target` is the thread; keep thread_ts aligned.
                     thread_ts: Some(thread_id),
                 };

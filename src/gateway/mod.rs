@@ -244,7 +244,7 @@ fn desktop_cors_allowed_origins(config: &Config) -> Vec<HeaderValue> {
         match HeaderValue::from_str(trimmed) {
             Ok(value) => origins.push(value),
             Err(err) => {
-                tracing::warn!(origin = trimmed, error = %err, "Skipping invalid desktop CORS origin")
+                tracing::warn!(origin = trimmed, error = %err, "Skipping invalid desktop CORS origin");
             }
         }
     }
@@ -3020,7 +3020,7 @@ fn workspace_synth_skill_run_state_timed(
     started_at: chrono::DateTime<Utc>,
     finished_at: chrono::DateTime<Utc>,
 ) -> workspace_synthesizer::WorkspaceSynthSkillRunState {
-    let duration_ms = (finished_at - started_at).num_milliseconds().max(0) as u64;
+    let duration_ms = u64::try_from((finished_at - started_at).num_milliseconds().max(0)).unwrap_or(0);
     workspace_synthesizer::WorkspaceSynthSkillRunState {
         skill_key: skill.key.clone(),
         name: skill.name.clone(),
@@ -8820,11 +8820,10 @@ async fn handle_library_delete(
         if let Some(legacy_caption_abs) =
             resolve_workspace_text_path(&workspace_dir, &legacy_caption_rel)
         {
-            if legacy_caption_abs.exists() && legacy_caption_abs.is_file() {
-                if tokio::fs::remove_file(&legacy_caption_abs).await.is_ok() {
+            if legacy_caption_abs.exists() && legacy_caption_abs.is_file()
+                && tokio::fs::remove_file(&legacy_caption_abs).await.is_ok() {
                     removed_related.push(legacy_caption_rel);
                 }
-            }
         }
     }
 
@@ -9365,7 +9364,7 @@ fn enqueue_transcription_job(
         )
         .await
         {
-            Ok(_) => {
+            Ok(()) => {
                 let workspace_dir = state_for_task.config.lock().workspace_dir.clone();
                 let (final_media_rel, final_transcript_rel) =
                     match relocate_inbox_audio_after_transcription(
@@ -9891,16 +9890,15 @@ fn collect_library_items_recursive(
             LibraryScope::Journal if is_feed_item => continue,
             _ => {}
         }
-        if is_feed_item {
-            if rel_lower.contains("/artifacts/")
+        if is_feed_item
+            && (rel_lower.contains("/artifacts/")
                 || rel_lower.contains("/pipeline/")
                 || rel_lower.ends_with(".srt")
                 || rel_lower.ends_with(".json")
-                || rel_lower.ends_with(".caption.txt")
+                || rel_lower.ends_with(".caption.txt"))
             {
                 continue;
             }
-        }
 
         let modified_at = meta
             .modified()
@@ -10875,7 +10873,7 @@ fn web_preview_cache_is_fresh(updated_at: &str) -> bool {
                 .signed_duration_since(value.with_timezone(&Utc))
                 .num_seconds()
         })
-        .map(|age| age >= 0 && age <= FEED_WEB_PREVIEW_CACHE_TTL_SECS)
+        .map(|age| (0..=FEED_WEB_PREVIEW_CACHE_TTL_SECS).contains(&age))
         .unwrap_or(false)
 }
 
@@ -11137,7 +11135,7 @@ fn content_source_is_stale(last_fetch_at: &str) -> bool {
                 .signed_duration_since(value.with_timezone(&Utc))
                 .num_seconds()
         })
-        .map(|age| age < 0 || age > CONTENT_SOURCE_REFRESH_TTL_SECS)
+        .map(|age| !(0..=CONTENT_SOURCE_REFRESH_TTL_SECS).contains(&age))
         .unwrap_or(true)
 }
 
@@ -11434,10 +11432,10 @@ fn content_preview_timestamp(item: &local_store::ContentItemRecord) -> String {
 }
 
 fn build_content_preview(item: &local_store::ContentItemRecord) -> WebFeedPreview {
-    let description = if !item.summary.trim().is_empty() {
-        item.summary.trim().to_string()
-    } else {
+    let description = if item.summary.trim().is_empty() {
         truncate_with_ellipsis(item.content_text.trim(), 220)
+    } else {
+        item.summary.trim().to_string()
     };
     WebFeedPreview {
         url: item.canonical_url.clone(),
@@ -11920,6 +11918,7 @@ async fn rebuild_interest_profile(
     })
 }
 
+#[allow(clippy::cast_possible_truncation)] // f64 health score narrowed to f32 match score
 fn best_interest_match(
     embedding: &[f32],
     interests: &[ActiveInterest],

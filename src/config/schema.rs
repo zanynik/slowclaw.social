@@ -514,6 +514,7 @@ fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjection
 
 /// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Default)]
 pub struct SkillsConfig {
     /// Enable loading and syncing the community open-skills repository.
     /// Default: `false` (opt-in).
@@ -529,15 +530,6 @@ pub struct SkillsConfig {
     pub prompt_injection_mode: SkillsPromptInjectionMode,
 }
 
-impl Default for SkillsConfig {
-    fn default() -> Self {
-        Self {
-            open_skills_enabled: false,
-            open_skills_dir: None,
-            prompt_injection_mode: SkillsPromptInjectionMode::default(),
-        }
-    }
-}
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2021,18 +2013,12 @@ impl Default for HooksConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Default)]
 pub struct BuiltinHooksConfig {
     /// Enable the command-logger hook (logs tool calls for auditing).
     pub command_logger: bool,
 }
 
-impl Default for BuiltinHooksConfig {
-    fn default() -> Self {
-        Self {
-            command_logger: false,
-        }
-    }
-}
 
 // ── Autonomy / Security ──────────────────────────────────────────
 
@@ -4846,7 +4832,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use tempfile::TempDir;
+    
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;

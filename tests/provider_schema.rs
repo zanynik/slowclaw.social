@@ -292,13 +292,11 @@ fn provider_construction_with_different_auth_styles() {
 
 #[test]
 fn chat_messages_maintain_role_sequence() {
-    let history = vec![
-        ChatMessage::system("You are helpful"),
+    let history = [ChatMessage::system("You are helpful"),
         ChatMessage::user("What is Rust?"),
         ChatMessage::assistant("Rust is a systems programming language"),
         ChatMessage::user("Tell me more"),
-        ChatMessage::assistant("It emphasizes safety and performance"),
-    ];
+        ChatMessage::assistant("It emphasizes safety and performance")];
 
     assert_eq!(history[0].role, "system");
     assert_eq!(history[1].role, "user");
@@ -309,13 +307,11 @@ fn chat_messages_maintain_role_sequence() {
 
 #[test]
 fn chat_messages_with_tool_calls_maintain_sequence() {
-    let history = vec![
-        ChatMessage::system("You are helpful"),
+    let history = [ChatMessage::system("You are helpful"),
         ChatMessage::user("Search for Rust"),
         ChatMessage::assistant("I'll search for that"),
         ChatMessage::tool(r#"{"tool_call_id": "tc_1", "content": "search results"}"#),
-        ChatMessage::assistant("Based on the search results..."),
-    ];
+        ChatMessage::assistant("Based on the search results...")];
 
     assert_eq!(history.len(), 5);
     assert_eq!(history[3].role, "tool");

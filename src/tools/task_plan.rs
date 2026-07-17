@@ -213,7 +213,7 @@ impl TaskPlanTool {
         let total = state.items.len();
 
         let mut lines = vec![format!("Tasks ({completed}/{total} completed):")];
-        for t in state.items.iter() {
+        for t in &state.items {
             lines.push(format!("- [{}] [{}] {}", t.id, t.status, t.title));
         }
 

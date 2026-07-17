@@ -71,7 +71,7 @@ impl FeedRanker {
         let negatives = &profile.negative_interests;
         let mut ranked = Vec::new();
         let mut has_strong_match = false;
-        for (candidate, embedding) in candidates_to_embed.into_iter().zip(embeddings.into_iter()) {
+        for (candidate, embedding) in candidates_to_embed.into_iter().zip(embeddings) {
             let (weighted_score, similarity, matched_label) =
                 best_interest_match(&embedding, &profile.interests);
             let penalty = negative_keyword_penalty(&candidate.rank_text, negatives);

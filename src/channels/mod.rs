@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 
 pub use cli::CliChannel;
 pub use context::{with_channel_execution_context, ChannelExecutionContext};
-pub use pocketbase::PocketBaseChannel;
 pub use traits::{Channel, SendMessage};
 
 pub mod email_channel {

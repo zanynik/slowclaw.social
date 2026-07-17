@@ -377,8 +377,7 @@ impl ContentMediaBackend for CommandContentMediaBackend {
         self.ensure_parent_dir(&output_abs)?;
         self.run_command(
             "ffmpeg",
-            &vec![
-                "-y".to_string(),
+            &["-y".to_string(),
                 "-i".to_string(),
                 input_abs.to_string_lossy().to_string(),
                 "-af".to_string(),
@@ -387,8 +386,7 @@ impl ContentMediaBackend for CommandContentMediaBackend {
                 "48000".to_string(),
                 "-ac".to_string(),
                 "1".to_string(),
-                output_abs.to_string_lossy().to_string(),
-            ],
+                output_abs.to_string_lossy().to_string()],
         )
         .await?;
         Ok(AudioTransformResult {
@@ -737,6 +735,7 @@ fn escape_ffmpeg_filter_path(path: &StdPath) -> String {
         .replace(':', "\\:")
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // bounded media duration (s -> ms)
 async fn ffprobe_duration_ms(path: &StdPath) -> Result<u64> {
     let output = tokio::time::timeout(
         Duration::from_secs(30),

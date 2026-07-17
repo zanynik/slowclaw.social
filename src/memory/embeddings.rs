@@ -84,6 +84,7 @@ impl HashEmbedding {
         hash
     }
 
+    #[allow(clippy::cast_possible_truncation)] // u64 hash -> usize bucket index is intentional
     fn add_hashed_feature(vector: &mut [f32], feature: &str, weight: f32) {
         if vector.is_empty() {
             return;

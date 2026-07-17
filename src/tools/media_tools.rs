@@ -369,15 +369,15 @@ impl Tool for RenderTextCardVideoTool {
             width: args
                 .get("width")
                 .and_then(|value| value.as_u64())
-                .map(|value| value as u32),
+                .map(|value| u32::try_from(value).unwrap_or(0)),
             height: args
                 .get("height")
                 .and_then(|value| value.as_u64())
-                .map(|value| value as u32),
+                .map(|value| u32::try_from(value).unwrap_or(0)),
             fps: args
                 .get("fps")
                 .and_then(|value| value.as_u64())
-                .map(|value| value as u32),
+                .map(|value| u32::try_from(value).unwrap_or(0)),
             theme: args
                 .get("theme")
                 .and_then(|value| value.as_str())
@@ -460,15 +460,15 @@ impl Tool for StitchImagesWithAudioTool {
             width: args
                 .get("width")
                 .and_then(|value| value.as_u64())
-                .map(|value| value as u32),
+                .map(|value| u32::try_from(value).unwrap_or(0)),
             height: args
                 .get("height")
                 .and_then(|value| value.as_u64())
-                .map(|value| value as u32),
+                .map(|value| u32::try_from(value).unwrap_or(0)),
             fps: args
                 .get("fps")
                 .and_then(|value| value.as_u64())
-                .map(|value| value as u32),
+                .map(|value| u32::try_from(value).unwrap_or(0)),
             output_path: output_path.to_string(),
         };
         match self.inner.backend.stitch_images_with_audio(&request).await {

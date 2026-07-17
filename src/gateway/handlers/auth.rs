@@ -6,7 +6,7 @@ use axum::{
 };
 use std::collections::HashMap;
 
-use crate::gateway::state::*;
+use crate::gateway::state::{AppState, OpenRouterOAuthSession, OpenRouterOAuthStatus};
 use crate::gateway::{pairing_auth_error, reset_workspace_synthesizer_status_for_provider_change};
 
 fn html_escape(s: &str) -> String {

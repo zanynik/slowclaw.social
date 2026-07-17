@@ -352,7 +352,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
             return Some(ParsedToolCall {
                 name,
                 arguments,
-                tool_call_id: tool_call_id,
+                tool_call_id,
             });
         }
     }
@@ -382,7 +382,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     Some(ParsedToolCall {
         name,
         arguments,
-        tool_call_id: tool_call_id,
+        tool_call_id,
     })
 }
 
@@ -1861,7 +1861,7 @@ pub(crate) async fn agent_turn(
     .await
 }
 
-fn prompt_tool_summaries<'a>(tools_registry: &'a [Box<dyn Tool>]) -> Vec<(&'a str, &'a str)> {
+fn prompt_tool_summaries(tools_registry: &[Box<dyn Tool>]) -> Vec<(&str, &str)> {
     tools_registry
         .iter()
         .map(|tool| (tool.name(), tool.description()))
@@ -2554,7 +2554,7 @@ pub(crate) async fn run_tool_call_loop(
         for ((idx, call), outcome) in executable_indices
             .iter()
             .zip(executable_calls.iter())
-            .zip(executed_outcomes.into_iter())
+            .zip(executed_outcomes)
         {
             runtime_trace::record_event(
                 "tool_call_result",
@@ -2599,15 +2599,13 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
-        for entry in ordered_results {
-            if let Some((tool_name, tool_call_id, outcome)) = entry {
-                individual_results.push((tool_call_id, outcome.output.clone()));
-                let _ = writeln!(
-                    tool_results,
-                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                    tool_name, outcome.output
-                );
-            }
+        for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+            individual_results.push((tool_call_id, outcome.output.clone()));
+            let _ = writeln!(
+                tool_results,
+                "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                tool_name, outcome.output
+            );
         }
 
         // Add assistant message with tool calls + tool results to history.

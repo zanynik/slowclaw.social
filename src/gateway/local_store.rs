@@ -3037,43 +3037,43 @@ fn init_schema(conn: &Connection) -> Result<()> {
     }
 
     ensure_column(
-        &conn,
+        conn,
         "feed_web_sources",
         "description",
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "feed_web_sources",
         "topics_csv",
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "feed_web_sources",
         "metadata_embedding",
         "BLOB NOT NULL DEFAULT X''",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "personalized_feed_state",
         "generation",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "feed_interests",
         "keywords_override",
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "feed_interest_sources",
         "profile_input_hash",
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "feed_interest_sources",
         "triage_keywords_json",
         "TEXT NOT NULL DEFAULT ''",
@@ -3082,7 +3082,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // negative (disliked-card). Additive migration; existing rows default to 0
     // (their pre-polarity positive-only behavior). See `FeedKeywordRecord`.
     ensure_column(
-        &conn,
+        conn,
         "feed_profile_keywords",
         "polarity",
         "INTEGER NOT NULL DEFAULT 0",
@@ -3812,7 +3812,7 @@ mod tests {
     fn non_empty_opt_trims_and_filters() {
         assert_eq!(non_empty_opt("hello".into()), Some("hello".into()));
         assert_eq!(non_empty_opt("  spaced  ".into()), Some("spaced".into()));
-        assert_eq!(non_empty_opt("".into()), None);
+        assert_eq!(non_empty_opt(String::new()), None);
         assert_eq!(non_empty_opt("   ".into()), None);
     }
 
