@@ -54,14 +54,14 @@ jobs:
                   load: true
                   provenance: false
                   sbom: false
-                  tags: zeroclaw-pr-smoke:latest
+                  tags: slowclaw-pr-smoke:latest
                   labels: ${{ steps.meta.outputs.labels || '' }}
                   platforms: linux/amd64
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
 
             - name: Verify image
-              run: docker run --rm zeroclaw-pr-smoke:latest --version
+              run: docker run --rm slowclaw-pr-smoke:latest --version
 
     publish:
         name: Build and Push Docker Image

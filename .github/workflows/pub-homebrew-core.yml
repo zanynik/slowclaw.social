@@ -26,7 +26,7 @@ jobs:
         runs-on: blacksmith-2vcpu-ubuntu-2404
         env:
             UPSTREAM_REPO: Homebrew/homebrew-core
-            FORMULA_PATH: Formula/z/zeroclaw.rb
+            FORMULA_PATH: Formula/s/slowclaw.rb
             RELEASE_TAG: ${{ inputs.release_tag }}
             DRY_RUN: ${{ inputs.dry_run }}
             BOT_FORK_REPO: ${{ vars.HOMEBREW_CORE_BOT_FORK_REPO }}
@@ -142,7 +142,7 @@ jobs:
                       upstream_ref="master"
                     fi
                     git -C "$repo_dir" fetch --depth=1 upstream "$upstream_ref"
-                    branch_name="zeroclaw-${RELEASE_TAG}-${GITHUB_RUN_ID}"
+                    branch_name="slowclaw-${RELEASE_TAG}-${GITHUB_RUN_ID}"
                     git -C "$repo_dir" checkout -B "$branch_name" "upstream/$upstream_ref"
                     echo "branch_name=$branch_name" >> "$GITHUB_OUTPUT"
                   fi
@@ -153,7 +153,7 @@ jobs:
                   perl -0pi -e "s|^  url \".*\"|  url \"${tarball_url}\"|m" "$formula_file"
                   perl -0pi -e "s|^  sha256 \".*\"|  sha256 \"${tarball_sha}\"|m" "$formula_file"
                   perl -0pi -e "s|^  license \".*\"|  license \"Apache-2.0 OR MIT\"|m" "$formula_file"
-                  perl -0pi -e 's|^  head "https://github\.com/zeroclaw-labs/zeroclaw\.git".*|  head "https://github.com/zanynik/slowclaw.social.git"|m' "$formula_file"
+                  perl -0pi -e 's|^  head "https://github\.com/[\w-]+/[\w.-]+\.git".*|  head "https://github.com/zanynik/slowclaw.social.git"|m' "$formula_file"
 
                   git -C "$repo_dir" diff -- "$FORMULA_PATH" > "$tmp_repo/formula.diff"
                   if [[ ! -s "$tmp_repo/formula.diff" ]]; then
@@ -185,7 +185,7 @@ jobs:
                   git -C "$repo_dir" config user.name "$fork_owner"
                   git -C "$repo_dir" config user.email "$bot_email"
                   git -C "$repo_dir" add "$FORMULA_PATH"
-                  git -C "$repo_dir" commit -m "zeroclaw ${tag_version}"
+                  git -C "$repo_dir" commit -m "slowclaw ${tag_version}"
                   if [[ -z "${GH_TOKEN:-}" ]]; then
                     echo "::error::Repository secret HOMEBREW_CORE_BOT_TOKEN is missing."
                     exit 1
@@ -193,9 +193,9 @@ jobs:
                   gh auth setup-git
                   git -C "$repo_dir" push --set-upstream origin "$branch_name"
 
-                  pr_title="zeroclaw ${tag_version}"
+                  pr_title="slowclaw ${tag_version}"
                   pr_body=$(cat <<EOF
-                  Automated formula bump from ZeroClaw release workflow.
+                  Automated formula bump from SlowClaw release workflow.
 
                   - Release tag: ${RELEASE_TAG}
                   - Source tarball: ${{ steps.release_meta.outputs.tarball_url }}
