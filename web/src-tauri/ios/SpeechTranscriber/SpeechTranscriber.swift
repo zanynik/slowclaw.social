@@ -349,9 +349,16 @@ func slowclaw_transcribe_with_speech_analyzer(
 /// Distinguishes failures that should abort (hard) from those that should fall
 /// back to the legacy path (soft). Permission denial is hard; engine/model/
 /// decode availability issues are soft.
-struct TranscribeFailure {
+///
+/// Conforms to `LocalizedError` because it is used as the `Failure` type of
+/// `Result<String, TranscribeFailure>`, whose `Failure` associated type must
+/// conform to `Error`. Surfacing `message` as `errorDescription` keeps the
+/// diagnostic readable if the value is ever logged as an error.
+struct TranscribeFailure: LocalizedError {
     let message: String
     let isHard: Bool
+
+    var errorDescription: String? { message }
 }
 
 /// Reference type so a `Task` can write a thrown error out for the caller to
@@ -473,7 +480,9 @@ private func transcribeFileWithSpeechAnalyzer(
         do {
             for try await result in transcriber.results {
                 if result.isFinal {
-                    await accumulator.append(String(result.text))
+                    // `result.text` is an `AttributedString` on iOS 26; its
+                    // `characters` view is the lossless plain-text content.
+                    await accumulator.append(String(result.text.characters))
                 }
             }
         } catch {
