@@ -225,8 +225,7 @@ impl LocalMiniLmEmbedder {
             .map(tokenizers::Encoding::len)
             .max()
             .unwrap_or(1)
-            .min(ALL_MINILM_MAX_TOKENS)
-            .max(1);
+            .clamp(1, ALL_MINILM_MAX_TOKENS);
 
         let mut input_ids = vec![0i64; batch_size * sequence_len];
         let mut attention_mask = vec![0i64; batch_size * sequence_len];

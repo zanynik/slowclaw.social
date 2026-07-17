@@ -3776,7 +3776,7 @@ async fn run_workspace_synth_split_skills_individually(
     state: &AppState,
     workspace_dir: &StdPath,
     orchestrator_workflow: &FeedContentAgentDefinition,
-    _orchestrator_skill_markdown: &str,
+    orchestrator_skill_markdown: &str,
     split_skills: &[(
         workspace_synthesizer::WorkspaceSynthSkillDefinition,
         workspace_synthesizer::WorkspaceSynthExtractorSpec,
@@ -3851,7 +3851,7 @@ async fn run_workspace_synth_split_skills_individually(
             run_workspace_synth_split_batch_call(
                 state,
                 orchestrator_workflow,
-                _orchestrator_skill_markdown,
+                orchestrator_skill_markdown,
                 &single_skill,
                 media_tool_summary,
                 target_sources,
@@ -9430,12 +9430,8 @@ async fn enqueue_journal_transcription(
     media_rel_path: String,
 ) -> Option<serde_json::Value> {
     let workspace_dir = state.config.lock().workspace_dir.clone();
-    let Some(abs_media_path) = resolve_workspace_media_path(&workspace_dir, &media_rel_path) else {
-        return None;
-    };
-    let Some(transcript_rel_path) = transcript_rel_path_for_media(&media_rel_path) else {
-        return None;
-    };
+    let abs_media_path = resolve_workspace_media_path(&workspace_dir, &media_rel_path)?;
+    let transcript_rel_path = transcript_rel_path_for_media(&media_rel_path)?;
     let transcript_json_path = transcript_json_rel_path(&transcript_rel_path);
     let transcript_srt_path = transcript_srt_rel_path(&transcript_rel_path);
     let transcript_abs_path = workspace_dir.join(&transcript_rel_path);

@@ -3214,7 +3214,6 @@ mod tests {
                 native_tool_calling: true,
                 vision: false,
             },
-            ..Default::default()
         };
         let tool_specs = vec![crate::tools::ToolSpec {
             name: "file_write".to_string(),
