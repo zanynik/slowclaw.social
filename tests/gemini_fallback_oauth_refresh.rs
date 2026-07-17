@@ -123,7 +123,7 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
 
     // Create GeminiProvider using the default factory
     // This will load auth from ~/.zeroclaw/auth-profiles.json (with expired token)
-    let provider = zeroclaw::providers::create_provider("gemini", None)?;
+    let provider = slowclaw::providers::create_provider("gemini", None)?;
 
     println!("Created Gemini provider with expired token");
 
@@ -221,7 +221,7 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
 #[ignore = "requires live Gemini OAuth credentials"]
 async fn gemini_warmup_with_valid_credentials() -> Result<()> {
     // Create provider from default config
-    let provider = zeroclaw::providers::create_provider("gemini", None)?;
+    let provider = slowclaw::providers::create_provider("gemini", None)?;
 
     println!("Created Gemini provider");
     println!("Calling warmup()...");

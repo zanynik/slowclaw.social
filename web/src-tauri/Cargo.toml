@@ -21,7 +21,7 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 keyring = "3"
-zeroclaw = { package = "slowclaw", path = "../.." }
+slowclaw = { path = "../.." }
 llama-cpp-2 = { version = "0.1.146", optional = true, features = ["metal"] }
 # Direct dep so the background ingester can drive a long-lived Nostr client
 # and subscriptions. Matches the core crate's version + feature set exactly
@@ -37,7 +37,7 @@ anyhow = "1"
 # native bridges (`nativeAiChat`, `transcribeAudio`) instead. Desktop (macOS,
 # Windows, Linux) keeps the default-on `desktop-synthesis` feature.
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
-zeroclaw = { package = "slowclaw", path = "../..", default-features = false }
+slowclaw = { path = "../..", default-features = false }
 
 [features]
 default = []

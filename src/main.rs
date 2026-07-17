@@ -82,7 +82,7 @@ mod workflow_assets;
 use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
-pub use zeroclaw::{
+pub use slowclaw::{
     ChannelCommands, IntegrationCommands, MigrateCommands, ServiceCommands, SkillCommands,
 };
 

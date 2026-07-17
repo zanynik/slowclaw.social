@@ -361,16 +361,16 @@ fn default_native_local_ai_status() -> NativeLocalAiStatus {
 
 fn sync_native_local_ai_env(model_id: &str, model_path: &str) {
     std::env::set_var(
-        zeroclaw::providers::local_native::ENV_NATIVE_MODEL_ID,
+        slowclaw::providers::local_native::ENV_NATIVE_MODEL_ID,
         model_id,
     );
     std::env::set_var(
-        zeroclaw::providers::local_native::ENV_NATIVE_MODEL_PATH,
+        slowclaw::providers::local_native::ENV_NATIVE_MODEL_PATH,
         model_path,
     );
 }
 
-fn native_local_ai_state_path(config: &zeroclaw::Config) -> PathBuf {
+fn native_local_ai_state_path(config: &slowclaw::Config) -> PathBuf {
     config
         .workspace_dir
         .join("state")
@@ -378,7 +378,7 @@ fn native_local_ai_state_path(config: &zeroclaw::Config) -> PathBuf {
 }
 
 async fn save_native_local_ai_state(
-    config: &zeroclaw::Config,
+    config: &slowclaw::Config,
     state: &NativeLocalAiPersistedState,
 ) -> Result<(), String> {
     let path = native_local_ai_state_path(config);
@@ -392,7 +392,7 @@ async fn save_native_local_ai_state(
 }
 
 async fn load_native_local_ai_state(
-    config: &zeroclaw::Config,
+    config: &slowclaw::Config,
 ) -> Result<Option<NativeLocalAiPersistedState>, String> {
     let path = native_local_ai_state_path(config);
     if !path.is_file() {
@@ -413,7 +413,7 @@ async fn load_native_local_ai_state(
 /// It also scans the models directory for any `.gguf` file matching the
 /// model_id pattern as a last resort.
 fn try_repair_model_path(model_id: &str, old_path: &str, workspace_dir: &Path) -> Option<String> {
-    use zeroclaw::gateway::handlers::model::{safe_local_model_dir_name, LOCAL_MODEL_DIR};
+    use slowclaw::gateway::handlers::model::{safe_local_model_dir_name, LOCAL_MODEL_DIR};
 
     // Reuse the canonical layout the catalog/downloader writes to so the
     // repair search stays in sync with the writer.
@@ -727,7 +727,7 @@ pub(crate) fn ensure_desktop_gateway_token() -> Result<String, String> {
 }
 
 async fn clear_provider_api_key_from_config() -> Result<(), String> {
-    let mut config = zeroclaw::Config::load_or_init()
+    let mut config = slowclaw::Config::load_or_init()
         .await
         .map_err(|e| format!("failed to load config: {e}"))?;
     if config.api_key.is_none() {
@@ -754,7 +754,7 @@ pub(crate) async fn restart_embedded_gateway(
         std::thread::sleep(Duration::from_millis(120));
     }
 
-    let mut config = zeroclaw::Config::load_or_init()
+    let mut config = slowclaw::Config::load_or_init()
         .await
         .map_err(|e| format!("failed to load config for embedded gateway: {e}"))?;
     let bind_host = "127.0.0.1".to_string();
@@ -831,7 +831,7 @@ pub(crate) async fn restart_embedded_gateway(
 
     let shared_for_gateway = shared.clone();
     let gateway_handle = tauri::async_runtime::spawn(async move {
-        let result = zeroclaw::gateway::run_gateway(&host, port, config).await;
+        let result = slowclaw::gateway::run_gateway(&host, port, config).await;
         if let Ok(mut guard) = shared_for_gateway.lock() {
             guard.running = false;
             guard.gateway_handle = None;
@@ -895,7 +895,7 @@ fn extract_first_url(line: &str) -> Option<String> {
 }
 
 async fn run_openai_auth_status_probe() -> Result<bool, String> {
-    zeroclaw::has_openai_codex_auth(None)
+    slowclaw::has_openai_codex_auth(None)
         .await
         .map_err(|err| format!("failed to check OpenAI auth status ({err})"))
 }
@@ -974,8 +974,8 @@ fn configure_app_owned_workspace(app: &tauri::App) {
 
 pub(crate) async fn load_workspace_config_for_ui(
     context: &str,
-) -> Result<zeroclaw::Config, String> {
-    zeroclaw::Config::load_or_init()
+) -> Result<slowclaw::Config, String> {
+    slowclaw::Config::load_or_init()
         .await
         .map_err(|e| ui_command_error(context, "Failed to load the workspace configuration.", e))
 }
@@ -1883,7 +1883,7 @@ async fn delete_journal(id: String) -> Result<(), String> {
     // already gone); a stale row would only re-seed a `pending` task that the
     // loop then skips when it can't read the file.
     if let Some(source_path) = rel_path_to_id(&config.workspace_dir, &path) {
-        let _ = zeroclaw::gateway::local_store::delete_journal_enrichment(
+        let _ = slowclaw::gateway::local_store::delete_journal_enrichment(
             &config.workspace_dir,
             &source_path,
         );
@@ -1919,13 +1919,13 @@ async fn save_journal_interest_keywords(
         .map_err(|e| format!("Failed to serialize interest keywords: {e}"))?;
     // Preserve interest_id/title across re-extraction; blank profile_input_hash
     // forces `rebuild_interest_profile` to recompute (no cache short-circuit).
-    let existing = zeroclaw::gateway::local_store::get_feed_interest_source(
+    let existing = slowclaw::gateway::local_store::get_feed_interest_source(
         &config.workspace_dir,
         &source_path,
     )
     .ok()
     .flatten();
-    let record = zeroclaw::gateway::local_store::FeedInterestSourceRecord {
+    let record = slowclaw::gateway::local_store::FeedInterestSourceRecord {
         source_path: source_path.clone(),
         content_hash,
         profile_input_hash: String::new(),
@@ -1937,12 +1937,12 @@ async fn save_journal_interest_keywords(
         triage_keywords_json,
         updated_at: unix_time_label(),
     };
-    zeroclaw::gateway::local_store::upsert_feed_interest_source(
+    slowclaw::gateway::local_store::upsert_feed_interest_source(
         &config.workspace_dir,
         &record,
     )
     .map_err(|e| format!("Failed to store interest keywords: {e}"))?;
-    zeroclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
+    slowclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
         .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
     Ok(())
 }
@@ -2002,7 +2002,7 @@ async fn ensure_journal_enrichment(
         None => ENRICHMENT_TASKS.iter().map(|s| s.to_string()).collect(),
     };
     let task_refs: Vec<&str> = task_list.iter().map(|s| s.as_str()).collect();
-    zeroclaw::gateway::local_store::ensure_journal_enrichment(
+    slowclaw::gateway::local_store::ensure_journal_enrichment(
         &config.workspace_dir,
         &source_path,
         &task_refs,
@@ -2029,7 +2029,7 @@ async fn set_journal_enrichment(
     }
     let config =
         load_workspace_config_for_ui("journal enrichment set config load failed").await?;
-    zeroclaw::gateway::local_store::set_journal_enrichment(
+    slowclaw::gateway::local_store::set_journal_enrichment(
         &config.workspace_dir,
         &source_path,
         &task,
@@ -2046,7 +2046,7 @@ async fn set_journal_enrichment(
 async fn list_journal_enrichment() -> Result<Vec<serde_json::Value>, String> {
     let config =
         load_workspace_config_for_ui("journal enrichment list config load failed").await?;
-    let rows = zeroclaw::gateway::local_store::list_all_journal_enrichment(&config.workspace_dir)
+    let rows = slowclaw::gateway::local_store::list_all_journal_enrichment(&config.workspace_dir)
         .map_err(|e| format!("Failed to list enrichment rows: {e}"))?;
     Ok(rows
         .into_iter()
@@ -2071,7 +2071,7 @@ async fn delete_journal_enrichment(source_path: String) -> Result<(), String> {
     validate_enrichment_source_path(&source_path)?;
     let config =
         load_workspace_config_for_ui("journal enrichment delete config load failed").await?;
-    zeroclaw::gateway::local_store::delete_journal_enrichment(&config.workspace_dir, &source_path)
+    slowclaw::gateway::local_store::delete_journal_enrichment(&config.workspace_dir, &source_path)
         .map_err(|e| format!("Failed to delete enrichment rows: {e}"))?;
     Ok(())
 }
@@ -2093,7 +2093,7 @@ async fn save_card_keywords(liked: Vec<String>, disliked: Vec<String>) -> Result
     // journal lens; re-liking reinforces.
     for raw in liked.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let term = raw.to_ascii_lowercase();
-        let existing = zeroclaw::gateway::local_store::list_feed_keywords_by_polarity(
+        let existing = slowclaw::gateway::local_store::list_feed_keywords_by_polarity(
             workspace_dir,
             0,
         )
@@ -2105,9 +2105,9 @@ async fn save_card_keywords(liked: Vec<String>, disliked: Vec<String>) -> Result
             Some(r) => (Some(r.id), (r.weight + 1.5).min(4.5), r.first_seen_at, r.source_count + 1),
             None => (None, 1.5_f64, now.clone(), 1),
         };
-        zeroclaw::gateway::local_store::upsert_feed_keyword(
+        slowclaw::gateway::local_store::upsert_feed_keyword(
             workspace_dir,
-            &zeroclaw::gateway::local_store::FeedKeywordUpsert {
+            &slowclaw::gateway::local_store::FeedKeywordUpsert {
                 id,
                 term,
                 weight,
@@ -2125,9 +2125,9 @@ async fn save_card_keywords(liked: Vec<String>, disliked: Vec<String>) -> Result
     // no-op (INSERT ON CONFLICT overwrites with the same weight).
     for raw in disliked.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let term = raw.to_ascii_lowercase();
-        zeroclaw::gateway::local_store::upsert_feed_keyword(
+        slowclaw::gateway::local_store::upsert_feed_keyword(
             workspace_dir,
-            &zeroclaw::gateway::local_store::FeedKeywordUpsert {
+            &slowclaw::gateway::local_store::FeedKeywordUpsert {
                 id: None,
                 term,
                 weight: 1.0_f64,
@@ -2140,7 +2140,7 @@ async fn save_card_keywords(liked: Vec<String>, disliked: Vec<String>) -> Result
         .map_err(|e| format!("Failed to store disliked keyword: {e}"))?;
     }
 
-    zeroclaw::feed::mark_world_feed_dirty(workspace_dir)
+    slowclaw::feed::mark_world_feed_dirty(workspace_dir)
         .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
     Ok(())
 }
@@ -2182,12 +2182,12 @@ async fn get_interest_profile() -> Result<InterestProfileSnapshot, String> {
     let workspace_dir = &config.workspace_dir;
 
     let overrides_map: std::collections::HashMap<String, f64> =
-        zeroclaw::gateway::local_store::list_feed_lens_overrides(workspace_dir)
+        slowclaw::gateway::local_store::list_feed_lens_overrides(workspace_dir)
             .map_err(|e| format!("Failed to read lens overrides: {e}"))?
             .into_iter()
             .map(|r| (r.term, r.multiplier))
             .collect();
-    let manual: Vec<String> = zeroclaw::gateway::local_store::list_feed_manual_interests(workspace_dir)
+    let manual: Vec<String> = slowclaw::gateway::local_store::list_feed_manual_interests(workspace_dir)
         .map_err(|e| format!("Failed to read manual interests: {e}"))?
         .into_iter()
         .map(|r| r.term)
@@ -2197,7 +2197,7 @@ async fn get_interest_profile() -> Result<InterestProfileSnapshot, String> {
     // Positives: derived keywords + manual interests, with lens multipliers
     // applied (mute drops, boost doubles). Mirrors rebuild_interest_profile.
     let mut positives: Vec<LensTerm> = Vec::new();
-    for kw in zeroclaw::gateway::local_store::list_feed_keywords_by_polarity(workspace_dir, 0)
+    for kw in slowclaw::gateway::local_store::list_feed_keywords_by_polarity(workspace_dir, 0)
         .map_err(|e| format!("Failed to read positive keywords: {e}"))?
     {
         let mult = overrides_map.get(&kw.term).copied().unwrap_or(1.0);
@@ -2225,7 +2225,7 @@ async fn get_interest_profile() -> Result<InterestProfileSnapshot, String> {
         });
     }
 
-    let negatives: Vec<LensTerm> = zeroclaw::gateway::local_store::list_feed_keywords_by_polarity(workspace_dir, 1)
+    let negatives: Vec<LensTerm> = slowclaw::gateway::local_store::list_feed_keywords_by_polarity(workspace_dir, 1)
         .map_err(|e| format!("Failed to read negative keywords: {e}"))?
         .into_iter()
         .map(|kw| LensTerm { label: kw.term, weight: kw.weight })
@@ -2247,9 +2247,9 @@ async fn get_interest_profile() -> Result<InterestProfileSnapshot, String> {
 #[tauri::command]
 async fn set_lens_override(term: String, multiplier: f64) -> Result<(), String> {
     let config = load_workspace_config_for_ui("set lens override config load failed").await?;
-    zeroclaw::gateway::local_store::set_feed_lens_override(&config.workspace_dir, &term, multiplier)
+    slowclaw::gateway::local_store::set_feed_lens_override(&config.workspace_dir, &term, multiplier)
         .map_err(|e| format!("Failed to set lens override: {e}"))?;
-    zeroclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
+    slowclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
         .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
     Ok(())
 }
@@ -2257,9 +2257,9 @@ async fn set_lens_override(term: String, multiplier: f64) -> Result<(), String> 
 #[tauri::command]
 async fn remove_lens_override(term: String) -> Result<(), String> {
     let config = load_workspace_config_for_ui("remove lens override config load failed").await?;
-    zeroclaw::gateway::local_store::remove_feed_lens_override(&config.workspace_dir, &term)
+    slowclaw::gateway::local_store::remove_feed_lens_override(&config.workspace_dir, &term)
         .map_err(|e| format!("Failed to remove lens override: {e}"))?;
-    zeroclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
+    slowclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
         .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
     Ok(())
 }
@@ -2267,9 +2267,9 @@ async fn remove_lens_override(term: String) -> Result<(), String> {
 #[tauri::command]
 async fn add_manual_interest(term: String) -> Result<(), String> {
     let config = load_workspace_config_for_ui("add manual interest config load failed").await?;
-    zeroclaw::gateway::local_store::add_feed_manual_interest(&config.workspace_dir, &term)
+    slowclaw::gateway::local_store::add_feed_manual_interest(&config.workspace_dir, &term)
         .map_err(|e| format!("Failed to add manual interest: {e}"))?;
-    zeroclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
+    slowclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
         .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
     Ok(())
 }
@@ -2277,9 +2277,9 @@ async fn add_manual_interest(term: String) -> Result<(), String> {
 #[tauri::command]
 async fn remove_manual_interest(term: String) -> Result<(), String> {
     let config = load_workspace_config_for_ui("remove manual interest config load failed").await?;
-    zeroclaw::gateway::local_store::remove_feed_manual_interest(&config.workspace_dir, &term)
+    slowclaw::gateway::local_store::remove_feed_manual_interest(&config.workspace_dir, &term)
         .map_err(|e| format!("Failed to remove manual interest: {e}"))?;
-    zeroclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
+    slowclaw::feed::mark_world_feed_dirty(&config.workspace_dir)
         .map_err(|e| format!("Failed to mark feed dirty: {e}"))?;
     Ok(())
 }
@@ -2433,7 +2433,7 @@ async fn get_openai_device_code_status(
 
 #[tauri::command]
 async fn get_anthropic_token_status() -> Result<AnthropicTokenStatus, String> {
-    match zeroclaw::has_anthropic_auth(None).await {
+    match slowclaw::has_anthropic_auth(None).await {
         Ok(true) => Ok(AnthropicTokenStatus {
             is_set: true,
             message: "Claude auth token is configured for this workspace.".to_string(),
@@ -2461,7 +2461,7 @@ async fn save_anthropic_token(
     if trimmed.is_empty() {
         return Err("Token cannot be empty.".to_string());
     }
-    zeroclaw::save_anthropic_token(trimmed).await.map_err(|e| {
+    slowclaw::save_anthropic_token(trimmed).await.map_err(|e| {
         ui_command_error(
             "anthropic token save failed",
             "Failed to save Claude token.",
@@ -2476,7 +2476,7 @@ async fn save_anthropic_token(
 async fn clear_anthropic_token(
     state: tauri::State<'_, GatewayState>,
 ) -> Result<AnthropicTokenStatus, String> {
-    zeroclaw::clear_anthropic_token().await.map_err(|e| {
+    slowclaw::clear_anthropic_token().await.map_err(|e| {
         ui_command_error(
             "anthropic token clear failed",
             "Failed to clear Claude token.",
@@ -2496,7 +2496,7 @@ async fn get_native_local_ai_status(
         return Ok(current);
     }
 
-    let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+    let config = slowclaw::Config::load_or_init().await.map_err(|e| {
         ui_command_error(
             "native local AI config load failed",
             "Failed to load local AI config.",
@@ -2540,7 +2540,7 @@ async fn configure_native_local_ai(
         return Err("Downloaded model file was not found on this device.".to_string());
     }
 
-    let mut config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+    let mut config = slowclaw::Config::load_or_init().await.map_err(|e| {
         ui_command_error(
             "native local AI config load failed",
             "Failed to load local AI config.",
@@ -2645,8 +2645,8 @@ async fn clear_native_local_ai_impl(
     let _ = std::fs::remove_file(&state_path);
 
     // 3. Unset the provider env vars so nothing points at the removed model.
-    std::env::remove_var(zeroclaw::providers::local_native::ENV_NATIVE_MODEL_ID);
-    std::env::remove_var(zeroclaw::providers::local_native::ENV_NATIVE_MODEL_PATH);
+    std::env::remove_var(slowclaw::providers::local_native::ENV_NATIVE_MODEL_ID);
+    std::env::remove_var(slowclaw::providers::local_native::ENV_NATIVE_MODEL_PATH);
 
     // 4. Reset the in-memory status to the unconfigured default.
     let status = default_native_local_ai_status();
@@ -2673,7 +2673,7 @@ async fn delete_local_model(
     state: tauri::State<'_, NativeLocalAiState>,
     gateway_state: tauri::State<'_, GatewayState>,
 ) -> Result<NativeLocalAiStatus, String> {
-    use zeroclaw::gateway::handlers::model::{
+    use slowclaw::gateway::handlers::model::{
         find_local_model_spec, local_model_file_path, safe_local_model_dir_name,
     };
     let config =
@@ -2927,9 +2927,9 @@ async fn nostr_store_status(
 #[tauri::command]
 async fn nostr_query_notes(
     req: NostrQueryRequest,
-) -> Result<Vec<zeroclaw::nostr_store::NoteRecord>, String> {
+) -> Result<Vec<slowclaw::nostr_store::NoteRecord>, String> {
     let workspace = nostr_workspace_dir().await?;
-    let query = zeroclaw::nostr_store::NoteQuery {
+    let query = slowclaw::nostr_store::NoteQuery {
         authors: if req.authors.is_empty() {
             None
         } else {
@@ -2950,7 +2950,7 @@ async fn nostr_query_notes(
         limit: req.limit,
     };
     tauri::async_runtime::spawn_blocking(move || {
-        zeroclaw::nostr_store::query_notes(&workspace, &query)
+        slowclaw::nostr_store::query_notes(&workspace, &query)
     })
     .await
     .map_err(|e| format!("nostr query task failed: {e}"))?
@@ -2960,10 +2960,10 @@ async fn nostr_query_notes(
 #[tauri::command]
 async fn nostr_get_note(
     event_id: String,
-) -> Result<Option<zeroclaw::nostr_store::NoteRecord>, String> {
+) -> Result<Option<slowclaw::nostr_store::NoteRecord>, String> {
     let workspace = nostr_workspace_dir().await?;
     tauri::async_runtime::spawn_blocking(move || {
-        zeroclaw::nostr_store::get_note(&workspace, &event_id)
+        slowclaw::nostr_store::get_note(&workspace, &event_id)
     })
     .await
     .map_err(|e| format!("nostr get_note task failed: {e}"))?
@@ -2973,10 +2973,10 @@ async fn nostr_get_note(
 #[tauri::command]
 async fn nostr_get_profiles(
     pubkeys: Vec<String>,
-) -> Result<Vec<zeroclaw::nostr_store::ProfileRecord>, String> {
+) -> Result<Vec<slowclaw::nostr_store::ProfileRecord>, String> {
     let workspace = nostr_workspace_dir().await?;
     tauri::async_runtime::spawn_blocking(move || {
-        zeroclaw::nostr_store::get_profiles(&workspace, &pubkeys)
+        slowclaw::nostr_store::get_profiles(&workspace, &pubkeys)
     })
     .await
     .map_err(|e| format!("nostr profiles task failed: {e}"))?
@@ -2989,7 +2989,7 @@ async fn nostr_get_reactions(
 ) -> Result<std::collections::HashMap<String, i64>, String> {
     let workspace = nostr_workspace_dir().await?;
     tauri::async_runtime::spawn_blocking(move || {
-        zeroclaw::nostr_store::get_reactions(&workspace, &event_ids)
+        slowclaw::nostr_store::get_reactions(&workspace, &event_ids)
     })
     .await
     .map_err(|e| format!("nostr reactions task failed: {e}"))?
@@ -2999,10 +2999,10 @@ async fn nostr_get_reactions(
 #[tauri::command]
 async fn nostr_get_replies(
     event_id: String,
-) -> Result<Vec<zeroclaw::nostr_store::NoteRecord>, String> {
+) -> Result<Vec<slowclaw::nostr_store::NoteRecord>, String> {
     let workspace = nostr_workspace_dir().await?;
     tauri::async_runtime::spawn_blocking(move || {
-        zeroclaw::nostr_store::get_replies(&workspace, &event_id)
+        slowclaw::nostr_store::get_replies(&workspace, &event_id)
     })
     .await
     .map_err(|e| format!("nostr replies task failed: {e}"))?
@@ -3012,10 +3012,10 @@ async fn nostr_get_replies(
 #[tauri::command]
 async fn nostr_get_articles(
     req: NostrArticleQueryRequest,
-) -> Result<Vec<zeroclaw::nostr_store::ArticleRecord>, String> {
+) -> Result<Vec<slowclaw::nostr_store::ArticleRecord>, String> {
     let workspace = nostr_workspace_dir().await?;
     tauri::async_runtime::spawn_blocking(move || {
-        zeroclaw::nostr_store::get_articles(&workspace, req.limit)
+        slowclaw::nostr_store::get_articles(&workspace, req.limit)
     })
     .await
     .map_err(|e| format!("nostr articles task failed: {e}"))?
@@ -3113,7 +3113,7 @@ async fn lookup_target_event(event_id: &str) -> Result<nostr_sdk::Event, String>
     let workspace = nostr_workspace_dir().await?;
     let id = event_id.to_string();
     let note = tauri::async_runtime::spawn_blocking(move || {
-        zeroclaw::nostr_store::get_note(&workspace, &id)
+        slowclaw::nostr_store::get_note(&workspace, &id)
     })
     .await
     .map_err(|e| format!("target lookup task failed: {e}"))?
@@ -3175,7 +3175,7 @@ async fn finalize_publish(
     let workspace = nostr_workspace_dir().await?;
     let ev_for_ingest = event.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        let _ = zeroclaw::nostr_store::ingest_event(&workspace, &ev_for_ingest);
+        let _ = slowclaw::nostr_store::ingest_event(&workspace, &ev_for_ingest);
     })
     .await;
 
@@ -3225,7 +3225,7 @@ async fn start_nostr_ingester(state: NostrIngestState) {
                 guard.last_error = None;
                 guard.relays = relays;
                 guard.hashtag_channels = hashtags;
-                guard.db_path = Some(zeroclaw::nostr_store::db_path(&workspace_dir));
+                guard.db_path = Some(slowclaw::nostr_store::db_path(&workspace_dir));
                 guard.client = client_wrapper;
                 guard.ingest_handle = Some(handle.join_handle);
             }
@@ -3252,7 +3252,7 @@ async fn video_workspace_dir() -> Result<PathBuf, String> {
 async fn ensure_video_store_initialized(workspace: &Path) {
     let ws = workspace.to_path_buf();
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        zeroclaw::video_store::initialize(&ws)
+        slowclaw::video_store::initialize(&ws)
     })
     .await;
 }
@@ -3263,10 +3263,10 @@ async fn video_store_status() -> Result<VideoStoreStatus, String> {
     ensure_video_store_initialized(&workspace).await;
     let ws = workspace.clone();
     let (total, counts, last, path) = tauri::async_runtime::spawn_blocking(move || {
-        let total = zeroclaw::video_store::video_count(&ws).unwrap_or(0);
-        let counts = zeroclaw::video_store::count_by_source(&ws).unwrap_or_default();
-        let last = zeroclaw::video_store::last_received_at(&ws).ok().flatten();
-        let path = zeroclaw::video_store::db_path(&ws).to_string_lossy().to_string();
+        let total = slowclaw::video_store::video_count(&ws).unwrap_or(0);
+        let counts = slowclaw::video_store::count_by_source(&ws).unwrap_or_default();
+        let last = slowclaw::video_store::last_received_at(&ws).ok().flatten();
+        let path = slowclaw::video_store::db_path(&ws).to_string_lossy().to_string();
         (total, counts, last, path)
     })
     .await
@@ -3284,16 +3284,16 @@ async fn video_store_status() -> Result<VideoStoreStatus, String> {
 #[tauri::command]
 async fn video_query(
     req: VideoQueryRequest,
-) -> Result<Vec<zeroclaw::video_store::VideoRecord>, String> {
+) -> Result<Vec<slowclaw::video_store::VideoRecord>, String> {
     let workspace = video_workspace_dir().await?;
     ensure_video_store_initialized(&workspace).await;
-    let query = zeroclaw::video_store::VideoQuery {
+    let query = slowclaw::video_store::VideoQuery {
         source: req.source,
         since: req.since,
         limit: req.limit,
     };
     tauri::async_runtime::spawn_blocking(move || {
-        zeroclaw::video_store::query_videos(&workspace, &query)
+        slowclaw::video_store::query_videos(&workspace, &query)
     })
     .await
     .map_err(|e| format!("video query task failed: {e}"))?
@@ -3305,7 +3305,7 @@ async fn video_upsert_bluesky(posts: Vec<serde_json::Value>) -> Result<usize, St
     let workspace = video_workspace_dir().await?;
     ensure_video_store_initialized(&workspace).await;
     tauri::async_runtime::spawn_blocking(move || {
-        zeroclaw::video_store::upsert_bluesky_posts(&workspace, &posts)
+        slowclaw::video_store::upsert_bluesky_posts(&workspace, &posts)
     })
     .await
     .map_err(|e| format!("video upsert task failed: {e}"))?
@@ -3461,7 +3461,7 @@ mod tests {
     fn try_repair_finds_gguf_by_model_id() {
         let workspace = temp_workspace("by_model_id");
         let model_dir = workspace
-            .join(zeroclaw::gateway::handlers::model::LOCAL_MODEL_DIR)
+            .join(slowclaw::gateway::handlers::model::LOCAL_MODEL_DIR)
             .join(safe_local_model_id_dir("gemma-3-4b"));
         let gguf = model_dir.join("model.gguf");
         write_fake_gguf(&gguf);
@@ -3479,7 +3479,7 @@ mod tests {
     fn try_repair_reroots_relative_suffix() {
         let workspace = temp_workspace("reroot_suffix");
         let gguf = workspace
-            .join(zeroclaw::gateway::handlers::model::LOCAL_MODEL_DIR)
+            .join(slowclaw::gateway::handlers::model::LOCAL_MODEL_DIR)
             .join("qwen-2.5-1.5b")
             .join("qwen.gguf");
         write_fake_gguf(&gguf);
@@ -3503,6 +3503,6 @@ mod tests {
     /// Local copy of the model-id sanitizer so tests don't depend on the
     /// private internals of the gateway handler beyond the public constant.
     fn safe_local_model_id_dir(model_id: &str) -> String {
-        zeroclaw::gateway::handlers::model::safe_local_model_dir_name(model_id)
+        slowclaw::gateway::handlers::model::safe_local_model_dir_name(model_id)
     }
 }

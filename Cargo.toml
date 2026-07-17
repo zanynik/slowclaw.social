@@ -17,7 +17,7 @@ categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.87"
 
 [lib]
-name = "zeroclaw"
+name = "slowclaw"
 
 [dependencies]
 # CLI - minimal and fast

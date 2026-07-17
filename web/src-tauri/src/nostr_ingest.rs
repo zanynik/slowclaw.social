@@ -4,7 +4,7 @@
 //! pure engine logic in this file, `#[tauri::command]` wrappers in `lib.rs`.
 //! The engine owns a long-lived [`nostr_sdk::Client`] and drains its
 //! notification stream, persisting every incoming event into the core crate's
-//! `zeroclaw::nostr_store`. The UI then queries the local store via IPC
+//! `slowclaw::nostr_store`. The UI then queries the local store via IPC
 //! instead of re-hitting relays on every feed load.
 //!
 //! Lifecycle:
@@ -24,7 +24,7 @@ use nostr_sdk::prelude::{Client as NostrClient, Filter, Kind, RelayPoolNotificat
 use tauri::async_runtime::JoinHandle;
 use tokio::sync::Mutex;
 
-use zeroclaw::nostr_store;
+use slowclaw::nostr_store;
 
 /// How far back to fetch on a cold start (seconds). Matches the gateway's
 /// `NOSTR_LOOKBACK_SECS` (7 days) so the local store sees the same window the
@@ -84,7 +84,7 @@ pub async fn start_ingester(
         let ws = workspace_dir.clone();
         tauri::async_runtime::spawn_blocking(move || {
             nostr_store::initialize(&ws).map_err(|e| format!("Failed to init nostr store: {e}"))?;
-            zeroclaw::video_store::initialize(&ws)
+            slowclaw::video_store::initialize(&ws)
                 .map_err(|e| format!("Failed to init video store: {e}"))
         })
         .await
@@ -206,7 +206,7 @@ async fn drain_notifications(client: Arc<NostrClient>, workspace_dir: PathBuf) {
                 // URL (no-op for text-only notes).
                 let _ = tauri::async_runtime::spawn_blocking(move || {
                     let _ = nostr_store::ingest_event(&ws, &ev);
-                    let _ = zeroclaw::video_store::upsert_from_nostr_event(&ws, &ev);
+                    let _ = slowclaw::video_store::upsert_from_nostr_event(&ws, &ev);
                 })
                 .await;
             }
@@ -225,7 +225,7 @@ async fn drain_notifications(client: Arc<NostrClient>, workspace_dir: PathBuf) {
 
 /// Resolve the configured relays from the slowclaw config, falling back to
 /// the built-in defaults. Reads `Config.channels_config.nostr.relays`.
-pub fn resolve_configured_relays(config: &zeroclaw::Config) -> Vec<String> {
+pub fn resolve_configured_relays(config: &slowclaw::Config) -> Vec<String> {
     let configured: Vec<String> = config
         .channels_config
         .nostr

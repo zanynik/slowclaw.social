@@ -32,7 +32,7 @@ pub(crate) async fn open_workspace_journals_folder() -> Result<String, String> {
     }
     #[cfg(not(mobile))]
     {
-        let config = zeroclaw::Config::load_or_init().await.map_err(|e| {
+        let config = slowclaw::Config::load_or_init().await.map_err(|e| {
             crate::ui_command_error(
                 "journals folder config load failed",
                 "Failed to load the workspace configuration.",
