@@ -1,9 +1,8 @@
 use super::{
     CleanAudioTool, ComposeSimpleClipTool, ContentSearchTool, ExtractAudioSegmentTool,
-    FileEditTool, FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool,
-    MemoryForgetTool, MemoryRecallTool, MemoryStoreTool, ModelRoutingConfigTool,
-    RenderTextCardVideoTool, ShellTool, StitchImagesWithAudioTool, TaskPlanTool, Tool,
-    ToolResult, TranscribeMediaTool, WebSearchTool,
+    FileEditTool, FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool, MemoryForgetTool,
+    MemoryRecallTool, MemoryStoreTool, ModelRoutingConfigTool, RenderTextCardVideoTool, ShellTool,
+    StitchImagesWithAudioTool, TaskPlanTool, Tool, ToolResult, TranscribeMediaTool, WebSearchTool,
 };
 use crate::config::Config;
 use crate::media::command_media_backend;

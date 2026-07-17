@@ -400,7 +400,11 @@ pub fn db_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("state").join("local_data.db")
 }
 
-pub fn list_chat_messages(workspace_dir: &Path, thread_id: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
+pub fn list_chat_messages(
+    workspace_dir: &Path,
+    thread_id: &str,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
     let conn = open_conn(&db_path(workspace_dir))?;
     let lim = i64::try_from(limit.max(1)).unwrap_or(200);
     let mut stmt = conn.prepare(
@@ -572,7 +576,10 @@ pub fn list_drafts(workspace_dir: &Path, limit: usize) -> Result<Vec<serde_json:
     Ok(out)
 }
 
-pub fn create_post_history(workspace_dir: &Path, item: &PostHistoryInput) -> Result<serde_json::Value> {
+pub fn create_post_history(
+    workspace_dir: &Path,
+    item: &PostHistoryInput,
+) -> Result<serde_json::Value> {
     let conn = open_conn(&db_path(workspace_dir))?;
     let id = format!("lc_{}", Uuid::new_v4().simple());
     let now = Utc::now().to_rfc3339();
@@ -711,9 +718,8 @@ pub fn replace_workspace_todos(
     // Only archive from sources we actually processed — don't touch items from
     // other sources that weren't part of this run.
     for src in processed_source_paths {
-        let mut stmt = tx.prepare(
-            "SELECT id FROM workspace_todos WHERE source_path = ?1 AND archived = 0",
-        )?;
+        let mut stmt =
+            tx.prepare("SELECT id FROM workspace_todos WHERE source_path = ?1 AND archived = 0")?;
         let stale_ids: Vec<String> = stmt
             .query_map(params![src.trim()], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
@@ -758,7 +764,8 @@ pub fn list_workspace_todos(workspace_dir: &Path, limit: usize) -> Result<Vec<se
     let rows = stmt.query_map(params![lim], |row| {
         let model_status: String = row.get(4)?;
         let status_override: String = row.get(5)?;
-        let effective_status = non_empty_opt(status_override.clone()).unwrap_or(model_status.clone());
+        let effective_status =
+            non_empty_opt(status_override.clone()).unwrap_or(model_status.clone());
         Ok(serde_json::json!({
             "id": row.get::<_, String>(0)?,
             "title": row.get::<_, String>(1)?,
@@ -897,9 +904,8 @@ pub fn replace_workspace_events(
 
     // Archive stale events from processed sources not re-extracted
     for src in processed_source_paths {
-        let mut stmt = tx.prepare(
-            "SELECT id FROM workspace_events WHERE source_path = ?1 AND archived = 0",
-        )?;
+        let mut stmt =
+            tx.prepare("SELECT id FROM workspace_events WHERE source_path = ?1 AND archived = 0")?;
         let stale_ids: Vec<String> = stmt
             .query_map(params![src.trim()], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
@@ -1546,11 +1552,7 @@ pub fn list_feed_lens_overrides(workspace_dir: &Path) -> Result<Vec<FeedLensOver
 
 /// Upsert a lens override for a term. `multiplier` is clamped to a sane range
 /// (0 = mute, 1 = normal, 2 = boost) to mirror the discrete UI states.
-pub fn set_feed_lens_override(
-    workspace_dir: &Path,
-    term: &str,
-    multiplier: f64,
-) -> Result<()> {
+pub fn set_feed_lens_override(workspace_dir: &Path, term: &str, multiplier: f64) -> Result<()> {
     let key = term.trim().to_lowercase();
     if key.is_empty() {
         return Ok(());
@@ -1926,9 +1928,7 @@ pub fn list_pending_journal_enrichment(
 }
 
 /// Every row — drives the AI Activity "Enrichment progress" summary.
-pub fn list_all_journal_enrichment(
-    workspace_dir: &Path,
-) -> Result<Vec<JournalEnrichmentRecord>> {
+pub fn list_all_journal_enrichment(workspace_dir: &Path) -> Result<Vec<JournalEnrichmentRecord>> {
     let conn = open_conn(&db_path(workspace_dir))?;
     let mut stmt = conn.prepare(
         "SELECT source_path, task, status, attempts, last_error, last_run_at, updated_at
@@ -2169,7 +2169,12 @@ pub fn replace_personalized_feed_cache(
         "DELETE FROM personalized_feed_cache WHERE feed_key = ?1",
         params![feed_key.trim()],
     )
-    .with_context(|| format!("Failed to clear personalized feed cache for {}", feed_key.trim()))?;
+    .with_context(|| {
+        format!(
+            "Failed to clear personalized feed cache for {}",
+            feed_key.trim()
+        )
+    })?;
 
     for item in items {
         let now = Utc::now().to_rfc3339();
@@ -2190,8 +2195,7 @@ pub fn replace_personalized_feed_cache(
         .with_context(|| {
             format!(
                 "Failed to insert personalized feed cache row {} for {}",
-                item.cache_key,
-                item.feed_key
+                item.cache_key, item.feed_key
             )
         })?;
     }
@@ -2271,7 +2275,12 @@ pub fn upsert_personalized_feed_state(
             now,
         ],
     )
-    .with_context(|| format!("Failed to upsert personalized feed state {}", state.feed_key))?;
+    .with_context(|| {
+        format!(
+            "Failed to upsert personalized feed state {}",
+            state.feed_key
+        )
+    })?;
 
     Ok(PersonalizedFeedStateRecord {
         feed_key: state.feed_key.trim().to_string(),
@@ -2348,7 +2357,10 @@ pub fn mark_personalized_feed_dirty(workspace_dir: &Path, feed_key: &str) -> Res
     Ok(())
 }
 
-pub fn list_content_sources(workspace_dir: &Path, limit: usize) -> Result<Vec<ContentSourceRecord>> {
+pub fn list_content_sources(
+    workspace_dir: &Path,
+    limit: usize,
+) -> Result<Vec<ContentSourceRecord>> {
     let conn = open_conn(&db_path(workspace_dir))?;
     let lim = i64::try_from(limit.max(1)).unwrap_or(100);
     let mut stmt = conn.prepare(
@@ -2486,11 +2498,20 @@ pub fn update_content_source_fetch(
             etag.unwrap_or("").trim(),
             last_modified.unwrap_or("").trim(),
             fetched_at.trim(),
-            if success { "" } else { normalized_error.as_str() },
+            if success {
+                ""
+            } else {
+                normalized_error.as_str()
+            },
             if success { 1 } else { 0 },
         ],
     )
-    .with_context(|| format!("Failed to update content source fetch state for {}", source_key))?;
+    .with_context(|| {
+        format!(
+            "Failed to update content source fetch state for {}",
+            source_key
+        )
+    })?;
     Ok(())
 }
 
@@ -3096,9 +3117,8 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 }
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1")?;
     let found = stmt
         .query_row(params![table], |_row| Ok(()))
         .optional()?
@@ -3871,7 +3891,10 @@ mod tests {
         assert_eq!(source.content_hash, "abc123");
         assert_eq!(source.profile_input_hash, "profile123");
         assert_eq!(source.interest_id.as_deref(), Some("interest-1"));
-        assert_eq!(source.triage_keywords_json, "[\"machine learning\",\"ranking\"]");
+        assert_eq!(
+            source.triage_keywords_json,
+            "[\"machine learning\",\"ranking\"]"
+        );
     }
 
     #[test]
@@ -4180,8 +4203,11 @@ mod tests {
         let removed = prune_feed_keywords(tmp.path(), 0.1, 300).unwrap();
         assert_eq!(removed, 1);
 
-        let remaining: Vec<String> =
-            list_feed_keywords(tmp.path()).unwrap().into_iter().map(|r| r.term).collect();
+        let remaining: Vec<String> = list_feed_keywords(tmp.path())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.term)
+            .collect();
         assert!(remaining.contains(&"celebrity gossip".to_string()));
         assert!(!remaining.contains(&"ranking".to_string()));
     }
@@ -4256,14 +4282,16 @@ mod tests {
         set_journal_enrichment(tmp.path(), path, "transcription", "done", None).unwrap();
         set_journal_enrichment(tmp.path(), path, "title", "done", None).unwrap();
         set_journal_enrichment(tmp.path(), path, "interests", "done", None).unwrap();
-        set_journal_enrichment(tmp.path(), path, "tweet", "error", Some("no output"))
-            .unwrap();
+        set_journal_enrichment(tmp.path(), path, "tweet", "error", Some("no output")).unwrap();
 
         // The errored task is terminal `error`, so the work queue is now EMPTY.
         // That is convergence: terminal rows leave the queue regardless of
         // success/error/skip.
         let pending_after = list_pending_journal_enrichment(tmp.path(), 64).unwrap();
-        assert!(pending_after.is_empty(), "terminal tasks must leave the queue");
+        assert!(
+            pending_after.is_empty(),
+            "terminal tasks must leave the queue"
+        );
 
         // attempts only bumps on non-done writes (the error task, once).
         let tweet_row = get_journal_enrichment(tmp.path(), path)
@@ -4294,5 +4322,4 @@ mod tests {
         assert!(get_journal_enrichment(tmp.path(), path).unwrap().is_empty());
         assert!(list_all_journal_enrichment(tmp.path()).unwrap().is_empty());
     }
-
 }

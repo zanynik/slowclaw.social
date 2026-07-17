@@ -42,12 +42,12 @@ mod tests {
 
     #[tokio::test]
     async fn channel_context_roundtrips() {
-        let ctx = ChannelExecutionContext::new("pocketbase", "thread-123", Some("thread-123".into()));
-        let retrieved = with_channel_execution_context(ctx, async {
-            current_channel_execution_context()
-        })
-        .await
-        .expect("context should exist");
+        let ctx =
+            ChannelExecutionContext::new("pocketbase", "thread-123", Some("thread-123".into()));
+        let retrieved =
+            with_channel_execution_context(ctx, async { current_channel_execution_context() })
+                .await
+                .expect("context should exist");
 
         assert_eq!(retrieved.channel, "pocketbase");
         assert_eq!(retrieved.recipient, "thread-123");

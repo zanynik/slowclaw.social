@@ -105,14 +105,16 @@ impl PocketBaseChannel {
         }
         let url = format!(
             "{}/api/collections/{}/records",
-            self.base_url,
-            self.collection
+            self.base_url, self.collection
         );
         let mut req = self.client.post(url).json(&payload);
         if let Some(token) = self.token.as_deref() {
             req = req.bearer_auth(token);
         }
-        let resp = req.send().await.context("PocketBase channel send request failed")?;
+        let resp = req
+            .send()
+            .await
+            .context("PocketBase channel send request failed")?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -151,22 +153,28 @@ impl PocketBaseChannel {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("PocketBase channel patch failed ({status}): {}", body.trim());
+            anyhow::bail!(
+                "PocketBase channel patch failed ({status}): {}",
+                body.trim()
+            );
         }
         Ok(())
     }
 
     async fn fetch_pending_user_messages(&self) -> Result<Vec<PocketBaseChatRecord>> {
-        let url = format!("{}/api/collections/{}/records", self.base_url, self.collection);
+        let url = format!(
+            "{}/api/collections/{}/records",
+            self.base_url, self.collection
+        );
         let per_page = FETCH_PAGE_SIZE.to_string();
         let mut pending = Vec::new();
 
         for page in 1..=MAX_FETCH_PAGES {
             let page_str = page.to_string();
-            let mut req = self.client.get(&url).query(&[
-                ("page", page_str.as_str()),
-                ("perPage", per_page.as_str()),
-            ]);
+            let mut req = self
+                .client
+                .get(&url)
+                .query(&[("page", page_str.as_str()), ("perPage", per_page.as_str())]);
             if let Some(token) = self.token.as_deref() {
                 req = req.bearer_auth(token);
             }
@@ -252,7 +260,8 @@ impl Channel for PocketBaseChannel {
                     continue;
                 }
 
-                self.patch_record_status(&record.id, "processing", None).await?;
+                self.patch_record_status(&record.id, "processing", None)
+                    .await?;
                 let msg = ChannelMessage {
                     id: record.id.clone(),
                     sender: record

@@ -124,12 +124,10 @@ pub fn transcribe_audio_file(audio_path: &str) -> Result<TranscriptionResult, St
 
     #[cfg(not(all(target_os = "ios", feature = "native-inference")))]
     {
-        Err(
-            "On-device audio transcription is currently iOS-only. \
+        Err("On-device audio transcription is currently iOS-only. \
              Desktop users can transcribe via the desktop gateway's faster-whisper \
              pipeline (see scripts/transcribe_audio_journal.py)."
-                .to_string(),
-        )
+            .to_string())
     }
 }
 

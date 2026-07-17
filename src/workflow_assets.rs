@@ -39,7 +39,10 @@ pub fn ensure_workspace_workflow_assets(workspace_dir: &Path) -> Result<Workflow
         }
 
         std::fs::write(&target, asset.content).with_context(|| {
-            format!("Failed to write bundled workflow asset {}", target.display())
+            format!(
+                "Failed to write bundled workflow asset {}",
+                target.display()
+            )
         })?;
         report.created += 1;
     }

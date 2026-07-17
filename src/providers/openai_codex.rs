@@ -833,10 +833,7 @@ mod tests {
             clamp_reasoning_effort("gpt-5-codex", "medium"),
             "medium".to_string()
         );
-        assert_eq!(
-            clamp_reasoning_effort("gpt-5", "xhigh"),
-            "high".to_string()
-        );
+        assert_eq!(clamp_reasoning_effort("gpt-5", "xhigh"), "high".to_string());
         assert_eq!(
             clamp_reasoning_effort("gpt-5", "minimal"),
             "low".to_string()

@@ -4,7 +4,7 @@ use crate::config::schema::{
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, HardwareConfig, HardwareTransport, IMessageConfig, LarkConfig, MatrixConfig,
+    HardwareConfig, HardwareTransport, HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig,
     MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig,
     TelegramConfig, WebhookConfig,
 };
@@ -193,7 +193,6 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
 
     config.save().await?;
 
-
     // ── Final summary ────────────────────────────────────────────
     print_summary(&config);
 
@@ -241,7 +240,6 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
     config.channels_config = setup_channels()?;
     config.save().await?;
-
 
     println!();
     println!(
@@ -305,7 +303,6 @@ async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) ->
     apply_provider_update(&mut config, provider, api_key, model, provider_api_url);
 
     config.save().await?;
-
 
     println!(
         "  {} Provider settings updated at {}",
@@ -539,7 +536,6 @@ async fn run_quick_setup_with_home(
     };
 
     config.save().await?;
-
 
     // Scaffold minimal workspace files
     let default_ctx = ProjectContext {
@@ -2066,8 +2062,6 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
 
     Ok(())
 }
-
-
 
 // ── Step 1: Workspace ────────────────────────────────────────────
 
@@ -5449,9 +5443,7 @@ fn print_summary(config: &Config) {
         if config.hardware.enabled {
             let mode = config.hardware.transport_mode();
             match mode {
-                HardwareTransport::Native => {
-                    style("Native GPIO (direct)").green().to_string()
-                }
+                HardwareTransport::Native => style("Native GPIO (direct)").green().to_string(),
                 HardwareTransport::Serial => format!(
                     "{}",
                     style(format!(

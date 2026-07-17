@@ -38,8 +38,7 @@ pub(crate) fn ios_open_safari_vc(url: &str) -> Result<(), String> {
 
     const ERROR_BUF_LEN: usize = 1024;
 
-    let c_url = CString::new(url)
-        .map_err(|e| format!("url contains an interior NUL byte: {e}"))?;
+    let c_url = CString::new(url).map_err(|e| format!("url contains an interior NUL byte: {e}"))?;
 
     let mut error_buf: Vec<u8> = vec![0u8; ERROR_BUF_LEN];
 

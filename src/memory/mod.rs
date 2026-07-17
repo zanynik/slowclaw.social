@@ -267,14 +267,13 @@ pub fn create_memory_with_storage_and_routes(
         workspace_dir: &Path,
         resolved_embedding: &ResolvedEmbeddingConfig,
     ) -> anyhow::Result<SqliteMemory> {
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> = Arc::from(
-            embeddings::create_embedding_provider(
+        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
+            Arc::from(embeddings::create_embedding_provider(
                 &resolved_embedding.provider,
                 resolved_embedding.api_key.as_deref(),
                 &resolved_embedding.model,
                 resolved_embedding.dimensions,
-            ),
-        );
+            ));
 
         #[allow(clippy::cast_possible_truncation)]
         let mem = SqliteMemory::with_embedder(

@@ -156,7 +156,10 @@ mod tests {
         let config = NativeEngineConfig::from_env();
         assert_eq!(config.model_id.as_deref(), Some("gemma-test"));
         assert_eq!(
-            config.model_path.as_ref().map(|path| path.display().to_string()),
+            config
+                .model_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
             Some("/tmp/gemma-test.gguf".to_string())
         );
 

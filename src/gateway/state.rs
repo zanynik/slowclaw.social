@@ -1,12 +1,12 @@
 use crate::config::Config;
-use crate::providers::Provider;
 use crate::memory::Memory;
+use crate::providers::Provider;
 use crate::security::pairing::PairingGuard;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;

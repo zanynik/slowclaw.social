@@ -3,8 +3,8 @@ use std::process::Command;
 use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindowBuilder};
 
 use crate::{
-    GatewayState, GatewayQrPayload, DesktopGatewayBootstrap,
-    OpenAiDeviceCodeState, OpenAiDeviceCodeStatus,
+    DesktopGatewayBootstrap, GatewayQrPayload, GatewayState, OpenAiDeviceCodeState,
+    OpenAiDeviceCodeStatus,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,7 +150,9 @@ pub(crate) fn open_in_app_webview(app: AppHandle, url: String) -> Result<(), Str
 }
 
 #[tauri::command]
-pub(crate) async fn restart_gateway_daemon(state: tauri::State<'_, GatewayState>) -> Result<String, String> {
+pub(crate) async fn restart_gateway_daemon(
+    state: tauri::State<'_, GatewayState>,
+) -> Result<String, String> {
     #[cfg(mobile)]
     {
         let _ = state;
@@ -201,7 +203,8 @@ pub(crate) async fn check_ollama() -> Result<OllamaStatus, String> {
         let config = crate::load_workspace_config_for_ui("ollama config load failed").await?;
         let models = crate::installed_ollama_models();
         Ok(OllamaStatus {
-            available: !models.is_empty() || Command::new("ollama").arg("--version").output().is_ok(),
+            available: !models.is_empty()
+                || Command::new("ollama").arg("--version").output().is_ok(),
             base_url: config
                 .api_url
                 .unwrap_or_else(|| "http://127.0.0.1:11434".to_string()),
@@ -214,7 +217,9 @@ pub(crate) async fn check_ollama() -> Result<OllamaStatus, String> {
 }
 
 #[tauri::command]
-pub(crate) async fn download_ollama_model(model: String) -> Result<LocalModelDownloadStatus, String> {
+pub(crate) async fn download_ollama_model(
+    model: String,
+) -> Result<LocalModelDownloadStatus, String> {
     #[cfg(mobile)]
     {
         let _ = model;

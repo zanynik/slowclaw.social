@@ -1011,8 +1011,7 @@ pub fn manifest_schema_json() -> Result<String> {
 
 fn insight_posts_schema_json() -> Result<String> {
     let schema = schema_for!(InsightPostFile);
-    serde_json::to_string_pretty(&schema)
-        .context("failed to serialize insight posts schema")
+    serde_json::to_string_pretty(&schema).context("failed to serialize insight posts schema")
 }
 
 fn todos_schema_json() -> Result<String> {
@@ -1114,7 +1113,10 @@ fn normalize_skill_output_prefix(prefix: &str, skill_key: &str) -> String {
     normalized
 }
 
-fn normalize_skill_record(skill_key: &str, mut record: WorkspaceSynthSkillRecord) -> WorkspaceSynthSkillRecord {
+fn normalize_skill_record(
+    skill_key: &str,
+    mut record: WorkspaceSynthSkillRecord,
+) -> WorkspaceSynthSkillRecord {
     record.skill_key = skill_key.trim().to_ascii_lowercase();
     if record.name.trim().is_empty() {
         record.name = skill_spec_by_key(skill_key)
@@ -1211,16 +1213,19 @@ fn built_in_skill_markdown(record: &WorkspaceSynthSkillRecord) -> Result<String>
         render_extractor_skill_markdown(&record.skill_key)?
     } else {
         match record.skill_key.as_str() {
-        article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY => {
-            article_synthesizer::render_skill_markdown(output_dir)
+            article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY => {
+                article_synthesizer::render_skill_markdown(output_dir)
+            }
+            "audio_insight_clips" => render_audio_insight_clip_skill_markdown(output_dir),
+            _ => render_template_skill_markdown(&record.name, &record.goal, output_dir),
         }
-        "audio_insight_clips" => render_audio_insight_clip_skill_markdown(output_dir),
-        _ => render_template_skill_markdown(&record.name, &record.goal, output_dir),
-    }};
+    };
     Ok(body)
 }
 
-fn skill_definition_from_record(record: &WorkspaceSynthSkillRecord) -> WorkspaceSynthSkillDefinition {
+fn skill_definition_from_record(
+    record: &WorkspaceSynthSkillRecord,
+) -> WorkspaceSynthSkillDefinition {
     WorkspaceSynthSkillDefinition {
         key: record.skill_key.clone(),
         name: record.name.clone(),
@@ -1299,7 +1304,10 @@ pub fn skill_definition_by_key(
     key: &str,
 ) -> Option<WorkspaceSynthSkillDefinition> {
     let normalized = key.trim().to_ascii_lowercase();
-    store.skills.get(&normalized).map(skill_definition_from_record)
+    store
+        .skills
+        .get(&normalized)
+        .map(skill_definition_from_record)
 }
 
 pub fn skill_for_feed_path(
@@ -1307,9 +1315,9 @@ pub fn skill_for_feed_path(
     path: &str,
 ) -> Option<WorkspaceSynthSkillDefinition> {
     let normalized_path = path.trim_start_matches('/').to_ascii_lowercase();
-    skill_definitions(store).into_iter().find(|skill| {
-        normalized_path.starts_with(&skill.output_prefix.to_ascii_lowercase())
-    })
+    skill_definitions(store)
+        .into_iter()
+        .find(|skill| normalized_path.starts_with(&skill.output_prefix.to_ascii_lowercase()))
 }
 
 fn built_in_skill_record(spec: WorkspaceSynthSkillSpec) -> WorkspaceSynthSkillRecord {
@@ -1338,16 +1346,19 @@ pub fn load_skill_store(workspace_dir: &Path) -> Result<WorkspaceSynthSkillStore
     if !path.exists() {
         return Ok(WorkspaceSynthSkillStore::default());
     }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let mut parsed: WorkspaceSynthSkillStore =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut parsed: WorkspaceSynthSkillStore = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     parsed.skills = parsed
         .skills
         .into_iter()
         .map(|(key, record)| {
             let normalized = key.trim().to_ascii_lowercase();
-            (normalized.clone(), normalize_skill_record(&normalized, record))
+            (
+                normalized.clone(),
+                normalize_skill_record(&normalized, record),
+            )
         })
         .collect();
     Ok(parsed)
@@ -1372,7 +1383,9 @@ pub fn ensure_built_in_skills(
     for spec in skill_specs() {
         let key = spec.key.to_ascii_lowercase();
         if !store.skills.contains_key(&key) {
-            store.skills.insert(key.clone(), built_in_skill_record(*spec));
+            store
+                .skills
+                .insert(key.clone(), built_in_skill_record(*spec));
             changed = true;
         }
         if let Some(record) = store.skills.get_mut(&key) {
@@ -1380,9 +1393,7 @@ pub fn ensure_built_in_skills(
             let canonical_body = built_in_skill_markdown(record)?;
             let canonical_fingerprint = content_agent_skill_fingerprint(&canonical_body);
             let skill_abs = workspace_dir.join(&record.skill_path);
-            let should_refresh = record
-                .built_in_skill_fingerprint
-                .as_deref()
+            let should_refresh = record.built_in_skill_fingerprint.as_deref()
                 != Some(canonical_fingerprint.as_str())
                 || !skill_abs.exists();
             if should_refresh {
@@ -1844,8 +1855,7 @@ pub fn reset_handoff_files(workspace_dir: &Path) -> Result<()> {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to clear {}", path.display()));
+                return Err(err).with_context(|| format!("failed to clear {}", path.display()));
             }
         }
     }
@@ -2044,8 +2054,10 @@ pub fn materialize_extractor_response(
         }
         WORKSPACE_PRIMITIVE_EVENT_EXTRACTOR_WORKFLOW_KEY => {
             let version = parse_handoff_version(&payload, "primitive events")?;
-            let items =
-                normalize_primitive_event_items(parse_handoff_items(&payload, "primitive events")?)?;
+            let items = normalize_primitive_event_items(parse_handoff_items(
+                &payload,
+                "primitive events",
+            )?)?;
             let file = PrimitiveEventFile {
                 version,
                 items: items.clone(),
@@ -2132,9 +2144,9 @@ pub fn extractor_response_template_json(workflow_key: &str) -> Result<&'static s
         WORKSPACE_CLIP_EXTRACTOR_WORKFLOW_KEY => Ok(
             r#"{"version":"1","items":[{"id":"optional-clip-id","title":"...","sourcePath":"journals/text/transcriptions/...","sourceExcerpt":"...","transcriptQuote":"...","startAt":"00:00:01.000","endAt":"00:00:08.000","notes":"..."}]}"#,
         ),
-        WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => Ok(
-            r#"{"version":"1","items":[{"sourcePath":"journals/text/...","title":"..."}]}"#,
-        ),
+        WORKSPACE_JOURNAL_TITLE_EXTRACTOR_WORKFLOW_KEY => {
+            Ok(r#"{"version":"1","items":[{"sourcePath":"journals/text/...","title":"..."}]}"#)
+        }
         other => anyhow::bail!("unknown workspace synthesizer extractor `{other}`"),
     }
 }
@@ -2167,7 +2179,10 @@ pub fn reset_skill_outputs(
 }
 
 pub fn direct_output_file_count(workspace_dir: &Path, output_prefix: &str) -> Result<usize> {
-    let rel = output_prefix.trim().trim_start_matches('/').trim_end_matches('/');
+    let rel = output_prefix
+        .trim()
+        .trim_start_matches('/')
+        .trim_end_matches('/');
     if rel.is_empty() {
         return Ok(0);
     }
@@ -2179,7 +2194,10 @@ pub fn direct_output_file_count(workspace_dir: &Path, output_prefix: &str) -> Re
 }
 
 pub fn direct_output_paths(workspace_dir: &Path, output_prefix: &str) -> Result<Vec<String>> {
-    let rel = output_prefix.trim().trim_start_matches('/').trim_end_matches('/');
+    let rel = output_prefix
+        .trim()
+        .trim_start_matches('/')
+        .trim_end_matches('/');
     if rel.is_empty() {
         return Ok(Vec::new());
     }
@@ -2217,8 +2235,8 @@ pub fn load_manifest(workspace_dir: &Path) -> Result<WorkspaceSynthesisManifest>
     let path = manifest_path(workspace_dir);
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let manifest: WorkspaceSynthesisManifest =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let manifest: WorkspaceSynthesisManifest = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_manifest(manifest)
 }
 
@@ -2227,15 +2245,14 @@ fn normalize_file_version(version: &mut String, artifact_label: &str) -> Result<
         *version = manifest_version();
     }
     if version != "1" {
-        anyhow::bail!(
-            "unsupported {artifact_label} handoff version `{}`",
-            version
-        );
+        anyhow::bail!("unsupported {artifact_label} handoff version `{}`", version);
     }
     Ok(())
 }
 
-fn load_optional_insight_posts_file(workspace_dir: &Path) -> Result<Option<Vec<InsightPostCandidate>>> {
+fn load_optional_insight_posts_file(
+    workspace_dir: &Path,
+) -> Result<Option<Vec<InsightPostCandidate>>> {
     let path = insight_posts_path(workspace_dir);
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -2244,8 +2261,8 @@ fn load_optional_insight_posts_file(workspace_dir: &Path) -> Result<Option<Vec<I
             return Err(err).with_context(|| format!("failed to read {}", path.display()));
         }
     };
-    let mut file: InsightPostFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let mut file: InsightPostFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_file_version(&mut file.version, "insight posts")?;
     Ok(Some(normalize_insight_post_items(file.items)?))
 }
@@ -2259,8 +2276,8 @@ fn load_optional_todos_file(workspace_dir: &Path) -> Result<Option<Vec<TodoCandi
             return Err(err).with_context(|| format!("failed to read {}", path.display()));
         }
     };
-    let mut file: TodoFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let mut file: TodoFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_file_version(&mut file.version, "todos")?;
     Ok(Some(normalize_todo_items(file.items)?))
 }
@@ -2274,8 +2291,8 @@ fn load_optional_events_file(workspace_dir: &Path) -> Result<Option<Vec<EventCan
             return Err(err).with_context(|| format!("failed to read {}", path.display()));
         }
     };
-    let mut file: EventFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let mut file: EventFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_file_version(&mut file.version, "events")?;
     Ok(Some(normalize_event_items(file.items)?))
 }
@@ -2289,13 +2306,15 @@ fn load_optional_clip_plans_file(workspace_dir: &Path) -> Result<Option<Vec<Clip
             return Err(err).with_context(|| format!("failed to read {}", path.display()));
         }
     };
-    let mut file: ClipPlanFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let mut file: ClipPlanFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_file_version(&mut file.version, "clip plans")?;
     Ok(Some(normalize_clip_plan_items(file.items)?))
 }
 
-fn load_optional_journal_titles_file(workspace_dir: &Path) -> Result<Option<Vec<JournalTitleCandidate>>> {
+fn load_optional_journal_titles_file(
+    workspace_dir: &Path,
+) -> Result<Option<Vec<JournalTitleCandidate>>> {
     let path = journal_titles_path(workspace_dir);
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -2304,8 +2323,8 @@ fn load_optional_journal_titles_file(workspace_dir: &Path) -> Result<Option<Vec<
             return Err(err).with_context(|| format!("failed to read {}", path.display()));
         }
     };
-    let mut file: JournalTitleFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let mut file: JournalTitleFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_file_version(&mut file.version, "journal titles")?;
     Ok(Some(normalize_journal_title_items(file.items)?))
 }
@@ -2317,8 +2336,8 @@ fn load_optional_entities_file(workspace_dir: &Path) -> Result<Option<Vec<Entity
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
-    let mut file: EntityFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let mut file: EntityFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_file_version(&mut file.version, "entities")?;
     Ok(Some(normalize_entity_items(file.items)?))
 }
@@ -2332,8 +2351,8 @@ fn load_optional_primitive_events_file(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
-    let mut file: PrimitiveEventFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let mut file: PrimitiveEventFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_file_version(&mut file.version, "primitive events")?;
     Ok(Some(normalize_primitive_event_items(file.items)?))
 }
@@ -2345,8 +2364,8 @@ fn load_optional_assertions_file(workspace_dir: &Path) -> Result<Option<Vec<Asse
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
-    let mut file: AssertionFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let mut file: AssertionFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_file_version(&mut file.version, "assertions")?;
     Ok(Some(normalize_assertion_items(file.items)?))
 }
@@ -2358,8 +2377,8 @@ fn load_optional_actions_file(workspace_dir: &Path) -> Result<Option<Vec<ActionC
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
-    let mut file: ActionFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let mut file: ActionFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_file_version(&mut file.version, "actions")?;
     Ok(Some(normalize_action_items(file.items)?))
 }
@@ -2371,8 +2390,8 @@ fn load_optional_segments_file(workspace_dir: &Path) -> Result<Option<Vec<Segmen
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
-    let mut file: SegmentFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let mut file: SegmentFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_file_version(&mut file.version, "segments")?;
     Ok(Some(normalize_segment_items(file.items)?))
 }
@@ -2384,18 +2403,23 @@ fn load_optional_structures_file(workspace_dir: &Path) -> Result<Option<Vec<Stru
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
-    let mut file: StructureFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let mut file: StructureFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_file_version(&mut file.version, "structures")?;
     Ok(Some(normalize_structure_items(file.items)?))
 }
 
-fn normalize_manifest(mut manifest: WorkspaceSynthesisManifest) -> Result<WorkspaceSynthesisManifest> {
+fn normalize_manifest(
+    mut manifest: WorkspaceSynthesisManifest,
+) -> Result<WorkspaceSynthesisManifest> {
     if manifest.version.trim().is_empty() {
         manifest.version = manifest_version();
     }
     if manifest.version != "1" {
-        anyhow::bail!("unsupported workspace synthesis manifest version `{}`", manifest.version);
+        anyhow::bail!(
+            "unsupported workspace synthesis manifest version `{}`",
+            manifest.version
+        );
     }
 
     manifest.insight_posts = normalize_insight_post_items(manifest.insight_posts)?;
@@ -2512,7 +2536,9 @@ fn normalize_clip_plan_items(mut items: Vec<ClipPlanCandidate>) -> Result<Vec<Cl
         item.end_at = item.end_at.trim().to_string();
         item.source_path = normalize_source_path(&item.source_path)?;
         item.source_excerpt = truncate_with_ellipsis(item.source_excerpt.trim(), 280);
-        if !item.source_path.starts_with("journals/text/transcriptions/")
+        if !item
+            .source_path
+            .starts_with("journals/text/transcriptions/")
             && !item.source_path.starts_with("journals/text/transcript/")
         {
             anyhow::bail!(
@@ -2528,7 +2554,10 @@ fn normalize_clip_plan_items(mut items: Vec<ClipPlanCandidate>) -> Result<Vec<Cl
         if item.start_at.is_empty() || item.end_at.is_empty() {
             anyhow::bail!("clipPlans items require startAt and endAt");
         }
-        let seed = format!("{}|{}|{}|{}", item.title, item.start_at, item.end_at, item.source_path);
+        let seed = format!(
+            "{}|{}|{}|{}",
+            item.title, item.start_at, item.end_at, item.source_path
+        );
         item.id = unique_id(&used_ids, &item.id, &seed, "clip");
         used_ids.insert(item.id.clone());
     }
@@ -2573,13 +2602,11 @@ fn normalize_journal_title_items(
 }
 
 fn is_transcript_source_path(path: &str) -> bool {
-    path.starts_with("journals/text/transcriptions/") || path.starts_with("journals/text/transcript/")
+    path.starts_with("journals/text/transcriptions/")
+        || path.starts_with("journals/text/transcript/")
 }
 
-fn workspace_relative_path_from_metadata_value(
-    workspace_dir: &Path,
-    raw: &str,
-) -> Option<String> {
+fn workspace_relative_path_from_metadata_value(workspace_dir: &Path, raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -2614,7 +2641,10 @@ fn linked_media_rel_path_from_transcript_path(
     workspace_dir: &Path,
     transcript_rel: &str,
 ) -> Option<String> {
-    let normalized = transcript_rel.trim().trim_start_matches('/').replace('\\', "/");
+    let normalized = transcript_rel
+        .trim()
+        .trim_start_matches('/')
+        .replace('\\', "/");
     if let Some(relative) = normalized.strip_prefix("journals/text/transcriptions/") {
         let relative_path = Path::new(relative);
         let stem = relative_path.file_stem()?.to_str()?.trim();
@@ -2718,8 +2748,13 @@ fn rename_workspace_file_if_exists(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::rename(&old_abs, &new_abs)
-        .with_context(|| format!("failed to rename {} -> {}", old_abs.display(), new_abs.display()))
+    fs::rename(&old_abs, &new_abs).with_context(|| {
+        format!(
+            "failed to rename {} -> {}",
+            old_abs.display(),
+            new_abs.display()
+        )
+    })
 }
 
 fn path_rename_conflicts(
@@ -2770,9 +2805,7 @@ fn rewrite_transcript_json_sidecar_after_family_rename(
     if let Some(media_rel) = media_rel {
         object.insert(
             "source".to_string(),
-            serde_json::Value::String(
-                workspace_dir.join(media_rel).to_string_lossy().into_owned(),
-            ),
+            serde_json::Value::String(workspace_dir.join(media_rel).to_string_lossy().into_owned()),
         );
     }
 
@@ -2798,7 +2831,12 @@ fn rename_transcript_backed_media_family(
         .parent()
         .and_then(|parent| parent.strip_prefix(workspace_dir).ok())
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-        .with_context(|| format!("missing transcript parent for {}", old_transcript_abs.display()))?;
+        .with_context(|| {
+            format!(
+                "missing transcript parent for {}",
+                old_transcript_abs.display()
+            )
+        })?;
     let transcript_ext = old_transcript_abs
         .extension()
         .and_then(|value| value.to_str())
@@ -2834,8 +2872,10 @@ fn rename_transcript_backed_media_family(
                 short_hash(&format!("{transcript_rel}|{stem}|{attempt}"))
             )
         };
-        let candidate_transcript_rel =
-            format!("{}/{}.{}", transcript_parent_rel, candidate_seed, transcript_ext);
+        let candidate_transcript_rel = format!(
+            "{}/{}.{}",
+            transcript_parent_rel, candidate_seed, transcript_ext
+        );
         let candidate_transcript_json_rel =
             super::transcript_json_rel_path(&candidate_transcript_rel);
         let candidate_transcript_srt_rel =
@@ -2883,12 +2923,8 @@ fn rename_transcript_backed_media_family(
         break;
     }
 
-    let Some((
-        new_transcript_rel,
-        new_transcript_json_rel,
-        new_transcript_srt_rel,
-        new_media_rel,
-    )) = selected
+    let Some((new_transcript_rel, new_transcript_json_rel, new_transcript_srt_rel, new_media_rel)) =
+        selected
     else {
         anyhow::bail!(
             "failed to choose a non-conflicting target name for transcript-backed media family {}",
@@ -2896,9 +2932,13 @@ fn rename_transcript_backed_media_family(
         );
     };
 
-    if let (Some((old_media_rel, _, _)), Some(new_media_rel)) = (media_spec.as_ref(), new_media_rel.as_ref()) {
+    if let (Some((old_media_rel, _, _)), Some(new_media_rel)) =
+        (media_spec.as_ref(), new_media_rel.as_ref())
+    {
         rename_workspace_file_if_exists(workspace_dir, old_media_rel, new_media_rel)?;
-        if let Err(err) = local_store::rename_media_asset_path(workspace_dir, old_media_rel, new_media_rel) {
+        if let Err(err) =
+            local_store::rename_media_asset_path(workspace_dir, old_media_rel, new_media_rel)
+        {
             tracing::warn!(
                 old = old_media_rel,
                 new = %new_media_rel,
@@ -2922,13 +2962,21 @@ fn rename_transcript_backed_media_family(
 
     for (old_rel, new_rel) in [
         (transcript_rel, new_transcript_rel.as_str()),
-        (old_transcript_json_rel.as_str(), new_transcript_json_rel.as_str()),
-        (old_transcript_srt_rel.as_str(), new_transcript_srt_rel.as_str()),
+        (
+            old_transcript_json_rel.as_str(),
+            new_transcript_json_rel.as_str(),
+        ),
+        (
+            old_transcript_srt_rel.as_str(),
+            new_transcript_srt_rel.as_str(),
+        ),
     ] {
         if old_rel == new_rel {
             continue;
         }
-        if let Err(err) = local_store::rename_workspace_synth_source_path(workspace_dir, old_rel, new_rel) {
+        if let Err(err) =
+            local_store::rename_workspace_synth_source_path(workspace_dir, old_rel, new_rel)
+        {
             tracing::warn!(
                 old = old_rel,
                 new = %new_rel,
@@ -3006,7 +3054,9 @@ fn normalize_provenance(
     if has_timing && !is_transcript_source_path(&provenance.source_path) {
         anyhow::bail!("timed primitive provenance must point to transcript sidecars");
     }
-    if require_timed_transcript && (!has_timing || !is_transcript_source_path(&provenance.source_path)) {
+    if require_timed_transcript
+        && (!has_timing || !is_transcript_source_path(&provenance.source_path))
+    {
         anyhow::bail!("timed primitive items must point to transcript sidecars with startAt/endAt");
     }
     Ok(())
@@ -3030,14 +3080,19 @@ fn normalize_entity_items(mut items: Vec<EntityCandidate>) -> Result<Vec<EntityC
         if item.canonical_name.is_empty() {
             anyhow::bail!("entities items require non-empty canonicalName");
         }
-        let seed = format!("{}|{}|{}", item.canonical_name, item.kind, item.provenance.source_path);
+        let seed = format!(
+            "{}|{}|{}",
+            item.canonical_name, item.kind, item.provenance.source_path
+        );
         item.id = unique_id(&used_ids, &item.id, &seed, "entity");
         used_ids.insert(item.id.clone());
     }
     Ok(items)
 }
 
-fn normalize_primitive_event_items(mut items: Vec<PrimitiveEventCandidate>) -> Result<Vec<PrimitiveEventCandidate>> {
+fn normalize_primitive_event_items(
+    mut items: Vec<PrimitiveEventCandidate>,
+) -> Result<Vec<PrimitiveEventCandidate>> {
     if items.len() > MAX_EVENTS {
         items.truncate(MAX_EVENTS);
     }
@@ -3063,14 +3118,19 @@ fn normalize_primitive_event_items(mut items: Vec<PrimitiveEventCandidate>) -> R
         if item.title.is_empty() {
             anyhow::bail!("primitive events items require non-empty title");
         }
-        let seed = format!("{}|{}|{}", item.title, item.start_at, item.provenance.source_path);
+        let seed = format!(
+            "{}|{}|{}",
+            item.title, item.start_at, item.provenance.source_path
+        );
         item.id = unique_id(&used_ids, &item.id, &seed, "pevent");
         used_ids.insert(item.id.clone());
     }
     Ok(items)
 }
 
-fn normalize_assertion_items(mut items: Vec<AssertionCandidate>) -> Result<Vec<AssertionCandidate>> {
+fn normalize_assertion_items(
+    mut items: Vec<AssertionCandidate>,
+) -> Result<Vec<AssertionCandidate>> {
     if items.len() > MAX_ASSERTIONS {
         items.truncate(MAX_ASSERTIONS);
     }
@@ -3090,7 +3150,10 @@ fn normalize_assertion_items(mut items: Vec<AssertionCandidate>) -> Result<Vec<A
         if item.text.is_empty() {
             anyhow::bail!("assertions items require non-empty text");
         }
-        let seed = format!("{}|{}|{}", item.text, item.kind, item.provenance.source_path);
+        let seed = format!(
+            "{}|{}|{}",
+            item.text, item.kind, item.provenance.source_path
+        );
         item.id = unique_id(&used_ids, &item.id, &seed, "assertion");
         used_ids.insert(item.id.clone());
     }
@@ -3114,7 +3177,10 @@ fn normalize_action_items(mut items: Vec<ActionCandidate>) -> Result<Vec<ActionC
         if item.title.is_empty() {
             anyhow::bail!("actions items require non-empty title");
         }
-        let seed = format!("{}|{}|{}", item.title, item.due_at, item.provenance.source_path);
+        let seed = format!(
+            "{}|{}|{}",
+            item.title, item.due_at, item.provenance.source_path
+        );
         item.id = unique_id(&used_ids, &item.id, &seed, "action");
         used_ids.insert(item.id.clone());
     }
@@ -3153,7 +3219,9 @@ fn normalize_segment_items(mut items: Vec<SegmentCandidate>) -> Result<Vec<Segme
     Ok(items)
 }
 
-fn normalize_structure_items(mut items: Vec<StructureCandidate>) -> Result<Vec<StructureCandidate>> {
+fn normalize_structure_items(
+    mut items: Vec<StructureCandidate>,
+) -> Result<Vec<StructureCandidate>> {
     if items.len() > MAX_STRUCTURES {
         items.truncate(MAX_STRUCTURES);
     }
@@ -3171,7 +3239,10 @@ fn normalize_structure_items(mut items: Vec<StructureCandidate>) -> Result<Vec<S
         if item.body.is_empty() {
             anyhow::bail!("structures items require non-empty body");
         }
-        let seed = format!("{}|{}|{}", item.kind, item.body, item.provenance.source_path);
+        let seed = format!(
+            "{}|{}|{}",
+            item.kind, item.body, item.provenance.source_path
+        );
         item.id = unique_id(&used_ids, &item.id, &seed, "structure");
         used_ids.insert(item.id.clone());
     }
@@ -3215,12 +3286,7 @@ fn normalize_event_status(raw: &str) -> String {
     }
 }
 
-fn unique_id(
-    used_ids: &HashSet<String>,
-    preferred: &str,
-    seed: &str,
-    prefix: &str,
-) -> String {
+fn unique_id(used_ids: &HashSet<String>, preferred: &str, seed: &str, prefix: &str) -> String {
     let base = normalize_id(preferred);
     let seeded = if base.is_empty() {
         format!("{prefix}-{}", short_hash(seed))
@@ -3324,7 +3390,11 @@ fn apply_source_path_renames(
 ) -> Result<HashMap<String, String>> {
     let mut title_map = HashMap::new();
     for item in journal_titles {
-        let old_rel = item.source_path.trim().trim_start_matches('/').replace('\\', "/");
+        let old_rel = item
+            .source_path
+            .trim()
+            .trim_start_matches('/')
+            .replace('\\', "/");
         if old_rel.is_empty() {
             continue;
         }
@@ -3358,7 +3428,10 @@ fn apply_source_path_renames(
             };
             let mut stem = normalize_title_stem(title);
             if stem.is_empty() {
-                stem = format!("recording-{}", short_hash(&format!("{}|{}", old_rel, title)));
+                stem = format!(
+                    "recording-{}",
+                    short_hash(&format!("{}|{}", old_rel, title))
+                );
             }
             rename_transcript_backed_media_family(
                 workspace_dir,
@@ -3390,8 +3463,13 @@ fn apply_source_path_renames(
         if stem.is_empty() {
             stem = format!("journal-{}", short_hash(&old_rel));
         }
-        let mut candidate_rel =
-            canonical_journal_target_rel_path(workspace_dir, &old_abs, &old_rel, &stem, &extension)?;
+        let mut candidate_rel = canonical_journal_target_rel_path(
+            workspace_dir,
+            &old_abs,
+            &old_rel,
+            &stem,
+            &extension,
+        )?;
         let mut candidate_abs = workspace_dir.join(&candidate_rel);
         if reserved_targets.contains(&candidate_rel)
             || (candidate_abs.exists() && candidate_abs != old_abs)
@@ -3399,7 +3477,10 @@ fn apply_source_path_renames(
             let suffix = short_hash(&format!(
                 "{}|{}",
                 old_rel,
-                title_map.get(&old_rel).cloned().unwrap_or_else(|| stem.clone())
+                title_map
+                    .get(&old_rel)
+                    .cloned()
+                    .unwrap_or_else(|| stem.clone())
             ));
             let candidate_seed = format!("{stem}-{suffix}");
             candidate_rel = canonical_journal_target_rel_path(
@@ -3421,13 +3502,15 @@ fn apply_source_path_renames(
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         fs::rename(&old_abs, &candidate_abs).with_context(|| {
-            format!("failed to rename {} -> {}", old_abs.display(), candidate_abs.display())
+            format!(
+                "failed to rename {} -> {}",
+                old_abs.display(),
+                candidate_abs.display()
+            )
         })?;
-        if let Err(e) = local_store::rename_workspace_synth_source_path(
-            workspace_dir,
-            &old_rel,
-            &candidate_rel,
-        ) {
+        if let Err(e) =
+            local_store::rename_workspace_synth_source_path(workspace_dir, &old_rel, &candidate_rel)
+        {
             tracing::warn!(old = old_rel, new = %candidate_rel, err = %e, "synth source path rename failed");
         }
         let title_for_record = title_map
@@ -3440,8 +3523,12 @@ fn apply_source_path_renames(
             &candidate_rel,
             &title_for_record,
         ) {
-            Ok(0) => tracing::warn!(old = old_rel, new = %candidate_rel, "journal rename: no DB rows matched"),
-            Err(e) => tracing::warn!(old = old_rel, new = %candidate_rel, err = %e, "journal rename failed"),
+            Ok(0) => {
+                tracing::warn!(old = old_rel, new = %candidate_rel, "journal rename: no DB rows matched")
+            }
+            Err(e) => {
+                tracing::warn!(old = old_rel, new = %candidate_rel, err = %e, "journal rename failed")
+            }
             _ => {}
         }
         reserved_targets.insert(candidate_rel.clone());
@@ -3475,15 +3562,20 @@ fn primitive_artifact_states_default() -> WorkspaceSynthArtifactStates {
         journal_titles: skipped_artifact_state(WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH),
         primitive_entities: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH),
         primitive_events: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH),
-        primitive_assertions: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH),
+        primitive_assertions: skipped_artifact_state(
+            WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH,
+        ),
         primitive_actions: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH),
         primitive_segments: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH),
-        primitive_structures: skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH),
+        primitive_structures: skipped_artifact_state(
+            WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH,
+        ),
     }
 }
 
 fn compile_todos_from_actions(items: &[ActionCandidate]) -> Vec<TodoCandidate> {
-    items.iter()
+    items
+        .iter()
         .map(|item| TodoCandidate {
             id: item.id.clone(),
             title: item.title.clone(),
@@ -3498,7 +3590,8 @@ fn compile_todos_from_actions(items: &[ActionCandidate]) -> Vec<TodoCandidate> {
 }
 
 fn compile_events_from_primitive_events(items: &[PrimitiveEventCandidate]) -> Vec<EventCandidate> {
-    items.iter()
+    items
+        .iter()
         .map(|item| EventCandidate {
             id: item.id.clone(),
             title: item.title.clone(),
@@ -3521,7 +3614,11 @@ fn compile_clip_plans_from_segments(
 ) -> Vec<ClipPlanCandidate> {
     segments
         .iter()
-        .filter(|item| !item.start_at.is_empty() && !item.end_at.is_empty() && is_transcript_source_path(&item.source_path))
+        .filter(|item| {
+            !item.start_at.is_empty()
+                && !item.end_at.is_empty()
+                && is_transcript_source_path(&item.source_path)
+        })
         .take(MAX_CLIP_PLANS)
         .map(|item| {
             let mut notes_parts = Vec::new();
@@ -3680,17 +3777,26 @@ fn apply_primitive_handoff_files(
     result.counts.primitive_segments = segments.len();
     result.counts.primitive_structures = structures.len();
     result.artifact_states.primitive_entities = if used_entities {
-        applied_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH, entities.len())
+        applied_artifact_state(
+            WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH,
+            entities.len(),
+        )
     } else {
         skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ENTITIES_PATH)
     };
     result.artifact_states.primitive_events = if used_primitive_events {
-        applied_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH, primitive_events.len())
+        applied_artifact_state(
+            WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH,
+            primitive_events.len(),
+        )
     } else {
         skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_EVENTS_PATH)
     };
     result.artifact_states.primitive_assertions = if used_assertions {
-        applied_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH, assertions.len())
+        applied_artifact_state(
+            WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH,
+            assertions.len(),
+        )
     } else {
         skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH)
     };
@@ -3700,12 +3806,18 @@ fn apply_primitive_handoff_files(
         skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_ACTIONS_PATH)
     };
     result.artifact_states.primitive_segments = if used_segments {
-        applied_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH, segments.len())
+        applied_artifact_state(
+            WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH,
+            segments.len(),
+        )
     } else {
         skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_SEGMENTS_PATH)
     };
     result.artifact_states.primitive_structures = if used_structures {
-        applied_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH, structures.len())
+        applied_artifact_state(
+            WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH,
+            structures.len(),
+        )
     } else {
         skipped_artifact_state(WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH)
     };
@@ -3918,7 +4030,11 @@ fn build_apply_summary(
         counts.insight_posts, counts.todos, counts.events, counts.clip_plans
     );
     if renamed_count > 0 {
-        base.push_str(&format!(" Retitled {} journal note{}.", renamed_count, if renamed_count == 1 { "" } else { "s" }));
+        base.push_str(&format!(
+            " Retitled {} journal note{}.",
+            renamed_count,
+            if renamed_count == 1 { "" } else { "s" }
+        ));
     }
     if !had_errors {
         return base;
@@ -4185,7 +4301,13 @@ pub fn apply_handoff_files(
             WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH,
             result.renamed_sources.len(),
         )
-    } else if result.artifact_states.journal_titles.error.trim().is_empty() {
+    } else if result
+        .artifact_states
+        .journal_titles
+        .error
+        .trim()
+        .is_empty()
+    {
         skipped_artifact_state(WORKSPACE_SYNTHESIZER_JOURNAL_TITLES_PATH)
     } else {
         result.artifact_states.journal_titles.clone()
@@ -4251,7 +4373,9 @@ pub fn apply_handoff_files(
         }
     }
 
-    if insight_items.is_none() && (!primitive_assertions.is_empty() || !primitive_structures.is_empty()) {
+    if insight_items.is_none()
+        && (!primitive_assertions.is_empty() || !primitive_structures.is_empty())
+    {
         let compiled = compile_insight_posts_from_primitives(
             &primitive_assertions,
             &primitive_segments,
@@ -4300,7 +4424,8 @@ pub fn apply_handoff_files(
         let todo_items: Vec<local_store::WorkspaceTodoUpsert> = items
             .iter()
             .map(|item| {
-                let metadata_json = serde_json::to_string(item).unwrap_or_else(|_| "{}".to_string());
+                let metadata_json =
+                    serde_json::to_string(item).unwrap_or_else(|_| "{}".to_string());
                 local_store::WorkspaceTodoUpsert {
                     id: item.id.clone(),
                     title: item.title.clone(),
@@ -4339,7 +4464,8 @@ pub fn apply_handoff_files(
         let event_items: Vec<local_store::WorkspaceEventUpsert> = items
             .iter()
             .map(|item| {
-                let metadata_json = serde_json::to_string(item).unwrap_or_else(|_| "{}".to_string());
+                let metadata_json =
+                    serde_json::to_string(item).unwrap_or_else(|_| "{}".to_string());
                 local_store::WorkspaceEventUpsert {
                     id: item.id.clone(),
                     title: item.title.clone(),
@@ -4452,10 +4578,7 @@ fn collect_processed_source_paths(
     out
 }
 
-fn write_insight_posts(
-    output_root: &Path,
-    items: &[InsightPostCandidate],
-) -> Result<Vec<String>> {
+fn write_insight_posts(output_root: &Path, items: &[InsightPostCandidate]) -> Result<Vec<String>> {
     let mut keep_files = HashSet::new();
     let mut written_paths = Vec::new();
     for item in items {
@@ -4479,13 +4602,20 @@ fn write_clip_plans(clip_dir: &Path, items: &[ClipPlanCandidate]) -> Result<Vec<
         let raw = serde_json::to_string_pretty(item)?;
         fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
         keep_files.insert(filename);
-        written_paths.push(format!("posts/workspace_synthesizer/pipeline/clips/{}.json", item.id));
+        written_paths.push(format!(
+            "posts/workspace_synthesizer/pipeline/clips/{}.json",
+            item.id
+        ));
     }
     remove_stale_files(clip_dir, &keep_files, &[])?;
     Ok(written_paths)
 }
 
-fn remove_stale_files(dir: &Path, keep_files: &HashSet<String>, preserve_dirs: &[&str]) -> Result<()> {
+fn remove_stale_files(
+    dir: &Path,
+    keep_files: &HashSet<String>,
+    preserve_dirs: &[&str],
+) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
@@ -4739,7 +4869,9 @@ Some extra narration in between.
         }])
         .unwrap_err();
 
-        assert!(format!("{err:#}").contains("segments with timing must point to transcript sidecars"));
+        assert!(
+            format!("{err:#}").contains("segments with timing must point to transcript sidecars")
+        );
     }
 
     #[test]
@@ -4835,12 +4967,11 @@ Do something useful.
         .unwrap();
 
         assert_eq!(written, 1);
-        let file = load_optional_insight_posts_file(tmp.path()).unwrap().unwrap();
+        let file = load_optional_insight_posts_file(tmp.path())
+            .unwrap()
+            .unwrap();
         assert_eq!(file.len(), 1);
-        assert_eq!(
-            file[0].source_path,
-            "journals/text/2026-03-21.md"
-        );
+        assert_eq!(file[0].source_path, "journals/text/2026-03-21.md");
     }
 
     #[test]
@@ -4939,7 +5070,8 @@ Do something useful.
         write_json_file(&journal_titles_path(tmp.path()), &titles);
 
         let processed_source_paths = vec![journal_rel.to_string()];
-        let applied = apply_handoff_files(tmp.path(), "run-title", &processed_source_paths).unwrap();
+        let applied =
+            apply_handoff_files(tmp.path(), "run-title", &processed_source_paths).unwrap();
 
         assert_eq!(applied.artifact_states.journal_titles.status, "applied");
         assert_eq!(applied.artifact_states.journal_titles.item_count, 1);
@@ -4948,11 +5080,10 @@ Do something useful.
             applied.renamed_sources[0].to_path,
             "journals/text/2026/03/15/work-and-life-reflections.md"
         );
-        assert!(
-            tmp.path()
-                .join("journals/text/2026/03/15/work-and-life-reflections.md")
-                .exists()
-        );
+        assert!(tmp
+            .path()
+            .join("journals/text/2026/03/15/work-and-life-reflections.md")
+            .exists());
     }
 
     #[test]
@@ -4965,7 +5096,8 @@ Do something useful.
         let observed_at = journal_source_observed_at(&journal_abs).unwrap();
 
         let processed_source_paths = vec![journal_rel.to_string()];
-        let applied = apply_handoff_files(tmp.path(), "run-inbox", &processed_source_paths).unwrap();
+        let applied =
+            apply_handoff_files(tmp.path(), "run-inbox", &processed_source_paths).unwrap();
 
         assert_eq!(applied.renamed_sources.len(), 1);
         let expected_rel = format!(
@@ -4975,7 +5107,10 @@ Do something useful.
             observed_at.day()
         );
         assert_eq!(applied.renamed_sources[0].to_path, expected_rel);
-        assert!(tmp.path().join(&applied.renamed_sources[0].to_path).exists());
+        assert!(tmp
+            .path()
+            .join(&applied.renamed_sources[0].to_path)
+            .exists());
         assert!(!tmp.path().join(journal_rel).exists());
     }
 
@@ -4994,7 +5129,8 @@ Do something useful.
         fs::write(&media_abs, b"audio").unwrap();
         fs::write(&transcript_abs, "mindful observation").unwrap();
         fs::write(
-            tmp.path().join(super::super::transcript_json_rel_path(transcript_rel)),
+            tmp.path()
+                .join(super::super::transcript_json_rel_path(transcript_rel)),
             format!(
                 "{}\n",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -5007,7 +5143,8 @@ Do something useful.
         )
         .unwrap();
         fs::write(
-            tmp.path().join(super::super::transcript_srt_rel_path(transcript_rel)),
+            tmp.path()
+                .join(super::super::transcript_srt_rel_path(transcript_rel)),
             "1\n00:00:00,000 --> 00:00:01,000\nmindful observation\n",
         )
         .unwrap();
@@ -5065,8 +5202,8 @@ Do something useful.
         );
 
         let processed_source_paths = vec![transcript_rel.to_string()];
-        let applied = apply_handoff_files(tmp.path(), "run-audio-title", &processed_source_paths)
-            .unwrap();
+        let applied =
+            apply_handoff_files(tmp.path(), "run-audio-title", &processed_source_paths).unwrap();
 
         let expected_media_rel =
             "journals/media/audio/2026/03/30/mindful-observation-beyond-judgment.mp3";
@@ -5082,26 +5219,34 @@ Do something useful.
         assert!(tmp.path().join(expected_transcript_rel).exists());
         assert!(tmp
             .path()
-            .join(super::super::transcript_json_rel_path(expected_transcript_rel))
+            .join(super::super::transcript_json_rel_path(
+                expected_transcript_rel
+            ))
             .exists());
         assert!(tmp
             .path()
-            .join(super::super::transcript_srt_rel_path(expected_transcript_rel))
+            .join(super::super::transcript_srt_rel_path(
+                expected_transcript_rel
+            ))
             .exists());
         assert!(!tmp.path().join(media_rel).exists());
         assert!(!tmp.path().join(transcript_rel).exists());
 
         let relocated_json: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(
-                tmp.path()
-                    .join(super::super::transcript_json_rel_path(expected_transcript_rel)),
-            )
+            &fs::read_to_string(tmp.path().join(super::super::transcript_json_rel_path(
+                expected_transcript_rel,
+            )))
             .unwrap(),
         )
         .unwrap();
         assert_eq!(
             relocated_json["source"].as_str(),
-            Some(tmp.path().join(expected_media_rel).to_string_lossy().as_ref())
+            Some(
+                tmp.path()
+                    .join(expected_media_rel)
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
         assert_eq!(
             relocated_json["transcriptPath"].as_str(),
@@ -5116,9 +5261,11 @@ Do something useful.
         let synth_sources = local_store::list_workspace_synth_sources(tmp.path()).unwrap();
         assert_eq!(synth_sources.len(), 1);
         assert_eq!(synth_sources[0].source_path, expected_transcript_rel);
-        assert!(local_store::get_feed_interest_source(tmp.path(), expected_transcript_rel)
-            .unwrap()
-            .is_some());
+        assert!(
+            local_store::get_feed_interest_source(tmp.path(), expected_transcript_rel)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             local_store::rename_media_asset_path(
                 tmp.path(),
@@ -5193,7 +5340,8 @@ Do something useful.
         write_json_file(&manifest_path(tmp.path()), &manifest);
 
         let processed_source_paths = vec!["journals/text/2026-03-11.md".to_string()];
-        let applied = apply_handoff_files(tmp.path(), "run-legacy", &processed_source_paths).unwrap();
+        let applied =
+            apply_handoff_files(tmp.path(), "run-legacy", &processed_source_paths).unwrap();
 
         assert!(applied.applied_any);
         assert!(!applied.had_errors);
@@ -5258,11 +5406,13 @@ Do something useful.
                 version: "1".to_string(),
                 items: vec![AssertionCandidate {
                     id: "product-belief".to_string(),
-                    text: "The sharper workflow makes the product demo easier to follow.".to_string(),
+                    text: "The sharper workflow makes the product demo easier to follow."
+                        .to_string(),
                     kind: "belief".to_string(),
                     provenance: PrimitiveProvenance {
                         source_path: "journals/text/2026-03-11.md".to_string(),
-                        source_excerpt: "The sharper workflow makes the demo easier to follow.".to_string(),
+                        source_excerpt: "The sharper workflow makes the demo easier to follow."
+                            .to_string(),
                         ..PrimitiveProvenance::default()
                     },
                     ..AssertionCandidate::default()
@@ -5289,7 +5439,8 @@ Do something useful.
         );
 
         let processed_source_paths = vec!["journals/text/2026-03-11.md".to_string()];
-        let applied = apply_handoff_files(tmp.path(), "run-primitive", &processed_source_paths).unwrap();
+        let applied =
+            apply_handoff_files(tmp.path(), "run-primitive", &processed_source_paths).unwrap();
 
         assert!(applied.applied_any);
         assert_eq!(applied.counts.todos, 1);

@@ -3845,7 +3845,8 @@ async fn resolve_runtime_config_dirs(
                     ALLOW_TEMP_WORKSPACE_ENV
                 );
             } else {
-                let (zeroclaw_dir, workspace_dir) = resolve_config_dir_for_workspace(&workspace_root);
+                let (zeroclaw_dir, workspace_dir) =
+                    resolve_config_dir_for_workspace(&workspace_root);
                 return Ok((
                     zeroclaw_dir,
                     workspace_dir,
@@ -4206,9 +4207,7 @@ impl Config {
         }
         for (index, origin) in self.gateway.desktop_cors_allowed_origins.iter().enumerate() {
             if origin.trim().is_empty() {
-                anyhow::bail!(
-                    "gateway.desktop_cors_allowed_origins[{index}] must not be empty"
-                );
+                anyhow::bail!("gateway.desktop_cors_allowed_origins[{index}] must not be empty");
             }
         }
 
@@ -6662,10 +6661,8 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         let original_workspace = config.workspace_dir.clone();
-        let temp_workspace = std::env::temp_dir().join(format!(
-            "zeroclaw_env_workspace_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp_workspace =
+            std::env::temp_dir().join(format!("zeroclaw_env_workspace_{}", uuid::Uuid::new_v4()));
 
         std::env::remove_var(ALLOW_TEMP_WORKSPACE_ENV);
         std::env::set_var("ZEROCLAW_WORKSPACE", &temp_workspace);
@@ -6680,10 +6677,8 @@ requires_openai_auth = true
     async fn env_override_workspace_allows_temp_with_opt_in() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        let temp_workspace = std::env::temp_dir().join(format!(
-            "zeroclaw_env_workspace_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp_workspace =
+            std::env::temp_dir().join(format!("zeroclaw_env_workspace_{}", uuid::Uuid::new_v4()));
 
         std::env::set_var(ALLOW_TEMP_WORKSPACE_ENV, "1");
         std::env::set_var("ZEROCLAW_WORKSPACE", &temp_workspace);

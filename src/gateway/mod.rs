@@ -8,34 +8,32 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod article_synthesizer;
-pub mod static_files;
-pub mod local_store;
 pub mod feed_web_sources;
-pub mod workspace_synthesizer;
-pub mod state;
 pub mod handlers;
+pub mod local_store;
+pub mod state;
+pub mod static_files;
+pub mod workspace_synthesizer;
 
 pub use state::*;
 
 use handlers::{
     handle_local_model_download, handle_local_model_runtime_start,
-    handle_local_model_runtime_status, handle_local_model_runtime_stop,
-    handle_local_model_use, handle_local_models, handle_openrouter_oauth_callback,
-    handle_openrouter_oauth_start, handle_openrouter_oauth_status,
+    handle_local_model_runtime_status, handle_local_model_runtime_stop, handle_local_model_use,
+    handle_local_models, handle_openrouter_oauth_callback, handle_openrouter_oauth_start,
+    handle_openrouter_oauth_status,
 };
 
 use crate::auth::AuthService;
 use crate::config::{Config, TranscriptionConfig};
 use crate::gateway::feed_web_sources::DEFAULT_FEED_WEB_SOURCES;
 use crate::media::{command_media_backend, MediaToolCapabilities};
-use crate::memory::{self, Memory, MemoryCategory};
 use crate::memory::vector::{bytes_to_vec, cosine_similarity, vec_to_bytes};
+use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use chrono::{Datelike, Utc};
 use axum::{
     extract::{ConnectInfo, Path as AxumPath, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
@@ -46,6 +44,8 @@ use axum::{
     routing::{delete, get, patch, post},
     Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use chrono::{Datelike, Utc};
 use http_body_util::BodyExt as _;
 use parking_lot::Mutex;
 use regex::Regex;
@@ -243,7 +243,9 @@ fn desktop_cors_allowed_origins(config: &Config) -> Vec<HeaderValue> {
         }
         match HeaderValue::from_str(trimmed) {
             Ok(value) => origins.push(value),
-            Err(err) => tracing::warn!(origin = trimmed, error = %err, "Skipping invalid desktop CORS origin"),
+            Err(err) => {
+                tracing::warn!(origin = trimmed, error = %err, "Skipping invalid desktop CORS origin")
+            }
         }
     }
 
@@ -294,7 +296,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
 
-    if config.memory.embedding_provider.trim().eq_ignore_ascii_case("builtin") {
+    if config
+        .memory
+        .embedding_provider
+        .trim()
+        .eq_ignore_ascii_case("builtin")
+    {
         let provider = config.memory.embedding_provider.clone();
         let model = config.memory.embedding_model.clone();
         tokio::spawn(async move {
@@ -409,10 +416,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     println!("🦀 SlowClaw Gateway listening on http://{display_addr}");
     println!("  🌐 Web UI: http://{display_addr}/");
-    println!(
-        "  💾 Local store: {}",
-        local_bootstrap.db_path.display()
-    );
+    println!("  💾 Local store: {}", local_bootstrap.db_path.display());
     println!("  📁 Workspace: {}", config.workspace_dir.display());
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /pair/new-code — mint a fresh one-time pairing code (requires bearer)");
@@ -483,7 +487,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(handle_runtime_config).post(handle_runtime_config_update),
         )
         .route("/api/local-models", get(handle_local_models))
-        .route("/api/local-models/download", post(handle_local_model_download))
+        .route(
+            "/api/local-models/download",
+            post(handle_local_model_download),
+        )
         .route("/api/local-models/use", post(handle_local_model_use))
         .route(
             "/api/local-models/runtime",
@@ -493,7 +500,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .route("/api/media/capabilities", get(handle_media_capabilities))
         .route("/webhook", post(handle_webhook))
-        .route("/api/chat/messages", get(handle_chat_list).post(handle_chat_send))
+        .route(
+            "/api/chat/messages",
+            get(handle_chat_list).post(handle_chat_send),
+        )
         .route("/api/chat/stream", get(handle_chat_stream))
         .route("/api/chat/result/stream", get(handle_chat_result_stream))
         .route(
@@ -510,8 +520,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .route(
             "/api/workspace/world-feed/interests/{interest_id}",
-            delete(handle_world_feed_interest_delete)
-                .patch(handle_world_feed_interest_update),
+            delete(handle_world_feed_interest_delete).patch(handle_world_feed_interest_update),
         )
         .route("/api/workspace/todos", get(handle_workspace_todos_list))
         .route(
@@ -519,7 +528,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             patch(handle_workspace_todo_update),
         )
         .route("/api/workspace/events", get(handle_workspace_events_list))
-        .route("/api/drafts", get(handle_drafts_list).post(handle_drafts_upsert))
+        .route(
+            "/api/drafts",
+            get(handle_drafts_list).post(handle_drafts_upsert),
+        )
         .route(
             "/api/post-history",
             get(handle_post_history_list).post(handle_post_history_create),
@@ -552,7 +564,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/feed/workflow-comment",
             post(handle_feed_workflow_comment),
         )
-        .route("/api/feed/workflow-settings", get(handle_feed_workflow_settings))
+        .route(
+            "/api/feed/workflow-settings",
+            get(handle_feed_workflow_settings),
+        )
         .route("/api/feed/workflow-run", post(handle_feed_workflow_run))
         .route(
             "/api/feed/workflow-auto-run",
@@ -564,7 +579,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .route(
             "/api/workspace/synthesizer/skills",
-            get(handle_workspace_synthesizer_skills).patch(handle_workspace_synthesizer_skills_update),
+            get(handle_workspace_synthesizer_skills)
+                .patch(handle_workspace_synthesizer_skills_update),
         )
         .route(
             "/api/workspace/synthesizer/stream",
@@ -629,9 +645,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Duration::from_secs(MEDIA_UPLOAD_TIMEOUT_SECS),
         ));
 
-    let app = Router::new()
-        .merge(core_router)
-        .merge(media_router);
+    let app = Router::new().merge(core_router).merge(media_router);
     #[cfg(feature = "desktop-synthesis")]
     let app = app
         .merge(desktop_synth_router)
@@ -754,7 +768,10 @@ fn frontend_error_payload_with_meta(
     extra: serde_json::Value,
 ) -> Json<serde_json::Value> {
     let mut payload = serde_json::Map::new();
-    payload.insert("error".to_string(), serde_json::Value::String(message.into()));
+    payload.insert(
+        "error".to_string(),
+        serde_json::Value::String(message.into()),
+    );
     payload.insert("code".to_string(), serde_json::Value::String(code.into()));
     if let serde_json::Value::Object(extra_fields) = extra {
         payload.extend(extra_fields);
@@ -776,7 +793,10 @@ fn frontend_error_response_with_meta(
     message: impl Into<String>,
     extra: serde_json::Value,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    (status, frontend_error_payload_with_meta(code, message, extra))
+    (
+        status,
+        frontend_error_payload_with_meta(code, message, extra),
+    )
 }
 
 pub(crate) fn frontend_error_response_with_retry_after(
@@ -802,7 +822,11 @@ fn frontend_internal_error<E: std::fmt::Display>(
     err: E,
 ) -> (StatusCode, Json<serde_json::Value>) {
     tracing::warn!(context, error = %err, "Frontend request failed");
-    frontend_error_response(status, frontend_error_code_from_context(context), user_message)
+    frontend_error_response(
+        status,
+        frontend_error_code_from_context(context),
+        user_message,
+    )
 }
 
 pub(crate) fn frontend_internal_error_response<E: std::fmt::Display>(
@@ -833,9 +857,9 @@ fn frontend_event_stream(
 ) -> axum::response::Response {
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
         )
         .into_response()
 }
@@ -911,23 +935,14 @@ async fn handle_runtime_config_update(
         .map(str::trim)
         .unwrap_or_default()
         != model;
-    let api_url_changed = next
-        .api_url
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default()
-        != api_url;
+    let api_url_changed = next.api_url.as_deref().map(str::trim).unwrap_or_default() != api_url;
     let api_key_changed = if let Some(new_key) = body
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|k| !k.is_empty())
     {
-        let old_key = next
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default();
+        let old_key = next.api_key.as_deref().map(str::trim).unwrap_or_default();
         let changed = old_key != new_key;
         tracing::info!(
             provider = provider,
@@ -1146,7 +1161,10 @@ async fn handle_sync_import(
     }
 }
 
-pub(crate) async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
+pub(crate) async fn persist_pairing_tokens(
+    config: Arc<Mutex<Config>>,
+    pairing: &PairingGuard,
+) -> Result<()> {
     let paired_tokens = pairing.tokens();
     // This is needed because parking_lot's guard is not Send so we clone the inner
     // this should be removed once async mutexes are used everywhere
@@ -1163,7 +1181,10 @@ pub(crate) async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: 
 }
 
 /// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
-pub(crate) async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
+pub(crate) async fn run_gateway_chat_simple(
+    state: &AppState,
+    message: &str,
+) -> anyhow::Result<String> {
     let user_messages = vec![ChatMessage::user(message)];
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
@@ -1204,16 +1225,8 @@ fn gateway_ui_tool_profile() -> crate::tools::ToolProfile {
     crate::tools::ToolProfile::UiRestricted
 }
 
-async fn run_gateway_ui_chat_with_tools(
-    config: Config,
-    message: &str,
-) -> anyhow::Result<String> {
-    crate::agent::process_message_with_profile(
-        config,
-        message,
-        gateway_ui_tool_profile(),
-    )
-    .await
+async fn run_gateway_ui_chat_with_tools(config: Config, message: &str) -> anyhow::Result<String> {
+    crate::agent::process_message_with_profile(config, message, gateway_ui_tool_profile()).await
 }
 
 /// Webhook request body
@@ -1597,7 +1610,10 @@ fn normalize_workflow_output_prefix(prefix: &str, workflow_key: &str) -> String 
     normalized
 }
 
-fn normalize_workflow_record(workflow_key: &str, mut record: FeedContentAgentRecord) -> FeedContentAgentRecord {
+fn normalize_workflow_record(
+    workflow_key: &str,
+    mut record: FeedContentAgentRecord,
+) -> FeedContentAgentRecord {
     record.workflow_key = workflow_key.to_string();
     record.workflow_bot = record
         .workflow_bot
@@ -1646,7 +1662,9 @@ impl StringExt for String {
     }
 }
 
-fn feed_workflow_definition_from_record(record: &FeedContentAgentRecord) -> FeedContentAgentDefinition {
+fn feed_workflow_definition_from_record(
+    record: &FeedContentAgentRecord,
+) -> FeedContentAgentDefinition {
     FeedContentAgentDefinition {
         key: record.workflow_key.clone(),
         bot_name: record.workflow_bot.clone(),
@@ -1669,8 +1687,7 @@ fn workflow_definitions(store: &FeedContentAgentStore) -> Vec<FeedContentAgentDe
         .values()
         .map(feed_workflow_definition_from_record)
         .filter(|workflow| {
-            workflow.visible_in_ui
-                && !workspace_synthesizer::is_managed_skill_key(&workflow.key)
+            workflow.visible_in_ui && !workspace_synthesizer::is_managed_skill_key(&workflow.key)
         })
         .collect();
     defs.sort_by(|a, b| a.key.cmp(&b.key));
@@ -1708,12 +1725,10 @@ fn normalize_workflow_settings(mut settings: FeedWorkflowSettings) -> FeedWorkfl
     if settings.schedule_cron.is_empty() {
         settings.schedule_cron = default_workflow_schedule_cron();
     }
-    settings.schedule_tz = settings
-        .schedule_tz
-        .and_then(|value| {
-            let trimmed = value.trim().to_string();
-            (!trimmed.is_empty()).then_some(trimmed)
-        });
+    settings.schedule_tz = settings.schedule_tz.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    });
     settings.goal = normalize_goal_text(settings.goal);
     settings.prompt = normalize_goal_text(settings.prompt);
     if settings.goal.is_none() {
@@ -1822,7 +1837,7 @@ fn ensure_content_agent_skill_file(
         render_template_skill_markdown(&record.workflow_bot, &goal, output_dir)
     });
     std::fs::write(&skill_abs, skill_body)
-    .with_context(|| format!("failed to write starter skill {}", skill_abs.display()))
+        .with_context(|| format!("failed to write starter skill {}", skill_abs.display()))
 }
 
 fn ensure_built_in_content_agents(
@@ -1850,9 +1865,7 @@ fn ensure_built_in_content_agents(
             if let Some(canonical_body) = canonical_content_agent_skill_body(record)? {
                 let canonical_fingerprint = content_agent_skill_fingerprint(&canonical_body);
                 let skill_abs = workspace_dir.join(&record.skill_path);
-                let should_refresh_skill = record
-                    .built_in_skill_fingerprint
-                    .as_deref()
+                let should_refresh_skill = record.built_in_skill_fingerprint.as_deref()
                     != Some(canonical_fingerprint.as_str())
                     || !skill_abs.exists();
                 if should_refresh_skill {
@@ -1893,7 +1906,10 @@ fn load_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedCont
             .into_iter()
             .map(|(key, record)| {
                 let normalized_key = sanitize_workflow_key(&key);
-                (normalized_key.clone(), normalize_workflow_record(&normalized_key, record))
+                (
+                    normalized_key.clone(),
+                    normalize_workflow_record(&normalized_key, record),
+                )
             })
             .collect();
         return Ok(parsed);
@@ -1911,7 +1927,10 @@ fn load_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedCont
             output_prefix: format!("posts/{key}/"),
             enabled: default_content_agent_enabled(),
             editable_files: vec![format!("skills/{key}/SKILL.md")],
-            goal: legacy_settings.goal.clone().or(legacy_settings.prompt.clone()),
+            goal: legacy_settings
+                .goal
+                .clone()
+                .or(legacy_settings.prompt.clone()),
             last_triggered_at: None,
             last_run_at: None,
             last_triggered_source_updated_at: None,
@@ -1944,7 +1963,9 @@ fn save_feed_workflow_settings_store(
         .with_context(|| format!("Failed to write workflow settings store {}", path.display()))
 }
 
-fn load_or_seed_feed_workflow_settings_store(workspace_dir: &StdPath) -> Result<FeedContentAgentStore> {
+fn load_or_seed_feed_workflow_settings_store(
+    workspace_dir: &StdPath,
+) -> Result<FeedContentAgentStore> {
     let mut store = load_feed_workflow_settings_store(workspace_dir)?;
     let mut changed = ensure_built_in_content_agents(workspace_dir, &mut store)?;
     if migrate_workspace_synth_managed_workflows(workspace_dir, &mut store)? {
@@ -1968,10 +1989,8 @@ fn migrate_workspace_synth_managed_workflows(
         let Some(legacy) = store.workflows.remove(&key) else {
             continue;
         };
-        let skill_record = skill_store
-            .skills
-            .entry(key.clone())
-            .or_insert_with(|| workspace_synthesizer::WorkspaceSynthSkillRecord {
+        let skill_record = skill_store.skills.entry(key.clone()).or_insert_with(|| {
+            workspace_synthesizer::WorkspaceSynthSkillRecord {
                 skill_key: key.clone(),
                 name: spec.name.to_string(),
                 skill_path: format!("skills/workspace_synthesizer/{key}/SKILL.md"),
@@ -1982,7 +2001,8 @@ fn migrate_workspace_synth_managed_workflows(
                 visible_in_ui: spec.visible_in_ui,
                 handler_kind: spec.handler_kind,
                 artifact_rules_override: String::new(),
-            });
+            }
+        });
         skill_record.enabled = legacy.enabled;
         if let Some(goal) = normalize_goal_text(legacy.goal.clone())
             .or_else(|| normalize_goal_text(legacy.settings.goal.clone()))
@@ -2261,8 +2281,7 @@ fn save_workspace_synthesizer_status(
     next.trigger_reason = trigger_reason.trim().to_string();
     next.thread_id = thread_id.trim().to_string();
     next.last_source_updated_at = latest_source_updated_at;
-    next.last_manifest_path =
-        workspace_synthesizer::WORKSPACE_SYNTHESIZER_PIPELINE_DIR.to_string();
+    next.last_manifest_path = workspace_synthesizer::WORKSPACE_SYNTHESIZER_PIPELINE_DIR.to_string();
     next.pending_source_count = pending_source_count;
     next.pending_word_count = pending_word_count;
     if let Some(selected_source_paths) = selected_source_paths {
@@ -2400,9 +2419,7 @@ fn set_workspace_synth_journal_save_cooldown(workspace_dir: &StdPath, cooldown_u
     let mut next = workspace_synthesizer::load_status(workspace_dir);
     next.journal_save_cooldown_until = cooldown_until.trim().to_string();
     if let Err(err) = workspace_synthesizer::save_status(workspace_dir, &next) {
-        tracing::warn!(
-            "Failed to persist workspace synthesizer journal-save cooldown: {err}"
-        );
+        tracing::warn!("Failed to persist workspace synthesizer journal-save cooldown: {err}");
     }
 }
 
@@ -2421,9 +2438,7 @@ fn clear_workspace_synth_journal_save_cooldown(
     }
     next.journal_save_cooldown_until.clear();
     if let Err(err) = workspace_synthesizer::save_status(workspace_dir, &next) {
-        tracing::warn!(
-            "Failed to clear workspace synthesizer journal-save cooldown: {err}"
-        );
+        tracing::warn!("Failed to clear workspace synthesizer journal-save cooldown: {err}");
     }
 }
 
@@ -2466,7 +2481,8 @@ fn workspace_synth_error_retry_due(
     }
 
     let last_run_secs = parse_rfc3339_timestamp_secs(&status.last_run_at).unwrap_or(0);
-    last_run_secs <= 0 || Utc::now().timestamp() - last_run_secs >= WORKSPACE_SYNTH_ERROR_RETRY_DELAY_SECS
+    last_run_secs <= 0
+        || Utc::now().timestamp() - last_run_secs >= WORKSPACE_SYNTH_ERROR_RETRY_DELAY_SECS
 }
 
 async fn enqueue_pending_journal_inbox_audio_transcriptions(state: &AppState) -> usize {
@@ -2525,10 +2541,7 @@ fn start_journal_inbox_maintenance(state: AppState) {
     });
 }
 
-fn schedule_workspace_synth_after_journal_save_cooldown(
-    state: AppState,
-    cooldown_until: String,
-) {
+fn schedule_workspace_synth_after_journal_save_cooldown(state: AppState, cooldown_until: String) {
     tokio::spawn(async move {
         loop {
             let wait = workspace_synth_cooldown_wait_duration(&cooldown_until);
@@ -2728,7 +2741,8 @@ fn queue_workspace_synthesizer_for_trigger(
     {
         return Ok(None);
     }
-    if matches!(status.status.as_str(), "pending" | "processing") && !status.thread_id.trim().is_empty()
+    if matches!(status.status.as_str(), "pending" | "processing")
+        && !status.thread_id.trim().is_empty()
     {
         return Ok(Some(status.thread_id));
     }
@@ -2852,7 +2866,8 @@ async fn run_local_agent_prompt_in_thread(
     .await
 }
 
-fn workspace_synth_default_artifact_states() -> workspace_synthesizer::WorkspaceSynthArtifactStates {
+fn workspace_synth_default_artifact_states() -> workspace_synthesizer::WorkspaceSynthArtifactStates
+{
     workspace_synthesizer::WorkspaceSynthArtifactStates {
         insight_posts: workspace_synthesizer::WorkspaceSynthArtifactState {
             status: "skipped".to_string(),
@@ -2898,7 +2913,8 @@ fn workspace_synth_default_artifact_states() -> workspace_synthesizer::Workspace
         },
         primitive_assertions: workspace_synthesizer::WorkspaceSynthArtifactState {
             status: "skipped".to_string(),
-            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH.to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_PRIMITIVE_ASSERTIONS_PATH
+                .to_string(),
             item_count: 0,
             error: String::new(),
         },
@@ -2916,7 +2932,8 @@ fn workspace_synth_default_artifact_states() -> workspace_synthesizer::Workspace
         },
         primitive_structures: workspace_synthesizer::WorkspaceSynthArtifactState {
             status: "skipped".to_string(),
-            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH.to_string(),
+            path: workspace_synthesizer::WORKSPACE_SYNTHESIZER_PRIMITIVE_STRUCTURES_PATH
+                .to_string(),
             item_count: 0,
             error: String::new(),
         },
@@ -3050,13 +3067,7 @@ fn workspace_synth_provider_is_local(provider_name: &str, api_url: Option<&str>)
     }
     if matches!(
         normalized.as_str(),
-        "lmstudio"
-            | "lm-studio"
-            | "llamacpp"
-            | "llama.cpp"
-            | "sglang"
-            | "vllm"
-            | "osaurus"
+        "lmstudio" | "lm-studio" | "llamacpp" | "llama.cpp" | "sglang" | "vllm" | "osaurus"
     ) {
         return true;
     }
@@ -3138,8 +3149,7 @@ async fn workspace_synth_provider_readiness(state: &AppState) -> (bool, String) 
         || provider_name.eq_ignore_ascii_case("google")
         || provider_name.eq_ignore_ascii_case("google-gemini")
     {
-        "Gemini login required. Finish Gemini setup before running workspace synthesis."
-            .to_string()
+        "Gemini login required. Finish Gemini setup before running workspace synthesis.".to_string()
     } else {
         format!(
             "Provider `{}` is not ready. Add credentials or switch to a local provider before running workspace synthesis.",
@@ -3169,10 +3179,14 @@ fn render_workspace_synth_triage_prompt(
     prompt.push_str("\n\n## Instructions\n");
     prompt.push_str("Return a single JSON object and nothing else.\n");
     prompt.push_str("```json\n");
-    prompt.push_str(r#"{"relevant_skills": ["skill_key_1", "skill_key_2"], "keywords": ["kw1", "kw2"]}"#);
+    prompt.push_str(
+        r#"{"relevant_skills": ["skill_key_1", "skill_key_2"], "keywords": ["kw1", "kw2"]}"#,
+    );
     prompt.push_str("\n```\n\n");
     prompt.push_str("Rules:\n");
-    prompt.push_str("- Include a skill only if the notes contain content that matches that skill's goal.\n");
+    prompt.push_str(
+        "- Include a skill only if the notes contain content that matches that skill's goal.\n",
+    );
     prompt.push_str("- `workspace_journal_title_extractor` is always relevant when notes exist.\n");
     prompt.push_str("- `workspace_insight_extractor` is relevant for most non-trivial notes with ideas, reflections, or observations.\n");
     prompt.push_str("- `workspace_todo_extractor` is relevant only if the notes contain action items, commitments, plans, or to-dos.\n");
@@ -3183,7 +3197,9 @@ fn render_workspace_synth_triage_prompt(
     prompt.push_str("- Include a mix of specific terms and a few broader adjacent interests when that would improve discovery.\n");
     prompt.push_str("- Avoid generic journaling words like `note`, `journal`, `reflection`, `thoughts`, `personal`, or `audio` unless the content is actually about those topics.\n");
     prompt.push_str("- Return lowercase keywords.\n");
-    prompt.push_str("- Return only the JSON object. No prose, no code fences beyond the object itself.\n");
+    prompt.push_str(
+        "- Return only the JSON object. No prose, no code fences beyond the object itself.\n",
+    );
     prompt
 }
 
@@ -3201,14 +3217,14 @@ async fn run_workspace_synth_triage(
     if target_sources.is_empty() || enabled_skills.is_empty() {
         return None;
     }
-    let inline_bundle = match render_workspace_synth_inline_source_bundle(workspace_dir, target_sources)
-    {
-        Ok(b) => b,
-        Err(err) => {
-            tracing::warn!("workspace synth triage: failed to inline sources: {err}");
-            return None;
-        }
-    };
+    let inline_bundle =
+        match render_workspace_synth_inline_source_bundle(workspace_dir, target_sources) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!("workspace synth triage: failed to inline sources: {err}");
+                return None;
+            }
+        };
     let prompt = render_workspace_synth_triage_prompt(enabled_skills, &inline_bundle);
     let system = "You are a strict JSON classification engine for ZeroClaw workspace synthesis. Return exactly one valid JSON object and no prose, code fences, or tool calls.";
 
@@ -3242,7 +3258,10 @@ async fn run_workspace_synth_triage(
             Some(result)
         }
         None => {
-            tracing::warn!("workspace synth triage: failed to parse response: {}", reply.chars().take(200).collect::<String>());
+            tracing::warn!(
+                "workspace synth triage: failed to parse response: {}",
+                reply.chars().take(200).collect::<String>()
+            );
             None
         }
     }
@@ -3298,19 +3317,25 @@ fn render_workspace_synth_split_batch_prompt(
                 item.source_path, item.word_count
             ));
         }
-        prompt.push_str("- If multiple target notes are present, synthesize them together as one batch.\n");
+        prompt.push_str(
+            "- If multiple target notes are present, synthesize them together as one batch.\n",
+        );
         prompt.push_str("- Ignore older journal files that are outside this target list unless one of the targets explicitly depends on them.\n\n");
     }
     prompt.push_str("- Read from `journals/text/**`, available transcript files, and journal media files when relevant to the goal.\n");
     prompt.push_str("- If a needed transcript for journal media is missing, use `transcribe_media` and save outputs under `journals/text/transcriptions/**`.\n");
     prompt.push_str(&format!("- {media_tool_summary}\n"));
     prompt.push_str("- For deterministic media transforms, use only the built-in media tools that are available on this device.\n");
-    prompt.push_str("- Write each allowed handoff file exactly once, even if its `items` array is empty.\n");
+    prompt.push_str(
+        "- Write each allowed handoff file exactly once, even if its `items` array is empty.\n",
+    );
     prompt.push_str("- Allowed handoff files for this run:\n");
     for (_, spec, _) in split_skills {
         prompt.push_str(&format!("  - `{}`\n", spec.handoff_path));
     }
-    prompt.push_str("- Do not write any other handoff file, final feed post, todo, event, or clip artifact.\n");
+    prompt.push_str(
+        "- Do not write any other handoff file, final feed post, todo, event, or clip artifact.\n",
+    );
     prompt.push_str("- Use direct file edits in the workspace, not code blocks in chat.\n");
     prompt.push_str("- Reply with a concise summary of what you wrote across the handoff files.\n");
     prompt
@@ -3425,19 +3450,32 @@ fn render_workspace_synth_direct_json_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     let mut prompt = String::new();
-    prompt.push_str("Extract one typed workspace synthesis handoff from the provided source bundle.\n\n");
+    prompt.push_str(
+        "Extract one typed workspace synthesis handoff from the provided source bundle.\n\n",
+    );
     prompt.push_str("## Shared Context\n");
-    prompt.push_str(&format!("- Index skill: {}\n", orchestrator_workflow.bot_name));
-    prompt.push_str(&format!("- Index goal: {}\n", orchestrator_workflow.goal.trim()));
+    prompt.push_str(&format!(
+        "- Index skill: {}\n",
+        orchestrator_workflow.bot_name
+    ));
+    prompt.push_str(&format!(
+        "- Index goal: {}\n",
+        orchestrator_workflow.goal.trim()
+    ));
     prompt.push_str(&format!("- Extractor: {}\n", split_skill.name));
     prompt.push_str(&format!("- Extractor goal: {}\n", split_skill.goal.trim()));
-    prompt.push_str(&format!("- Allowed handoff file: `{}`\n", spec.handoff_path));
+    prompt.push_str(&format!(
+        "- Allowed handoff file: `{}`\n",
+        spec.handoff_path
+    ));
     prompt.push_str("- Process only the provided sources.\n");
     prompt.push_str("- Return exactly one JSON object and nothing else.\n");
     prompt.push_str("- Do not call tools.\n");
     prompt.push_str("- Do not describe what you are doing.\n");
     prompt.push_str("- Always return `{\"version\":\"1\",\"items\":[...]}` even when empty.\n");
-    prompt.push_str("- Use only workspace-relative `sourcePath` values copied from the provided sources.\n");
+    prompt.push_str(
+        "- Use only workspace-relative `sourcePath` values copied from the provided sources.\n",
+    );
     prompt.push_str("- If the note uses relative timing like `tomorrow`, anchor it to the source note date when the path reveals one.\n");
     prompt.push_str("- If there are no strong candidates, return an empty `items` array.\n\n");
     prompt.push_str("## Artifact Rules\n");
@@ -3504,18 +3542,18 @@ async fn run_workspace_synth_split_skill_via_direct_json(
             );
         }
     };
-    let item_count =
-        workspace_synthesizer::materialize_extractor_response(workspace_dir, &split_skill.key, &reply)?;
+    let item_count = workspace_synthesizer::materialize_extractor_response(
+        workspace_dir,
+        &split_skill.key,
+        &reply,
+    )?;
     Ok(format!(
         "Wrote {} item(s) to {} via direct JSON fallback.",
         item_count, spec.handoff_path
     ))
 }
 
-fn workspace_synth_split_handoff_written(
-    workspace_dir: &StdPath,
-    skill_key: &str,
-) -> bool {
+fn workspace_synth_split_handoff_written(workspace_dir: &StdPath, skill_key: &str) -> bool {
     workspace_synthesizer::extractor_handoff_path(skill_key)
         .map(|path| workspace_dir.join(path).is_file())
         .unwrap_or(false)
@@ -3551,9 +3589,7 @@ fn extend_workspace_synth_split_skill_defs(
     }
 }
 
-fn workspace_synth_bundle_payload_item_keys(
-    payload: &serde_json::Value,
-) -> HashSet<String> {
+fn workspace_synth_bundle_payload_item_keys(payload: &serde_json::Value) -> HashSet<String> {
     let mut keys = HashSet::new();
     let Some(items) = payload
         .get("items")
@@ -3650,7 +3686,11 @@ fn workspace_synth_bundle_payload_matches_skill(
         workspace_synthesizer::WORKSPACE_SEGMENT_EXTRACTOR_WORKFLOW_KEY => {
             has("sourcePath")
                 && has("provenance")
-                && (has("label") || has("topic") || has("transcriptQuote") || has("startAt") || has("endAt"))
+                && (has("label")
+                    || has("topic")
+                    || has("transcriptQuote")
+                    || has("startAt")
+                    || has("endAt"))
         }
         _ => has("body") || has("formatHint"),
     }
@@ -3819,8 +3859,7 @@ async fn run_workspace_synth_split_skills_individually(
             .await
         };
 
-        match run_result
-        {
+        match run_result {
             Ok(reply) => {
                 let skill_finished_at = Utc::now();
                 fallback_finished_at = skill_finished_at;
@@ -3832,8 +3871,9 @@ async fn run_workspace_synth_split_skills_individually(
                         skill_replies.push(format!("{}: {}", split_skill.name, trimmed));
                     }
                 } else {
-                    let handoff_path = workspace_synthesizer::extractor_handoff_path(&split_skill.key)
-                        .unwrap_or("its configured handoff file");
+                    let handoff_path =
+                        workspace_synthesizer::extractor_handoff_path(&split_skill.key)
+                            .unwrap_or("its configured handoff file");
                     let message = truncate_with_ellipsis(
                         &format!(
                             "{} returned without writing {}",
@@ -3862,10 +3902,8 @@ async fn run_workspace_synth_split_skills_individually(
             Err(err) => {
                 let skill_finished_at = Utc::now();
                 fallback_finished_at = skill_finished_at;
-                let message = truncate_with_ellipsis(
-                    &format!("{} failed: {err:#}", split_skill.name),
-                    800,
-                );
+                let message =
+                    truncate_with_ellipsis(&format!("{} failed: {err:#}", split_skill.name), 800);
                 if let Some(state) =
                     workspace_synth_artifact_state_mut(split_artifact_states, &split_skill.key)
                 {
@@ -4063,7 +4101,8 @@ async fn run_workspace_synthesizer_orchestrator(
         };
 
         if !pending_split_skills.is_empty()
-            && skill.handler_kind != workspace_synthesizer::WorkspaceSynthSkillHandlerKind::SplitHandoff
+            && skill.handler_kind
+                != workspace_synthesizer::WorkspaceSynthSkillHandlerKind::SplitHandoff
         {
             if sequential_split_skills {
                 if let Some((started_at, finished_at)) = run_workspace_synth_split_skills_individually(
@@ -4228,7 +4267,8 @@ async fn run_workspace_synthesizer_orchestrator(
                                     started_at,
                                     finished_at,
                                 ));
-                                skill_errors.push(format!("{} failed: {}", split_skill.name, message));
+                                skill_errors
+                                    .push(format!("{} failed: {}", split_skill.name, message));
                             }
                         }
                     }
@@ -4272,8 +4312,7 @@ async fn run_workspace_synthesizer_orchestrator(
                     &skill_markdown,
                     media_tool_summary,
                 );
-                let subthread_id =
-                    format!("workflow:{}:{}", orchestrator_workflow.key, skill.key);
+                let subthread_id = format!("workflow:{}:{}", orchestrator_workflow.key, skill.key);
                 let started_at = Utc::now();
                 match tokio::time::timeout(
                     Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
@@ -4297,11 +4336,19 @@ async fn run_workspace_synthesizer_orchestrator(
                                     format!("{} {}", applied.summary.trim(), reply.trim())
                                 };
                                 if !summary.trim().is_empty() {
-                                    skill_replies.push(format!("{}: {}", skill.name, summary.trim()));
+                                    skill_replies.push(format!(
+                                        "{}: {}",
+                                        skill.name,
+                                        summary.trim()
+                                    ));
                                 }
                                 skill_runs.push(workspace_synth_skill_run_state_timed(
                                     &skill,
-                                    if applied.had_errors { "error" } else { "applied" },
+                                    if applied.had_errors {
+                                        "error"
+                                    } else {
+                                        "applied"
+                                    },
                                     applied.summary.clone(),
                                     if applied.had_errors {
                                         applied.summary.clone()
@@ -4369,8 +4416,10 @@ async fn run_workspace_synthesizer_orchestrator(
                     }
                     Err(_) => {
                         let finished_at = Utc::now();
-                        let message =
-                            format!("{} timed out after {}s", skill.name, CONTENT_AGENT_TIMEOUT_SECS);
+                        let message = format!(
+                            "{} timed out after {}s",
+                            skill.name, CONTENT_AGENT_TIMEOUT_SECS
+                        );
                         skill_runs.push(workspace_synth_skill_run_state_timed(
                             &skill,
                             "error",
@@ -4393,8 +4442,7 @@ async fn run_workspace_synthesizer_orchestrator(
                     &skill_markdown,
                     media_tool_summary,
                 );
-                let subthread_id =
-                    format!("workflow:{}:{}", orchestrator_workflow.key, skill.key);
+                let subthread_id = format!("workflow:{}:{}", orchestrator_workflow.key, skill.key);
                 let started_at = Utc::now();
                 match tokio::time::timeout(
                     Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
@@ -4442,8 +4490,10 @@ async fn run_workspace_synthesizer_orchestrator(
                     }
                     Err(_) => {
                         let finished_at = Utc::now();
-                        let message =
-                            format!("{} timed out after {}s", skill.name, CONTENT_AGENT_TIMEOUT_SECS);
+                        let message = format!(
+                            "{} timed out after {}s",
+                            skill.name, CONTENT_AGENT_TIMEOUT_SECS
+                        );
                         skill_runs.push(workspace_synth_skill_run_state_timed(
                             &skill,
                             "error",
@@ -4475,7 +4525,9 @@ async fn run_workspace_synthesizer_orchestrator(
                 &mut skill_replies,
                 &mut skill_runs,
                 &mut skill_errors,
-                Some("Running extractor skills one by one for OpenRouter free-route compatibility."),
+                Some(
+                    "Running extractor skills one by one for OpenRouter free-route compatibility.",
+                ),
                 true,
             )
             .await
@@ -4608,9 +4660,10 @@ async fn run_workspace_synthesizer_orchestrator(
                         split_batch_finished_at = Some(finished_at);
                     } else {
                         for (split_skill, _, _) in &pending_split_skills {
-                            if let Some(state) =
-                                workspace_synth_artifact_state_mut(&mut split_artifact_states, &split_skill.key)
-                            {
+                            if let Some(state) = workspace_synth_artifact_state_mut(
+                                &mut split_artifact_states,
+                                &split_skill.key,
+                            ) {
                                 state.status = "error".to_string();
                                 state.error = message.clone();
                             }
@@ -4670,27 +4723,55 @@ async fn run_workspace_synthesizer_orchestrator(
     if !split_artifact_states.journal_titles.error.trim().is_empty() {
         applied.artifact_states.journal_titles = split_artifact_states.journal_titles.clone();
     }
-    if !split_artifact_states.primitive_entities.error.trim().is_empty() {
-        applied.artifact_states.primitive_entities = split_artifact_states.primitive_entities.clone();
+    if !split_artifact_states
+        .primitive_entities
+        .error
+        .trim()
+        .is_empty()
+    {
+        applied.artifact_states.primitive_entities =
+            split_artifact_states.primitive_entities.clone();
     }
-    if !split_artifact_states.primitive_actions.error.trim().is_empty() {
+    if !split_artifact_states
+        .primitive_actions
+        .error
+        .trim()
+        .is_empty()
+    {
         applied.artifact_states.primitive_actions = split_artifact_states.primitive_actions.clone();
     }
-    if !split_artifact_states.primitive_events.error.trim().is_empty() {
+    if !split_artifact_states
+        .primitive_events
+        .error
+        .trim()
+        .is_empty()
+    {
         applied.artifact_states.primitive_events = split_artifact_states.primitive_events.clone();
     }
-    if !split_artifact_states.primitive_assertions.error.trim().is_empty() {
+    if !split_artifact_states
+        .primitive_assertions
+        .error
+        .trim()
+        .is_empty()
+    {
         applied.artifact_states.primitive_assertions =
             split_artifact_states.primitive_assertions.clone();
     }
-    if !split_artifact_states.primitive_segments.error.trim().is_empty() {
-        applied.artifact_states.primitive_segments = split_artifact_states.primitive_segments.clone();
+    if !split_artifact_states
+        .primitive_segments
+        .error
+        .trim()
+        .is_empty()
+    {
+        applied.artifact_states.primitive_segments =
+            split_artifact_states.primitive_segments.clone();
     }
 
     for skill in split_skill_defs {
-        let item_state = workspace_synth_artifact_state_mut(&mut applied.artifact_states, &skill.key)
-            .map(|state| state.clone())
-            .unwrap_or_default();
+        let item_state =
+            workspace_synth_artifact_state_mut(&mut applied.artifact_states, &skill.key)
+                .map(|state| state.clone())
+                .unwrap_or_default();
         let status = if item_state.status.trim().is_empty() {
             "skipped"
         } else {
@@ -4699,7 +4780,10 @@ async fn run_workspace_synthesizer_orchestrator(
         let summary = if !item_state.error.trim().is_empty() {
             item_state.error.clone()
         } else if item_state.item_count > 0 {
-            format!("Applied {} item(s) via {}.", item_state.item_count, skill.name)
+            format!(
+                "Applied {} item(s) via {}.",
+                item_state.item_count, skill.name
+            )
         } else {
             "No items applied.".to_string()
         };
@@ -4774,16 +4858,17 @@ fn persist_workspace_synth_triage_keywords(
     let now = Utc::now().to_rfc3339();
 
     for source in target_sources {
-        let existing = match local_store::get_feed_interest_source(workspace_dir, &source.source_path) {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!(
-                    source_path = %source.source_path,
-                    "workspace synth triage: failed to load existing source record: {err}"
-                );
-                None
-            }
-        };
+        let existing =
+            match local_store::get_feed_interest_source(workspace_dir, &source.source_path) {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        source_path = %source.source_path,
+                        "workspace synth triage: failed to load existing source record: {err}"
+                    );
+                    None
+                }
+            };
         let title = existing
             .as_ref()
             .map(|record| record.title.clone())
@@ -4884,14 +4969,12 @@ fn queue_workflow_run(
         } else {
             Vec::new()
         };
-        if let Err(err) =
-            local_store::patch_chat_status(
-                &workspace_for_worker,
-                &user_id_for_worker,
-                "processing",
-                None,
-            )
-        {
+        if let Err(err) = local_store::patch_chat_status(
+            &workspace_for_worker,
+            &user_id_for_worker,
+            "processing",
+            None,
+        ) {
             tracing::warn!("Failed to update workflow-run status to processing: {err}");
         }
         if is_workspace_synth {
@@ -5061,10 +5144,10 @@ fn queue_workflow_run(
                                         .iter()
                                         .find(|item| {
                                             item.source_path == *path
-                                                || applied
-                                                    .renamed_sources
-                                                    .iter()
-                                                    .any(|rename| rename.to_path == *path && rename.from_path == item.source_path)
+                                                || applied.renamed_sources.iter().any(|rename| {
+                                                    rename.to_path == *path
+                                                        && rename.from_path == item.source_path
+                                                })
                                         })
                                         .map(|item| item.modified_at)
                                 })
@@ -5184,11 +5267,7 @@ fn queue_workflow_run(
         );
         let run_result = tokio::time::timeout(
             Duration::from_secs(CONTENT_AGENT_TIMEOUT_SECS),
-            run_local_agent_prompt_in_thread(
-                &state_for_worker,
-                &thread_id_for_worker,
-                &run_prompt,
-            ),
+            run_local_agent_prompt_in_thread(&state_for_worker, &thread_id_for_worker, &run_prompt),
         )
         .await;
 
@@ -5196,8 +5275,7 @@ fn queue_workflow_run(
             Ok(Ok(reply)) => {
                 if is_workspace_synth {
                     let workspace_for_apply = workspace_for_worker.clone();
-                    let selected_source_paths =
-                        synth_status_snapshot.selected_source_paths.clone();
+                    let selected_source_paths = synth_status_snapshot.selected_source_paths.clone();
                     let apply_result = tokio::task::spawn_blocking(move || {
                         workspace_synthesizer::apply_handoff_files(
                             &workspace_for_apply,
@@ -5372,7 +5450,8 @@ fn queue_workflow_run(
                     return;
                 }
 
-                if workflow_for_worker.key == article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY {
+                if workflow_for_worker.key == article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY
+                {
                     let workspace_for_apply = workspace_for_worker.clone();
                     let apply_result = tokio::task::spawn_blocking(move || {
                         article_synthesizer::apply_handoff_file(&workspace_for_apply)
@@ -5703,17 +5782,22 @@ fn ensure_workflow_bot_creation_skill(workspace_dir: &StdPath) -> Result<String>
             &abs,
             include_str!("../../skills/workflow_bot_creation/SKILL.md"),
         )
-        .with_context(|| format!("failed to write workflow bot creation skill {}", abs.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to write workflow bot creation skill {}",
+                abs.display()
+            )
+        })?;
     }
-    std::fs::read_to_string(&abs)
-        .with_context(|| format!("failed to read workflow bot creation skill {}", abs.display()))
+    std::fs::read_to_string(&abs).with_context(|| {
+        format!(
+            "failed to read workflow bot creation skill {}",
+            abs.display()
+        )
+    })
 }
 
-fn render_template_skill_markdown(
-    skill_name: &str,
-    goal: &str,
-    output_dir: &str,
-) -> String {
+fn render_template_skill_markdown(skill_name: &str, goal: &str, output_dir: &str) -> String {
     format!(
         "# {skill_name}\n\n\
 Use this content agent to fulfill the following goal:\n\n\
@@ -5846,7 +5930,9 @@ fn render_content_agent_run_prompt(
     media_tool_summary: &str,
 ) -> String {
     let mut prompt = String::new();
-    prompt.push_str("Run the following content agent and create feed artifacts in the workspace.\n\n");
+    prompt.push_str(
+        "Run the following content agent and create feed artifacts in the workspace.\n\n",
+    );
     prompt.push_str("## Agent\n");
     prompt.push_str(&format!("- Name: {}\n", workflow.bot_name));
     prompt.push_str(&format!("- Key: {}\n", workflow.key));
@@ -5862,7 +5948,9 @@ fn render_content_agent_run_prompt(
     prompt.push_str("- If a needed transcript for journal media is missing, use `transcribe_media` and save outputs under `journals/text/transcriptions/**`.\n");
     prompt.push_str(&format!("- {media_tool_summary}\n"));
     prompt.push_str("- For deterministic media transforms, use only the built-in media tools that are available on this device.\n");
-    prompt.push_str("- Do not invent script paths or raw ffmpeg commands inside the skill execution.\n");
+    prompt.push_str(
+        "- Do not invent script paths or raw ffmpeg commands inside the skill execution.\n",
+    );
     if workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY {
         prompt.push_str(&format!(
             "- Write only small JSON handoff files under `{}`.\n",
@@ -5876,7 +5964,8 @@ fn render_content_agent_run_prompt(
             workspace_synthesizer::WORKSPACE_SYNTHESIZER_CLIP_PLANS_PATH
         ));
         prompt.push_str("- Omit any handoff file that has no strong candidates, or write an empty `items` array.\n");
-        prompt.push_str("- Do not directly write feed posts, todos, events, or clip plan outputs.\n");
+        prompt
+            .push_str("- Do not directly write feed posts, todos, events, or clip plan outputs.\n");
         prompt.push_str("- Use direct file edits in the workspace so the runtime can validate and apply each handoff independently.\n");
     } else if workflow.key == article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY {
         prompt.push_str(&format!(
@@ -5892,12 +5981,23 @@ fn render_content_agent_run_prompt(
         prompt.push_str("- Use `createArticle` when no existing article is the right fit.\n");
         prompt.push_str("- Read existing article contents before rewriting one so the new body preserves continuity.\n\n");
         prompt.push_str("## Existing Article Inventory\n");
-        prompt.push_str(&article_synthesizer::article_inventory_markdown(workspace_dir));
+        prompt.push_str(&article_synthesizer::article_inventory_markdown(
+            workspace_dir,
+        ));
         prompt.push_str("\n\n");
     } else {
-        prompt.push_str(&format!("- Write feed-visible artifacts only under `{}`.\n", workflow.output_prefix));
-        prompt.push_str(&format!("- Hidden intermediate artifacts may go under `{}/pipeline/` or `{}/artifacts/`.\n", workflow.output_prefix.trim_end_matches('/'), workflow.output_prefix.trim_end_matches('/')));
-        prompt.push_str("- If multiple distinct post candidates are useful, save each as a separate file.\n");
+        prompt.push_str(&format!(
+            "- Write feed-visible artifacts only under `{}`.\n",
+            workflow.output_prefix
+        ));
+        prompt.push_str(&format!(
+            "- Hidden intermediate artifacts may go under `{}/pipeline/` or `{}/artifacts/`.\n",
+            workflow.output_prefix.trim_end_matches('/'),
+            workflow.output_prefix.trim_end_matches('/')
+        ));
+        prompt.push_str(
+            "- If multiple distinct post candidates are useful, save each as a separate file.\n",
+        );
     }
     prompt.push_str("- Use direct file edits in the workspace, not code blocks in chat.\n");
     prompt.push_str("- Reply with a concise summary of files written.\n");
@@ -5913,7 +6013,10 @@ fn workflow_comment_prompt(
         "Apply this workflow modification request by editing files in the workspace.\n\n",
     );
     prompt.push_str("## Request Context\n");
-    prompt.push_str(&format!("- Workflow: {} ({})\n", workflow.bot_name, workflow.key));
+    prompt.push_str(&format!(
+        "- Workflow: {} ({})\n",
+        workflow.bot_name, workflow.key
+    ));
     prompt.push_str(&format!("- Feed item path: `{}`\n", feed_item_path));
     prompt.push_str(&format!("- User comment: \"{}\"\n\n", comment.trim()));
 
@@ -5923,8 +6026,12 @@ fn workflow_comment_prompt(
 
     prompt.push_str("## Guardrails\n");
     prompt.push_str("- Edit only the listed files.\n");
-    prompt.push_str("- Update the target feed item directly when the request is about that one item.\n");
-    prompt.push_str("- Update the skill only if the request should change future generated posts too.\n");
+    prompt.push_str(
+        "- Update the target feed item directly when the request is about that one item.\n",
+    );
+    prompt.push_str(
+        "- Update the skill only if the request should change future generated posts too.\n",
+    );
     prompt.push_str(&format!(
         "- Keep feed output rooted under `{}`.\n",
         workflow.output_prefix
@@ -6122,7 +6229,11 @@ async fn handle_chat_result_stream(
                     let fingerprint = serde_json::to_string(&payload).unwrap_or_default();
                     if fingerprint != last_snapshot {
                         last_snapshot = fingerprint;
-                        if tx.send(sse_json_event("chat_result", &payload)).await.is_err() {
+                        if tx
+                            .send(sse_json_event("chat_result", &payload))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -6204,9 +6315,12 @@ async fn handle_chat_send(
             let state_for_worker = state.clone();
             let workspace_for_worker = workspace_dir.clone();
             tokio::spawn(async move {
-                if let Err(err) =
-                    local_store::patch_chat_status(&workspace_for_worker, &user_id, "processing", None)
-                {
+                if let Err(err) = local_store::patch_chat_status(
+                    &workspace_for_worker,
+                    &user_id,
+                    "processing",
+                    None,
+                ) {
                     tracing::warn!("Chat worker status update failed: {err}");
                 }
 
@@ -6241,9 +6355,12 @@ async fn handle_chat_send(
                         ) {
                             tracing::warn!("Chat worker failed to save assistant reply: {err}");
                         }
-                        if let Err(err) =
-                            local_store::patch_chat_status(&workspace_for_worker, &user_id, "done", None)
-                        {
+                        if let Err(err) = local_store::patch_chat_status(
+                            &workspace_for_worker,
+                            &user_id,
+                            "done",
+                            None,
+                        ) {
                             tracing::warn!("Chat worker failed to mark done: {err}");
                         }
                         if state_for_worker.auto_save {
@@ -6276,7 +6393,9 @@ async fn handle_chat_send(
                             "error",
                             Some(&err_text),
                         ) {
-                            tracing::warn!("Chat worker failed to persist error status: {update_err}");
+                            tracing::warn!(
+                                "Chat worker failed to persist error status: {update_err}"
+                            );
                         }
                     }
                 }
@@ -6420,7 +6539,9 @@ async fn handle_workspace_synthesizer_skills_update(
                     StatusCode::BAD_REQUEST,
                     "WORKSPACE_SYNTH_SKILL_UNSUPPORTED",
                     workspace_synth_skill_unsupported_reason(&skill, media_capabilities)
-                        .unwrap_or_else(|| "This skill is not supported on this device.".to_string()),
+                        .unwrap_or_else(|| {
+                            "This skill is not supported on this device.".to_string()
+                        }),
                 );
             }
             record.enabled = enabled;
@@ -6446,12 +6567,8 @@ async fn handle_workspace_synthesizer_skills_update(
             "unknown skillKey",
         );
     };
-    let item = workspace_synth_skill_response_item(
-        &workspace_dir,
-        &skill,
-        record,
-        media_capabilities,
-    );
+    let item =
+        workspace_synth_skill_response_item(&workspace_dir, &skill, record, media_capabilities);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -6506,10 +6623,7 @@ async fn handle_feed_workflow_settings_update(
     let previous_goal = normalize_goal_text(workflow_record.goal.clone())
         .or_else(|| normalize_goal_text(workflow_record.settings.goal.clone()))
         .or_else(|| normalize_goal_text(workflow_record.settings.prompt.clone()));
-    let Some(goal) = updated_goal
-        .clone()
-        .or_else(|| previous_goal.clone())
-    else {
+    let Some(goal) = updated_goal.clone().or_else(|| previous_goal.clone()) else {
         return frontend_error_response(
             StatusCode::BAD_REQUEST,
             "WORKFLOW_GOAL_REQUIRED",
@@ -6635,7 +6749,11 @@ async fn handle_feed_workflow_settings_update(
 
     let workflow_def = feed_workflow_definition_from_record(&workflow_record);
     let run_thread_id = if workflow_record.enabled && body.run_now.unwrap_or(false) {
-        match queue_workflow_run(state.clone(), workflow_def.clone(), "workflow-settings-save") {
+        match queue_workflow_run(
+            state.clone(),
+            workflow_def.clone(),
+            "workflow-settings-save",
+        ) {
             Ok(thread_id) => Some(thread_id),
             Err(err) => {
                 tracing::warn!("Failed to queue workflow run after settings save: {err}");
@@ -6808,7 +6926,11 @@ async fn handle_workspace_synthesizer_stream(
             let fingerprint = serde_json::to_string(&value).unwrap_or_default();
             if fingerprint != last_snapshot {
                 last_snapshot = fingerprint;
-                if tx.send(sse_json_event("workspace_synth_status", &value)).await.is_err() {
+                if tx
+                    .send(sse_json_event("workspace_synth_status", &value))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -6833,7 +6955,8 @@ async fn handle_workspace_synthesizer_run(
         return err;
     }
 
-    let (provider_ready, provider_blocked_reason) = workspace_synth_provider_readiness(&state).await;
+    let (provider_ready, provider_blocked_reason) =
+        workspace_synth_provider_readiness(&state).await;
     if !provider_ready {
         return (
             StatusCode::OK,
@@ -6931,7 +7054,8 @@ async fn handle_workspace_synthesizer_auto_run(
         return err;
     }
 
-    let (provider_ready, provider_blocked_reason) = workspace_synth_provider_readiness(&state).await;
+    let (provider_ready, provider_blocked_reason) =
+        workspace_synth_provider_readiness(&state).await;
     if !provider_ready {
         return (
             StatusCode::OK,
@@ -7059,7 +7183,10 @@ async fn handle_feed_personalized(
         return err;
     }
 
-    let limit = body.limit.unwrap_or(30).clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
+    let limit = body
+        .limit
+        .unwrap_or(30)
+        .clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
     let config_snapshot = state.config.lock().clone();
     let bluesky_auth = match (
         body.service_url
@@ -7070,7 +7197,7 @@ async fn handle_feed_personalized(
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty()),
-        ) {
+    ) {
         (Some(service_url), Some(access_jwt)) => Some(crate::feed::BlueskyAuth {
             service_url: service_url.to_string(),
             access_jwt: access_jwt.to_string(),
@@ -7372,8 +7499,9 @@ async fn handle_feed_workflow_template_create(
     );
 
     let creation_thread_id = format!("workflow:create:{workflow_key}");
-    let creation_user_content =
-        format!("[create] goal={goal}; key={workflow_key}; skill={skill_rel}; output={output_dir_rel}");
+    let creation_user_content = format!(
+        "[create] goal={goal}; key={workflow_key}; skill={skill_rel}; output={output_dir_rel}"
+    );
     let creation_user_record = match local_store::create_chat_message(
         &workspace_dir,
         &creation_thread_id,
@@ -7507,18 +7635,19 @@ async fn handle_feed_workflow_template_create(
             return;
         }
 
-        let mut worker_store = match load_or_seed_feed_workflow_settings_store(&workspace_for_worker) {
-            Ok(store) => store,
-            Err(err) => {
-                let err_text = frontend_background_error(
-                    "feed workflow template worker store load",
-                    "Failed to load content agent settings.",
-                    &err,
-                );
-                persist_error(&err_text);
-                return;
-            }
-        };
+        let mut worker_store =
+            match load_or_seed_feed_workflow_settings_store(&workspace_for_worker) {
+                Ok(store) => store,
+                Err(err) => {
+                    let err_text = frontend_background_error(
+                        "feed workflow template worker store load",
+                        "Failed to load content agent settings.",
+                        &err,
+                    );
+                    persist_error(&err_text);
+                    return;
+                }
+            };
         if workflow_definition_by_key(&worker_store, &workflow_key_for_worker).is_some() {
             persist_error("workflow key already exists");
             return;
@@ -7664,8 +7793,8 @@ async fn handle_feed_workflow_comment(
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let store = load_or_seed_feed_workflow_settings_store(&workspace_dir).unwrap_or_default();
-    let synth_skill_store = workspace_synthesizer::load_or_seed_skill_store(&workspace_dir)
-        .unwrap_or_default();
+    let synth_skill_store =
+        workspace_synthesizer::load_or_seed_skill_store(&workspace_dir).unwrap_or_default();
     let workflow = workflow_for_feed_path(&store, &requested_path).or_else(|| {
         workspace_synthesizer::skill_for_feed_path(&synth_skill_store, &requested_path)
             .map(|skill| workspace_synth_skill_as_workflow_definition(&skill))
@@ -7810,14 +7939,12 @@ async fn handle_feed_workflow_comment(
     let user_id_for_worker = user_id.clone();
 
     tokio::spawn(async move {
-        if let Err(err) =
-            local_store::patch_chat_status(
-                &workspace_for_worker,
-                &user_id_for_worker,
-                "processing",
-                None,
-            )
-        {
+        if let Err(err) = local_store::patch_chat_status(
+            &workspace_for_worker,
+            &user_id_for_worker,
+            "processing",
+            None,
+        ) {
             tracing::warn!("Failed to update feed-comment status to processing: {err}");
         }
 
@@ -8096,7 +8223,8 @@ pub(crate) fn available_local_transcription_models() -> Vec<String> {
     let cache = TRANSCRIPTION_MODEL_CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = cache.lock();
     if let Some(entry) = guard.as_ref() {
-        let fresh = entry.cached_at.elapsed() < Duration::from_secs(TRANSCRIPTION_MODEL_CACHE_TTL_SECS);
+        let fresh =
+            entry.cached_at.elapsed() < Duration::from_secs(TRANSCRIPTION_MODEL_CACHE_TTL_SECS);
         if fresh && entry.cache_key == cache_key {
             return entry.models.clone();
         }
@@ -8511,7 +8639,11 @@ async fn handle_library_text(
                 .ok()
                 .map(workspace_relative_display_path)
                 .unwrap_or_else(|| normalize_workspace_relative_path(&query.path));
-            (StatusCode::OK, Json(serde_json::json!({"path": rel, "content": content}))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"path": rel, "content": content})),
+            )
+                .into_response()
         }
         Err(err) => frontend_internal_error_response(
             StatusCode::NOT_FOUND,
@@ -8608,7 +8740,11 @@ async fn handle_library_save_text(
         .map(workspace_relative_display_path)
         .unwrap_or_else(|| normalize_workspace_relative_path(&body.path));
     maybe_mark_world_feed_dirty_for_path(&workspace_dir, &rel);
-    (StatusCode::OK, Json(serde_json::json!({"ok": true, "path": rel}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "path": rel})),
+    )
+        .into_response()
 }
 
 async fn handle_library_delete(
@@ -8929,7 +9065,11 @@ async fn handle_journal_transcribe_stream(
                     let fingerprint = serde_json::to_string(&payload).unwrap_or_default();
                     if fingerprint != last_snapshot {
                         last_snapshot = fingerprint;
-                        if tx.send(sse_json_event("transcription_status", &payload)).await.is_err() {
+                        if tx
+                            .send(sse_json_event("transcription_status", &payload))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -9152,11 +9292,9 @@ fn relocate_inbox_audio_after_transcription(
             );
         }
         if new_rel == new_transcript_json_rel {
-            if let Err(err) = rewrite_transcript_json_sidecar_paths(
-                &new_abs,
-                &candidate_abs,
-                &new_transcript_abs,
-            ) {
+            if let Err(err) =
+                rewrite_transcript_json_sidecar_paths(&new_abs, &candidate_abs, &new_transcript_abs)
+            {
                 tracing::warn!(
                     path = %new_rel,
                     err = %err,
@@ -9278,7 +9416,6 @@ fn enqueue_transcription_job(
                 jobs.insert(final_media_rel_path.clone(), final_state.clone());
             }
         }
-
     });
 
     JournalTranscriptionJob {
@@ -9404,7 +9541,11 @@ async fn run_local_faster_whisper(
             "transcriber script failed ({}): {}",
             output.status,
             truncate_with_ellipsis(
-                &(if stderr.trim().is_empty() { stdout } else { stderr }),
+                &(if stderr.trim().is_empty() {
+                    stdout
+                } else {
+                    stderr
+                }),
                 300
             )
         );
@@ -9522,10 +9663,7 @@ fn text_journal_rel_path(title: &str) -> String {
 }
 
 fn normalize_workspace_relative_path(requested: &str) -> String {
-    requested
-        .trim()
-        .trim_start_matches('/')
-        .replace('\\', "/")
+    requested.trim().trim_start_matches('/').replace('\\', "/")
 }
 
 fn workspace_relative_display_path(path: &StdPath) -> String {
@@ -9540,7 +9678,9 @@ fn resolve_workspace_media_path(workspace_dir: &StdPath, requested: &str) -> Opt
     let candidate = workspace_dir.join(&trimmed);
     let resolved = candidate.canonicalize().ok()?;
     // Canonicalize workspace_dir too so both sides use the same symlink resolution.
-    let workspace_resolved = workspace_dir.canonicalize().unwrap_or_else(|_| workspace_dir.to_path_buf());
+    let workspace_resolved = workspace_dir
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_dir.to_path_buf());
     if !resolved.starts_with(&workspace_resolved) {
         tracing::debug!(
             requested = %requested,
@@ -9570,7 +9710,9 @@ fn resolve_workspace_text_path(workspace_dir: &StdPath, requested: &str) -> Opti
     let parent = candidate.parent()?.to_path_buf();
     let parent_resolved = parent.canonicalize().unwrap_or(parent);
     // Canonicalize workspace_dir too so both sides use the same symlink resolution.
-    let workspace_resolved = workspace_dir.canonicalize().unwrap_or_else(|_| workspace_dir.to_path_buf());
+    let workspace_resolved = workspace_dir
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_dir.to_path_buf());
     if !parent_resolved.starts_with(&workspace_resolved) {
         tracing::debug!(
             requested = %requested,
@@ -9580,9 +9722,20 @@ fn resolve_workspace_text_path(workspace_dir: &StdPath, requested: &str) -> Opti
         );
         return None;
     }
-    let allowed = ["journals", "memory", "state", "posts", "outputs", "artifacts"];
+    let allowed = [
+        "journals",
+        "memory",
+        "state",
+        "posts",
+        "outputs",
+        "artifacts",
+    ];
     let rel_parent = parent_resolved.strip_prefix(&workspace_resolved).ok()?;
-    let first = rel_parent.components().next()?.as_os_str().to_string_lossy();
+    let first = rel_parent
+        .components()
+        .next()?
+        .as_os_str()
+        .to_string_lossy();
     if !allowed.iter().any(|a| *a == first) {
         tracing::debug!(
             requested = %requested,
@@ -9606,7 +9759,6 @@ fn list_workspace_library_items(
     scope: &str,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>> {
-
     let mut roots: Vec<PathBuf> = Vec::new();
     let normalized = scope.trim().to_ascii_lowercase();
     let requested_scope = match normalized.as_str() {
@@ -9650,8 +9802,14 @@ fn list_workspace_library_items(
     }
 
     items.sort_by(|a, b| {
-        let a_ts = a.get("modifiedAt").and_then(serde_json::Value::as_i64).unwrap_or(0);
-        let b_ts = b.get("modifiedAt").and_then(serde_json::Value::as_i64).unwrap_or(0);
+        let a_ts = a
+            .get("modifiedAt")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let b_ts = b
+            .get("modifiedAt")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
         b_ts.cmp(&a_ts)
     });
     items.truncate(limit);
@@ -9772,7 +9930,9 @@ fn collect_library_items_recursive(
                     .unwrap_or_default();
                 let state = synth_state_map.get(&rel);
                 let processed = state
-                    .map(|item| !current_hash.is_empty() && item.last_processed_hash == current_hash)
+                    .map(|item| {
+                        !current_hash.is_empty() && item.last_processed_hash == current_hash
+                    })
                     .unwrap_or(false);
                 (
                     processed,
@@ -10173,7 +10333,9 @@ fn select_workspace_synth_sources(
     let mut selected = Vec::new();
     let mut selected_word_count = 0usize;
     for item in &pending {
-        if !selected.is_empty() && selected_word_count + item.word_count > WORKSPACE_SYNTH_BATCH_WORD_LIMIT {
+        if !selected.is_empty()
+            && selected_word_count + item.word_count > WORKSPACE_SYNTH_BATCH_WORD_LIMIT
+        {
             break;
         }
         selected_word_count += item.word_count;
@@ -10305,9 +10467,9 @@ fn build_bluesky_feed_endpoint(
     let trimmed_service = service_url.trim().trim_end_matches('/');
     let normalized_limit = limit.clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
     let mut url = match &source.endpoint {
-        BlueskyCandidateSourceEndpoint::HomeTimeline => format!(
-            "{trimmed_service}/xrpc/app.bsky.feed.getTimeline?limit={normalized_limit}"
-        ),
+        BlueskyCandidateSourceEndpoint::HomeTimeline => {
+            format!("{trimmed_service}/xrpc/app.bsky.feed.getTimeline?limit={normalized_limit}")
+        }
         BlueskyCandidateSourceEndpoint::FeedGenerator { uri } => format!(
             "{trimmed_service}/xrpc/app.bsky.feed.getFeed?feed={}&limit={normalized_limit}",
             urlencoding::encode(uri)
@@ -10365,7 +10527,10 @@ fn append_unique_bluesky_sources(
     target: &mut Vec<BlueskyCandidateSource>,
     extra: Vec<BlueskyCandidateSource>,
 ) {
-    let mut seen: HashSet<String> = target.iter().map(BlueskyCandidateSource::endpoint_key).collect();
+    let mut seen: HashSet<String> = target
+        .iter()
+        .map(BlueskyCandidateSource::endpoint_key)
+        .collect();
     for source in extra {
         if seen.insert(source.endpoint_key()) {
             target.push(source);
@@ -10609,15 +10774,12 @@ async fn fetch_bluesky_candidate_page(
         );
     }
 
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to decode Bluesky {} feed response",
-                source.request_label()
-            )
-        })?;
+    let json: serde_json::Value = response.json().await.with_context(|| {
+        format!(
+            "Failed to decode Bluesky {} feed response",
+            source.request_label()
+        )
+    })?;
     let feed = json
         .get("feed")
         .and_then(serde_json::Value::as_array)
@@ -10680,9 +10842,9 @@ fn resolve_feed_web_domain(url: &str) -> Option<String> {
 
 fn is_allowed_feed_web_domain(host: &str, allowed: &BTreeSet<String>) -> bool {
     let normalized = normalize_feed_web_domain(host);
-    allowed.iter().any(|domain| {
-        normalized == *domain || normalized.ends_with(&format!(".{domain}"))
-    })
+    allowed
+        .iter()
+        .any(|domain| normalized == *domain || normalized.ends_with(&format!(".{domain}")))
 }
 
 fn seed_default_feed_web_sources(workspace_dir: &StdPath) -> Result<()> {
@@ -10708,7 +10870,11 @@ fn seed_default_feed_web_sources(workspace_dir: &StdPath) -> Result<()> {
 fn web_preview_cache_is_fresh(updated_at: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(updated_at)
         .ok()
-        .map(|value| Utc::now().signed_duration_since(value.with_timezone(&Utc)).num_seconds())
+        .map(|value| {
+            Utc::now()
+                .signed_duration_since(value.with_timezone(&Utc))
+                .num_seconds()
+        })
         .map(|age| age >= 0 && age <= FEED_WEB_PREVIEW_CACHE_TTL_SECS)
         .unwrap_or(false)
 }
@@ -10738,13 +10904,19 @@ fn html_unescape_basic(raw: &str) -> String {
 }
 
 fn xml_block_regex(tag: &str) -> Regex {
-    Regex::new(&format!(r"(?is)<{tag}\b[^>]*>(.*?)</{tag}>", tag = regex::escape(tag)))
-        .expect("valid XML block regex")
+    Regex::new(&format!(
+        r"(?is)<{tag}\b[^>]*>(.*?)</{tag}>",
+        tag = regex::escape(tag)
+    ))
+    .expect("valid XML block regex")
 }
 
 fn xml_tag_regex(tag: &str) -> Regex {
-    Regex::new(&format!(r"(?is)<{tag}\b[^>]*>(.*?)</{tag}>", tag = regex::escape(tag)))
-        .expect("valid XML tag regex")
+    Regex::new(&format!(
+        r"(?is)<{tag}\b[^>]*>(.*?)</{tag}>",
+        tag = regex::escape(tag)
+    ))
+    .expect("valid XML tag regex")
 }
 
 fn xml_link_regex() -> &'static Regex {
@@ -10910,7 +11082,8 @@ fn parse_atom_feed_entries(xml: &str, base_url: &str) -> Vec<ParsedFeedEntry> {
     for capture in xml_block_regex("entry").captures_iter(xml) {
         let fragment = capture.get(1).map(|value| value.as_str()).unwrap_or("");
         let title = extract_xml_tag_text(fragment, &["title"]).unwrap_or_default();
-        let canonical_url = extract_atom_link(fragment, base_url).unwrap_or_else(|| base_url.to_string());
+        let canonical_url =
+            extract_atom_link(fragment, base_url).unwrap_or_else(|| base_url.to_string());
         let summary = extract_xml_tag_text(fragment, &["summary"]).unwrap_or_default();
         let content_text = extract_xml_tag_text(fragment, &["content", "summary"])
             .unwrap_or_else(|| summary.clone());
@@ -10959,7 +11132,11 @@ fn parse_feed_entries(xml: &str, base_url: &str) -> Vec<ParsedFeedEntry> {
 fn content_source_is_stale(last_fetch_at: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(last_fetch_at.trim())
         .ok()
-        .map(|value| Utc::now().signed_duration_since(value.with_timezone(&Utc)).num_seconds())
+        .map(|value| {
+            Utc::now()
+                .signed_duration_since(value.with_timezone(&Utc))
+                .num_seconds()
+        })
         .map(|age| age < 0 || age > CONTENT_SOURCE_REFRESH_TTL_SECS)
         .unwrap_or(true)
 }
@@ -11011,7 +11188,9 @@ struct RemoteFeedFetchResult {
     not_modified: bool,
 }
 
-async fn fetch_remote_feed(source: &local_store::ContentSourceRecord) -> Result<RemoteFeedFetchResult> {
+async fn fetch_remote_feed(
+    source: &local_store::ContentSourceRecord,
+) -> Result<RemoteFeedFetchResult> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(CONTENT_FETCH_TIMEOUT_SECS))
         .build()?;
@@ -11053,7 +11232,10 @@ async fn fetch_remote_feed(source: &local_store::ContentSourceRecord) -> Result<
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Feed fetch failed for {} ({status}): {body}", source.xml_url);
+        anyhow::bail!(
+            "Feed fetch failed for {} ({status}): {body}",
+            source.xml_url
+        );
     }
 
     let body = response.bytes().await?;
@@ -11311,7 +11493,8 @@ fn rank_cached_content_items(
     limit: usize,
 ) -> Result<Vec<PersonalizedBlueskyItem>> {
     let mut ranked = Vec::new();
-    for item in local_store::list_recent_content_items(workspace_dir, CONTENT_RANK_CANDIDATE_LIMIT)? {
+    for item in local_store::list_recent_content_items(workspace_dir, CONTENT_RANK_CANDIDATE_LIMIT)?
+    {
         let embedding = bytes_to_vec(&item.embedding);
         if embedding.is_empty() {
             continue;
@@ -11536,7 +11719,12 @@ async fn resolve_feed_embedder(
     Option<Arc<dyn memory::embeddings::EmbeddingProvider>>,
     Option<String>,
 )> {
-    if config.memory.embedding_provider.trim().eq_ignore_ascii_case("none") {
+    if config
+        .memory
+        .embedding_provider
+        .trim()
+        .eq_ignore_ascii_case("none")
+    {
         return Ok((
             None,
             Some(
@@ -11570,14 +11758,15 @@ async fn rebuild_interest_profile(
 
     let workspace_dir = &config.workspace_dir;
     let _ = local_store::decay_feed_interests(workspace_dir, INTEREST_DECAY_RATE)?;
-    let mut active_interests: Vec<ActiveInterest> = local_store::list_feed_interests(workspace_dir)?
-        .into_iter()
-        .map(|record| ActiveInterest {
-            embedding: bytes_to_vec(&record.embedding),
-            record,
-        })
-        .filter(|interest| !interest.embedding.is_empty())
-        .collect();
+    let mut active_interests: Vec<ActiveInterest> =
+        local_store::list_feed_interests(workspace_dir)?
+            .into_iter()
+            .map(|record| ActiveInterest {
+                embedding: bytes_to_vec(&record.embedding),
+                record,
+            })
+            .filter(|interest| !interest.embedding.is_empty())
+            .collect();
 
     let items = list_workspace_library_items(workspace_dir, "feed", 2_000)?;
     let text_items: Vec<serde_json::Value> = items
@@ -11797,8 +11986,10 @@ async fn rank_bluesky_candidates(
         });
     }
 
-    let mut filtered: Vec<PersonalizedBlueskyItem> =
-        ranked.into_iter().filter(|item| item.passed_threshold).collect();
+    let mut filtered: Vec<PersonalizedBlueskyItem> = ranked
+        .into_iter()
+        .filter(|item| item.passed_threshold)
+        .collect();
     sort_personalized_items(&mut filtered);
     Ok(filtered)
 }
@@ -11812,7 +12003,11 @@ async fn rank_web_candidates(
 ) -> Result<Vec<PersonalizedBlueskyItem>> {
     let mut ranked = Vec::new();
     for candidate in candidates {
-        let combined = format!("{}\n{}", candidate.title.trim(), candidate.description.trim());
+        let combined = format!(
+            "{}\n{}",
+            candidate.title.trim(),
+            candidate.description.trim()
+        );
         let trimmed = combined.trim();
         if trimmed.is_empty() {
             continue;
@@ -12368,7 +12563,9 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
-            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(
+                LocalModelRuntimeState::default(),
+            )),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         }
     }
@@ -12466,7 +12663,9 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
-            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(
+                LocalModelRuntimeState::default(),
+            )),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -12512,7 +12711,9 @@ mod tests {
             observer,
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
-            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(
+                LocalModelRuntimeState::default(),
+            )),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -12576,7 +12777,10 @@ mod tests {
 
     #[test]
     fn derive_interest_label_prefers_title_then_content() {
-        assert_eq!(derive_interest_label("Machine Learning", "ignored"), "Machine Learning");
+        assert_eq!(
+            derive_interest_label("Machine Learning", "ignored"),
+            "Machine Learning"
+        );
         assert_eq!(
             derive_interest_label("untitled", "# Systems Thinking\nBody"),
             "Systems Thinking"
@@ -12599,11 +12803,7 @@ mod tests {
     fn build_bluesky_feed_endpoint_uses_discover_feed_generator() {
         let url = build_bluesky_feed_endpoint(
             "https://bsky.social/",
-            &BlueskyCandidateSource::feed_generator(
-                BLUESKY_DISCOVER_FEED_URI,
-                "discover",
-                None,
-            ),
+            &BlueskyCandidateSource::feed_generator(BLUESKY_DISCOVER_FEED_URI, "discover", None),
             Some("cursor-1"),
             30,
         );
@@ -12982,7 +13182,9 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
-            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(
+                LocalModelRuntimeState::default(),
+            )),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13043,7 +13245,9 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
-            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(
+                LocalModelRuntimeState::default(),
+            )),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13116,7 +13320,9 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
-            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(
+                LocalModelRuntimeState::default(),
+            )),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13161,7 +13367,9 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
-            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(
+                LocalModelRuntimeState::default(),
+            )),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13211,7 +13419,9 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
-            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(
+                LocalModelRuntimeState::default(),
+            )),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13447,16 +13657,22 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
-            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(
+                LocalModelRuntimeState::default(),
+            )),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
-        let Some((status, Json(payload))) = pairing_auth_error(&state, &HeaderMap::new(), "test") else {
+        let Some((status, Json(payload))) = pairing_auth_error(&state, &HeaderMap::new(), "test")
+        else {
             panic!("pairing_auth_error should reject missing bearer token");
         };
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(payload["error"], "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>");
+        assert_eq!(
+            payload["error"],
+            "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+        );
         assert_eq!(payload["code"], "PAIRING_REQUIRED");
     }
 
@@ -13483,7 +13699,9 @@ mod tests {
             .collect();
 
         assert!(paths.iter().any(|path| path.starts_with("posts/")));
-        assert!(!paths.iter().any(|path| path.starts_with("journals/processed/")));
+        assert!(!paths
+            .iter()
+            .any(|path| path.starts_with("journals/processed/")));
     }
 
     #[test]
@@ -13548,7 +13766,9 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
-            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(
+                LocalModelRuntimeState::default(),
+            )),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13598,7 +13818,9 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             journal_transcription_jobs: Arc::new(Mutex::new(HashMap::new())),
             local_model_downloads: Arc::new(Mutex::new(HashMap::new())),
-            local_model_runtime: Arc::new(tokio::sync::Mutex::new(LocalModelRuntimeState::default())),
+            local_model_runtime: Arc::new(tokio::sync::Mutex::new(
+                LocalModelRuntimeState::default(),
+            )),
             openrouter_oauth: Arc::new(Mutex::new(None)),
         };
 
@@ -13637,7 +13859,8 @@ mod tests {
             Json(FeedContentAgentCreateBody {
                 name: Some("Clip Maker".to_string()),
                 goal: Some(
-                    "Create simple vertical video clips from my journal audio recordings.".to_string(),
+                    "Create simple vertical video clips from my journal audio recordings."
+                        .to_string(),
                 ),
                 bot_name: None,
                 prompt: None,
@@ -13670,7 +13893,10 @@ mod tests {
 
         assert_eq!(store.workflows.len(), 1);
         let key = sanitize_workflow_key(WORKSPACE_SYNTHESIZER_WORKFLOW_KEY);
-        let record = store.workflows.get(&key).expect("missing workspace synthesizer");
+        let record = store
+            .workflows
+            .get(&key)
+            .expect("missing workspace synthesizer");
         assert_eq!(record.workflow_bot, "Workspace Synthesizer");
         assert!(record.enabled);
         assert!(workspace.join(&record.skill_path).exists());
@@ -13690,7 +13916,9 @@ mod tests {
 
         let defs = workflow_definitions(&store);
 
-        assert!(defs.iter().any(|workflow| workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY));
+        assert!(defs
+            .iter()
+            .any(|workflow| workflow.key == WORKSPACE_SYNTHESIZER_WORKFLOW_KEY));
         assert!(!defs.iter().any(|workflow| {
             workflow.key == workspace_synthesizer::WORKSPACE_INSIGHT_EXTRACTOR_WORKFLOW_KEY
         }));
@@ -13709,9 +13937,15 @@ mod tests {
         assert!(!defs.iter().any(|workflow| {
             workflow.key == article_synthesizer::ARTICLE_SYNTHESIZER_WORKFLOW_KEY
         }));
-        assert!(!defs.iter().any(|workflow| workflow.key == "weekly_highlights"));
-        assert!(!defs.iter().any(|workflow| workflow.key == "bluesky_insight_posts"));
-        assert!(!defs.iter().any(|workflow| workflow.key == "audio_insight_clips"));
+        assert!(!defs
+            .iter()
+            .any(|workflow| workflow.key == "weekly_highlights"));
+        assert!(!defs
+            .iter()
+            .any(|workflow| workflow.key == "bluesky_insight_posts"));
+        assert!(!defs
+            .iter()
+            .any(|workflow| workflow.key == "audio_insight_clips"));
     }
 
     #[test]
@@ -14051,7 +14285,12 @@ mod tests {
         );
         assert_eq!(
             relocated_json["transcriptPath"].as_str(),
-            Some(workspace.join(&new_transcript_rel).to_string_lossy().as_ref())
+            Some(
+                workspace
+                    .join(&new_transcript_rel)
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
     }
 
@@ -14088,7 +14327,9 @@ mod tests {
             &workspace_synthesizer::WorkspaceSynthesizerStatus {
                 status: "done".to_string(),
                 last_run_at: Utc::now().to_rfc3339(),
-                last_source_updated_at: source_file_modified_at_secs(&journal_dir.join("recent.md")),
+                last_source_updated_at: source_file_modified_at_secs(
+                    &journal_dir.join("recent.md"),
+                ),
                 ..workspace_synthesizer::WorkspaceSynthesizerStatus::default()
             },
         )
@@ -14106,7 +14347,10 @@ mod tests {
         save_feed_workflow_settings_store(workspace, &store).unwrap();
 
         let thread_id = queue_workspace_synthesizer_for_trigger(&state, "app-open").unwrap();
-        assert!(thread_id.is_some(), "older pending backlog should still queue");
+        assert!(
+            thread_id.is_some(),
+            "older pending backlog should still queue"
+        );
     }
 
     #[tokio::test]
@@ -14289,10 +14533,17 @@ mod tests {
     fn content_agent_config_with_headroom_keeps_existing_command_allowlist() {
         let base = Config::default();
         let config = content_agent_config_with_headroom(&base);
-        assert_eq!(config.autonomy.allowed_commands, base.autonomy.allowed_commands);
+        assert_eq!(
+            config.autonomy.allowed_commands,
+            base.autonomy.allowed_commands
+        );
         for command in ["python", "python3", "ffmpeg", "ffprobe"] {
             assert!(
-                !config.autonomy.allowed_commands.iter().any(|value| value == command),
+                !config
+                    .autonomy
+                    .allowed_commands
+                    .iter()
+                    .any(|value| value == command),
                 "unexpected command {command}"
             );
         }
@@ -14509,5 +14760,4 @@ mod tests {
             )
         );
     }
-
 }

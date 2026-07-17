@@ -42,7 +42,10 @@ impl WebSearchTool {
         Ok(format_search_results(query, "DuckDuckGo", &results))
     }
 
-    async fn search_duckduckgo_structured(&self, query: &str) -> anyhow::Result<Vec<WebSearchResultItem>> {
+    async fn search_duckduckgo_structured(
+        &self,
+        query: &str,
+    ) -> anyhow::Result<Vec<WebSearchResultItem>> {
         let encoded_query = urlencoding::encode(query);
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
 
@@ -112,12 +115,19 @@ impl WebSearchTool {
     }
 }
 
-fn format_search_results(query: &str, provider_label: &str, items: &[WebSearchResultItem]) -> String {
+fn format_search_results(
+    query: &str,
+    provider_label: &str,
+    items: &[WebSearchResultItem],
+) -> String {
     if items.is_empty() {
         return format!("No results found for: {}", query);
     }
 
-    let mut lines = vec![format!("Search results for: {} (via {})", query, provider_label)];
+    let mut lines = vec![format!(
+        "Search results for: {} (via {})",
+        query, provider_label
+    )];
     for (index, item) in items.iter().enumerate() {
         lines.push(format!("{}. {}", index + 1, item.title));
         lines.push(format!("   {}", item.url));
@@ -223,7 +233,9 @@ mod tests {
     #[test]
     fn test_parse_duckduckgo_results_empty() {
         let tool = WebSearchTool::new(5, 15);
-        let result = tool.parse_duckduckgo_results("<html>No results here</html>").unwrap();
+        let result = tool
+            .parse_duckduckgo_results("<html>No results here</html>")
+            .unwrap();
         assert!(result.is_empty());
     }
 

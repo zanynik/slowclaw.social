@@ -136,18 +136,21 @@ impl Tool for TranscribeMediaTool {
             .get("mediaPath")
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'mediaPath' parameter"))?;
-        if let Some(result) = validate_media_paths(
-            &self.inner.security,
-            &[media_path.to_string()],
-            self.name(),
-        ) {
+        if let Some(result) =
+            validate_media_paths(&self.inner.security, &[media_path.to_string()], self.name())
+        {
             return Ok(result);
         }
 
         match self
             .inner
             .backend
-            .transcribe_media(media_path, args.get("force").and_then(|value| value.as_bool()).unwrap_or(false))
+            .transcribe_media(
+                media_path,
+                args.get("force")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+            )
             .await
         {
             Ok(result) => json_result(&result),
@@ -359,11 +362,26 @@ impl Tool for RenderTextCardVideoTool {
         }
         let request = RenderTextCardVideoRequest {
             cards: parse_media_cards(&args)?,
-            audio_path: args.get("audioPath").and_then(|value| value.as_str()).map(str::to_string),
-            width: args.get("width").and_then(|value| value.as_u64()).map(|value| value as u32),
-            height: args.get("height").and_then(|value| value.as_u64()).map(|value| value as u32),
-            fps: args.get("fps").and_then(|value| value.as_u64()).map(|value| value as u32),
-            theme: args.get("theme").and_then(|value| value.as_str()).map(str::to_string),
+            audio_path: args
+                .get("audioPath")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            width: args
+                .get("width")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32),
+            height: args
+                .get("height")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32),
+            fps: args
+                .get("fps")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32),
+            theme: args
+                .get("theme")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
             output_path: output_path.to_string(),
         };
         match self.inner.backend.render_text_card_video(&request).await {
@@ -434,10 +452,23 @@ impl Tool for StitchImagesWithAudioTool {
         let request = StitchImagesWithAudioRequest {
             image_paths,
             audio_path: audio_path.to_string(),
-            durations_ms: args.get("durationsMs").cloned().map(serde_json::from_value).transpose()?,
-            width: args.get("width").and_then(|value| value.as_u64()).map(|value| value as u32),
-            height: args.get("height").and_then(|value| value.as_u64()).map(|value| value as u32),
-            fps: args.get("fps").and_then(|value| value.as_u64()).map(|value| value as u32),
+            durations_ms: args
+                .get("durationsMs")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?,
+            width: args
+                .get("width")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32),
+            height: args
+                .get("height")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32),
+            fps: args
+                .get("fps")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32),
             output_path: output_path.to_string(),
         };
         match self.inner.backend.stitch_images_with_audio(&request).await {
@@ -504,8 +535,11 @@ impl Tool for ComposeSimpleClipTool {
             .get("audioPath")
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'audioPath' parameter"))?;
-        let image_paths: Option<Vec<String>> =
-            args.get("imagePaths").cloned().map(serde_json::from_value).transpose()?;
+        let image_paths: Option<Vec<String>> = args
+            .get("imagePaths")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
         let mut paths = vec![output_path.to_string(), audio_path.to_string()];
         if let Some(images) = image_paths.as_ref() {
             paths.extend(images.clone());
@@ -516,10 +550,20 @@ impl Tool for ComposeSimpleClipTool {
 
         let request = ComposeSimpleClipRequest {
             audio_path: audio_path.to_string(),
-            cards: args.get("cards").cloned().map(serde_json::from_value).transpose()?,
+            cards: args
+                .get("cards")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?,
             image_paths,
-            title: args.get("title").and_then(|value| value.as_str()).map(str::to_string),
-            preset: args.get("preset").and_then(|value| value.as_str()).map(str::to_string),
+            title: args
+                .get("title")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            preset: args
+                .get("preset")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
             output_path: output_path.to_string(),
         };
         match self.inner.backend.compose_simple_clip(&request).await {

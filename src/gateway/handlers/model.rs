@@ -1,23 +1,22 @@
+use anyhow::{Context, Result};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
+use futures_util::StreamExt;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use anyhow::{Context, Result};
-use futures_util::StreamExt;
-use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::gateway::state::*;
 use crate::gateway::{
-    pairing_auth_error, frontend_error_response,
-    frontend_internal_error_response,
+    frontend_error_response, frontend_internal_error_response, pairing_auth_error,
     reset_workspace_synthesizer_status_for_provider_change,
 };
 
@@ -296,7 +295,11 @@ pub async fn handle_local_model_download(
         let mut jobs = state.local_model_downloads.lock();
         if let Some(job) = jobs.get(spec.id) {
             if job.status == "downloading" {
-                return (StatusCode::ACCEPTED, Json(serde_json::json!({ "ok": true }))).into_response();
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({ "ok": true })),
+                )
+                    .into_response();
             }
         }
         jobs.insert(
@@ -317,7 +320,11 @@ pub async fn handle_local_model_download(
         download_local_model(spec, workspace_dir, jobs).await;
     });
 
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "ok": true }))).into_response()
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "ok": true })),
+    )
+        .into_response()
 }
 
 async fn download_local_model(
@@ -369,7 +376,11 @@ async fn download_local_model(
         }
 
         let actually_resuming = status.as_u16() == 206 && existing_bytes > 0;
-        let mut transferred = if actually_resuming { existing_bytes } else { 0u64 };
+        let mut transferred = if actually_resuming {
+            existing_bytes
+        } else {
+            0u64
+        };
 
         let total = if actually_resuming {
             response
@@ -393,7 +404,7 @@ async fn download_local_model(
                 .append(true)
                 .open(&tmp_path)
                 .await
-                .context("failed to open temp file for resume")?  
+                .context("failed to open temp file for resume")?
         } else {
             tokio::fs::File::create(&tmp_path)
                 .await
@@ -413,7 +424,9 @@ async fn download_local_model(
                 job.total_bytes = total;
             }
         }
-        file.flush().await.context("failed to flush model download")?;
+        file.flush()
+            .await
+            .context("failed to flush model download")?;
 
         let min_expected = (spec.size_bytes as f64 * 0.9) as u64;
         if transferred < min_expected {
@@ -454,9 +467,7 @@ async fn download_local_model(
             if err_msg.contains("incomplete") {
                 let _ = std::fs::remove_file(&tmp_path);
             }
-            let resumed_bytes = std::fs::metadata(&tmp_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let resumed_bytes = std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0);
             guard.insert(
                 spec.id.to_string(),
                 LocalModelDownloadJob {
@@ -465,7 +476,10 @@ async fn download_local_model(
                     transferred_bytes: resumed_bytes,
                     total_bytes: Some(spec.size_bytes),
                     error: Some(if resumed_bytes > 0 {
-                        format!("{err_msg} — tap Download to resume from {:.0}%", (resumed_bytes as f64 / spec.size_bytes as f64) * 100.0)
+                        format!(
+                            "{err_msg} — tap Download to resume from {:.0}%",
+                            (resumed_bytes as f64 / spec.size_bytes as f64) * 100.0
+                        )
                     } else {
                         err_msg
                     }),

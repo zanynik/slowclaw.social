@@ -91,8 +91,12 @@ mod engine {
         }
 
         // Pre-check: validate file is readable and has reasonable size
-        let file_meta = std::fs::metadata(&path)
-            .map_err(|e| format!("Cannot read model file metadata: {e} — path: {}", path.display()))?;
+        let file_meta = std::fs::metadata(&path).map_err(|e| {
+            format!(
+                "Cannot read model file metadata: {e} — path: {}",
+                path.display()
+            )
+        })?;
         let file_size = file_meta.len();
         if file_size < 1024 {
             return Err(format!(
@@ -208,7 +212,11 @@ mod engine {
     /// Build a prompt string manually when the model's embedded Jinja2 template
     /// fails (common with Gemma 4's complex multimodal/tool-calling template).
     /// Detects model family from the model_id and uses the correct format.
-    fn build_fallback_prompt(system_prompt: &Option<String>, user_prompt: &str, model_id: &str) -> String {
+    fn build_fallback_prompt(
+        system_prompt: &Option<String>,
+        user_prompt: &str,
+        model_id: &str,
+    ) -> String {
         let id_lower = model_id.to_lowercase();
         if id_lower.contains("gemma-4") || id_lower.contains("gemma4") {
             // Gemma 4 format uses <|turn>role / <turn|> delimiters
@@ -326,7 +334,9 @@ mod engine {
         let tokens = if tokens.len() > max_prompt_tokens {
             eprintln!(
                 "[inference] Prompt too long ({} tokens), truncating to {} (ctx={})",
-                tokens.len(), max_prompt_tokens, max_ctx
+                tokens.len(),
+                max_prompt_tokens,
+                max_ctx
             );
             // Keep the first 80% and last 20% of the budget so the model
             // sees both the instruction/system prompt and the tail of the content.
@@ -342,7 +352,9 @@ mod engine {
         let n_ctx = (tokens.len() as u32 + gen_headroom + 8).min(max_ctx);
         eprintln!(
             "[inference] Context: n_ctx={} prompt_tokens={} gen_headroom={}",
-            n_ctx, tokens.len(), gen_headroom
+            n_ctx,
+            tokens.len(),
+            gen_headroom
         );
 
         let n_batch: usize = if cfg!(target_os = "ios") { 128 } else { 512 };
@@ -430,11 +442,9 @@ mod engine {
         // Detokenize output
         let text: String = output_tokens
             .iter()
-            .map(|&t| {
-                match model.token_to_piece_bytes(t, 128, true, None) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                    Err(_) => String::new(),
-                }
+            .map(|&t| match model.token_to_piece_bytes(t, 128, true, None) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(_) => String::new(),
             })
             .collect();
 

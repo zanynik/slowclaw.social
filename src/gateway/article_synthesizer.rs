@@ -195,7 +195,9 @@ fn metadata_path_for_article(workspace_dir: &Path, article_path: &str) -> Result
         .trim_start_matches('/')
         .strip_prefix("posts/articles/")
         .context("article path must live under posts/articles/")?;
-    Ok(metadata_root(workspace_dir).join(rel).with_extension("json"))
+    Ok(metadata_root(workspace_dir)
+        .join(rel)
+        .with_extension("json"))
 }
 
 fn load_article_metadata(workspace_dir: &Path, article_path: &str) -> Option<ArticleMetadataFile> {
@@ -224,8 +226,7 @@ fn write_article_metadata(
 }
 
 fn collect_article_paths(dir: &Path, workspace_dir: &Path, out: &mut Vec<String>) -> Result<()> {
-    let entries =
-        fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?;
+    let entries = fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -285,9 +286,7 @@ pub fn article_inventory(workspace_dir: &Path) -> Result<Vec<ArticleInventoryIte
                 .as_ref()
                 .map(|item| truncate_with_ellipsis(item.summary.trim(), 240))
                 .unwrap_or_default(),
-            source_paths: metadata
-                .map(|item| item.source_paths)
-                .unwrap_or_default(),
+            source_paths: metadata.map(|item| item.source_paths).unwrap_or_default(),
         });
     }
     Ok(out)
@@ -392,8 +391,8 @@ fn load_update_file(workspace_dir: &Path) -> Result<ArticleUpdateFile> {
     let path = handoff_path(workspace_dir);
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let file: ArticleUpdateFile =
-        serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let file: ArticleUpdateFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     normalize_update_file(file)
 }
 
@@ -458,8 +457,12 @@ pub fn apply_handoff_file(workspace_dir: &Path) -> Result<ArticleApplyResult> {
     let output_root = workspace_dir.join(ARTICLE_OUTPUT_ROOT);
     fs::create_dir_all(&output_root)
         .with_context(|| format!("failed to create {}", output_root.display()))?;
-    fs::create_dir_all(metadata_root(workspace_dir))
-        .with_context(|| format!("failed to create {}", metadata_root(workspace_dir).display()))?;
+    fs::create_dir_all(metadata_root(workspace_dir)).with_context(|| {
+        format!(
+            "failed to create {}",
+            metadata_root(workspace_dir).display()
+        )
+    })?;
 
     let mut result = ArticleApplyResult::default();
     let mut error_messages = Vec::new();

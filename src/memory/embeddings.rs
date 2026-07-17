@@ -130,11 +130,7 @@ impl HashEmbedding {
         }
 
         let token_count = tokens.len();
-        Self::add_hashed_feature(
-            &mut vector,
-            &format!("meta:model={}", self.model),
-            0.1,
-        );
+        Self::add_hashed_feature(&mut vector, &format!("meta:model={}", self.model), 0.1);
         Self::add_hashed_feature(
             &mut vector,
             &format!("meta:tokens={}", token_count / 8),
@@ -189,7 +185,12 @@ impl LocalMiniLmEmbedder {
 
         let inference_model = tract_onnx::onnx()
             .model_for_path(&assets.model_path)
-            .with_context(|| format!("failed to load ONNX model from {}", assets.model_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to load ONNX model from {}",
+                    assets.model_path.display()
+                )
+            })?;
         let input_count = inference_model.inputs.len();
         let model = inference_model
             .into_optimized()?
@@ -244,10 +245,11 @@ impl LocalMiniLmEmbedder {
             }
         }
 
-        let input_ids_tensor =
-            Tensor::from_shape(&[batch_size, sequence_len], &input_ids).context("input_ids tensor")?;
-        let attention_mask_tensor = Tensor::from_shape(&[batch_size, sequence_len], &attention_mask)
-            .context("attention_mask tensor")?;
+        let input_ids_tensor = Tensor::from_shape(&[batch_size, sequence_len], &input_ids)
+            .context("input_ids tensor")?;
+        let attention_mask_tensor =
+            Tensor::from_shape(&[batch_size, sequence_len], &attention_mask)
+                .context("attention_mask tensor")?;
         let token_type_ids_tensor =
             Tensor::from_shape(&[batch_size, sequence_len], &token_type_ids)
                 .context("token_type_ids tensor")?;
@@ -458,9 +460,10 @@ impl EmbeddingProvider for BuiltinEmbedding {
         let owned_texts: Vec<String> = texts.iter().map(|text| (*text).to_string()).collect();
         match self.local_runtime().await {
             Ok(runtime) => {
-                let result = tokio::task::spawn_blocking(move || runtime.lock().embed_batch(&owned_texts))
-                    .await
-                    .map_err(|err| anyhow!("all-MiniLM inference task failed: {err}"))?;
+                let result =
+                    tokio::task::spawn_blocking(move || runtime.lock().embed_batch(&owned_texts))
+                        .await
+                        .map_err(|err| anyhow!("all-MiniLM inference task failed: {err}"))?;
                 match result {
                     Ok(embeddings) => return Ok(embeddings),
                     Err(err) => {
@@ -674,8 +677,14 @@ mod tests {
     #[tokio::test]
     async fn builtin_embedding_is_deterministic() {
         let p = BuiltinEmbedding::new("builtin-384-v1", 384);
-        let first = p.embed_one("Camera journal about autumn street photos").await.unwrap();
-        let second = p.embed_one("Camera journal about autumn street photos").await.unwrap();
+        let first = p
+            .embed_one("Camera journal about autumn street photos")
+            .await
+            .unwrap();
+        let second = p
+            .embed_one("Camera journal about autumn street photos")
+            .await
+            .unwrap();
         assert_eq!(first, second);
     }
 

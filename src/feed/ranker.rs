@@ -7,9 +7,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use super::types::{
-    FeedCandidate, FeedProfile, InterestVector, PersonalizedFeedItem,
-};
+use super::types::{FeedCandidate, FeedProfile, InterestVector, PersonalizedFeedItem};
 
 const FEED_PROFILE_MAX_CHARS: usize = 2_400;
 const FEED_EMBED_BATCH_SIZE: usize = 16;
@@ -115,7 +113,10 @@ impl FeedRanker {
             ranked_items.retain(|candidate| candidate.item.passed_threshold);
         }
         ranked_items = interleave_ranked_candidates_by_source(ranked_items, limit);
-        Ok(ranked_items.into_iter().map(|candidate| candidate.item).collect())
+        Ok(ranked_items
+            .into_iter()
+            .map(|candidate| candidate.item)
+            .collect())
     }
 }
 
@@ -132,7 +133,8 @@ pub fn rank_candidates_stage2(
             keyword_weight_sum(&candidate.rank_text, &keyword_weights);
         let freshness_bonus = candidate_freshness_bonus(&candidate.item);
         let penalty = negative_keyword_penalty(&candidate.rank_text, negatives);
-        let final_score = keyword_score + freshness_bonus
+        let final_score = keyword_score
+            + freshness_bonus
             + (candidate.stage1_score * KEYWORD_PROFILE_SOURCE_BONUS)
             - penalty;
         let mut item = candidate.item;
@@ -301,9 +303,7 @@ pub fn candidate_freshness_bonus(item: &PersonalizedFeedItem) -> f32 {
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
         return 0.0;
     };
-    let age_hours = (Utc::now() - parsed.with_timezone(&Utc))
-        .num_hours()
-        .max(0) as f32;
+    let age_hours = (Utc::now() - parsed.with_timezone(&Utc)).num_hours().max(0) as f32;
     if age_hours <= 24.0 {
         KEYWORD_PROFILE_FRESHNESS_BONUS_MAX
     } else if age_hours <= 72.0 {
@@ -427,18 +427,118 @@ pub fn stage1_stopwords() -> &'static HashSet<&'static str> {
     static WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
     WORDS.get_or_init(|| {
         HashSet::from([
-            "about", "after", "also", "been", "being", "because", "before", "between", "could",
-            "from", "have", "into", "just", "like", "more", "most", "only", "other", "over",
-            "really", "some", "than", "that", "their", "there", "these", "they", "this",
-            "those", "through", "very", "what", "when", "where", "which", "with", "would",
-            "your", "ours", "ourselves", "the", "and", "for", "are", "was", "were", "you",
-            "has", "had", "but", "not", "too", "out", "off", "its", "why", "how", "who",
-            "insight", "post", "notes", "note", "journal", "entry", "entries", "work", "thing",
-            "things", "stuff", "really", "just", "dont", "didnt", "doesnt", "cant", "wont",
-            "ive", "im", "youre", "thats", "maybe", "also", "still", "feel", "kind", "lot",
-            "can", "should", "did", "done", "her", "his", "our", "lack", "start", "write",
-            "need", "needs", "want", "wants", "think", "thinking", "good", "bad", "better",
-            "best", "worse", "life", "people", "person", "someone", "something",
+            "about",
+            "after",
+            "also",
+            "been",
+            "being",
+            "because",
+            "before",
+            "between",
+            "could",
+            "from",
+            "have",
+            "into",
+            "just",
+            "like",
+            "more",
+            "most",
+            "only",
+            "other",
+            "over",
+            "really",
+            "some",
+            "than",
+            "that",
+            "their",
+            "there",
+            "these",
+            "they",
+            "this",
+            "those",
+            "through",
+            "very",
+            "what",
+            "when",
+            "where",
+            "which",
+            "with",
+            "would",
+            "your",
+            "ours",
+            "ourselves",
+            "the",
+            "and",
+            "for",
+            "are",
+            "was",
+            "were",
+            "you",
+            "has",
+            "had",
+            "but",
+            "not",
+            "too",
+            "out",
+            "off",
+            "its",
+            "why",
+            "how",
+            "who",
+            "insight",
+            "post",
+            "notes",
+            "note",
+            "journal",
+            "entry",
+            "entries",
+            "work",
+            "thing",
+            "things",
+            "stuff",
+            "really",
+            "just",
+            "dont",
+            "didnt",
+            "doesnt",
+            "cant",
+            "wont",
+            "ive",
+            "im",
+            "youre",
+            "thats",
+            "maybe",
+            "also",
+            "still",
+            "feel",
+            "kind",
+            "lot",
+            "can",
+            "should",
+            "did",
+            "done",
+            "her",
+            "his",
+            "our",
+            "lack",
+            "start",
+            "write",
+            "need",
+            "needs",
+            "want",
+            "wants",
+            "think",
+            "thinking",
+            "good",
+            "bad",
+            "better",
+            "best",
+            "worse",
+            "life",
+            "people",
+            "person",
+            "someone",
+            "something",
         ])
     })
 }
@@ -601,4 +701,3 @@ mod tests {
         assert!((p - 0.7).abs() < 1e-6);
     }
 }
-

@@ -83,8 +83,7 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, IntegrationCommands, MigrateCommands, ServiceCommands,
-    SkillCommands,
+    ChannelCommands, IntegrationCommands, MigrateCommands, ServiceCommands, SkillCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -722,16 +721,9 @@ async fn main() -> Result<()> {
             provider,
             model,
             temperature,
-        } => agent::run(
-            config,
-            message,
-            provider,
-            model,
-            temperature,
-            true,
-        )
-        .await
-        .map(|_| ()),
+        } => agent::run(config, message, provider, model, temperature, true)
+            .await
+            .map(|_| ()),
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);

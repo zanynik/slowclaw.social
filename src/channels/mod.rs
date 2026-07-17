@@ -98,7 +98,12 @@ pub mod clawdtalk {
 
 pub mod linq {
     /// External Linq verification is disabled in this fork.
-    pub fn verify_linq_signature(_secret: &str, _body: &str, _timestamp: &str, _signature: &str) -> bool {
+    pub fn verify_linq_signature(
+        _secret: &str,
+        _body: &str,
+        _timestamp: &str,
+        _signature: &str,
+    ) -> bool {
         false
     }
 }
@@ -210,7 +215,10 @@ macro_rules! impl_disabled_channel {
             }
 
             async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
-                anyhow::bail!(concat!($name, " channel integration is disabled in this fork"))
+                anyhow::bail!(concat!(
+                    $name,
+                    " channel integration is disabled in this fork"
+                ))
             }
 
             async fn listen(
@@ -232,7 +240,10 @@ impl_disabled_channel!(LinqChannel, "linq");
 impl_disabled_channel!(WatiChannel, "wati");
 impl_disabled_channel!(NextcloudTalkChannel, "nextcloud-talk");
 
-pub(crate) async fn handle_command(command: crate::ChannelCommands, _config: &crate::config::Config) -> Result<()> {
+pub(crate) async fn handle_command(
+    command: crate::ChannelCommands,
+    _config: &crate::config::Config,
+) -> Result<()> {
     match command {
         crate::ChannelCommands::Start => {
             anyhow::bail!("Channel runtime is disabled in this fork")
@@ -249,7 +260,9 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, _config: &cr
             Ok(())
         }
         crate::ChannelCommands::Add { channel_type, .. } => {
-            anyhow::bail!("External channel integrations are disabled in this fork ({channel_type})")
+            anyhow::bail!(
+                "External channel integrations are disabled in this fork ({channel_type})"
+            )
         }
         crate::ChannelCommands::Remove { name } => {
             anyhow::bail!("External channel integrations are disabled in this fork ({name})")
@@ -261,7 +274,9 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, _config: &cr
 }
 
 pub async fn doctor_channels(_config: crate::config::Config) -> Result<()> {
-    println!("Channel doctor is disabled: external channel integrations were removed in this fork.");
+    println!(
+        "Channel doctor is disabled: external channel integrations were removed in this fork."
+    );
     println!("Use `slowclaw cron ...` and PocketBase delivery instead.");
     Ok(())
 }
@@ -312,7 +327,9 @@ pub fn build_system_prompt_with_mode(
     let _ = writeln!(prompt, "You are SlowClaw running in a workspace-only fork.");
     let _ = writeln!(prompt, "Current workspace: `{}`", workspace_dir.display());
     let _ = writeln!(prompt, "Model: `{model_name}`");
-    prompt.push_str("External messaging channels are disabled except the internal PocketBase app channel.\n");
+    prompt.push_str(
+        "External messaging channels are disabled except the internal PocketBase app channel.\n",
+    );
     prompt.push_str("Prefer workspace-local tools and scheduled tasks.\n\n");
 
     if !tools.is_empty() {
@@ -360,7 +377,9 @@ mod tests {
             tags: vec!["workflow".to_string()],
             tools: Vec::new(),
             prompts: vec!["# Daily Summary Skill".to_string()],
-            location: Some(PathBuf::from("/tmp/workspace/skills/daily_summary/SKILL.md")),
+            location: Some(PathBuf::from(
+                "/tmp/workspace/skills/daily_summary/SKILL.md",
+            )),
         }
     }
 

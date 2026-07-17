@@ -5288,7 +5288,12 @@ Let me check the result."#;
                 "UI restricted prompt should omit {removed}"
             );
         }
-        for allowed in ["file_read", "file_write", "memory_store", "model_routing_config"] {
+        for allowed in [
+            "file_read",
+            "file_write",
+            "memory_store",
+            "model_routing_config",
+        ] {
             assert!(
                 prompt.contains(allowed),
                 "UI restricted prompt should include {allowed}"
@@ -5340,7 +5345,10 @@ Let me check the result."#;
         );
 
         for expected in ["shell", "git_operations"] {
-            assert!(prompt.contains(expected), "Full prompt should include {expected}");
+            assert!(
+                prompt.contains(expected),
+                "Full prompt should include {expected}"
+            );
         }
     }
 

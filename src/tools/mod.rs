@@ -22,10 +22,10 @@ pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
+pub mod media_tools;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
-pub mod media_tools;
 pub mod model_routing_config;
 pub(crate) mod registry;
 pub mod schema;
@@ -40,13 +40,13 @@ pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
-pub use memory_forget::MemoryForgetTool;
-pub use memory_recall::MemoryRecallTool;
-pub use memory_store::MemoryStoreTool;
 pub use media_tools::{
     CleanAudioTool, ComposeSimpleClipTool, ExtractAudioSegmentTool, RenderTextCardVideoTool,
     StitchImagesWithAudioTool, TranscribeMediaTool,
 };
+pub use memory_forget::MemoryForgetTool;
+pub use memory_recall::MemoryRecallTool;
+pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use registry::ToolProfile;
 #[allow(unused_imports)]
@@ -356,7 +356,10 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         for name in ["shell", "git_operations"] {
-            assert!(!names.contains(&name), "unexpected tool {name} in UI profile");
+            assert!(
+                !names.contains(&name),
+                "unexpected tool {name} in UI profile"
+            );
         }
         for name in [
             "file_read",

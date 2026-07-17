@@ -122,7 +122,10 @@ impl MediaToolCapabilities {
         if names.is_empty() {
             "No local media tools are currently available on this device.".to_string()
         } else {
-            format!("Local media tools available on this device: {}.", names.join(", "))
+            format!(
+                "Local media tools available on this device: {}.",
+                names.join(", ")
+            )
         }
     }
 }
@@ -130,7 +133,11 @@ impl MediaToolCapabilities {
 #[async_trait]
 pub trait ContentMediaBackend: Send + Sync {
     fn capabilities(&self) -> MediaToolCapabilities;
-    async fn transcribe_media(&self, media_path: &str, force: bool) -> Result<MediaTranscriptResult>;
+    async fn transcribe_media(
+        &self,
+        media_path: &str,
+        force: bool,
+    ) -> Result<MediaTranscriptResult>;
     async fn clean_audio(
         &self,
         audio_path: &str,
@@ -164,7 +171,10 @@ pub fn command_media_backend(
     workspace_dir: PathBuf,
     transcription: TranscriptionConfig,
 ) -> SharedContentMediaBackend {
-    Arc::new(CommandContentMediaBackend::new(workspace_dir, transcription))
+    Arc::new(CommandContentMediaBackend::new(
+        workspace_dir,
+        transcription,
+    ))
 }
 
 pub struct CommandContentMediaBackend {
@@ -226,7 +236,11 @@ impl CommandContentMediaBackend {
                 "{program} failed ({}): {}",
                 output.status,
                 truncate_with_ellipsis(
-                    &(if stderr.trim().is_empty() { stdout } else { stderr }),
+                    &(if stderr.trim().is_empty() {
+                        stdout
+                    } else {
+                        stderr
+                    }),
                     320
                 )
             );
@@ -266,7 +280,11 @@ impl ContentMediaBackend for CommandContentMediaBackend {
         }
     }
 
-    async fn transcribe_media(&self, media_path: &str, force: bool) -> Result<MediaTranscriptResult> {
+    async fn transcribe_media(
+        &self,
+        media_path: &str,
+        force: bool,
+    ) -> Result<MediaTranscriptResult> {
         let media_abs = self.resolve_rel_path(media_path)?;
         if !media_abs.exists() || !media_abs.is_file() {
             anyhow::bail!("Media file not found: {media_path}");
@@ -300,7 +318,9 @@ impl ContentMediaBackend for CommandContentMediaBackend {
         self.ensure_helper_scripts().await?;
         self.ensure_parent_dir(&transcript_abs)?;
 
-        let script_path = self.workspace_dir.join("scripts/transcribe_audio_journal.py");
+        let script_path = self
+            .workspace_dir
+            .join("scripts/transcribe_audio_journal.py");
         let mut args = vec![
             script_path.to_string_lossy().to_string(),
             "--input".to_string(),
@@ -326,9 +346,12 @@ impl ContentMediaBackend for CommandContentMediaBackend {
             args.push("--language".to_string());
             args.push(language.to_string());
         }
-        self.run_command(self.transcription.python_bin.trim(), &args).await?;
+        self.run_command(self.transcription.python_bin.trim(), &args)
+            .await?;
 
-        let text = tokio::fs::read_to_string(&transcript_abs).await.unwrap_or_default();
+        let text = tokio::fs::read_to_string(&transcript_abs)
+            .await
+            .unwrap_or_default();
         Ok(MediaTranscriptResult {
             status: "done".to_string(),
             media_path: media_path.trim().trim_start_matches('/').to_string(),
@@ -446,7 +469,10 @@ impl ContentMediaBackend for CommandContentMediaBackend {
             "-f".to_string(),
             "lavfi".to_string(),
             "-i".to_string(),
-            format!("color=c=black:s={}x{}:r={fps}:d={duration_secs}", width, height),
+            format!(
+                "color=c=black:s={}x{}:r={fps}:d={duration_secs}",
+                width, height
+            ),
         ];
         if let Some(audio_path) = request.audio_path.as_deref() {
             let audio_abs = self.resolve_rel_path(audio_path)?;
@@ -475,7 +501,11 @@ impl ContentMediaBackend for CommandContentMediaBackend {
         self.run_command("ffmpeg", &args).await?;
 
         Ok(AudioTransformResult {
-            output_path: request.output_path.trim().trim_start_matches('/').to_string(),
+            output_path: request
+                .output_path
+                .trim()
+                .trim_start_matches('/')
+                .to_string(),
             duration_ms: Some(duration_ms),
         })
     }
@@ -505,11 +535,18 @@ impl ContentMediaBackend for CommandContentMediaBackend {
                 .get(index)
                 .copied()
                 .unwrap_or(DEFAULT_CARD_DURATION_MS);
-            concat.push_str(&format!("file '{}'\n", image_abs.to_string_lossy().replace('\'', "'\\''")));
+            concat.push_str(&format!(
+                "file '{}'\n",
+                image_abs.to_string_lossy().replace('\'', "'\\''")
+            ));
             concat.push_str(&format!("duration {}\n", duration as f64 / 1000.0));
         }
-        let last_image = self.resolve_rel_path(request.image_paths.last().expect("checked above"))?;
-        concat.push_str(&format!("file '{}'\n", last_image.to_string_lossy().replace('\'', "'\\''")));
+        let last_image =
+            self.resolve_rel_path(request.image_paths.last().expect("checked above"))?;
+        concat.push_str(&format!(
+            "file '{}'\n",
+            last_image.to_string_lossy().replace('\'', "'\\''")
+        ));
         tokio::fs::write(&concat_abs, concat).await?;
 
         let audio_abs = self.resolve_rel_path(&request.audio_path)?;
@@ -543,7 +580,11 @@ impl ContentMediaBackend for CommandContentMediaBackend {
         .await?;
 
         Ok(AudioTransformResult {
-            output_path: request.output_path.trim().trim_start_matches('/').to_string(),
+            output_path: request
+                .output_path
+                .trim()
+                .trim_start_matches('/')
+                .to_string(),
             duration_ms: ffprobe_duration_ms(&output_abs).await.ok(),
         })
     }
@@ -556,7 +597,11 @@ impl ContentMediaBackend for CommandContentMediaBackend {
             anyhow::bail!("Unsupported compose_simple_clip preset");
         }
 
-        if let Some(image_paths) = request.image_paths.as_ref().filter(|items| !items.is_empty()) {
+        if let Some(image_paths) = request
+            .image_paths
+            .as_ref()
+            .filter(|items| !items.is_empty())
+        {
             let stitched = self
                 .stitch_images_with_audio(&StitchImagesWithAudioRequest {
                     image_paths: image_paths.clone(),

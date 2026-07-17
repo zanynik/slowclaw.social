@@ -383,7 +383,6 @@ pub const DEFAULT_FEED_WEB_SOURCES: &[DefaultFeedWebSource] = &[
         html_url: "https://www.astralcodexten.com",
         xml_url: "https://www.astralcodexten.com/feed",
     },
-
     // --- Hacker News (aggregated front page) ---
     // Note: HN front-page stories often link to blogs already in this catalog.
     // content_items dedupes on canonical_url, so the same article appearing
@@ -394,7 +393,6 @@ pub const DEFAULT_FEED_WEB_SOURCES: &[DefaultFeedWebSource] = &[
         html_url: "https://news.ycombinator.com",
         xml_url: "https://hnrss.org/frontpage",
     },
-
     // --- YouTube channel feeds (Atom; entries are title-only — no media:description parsing yet) ---
     // domain must be unique per channel (feed_web_sources PK is domain).
     DefaultFeedWebSource {
@@ -421,7 +419,6 @@ pub const DEFAULT_FEED_WEB_SOURCES: &[DefaultFeedWebSource] = &[
         html_url: "https://www.youtube.com/@LinusTechTips",
         xml_url: "https://www.youtube.com/feeds/videos.xml?channel_id=UCXuqSBlHAE6Xw-yeJA0Tunw",
     },
-
     // --- HN Popularity Contest 2025 (new entries, deduped against the catalog above) ---
     DefaultFeedWebSource {
         title: "utcc.utoronto.ca/~cks",

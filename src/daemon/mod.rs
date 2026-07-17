@@ -182,16 +182,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
-            match crate::agent::run(
-                config.clone(),
-                Some(prompt),
-                None,
-                None,
-                temp,
-                false,
-            )
-            .await
-            {
+            match crate::agent::run(config.clone(), Some(prompt), None, None, temp, false).await {
                 Ok(output) => {
                     crate::health::mark_component_ok("heartbeat");
                     let announcement = if output.trim().is_empty() {

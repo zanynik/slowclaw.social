@@ -17,9 +17,9 @@ use regex::Regex;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 pub use traits::FeedSource;
@@ -92,11 +92,11 @@ const LENS_MULTIPLIER_MUTE: f64 = 0.0;
 const LENS_MULTIPLIER_BOOST: f64 = 2.0;
 const LENS_MANUAL_INTEREST_WEIGHT: f64 = 3.0;
 
-pub mod types;
 pub mod ranker;
+pub mod types;
 
-pub use types::*;
 pub use ranker::*;
+pub use types::*;
 
 struct PreparedWorldFeedData {
     profile: FeedProfile,
@@ -212,8 +212,6 @@ fn fallback_bluesky_selected_sources() -> Vec<SelectedSource> {
     ]
 }
 
-
-
 pub fn mark_world_feed_dirty(workspace_dir: &Path) -> Result<()> {
     local_store::mark_personalized_feed_dirty(workspace_dir, WORLD_FEED_KEY)
 }
@@ -262,14 +260,16 @@ async fn build_prepared_world_feed_data(
     // Use the freshest Bluesky auth: prefer the globally stored latest auth
     // (which may have been updated by a newer request while this task was running),
     // falling back to the auth captured at spawn time.
-    let effective_bluesky_auth = take_latest_bluesky_auth(&config.workspace_dir)
-        .or(bluesky_auth);
+    let effective_bluesky_auth = take_latest_bluesky_auth(&config.workspace_dir).or(bluesky_auth);
 
     let rss_future = async {
         match rss_source.discover_sources_with_diagnostics(&profile).await {
             Ok((selected, diagnostics)) => {
                 let cloned = selected.clone();
-                match rss_source.fetch_candidates(&profile, &selected, limit_for_candidates()).await {
+                match rss_source
+                    .fetch_candidates(&profile, &selected, limit_for_candidates())
+                    .await
+                {
                     Ok(fetched) => {
                         let mut d = diagnostics;
                         d.candidate_count = fetched.len();
@@ -285,7 +285,16 @@ async fn build_prepared_world_feed_data(
             }
             Err(err) => {
                 tracing::warn!("RSS source discovery failed: {err}");
-                (Vec::new(), FeedProtocolDiagnostics { available: false, error: Some(format!("{err}")), ..Default::default() }, Vec::new(), Vec::new())
+                (
+                    Vec::new(),
+                    FeedProtocolDiagnostics {
+                        available: false,
+                        error: Some(format!("{err}")),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                )
             }
         }
     };
@@ -294,9 +303,15 @@ async fn build_prepared_world_feed_data(
         let mut diagnostics = FeedProtocolDiagnostics::default();
         let mut selected = Vec::new();
         let mut candidates = Vec::new();
-        match nostr_source.discover_sources_with_diagnostics(&profile).await {
+        match nostr_source
+            .discover_sources_with_diagnostics(&profile)
+            .await
+        {
             Ok((nostr_selected, mut discovered_diagnostics)) => {
-                match nostr_source.fetch_candidates(&profile, &nostr_selected, limit_for_candidates()).await {
+                match nostr_source
+                    .fetch_candidates(&profile, &nostr_selected, limit_for_candidates())
+                    .await
+                {
                     Ok(nostr_candidates) => {
                         discovered_diagnostics.candidate_count = nostr_candidates.len();
                         candidates = nostr_candidates;
@@ -326,9 +341,15 @@ async fn build_prepared_world_feed_data(
             Some(auth) => {
                 tracing::info!(service_url = %auth.service_url, "World feed: Bluesky auth available, running discovery");
                 let bluesky_source = BlueskyFeedSource::new(auth);
-                match bluesky_source.discover_sources_with_diagnostics(&profile).await {
+                match bluesky_source
+                    .discover_sources_with_diagnostics(&profile)
+                    .await
+                {
                     Ok((bluesky_selected, mut discovered_diagnostics)) => {
-                        match bluesky_source.fetch_candidates(&profile, &bluesky_selected, limit_for_candidates()).await {
+                        match bluesky_source
+                            .fetch_candidates(&profile, &bluesky_selected, limit_for_candidates())
+                            .await
+                        {
                             Ok(bluesky_candidates) => {
                                 discovered_diagnostics.candidate_count = bluesky_candidates.len();
                                 candidates = bluesky_candidates;
@@ -362,7 +383,10 @@ async fn build_prepared_world_feed_data(
         let mut candidates = Vec::new();
         match web_source.discover_sources_with_diagnostics(&profile).await {
             Ok((web_selected, mut discovered_diagnostics)) => {
-                match web_source.fetch_candidates(&profile, &web_selected, limit_for_candidates()).await {
+                match web_source
+                    .fetch_candidates(&profile, &web_selected, limit_for_candidates())
+                    .await
+                {
                     Ok(web_candidates) => {
                         discovered_diagnostics.candidate_count = web_candidates.len();
                         candidates = web_candidates;
@@ -388,9 +412,15 @@ async fn build_prepared_world_feed_data(
         let mut diagnostics = FeedProtocolDiagnostics::default();
         let mut selected = Vec::new();
         let mut candidates = Vec::new();
-        match bluesky_search_source.discover_sources_with_diagnostics(&profile).await {
+        match bluesky_search_source
+            .discover_sources_with_diagnostics(&profile)
+            .await
+        {
             Ok((search_selected, mut discovered_diagnostics)) => {
-                match bluesky_search_source.fetch_candidates(&profile, &search_selected, limit_for_candidates()).await {
+                match bluesky_search_source
+                    .fetch_candidates(&profile, &search_selected, limit_for_candidates())
+                    .await
+                {
                     Ok(search_candidates) => {
                         discovered_diagnostics.candidate_count = search_candidates.len();
                         candidates = search_candidates;
@@ -419,7 +449,13 @@ async fn build_prepared_world_feed_data(
         (bluesky_selected, bluesky_diagnostics, bluesky_candidates),
         (web_selected, web_diagnostics, web_candidates),
         (bsky_search_selected, bsky_search_diagnostics, bsky_search_candidates),
-    ) = tokio::join!(rss_future, nostr_future, bluesky_future, web_future, bluesky_search_future);
+    ) = tokio::join!(
+        rss_future,
+        nostr_future,
+        bluesky_future,
+        web_future,
+        bluesky_search_future
+    );
 
     selected_sources.extend(nostr_selected);
     selected_sources.extend(bluesky_selected);
@@ -613,8 +649,11 @@ pub async fn load_world_feed(
 
     let mut fallback_items = Vec::new();
     if let Some(auth) = bluesky_auth {
-        let bluesky_limit = limit
-            .min(limit.saturating_div(2).max(WORLD_FEED_FALLBACK_MIN_BLUESKY_ITEMS));
+        let bluesky_limit = limit.min(
+            limit
+                .saturating_div(2)
+                .max(WORLD_FEED_FALLBACK_MIN_BLUESKY_ITEMS),
+        );
         let raw_candidates =
             fetch_bluesky_fallback_candidates(&auth.service_url, &auth.access_jwt, bluesky_limit)
                 .await
@@ -708,9 +747,7 @@ fn begin_world_feed_refresh(workspace_dir: &Path) -> bool {
 }
 
 fn finish_world_feed_refresh(workspace_dir: &Path) {
-    world_feed_refresh_inflight()
-        .lock()
-        .remove(workspace_dir);
+    world_feed_refresh_inflight().lock().remove(workspace_dir);
 }
 
 /// Write partial diagnostics to SQLite and bump generation so the frontend poll
@@ -926,7 +963,10 @@ fn store_latest_bluesky_auth(workspace_dir: &Path, auth: &BlueskyAuth) {
 }
 
 fn take_latest_bluesky_auth(workspace_dir: &Path) -> Option<BlueskyAuth> {
-    latest_bluesky_auth_store().lock().get(workspace_dir).cloned()
+    latest_bluesky_auth_store()
+        .lock()
+        .get(workspace_dir)
+        .cloned()
 }
 
 fn default_feed_state_record() -> local_store::PersonalizedFeedStateRecord {
@@ -971,7 +1011,10 @@ fn compute_refresh_state(
         }
         return "fresh".to_string();
     }
-    if !state.dirty && !state.profile_status.trim().is_empty() && !state_is_stale(&state.refreshed_at) {
+    if !state.dirty
+        && !state.profile_status.trim().is_empty()
+        && !state_is_stale(&state.refreshed_at)
+    {
         "fresh".to_string()
     } else {
         "warming".to_string()
@@ -998,7 +1041,11 @@ fn should_refresh_world_feed(
 fn state_is_stale(refreshed_at: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(refreshed_at.trim())
         .ok()
-        .map(|value| Utc::now().signed_duration_since(value.with_timezone(&Utc)).num_seconds())
+        .map(|value| {
+            Utc::now()
+                .signed_duration_since(value.with_timezone(&Utc))
+                .num_seconds()
+        })
         .map(|age| age < 0 || age > WORLD_FEED_CACHE_TTL_SECS)
         .unwrap_or(true)
 }
@@ -1038,7 +1085,9 @@ fn deserialize_cached_items(
 ) -> Vec<PersonalizedFeedItem> {
     records
         .iter()
-        .filter_map(|record| serde_json::from_str::<PersonalizedFeedItem>(&record.payload_json).ok())
+        .filter_map(|record| {
+            serde_json::from_str::<PersonalizedFeedItem>(&record.payload_json).ok()
+        })
         .collect()
 }
 
@@ -1050,7 +1099,10 @@ fn world_feed_message(
     last_error: &str,
 ) -> Option<String> {
     if profile_status.eq_ignore_ascii_case("noInterests") {
-        return Some("Personalized feed starts after text items exist under posts/ or journals/.".to_string());
+        return Some(
+            "Personalized feed starts after text items exist under posts/ or journals/."
+                .to_string(),
+        );
     }
     if !last_error.trim().is_empty() && used_fallback {
         return Some(format!(
@@ -1059,7 +1111,10 @@ fn world_feed_message(
         ));
     }
     if refresh_state == "refreshing" || refresh_state == "stale" {
-        return Some("Updating the world feed in the background. Showing the last ranked results.".to_string());
+        return Some(
+            "Updating the world feed in the background. Showing the last ranked results."
+                .to_string(),
+        );
     }
     if used_fallback {
         if profile_status.eq_ignore_ascii_case("ready") && refresh_state == "fresh" {
@@ -1178,7 +1233,10 @@ fn limit_for_candidates() -> usize {
     96
 }
 
-fn build_recent_content_fallback(workspace_dir: &Path, limit: usize) -> Result<Vec<PersonalizedFeedItem>> {
+fn build_recent_content_fallback(
+    workspace_dir: &Path,
+    limit: usize,
+) -> Result<Vec<PersonalizedFeedItem>> {
     let items = local_store::list_recent_content_items(workspace_dir, limit)?;
     Ok(items
         .into_iter()
@@ -1257,7 +1315,9 @@ fn fallback_nostr_selected_source(relay_url: &str) -> SelectedSource {
         key: relay_url.to_string(),
         label: nostr_relay_label(relay_url, None),
         stage1_score: 0.2,
-        description: Some("Fallback Nostr relay while interest-matched relays warm up.".to_string()),
+        description: Some(
+            "Fallback Nostr relay while interest-matched relays warm up.".to_string(),
+        ),
         matched_interest_label: None,
         matched_interest_score: None,
         metadata_json: serde_json::json!({
@@ -1301,7 +1361,9 @@ async fn fetch_nip66_relay_candidates(
     let filter = NostrFilter::new()
         .kind(NostrKind::from(NOSTR_NIP66_DISCOVERY_KIND))
         .since(NostrTimestamp::from_secs(
-            Utc::now().timestamp().saturating_sub(NOSTR_LOOKBACK_SECS as i64) as u64,
+            Utc::now()
+                .timestamp()
+                .saturating_sub(NOSTR_LOOKBACK_SECS as i64) as u64,
         ))
         .limit(NOSTR_NIP66_DISCOVERY_EVENT_LIMIT);
     let events = client
@@ -1341,8 +1403,7 @@ async fn fetch_nip66_relay_candidates(
             event.content.trim(),
             relay_tags.join(" ")
         );
-        let (keyword_score, matched_keyword) =
-            keyword_weight_sum(&search_text, keyword_weights);
+        let (keyword_score, matched_keyword) = keyword_weight_sum(&search_text, keyword_weights);
         if keyword_score <= 0.0 {
             continue;
         }
@@ -1385,7 +1446,9 @@ fn nostr_relay_http_url(relay_url: &str) -> Option<String> {
     None
 }
 
-async fn fetch_nostr_relay_metadata(relay_url: &str) -> Result<Option<nostr_sdk::prelude::RelayInformationDocument>> {
+async fn fetch_nostr_relay_metadata(
+    relay_url: &str,
+) -> Result<Option<nostr_sdk::prelude::RelayInformationDocument>> {
     let Some(http_url) = nostr_relay_http_url(relay_url) else {
         return Ok(None);
     };
@@ -1479,12 +1542,17 @@ async fn fetch_nostr_events(
     let client = NostrClient::default();
     client.add_relay(relay_url).await?;
     client
-        .try_connect_relay(relay_url, Duration::from_secs(NOSTR_RELAY_CONNECT_TIMEOUT_SECS))
+        .try_connect_relay(
+            relay_url,
+            Duration::from_secs(NOSTR_RELAY_CONNECT_TIMEOUT_SECS),
+        )
         .await?;
     let mut filter = NostrFilter::new()
         .kinds([NostrKind::TextNote, NostrKind::from(30023)])
         .since(NostrTimestamp::from_secs(
-            Utc::now().timestamp().saturating_sub(NOSTR_LOOKBACK_SECS as i64) as u64,
+            Utc::now()
+                .timestamp()
+                .saturating_sub(NOSTR_LOOKBACK_SECS as i64) as u64,
         ))
         .limit(limit);
     if !hashtags.is_empty() {
@@ -1726,12 +1794,15 @@ async fn select_feed_embedder(config: &Config) -> Result<Option<SharedEmbedder>>
 async fn resolve_feed_embedder(
     config: &Config,
 ) -> Result<(Option<SharedEmbedder>, Option<String>)> {
-    if config.memory.embedding_provider.trim().eq_ignore_ascii_case("none") {
+    if config
+        .memory
+        .embedding_provider
+        .trim()
+        .eq_ignore_ascii_case("none")
+    {
         return Ok((
             None,
-            Some(
-                "Personalized feed embeddings are disabled in [memory].".to_string(),
-            ),
+            Some("Personalized feed embeddings are disabled in [memory].".to_string()),
         ));
     }
 
@@ -1748,10 +1819,11 @@ async fn resolve_feed_embedder(
 async fn rebuild_interest_profile(config: &Config) -> Result<FeedProfile> {
     let workspace_dir = &config.workspace_dir;
     let _ = local_store::decay_feed_keywords(workspace_dir, KEYWORD_PROFILE_DECAY_RATE)?;
-    let mut active_keywords: HashMap<String, local_store::FeedKeywordRecord> = local_store::list_feed_keywords(workspace_dir)?
-        .into_iter()
-        .map(|record| (record.term.clone(), record))
-        .collect();
+    let mut active_keywords: HashMap<String, local_store::FeedKeywordRecord> =
+        local_store::list_feed_keywords(workspace_dir)?
+            .into_iter()
+            .map(|record| (record.term.clone(), record))
+            .collect();
 
     let text_sources = collect_post_text_sources(workspace_dir)?;
     tracing::info!(
@@ -1806,9 +1878,7 @@ async fn rebuild_interest_profile(config: &Config) -> Result<FeedProfile> {
             let first_seen_at = existing
                 .map(|record| record.first_seen_at.clone())
                 .unwrap_or_else(|| now.clone());
-            let source_count = existing
-                .map(|record| record.source_count + 1)
-                .unwrap_or(1);
+            let source_count = existing.map(|record| record.source_count + 1).unwrap_or(1);
             let saved = local_store::upsert_feed_keyword(
                 workspace_dir,
                 &local_store::FeedKeywordUpsert {
@@ -1850,10 +1920,11 @@ async fn rebuild_interest_profile(config: &Config) -> Result<FeedProfile> {
     // Read the editable lens (overrides + manual interests) from SQLite so the
     // Rust world-feed ranker honors the same steering the TS ranker does, and
     // survives an iOS app reinstall (localStorage does not).
-    let lens_overrides: HashMap<String, f64> = local_store::list_feed_lens_overrides(workspace_dir)?
-        .into_iter()
-        .map(|record| (record.term, record.multiplier))
-        .collect();
+    let lens_overrides: HashMap<String, f64> =
+        local_store::list_feed_lens_overrides(workspace_dir)?
+            .into_iter()
+            .map(|record| (record.term, record.multiplier))
+            .collect();
     let manual_interests = local_store::list_feed_manual_interests(workspace_dir)?;
     let manual_terms: HashSet<String> = manual_interests
         .iter()
@@ -1865,10 +1936,7 @@ async fn rebuild_interest_profile(config: &Config) -> Result<FeedProfile> {
     // interests the journals haven't surfaced yet.
     let mut interests: Vec<InterestVector> = Vec::new();
     for keyword in local_store::list_feed_keywords_by_polarity(workspace_dir, 0)? {
-        let multiplier = lens_overrides
-            .get(&keyword.term)
-            .copied()
-            .unwrap_or(1.0);
+        let multiplier = lens_overrides.get(&keyword.term).copied().unwrap_or(1.0);
         if (multiplier - LENS_MULTIPLIER_MUTE).abs() < f64::EPSILON {
             continue; // muted — drop from the lens entirely
         }
@@ -1886,7 +1954,10 @@ async fn rebuild_interest_profile(config: &Config) -> Result<FeedProfile> {
     }
     for term in &manual_terms {
         // Skip manual interests already covered by a derived keyword above.
-        if interests.iter().any(|iv| iv.label.eq_ignore_ascii_case(term)) {
+        if interests
+            .iter()
+            .any(|iv| iv.label.eq_ignore_ascii_case(term))
+        {
             continue;
         }
         let multiplier = lens_overrides.get(term).copied().unwrap_or(1.0);
@@ -2018,7 +2089,10 @@ fn label_looks_auto_generated(label: &str) -> bool {
         return true;
     }
 
-    if normalized.chars().all(|ch| ch.is_ascii_digit() || ch.is_ascii_whitespace()) {
+    if normalized
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || ch.is_ascii_whitespace())
+    {
         return true;
     }
 
@@ -2053,7 +2127,9 @@ fn normalize_label_for_quality_checks(label: &str) -> String {
 }
 
 fn is_meaningful_label_candidate(candidate: &str) -> bool {
-    let trimmed = candidate.trim().trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
+    let trimmed = candidate
+        .trim()
+        .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
     if trimmed.len() < 8 {
         return false;
     }
@@ -2100,7 +2176,9 @@ fn broaden_stage1_keyword(term: &str) -> &'static [&'static str] {
         "startup" | "startups" => &["founder", "business", "venture"],
         "founder" | "venture" => &["startup", "business"],
         "rust" => &["systems", "compiler", "software", "engineering"],
-        "python" | "javascript" | "typescript" | "golang" => &["software", "programming", "engineering"],
+        "python" | "javascript" | "typescript" | "golang" => {
+            &["software", "programming", "engineering"]
+        }
         "programming" | "coding" | "code" => &["software", "engineering", "technology"],
         "software" => &["programming", "engineering", "technology"],
         "engineering" => &["software", "systems", "technology"],
@@ -2120,11 +2198,23 @@ fn broaden_stage1_keyword(term: &str) -> &'static [&'static str] {
         "science" | "research" => &["analysis", "academic"],
         "writing" | "blog" => &["content", "publishing"],
         // Mindfulness, Buddhism, Consciousness
-        "meditation" | "meditate" | "mindfulness" | "mindful" => &["consciousness", "buddhism", "awareness", "psychology", "contemplation"],
-        "buddhism" | "buddhist" | "dharma" | "vipassana" => &["meditation", "mindfulness", "consciousness", "philosophy"],
+        "meditation" | "meditate" | "mindfulness" | "mindful" => &[
+            "consciousness",
+            "buddhism",
+            "awareness",
+            "psychology",
+            "contemplation",
+        ],
+        "buddhism" | "buddhist" | "dharma" | "vipassana" => {
+            &["meditation", "mindfulness", "consciousness", "philosophy"]
+        }
         "consciousness" | "awareness" => &["meditation", "mindfulness", "philosophy", "psychology"],
-        "craving" | "attachment" | "aversion" => &["mindfulness", "psychology", "buddhism", "behavior"],
-        "contemplation" | "contemplative" => &["meditation", "mindfulness", "philosophy", "reflection"],
+        "craving" | "attachment" | "aversion" => {
+            &["mindfulness", "psychology", "buddhism", "behavior"]
+        }
+        "contemplation" | "contemplative" => {
+            &["meditation", "mindfulness", "philosophy", "reflection"]
+        }
         // Psychology, Behavior, Learning
         "reinforcement" => &["learning", "psychology", "behavior", "reward"],
         "reward" | "punishment" => &["reinforcement", "psychology", "behavior", "learning"],
@@ -2184,8 +2274,7 @@ fn derive_interest_keywords(label: &str, content: &str) -> Vec<String> {
 fn useful_single_keyword(term: &str) -> bool {
     matches!(
         term,
-        "ai"
-            | "rust"
+        "ai" | "rust"
             | "python"
             | "javascript"
             | "typescript"
@@ -2232,7 +2321,11 @@ fn extract_weighted_profile_keywords(label: &str, content: &str) -> Vec<(String,
             }
         }
     }
-    score_terms_from_text(&truncate_with_ellipsis(content.trim(), 1_600), 1.0, &mut scores);
+    score_terms_from_text(
+        &truncate_with_ellipsis(content.trim(), 1_600),
+        1.0,
+        &mut scores,
+    );
 
     let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
     ranked.sort_by(|left, right| {
@@ -2244,7 +2337,10 @@ fn extract_weighted_profile_keywords(label: &str, content: &str) -> Vec<(String,
     });
     let mut phrase_terms = Vec::new();
     let mut single_terms = Vec::new();
-    for (term, score) in ranked.into_iter().filter(|(term, _)| keyword_is_meaningful(term)) {
+    for (term, score) in ranked
+        .into_iter()
+        .filter(|(term, _)| keyword_is_meaningful(term))
+    {
         if term.split_whitespace().count() >= 2 {
             phrase_terms.push((term, score));
         } else if useful_single_keyword(&term) {
@@ -2341,7 +2437,9 @@ fn sanitize_text_for_keyword_extraction(raw: &str) -> String {
         .filter(|line| {
             let trimmed = line.trim();
             !trimmed.is_empty()
-                && !trimmed.chars().all(|ch| ch == '-' || ch == '_' || ch == '=' || ch == '*')
+                && !trimmed
+                    .chars()
+                    .all(|ch| ch == '-' || ch == '_' || ch == '=' || ch == '*')
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -2361,7 +2459,8 @@ fn score_phrases_from_text(raw: &str, weight: f32, scores: &mut HashMap<String, 
             }
             let phrase = window.join(" ");
             if keyword_is_meaningful(&phrase) {
-                *scores.entry(phrase).or_insert(0.0) += weight * if window_size == 2 { 1.35 } else { 1.6 };
+                *scores.entry(phrase).or_insert(0.0) +=
+                    weight * if window_size == 2 { 1.35 } else { 1.6 };
             }
         }
     }
@@ -2384,9 +2483,9 @@ fn keyword_is_meaningful(term: &str) -> bool {
         let token = parts[0];
         return token.chars().any(|ch| ch.is_alphabetic()) && !stopwords.contains(token);
     }
-    parts.iter().all(|part| {
-        part.chars().any(|ch| ch.is_alphabetic()) && !stopwords.contains(*part)
-    })
+    parts
+        .iter()
+        .all(|part| part.chars().any(|ch| ch.is_alphabetic()) && !stopwords.contains(*part))
 }
 
 fn load_interest_source_text(workspace_dir: &Path, source_path: &str) -> String {
@@ -2423,8 +2522,6 @@ fn ema_merge_vectors(current: &[f32], previous: &[f32]) -> Vec<f32> {
         })
         .collect()
 }
-
-
 
 #[derive(Clone)]
 struct BlueskyFeedSource {
@@ -2717,7 +2814,11 @@ impl FeedSource for BlueskySearchSource {
                     .get("record")
                     .and_then(|r| r.get("createdAt"))
                     .and_then(serde_json::Value::as_str)
-                    .or_else(|| post_json.get("indexedAt").and_then(serde_json::Value::as_str))
+                    .or_else(|| {
+                        post_json
+                            .get("indexedAt")
+                            .and_then(serde_json::Value::as_str)
+                    })
                     .unwrap_or("");
                 candidates.push(FeedCandidate {
                     protocol: FeedProtocol::Bluesky,
@@ -2760,10 +2861,7 @@ impl FeedSource for BlueskySearchSource {
 
 /// Fetch a page of public Bluesky posts matching `query` via the anonymous
 /// AppView searchPosts endpoint. No auth required — same path the frontend uses.
-async fn fetch_bluesky_search_page(
-    query: &str,
-    limit: usize,
-) -> Result<Vec<serde_json::Value>> {
+async fn fetch_bluesky_search_page(query: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
     let encoded_query = urlencoding::encode(query);
     let url = format!(
         "{base}/xrpc/app.bsky.feed.searchPosts?q={q}&limit={limit}&sort=top&lang=en",
@@ -2817,7 +2915,11 @@ impl NostrFeedSource {
         let fallback_relays = fallback_nostr_world_feed_relays(&self.config);
         let mut diagnostics = FeedProtocolDiagnostics {
             available: true,
-            scanned_count: if relay_urls.is_empty() { fallback_relays.len() } else { relay_urls.len() },
+            scanned_count: if relay_urls.is_empty() {
+                fallback_relays.len()
+            } else {
+                relay_urls.len()
+            },
             ..FeedProtocolDiagnostics::default()
         };
         let mut selected = fetch_nip66_relay_candidates(&fallback_relays, &keyword_weights)
@@ -2838,9 +2940,7 @@ impl NostrFeedSource {
 
         let mut relay_metadata = Vec::new();
         for relay_url in relay_urls {
-            let metadata = fetch_nostr_relay_metadata(&relay_url)
-                .await
-                .unwrap_or(None);
+            let metadata = fetch_nostr_relay_metadata(&relay_url).await.unwrap_or(None);
             if metadata.is_some() {
                 diagnostics.metadata_fetched_count += 1;
             }
@@ -2927,7 +3027,13 @@ impl FeedSource for NostrFeedSource {
                 continue;
             };
 
-            let events = match fetch_nostr_events(relay_url, NOSTR_RECENT_NOTE_LIMIT_PER_RELAY, &hashtags).await {
+            let events = match fetch_nostr_events(
+                relay_url,
+                NOSTR_RECENT_NOTE_LIMIT_PER_RELAY,
+                &hashtags,
+            )
+            .await
+            {
                 Ok(events) => events,
                 Err(err) => {
                     tracing::debug!(relay = relay_url, error = %err, "Failed to fetch Nostr world-feed events");
@@ -2936,7 +3042,8 @@ impl FeedSource for NostrFeedSource {
             };
 
             for event in events {
-                let rank_text = truncate_with_ellipsis(event.content.trim(), FEED_PROFILE_MAX_CHARS);
+                let rank_text =
+                    truncate_with_ellipsis(event.content.trim(), FEED_PROFILE_MAX_CHARS);
                 if rank_text.trim().is_empty() {
                     continue;
                 }
@@ -2944,8 +3051,9 @@ impl FeedSource for NostrFeedSource {
                 if !seen.insert(dedupe_key.clone()) {
                     continue;
                 }
-                let relay_domain = resolve_feed_web_domain(&nostr_relay_http_url(relay_url).unwrap_or_default())
-                    .unwrap_or_else(|| relay_url.to_string());
+                let relay_domain =
+                    resolve_feed_web_domain(&nostr_relay_http_url(relay_url).unwrap_or_default())
+                        .unwrap_or_else(|| relay_url.to_string());
                 let author = event
                     .pubkey
                     .to_bech32()
@@ -2954,30 +3062,32 @@ impl FeedSource for NostrFeedSource {
                 // Kind 30023 (NIP-23 long-form article): extract title/summary/
                 // image from tags and deeplink to habla.news. Kind 1 (text note):
                 // derive a label from content and deeplink to njump.
-                let (permalink, title, description, image_url, published_at) = if is_long_form_article(&event) {
-                    let article_title = nostr_tag_value(&event, "title")
-                        .unwrap_or_else(|| derive_interest_label("Nostr article", &event.content));
-                    let summary = nostr_tag_value(&event, "summary")
-                        .unwrap_or_else(|| truncate_with_ellipsis(event.content.trim(), 220));
-                    let image = nostr_tag_value(&event, "image");
-                    let published = nostr_tag_value(&event, "published_at")
-                        .unwrap_or_else(|| nostr_timestamp_to_rfc3339(event.created_at));
-                    (
-                        nostr_article_permalink(&event),
-                        article_title,
-                        summary,
-                        image,
-                        published,
-                    )
-                } else {
-                    (
-                        nostr_event_permalink(&event),
-                        derive_interest_label("Nostr note", &event.content),
-                        truncate_with_ellipsis(event.content.trim(), 220),
-                        None,
-                        nostr_timestamp_to_rfc3339(event.created_at),
-                    )
-                };
+                let (permalink, title, description, image_url, published_at) =
+                    if is_long_form_article(&event) {
+                        let article_title = nostr_tag_value(&event, "title").unwrap_or_else(|| {
+                            derive_interest_label("Nostr article", &event.content)
+                        });
+                        let summary = nostr_tag_value(&event, "summary")
+                            .unwrap_or_else(|| truncate_with_ellipsis(event.content.trim(), 220));
+                        let image = nostr_tag_value(&event, "image");
+                        let published = nostr_tag_value(&event, "published_at")
+                            .unwrap_or_else(|| nostr_timestamp_to_rfc3339(event.created_at));
+                        (
+                            nostr_article_permalink(&event),
+                            article_title,
+                            summary,
+                            image,
+                            published,
+                        )
+                    } else {
+                        (
+                            nostr_event_permalink(&event),
+                            derive_interest_label("Nostr note", &event.content),
+                            truncate_with_ellipsis(event.content.trim(), 220),
+                            None,
+                            nostr_timestamp_to_rfc3339(event.created_at),
+                        )
+                    };
 
                 matched.push(FeedCandidate {
                     protocol: FeedProtocol::Nostr,
@@ -3154,11 +3264,16 @@ impl FeedSource for RssFeedSource {
             .collect();
         let mut per_source_counts: HashMap<String, usize> = HashMap::new();
         let mut candidates = Vec::new();
-        for item in local_store::list_recent_content_items(&self.config.workspace_dir, RSS_RECENT_SCAN_LIMIT)? {
+        for item in local_store::list_recent_content_items(
+            &self.config.workspace_dir,
+            RSS_RECENT_SCAN_LIMIT,
+        )? {
             let Some(selected) = selected_keys.get(&item.source_key) else {
                 continue;
             };
-            let count = per_source_counts.entry(item.source_key.clone()).or_insert(0);
+            let count = per_source_counts
+                .entry(item.source_key.clone())
+                .or_insert(0);
             if *count >= RSS_CANDIDATE_PER_SOURCE_LIMIT {
                 continue;
             }
@@ -3390,12 +3505,8 @@ async fn ensure_catalog_metadata_embeddings(
         let (description, topics_csv) = enrich_feed_source_metadata(&source);
         let needs_embedding = source.metadata_embedding.is_empty();
         if needs_embedding {
-            let metadata_text = catalog_metadata_text(
-                &source.title,
-                &source.domain,
-                &description,
-                &topics_csv,
-            );
+            let metadata_text =
+                catalog_metadata_text(&source.title, &source.domain, &description, &topics_csv);
             texts.push(metadata_text);
         }
         updates.push((source, description, topics_csv, needs_embedding));
@@ -3434,7 +3545,8 @@ async fn ensure_catalog_metadata_embeddings(
 
 fn seed_default_feed_web_sources(workspace_dir: &Path) -> Result<()> {
     for source in DEFAULT_FEED_WEB_SOURCES {
-        let (description, topics_csv) = infer_default_feed_source_metadata(source.domain, source.title);
+        let (description, topics_csv) =
+            infer_default_feed_source_metadata(source.domain, source.title);
         let _ = local_store::upsert_feed_web_source(
             workspace_dir,
             &local_store::FeedWebSourceUpsert {
@@ -3498,19 +3610,25 @@ fn infer_default_feed_source_metadata(domain: &str, title: &str) -> (String, Str
     if combined.contains("web") || combined.contains("react") || combined.contains("javascript") {
         topics.extend(["web", "frontend", "programming"]);
     }
-    if combined.contains("econom") || combined.contains("policy") || combined.contains("construction") {
+    if combined.contains("econom")
+        || combined.contains("policy")
+        || combined.contains("construction")
+    {
         topics.extend(["policy", "analysis"]);
     }
     if combined.contains("science") || combined.contains("physics") || combined.contains("math") {
         topics.extend(["science", "research"]);
     }
-    if combined.contains("startup") || combined.contains("venture") || combined.contains("founder") {
+    if combined.contains("startup") || combined.contains("venture") || combined.contains("founder")
+    {
         topics.extend(["startup", "business", "founder"]);
     }
-    if combined.contains("open") || combined.contains("protocol") || combined.contains("decentrali") {
+    if combined.contains("open") || combined.contains("protocol") || combined.contains("decentrali")
+    {
         topics.extend(["protocol", "decentralized", "open-source"]);
     }
-    if combined.contains("data") || combined.contains("database") || combined.contains("analytics") {
+    if combined.contains("data") || combined.contains("database") || combined.contains("analytics")
+    {
         topics.extend(["data", "engineering", "analytics"]);
     }
     if combined.contains("hardware") || combined.contains("embedded") || combined.contains("gpio") {
@@ -3524,7 +3642,13 @@ fn infer_default_feed_source_metadata(domain: &str, title: &str) -> (String, Str
         || combined.contains("vipassana")
         || combined.contains("contemplat")
     {
-        topics.extend(["mindfulness", "meditation", "consciousness", "philosophy", "psychology"]);
+        topics.extend([
+            "mindfulness",
+            "meditation",
+            "consciousness",
+            "philosophy",
+            "psychology",
+        ]);
     }
     if combined.contains("psycholog")
         || combined.contains("psyche")
@@ -3542,11 +3666,15 @@ fn infer_default_feed_source_metadata(domain: &str, title: &str) -> (String, Str
     {
         topics.extend(["philosophy", "ideas", "consciousness", "thinking"]);
     }
-    if combined.contains("tricycle")
-        || combined.contains("lionsroar")
-        || combined.contains("lion")
+    if combined.contains("tricycle") || combined.contains("lionsroar") || combined.contains("lion")
     {
-        topics.extend(["buddhism", "meditation", "mindfulness", "consciousness", "philosophy"]);
+        topics.extend([
+            "buddhism",
+            "meditation",
+            "mindfulness",
+            "consciousness",
+            "philosophy",
+        ]);
     }
     if combined.contains("productiv")
         || combined.contains("nesslabs")
@@ -3574,12 +3702,23 @@ fn infer_default_feed_source_metadata(domain: &str, title: &str) -> (String, Str
         topics.extend(["economics", "policy", "ideas", "innovation"]);
     }
     if combined.contains("farnam") || combined.contains("fs.blog") {
-        topics.extend(["mental-models", "decision-making", "philosophy", "psychology"]);
+        topics.extend([
+            "mental-models",
+            "decision-making",
+            "philosophy",
+            "psychology",
+        ]);
     }
     // Hacker News: front-page aggregation spanning startups, tech, science.
     if combined.contains("ycombinator") || combined.contains("hacker news") {
         topics.extend([
-            "startup", "technology", "news", "engineering", "founder", "ai", "science",
+            "startup",
+            "technology",
+            "news",
+            "engineering",
+            "founder",
+            "ai",
+            "science",
         ]);
     }
     // YouTube channel feeds: video-format education/media across tech + science.
@@ -3615,10 +3754,11 @@ fn sync_content_sources_from_selected_sources(
     workspace_dir: &Path,
     selected_sources: &[SelectedSource],
 ) -> Result<()> {
-    let source_map: HashMap<String, local_store::FeedWebSourceRecord> = local_store::list_feed_web_sources(workspace_dir)?
-        .into_iter()
-        .map(|source| (source.xml_url.clone(), source))
-        .collect();
+    let source_map: HashMap<String, local_store::FeedWebSourceRecord> =
+        local_store::list_feed_web_sources(workspace_dir)?
+            .into_iter()
+            .map(|source| (source.xml_url.clone(), source))
+            .collect();
 
     for selected in selected_sources {
         let Some(source) = source_map.get(&selected.key) else {
@@ -3656,7 +3796,8 @@ async fn refresh_selected_content_sources(
         match fetch_remote_feed(&source).await {
             Ok(result) => {
                 if !result.not_modified {
-                    upsert_feed_entries(workspace_dir, &source, result.entries, &fetched_at).await?;
+                    upsert_feed_entries(workspace_dir, &source, result.entries, &fetched_at)
+                        .await?;
                 }
                 local_store::update_content_source_fetch(
                     workspace_dir,
@@ -3730,7 +3871,11 @@ async fn upsert_feed_entries(
 fn content_source_is_stale(last_fetch_at: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(last_fetch_at.trim())
         .ok()
-        .map(|value| Utc::now().signed_duration_since(value.with_timezone(&Utc)).num_seconds())
+        .map(|value| {
+            Utc::now()
+                .signed_duration_since(value.with_timezone(&Utc))
+                .num_seconds()
+        })
         .map(|age| age < 0 || age > RSS_CONTENT_REFRESH_TTL_SECS)
         .unwrap_or(true)
 }
@@ -3742,7 +3887,9 @@ struct RemoteFeedFetchResult {
     not_modified: bool,
 }
 
-async fn fetch_remote_feed(source: &local_store::ContentSourceRecord) -> Result<RemoteFeedFetchResult> {
+async fn fetch_remote_feed(
+    source: &local_store::ContentSourceRecord,
+) -> Result<RemoteFeedFetchResult> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(RSS_CONTENT_FETCH_TIMEOUT_SECS))
         .build()?;
@@ -3751,7 +3898,10 @@ async fn fetch_remote_feed(source: &local_store::ContentSourceRecord) -> Result<
         request = request.header(reqwest::header::IF_NONE_MATCH, source.etag.trim());
     }
     if !source.last_modified.trim().is_empty() {
-        request = request.header(reqwest::header::IF_MODIFIED_SINCE, source.last_modified.trim());
+        request = request.header(
+            reqwest::header::IF_MODIFIED_SINCE,
+            source.last_modified.trim(),
+        );
     }
 
     let response = request
@@ -3781,7 +3931,10 @@ async fn fetch_remote_feed(source: &local_store::ContentSourceRecord) -> Result<
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Feed fetch failed for {} ({status}): {body}", source.xml_url);
+        anyhow::bail!(
+            "Feed fetch failed for {} ({status}): {body}",
+            source.xml_url
+        );
     }
 
     let body = response.bytes().await?;
@@ -3910,7 +4063,10 @@ fn append_unique_bluesky_sources(
     target: &mut Vec<BlueskyCandidateSource>,
     extra: Vec<BlueskyCandidateSource>,
 ) {
-    let mut seen: HashSet<String> = target.iter().map(BlueskyCandidateSource::endpoint_key).collect();
+    let mut seen: HashSet<String> = target
+        .iter()
+        .map(BlueskyCandidateSource::endpoint_key)
+        .collect();
     for source in extra {
         if seen.insert(source.endpoint_key()) {
             target.push(source);
@@ -3988,9 +4144,9 @@ fn build_bluesky_feed_endpoint(
     let trimmed_service = service_url.trim().trim_end_matches('/');
     let normalized_limit = limit.clamp(1, BLUESKY_TIMELINE_LIMIT_MAX);
     let mut url = match &source.endpoint {
-        BlueskyCandidateSourceEndpoint::HomeTimeline => format!(
-            "{trimmed_service}/xrpc/app.bsky.feed.getTimeline?limit={normalized_limit}"
-        ),
+        BlueskyCandidateSourceEndpoint::HomeTimeline => {
+            format!("{trimmed_service}/xrpc/app.bsky.feed.getTimeline?limit={normalized_limit}")
+        }
         BlueskyCandidateSourceEndpoint::FeedGenerator { uri } => format!(
             "{trimmed_service}/xrpc/app.bsky.feed.getFeed?feed={}&limit={normalized_limit}",
             urlencoding::encode(uri)
@@ -4140,7 +4296,10 @@ async fn fetch_bluesky_candidate_page(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Bluesky {} feed request failed ({status}): {body}", source.label);
+        anyhow::bail!(
+            "Bluesky {} feed request failed ({status}): {body}",
+            source.label
+        );
     }
 
     let json: serde_json::Value = response
@@ -4197,13 +4356,19 @@ async fn fetch_bluesky_fallback_candidates(
 }
 
 fn xml_block_regex(tag: &str) -> Regex {
-    Regex::new(&format!(r"(?is)<{tag}\b[^>]*>(.*?)</{tag}>", tag = regex::escape(tag)))
-        .expect("valid XML block regex")
+    Regex::new(&format!(
+        r"(?is)<{tag}\b[^>]*>(.*?)</{tag}>",
+        tag = regex::escape(tag)
+    ))
+    .expect("valid XML block regex")
 }
 
 fn xml_tag_regex(tag: &str) -> Regex {
-    Regex::new(&format!(r"(?is)<{tag}\b[^>]*>(.*?)</{tag}>", tag = regex::escape(tag)))
-        .expect("valid XML tag regex")
+    Regex::new(&format!(
+        r"(?is)<{tag}\b[^>]*>(.*?)</{tag}>",
+        tag = regex::escape(tag)
+    ))
+    .expect("valid XML tag regex")
 }
 
 fn xml_link_regex() -> &'static Regex {
@@ -4259,9 +4424,7 @@ fn sanitize_feed_text(raw: &str) -> String {
     // block (it sees the whole thing as one "tag" from `<` to `>`), eating
     // the content inside — including titles. This is why HN items (which use
     // CDATA for titles) showed URLs instead of headlines.
-    let without_cdata = raw
-        .replace("<![CDATA[", "")
-        .replace("]]>", "");
+    let without_cdata = raw.replace("<![CDATA[", "").replace("]]>", "");
     let without_breaks = html_break_regex().replace_all(&without_cdata, "\n");
     let with_paragraphs = html_paragraph_regex().replace_all(&without_breaks, "\n");
     let without_tags = html_tag_regex().replace_all(&with_paragraphs, " ");
@@ -4383,7 +4546,8 @@ fn parse_atom_feed_entries(xml: &str, base_url: &str) -> Vec<ParsedFeedEntry> {
     for capture in xml_block_regex("entry").captures_iter(xml) {
         let fragment = capture.get(1).map(|value| value.as_str()).unwrap_or("");
         let title = extract_xml_tag_text(fragment, &["title"]).unwrap_or_default();
-        let canonical_url = extract_atom_link(fragment, base_url).unwrap_or_else(|| base_url.to_string());
+        let canonical_url =
+            extract_atom_link(fragment, base_url).unwrap_or_else(|| base_url.to_string());
         let summary = extract_xml_tag_text(fragment, &["summary"]).unwrap_or_default();
         let content_text = extract_xml_tag_text(fragment, &["content", "summary"])
             .unwrap_or_else(|| summary.clone());
@@ -4452,14 +4616,12 @@ mod tests {
     fn make_nostr_event(kind: u16, content: &str, tags: &[&[&str]]) -> NostrEvent {
         use nostr_sdk::prelude::{EventId, PublicKey, Signature, Tags};
         use std::str::FromStr;
-        let id = EventId::from_hex(
-            "aa0000000000000000000000000000000000000000000000000000000000aa01",
-        )
-        .expect("id");
-        let pubkey = PublicKey::from_hex(
-            "3bf0c63fcb93463407af97ef5c6b13c30171b02d6b1fe9e9c1e4b4b4b4b4b4b4",
-        )
-        .expect("pubkey");
+        let id =
+            EventId::from_hex("aa0000000000000000000000000000000000000000000000000000000000aa01")
+                .expect("id");
+        let pubkey =
+            PublicKey::from_hex("3bf0c63fcb93463407af97ef5c6b13c30171b02d6b1fe9e9c1e4b4b4b4b4b4b4")
+                .expect("pubkey");
         let parsed_tags: Vec<Vec<String>> = tags
             .iter()
             .map(|parts| parts.iter().map(|s| (*s).to_string()).collect())
@@ -4506,7 +4668,10 @@ mod tests {
             nostr_tag_value(&event, "image").as_deref(),
             Some("https://example.com/cover.png")
         );
-        assert_eq!(nostr_tag_value(&event, "d").as_deref(), Some("local-first-essay"));
+        assert_eq!(
+            nostr_tag_value(&event, "d").as_deref(),
+            Some("local-first-essay")
+        );
         // Absent tag returns None.
         assert!(nostr_tag_value(&event, "nonexistent").is_none());
     }
@@ -4588,8 +4753,14 @@ mod tests {
         // reads must be present and correct.
         let preview = item.web_preview.as_ref().expect("web_preview");
         assert_eq!(preview.title, "On Local-First Computing");
-        assert_eq!(preview.description, "Why your data should live on your device");
-        assert_eq!(preview.image_url.as_deref(), Some("https://example.com/cover.png"));
+        assert_eq!(
+            preview.description,
+            "Why your data should live on your device"
+        );
+        assert_eq!(
+            preview.image_url.as_deref(),
+            Some("https://example.com/cover.png")
+        );
         assert!(preview.url.starts_with("https://habla.news/a/naddr1"));
         assert_eq!(item.source_type, "web");
     }
@@ -4679,15 +4850,22 @@ mod tests {
         // The feed_item JSON must carry author + counts for frontend rendering.
         assert_eq!(item.source_type, "bluesky");
         assert_eq!(
-            item.feed_item.get("author").and_then(|a| a.get("handle")).and_then(serde_json::Value::as_str),
+            item.feed_item
+                .get("author")
+                .and_then(|a| a.get("handle"))
+                .and_then(serde_json::Value::as_str),
             Some("user.bsky.social")
         );
         assert_eq!(
-            item.feed_item.get("replyCount").and_then(serde_json::Value::as_u64),
+            item.feed_item
+                .get("replyCount")
+                .and_then(serde_json::Value::as_u64),
             Some(12)
         );
         assert_eq!(
-            item.feed_item.get("likeCount").and_then(serde_json::Value::as_u64),
+            item.feed_item
+                .get("likeCount")
+                .and_then(serde_json::Value::as_u64),
             Some(42)
         );
         // The preview must carry the post text for ranking + rendering.
@@ -5001,21 +5179,26 @@ mod tests {
 
         assert!(!ranked.is_empty());
         assert_eq!(ranked[0].label, "Systems");
-        assert!(ranked.iter().all(|item| item.stage1_score < RSS_SOURCE_MATCH_THRESHOLD));
+        assert!(ranked
+            .iter()
+            .all(|item| item.stage1_score < RSS_SOURCE_MATCH_THRESHOLD));
     }
 
     #[test]
     fn bluesky_source_fallback_includes_home_timeline() {
         let mut sources = Vec::new();
+        append_unique_bluesky_sources(&mut sources, vec![BlueskyCandidateSource::home_timeline()]);
         append_unique_bluesky_sources(
             &mut sources,
-            vec![BlueskyCandidateSource::home_timeline()],
+            vec![
+                BlueskyCandidateSource::home_timeline(),
+                BlueskyCandidateSource::discover_fallback(),
+            ],
         );
-        append_unique_bluesky_sources(
-            &mut sources,
-            vec![BlueskyCandidateSource::home_timeline(), BlueskyCandidateSource::discover_fallback()],
-        );
-        assert!(sources.iter().any(|source| matches!(source.endpoint, BlueskyCandidateSourceEndpoint::HomeTimeline)));
+        assert!(sources.iter().any(|source| matches!(
+            source.endpoint,
+            BlueskyCandidateSourceEndpoint::HomeTimeline
+        )));
     }
 
     #[test]
@@ -5103,8 +5286,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].feed_item.get("url").and_then(serde_json::Value::as_str), Some("https://example.com/a"));
-        assert_eq!(items[1].feed_item.get("url").and_then(serde_json::Value::as_str), Some("https://example.com/b"));
+        assert_eq!(
+            items[0]
+                .feed_item
+                .get("url")
+                .and_then(serde_json::Value::as_str),
+            Some("https://example.com/a")
+        );
+        assert_eq!(
+            items[1]
+                .feed_item
+                .get("url")
+                .and_then(serde_json::Value::as_str),
+            Some("https://example.com/b")
+        );
     }
 
     #[tokio::test]
@@ -5152,7 +5347,10 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("https://example.com/best-effort")
         );
-        assert_eq!(items[0].matched_interest_label.as_deref(), Some("Rust systems"));
+        assert_eq!(
+            items[0].matched_interest_label.as_deref(),
+            Some("Rust systems")
+        );
         assert_eq!(items[0].passed_threshold, false);
         assert!(items[0].score.unwrap_or_default() > 0.0);
     }
@@ -5238,7 +5436,9 @@ mod tests {
             "A strong AI workflow does most of the production in the background and returns only the minimal questions that need human judgment.",
         );
         assert!(keywords.iter().any(|term| term.contains("workflow")));
-        assert!(keywords.iter().any(|term| term.contains("human judgment") || term.contains("judgment")));
+        assert!(keywords
+            .iter()
+            .any(|term| term.contains("human judgment") || term.contains("judgment")));
         assert!(!keywords.iter().any(|term| term.contains("20260314")));
         assert!(!keywords.iter().any(|term| term == "insight"));
     }
@@ -5275,7 +5475,11 @@ mod tests {
         let profile = rebuild_interest_profile(&test_config(workspace.path()))
             .await
             .unwrap();
-        let labels: Vec<String> = profile.interests.iter().map(|item| item.label.clone()).collect();
+        let labels: Vec<String> = profile
+            .interests
+            .iter()
+            .map(|item| item.label.clone())
+            .collect();
 
         assert!(labels.iter().any(|term| term == "local first"));
         assert!(labels.iter().any(|term| term == "video workflow"));
