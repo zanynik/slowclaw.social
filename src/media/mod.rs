@@ -378,7 +378,8 @@ impl ContentMediaBackend for CommandContentMediaBackend {
         self.ensure_parent_dir(&output_abs)?;
         self.run_command(
             "ffmpeg",
-            &["-y".to_string(),
+            &[
+                "-y".to_string(),
                 "-i".to_string(),
                 input_abs.to_string_lossy().to_string(),
                 "-af".to_string(),
@@ -387,7 +388,8 @@ impl ContentMediaBackend for CommandContentMediaBackend {
                 "48000".to_string(),
                 "-ac".to_string(),
                 "1".to_string(),
-                output_abs.to_string_lossy().to_string()],
+                output_abs.to_string_lossy().to_string(),
+            ],
         )
         .await?;
         Ok(AudioTransformResult {

@@ -113,7 +113,11 @@ pub fn all_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio.
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments, clippy::used_underscore_binding)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::used_underscore_binding
+)]
 pub fn all_tools_with_runtime(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,

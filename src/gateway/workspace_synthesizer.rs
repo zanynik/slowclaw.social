@@ -155,7 +155,6 @@ pub enum WorkspaceSynthSkillHandlerKind {
     DirectMediaOutput,
 }
 
-
 #[derive(Debug, Clone, Copy)]
 pub struct WorkspaceSynthSkillSpec {
     pub key: &'static str,

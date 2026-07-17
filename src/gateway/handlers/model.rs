@@ -14,7 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::gateway::state::{LocalModelDownloadJob, LocalModelRuntimeState, LocalModelRuntimeSnapshot, AppState};
+use crate::gateway::state::{
+    AppState, LocalModelDownloadJob, LocalModelRuntimeSnapshot, LocalModelRuntimeState,
+};
 use crate::gateway::{
     frontend_error_response, frontend_internal_error_response, pairing_auth_error,
     reset_workspace_synthesizer_status_for_provider_change,

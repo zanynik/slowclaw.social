@@ -3020,7 +3020,8 @@ fn workspace_synth_skill_run_state_timed(
     started_at: chrono::DateTime<Utc>,
     finished_at: chrono::DateTime<Utc>,
 ) -> workspace_synthesizer::WorkspaceSynthSkillRunState {
-    let duration_ms = u64::try_from((finished_at - started_at).num_milliseconds().max(0)).unwrap_or(0);
+    let duration_ms =
+        u64::try_from((finished_at - started_at).num_milliseconds().max(0)).unwrap_or(0);
     workspace_synthesizer::WorkspaceSynthSkillRunState {
         skill_key: skill.key.clone(),
         name: skill.name.clone(),
@@ -8820,10 +8821,12 @@ async fn handle_library_delete(
         if let Some(legacy_caption_abs) =
             resolve_workspace_text_path(&workspace_dir, &legacy_caption_rel)
         {
-            if legacy_caption_abs.exists() && legacy_caption_abs.is_file()
-                && tokio::fs::remove_file(&legacy_caption_abs).await.is_ok() {
-                    removed_related.push(legacy_caption_rel);
-                }
+            if legacy_caption_abs.exists()
+                && legacy_caption_abs.is_file()
+                && tokio::fs::remove_file(&legacy_caption_abs).await.is_ok()
+            {
+                removed_related.push(legacy_caption_rel);
+            }
         }
     }
 
@@ -9892,9 +9895,9 @@ fn collect_library_items_recursive(
                 || rel_lower.ends_with(".srt")
                 || rel_lower.ends_with(".json")
                 || rel_lower.ends_with(".caption.txt"))
-            {
-                continue;
-            }
+        {
+            continue;
+        }
 
         let modified_at = meta
             .modified()
