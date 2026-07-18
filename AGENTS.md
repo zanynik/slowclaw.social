@@ -46,10 +46,9 @@ The workspace lets a single user:
 These are intentional legacy names carried over from the fork. Renaming any of them is a **separate, tracked migration** with its own blast radius — never bundle a rename into an unrelated change:
 
 - Environment variable prefix: `ZEROCLAW_*` (e.g. `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_WORKSPACE`, `ZEROCLAW_GATEWAY_TOKEN`, `ZEROCLAW_ALLOW_TEMP_WORKSPACE`, `ZEROCLAW_LEGACY_POCKETBASE_DATA_DIR`). These are public API (§2.4); a future migration will add `SLOWCLAW_*` aliases with a dual-read shim.
-- Launchd/systemd service label `com.zeroclaw.daemon` (`src/service/mod.rs`) — renaming orphans already-installed daemons; kept until an uninstall-migration step exists.
 - The on-disk config dir `~/.zeroclaw` is supported as a **backward-compat fallback**: fresh installs and any dir created by this codebase use `~/.slowclaw`, but existing installs that still have `~/.zeroclaw` continue to resolve there (see `config::schema::home_data_dir`). Do not remove the fallback until a release has shipped that migrates data off the legacy path.
 
-> **Migration note (mostly complete):** the crate *library* name, `zeroclaw::` module paths, the `zeroclaw-local-smoke` docker tag, docker container/volume names, repo URLs, CI/release artifact names, the Python package, and the `~/.slowclaw` config-dir default have all been renamed to SlowClaw. The remaining legacy surface is the `ZEROCLAW_*` env-var prefix and the items above. The `.md` docs-content rename ("ZeroClaw" → "SlowClaw" across docs/READMEs + locale mirrors) is a separate tracked migration (§4.1).
+> **Migration note (mostly complete):** the crate *library* name, `zeroclaw::` module paths, the `zeroclaw-local-smoke` docker tag, docker container/volume names, repo URLs, CI/release artifact names, the Python package, the `~/.slowclaw` config-dir default, and the daemon service subsystem (system user/group, `/etc/slowclaw`, `/var/log/slowclaw`, service unit names, `com.slowclaw.daemon` label) have all been renamed to SlowClaw. The remaining legacy surface is the `ZEROCLAW_*` env-var prefix and the `~/.zeroclaw` fallback above. **Operators upgrading from a pre-rename daemon install must uninstall the old `zeroclaw` service/user before installing the new `slowclaw` one** (the new code will not manage the old service). The `.md` docs-content rename ("ZeroClaw" → "SlowClaw" across docs/READMEs + locale mirrors) is a separate tracked migration (§4.1).
 
 ### Product direction (merge gate)
 
@@ -245,7 +244,7 @@ Apply unless a subsystem has a stronger existing pattern.
 - Trait implementer naming: `<Name>Provider`, `<Name>Memory`, `<Name>Tool`; UI components `XView` / `XCard` / `XButton`.
 - Factory registration keys: stable, lowercase, user-facing (e.g. `"openai"`, `"bluesky"`, `"shell"`); avoid alias sprawl without migration need.
 - Tests named by behavior/outcome (`<subject>_<expected_behavior>`).
-- **Legacy exception (not a violation):** the `ZEROCLAW_*` env-var prefix, the `com.zeroclaw.daemon` service label, and the `~/.zeroclaw` on-disk config-dir fallback are intentional legacy (see §1). Renaming them is a separate tracked migration. (The crate library name, module paths, and docker tags were already renamed to SlowClaw.)
+- **Legacy exception (not a violation):** the `ZEROCLAW_*` env-var prefix and the `~/.zeroclaw` on-disk config-dir fallback are intentional legacy (see §1). Renaming them is a separate tracked migration. (The crate library name, module paths, docker tags, repo URLs, daemon service subsystem, and Python package were already renamed to SlowClaw.)
 - If identity-like naming is required in tests/examples, use **SlowClaw-native labels only** (`SlowClawAgent`, `slowclaw_user`).
 
 ### 6.4 Architecture Boundary Contract (Required)
@@ -432,7 +431,7 @@ Keep one blank line between sections, exactly one blank line before trailers, ea
 - Do not silently weaken security policy, file-access scope, or signing/entitlement boundaries.
 - Do not re-introduce removed surfaces (external chat channels, dashboard REST/SSE/WebSocket API, configurable extra file roots).
 - Do not add speculative config/env-var/feature flags "just in case".
-- Do not opportunistically rename legacy identifiers (`ZEROCLAW_*` env vars, `com.zeroclaw.daemon` service label, the `~/.zeroclaw` fallback) outside their dedicated migration.
+- Do not opportunistically rename legacy identifiers (`ZEROCLAW_*` env vars, the `~/.zeroclaw` fallback) outside their dedicated migration.
 - Do not mix massive formatting-only changes with functional changes.
 - Do not modify unrelated modules "while here".
 - Do not bypass failing checks without explicit explanation.
