@@ -164,24 +164,190 @@ public func slowclaw_transcribe_audio(
         return -1
     }
 
-    // 4. Build the URL-backed recognition request and force on-device decoding.
-    let request = SFSpeechURLRecognitionRequest(url: fileURL)
+    // 4. Decide whether to transcribe the file whole or in segments.
+    //
+    // On-device SFSpeechRecognizer has a hard ~60-second limit per recognition
+    // task on iOS < 26: a single SFSpeechURLRecognitionRequest for audio longer
+    // than that can be truncated (the recognizer stops committing segments past
+    // the cap). This was the root cause of "only the audio after the 1-minute
+    // mark is transcribed" for ~1:06 recordings. Fix: when the file's duration
+    // exceeds SEGMENT_SECONDS, split it into <SEGMENT_SECONDS segments and run a
+    // separate recognition task per segment, concatenating the finals. Shorter
+    // audio takes the original single-request path (no behavior change).
+    let wholeDurationSeconds = audioDurationSeconds(fileURL)
+    let segmentURLs: [URL]
+    let tempSegmentDir: URL?
+    if wholeDurationSeconds > Double(SEGMENT_SECONDS) {
+        let segments = splitAudioIntoSegments(fileURL, maxSeconds: SEGMENT_SECONDS)
+        if segments.isEmpty {
+            // Segmentation failed (decode error) — fall back to the whole file.
+            segmentURLs = [fileURL]
+            tempSegmentDir = nil
+        } else {
+            segmentURLs = segments
+            // Derive the parent session dir from the first segment for cleanup.
+            tempSegmentDir = segments.first?.deletingLastPathComponent()
+        }
+    } else {
+        segmentURLs = [fileURL]
+        tempSegmentDir = nil
+    }
+    // Always clean up the temp segment dir, even on early-return error paths.
+    defer {
+        if let dir = tempSegmentDir {
+            try? FileManager.default.removeItem(at: dir)
+        }
+    }
+
+    // 5. Transcribe each segment and concatenate. `recognizeSingleSegment`
+    // encapsulates the segment-accumulation + debounced settle logic (one final
+    // per segment, appended) and a per-segment timeout. The total work is
+    // bounded by SEGMENT_SECONDS per segment plus recognition overhead.
+    var transcriptParts: [String] = []
+    for segmentURL in segmentURLs {
+        let outcome = recognizeSingleSegment(at: segmentURL, with: activeRecognizer)
+        switch outcome {
+        case let .text(text):
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { transcriptParts.append(trimmed) }
+        case let .error(error):
+            let nsError = error as NSError
+            writeError("SFSpeechRecognizer error: \(nsError.localizedDescription) (domain=\(nsError.domain), code=\(nsError.code))")
+            return -1
+        case .noSpeech:
+            // Silent segment: skip without failing the whole transcript so a
+            // quiet stretch mid-recording doesn't abort a valid capture.
+            continue
+        case .timedOut:
+            writeError("Speech recognition timed out after \(SINGLE_SEGMENT_TIMEOUT_SECONDS) seconds.")
+            return -1
+        }
+    }
+
+    guard !transcriptParts.isEmpty else {
+        writeError("Speech recognition produced no transcript (silent audio or unrecognized speech).")
+        return -1
+    }
+
+    return writeText(transcriptParts.joined(separator: " "))
+}
+
+// MARK: - Legacy SFSpeechRecognizer segment helpers
+
+/// Per-segment audio length in seconds. The on-device recognizer's hard ~60s
+/// per-task cap sits a little above this, so segments stay safely under it with
+/// headroom for the recognizer's own buffering.
+private let SEGMENT_SECONDS: TimeInterval = 50
+/// Per-segment recognition timeout. Well above the segment length plus
+/// realistic recognition overhead; bounded so a stuck recognizer can't wedge
+/// the command thread on a single segment.
+private let SINGLE_SEGMENT_TIMEOUT_SECONDS: Int = 180
+
+/// Outcome of recognizing a single audio segment.
+private enum SegmentOutcome {
+    case text(String)
+    case noSpeech
+    case error(Error)
+    case timedOut
+}
+
+/// Read the playback duration of an audio file in seconds. Returns 0 if the
+/// duration cannot be determined (the caller then takes the single-file path).
+/// Uses the synchronous AVAsset APIs (still functional on iOS 16+, just
+/// deprecated) because this bridge runs on iOS < 26 too and the one-shot read
+/// is bounded by the file size.
+private func audioDurationSeconds(_ url: URL) -> TimeInterval {
+    let asset = AVURLAsset(url: url)
+    if let track = asset.tracks(withMediaType: .audio).first {
+        let duration = track.timeRange.duration
+        if duration.isValid, !duration.isIndefinite {
+            return CMTimeGetSeconds(duration)
+        }
+    }
+    let duration = asset.duration
+    if duration.isValid, !duration.isIndefinite {
+        return CMTimeGetSeconds(duration)
+    }
+    return 0
+}
+
+/// Split an audio file into ≤`maxSeconds` segments written as temporary
+/// `.caf` files in the system temp dir. Uses AVAudioFile + AVAudioPCMBuffer to
+/// read bounded frame ranges and write them to self-contained CAF containers
+/// that SFSpeechURLRecognitionRequest accepts. Returns the temp URLs in order,
+/// or `[]` if the source could not be opened. The caller owns cleanup.
+private func splitAudioIntoSegments(_ sourceURL: URL, maxSeconds: TimeInterval) -> [URL] {
+    let audioFile: AVAudioFile
+    do {
+        audioFile = try AVAudioFile(forReading: sourceURL)
+    } catch {
+        return []
+    }
+    let processingFormat = audioFile.processingFormat
+    let totalFrames = AVAudioFramePosition(audioFile.length)
+    guard totalFrames > 0 else { return [] }
+    let sampleRate = processingFormat.sampleRate
+    let framesPerSegment = AVAudioFramePosition(maxSeconds * sampleRate)
+    guard framesPerSegment > 0 else { return [] }
+    let segmentCount = Int((totalFrames + framesPerSegment - 1) / framesPerSegment)
+
+    let sessionDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("slowclaw-transcribe-\(UUID().uuidString)", isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+    } catch {
+        return []
+    }
+
+    var segmentURLs: [URL] = []
+    var startFrame: AVAudioFramePosition = 0
+    for index in 0..<segmentCount {
+        let remaining = totalFrames - startFrame
+        let chunkFrames = AVAudioFrameCount(min(framesPerSegment, remaining))
+        guard chunkFrames > 0 else { break }
+        guard let readBuffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: chunkFrames) else { break }
+        do {
+            audioFile.framePosition = startFrame
+            try audioFile.read(into: readBuffer, frameCount: chunkFrames)
+        } catch {
+            break
+        }
+        let segmentURL = sessionDir.appendingPathComponent("segment-\(index).caf")
+        do {
+            // Write as CAF in the processing format — lossless and reliably
+            // accepted by SFSpeechURLRecognitionRequest.
+            let outFile = try AVAudioFile(
+                forWriting: segmentURL,
+                settings: processingFormat.settings,
+                commonFormat: processingFormat.commonFormat,
+                interleaved: processingFormat.isInterleaved
+            )
+            try outFile.write(from: readBuffer)
+        } catch {
+            break
+        }
+        segmentURLs.append(segmentURL)
+        startFrame += AVAudioFramePosition(chunkFrames)
+    }
+    return segmentURLs
+}
+
+/// Run one recognition task on a single segment URL, appending every final
+/// result (a task can deliver multiple finals) and signaling completion via a
+/// 0.8s settle timer. Encapsulates the segment-accumulation logic that
+/// previously lived inline in the entry point; pulled out so the segmenting
+/// loop can call it once per segment.
+private func recognizeSingleSegment(
+    at url: URL,
+    with recognizer: SFSpeechRecognizer
+) -> SegmentOutcome {
+    let request = SFSpeechURLRecognitionRequest(url: url)
     request.shouldReportPartialResults = false
     request.requiresOnDeviceRecognition = true
     if #available(iOS 16.0, *) {
         request.addsPunctuation = true
     }
 
-    // 5. Run the recognition task, bridging the callback onto a semaphore.
-    //
-    // On-device recognition can deliver LONGER audio in SEGMENTS: the handler
-    // is invoked with isFinal=true once per segment, and each result's
-    // bestTranscription holds only THAT segment's text. Overwriting on each
-    // final left only the last segment (the "only the last line" bug for ~1min
-    // recordings). Fix: append every final segment, and signal completion via a
-    // short settle timer (0.8s of quiet after the last segment). For normal
-    // single-final audio this adds ~0.8s of latency to a background op, which
-    // is acceptable; the existing 600s timeout remains the ultimate safety net.
     let resultSemaphore = DispatchSemaphore(value: 0)
     final class ResultBox {
         var text: String?
@@ -197,17 +363,14 @@ public func slowclaw_transcribe_audio(
             resultSemaphore.signal()
         }
     }
-    settleTimer.schedule(deadline: .now() + .seconds(600), repeating: .never)
+    settleTimer.schedule(deadline: .now() + .seconds(SINGLE_SEGMENT_TIMEOUT_SECONDS), repeating: .never)
     settleTimer.setEventHandler { signalOnce() }
     settleTimer.activate()
-    // Re-arm the settle timer to `delay` seconds from now (debounce: each new
-    // final segment pushes "done" out, so we only finish after the recognizer
-    // goes quiet).
     func rearmSettle(_ delay: TimeInterval) {
         settleTimer.schedule(deadline: .now() + delay, repeating: .never)
     }
 
-    let task = activeRecognizer.recognitionTask(with: request) { result, error in
+    let task = recognizer.recognitionTask(with: request) { result, error in
         if let error = error {
             box.error = error
             settleTimer.cancel()
@@ -215,7 +378,6 @@ public func slowclaw_transcribe_audio(
             return
         }
         guard let result = result else {
-            // Completion with no further result and no error: finish now.
             settleTimer.cancel()
             signalOnce()
             return
@@ -227,36 +389,22 @@ public func slowclaw_transcribe_audio(
             } else {
                 box.text = segment
             }
-            // Debounce: wait a little in case another segment follows.
             rearmSettle(0.8)
         }
     }
 
-    // Bound the total wait so a misbehaving recognizer can never wedge the
-    // Tauri command thread indefinitely. The SDK should always deliver a
-    // final result or an error well within this window for normal journal
-    // recordings (typically < 60s for a few minutes of audio).
-    let waitResult = resultSemaphore.wait(timeout: .now() + .seconds(600))
-    switch waitResult {
-    case .success:
-        break
-    case .timedOut:
+    let waitResult = resultSemaphore.wait(timeout: .now() + .seconds(SINGLE_SEGMENT_TIMEOUT_SECONDS))
+    if waitResult == .timedOut {
         task.cancel()
-        writeError("Speech recognition timed out after 600 seconds.")
-        return -1
+        return .timedOut
     }
-
     if let error = box.error {
-        let nsError = error as NSError
-        writeError("SFSpeechRecognizer error: \(nsError.localizedDescription) (domain=\(nsError.domain), code=\(nsError.code))")
-        return -1
+        return .error(error)
     }
     guard let transcript = box.text, !transcript.isEmpty else {
-        writeError("Speech recognition produced no transcript (silent audio or unrecognized speech).")
-        return -1
+        return .noSpeech
     }
-
-    return writeText(transcript)
+    return .text(transcript)
 }
 
 // MARK: - iOS 26 SpeechAnalyzer path
@@ -501,63 +649,81 @@ private func transcribeFileWithSpeechAnalyzer(
         ))
     }
 
-    // Read the whole file and pump converted buffers into the stream.
-    let readFrameCapacity = AVAudioFrameCount(audioFile.length)
-    guard readFrameCapacity > 0,
-          let readBuffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: readFrameCapacity)
-    else {
+    // Read the file in bounded PCM chunks and pump converted buffers into the
+    // stream. The previous implementation read the whole file into one buffer
+    // and yielded it once, then returned `.noDataNow` from the converter's
+    // input callback. `.noDataNow` means "paused, may resume"; for longer input
+    // the converter could stop early and only the first ~minute of audio
+    // reached the analyzer — the root cause of "only the audio after the
+    // 1-minute mark is transcribed" for ~1:06 recordings on iOS 26. Fix: read
+    // ~4s chunks directly from disk, convert each fully (signalling
+    // `.endOfStream` so the converter drains its internal buffers), and yield
+    // until the whole file is consumed. Bounds memory and handles long files.
+    let inputFormat = audioFile.processingFormat
+    let totalFrames = AVAudioFrameCount(audioFile.length)
+    guard totalFrames > 0 else {
         inputContinuation.finish()
         return .failure(TranscribeFailure(
             message: "Audio file appears empty or unreadable.",
             isHard: false
         ))
     }
+    let inputFramesPerChunk = max(1, AVAudioFrameCount(4.0 * inputFormat.sampleRate))
+    var framesRead: AVAudioFrameCount = 0
 
-    do {
-        try audioFile.read(into: readBuffer)
-    } catch {
-        inputContinuation.finish()
-        return .failure(TranscribeFailure(
-            message: "Failed reading audio samples: \(error.localizedDescription)",
-            isHard: false
-        ))
-    }
+    while framesRead < totalFrames {
+        let chunkFrameCount = min(inputFramesPerChunk, totalFrames - framesRead)
+        guard chunkFrameCount > 0,
+              let readBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: chunkFrameCount)
+        else { break }
 
-    if let converter {
-        // Convert the single read buffer into the analyzer format, then yield.
-        // (Journal recordings are short; a single whole-file conversion is fine.
-        // If this ever needs to stream very long files, switch to chunked reads
-        // feeding AVAudioConverter's render callback — same as the reference.)
-        let ratio = analyzerFormat.sampleRate / audioFile.processingFormat.sampleRate
-        let outFrames = AVAudioFrameCount((Double(readBuffer.frameLength) * ratio).rounded(.up))
-        guard outFrames > 0,
-              let outBuffer = AVAudioPCMBuffer(pcmFormat: analyzerFormat, frameCapacity: outFrames)
-        else {
-            inputContinuation.finish()
-            return .failure(TranscribeFailure(message: "Audio format conversion produced no samples.", isHard: false))
-        }
-        var conversionError: NSError?
-        var consumed = false
-        let convStatus = converter.convert(to: outBuffer, error: &conversionError) { _, status in
-            if consumed {
-                status.pointee = .noDataNow
-                return nil
-            }
-            consumed = true
-            status.pointee = .haveData
-            return readBuffer
-        }
-        if convStatus == .error {
+        do {
+            // Sequential reads; framePosition advances automatically per read.
+            try audioFile.read(into: readBuffer, frameCount: chunkFrameCount)
+        } catch {
             inputContinuation.finish()
             return .failure(TranscribeFailure(
-                message: "Audio format conversion failed: \(conversionError?.localizedDescription ?? "unknown")",
+                message: "Failed reading audio samples: \(error.localizedDescription)",
                 isHard: false
             ))
         }
-        inputContinuation.yield(AnalyzerInput(buffer: outBuffer))
-    } else {
-        // Processing format already matches the analyzer format.
-        inputContinuation.yield(AnalyzerInput(buffer: readBuffer))
+        framesRead += chunkFrameCount
+
+        if let converter {
+            let ratio = analyzerFormat.sampleRate / inputFormat.sampleRate
+            let outFrames = AVAudioFrameCount(
+                (Double(readBuffer.frameLength) * ratio).rounded(.up)
+            )
+            guard outFrames > 0,
+                  let outBuffer = AVAudioPCMBuffer(pcmFormat: analyzerFormat, frameCapacity: outFrames)
+            else { continue }
+            var conversionError: NSError?
+            var inputDelivered = false
+            let convStatus = converter.convert(to: outBuffer, error: &conversionError) { _, status in
+                if inputDelivered {
+                    // This chunk is fully consumed — signal end of stream so the
+                    // converter drains and this convert() call completes.
+                    status.pointee = .endOfStream
+                    return nil
+                }
+                inputDelivered = true
+                status.pointee = .haveData
+                return readBuffer
+            }
+            if convStatus == .error {
+                inputContinuation.finish()
+                return .failure(TranscribeFailure(
+                    message: "Audio format conversion failed: \(conversionError?.localizedDescription ?? "unknown")",
+                    isHard: false
+                ))
+            }
+            if outBuffer.frameLength > 0 {
+                inputContinuation.yield(AnalyzerInput(buffer: outBuffer))
+            }
+        } else {
+            // Processing format already matches the analyzer format.
+            inputContinuation.yield(AnalyzerInput(buffer: readBuffer))
+        }
     }
 
     // Signal end-of-input, then finalize so the last segment is committed.
