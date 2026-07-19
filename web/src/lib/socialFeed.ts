@@ -389,22 +389,85 @@ export function toUnifiedFromWorldFeed(item: PersonalizedFeedItem): UnifiedItem 
   const tsRaw = preview?.discoveredAt || (feedItem.publishedAt as string) || "";
   const tsMs = tsRaw ? Date.parse(tsRaw) : NaN;
   const imageUrl = preview?.imageUrl ?? null;
-  const isVideo = /\byoutube\.com\/watch|youtu\.be\//i.test(url);
+  const youTubeId = extractYouTubeId(url);
+  const isYouTube = youTubeId !== null;
+  // YouTube thumbnails are deterministic from the video ID
+  // (https://i.ytimg.com/vi/<id>/hqdefault.jpg) and don't require a network
+  // round-trip. Prefer the backend-supplied preview image when present (it may
+  // be a higher-res maxres); otherwise build the URL from the ID so a missing
+  // backend preview never leaves the card without a cover. This also keeps the
+  // useReadsThumbnails OG-fallback hook from being asked to scrape a YT watch
+  // page (which yields no usable og:image).
+  const youTubeThumb = isYouTube ? youTubeThumbnailUrl(youTubeId) : null;
+  const thumbnailUrl = imageUrl || youTubeThumb || undefined;
   return {
     id: `world-${url || JSON.stringify(feedItem)}`,
-    sourcePlatform: item.sourceType === "bluesky" ? "atproto" : "rss",
+    // Tag YouTube items as "youtube" (not the generic "rss") so the Reads card
+    // shows the "▶ Video" badge and downstream ranking can treat video
+    // distinctly. Only Bluesky was special-cased before, which silently
+    // mistagged every YouTube item.
+    sourcePlatform: isYouTube
+      ? "youtube"
+      : item.sourceType === "bluesky"
+        ? "atproto"
+        : "rss",
     timestamp: Number.isFinite(tsMs) ? Math.floor(tsMs / 1000) : 0,
     author: {
       id: preview?.domain || (feedItem.domain as string) || "world",
       handle: item.feedSource?.label || preview?.domain || "Web",
     },
     content: { title, body: body.slice(0, 320), linkUrl: url || undefined },
-    media: isVideo
-      ? { type: "video", urls: [url], thumbnailUrl: imageUrl || undefined }
+    media: isYouTube
+      ? { type: "video", urls: [url], thumbnailUrl }
       : imageUrl
         ? { type: "image", urls: [imageUrl], thumbnailUrl: imageUrl }
         : { type: "none", urls: [] },
   };
+}
+
+/**
+ * Extract the 11-char YouTube video id from a watch/share URL, or return null.
+ * Handles the common shapes: youtube.com/watch?v=ID, youtu.be/ID,
+ * youtube.com/embed/ID, youtube.com/shorts/ID, youtube.com/live/ID, and any
+ * youtube-nocookie.com variants. Conservative: returns null for non-YouTube
+ * hosts or URLs without a recognizable id.
+ */
+export function extractYouTubeId(url: string): string | null {
+  if (!url) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!/(^|\.)(youtube\.com|youtube-nocookie\.com|youtu\.be)$/i.test(host)) {
+    return null;
+  }
+  // youtu.be/<id>
+  if (host === "youtu.be") {
+    const id = parsed.pathname.split("/").filter(Boolean)[0] || "";
+    return /^[A-Za-z0-9_-]{11}$/.test(id) ? id : null;
+  }
+  // youtube.com/watch?v=<id>
+  const v = parsed.searchParams.get("v");
+  if (v && /^[A-Za-z0-9_-]{11}$/.test(v)) return v;
+  // youtube.com/(embed|shorts|live|v)/<id>
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  if (segments.length >= 2 && /^(embed|shorts|live|v|education)$/i.test(segments[0])) {
+    const id = segments[1];
+    return /^[A-Za-z0-9_-]{11}$/.test(id) ? id : null;
+  }
+  return null;
+}
+
+/**
+ * Build a YouTube thumbnail URL for a video id. Uses hqdefault.jpg (480x360,
+ * always exists for every video — maxres is not guaranteed). Served from
+ * i.ytimg.com over HTTPS with permissive hotlinking.
+ */
+export function youTubeThumbnailUrl(videoId: string): string {
+  return `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 }
 
 
