@@ -20,6 +20,8 @@ pub const porter_stemmer = @import("porter_stemmer.zig");
 pub const tokenize = @import("tokenize.zig");
 pub const feed_types = @import("feed_types.zig");
 pub const ranker = @import("ranker.zig");
+pub const memory_types = @import("memory_types.zig");
+pub const chunker = @import("chunker.zig");
 
 test {
     // Zig 0.16 only collects test blocks from the root source file of a test
@@ -32,6 +34,8 @@ test {
     _ = tokenize;
     _ = feed_types;
     _ = ranker;
+    _ = memory_types;
+    _ = chunker;
 
     // Sanity: std is reachable.
     try std.testing.expect(std.mem.eql(u8, "ok", "ok"));
