@@ -23,6 +23,7 @@ pub const ranker = @import("ranker.zig");
 pub const memory_types = @import("memory_types.zig");
 pub const chunker = @import("chunker.zig");
 pub const embeddings = @import("embeddings.zig");
+pub const ffi = @import("ffi.zig");
 
 test {
     // Zig 0.16 only collects test blocks from the root source file of a test
@@ -38,6 +39,7 @@ test {
     _ = memory_types;
     _ = chunker;
     _ = embeddings;
+    _ = ffi;
 
     // Sanity: std is reachable.
     try std.testing.expect(std.mem.eql(u8, "ok", "ok"));

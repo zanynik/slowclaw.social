@@ -17,7 +17,32 @@ Explicitly **out of scope** for slice 1 (later slices):
 - Tauri host, iOS shell, Swift bridge, Xcode integration.
 - Removing Rust, dropping desktop, CI surgery.
 
-## Toolchain
+## C ABI surface (Swift consumers)
+
+The staticlib `libslowclaw_feed.a` exposes a small C ABI in `src/ffi.zig`. Swift
+imports it via a bridging header (TBD in the iOS shell slice). Current surface:
+
+| Function | Purpose |
+| --- | --- |
+| `slowclaw_feed_free(ptr)` | Free any pointer returned by the library. |
+| `slowclaw_feed_hash_embedder_new(model, dims)` | Create a `HashEmbedding` handle. |
+| `slowclaw_feed_hash_embedder_free(handle)` | Destroy a HashEmbedding handle. |
+| `slowclaw_feed_hash_embed(handle, text, out_dims)` | Embed one text → f32 buffer. |
+| `slowclaw_feed_rank_stage2(interests, negatives, candidates, limit, now, out_err)` | Run the keyword-path ranker over C-struct inputs; returns a JSON array of ranked items. |
+| `slowclaw_feed_rank_result_free(result)` | Free a rank result and its JSON string. |
+
+**Memory ownership**: strings passed in are caller-owned (Zig does not free).
+Strings/buffers passed out are Zig-allocated via `c_allocator`; the caller frees
+via `slowclaw_feed_free`. Errors are returned as a negative status code; an
+optional `*SlowclawString` out-param receives the error message (also
+caller-freed).
+
+**Embedder callback** (TODO): the next slice adds `slowclaw_feed_rank(...)` that
+takes a Swift-provided C function pointer for the embedder (matching
+`SlowclawEmbedFunction`), enabling the full stage-1 embedding path from Swift
+without going through HashEmbedding.
+
+
 
 - **Zig 0.16.0** (stable, April 2026).
 - Download from <https://ziglang.org/download/0.16.0/> and place on `PATH`, or
@@ -27,18 +52,21 @@ Explicitly **out of scope** for slice 1 (later slices):
 
 ```bash
 cd zig-src
-zig build           # emits zig-out/libslowclaw_feed.a (staticlib)
-zig build test      # runs every test{} block in the package
+zig build           # emits zig-out/libslowclaw_feed.a (staticlib, libc-linked, includes FFI)
+zig build test      # runs every test{} block in the package (libc-free)
+zig build test-ffi  # runs the C ABI tests in ffi.zig (libc-linked)
 ```
 
 ## Module layout (current)
 
 ```
 zig-src/
-  build.zig             # staticlib + test runner
+  build.zig             # staticlib + test runner (libc-free test + libc-linked lib)
   build.zig.zon         # package manifest, no external deps
   src/
-    root.zig            # public re-exports + test discovery
+    root.zig            # library public re-exports (includes ffi)
+    test_root.zig       # test entry point (excludes ffi — see build.zig)
+    ffi.zig             # C ABI surface — Swift-callable export fns
     vector_math.zig     # cosine_similarity, vec<->bytes, hybrid_merge
     text_util.zig       # truncate_with_ellipsis (UTF-8 safe)
     porter_stemmer.zig  # Snowball English (Porter2) stemmer, from scratch
@@ -127,10 +155,13 @@ in `src/porter_stemmer.zig`).
 - [x] embeddings.zig — EmbeddingProvider vtable, NoopEmbedding, HashEmbedding
       (deterministic fallback, FNV-1a hashed features, L2-normalized)
 - [x] ranker.Embedder unified with embeddings.EmbeddingProvider (single contract)
+- [x] ffi.zig — C ABI surface (rank_stage2, hash embedder, JSON serialization);
+      build separates libc-free tests from libc-linked library artifact
 
-**Total: 117 tests, 0 leaks.** Ported so far: all of `src/feed/ranker.rs`
-(703 LOC) plus its pure deps, the `Memory` trait + types, the markdown chunker,
-and the embeddings trait + Noop + Hash implementations.
+**Total: 117 libc-free tests + 88 libc-linked FFI tests, 0 leaks.** Ported so
+far: all of `src/feed/ranker.rs` (703 LOC) plus its pure deps, the `Memory`
+trait + types, the markdown chunker, the embeddings trait + Noop + Hash
+implementations, and the C ABI boundary that makes the package Swift-callable.
 
 ## Next slices (not in this branch's current scope)
 

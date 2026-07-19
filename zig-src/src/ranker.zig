@@ -817,14 +817,19 @@ pub fn rank_candidates(
 // src/feed/ranker.rs:664-702.
 // ──────────────────────────────────────────────────────────────────────────
 
-fn neg(label: []const u8) InterestVector {
+/// Test helper: build a negative InterestVector whose single keyword is the
+/// label. The `keyword_array` comptime parameter materializes a stable static
+/// array (the label is always a string literal in tests), avoiding the
+/// dangling-pointer issue of `&.{label}` when `label` is a runtime slice.
+fn neg(comptime label: []const u8) InterestVector {
+    const keyword_array = [_][]const u8{label};
     return .{
         .id = "",
         .label = label,
         .embedding = &.{},
         .health_score = 1.0,
         .source_path = "",
-        .keywords = &.{label},
+        .keywords = &keyword_array,
     };
 }
 
