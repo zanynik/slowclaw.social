@@ -96,8 +96,15 @@ pub(crate) fn open_external_url(url: String) -> Result<(), String> {
 ///     be dismissed on iOS — the native Safari sheet is the correct primitive.
 ///   - Desktop: opens a dedicated `"reader"` `WebviewWindow` over the main
 ///     window. Reuses a single label so repeated opens replace, not stack.
+///
+/// DWELL MEASUREMENT: this command is `async` and BLOCKS until the reader is
+/// dismissed — on iOS via the SFSafariViewController delegate callback (run in
+/// `spawn_blocking`), on desktop via the reader window's CloseRequested event.
+/// This lets the TS caller (`openFeedLink`) measure true dwell by timestamping
+/// around the `await invoke(...)`. A 30-minute safety timeout caps both paths
+/// so a lost dismiss signal can never wedge the command indefinitely.
 #[tauri::command]
-pub(crate) fn open_in_app_webview(app: AppHandle, url: String) -> Result<(), String> {
+pub(crate) async fn open_in_app_webview(app: AppHandle, url: String) -> Result<(), String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err("url is required".to_string());
@@ -108,12 +115,19 @@ pub(crate) fn open_in_app_webview(app: AppHandle, url: String) -> Result<(), Str
         return Err("only http(s) urls can be opened".to_string());
     }
 
-    // iOS: hand off to the native SFSafariViewController bridge (fire-and-forget
-    // present). No desktop-only window APIs are touched on this path.
+    // iOS: hand off to the native SFSafariViewController bridge. The Swift side
+    // blocks until the user dismisses the sheet (or the 30-min safety timeout).
+    // Run it in spawn_blocking so the blocking wait doesn't stall the async
+    // runtime. No desktop-only window APIs are touched on this path.
     #[cfg(target_os = "ios")]
     {
         let _ = app; // app unused on the iOS path
-        return crate::ios_safari::ios_open_safari_vc(parsed.as_str());
+        let url_string = parsed.as_str().to_string();
+        return tauri::async_runtime::spawn_blocking(move || {
+            crate::ios_safari::ios_open_safari_vc(&url_string)
+        })
+        .await
+        .map_err(|e| format!("in-app webview task failed: {e}"))?;
     }
 
     // Android (and any other mobile target without a native bridge yet): we
@@ -129,7 +143,7 @@ pub(crate) fn open_in_app_webview(app: AppHandle, url: String) -> Result<(), Str
     }
 
     // Desktop: close any existing reader window so we never stack webviews, then
-    // build a fresh one.
+    // build a fresh one and BLOCK until the user closes it (dwell measurement).
     #[cfg(not(mobile))]
     {
         if let Some(existing) = app.get_webview_window("reader") {
@@ -138,13 +152,29 @@ pub(crate) fn open_in_app_webview(app: AppHandle, url: String) -> Result<(), Str
 
         let mut builder = WebviewWindowBuilder::new(&app, "reader", WebviewUrl::External(parsed));
         builder = builder.title("SlowClaw Reader").center();
-        builder.build().map_err(|e| {
+        let reader_window = builder.build().map_err(|e| {
             crate::ui_command_error(
                 "in-app webview open failed",
                 "Failed to open the link in the app.",
                 e,
             )
         })?;
+
+        // Block until the reader window is closed (or the safety timeout fires)
+        // so the caller can measure dwell. A oneshot channel is signalled from
+        // the window-event handler when CloseRequested fires. The handler is
+        // `Fn` (may be called multiple times), so the Sender is wrapped in an
+        // Option inside a Mutex and taken on the first close.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let tx_cell = std::sync::Mutex::new(Some(tx));
+        reader_window.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                if let Some(sender) = tx_cell.lock().ok().and_then(|mut g| g.take()) {
+                    let _ = sender.send(());
+                }
+            }
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30 * 60), rx).await;
         Ok(())
     }
 }

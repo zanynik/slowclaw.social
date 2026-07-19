@@ -9,8 +9,14 @@
 // pattern: a Swift `@_cdecl("slowclaw_open_safari_vc")` symbol is resolved at
 // the final Xcode app link (see `scripts/ios-add-safari-opener.rb`), and the
 // Rust crate declares the `extern "C"` counterpart gated to `target_os = "ios"`.
-// Unlike transcription, the call is fire-and-forget — the Swift side dispatches
-// the presentation onto the main thread and returns immediately.
+//
+// BLOCKING UNTIL DISMISSAL: the Swift side blocks on a DispatchSemaphore
+// signalled from `SFSafariViewControllerDelegate.didFinish` — so this call
+// returns AFTER the user dismisses the Safari sheet (or after a 30-minute
+// safety timeout). The caller MUST run this in `spawn_blocking` (which
+// `open_in_app_webview` does on iOS) so the blocking wait doesn't stall the
+// async runtime. The blocking semantics let the TS layer measure true article
+// dwell by timestamping around the `await invoke(...)`.
 //
 // The symbol is intentionally NOT gated on the `native-inference` feature: the
 // in-app reader is a core feature, independent of on-device inference.
@@ -27,6 +33,10 @@ extern "C" {
 /// Present `url` in a native `SFSafariViewController` over the app's topmost
 /// view controller. iOS-only; returns an error on every other target so callers
 /// can fall back to the desktop webview path.
+///
+/// BLOCKS the calling thread until the user dismisses the Safari sheet (or the
+/// Swift-side 30-minute safety timeout fires). The caller MUST run this in
+/// `spawn_blocking` — see `open_in_app_webview` in `commands/desktop.rs`.
 ///
 /// Contract mirrors `transcription::call_ios_transcriber`: returns `Ok(())` when
 /// the Swift bridge reports success (status >= 0), or `Err(message)` on failure
