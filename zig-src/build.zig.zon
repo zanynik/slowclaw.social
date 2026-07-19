@@ -1,0 +1,15 @@
+.{
+    // Library name used by packages that depend on this one. The staticlib
+    // artifact is emitted as `libslowclaw_feed.a` (see build.zig).
+    .name = .slowclaw_feed,
+    .version = "0.0.1",
+    .fingerprint = 0x93a03a4ed1680eda, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
