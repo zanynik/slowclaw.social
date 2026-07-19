@@ -2301,11 +2301,35 @@ function App() {
         } catch {
           persisted = false;
         }
-        setJournalSaveStatus(
-          persisted
-            ? `Transcribed: ${transcriptText.length} chars`
-            : `Transcribed (not saved): ${transcriptText.length} chars`
-        );
+        // Reflect the transcript in the open entry + library so the user sees
+        // it without a manual reload, and mark the per-path status done. The
+        // previous code wrote the file but never surfaced it, so the UI read
+        // "Transcribed (not saved)" even on a successful native write.
+        const stillSelected = () => selectedJournalPathRef.current === audioPath;
+        if (persisted) {
+          if (stillSelected()) {
+            loadedTextPathRef.current = transcriptPath;
+            setSelectedJournalText(transcriptText);
+            setJournalDraftText(transcriptText);
+          }
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [audioPath]: "done"
+          }));
+          // Refresh the library so the entry's transcript field is populated,
+          // then nudge the enrichment loop so the just-eligible title/interests/
+          // tweet tasks for this audio journal run immediately (its title still
+          // reads as the capture default, e.g. "audio 1750000000").
+          await refreshLibrary("journal");
+          nudgeEnrichmentRef.current?.();
+          setJournalSaveStatus(`Transcribed: ${transcriptText.length} chars · saved`);
+        } else {
+          setJournalTranscriptionStatusByPath((prev) => ({
+            ...prev,
+            [audioPath]: "error"
+          }));
+          setJournalSaveStatus(`Transcribed (not saved): ${transcriptText.length} chars`);
+        }
         setRecordingHint(`\u{1F3A4} Transcript ready (${transcriptText.split(/\s+/).length} words)`);
       } else {
         setJournalSaveStatus("No speech detected in recording.");
@@ -3066,26 +3090,31 @@ Rules:
         const transcriptText = (result.text || "").trim();
         if (transcriptText) {
           const transcriptPath = journalTranscriptPathForMedia(selectedJournalItem);
-          // Persist the transcript to the workspace so it survives navigation
-          // and reload (see transcribeAfterSave for rationale).
-          let persisted = true;
+          // Persist via the native-first helper (same as post-record auto
+          // transcribe). The raw gateway HTTP endpoint was unreachable from the
+          // mobile runtime and produced "Transcribed (not saved)" here too.
+          let persisted = false;
           try {
-            await saveLibraryText(transcriptPath, transcriptText, token || undefined, gatewayBaseUrl);
+            persisted = await persistTranscript(transcriptPath, transcriptText, token);
           } catch {
             persisted = false;
           }
           setJournalTranscriptionStatusByPath((prev) => ({
             ...prev,
-            [selectedJournalItem.path]: "done"
+            [selectedJournalItem.path]: persisted ? "done" : "error"
           }));
           loadedTextPathRef.current = transcriptPath;
           setSelectedJournalText(transcriptText);
           setJournalDraftText(transcriptText);
-          setJournalSaveStatus(
-            persisted
-              ? `Transcribed: ${transcriptText.length} chars`
-              : `Transcribed (not saved): ${transcriptText.length} chars`
-          );
+          if (persisted) {
+            // Refresh + nudge so the now-eligible title/interests/tweet tasks
+            // for this audio journal run without waiting on the cooldown.
+            await refreshLibrary("journal");
+            nudgeEnrichmentRef.current?.();
+            setJournalSaveStatus(`Transcribed: ${transcriptText.length} chars · saved`);
+          } else {
+            setJournalSaveStatus(`Transcribed (not saved): ${transcriptText.length} chars`);
+          }
         } else {
           setJournalTranscriptionStatusByPath((prev) => ({
             ...prev,
@@ -7353,7 +7382,7 @@ Rules:
     [],
   );
 
-  const enrichmentProgress = useJournalEnrichmentLoop({
+  const { progress: enrichmentProgress, nudge: nudgeEnrichment } = useJournalEnrichmentLoop({
     journals: journalItems,
     enabled: isTauriMobileRuntime() && !!nativeLocalAiStatus?.available,
     busy: generatePostBusy,
@@ -7365,6 +7394,11 @@ Rules:
   // Expose enrichment progress to the AI Activity panel via a ref the view reads.
   const enrichmentProgressRef = useRef(enrichmentProgress);
   enrichmentProgressRef.current = enrichmentProgress;
+  // Stable ref so `transcribeAfterSave` can nudge the enrichment loop to run the
+  // freshly-eligible title/interests/tasks immediately after a transcript lands,
+  // without waiting for the 30s cooldown. Kept current on every render.
+  const nudgeEnrichmentRef = useRef(nudgeEnrichment);
+  nudgeEnrichmentRef.current = nudgeEnrichment;
 
   // What the Reads tab actually renders: the live ranked stream once it has
   // loaded, otherwise the cached stream so the tab is never blank on open.
