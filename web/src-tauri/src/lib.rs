@@ -1090,6 +1090,31 @@ fn resolve_journal_id(workspace_dir: &Path, id: &str) -> Result<PathBuf, String>
     Ok(path)
 }
 
+/// The canonical (non-legacy) sidecar transcript path for a media file with the
+/// given stem: `journals/text/transcriptions/<stem>.txt`. Used by
+/// {@link media_transcript_path} (lookup) and {@link rename_journal} (move
+/// target), so the lookup and rename stay in sync on where transcripts live.
+fn primary_transcript_path(workspace_dir: &Path, stem: &str) -> PathBuf {
+    workspace_dir
+        .join("journals/text/transcriptions")
+        .join(format!("{stem}.txt"))
+}
+
+/// Derive the primary transcript path for a media journal id WITHOUT an
+/// existence check. Mirrors the stem derivation in {@link media_transcript_path}
+/// (preserving the sub-path under `journals/media/`, e.g. `audio/inbox/`), so a
+/// rename can compute the NEW transcript path even before the sidecar exists.
+/// Returns `None` for non-media ids (text journals have no sidecar to move).
+fn media_transcript_path_for_id(workspace_dir: &Path, media_id: &str) -> Option<PathBuf> {
+    let normalized = media_id.trim_start_matches('/');
+    let relative = normalized.strip_prefix("journals/media/")?;
+    let stem = relative
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(relative);
+    Some(primary_transcript_path(workspace_dir, stem))
+}
+
 /// Resolve the sidecar transcript path for a media journal entry.
 ///
 /// Mirrors the JS `journalTranscriptPathForMediaPath` convention so the
@@ -1104,9 +1129,7 @@ fn media_transcript_path(workspace_dir: &Path, media_id: &str) -> Option<PathBuf
         .rsplit_once('.')
         .map(|(stem, _)| stem)
         .unwrap_or(relative);
-    let primary = workspace_dir
-        .join("journals/text/transcriptions")
-        .join(format!("{stem}.txt"));
+    let primary = primary_transcript_path(workspace_dir, stem);
     let legacy = workspace_dir
         .join("journals/text/transcript")
         .join(format!("{stem}.txt"));
@@ -2331,6 +2354,33 @@ async fn rename_journal(id: String, new_title: String) -> Result<JournalEntry, S
             )
         })?;
     }
+
+    // Media journals carry their transcript in a sidecar whose path is keyed on
+    // the media filename stem (`journals/text/transcriptions/<stem>.txt`). The
+    // rename above changed that stem, so move the sidecar too — otherwise an
+    // auto-titled audio journal would orphan its transcript and the journal
+    // entry's body would silently empty out. Text journals have no sidecar, so
+    // the lookup returns `None` and this is a no-op. Best-effort: a sidecar
+    // move failure should NOT block the rename that already succeeded. Note the
+    // lookup uses the OLD id (the sidecar still has the pre-rename stem), and
+    // the target is derived from the NEW media id so the sub-path (e.g.
+    // `audio/inbox/`) is preserved — otherwise a media rename would move the
+    // sidecar to a path that no reader checks.
+    if let Some(existing_transcript) = media_transcript_path(&config.workspace_dir, &id) {
+        let new_media_id = rel_path_to_id(&config.workspace_dir, &new_path);
+        let target = new_media_id
+            .as_deref()
+            .and_then(|nid| media_transcript_path_for_id(&config.workspace_dir, nid));
+        if let Some(target) = target {
+            if target != existing_transcript {
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::rename(&existing_transcript, &target);
+            }
+        }
+    }
+
     journal_entry_from_path(&config.workspace_dir, &new_path)
         .ok_or_else(|| "Failed to read renamed journal entry.".to_string())
 }
@@ -3504,5 +3554,103 @@ mod tests {
     /// private internals of the gateway handler beyond the public constant.
     fn safe_local_model_id_dir(model_id: &str) -> String {
         zeroclaw::gateway::handlers::model::safe_local_model_dir_name(model_id)
+    }
+
+    /// `primary_transcript_path` returns the canonical sidecar path for a media
+    /// stem. This is the move target `rename_journal` uses when a media journal
+    /// is renamed, so it must stay in lockstep with `media_transcript_path`.
+    #[test]
+    fn primary_transcript_path_is_canonical_layout() {
+        let workspace = temp_workspace("primary_transcript_layout");
+        let path = primary_transcript_path(&workspace, "audio-1750000000");
+        assert_eq!(
+            path,
+            workspace
+                .join("journals/text/transcriptions")
+                .join("audio-1750000000.txt")
+        );
+    }
+
+    /// `media_transcript_path` finds a sidecar at the primary location when it
+    /// exists. This is the lookup `rename_journal` uses to find the sidecar to
+    /// move; returning `None` for a text journal makes the move a no-op. The
+    /// transcript path mirrors the media id's sub-path under journals/media/ —
+    /// e.g. `journals/media/audio/inbox/foo.m4a` →
+    /// `journals/text/transcriptions/audio/inbox/foo.txt` (matches the JS
+    /// `journalTranscriptPathForMediaPath` convention exactly).
+    #[test]
+    fn media_transcript_path_finds_primary_sidecar() {
+        let workspace = temp_workspace("media_transcript_primary");
+        // Transcript path mirrors the media sub-path: audio/inbox/<stem>.txt
+        let transcript = workspace
+            .join("journals/text/transcriptions")
+            .join("audio/inbox/audio-1750000000.txt");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, b"hello world").unwrap();
+
+        let found = media_transcript_path(
+            &workspace,
+            "journals/media/audio/inbox/audio-1750000000.m4a",
+        );
+        assert_eq!(found, Some(transcript));
+    }
+
+    /// `media_transcript_path` returns `None` for a text journal id (no sidecar
+    /// to move), so `rename_journal`'s sidecar move is a no-op for text.
+    #[test]
+    fn media_transcript_path_returns_none_for_text_journal() {
+        let workspace = temp_workspace("media_transcript_text");
+        let found = media_transcript_path(&workspace, "journals/text/1750000000-note.txt");
+        assert!(found.is_none());
+    }
+
+    /// `media_transcript_path` falls back to the legacy `transcript/` (singular)
+    /// location when the primary `transcriptions/` (plural) file is absent, so
+    /// older captures still resolve.
+    #[test]
+    fn media_transcript_path_falls_back_to_legacy() {
+        let workspace = temp_workspace("media_transcript_legacy");
+        let legacy = workspace
+            .join("journals/text/transcript")
+            .join("audio/inbox/audio-1750000000.txt");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"legacy transcript").unwrap();
+
+        let found = media_transcript_path(
+            &workspace,
+            "journals/media/audio/inbox/audio-1750000000.m4a",
+        );
+        assert_eq!(found, Some(legacy));
+    }
+
+    /// Simulate the rename sidecar move: an existing sidecar at the OLD media
+    /// id's derived path must move to the NEW media id's derived path, mirroring
+    /// exactly what `rename_journal` does after renaming a media journal.
+    /// Verifies the lookup-then-move logic that protects auto-titled audio
+    /// journals from orphaning their transcripts. Both paths carry the
+    /// `audio/inbox/` sub-path, matching the JS/Rust transcript-path convention.
+    #[test]
+    fn rename_sidecar_moves_transcript_to_new_stem() {
+        let workspace = temp_workspace("rename_sidecar_move");
+        let old_media_id = "journals/media/audio/inbox/audio-1750000000.m4a";
+        let old_transcript = workspace
+            .join("journals/text/transcriptions")
+            .join("audio/inbox/audio-1750000000.txt");
+        fs::create_dir_all(old_transcript.parent().unwrap()).unwrap();
+        fs::write(&old_transcript, b"the transcript").unwrap();
+
+        // Mirror the rename_journal sidecar-move block: look up by OLD id, move
+        // to the NEW primary path keyed on the new stem (sub-path preserved).
+        let existing = media_transcript_path(&workspace, old_media_id).unwrap();
+        let new_stem = "audio/inbox/audio-1750000000-my-ai-title";
+        let target = primary_transcript_path(&workspace, new_stem);
+        if target != existing {
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::rename(&existing, &target).unwrap();
+        }
+
+        assert!(!old_transcript.exists(), "old sidecar should be moved away");
+        assert!(target.is_file(), "new sidecar must exist at the primary path");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "the transcript");
     }
 }
