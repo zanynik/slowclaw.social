@@ -127,6 +127,13 @@ export function isDefaultTitle(title: string): boolean {
   // are the audio-capture default filename — treat as un-titled.
   if (/^\d{4}-\d{2}-\d{2}.*$/.test(t) && t.replace(/[^a-z]/g, "").length === 0) return true;
   if (/^\d+$/.test(t)) return true;
+  // Audio/video capture default filenames: `audio-<digits>.m4a`,
+  // `video-<digits>.mp4`, or the gateway-saved `{digits}-{audio|video}.<ext>`.
+  // After title_from_path's dash→space mapping these surface as
+  // "audio 1750000000", "video 1750000000", "1750000000 audio". Treat both
+  // word orders as default so the title task runs for un-titled media journals.
+  if (/^(audio|video)\s+\d+$/.test(t)) return true;
+  if (/^\d+\s+(audio|video)$/.test(t)) return true;
   return false;
 }
 

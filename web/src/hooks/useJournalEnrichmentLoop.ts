@@ -24,7 +24,7 @@
  * on a non-iOS Tauri build it records `error` once and the row goes terminal.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { LibraryItem } from "../lib/types";
 import {
   ensureJournalEnrichment,
@@ -56,6 +56,19 @@ export type EnrichmentProgress = {
   /** Human label for the row the loop is currently working, if any. */
   current?: string;
   error_message?: string;
+};
+
+/**
+ * Handle returned by {@link useJournalEnrichmentLoop}: the panel-facing
+ * progress plus a `nudge` callback. Call `nudge()` when an event makes new
+ * enrichment work eligible immediately (e.g. a transcript just landed for an
+ * audio journal → its title/interests/tasks can now run without waiting for
+ * the 30s cooldown). It clears the cooldown and triggers a pass on the next
+ * tick. No-op when the loop is disabled (non-iOS / no model).
+ */
+export type UseJournalEnrichmentLoop = {
+  progress: EnrichmentProgress;
+  nudge: () => void;
 };
 
 const INITIAL_PROGRESS: EnrichmentProgress = {
@@ -105,14 +118,22 @@ export function useJournalEnrichmentLoop({
   existingPostsFor,
   tweetPrompt,
   deps,
-}: UseJournalEnrichmentLoopArgs): EnrichmentProgress {
+}: UseJournalEnrichmentLoopArgs): UseJournalEnrichmentLoop {
   const [progress, setProgress] = useState<EnrichmentProgress>(INITIAL_PROGRESS);
   const lastRunRef = useRef<number>(0);
   const passTokenRef = useRef<number>(0);
+  // Bumped by `nudge()` to bypass the cooldown for one pass. Lives in state so
+  // the effect re-runs when nudged even when journals/busy are unchanged.
+  const [nudgeToken, setNudgeToken] = useState<number>(0);
   // Map journal path → most recent body/transcript, so a transcription result
   // feeds the downstream text tasks within the same convergence sweep without
   // a second read. Cleared each pass.
   const bodyCacheRef = useRef<Map<string, string>>(new Map());
+
+  const nudge = useCallback(() => {
+    lastRunRef.current = 0;
+    setNudgeToken((n) => n + 1);
+  }, []);
 
   useEffect(() => {
     // Hard gate: on-device model/runtime unavailable → never run.
@@ -126,7 +147,9 @@ export function useJournalEnrichmentLoop({
     // Foreground preference: never start a background pass while a user-initiated
     // AI request is in flight. (A pass already running finishes fast — one task.)
     if (busy) return;
-    // Throttle: don't re-run more often than the cooldown.
+    // Throttle: don't re-run more often than the cooldown. A `nudge()` clears
+    // lastRunRef to 0 so an eligible event (e.g. transcript just landed) runs
+    // immediately instead of waiting up to ENRICH_COOLDOWN_SECS.
     const now = Date.now();
     if (now - lastRunRef.current < ENRICH_COOLDOWN_SECS * 1000) return;
 
@@ -279,9 +302,9 @@ export function useJournalEnrichmentLoop({
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, busy, journals]);
+  }, [enabled, busy, journals, nudgeToken]);
 
-  return progress;
+  return { progress, nudge };
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
