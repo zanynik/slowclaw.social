@@ -26,7 +26,8 @@ export type AiFeature =
   | "rerank" // background Reads re-rank (useAiFeedRerank)
   | "transcription" // audio/video journal → iOS Speech transcript (loop)
   | "enrichment" // the convergence loop itself (useJournalEnrichmentLoop)
-  | "warm"; // auto-warm the model on launch (nativeAiLoadModel)
+  | "warm" // auto-warm the model on launch (nativeAiLoadModel)
+  | "dwell"; // link dwell ≥30s → keyword boost (openFeedLink)
 
 /** Lifecycle phase of a single feature invocation. */
 export type AiEventKind = "start" | "success" | "error" | "skipped";
@@ -120,4 +121,5 @@ export const AI_FEATURE_LABELS: Record<AiFeature, string> = {
   transcription: "Transcription",
   enrichment: "Enrichment loop",
   warm: "Model warm-up",
+  dwell: "Link dwell",
 };

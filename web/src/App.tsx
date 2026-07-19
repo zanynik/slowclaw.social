@@ -6309,16 +6309,70 @@ Rules:
     }
   }
 
-  async function openFeedLink(url: string) {
+  /**
+   * Open a feed/article link. On native clients this uses the in-app reader
+   * (iOS SFSafariViewController / desktop reader window), which BLOCKS until
+   * the user dismisses it — so we can measure true dwell and feed it back into
+   * the interest lens: a dwell of ≥30s on a Reads item is treated as an
+   * implicit 👍, extracting the article's keywords on-device and bumping their
+   * steering weights via the same pipeline as the like button. The threshold
+   * filters accidental taps/bounces; deep reads (≥3min) get a doubled boost.
+   *
+   * `context` is optional: only the Reads-card open passes it (the ranking-
+   * relevant surface). Other openers (saved items, profile, article-preview
+   * "open in browser") pass nothing and skip the dwell pipeline.
+   */
+  async function openFeedLink(
+    url: string,
+    context?: { title: string; body: string },
+  ) {
     const trimmed = url.trim();
     if (!trimmed) return;
     try {
       if (isNativeClient) {
-        // Open inside the app as an in-app webview (iOS WKWebView / desktop
-        // WebView2). The OS-browser hand-off (open_external_url) actually
-        // errors out on mobile, so the in-app path is the correct one for the
-        // primary (iOS) target.
+        // Open inside the app as an in-app reader (iOS SFSafariViewController /
+        // desktop reader window). The command blocks until the user dismisses
+        // the reader, so the time between the call and its return is the
+        // article dwell.
+        const openedAt = Date.now();
         await invokeDesktopCommandStrict("open_in_app_webview", { url: trimmed });
+        const dwellMs = Date.now() - openedAt;
+        const dwellSeconds = dwellMs / 1000;
+        // Reuse the 👍 keyword pipeline: extract the article's subject keywords
+        // and boost them. 30s is the "engaged read" threshold; bounces below it
+        // are ignored (not penalized). Desktop readers don't have on-device AI,
+        // so this is gated on the mobile runtime + model availability.
+        if (
+          context &&
+          dwellSeconds >= 30 &&
+          isTauriMobileRuntime() &&
+          nativeLocalAiStatus?.available
+        ) {
+          try {
+            const kws = await extractCardKeywords(context.title, context.body);
+            if (kws && kws.length > 0) {
+              // Scale the boost with dwell: a standard engaged read (30s–3min)
+              // bumps keywords once (same as a 👍); a deep read (≥3min) bumps
+              // twice for a stronger signal. saveCardKeywords caps each term at
+              // 4.5, so repeated passes converge, they don't compound forever.
+              const passes = dwellSeconds >= 180 ? 2 : 1;
+              for (let i = 0; i < passes; i++) {
+                await saveCardKeywords(kws, []);
+              }
+              notifyLensChange();
+              logAiEvent(
+                "dwell",
+                "success",
+                `Dwell ${Math.round(dwellSeconds)}s → boosted ${kws.length} keyword${kws.length > 1 ? "s" : ""}`,
+                kws.join(", "),
+                dwellMs,
+              );
+            }
+          } catch {
+            // Keyword extraction/persistence is best-effort — the read itself
+            // already happened; don't surface an error to the user.
+          }
+        }
       } else {
         window.open(trimmed, "_blank", "noopener,noreferrer");
       }
@@ -10453,7 +10507,7 @@ Rules:
                             href={url}
                             target="_blank"
                             rel="noreferrer"
-                            onClick={(e) => { if (url === "#") { e.preventDefault(); return; } e.preventDefault(); void openFeedLink(url); }}
+                            onClick={(e) => { if (url === "#") { e.preventDefault(); return; } e.preventDefault(); void openFeedLink(url, { title: item.content.title || "", body: item.content.body || "" }); }}
                           >
                             {(() => {
                               // Prefer the source-provided thumbnail; fall back to the
