@@ -15,7 +15,7 @@ const std = @import("std");
 
 // Re-export sub-modules as they land.
 pub const vector_math = @import("vector_math.zig");
-// pub const text_util = @import("text_util.zig");
+pub const text_util = @import("text_util.zig");
 // pub const tokenize = @import("tokenize.zig");
 // pub const feed_types = @import("feed_types.zig");
 // pub const ranker = @import("ranker.zig");
@@ -26,7 +26,7 @@ test {
     // `test {}` blocks are included in `zig build test`. Add one line per
     // sub-module.
     _ = vector_math;
-    // _ = text_util;
+    _ = text_util;
     // _ = tokenize;
     // _ = feed_types;
     // _ = ranker;
