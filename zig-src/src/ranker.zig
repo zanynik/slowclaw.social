@@ -346,6 +346,489 @@ fn containsStr(tokens: [][]const u8, needle: []const u8) bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Timestamp freshness — needs a minimal RFC3339 parser.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Parse a 2-digit ASCII decimal number at `s[offset..offset+2]`. Returns null
+/// on malformed input.
+fn parse2(s: []const u8, offset: usize) ?u32 {
+    if (offset + 2 > s.len) return null;
+    const a = std.ascii.toLower(s[offset]);
+    const b = std.ascii.toLower(s[offset + 1]);
+    if (!std.ascii.isDigit(a) or !std.ascii.isDigit(b)) return null;
+    return (@as(u32, a - '0') * 10) + @as(u32, b - '0');
+}
+
+/// Parse a 4-digit ASCII decimal number at `s[offset..offset+4]`.
+fn parse4(s: []const u8, offset: usize) ?u32 {
+    if (offset + 4 > s.len) return null;
+    var n: u32 = 0;
+    var i: usize = offset;
+    while (i < offset + 4) : (i += 1) {
+        if (!std.ascii.isDigit(s[i])) return null;
+        n = n * 10 + @as(u32, s[i] - '0');
+    }
+    return n;
+}
+
+/// Days in a given (Gregorian) month. February accounts for leap years.
+fn daysInMonth(year: u32, month: u32) u32 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) 29 else 28,
+        else => 0,
+    };
+}
+
+fn isLeapYear(year: u32) bool {
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
+}
+
+/// Convert a (UTC) civil date to Unix epoch seconds. Uses the well-known
+/// days-from-civil algorithm (Howard Hinnant). Handles years 1970–9999.
+fn civilToEpochSeconds(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32) i64 {
+    const month_adj: i64 = if (month <= 2) 1 else 0;
+    const y: i64 = @as(i64, year) - month_adj;
+    const era: i64 = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe: u64 = @intCast(y - era * 400); // [0, 399]
+    const m: u64 = month;
+    const d: u64 = day;
+    const doy: u64 = @divFloor(153 * (if (m > 2) m - 3 else m + 9) + 2, 5) + d - 1; // [0, 365]
+    const doe: u64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy; // [0, 146096]
+    const days_since_epoch: i64 = @as(i64, era * 146097 + @as(i64, @intCast(doe)) - 719468);
+    return days_since_epoch * 86400 +
+        @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+}
+
+/// Parse an RFC3339 timestamp into Unix epoch seconds (UTC). Accepts the
+/// formats produced by Bluesky/Nostr/ISO-8601 sources:
+///   `2026-07-19T20:47:00Z`, `2026-07-19T20:47:00+00:00`,
+///   `2026-07-19T20:47:00.123Z`, `2026-07-19T20:47:00.123456789+05:30`.
+/// Returns null on malformed input (mirrors chrono's parse_from_rfc3339
+/// returning an Err, which the ranker treats as "no freshness bonus").
+pub fn parse_rfc3339(s: []const u8) ?i64 {
+    // Layout: YYYY-MM-DDTHH:MM:SS[.fraction][Z|±HH:MM]
+    if (s.len < 20) return null;
+    if (s[4] != '-' or s[7] != '-' or (s[10] != 'T' and s[10] != 't' and s[10] != ' ')) return null;
+    if (s[13] != ':' or s[16] != ':') return null;
+
+    const year = parse4(s, 0) orelse return null;
+    const month = parse2(s, 5) orelse return null;
+    const day = parse2(s, 8) orelse return null;
+    const hour = parse2(s, 11) orelse return null;
+    const minute = parse2(s, 14) orelse return null;
+    const second = parse2(s, 17) orelse return null;
+
+    if (month < 1 or month > 12 or day < 1 or day > daysInMonth(year, month)) return null;
+    if (hour > 23 or minute > 59 or second > 60) return null; // 60 for leap seconds
+
+    var i: usize = 19;
+    // Optional fractional seconds.
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        var saw_digit = false;
+        while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) saw_digit = true;
+        if (!saw_digit) return null;
+    }
+
+    if (i >= s.len) return null;
+    var offset_secs: i64 = 0;
+    switch (s[i]) {
+        'Z', 'z' => i += 1,
+        '+', '-' => {
+            const sign: i64 = if (s[i] == '-') -1 else 1;
+            if (i + 6 > s.len) return null;
+            if (s[i + 3] != ':') return null;
+            const oh = parse2(s, i + 1) orelse return null;
+            const om = parse2(s, i + 4) orelse return null;
+            if (oh > 23 or om > 59) return null;
+            offset_secs = sign * (@as(i64, oh) * 3600 + @as(i64, om) * 60);
+            i += 6;
+        },
+        else => return null,
+    }
+    // Trailing garbage fails the parse (chrono is strict about a complete match).
+    if (i != s.len) return null;
+
+    const local_secs = civilToEpochSeconds(year, month, day, hour, minute, second);
+    return local_secs - offset_secs;
+}
+
+/// Sort timestamp extracted from a ranked item. Prefers
+/// `web_preview.discovered_at`; falls back to the `feed_item` JSON's
+/// `post.indexedAt` then `publishedAt`; else empty string. Mirrors
+/// `item_sort_timestamp` in ranker.rs:359.
+pub fn item_sort_timestamp(item: PersonalizedFeedItem) []const u8 {
+    if (item.web_preview) |wp| {
+        if (wp.discovered_at.len > 0) return wp.discovered_at;
+    }
+    // The Zig PersonalizedFeedItem stores feed_item as an opaque JSON blob.
+    // A full JSON lookup would require parsing; for the pilot we expose the
+    // discovered_at path (the only one used in the test fixtures) and treat
+    // the JSON path as a TODO until the JSON shape is needed by callers.
+    // TODO(slice-7): parse feed_item_json for post.indexedAt / publishedAt.
+    return "";
+}
+
+/// Freshness bonus for a ranked item based on its age. Mirrors
+/// `candidate_freshness_bonus` in ranker.rs:301. Returns 0 if the timestamp
+/// is missing or unparseable, else a tiered bonus:
+///   ≤24h → KEYWORD_PROFILE_FRESHNESS_BONUS_MAX
+///   ≤72h → max × 0.5
+///   ≤168h → max × 0.2
+///   else → 0
+pub fn candidate_freshness_bonus(item: PersonalizedFeedItem, now_epoch: i64) f32 {
+    const ts = item_sort_timestamp(item);
+    if (ts.len == 0) return 0.0;
+    const parsed_epoch = parse_rfc3339(ts) orelse return 0.0;
+    const age_secs = now_epoch - parsed_epoch;
+    if (age_secs < 0) return KEYWORD_PROFILE_FRESHNESS_BONUS_MAX;
+    const age_hours = @as(f32, @floatFromInt(age_secs)) / 3600.0;
+    if (age_hours <= 24.0) return KEYWORD_PROFILE_FRESHNESS_BONUS_MAX;
+    if (age_hours <= 72.0) return KEYWORD_PROFILE_FRESHNESS_BONUS_MAX * 0.5;
+    if (age_hours <= 168.0) return KEYWORD_PROFILE_FRESHNESS_BONUS_MAX * 0.2;
+    return 0.0;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Ranking comparators + interleave.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Three-key comparison for sorting ranked candidates: score desc, then
+/// timestamp desc (lexicographic on the raw string — matches Rust's `&str`
+/// comparison), then original_index asc. Mirrors `rank_candidate_cmp` in
+/// ranker.rs:332.
+pub fn rank_candidate_cmp(left: RankedCandidate, right: RankedCandidate) std.math.Order {
+    const neg_inf: f32 = -std.math.inf(f32);
+    const l = if (std.math.isNan(left.score)) neg_inf else left.score;
+    const r = if (std.math.isNan(right.score)) neg_inf else right.score;
+    if (l != r) {
+        // Descending by score: left ranks first (Less) when its score is higher.
+        return if (l > r) .lt else .gt;
+    }
+    // Tie on score → descending by timestamp string (lexicographic).
+    const lt_ts = item_sort_timestamp(left.item);
+    const rt_ts = item_sort_timestamp(right.item);
+    const ts_order = std.mem.order(u8, rt_ts, lt_ts);
+    if (ts_order != .eq) return ts_order;
+    // Final tiebreak → ascending original_index.
+    if (left.original_index < right.original_index) return .lt;
+    if (left.original_index > right.original_index) return .gt;
+    return .eq;
+}
+
+/// Lowercased "source mix" key for interleaving. Prefers the feed_source
+/// label when non-empty, else falls back to source_type. Mirrors
+/// `candidate_source_mix_key` in ranker.rs:347.
+pub fn candidate_source_mix_key(allocator: std.mem.Allocator, item: PersonalizedFeedItem) ![]u8 {
+    if (item.feed_source) |src| {
+        const trimmed = std.mem.trim(u8, src.label, " \t\n\r");
+        if (trimmed.len > 0) {
+            return asciiLowerOwned(allocator, trimmed);
+        }
+    }
+    const trimmed = std.mem.trim(u8, item.source_type, " \t\n\r");
+    return asciiLowerOwned(allocator, trimmed);
+}
+
+fn asciiLowerOwned(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, s.len);
+    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
+    return out;
+}
+
+/// Round-robin interleave ranked candidates by source-key bucket so no single
+/// source dominates the top of the feed. Mirrors
+/// `interleave_ranked_candidates_by_source` in ranker.rs:380.
+///
+/// Takes the already-sorted ranked candidates and `limit`; returns a fresh
+/// slice (allocator-owned) of interleaved candidates. Caller owns the slice
+/// (the items inside are copied by value and their inner slices alias the
+/// originals — do not free those).
+pub fn interleave_ranked_candidates_by_source(
+    allocator: std.mem.Allocator,
+    ranked: []RankedCandidate,
+    limit: usize,
+) ![]RankedCandidate {
+    if (ranked.len <= 2) {
+        const take = @min(ranked.len, limit);
+        const out = try allocator.alloc(RankedCandidate, take);
+        @memcpy(out, ranked[0..take]);
+        return out;
+    }
+
+    // Bucket by source key, preserving first-seen order of buckets.
+    var bucket_keys = std.ArrayList([]u8).empty;
+    defer {
+        for (bucket_keys.items) |k| allocator.free(k);
+        bucket_keys.deinit(allocator);
+    }
+    var buckets = std.ArrayList(std.ArrayList(RankedCandidate)).empty;
+    defer {
+        for (buckets.items) |*b| b.deinit(allocator);
+        buckets.deinit(allocator);
+    }
+
+    for (ranked) |c| {
+        const key = try candidate_source_mix_key(allocator, c.item);
+        var found: ?usize = null;
+        for (bucket_keys.items, 0..) |k, idx| {
+            if (std.mem.eql(u8, k, key)) {
+                found = idx;
+                break;
+            }
+        }
+        allocator.free(key);
+        if (found) |idx| {
+            try buckets.items[idx].append(allocator, c);
+        } else {
+            const owned_key = try candidate_source_mix_key(allocator, c.item);
+            try bucket_keys.append(allocator, owned_key);
+            var new_bucket = std.ArrayList(RankedCandidate).empty;
+            try new_bucket.append(allocator, c);
+            try buckets.append(allocator, new_bucket);
+        }
+    }
+
+    if (buckets.items.len <= 1) {
+        const take = @min(ranked.len, limit);
+        const out = try allocator.alloc(RankedCandidate, take);
+        @memcpy(out, ranked[0..take]);
+        return out;
+    }
+
+    var out = std.ArrayList(RankedCandidate).empty;
+    errdefer out.deinit(allocator);
+    while (true) {
+        var advanced = false;
+        for (buckets.items) |*b| {
+            if (b.items.len == 0) continue;
+            try out.append(allocator, b.orderedRemove(0));
+            advanced = true;
+            if (out.items.len >= limit) return out.toOwnedSlice(allocator);
+        }
+        if (!advanced) break;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// rank_candidates_stage2 — keyword-path orchestrator (no embedder).
+// Mirrors `rank_candidates_stage2` in ranker.rs:123.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Rank candidates using the keyword path (stage 2). Pure orchestrator over
+/// the helpers above; takes a `now_epoch` for deterministic freshness scoring.
+/// The returned slice and each item's mutable fields (score, matched_*,
+/// passed_threshold) are allocator-owned COPIES of the inputs — the caller's
+/// candidates are not mutated.
+pub fn rank_candidates_stage2(
+    allocator: std.mem.Allocator,
+    profile: FeedProfile,
+    candidates: []const FeedCandidate,
+    limit: usize,
+    now_epoch: i64,
+) ![]PersonalizedFeedItem {
+    const keyword_weights = try weighted_interest_keywords(allocator, profile);
+    defer allocator.free(keyword_weights);
+
+    var ranked = std.ArrayList(RankedCandidate).empty;
+    defer ranked.deinit(allocator);
+
+    for (candidates) |candidate| {
+        const kws = try keyword_weight_sum(allocator, candidate.rank_text, keyword_weights);
+        const freshness_bonus = candidate_freshness_bonus(candidate.item, now_epoch);
+        const penalty = try negative_keyword_penalty(allocator, candidate.rank_text, profile.negative_interests);
+        const final_score = kws.sum +
+            freshness_bonus +
+            (candidate.stage1_score * KEYWORD_PROFILE_SOURCE_BONUS) -
+            penalty;
+
+        var item = candidate.item;
+        item.score = final_score;
+        item.matched_interest_label = kws.best;
+        item.matched_interest_score = if (kws.sum > 0.0) kws.sum else null;
+        item.passed_threshold = final_score > 0.0;
+        try ranked.append(allocator, .{
+            .dedupe_key = candidate.dedupe_key,
+            .item = item,
+            .original_index = candidate.original_index,
+            .score = final_score,
+        });
+    }
+
+    // Dedupe by dedupe_key, keeping the better-ranked candidate per key.
+    var deduped = std.StringHashMap(RankedCandidate).init(allocator);
+    defer deduped.deinit();
+    for (ranked.items) |c| {
+        const gop = try deduped.getOrPut(c.dedupe_key);
+        if (gop.found_existing) {
+            // Keep the new candidate only if it strictly outranks the existing.
+            if (rank_candidate_cmp(c, gop.value_ptr.*) == .lt) continue;
+        }
+        gop.value_ptr.* = c;
+    }
+
+    var deduped_list = std.ArrayList(RankedCandidate).empty;
+    defer deduped_list.deinit(allocator);
+    var it = deduped.valueIterator();
+    while (it.next()) |v| try deduped_list.append(allocator, v.*);
+    std.mem.sort(RankedCandidate, deduped_list.items, {}, struct {
+        fn lt(_: void, a: RankedCandidate, b: RankedCandidate) bool {
+            return rank_candidate_cmp(a, b) == .lt;
+        }
+    }.lt);
+
+    const interleaved = try interleave_ranked_candidates_by_source(allocator, deduped_list.items, limit);
+    defer allocator.free(interleaved);
+
+    const out = try allocator.alloc(PersonalizedFeedItem, interleaved.len);
+    for (interleaved, 0..) |c, i| out[i] = c.item;
+    return out;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// rank_candidates — embedder-driven path. Mirrors the async
+// `FeedRanker::rank_candidates` in ranker.rs:40, but synchronous with an
+// injected embedder callback (idiomatic Zig dependency injection, replacing
+// tokio + Arc<dyn EmbeddingProvider>).
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Embedder interface: a function pointer that embeds a batch of texts into
+/// f32 vectors. Each returned vector's lifetime is owned by the caller (the
+/// embedder writes into a caller-provided buffer or returns allocator-owned
+/// slices via the `out_vecs` ArrayList).
+pub const Embedder = struct {
+    ctx: *anyopaque,
+    embed_fn: *const fn (ctx: *anyopaque, texts: []const []const u8, out_vecs: *std.ArrayList([]f32), allocator: std.mem.Allocator) anyerror!void,
+
+    pub fn embed(
+        self: Embedder,
+        allocator: std.mem.Allocator,
+        texts: []const []const u8,
+    ) ![][]f32 {
+        var out_vecs = std.ArrayList([]f32).empty;
+        errdefer {
+            for (out_vecs.items) |v| allocator.free(v);
+            out_vecs.deinit(allocator);
+        }
+        try self.embed_fn(self.ctx, texts, &out_vecs, allocator);
+        return out_vecs.toOwnedSlice(allocator);
+    }
+};
+
+/// Helper to free the slice-of-slices returned by `Embedder.embed`.
+pub fn freeEmbeddings(allocator: std.mem.Allocator, vecs: [][]f32) void {
+    for (vecs) |v| allocator.free(v);
+    allocator.free(vecs);
+}
+
+/// Rank candidates via the embedding path (stage 1 weighted + stage 2). Mirrors
+/// `FeedRanker::rank_candidates` in ranker.rs:40. Synchronous — the embedder is
+/// injected via a function pointer.
+///
+/// Returns the ranked items (allocator-owned slice; inner slices alias inputs).
+pub fn rank_candidates(
+    allocator: std.mem.Allocator,
+    embedder: Embedder,
+    profile: FeedProfile,
+    candidates: []const FeedCandidate,
+    limit: usize,
+) ![]PersonalizedFeedItem {
+    if (profile.interests.len == 0 or candidates.len == 0) return &.{};
+
+    const lexical_terms = try top_interest_terms(allocator, profile);
+    defer freeTerms(allocator, lexical_terms);
+
+    // Pass lexical gate + truncate rank_text to FEED_PROFILE_MAX_CHARS.
+    var texts = std.ArrayList([]const u8).empty;
+    defer texts.deinit(allocator);
+    var kept_candidates = std.ArrayList(FeedCandidate).empty;
+    defer kept_candidates.deinit(allocator);
+
+    for (candidates) |candidate| {
+        const trimmed = std.mem.trim(u8, candidate.rank_text, " \t\n\r");
+        if (trimmed.len == 0) continue;
+        if (!passes_lexical_gate(trimmed, lexical_terms, candidate.stage1_score)) continue;
+        // Truncate to FEED_PROFILE_MAX_CHARS for the embedder call (best-effort;
+        // embedders typically have their own token budgets).
+        const text_slice = if (trimmed.len > FEED_PROFILE_MAX_CHARS) trimmed[0..FEED_PROFILE_MAX_CHARS] else trimmed;
+        try texts.append(allocator, text_slice);
+        try kept_candidates.append(allocator, candidate);
+    }
+    if (kept_candidates.items.len == 0) return &.{};
+
+    const embeddings = try embedder.embed(allocator, texts.items);
+    defer freeEmbeddings(allocator, embeddings);
+
+    var ranked = std.ArrayList(RankedCandidate).empty;
+    defer ranked.deinit(allocator);
+    var has_strong_match = false;
+
+    for (kept_candidates.items, 0..) |candidate, i| {
+        const embedding = embeddings[i];
+        const m = best_interest_match(embedding, profile.interests);
+        const penalty = try negative_keyword_penalty(allocator, candidate.rank_text, profile.negative_interests);
+        const final_score = STAGE1_SOURCE_WEIGHT * candidate.stage1_score +
+            STAGE2_ITEM_WEIGHT * m.weighted -
+            penalty;
+        var item = candidate.item;
+        item.score = final_score;
+        item.matched_interest_label = m.label;
+        item.matched_interest_score = if (m.similarity > 0.0) m.similarity else null;
+        item.passed_threshold = final_score >= FEED_MATCH_THRESHOLD;
+        if (item.passed_threshold) has_strong_match = true;
+        try ranked.append(allocator, .{
+            .dedupe_key = candidate.dedupe_key,
+            .item = item,
+            .original_index = candidate.original_index,
+            .score = final_score,
+        });
+    }
+
+    // Dedupe by dedupe_key, keeping the better-ranked candidate per key.
+    var deduped = std.StringHashMap(RankedCandidate).init(allocator);
+    defer deduped.deinit();
+    for (ranked.items) |c| {
+        const gop = try deduped.getOrPut(c.dedupe_key);
+        if (gop.found_existing) {
+            if (rank_candidate_cmp(c, gop.value_ptr.*) == .lt) continue;
+        }
+        gop.value_ptr.* = c;
+    }
+    var deduped_list = std.ArrayList(RankedCandidate).empty;
+    defer deduped_list.deinit(allocator);
+    var it = deduped.valueIterator();
+    while (it.next()) |v| try deduped_list.append(allocator, v.*);
+    std.mem.sort(RankedCandidate, deduped_list.items, {}, struct {
+        fn lt(_: void, a: RankedCandidate, b: RankedCandidate) bool {
+            return rank_candidate_cmp(a, b) == .lt;
+        }
+    }.lt);
+
+    // If any candidate passed threshold, retain only passing candidates.
+    if (has_strong_match) {
+        var retained = std.ArrayList(RankedCandidate).empty;
+        defer retained.deinit(allocator);
+        for (deduped_list.items) |c| {
+            if (c.item.passed_threshold) try retained.append(allocator, c);
+        }
+        const interleaved = try interleave_ranked_candidates_by_source(allocator, retained.items, limit);
+        defer allocator.free(interleaved);
+        const out = try allocator.alloc(PersonalizedFeedItem, interleaved.len);
+        for (interleaved, 0..) |c, i| out[i] = c.item;
+        return out;
+    } else {
+        const interleaved = try interleave_ranked_candidates_by_source(allocator, deduped_list.items, limit);
+        defer allocator.free(interleaved);
+        const out = try allocator.alloc(PersonalizedFeedItem, interleaved.len);
+        for (interleaved, 0..) |c, i| out[i] = c.item;
+        return out;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Tests — pure helpers.
 // The negative_keyword_penalty tests are verbatim ports of the 3 Rust tests at
 // src/feed/ranker.rs:664-702.
@@ -454,4 +937,346 @@ test "keyword_match_score: 0.65 base, +0.15 per extra match, capped at 1.0" {
 test "keyword_match_score: empty keywords returns 0" {
     const a = testing.allocator;
     try testing.expectEqual(@as(f32, 0.0), try keyword_match_score(a, "anything", &.{}));
+}
+
+// ── RFC3339 parser tests ──────────────────────────────────────────────────
+
+test "parse_rfc3339: Zulu timestamp" {
+    // 2026-07-19T20:47:00Z → known epoch value.
+    const ts = parse_rfc3339("2026-07-19T20:47:00Z");
+    try testing.expect(ts != null);
+    // Sanity: same instant via +00:00 offset must match.
+    const ts2 = parse_rfc3339("2026-07-19T20:47:00+00:00");
+    try testing.expectEqual(ts.?, ts2.?);
+}
+
+test "parse_rfc3339: offset shifts the epoch" {
+    // 12:00 UTC vs 12:00+02:00 (== 10:00 UTC) — differ by 2 hours.
+    const a = parse_rfc3339("2026-07-19T12:00:00Z").?;
+    const b = parse_rfc3339("2026-07-19T12:00:00+02:00").?;
+    try testing.expectEqual(@as(i64, 2 * 3600), a - b);
+}
+
+test "parse_rfc3339: fractional seconds accepted" {
+    const a = parse_rfc3339("2026-07-19T12:00:00.123Z");
+    const b = parse_rfc3339("2026-07-19T12:00:00.123456789Z");
+    try testing.expect(a != null);
+    try testing.expect(b != null);
+    // Fractional part is ignored (we truncate to whole seconds, like chrono's
+    // second-level comparison the ranker uses).
+    try testing.expectEqual(a.?, b.?);
+}
+
+test "parse_rfc3339: lowercase t and space separators accepted" {
+    const a = parse_rfc3339("2026-07-19T20:47:00Z");
+    const t_lower = parse_rfc3339("2026-07-19t20:47:00Z");
+    const space = parse_rfc3339("2026-07-19 20:47:00Z");
+    try testing.expect(t_lower != null);
+    try testing.expect(space != null);
+    try testing.expectEqual(a.?, t_lower.?);
+    try testing.expectEqual(a.?, space.?);
+}
+
+test "parse_rfc3339: malformed returns null" {
+    try testing.expect(parse_rfc3339("") == null);
+    try testing.expect(parse_rfc3339("not-a-date") == null);
+    try testing.expect(parse_rfc3339("2026-13-01T00:00:00Z") == null); // bad month
+    try testing.expect(parse_rfc3339("2026-02-30T00:00:00Z") == null); // bad day
+    try testing.expect(parse_rfc3339("2026-07-19T25:00:00Z") == null); // bad hour
+    try testing.expect(parse_rfc3339("2026-07-19T20:47:00") == null); // no Z/offset
+    try testing.expect(parse_rfc3339("2026-07-19T20:47:00Zextra") == null); // trailing
+}
+
+test "parse_rfc3339: leap year Feb 29 valid in 2024" {
+    try testing.expect(parse_rfc3339("2024-02-29T00:00:00Z") != null);
+    try testing.expect(parse_rfc3339("2023-02-29T00:00:00Z") == null);
+}
+
+// ── Freshness tests ───────────────────────────────────────────────────────
+
+test "candidate_freshness_bonus: tiered by age" {
+    // Anchor "now" = 2026-07-19T20:47:00Z.
+    const now = parse_rfc3339("2026-07-19T20:47:00Z").?;
+    const max = KEYWORD_PROFILE_FRESHNESS_BONUS_MAX;
+
+    const recent = PersonalizedFeedItem{
+        .source_type = "web",
+        .feed_item_json = "{}",
+        .web_preview = .{
+            .url = "u",
+            .title = "t",
+            .description = "",
+            .content_text = "",
+            .domain = "d",
+            .provider = "p",
+            .discovered_at = "2026-07-19T10:47:00Z", // 10h ago
+        },
+    };
+    try testing.expect(@abs(candidate_freshness_bonus(recent, now) - max) < 1e-6);
+
+    const day_old = PersonalizedFeedItem{
+        .source_type = "web",
+        .feed_item_json = "{}",
+        .web_preview = .{
+            .url = "u",
+            .title = "t",
+            .description = "",
+            .content_text = "",
+            .domain = "d",
+            .provider = "p",
+            .discovered_at = "2026-07-17T10:47:00Z", // ~58h ago
+        },
+    };
+    try testing.expect(@abs(candidate_freshness_bonus(day_old, now) - max * 0.5) < 1e-6);
+
+    const week_old = PersonalizedFeedItem{
+        .source_type = "web",
+        .feed_item_json = "{}",
+        .web_preview = .{
+            .url = "u",
+            .title = "t",
+            .description = "",
+            .content_text = "",
+            .domain = "d",
+            .provider = "p",
+            .discovered_at = "2026-07-15T10:47:00Z", // ~106h ago
+        },
+    };
+    try testing.expect(@abs(candidate_freshness_bonus(week_old, now) - max * 0.2) < 1e-6);
+
+    const ancient = PersonalizedFeedItem{
+        .source_type = "web",
+        .feed_item_json = "{}",
+        .web_preview = .{
+            .url = "u",
+            .title = "t",
+            .description = "",
+            .content_text = "",
+            .domain = "d",
+            .provider = "p",
+            .discovered_at = "2020-01-01T00:00:00Z",
+        },
+    };
+    try testing.expectEqual(@as(f32, 0.0), candidate_freshness_bonus(ancient, now));
+}
+
+test "candidate_freshness_bonus: no timestamp returns 0" {
+    const item = PersonalizedFeedItem{
+        .source_type = "web",
+        .feed_item_json = "{}",
+    };
+    try testing.expectEqual(@as(f32, 0.0), candidate_freshness_bonus(item, 1_000_000));
+}
+
+test "candidate_freshness_bonus: malformed timestamp returns 0" {
+    const item = PersonalizedFeedItem{
+        .source_type = "web",
+        .feed_item_json = "{}",
+        .web_preview = .{
+            .url = "u",
+            .title = "t",
+            .description = "",
+            .content_text = "",
+            .domain = "d",
+            .provider = "p",
+            .discovered_at = "not-a-date",
+        },
+    };
+    try testing.expectEqual(@as(f32, 0.0), candidate_freshness_bonus(item, 1_000_000));
+}
+
+// ── Comparator + interleave tests ──────────────────────────────────────────
+
+fn makeRanked(score: f32, ts: []const u8, idx: usize) RankedCandidate {
+    return .{
+        .dedupe_key = "",
+        .item = .{
+            .source_type = "web",
+            .feed_item_json = "{}",
+            .web_preview = if (ts.len > 0) .{
+                .url = "u",
+                .title = "t",
+                .description = "",
+                .content_text = "",
+                .domain = "d",
+                .provider = "p",
+                .discovered_at = ts,
+            } else null,
+        },
+        .original_index = idx,
+        .score = score,
+    };
+}
+
+test "rank_candidate_cmp: score desc primary" {
+    const a = makeRanked(0.9, "", 1);
+    const b = makeRanked(0.5, "", 2);
+    try testing.expectEqual(std.math.Order.lt, rank_candidate_cmp(a, b)); // a ranks higher
+    try testing.expectEqual(std.math.Order.gt, rank_candidate_cmp(b, a));
+}
+
+test "rank_candidate_cmp: timestamp breaks ties, descending" {
+    const a = makeRanked(0.5, "2026-07-19T10:00:00Z", 1);
+    const b = makeRanked(0.5, "2026-07-18T10:00:00Z", 2);
+    try testing.expectEqual(std.math.Order.lt, rank_candidate_cmp(a, b)); // newer ranks higher
+}
+
+test "rank_candidate_cmp: original_index breaks further ties, ascending" {
+    const a = makeRanked(0.5, "", 1);
+    const b = makeRanked(0.5, "", 2);
+    try testing.expectEqual(std.math.Order.lt, rank_candidate_cmp(a, b));
+}
+
+test "interleave: single bucket returns in order" {
+    const a = testing.allocator;
+    var items = [_]RankedCandidate{
+        makeRanked(0.9, "", 0),
+        makeRanked(0.8, "", 1),
+    };
+    // Both items share source_type "web" and no feed_source label → same bucket.
+    const out = try interleave_ranked_candidates_by_source(a, &items, 10);
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+}
+
+test "interleave: two buckets round-robin" {
+    const a = testing.allocator;
+    var items = [_]RankedCandidate{
+        .{ .dedupe_key = "", .item = .{ .source_type = "bluesky", .feed_item_json = "{}" }, .original_index = 0, .score = 0.9 },
+        .{ .dedupe_key = "", .item = .{ .source_type = "bluesky", .feed_item_json = "{}" }, .original_index = 1, .score = 0.8 },
+        .{ .dedupe_key = "", .item = .{ .source_type = "web", .feed_item_json = "{}" }, .original_index = 2, .score = 0.7 },
+    };
+    const out = try interleave_ranked_candidates_by_source(a, &items, 10);
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 3), out.len);
+    // Round-robin: bluesky, web, bluesky.
+    try testing.expectEqualStrings("bluesky", out[0].item.source_type);
+    try testing.expectEqualStrings("web", out[1].item.source_type);
+    try testing.expectEqualStrings("bluesky", out[2].item.source_type);
+}
+
+test "interleave: respects limit" {
+    const a = testing.allocator;
+    var items = [_]RankedCandidate{
+        .{ .dedupe_key = "", .item = .{ .source_type = "bluesky", .feed_item_json = "{}" }, .original_index = 0, .score = 0.9 },
+        .{ .dedupe_key = "", .item = .{ .source_type = "web", .feed_item_json = "{}" }, .original_index = 1, .score = 0.8 },
+        .{ .dedupe_key = "", .item = .{ .source_type = "bluesky", .feed_item_json = "{}" }, .original_index = 2, .score = 0.7 },
+        .{ .dedupe_key = "", .item = .{ .source_type = "web", .feed_item_json = "{}" }, .original_index = 3, .score = 0.6 },
+    };
+    const out = try interleave_ranked_candidates_by_source(a, &items, 2);
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+}
+
+// ── rank_candidates_stage2 test ───────────────────────────────────────────
+
+test "rank_candidates_stage2: keyword path ranks and dedupes" {
+    const a = testing.allocator;
+    const interests = [_]InterestVector{
+        .{ .id = "i1", .label = "rust", .embedding = &.{}, .health_score = 0.9, .source_path = "", .keywords = &.{"rust"} },
+    };
+    const profile = FeedProfile{ .interests = &interests };
+    var cands = [_]FeedCandidate{
+        .{
+            .protocol = .web,
+            .dedupe_key = "k1",
+            .stage1_score = 0.5,
+            .rank_text = "an article about rust the language",
+            .item = .{ .source_type = "web", .feed_item_json = "{}" },
+            .original_index = 0,
+        },
+        .{
+            .protocol = .web,
+            .dedupe_key = "k2",
+            .stage1_score = 0.1,
+            .rank_text = "celebrity gossip and nothing relevant",
+            .item = .{ .source_type = "web", .feed_item_json = "{}" },
+            .original_index = 1,
+        },
+    };
+    const now = parse_rfc3339("2026-07-19T20:47:00Z").?;
+    const out = try rank_candidates_stage2(a, profile, &cands, 10, now);
+    defer a.free(out);
+    try testing.expect(out.len >= 1);
+    // The rust article should rank higher than the gossip one (keyword match).
+    try testing.expectEqualStrings("web", out[0].source_type);
+    // First item should have a non-null matched_interest_label ("rust").
+    try testing.expect(out[0].matched_interest_label != null);
+    try testing.expectEqualStrings("rust", out[0].matched_interest_label.?);
+}
+
+// ── rank_candidates (embedder path) test with a deterministic stub ───────
+
+/// Deterministic embedder: returns a vector that mirrors the query embedding
+/// for "rust"-containing texts (so they match the "rust" interest) and zero
+/// otherwise. Used to exercise rank_candidates end-to-end without real inference.
+const StubEmbedderCtx = struct {
+    dim: usize,
+};
+fn stubEmbed(
+    ctx: *anyopaque,
+    texts: []const []const u8,
+    out_vecs: *std.ArrayList([]f32),
+    allocator: std.mem.Allocator,
+) !void {
+    const self: *StubEmbedderCtx = @ptrCast(@alignCast(ctx));
+    for (texts) |t| {
+        const v = try allocator.alloc(f32, self.dim);
+        // If the text mentions "rust", produce a vector aligned with the test
+        // interest's embedding [1.0, 0.0, ...]; else zero vector.
+        const mentions_rust = std.mem.indexOf(u8, t, "rust") != null;
+        if (mentions_rust) {
+            v[0] = 1.0;
+            for (v[1..]) |*x| x.* = 0.0;
+        } else {
+            for (v) |*x| x.* = 0.0;
+        }
+        try out_vecs.append(allocator, v);
+    }
+}
+
+test "rank_candidates: embedder path returns passing candidates first" {
+    const a = testing.allocator;
+    var ctx = StubEmbedderCtx{ .dim = 3 };
+    const embedder = Embedder{ .ctx = &ctx, .embed_fn = stubEmbed };
+
+    const emb = [_]f32{ 1.0, 0.0, 0.0 };
+    const interests = [_]InterestVector{
+        .{ .id = "i1", .label = "rust", .embedding = &emb, .health_score = 1.0, .source_path = "", .keywords = &.{"rust"} },
+    };
+    const profile = FeedProfile{ .interests = &interests };
+
+    var cands = [_]FeedCandidate{
+        .{
+            .protocol = .web,
+            .dedupe_key = "k1",
+            .stage1_score = 1.0,
+            .rank_text = "all about rust programming",
+            .item = .{ .source_type = "web", .feed_item_json = "{}" },
+            .original_index = 0,
+        },
+        .{
+            .protocol = .web,
+            .dedupe_key = "k2",
+            .stage1_score = 0.5,
+            .rank_text = "celebrity gossip",
+            .item = .{ .source_type = "web", .feed_item_json = "{}" },
+            .original_index = 1,
+        },
+    };
+    const out = try rank_candidates(a, embedder, profile, &cands, 10);
+    defer a.free(out);
+    // The rust candidate should rank first (similarity 1.0 × health 1.0 × 0.72
+    // + stage1 1.0 × 0.28 = 1.0 ≥ threshold 0.62 → passes).
+    try testing.expect(out.len >= 1);
+    try testing.expect(out[0].passed_threshold);
+}
+
+test "rank_candidates: empty inputs return empty" {
+    const a = testing.allocator;
+    var ctx = StubEmbedderCtx{ .dim = 3 };
+    const embedder = Embedder{ .ctx = &ctx, .embed_fn = stubEmbed };
+    const empty_profile = FeedProfile{};
+    const out = try rank_candidates(a, embedder, empty_profile, &.{}, 10);
+    try testing.expectEqual(@as(usize, 0), out.len);
 }
