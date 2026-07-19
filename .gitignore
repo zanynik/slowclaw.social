@@ -41,7 +41,7 @@ credentials.json
 # Zig toolchain (downloaded locally, never committed — ~177MB binary)
 tools/
 
-# Zig build output (zig-src pilot)
-zig-src/zig-cache/
+# Zig build output (zig-src pilot) — Zig 0.16 uses .zig-cache
+zig-src/.zig-cache/
 zig-src/zig-out/
 

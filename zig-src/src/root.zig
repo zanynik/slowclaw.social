@@ -13,13 +13,24 @@
 
 const std = @import("std");
 
-// Re-export sub-modules as they land. Placeholder until slice 2.
-// pub const vector_math = @import("vector_math.zig");
+// Re-export sub-modules as they land.
+pub const vector_math = @import("vector_math.zig");
 // pub const text_util = @import("text_util.zig");
 // pub const tokenize = @import("tokenize.zig");
 // pub const feed_types = @import("feed_types.zig");
 // pub const ranker = @import("ranker.zig");
 
-test "skeleton: package imports std and builds" {
-    try std.testing.expect(@import("std").mem.eql(u8, "ok", "ok"));
+test {
+    // Zig 0.16 only collects test blocks from the root source file of a test
+    // binary; transitively-imported modules must be referenced here so their
+    // `test {}` blocks are included in `zig build test`. Add one line per
+    // sub-module.
+    _ = vector_math;
+    // _ = text_util;
+    // _ = tokenize;
+    // _ = feed_types;
+    // _ = ranker;
+
+    // Sanity: std is reachable.
+    try std.testing.expect(std.mem.eql(u8, "ok", "ok"));
 }
