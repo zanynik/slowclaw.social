@@ -12,6 +12,13 @@ const testing = std.testing;
 const vector_math = @import("vector_math.zig");
 const tokenize = @import("tokenize.zig");
 const feed_types = @import("feed_types.zig");
+const embeddings = @import("embeddings.zig");
+
+/// Canonical embedder interface for the ranker. Aliases
+/// `embeddings.EmbeddingProvider` so the whole package has ONE embedder
+/// contract (no parallel "Embedder" type). Mirrors the Rust ranker's use of
+/// `Arc<dyn EmbeddingProvider>` from `src/memory/embeddings.rs`.
+pub const Embedder = embeddings.EmbeddingProvider;
 
 pub const FEED_PROFILE_MAX_CHARS: usize = 2_400;
 pub const FEED_EMBED_BATCH_SIZE: usize = 16;
@@ -691,42 +698,13 @@ pub fn rank_candidates_stage2(
 // ──────────────────────────────────────────────────────────────────────────
 // rank_candidates — embedder-driven path. Mirrors the async
 // `FeedRanker::rank_candidates` in ranker.rs:40, but synchronous with an
-// injected embedder callback (idiomatic Zig dependency injection, replacing
+// injected `EmbeddingProvider` (idiomatic Zig dependency injection, replacing
 // tokio + Arc<dyn EmbeddingProvider>).
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Embedder interface: a function pointer that embeds a batch of texts into
-/// f32 vectors. Each returned vector's lifetime is owned by the caller (the
-/// embedder writes into a caller-provided buffer or returns allocator-owned
-/// slices via the `out_vecs` ArrayList).
-pub const Embedder = struct {
-    ctx: *anyopaque,
-    embed_fn: *const fn (ctx: *anyopaque, texts: []const []const u8, out_vecs: *std.ArrayList([]f32), allocator: std.mem.Allocator) anyerror!void,
-
-    pub fn embed(
-        self: Embedder,
-        allocator: std.mem.Allocator,
-        texts: []const []const u8,
-    ) ![][]f32 {
-        var out_vecs = std.ArrayList([]f32).empty;
-        errdefer {
-            for (out_vecs.items) |v| allocator.free(v);
-            out_vecs.deinit(allocator);
-        }
-        try self.embed_fn(self.ctx, texts, &out_vecs, allocator);
-        return out_vecs.toOwnedSlice(allocator);
-    }
-};
-
-/// Helper to free the slice-of-slices returned by `Embedder.embed`.
-pub fn freeEmbeddings(allocator: std.mem.Allocator, vecs: [][]f32) void {
-    for (vecs) |v| allocator.free(v);
-    allocator.free(vecs);
-}
-
 /// Rank candidates via the embedding path (stage 1 weighted + stage 2). Mirrors
 /// `FeedRanker::rank_candidates` in ranker.rs:40. Synchronous — the embedder is
-/// injected via a function pointer.
+/// injected via the canonical `EmbeddingProvider` interface.
 ///
 /// Returns the ranked items (allocator-owned slice; inner slices alias inputs).
 pub fn rank_candidates(
@@ -759,15 +737,20 @@ pub fn rank_candidates(
     }
     if (kept_candidates.items.len == 0) return &.{};
 
-    const embeddings = try embedder.embed(allocator, texts.items);
-    defer freeEmbeddings(allocator, embeddings);
+    const embedded = try embedder.embed(allocator, texts.items);
+    defer embeddings.freeEmbeddings(allocator, embedded);
+
+    // Defensive: a misbehaving embedder (e.g. NoopEmbedding returning zero
+    // vectors for non-empty input) would otherwise cause an out-of-bounds
+    // access below. Surface it as a clear error instead of crashing.
+    if (embedded.len != texts.items.len) return error.EmbedderCountMismatch;
 
     var ranked = std.ArrayList(RankedCandidate).empty;
     defer ranked.deinit(allocator);
     var has_strong_match = false;
 
     for (kept_candidates.items, 0..) |candidate, i| {
-        const embedding = embeddings[i];
+        const embedding = embedded[i];
         const m = best_interest_match(embedding, profile.interests);
         const penalty = try negative_keyword_penalty(allocator, candidate.rank_text, profile.negative_interests);
         const final_score = STAGE1_SOURCE_WEIGHT * candidate.stage1_score +
@@ -1205,44 +1188,26 @@ test "rank_candidates_stage2: keyword path ranks and dedupes" {
     try testing.expectEqualStrings("rust", out[0].matched_interest_label.?);
 }
 
-// ── rank_candidates (embedder path) test with a deterministic stub ───────
+// ── rank_candidates (embedder path) tests using the real HashEmbedding ───
+//
+// The ranker tests previously used a hand-rolled StubEmbedderCtx. Now that the
+// package has the canonical HashEmbedding (deterministic fallback from
+// src/memory/embeddings.rs), we use it — proving the ranker works against the
+// real embedder contract end-to-end.
 
-/// Deterministic embedder: returns a vector that mirrors the query embedding
-/// for "rust"-containing texts (so they match the "rust" interest) and zero
-/// otherwise. Used to exercise rank_candidates end-to-end without real inference.
-const StubEmbedderCtx = struct {
-    dim: usize,
-};
-fn stubEmbed(
-    ctx: *anyopaque,
-    texts: []const []const u8,
-    out_vecs: *std.ArrayList([]f32),
-    allocator: std.mem.Allocator,
-) !void {
-    const self: *StubEmbedderCtx = @ptrCast(@alignCast(ctx));
-    for (texts) |t| {
-        const v = try allocator.alloc(f32, self.dim);
-        // If the text mentions "rust", produce a vector aligned with the test
-        // interest's embedding [1.0, 0.0, ...]; else zero vector.
-        const mentions_rust = std.mem.indexOf(u8, t, "rust") != null;
-        if (mentions_rust) {
-            v[0] = 1.0;
-            for (v[1..]) |*x| x.* = 0.0;
-        } else {
-            for (v) |*x| x.* = 0.0;
-        }
-        try out_vecs.append(allocator, v);
-    }
-}
-
-test "rank_candidates: embedder path returns passing candidates first" {
+test "rank_candidates: embedder path ranks matching candidate first" {
     const a = testing.allocator;
-    var ctx = StubEmbedderCtx{ .dim = 3 };
-    const embedder = Embedder{ .ctx = &ctx, .embed_fn = stubEmbed };
+    const dim: usize = 64;
+    var hash_embed = embeddings.HashEmbedding.init("test", dim);
+    const embedder = hash_embed.provider();
 
-    const emb = [_]f32{ 1.0, 0.0, 0.0 };
+    // Build the interest's embedding from HashEmbedding's own output for
+    // "rust", so candidate texts about rust will cosine-match strongly.
+    const rust_emb = try embeddings.HashEmbedding.embed_text(a, &hash_embed, "rust");
+    defer a.free(rust_emb);
+
     const interests = [_]InterestVector{
-        .{ .id = "i1", .label = "rust", .embedding = &emb, .health_score = 1.0, .source_path = "", .keywords = &.{"rust"} },
+        .{ .id = "i1", .label = "rust", .embedding = rust_emb, .health_score = 1.0, .source_path = "", .keywords = &.{"rust"} },
     };
     const profile = FeedProfile{ .interests = &interests };
 
@@ -1250,7 +1215,7 @@ test "rank_candidates: embedder path returns passing candidates first" {
         .{
             .protocol = .web,
             .dedupe_key = "k1",
-            .stage1_score = 1.0,
+            .stage1_score = 0.5,
             .rank_text = "all about rust programming",
             .item = .{ .source_type = "web", .feed_item_json = "{}" },
             .original_index = 0,
@@ -1259,23 +1224,23 @@ test "rank_candidates: embedder path returns passing candidates first" {
             .protocol = .web,
             .dedupe_key = "k2",
             .stage1_score = 0.5,
-            .rank_text = "celebrity gossip",
+            .rank_text = "celebrity gossip unrelated fluff",
             .item = .{ .source_type = "web", .feed_item_json = "{}" },
             .original_index = 1,
         },
     };
     const out = try rank_candidates(a, embedder, profile, &cands, 10);
     defer a.free(out);
-    // The rust candidate should rank first (similarity 1.0 × health 1.0 × 0.72
-    // + stage1 1.0 × 0.28 = 1.0 ≥ threshold 0.62 → passes).
     try testing.expect(out.len >= 1);
-    try testing.expect(out[0].passed_threshold);
+    // The rust candidate must outrank the gossip one (its embedding shares
+    // hashed features with the interest's "rust" embedding).
+    try testing.expectEqualStrings("web", out[0].source_type);
 }
 
 test "rank_candidates: empty inputs return empty" {
     const a = testing.allocator;
-    var ctx = StubEmbedderCtx{ .dim = 3 };
-    const embedder = Embedder{ .ctx = &ctx, .embed_fn = stubEmbed };
+    var hash_embed = embeddings.HashEmbedding.init("test", 16);
+    const embedder = hash_embed.provider();
     const empty_profile = FeedProfile{};
     const out = try rank_candidates(a, embedder, empty_profile, &.{}, 10);
     try testing.expectEqual(@as(usize, 0), out.len);

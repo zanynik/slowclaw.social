@@ -47,6 +47,10 @@ zig-src/
     ranker.zig          # pure helpers, RFC3339 freshness, interleave,
                         #   rank_candidates (sync, embedder-injected),
                         #   rank_candidates_stage2
+    memory_types.zig    # MemoryEntry, MemoryCategory, Memory backend vtable
+    chunker.zig         # line-based markdown chunker (headings→paragraphs→lines)
+    embeddings.zig      # EmbeddingProvider vtable, NoopEmbedding, HashEmbedding
+                        #   (deterministic fallback; Builtin/OpenAi stay FFI-injected)
   README.md             # this file
 ```
 
@@ -81,6 +85,20 @@ capture expected values (`cargo test --lib memory::vector`,
   (Zig function pointer), replacing tokio + `Arc<dyn EmbeddingProvider>`. This
   is the idiomatic Zig shape; the iOS FFI slice will wrap the embedder call as a
   Swift callback through the C ABI.
+- **`Memory` and `EmbeddingProvider` traits are vtables**, not language traits.
+  Zig 0.16 traits can't express the multi-method + ctx contracts the way Rust
+  traits do; the struct-of-function-pointers + `*anyopaque` pattern is the
+  idiomatic equivalent and the same shape Swift will see through the C ABI.
+- **`HashEmbedding` Unicode handling**: text normalization lowercases ASCII
+  codepoints and passes non-ASCII letters through. Rust's `char::is_alphanumeric`
+  is fully Unicode; our ASCII fast path matches English text and treats
+  non-ASCII letters as separators (loose divergence). Extending to the Unicode
+  alpha table is a tracked follow-up if real journal input needs it.
+- **`BuiltinEmbedding` (tract-onnx + tokenizers) and `OpenAiEmbedding` (HTTP)**
+  are not ported — they have no Zig equivalents. They'll be implemented on the
+  Swift/iOS side (CoreML/Metal for on-device, URLSession for OpenAI-compatible)
+  and surfaced to the ranker via the same `EmbeddingProvider` vtable through the
+  C ABI in a later slice.
 
 ## Cross-validation against Rust
 
@@ -104,17 +122,29 @@ in `src/porter_stemmer.zig`).
 - [x] feed_types.zig — InterestVector, FeedProfile, FeedCandidate, …
 - [x] ranker.zig — pure helpers, RFC3339 freshness, interleave, rank_candidates
       (embedder-injected, sync), rank_candidates_stage2
+- [x] memory_types.zig — MemoryEntry, MemoryCategory, Memory backend vtable
+- [x] chunker.zig — line-based markdown chunker (18 Rust edge-case tests)
+- [x] embeddings.zig — EmbeddingProvider vtable, NoopEmbedding, HashEmbedding
+      (deterministic fallback, FNV-1a hashed features, L2-normalized)
+- [x] ranker.Embedder unified with embeddings.EmbeddingProvider (single contract)
 
-**Total: 85 tests, 0 leaks.** All of `src/feed/ranker.rs` (703 LOC) plus its
-pure deps (`cosine_similarity`, `truncate_with_ellipsis`) and a from-scratch
-Porter2 stemmer are ported and green.
+**Total: 117 tests, 0 leaks.** Ported so far: all of `src/feed/ranker.rs`
+(703 LOC) plus its pure deps, the `Memory` trait + types, the markdown chunker,
+and the embeddings trait + Noop + Hash implementations.
 
 ## Next slices (not in this branch's current scope)
 
-- **Slice 7:** FFI boundary — expose `rank_candidates` and friends behind a C
-  ABI (`slowclaw_feed_rank(...)`), wire the embedder as a Swift callback, and
-  parse `feed_item_json` for the missing timestamp fallback paths.
-- **Slice 8+:** Port `src/feed/mod.rs` (Bluesky / Nostr / RSS / gateway
-  coupling) — the network-heavy 5,601-line layer. Largest remaining chunk.
+- **Slice 3 (config):** port `src/config/` (7,737 LOC) — schema + loading +
+  env-var merging. Pure data + parsing; biggest unblocking win for everything
+  downstream (providers, gateway, tools all read config).
+- **Slice 4 (security core):** port `src/security/{policy,pairing,secrets,traits}.rs`
+  — the iOS-relevant subset (skip landlock/firejail/bubblewrap/docker which are
+  desktop-Linux sandboxing only).
+- **Slice 5 (memory backends):** port `src/memory/sqlite.rs` (66K — the
+  production backend) + `markdown.rs`. These are the real persistence path.
+- **Slice 6 (feed/mod.rs):** port the network-heavy 5,601-line Bluesky/Nostr/RSS
+  layer. Largest single chunk.
+- **Slice 7 (FFI):** expose rank_candidates, Memory, EmbeddingProvider behind a
+  C ABI; wire Swift callbacks for the embedder; parse `feed_item_json`.
 - **Later:** iOS native shell (SwiftUI + Zig staticlib), drop Tauri, remove
   desktop/CLI/gateway surfaces, CI surgery.
