@@ -30,53 +30,39 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
 
     // ── SQLite source ────────────────────────────────────────────────────
-    // On iOS/macOS we link the system libsqlite3 (smaller binary, no version
-    // drift, no need for the iOS sysroot to compile sqlite3.c — which Zig's
-    // cross-compiler doesn't ship). On every other target we compile the
-    // vendored SQLite amalgamation so dev/test boxes without a system SQLite
-    // (notably Windows) still work out of the box.
-    const target_os = target.result.os.tag;
-    const use_system_sqlite = (target_os == .ios or target_os == .macos);
+    // Always compile the vendored SQLite amalgamation. We previously tried
+    // linking the system libsqlite3 on iOS/macOS for a smaller binary, but
+    // Zig's cross-compiler can't auto-discover the iOS SDK sysroot — it would
+    // need an explicit --sysroot flag plumbed through, and the binary-size
+    // win isn't worth the fragility. The amalgamation is self-contained and
+    // identical across all targets.
+    const sqlite_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sqlite_mod.addCSourceFile(.{
+        .file = b.path("vendor/sqlite/sqlite3.c"),
+        .flags = &.{
+            "-std=c11", "-w",
+            "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_ENABLE_FTS5",
+            "-DSQLITE_OMIT_DEPRECATED",
+        },
+    });
+    const sqlite_c = b.addLibrary(.{
+        .name = "sqlite3",
+        .root_module = sqlite_mod,
+        .linkage = .static,
+    });
+    sqlite_c.installHeader(b.path("vendor/sqlite/sqlite3.h"), "sqlite3.h");
+    b.installArtifact(sqlite_c);
 
-    // `sqlite_c` is the library artifact other modules link against. It's
-    // either the compiled amalgamation or null (the system framework is
-    // linked directly by the consumer via linker flags).
-    var sqlite_c: ?*std.Build.Step.Compile = null;
-    if (!use_system_sqlite) {
-        const sqlite_mod = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        sqlite_mod.addCSourceFile(.{
-            .file = b.path("vendor/sqlite/sqlite3.c"),
-            .flags = &.{
-                "-std=c11", "-w",
-                "-DSQLITE_THREADSAFE=1",
-                "-DSQLITE_ENABLE_FTS5",
-                "-DSQLITE_OMIT_DEPRECATED",
-            },
-        });
-        const artifact = b.addLibrary(.{
-            .name = "sqlite3",
-            .root_module = sqlite_mod,
-            .linkage = .static,
-        });
-        artifact.installHeader(b.path("vendor/sqlite/sqlite3.h"), "sqlite3.h");
-        b.installArtifact(artifact);
-        sqlite_c = artifact;
-    }
-
-    // Helper: link SQLite into a consumer module, picking the right source.
+    // Helper: link SQLite into a consumer module.
     const linkSqlite = struct {
-        fn link(mod: *std.Build.Module, sc: ?*std.Build.Step.Compile) void {
-            if (sc) |artifact| {
-                mod.linkLibrary(artifact);
-                mod.addIncludePath(.{ .cwd_relative = "vendor/sqlite" });
-            } else {
-                // System framework path (iOS/macOS).
-                mod.linkSystemLibrary("sqlite3", .{});
-            }
+        fn link(mod: *std.Build.Module, sc: *std.Build.Step.Compile) void {
+            mod.linkLibrary(sc);
+            mod.addIncludePath(.{ .cwd_relative = "vendor/sqlite" });
         }
     }.link;
 

@@ -53,13 +53,13 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: SlowClawApp/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        # Link the Zig staticlib (built by the pre-build script).
-        OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3"
+        # Link the Zig staticlib (built by the pre-build script). SQLite is
+        # statically compiled INTO libslowclaw_feed.a via the vendored
+        # amalgamation, so no separate -lsqlite3 flag.
+        OTHER_LDFLAGS: "-lslowclaw_feed"
         LIBRARY_SEARCH_PATHS: "$(SRCROOT)/../zig-src/zig-out/lib"
         ENABLE_BITCODE: NO
         TARGETED_DEVICE_FAMILY: "1,2" # iPhone + iPad
-    dependencies:
-      - sdk: sqlite3.dylib
     preBuildScripts:
       - name: Build Zig staticlib
         # The Zig toolchain is downloaded by CI into tools/zig/. Locally,
