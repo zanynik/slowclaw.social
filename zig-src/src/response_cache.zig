@@ -16,8 +16,18 @@ const c = @cImport({
     @cInclude("time.h");
 });
 
-// SQLITE_TRANSIENT workaround — see sqlite.zig for the rationale.
-const SQLITE_TRANSIENT: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+// SQLITE_TRANSIENT workaround — see sqlite.zig for the full rationale.
+// Declare sqlite3_bind_text with the destructor as ?*const anyopaque to
+// bypass the function-pointer alignment check on arm64.
+const SQLITE_TRANSIENT: ?*const anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+
+extern fn sqlite3_bind_text(
+    stmt: *c.sqlite3_stmt,
+    idx: c_int,
+    text: [*]const u8,
+    len: c_int,
+    destructor: ?*const anyopaque,
+) c_int;
 
 pub const ResponseCacheError = error{
     OpenFailed,
@@ -276,7 +286,7 @@ pub const ResponseCache = struct {
 };
 
 fn bindText(stmt: *c.sqlite3_stmt, idx: c_int, text: []const u8) !void {
-    const rc = c.sqlite3_bind_text(stmt, idx, text.ptr, @intCast(text.len), @ptrCast(SQLITE_TRANSIENT));
+    const rc = sqlite3_bind_text(stmt, idx, text.ptr, @intCast(text.len), SQLITE_TRANSIENT);
     if (rc != c.SQLITE_OK) return error.BindFailed;
 }
 
