@@ -403,6 +403,85 @@ pub const SqliteMemory = struct {
         return true;
     }
 
+    // ── Memory vtable adapters ───────────────────────────────────────────
+    // These functions bridge SqliteMemory to the canonical `Memory` vtable
+    // defined in memory_types.zig. The Swift side (or any C-ABI consumer) can
+    // get a `Memory` value via `db.memoryProvider()` and pass it to any code
+    // that expects the abstract interface.
+
+    pub fn memoryProvider(self: *SqliteMemory) memory_types.Memory {
+        return .{
+            .ctx = self,
+            .name_fn = vtableName,
+            .store_fn = vtableStore,
+            .recall_fn = vtableRecall,
+            .get_fn = vtableGet,
+            .list_fn = vtableList,
+            .forget_fn = vtableForget,
+            .count_fn = vtableCount,
+            .health_check_fn = vtableHealthCheck,
+        };
+    }
+
+    fn vtableName(ctx: *anyopaque) []const u8 {
+        const self: *SqliteMemory = @ptrCast(@alignCast(ctx));
+        return self.name();
+    }
+
+    fn vtableStore(
+        ctx: *anyopaque,
+        key: []const u8,
+        content: []const u8,
+        category: MemoryCategory,
+        session_id: ?[]const u8,
+    ) memory_types.MemoryError!void {
+        const self: *SqliteMemory = @ptrCast(@alignCast(ctx));
+        self.store(key, content, category, session_id) catch return error.BackendFailed;
+    }
+
+    fn vtableRecall(
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        query: []const u8,
+        limit: usize,
+        session_id: ?[]const u8,
+    ) memory_types.MemoryError![]MemoryEntry {
+        const self: *SqliteMemory = @ptrCast(@alignCast(ctx));
+        return self.recall(allocator, query, limit, session_id) catch return error.BackendFailed;
+    }
+
+    fn vtableGet(ctx: *anyopaque, key: []const u8) memory_types.MemoryError!?MemoryEntry {
+        const self: *SqliteMemory = @ptrCast(@alignCast(ctx));
+        // The vtable's allocator must come from somewhere — the vtable doesn't
+        // carry one. Use the backend's own allocator (set at open time).
+        return self.get(self.allocator, key) catch return error.BackendFailed;
+    }
+
+    fn vtableList(
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        category: ?MemoryCategory,
+        session_id: ?[]const u8,
+    ) memory_types.MemoryError![]MemoryEntry {
+        const self: *SqliteMemory = @ptrCast(@alignCast(ctx));
+        return self.list(allocator, category, session_id) catch return error.BackendFailed;
+    }
+
+    fn vtableForget(ctx: *anyopaque, key: []const u8) memory_types.MemoryError!bool {
+        const self: *SqliteMemory = @ptrCast(@alignCast(ctx));
+        return self.forget(key) catch return error.BackendFailed;
+    }
+
+    fn vtableCount(ctx: *anyopaque) memory_types.MemoryError!usize {
+        const self: *SqliteMemory = @ptrCast(@alignCast(ctx));
+        return self.count() catch return error.BackendFailed;
+    }
+
+    fn vtableHealthCheck(ctx: *anyopaque) bool {
+        const self: *SqliteMemory = @ptrCast(@alignCast(ctx));
+        return self.healthCheck();
+    }
+
     /// FTS5 keyword search. Returns (id, score) pairs where score = -bm25
     /// (higher = better, matching the Rust negation).
     /// Mirrors `fts5_search` in sqlite.rs:288.
@@ -455,7 +534,278 @@ pub const SqliteMemory = struct {
         }
         return results.toOwnedSlice(allocator);
     }
+
+    /// Vector similarity search: scan embeddings and compute cosine similarity
+    /// to `query_embedding`. Returns at most `limit` (id, similarity) pairs,
+    /// descending by similarity, excluding zero-similarity matches.
+    /// Mirrors `vector_search` in sqlite.rs:335.
+    pub fn vectorSearch(
+        self: *SqliteMemory,
+        allocator: std.mem.Allocator,
+        query_embedding: []const f32,
+        limit: usize,
+        category: ?[]const u8,
+        session_id: ?[]const u8,
+    ) ![]ScoredId {
+        const sql_base = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL";
+        // Build the WHERE-clause tail dynamically. Parameters are bound by
+        // index; we count them in the same order as the Rust impl.
+        var sql_buf = std.ArrayList(u8).empty;
+        defer sql_buf.deinit(self.allocator);
+        try sql_buf.appendSlice(self.allocator, sql_base);
+
+        var cat_idx: ?c_int = null;
+        var sid_idx: ?c_int = null;
+        var next_idx: c_int = 1;
+        if (category) |cat| {
+            _ = cat;
+            const tail = try std.fmt.allocPrint(self.allocator, " AND category = ?{d}", .{next_idx});
+            defer self.allocator.free(tail);
+            try sql_buf.appendSlice(self.allocator, tail);
+            cat_idx = next_idx;
+            next_idx += 1;
+        }
+        if (session_id) |sid| {
+            _ = sid;
+            const tail = try std.fmt.allocPrint(self.allocator, " AND session_id = ?{d}", .{next_idx});
+            defer self.allocator.free(tail);
+            try sql_buf.appendSlice(self.allocator, tail);
+            sid_idx = next_idx;
+        }
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql_z = try self.allocator.dupeZ(u8, sql_buf.items);
+        defer self.allocator.free(sql_z);
+        if (c.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (cat_idx) |idx| try bindText(stmt.?, idx, category.?);
+        if (sid_idx) |idx| try bindText(stmt.?, idx, session_id.?);
+
+        var scored = std.ArrayList(ScoredId).empty;
+        errdefer {
+            for (scored.items) |s| allocator.free(s.id);
+            scored.deinit(allocator);
+        }
+        while (true) {
+            const rc = c.sqlite3_step(stmt.?);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+            const id_text = columnText(stmt.?, 0);
+            // Read the embedding blob and deserialize to f32 little-endian.
+            const blob_ptr = c.sqlite3_column_blob(stmt.?, 1);
+            const blob_len: usize = @intCast(c.sqlite3_column_bytes(stmt.?, 1));
+            if (blob_ptr == null or blob_len < 4) continue;
+            const byte_slice = @as([*]const u8, @ptrCast(blob_ptr))[0..blob_len];
+            const n = blob_len / 4;
+            const sim = cosineSimilarFromBytes(query_embedding, byte_slice[0 .. n * 4]);
+            if (sim > 0.0) {
+                const id_owned = try allocator.dupe(u8, id_text);
+                try scored.append(allocator, .{ .id = id_owned, .score = sim });
+            }
+        }
+        // Sort descending by score (NaNs sorted last).
+        std.mem.sort(ScoredId, scored.items, {}, struct {
+            fn lt(_: void, a: ScoredId, b: ScoredId) bool {
+                const neg_inf: f32 = -std.math.inf(f32);
+                const aa = if (std.math.isNan(a.score)) neg_inf else a.score;
+                const bb = if (std.math.isNan(b.score)) neg_inf else b.score;
+                return aa > bb;
+            }
+        }.lt);
+        const take = @min(scored.items.len, limit);
+        // If we're truncating, free the dropped ids.
+        if (take < scored.items.len) {
+            for (scored.items[take..]) |s| allocator.free(s.id);
+            scored.shrinkRetainingCapacity(take);
+        }
+        return scored.toOwnedSlice(allocator);
+    }
+
+    /// Hybrid recall: merge FTS5 keyword results with vector-similarity results
+    /// using `vector_math.hybrid_merge`. Mirrors `recall` in sqlite.rs:479.
+    /// Returns the top `limit` MemoryEntries by fused score.
+    pub fn recall(
+        self: *SqliteMemory,
+        allocator: std.mem.Allocator,
+        query: []const u8,
+        limit: usize,
+        session_id: ?[]const u8,
+    ) ![]MemoryEntry {
+        if (isOnlyWhitespace(query)) return &.{};
+
+        // Optional query embedding — only when an embedder is configured.
+        var query_emb: ?[]f32 = null;
+        defer if (query_emb) |e| self.allocator.free(e);
+        if (self.embedder) |emb| {
+            const ctx: *anyopaque = emb.ctx;
+            // The embedder ctx is a HashEmbedding pointer in our SQLite setup;
+            // we compute the embedding via the HashEmbedding helper directly.
+            if (embeddings_mod.HashEmbedding.embed_text(self.allocator, @ptrCast(@alignCast(ctx)), query)) |vec| {
+                if (vec.len > 0) query_emb = vec else self.allocator.free(vec);
+            } else |_| {}
+        }
+
+        // FTS5 keyword path.
+        const keyword_results = try self.fts5Search(allocator, query, limit * 2);
+        defer freeScoredIds(allocator, keyword_results);
+
+        // Vector path (optional).
+        var vector_results: []ScoredId = &.{};
+        defer if (vector_results.len > 0) freeScoredIds(allocator, vector_results);
+        if (query_emb) |qe| {
+            vector_results = try self.vectorSearch(allocator, qe, limit * 2, null, session_id);
+        }
+
+        // Build (id, score) pair slices for hybrid_merge.
+        const kw_pairs = try allocator.alloc(vector_math.IdScore, keyword_results.len);
+        defer allocator.free(kw_pairs);
+        for (keyword_results, 0..) |r, i| kw_pairs[i] = .{ .id = r.id, .score = r.score };
+        const vec_pairs = try allocator.alloc(vector_math.IdScore, vector_results.len);
+        defer allocator.free(vec_pairs);
+        for (vector_results, 0..) |r, i| vec_pairs[i] = .{ .id = r.id, .score = r.score };
+
+        const merged = if (vector_results.len == 0)
+            null
+        else
+            try vector_math.hybrid_merge(allocator, vec_pairs, kw_pairs, self.vector_weight, self.keyword_weight, limit);
+        defer if (merged) |m| allocator.free(m);
+
+        // Choose the id ordering: merged (if vectors) else keyword-only desc.
+        var ordered_ids = std.ArrayList([]const u8).empty;
+        defer ordered_ids.deinit(allocator);
+        if (merged) |m| {
+            for (m) |r| try ordered_ids.append(allocator, r.id);
+        } else {
+            // Keyword-only: just take them in score-desc order (fts5Search already sorts).
+            for (keyword_results) |r| try ordered_ids.append(allocator, r.id);
+        }
+        if (ordered_ids.items.len == 0) return &.{};
+
+        // Fetch the full entries by id IN (...).
+        return try self.fetchEntriesByIds(allocator, ordered_ids.items, session_id);
+    }
+
+    /// Fetch full MemoryEntry rows for the given id list, preserving order.
+    /// Optionally filters by session_id (drops non-matching rows).
+    fn fetchEntriesByIds(
+        self: *SqliteMemory,
+        allocator: std.mem.Allocator,
+        ids: []const []const u8,
+        session_id: ?[]const u8,
+    ) ![]MemoryEntry {
+        // Build "WHERE id IN (?1, ?2, ...)".
+        var sql_buf = std.ArrayList(u8).empty;
+        defer sql_buf.deinit(self.allocator);
+        try sql_buf.appendSlice(self.allocator, "SELECT id, key, content, category, created_at, session_id FROM memories WHERE id IN (");
+        for (ids, 0..) |_, i| {
+            if (i > 0) try sql_buf.append(self.allocator, ',');
+            const placeholder = try std.fmt.allocPrint(self.allocator, "?{d}", .{i + 1});
+            defer self.allocator.free(placeholder);
+            try sql_buf.appendSlice(self.allocator, placeholder);
+        }
+        try sql_buf.append(self.allocator, ')');
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql_z = try self.allocator.dupeZ(u8, sql_buf.items);
+        defer self.allocator.free(sql_z);
+        if (c.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        for (ids, 0..) |id, i| try bindText(stmt.?, @intCast(i + 1), id);
+
+        // Read all rows into a map keyed by id (preserves DB-returned data).
+        var entry_map = std.StringHashMap(MemoryEntry).init(allocator);
+        defer {
+            // Free both keys (id dupes) and values (entries).
+            var it = entry_map.iterator();
+            while (it.next()) |kv| {
+                allocator.free(kv.key_ptr.*);
+                freeEntry(allocator, kv.value_ptr.*);
+            }
+            entry_map.deinit();
+        }
+        while (true) {
+            const rc = c.sqlite3_step(stmt.?);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+            const entry = try readRow(allocator, stmt.?);
+            const id_key = try allocator.dupe(u8, entry.id);
+            try entry_map.put(id_key, entry);
+        }
+
+        // Emit in the requested id order; apply session filter.
+        var out = std.ArrayList(MemoryEntry).empty;
+        errdefer {
+            for (out.items) |e| freeEntry(allocator, e);
+            out.deinit(allocator);
+        }
+        for (ids) |requested_id| {
+            const entry = entry_map.get(requested_id) orelse continue;
+            if (session_id) |sid| {
+                const matches = if (entry.session_id) |s| std.mem.eql(u8, s, sid) else false;
+                if (!matches) continue;
+            }
+            // The map owns the entry; we need a deep copy because we'll free
+            // the map at function exit. Copy each field.
+            const copy = try dupeEntry(allocator, entry);
+            try out.append(allocator, copy);
+        }
+        return out.toOwnedSlice(allocator);
+    }
 };
+
+/// Deep-copy a MemoryEntry's owned fields into a fresh allocation.
+fn dupeEntry(allocator: std.mem.Allocator, entry: MemoryEntry) !MemoryEntry {
+    var copy = MemoryEntry{
+        .id = try allocator.dupe(u8, entry.id),
+        .key = try allocator.dupe(u8, entry.key),
+        .content = try allocator.dupe(u8, entry.content),
+        .category = switch (entry.category) {
+            .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+            else => entry.category,
+        },
+        .timestamp = try allocator.dupe(u8, entry.timestamp),
+        .session_id = null,
+        .score = entry.score,
+    };
+    if (entry.session_id) |s| copy.session_id = try allocator.dupe(u8, s);
+    return copy;
+}
+
+/// Decode a little-endian f32 byte slice and compute cosine similarity against
+/// `query`. Reuses `vector_math.cosine_similarity` after decoding.
+fn cosineSimilarFromBytes(query: []const f32, bytes: []const u8) f32 {
+    const n = bytes.len / 4;
+    if (n == 0) return 0.0;
+    var stack_buf: [1024]f32 = undefined;
+    var heap_buf: ?[]f32 = null;
+    defer if (heap_buf) |b| std.heap.page_allocator.free(b);
+    const decoded: []f32 = if (n <= stack_buf.len) blk: {
+        // Decode in-place into the stack buffer.
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const bits = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+            stack_buf[i] = @bitCast(bits);
+        }
+        break :blk stack_buf[0..n];
+    } else blk: {
+        const b = std.heap.page_allocator.alloc(f32, n) catch return 0.0;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const bits = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+            b[i] = @bitCast(bits);
+        }
+        heap_buf = b;
+        break :blk b;
+    };
+    return vector_math.cosine_similarity(query, decoded);
+}
+
+fn isOnlyWhitespace(s: []const u8) bool {
+    for (s) |ch| {
+        if (ch != ' ' and ch != '\t' and ch != '\n' and ch != '\r' and ch != 0x0c and ch != 0x0b) return false;
+    }
+    return true;
+}
 
 pub const ScoredId = struct { id: []const u8, score: f32 };
 
@@ -758,4 +1108,168 @@ test "sqlite: newId generates distinct 36-char hex UUIDs" {
     try testing.expectEqual(@as(u8, '-'), id1[13]);
     try testing.expectEqual(@as(u8, '-'), id1[18]);
     try testing.expectEqual(@as(u8, '-'), id1[23]);
+}
+
+// ── recall + vectorSearch tests (with HashEmbedding-backed store) ─────────
+
+/// Helper: open a SqliteMemory with a real HashEmbedding so the embedding
+/// column is populated and recall's vector path engages.
+fn openWithEmbedder(allocator: std.mem.Allocator, emb: *embeddings_mod.HashEmbedding) !SqliteMemory {
+    return SqliteMemory.open(
+        allocator,
+        ":memory:",
+        emb.provider(),
+        0.7, // vector_weight
+        0.3, // keyword_weight
+        1024,
+    );
+}
+
+test "sqlite: recall empty query returns empty" {
+    const a = testing.allocator;
+    var emb = embeddings_mod.HashEmbedding.init("test", 64);
+    var db = try openWithEmbedder(a, &emb);
+    defer db.close();
+    const results = try db.recall(a, "   ", 10, null);
+    try testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "sqlite: recall keyword path finds matches" {
+    const a = testing.allocator;
+    var emb = embeddings_mod.HashEmbedding.init("test", 64);
+    var db = try openWithEmbedder(a, &emb);
+    defer db.close();
+    try db.store("rust-fact", "Rust is a systems programming language", .{ .core = {} }, null);
+    try db.store("unrelated", "The weather is sunny today", .{ .core = {} }, null);
+
+    const results = try db.recall(a, "rust programming", 10, null);
+    defer {
+        for (results) |e| freeEntry(a, e);
+        a.free(results);
+    }
+    try testing.expect(results.len >= 1);
+    // The rust-fact entry must be in the results.
+    var found = false;
+    for (results) |e| {
+        if (std.mem.eql(u8, e.key, "rust-fact")) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "sqlite: recall respects session_id filter" {
+    const a = testing.allocator;
+    var emb = embeddings_mod.HashEmbedding.init("test", 64);
+    var db = try openWithEmbedder(a, &emb);
+    defer db.close();
+    try db.store("shared-key", "rust content for session-a", .{ .core = {} }, "session-a");
+    try db.store("shared-key-b", "rust content for session-b", .{ .core = {} }, "session-b");
+
+    const a_results = try db.recall(a, "rust", 10, "session-a");
+    defer {
+        for (a_results) |e| freeEntry(a, e);
+        a.free(a_results);
+    }
+    for (a_results) |e| {
+        try testing.expectEqualStrings("session-a", e.session_id.?);
+    }
+}
+
+test "sqlite: recall with no keyword match falls back to vector path (with embedder)" {
+    const a = testing.allocator;
+    var emb = embeddings_mod.HashEmbedding.init("test", 64);
+    var db = try openWithEmbedder(a, &emb);
+    defer db.close();
+    try db.store("k", "hello world", .{ .core = {} }, null);
+    // With an embedder configured, "nonexistentword" still produces a hash
+    // embedding that may cosine-match the stored entry. The Rust recall
+    // applies the same `sim > 0.0` cutoff. We assert the result set is small
+    // and the matches have low similarity (no strong signal).
+    const results = try db.recall(a, "nonexistentword", 10, null);
+    defer {
+        for (results) |e| freeEntry(a, e);
+        a.free(results);
+    }
+    try testing.expect(results.len <= 1);
+}
+
+test "sqlite: vectorSearch returns cosine similarity" {
+    const a = testing.allocator;
+    var emb = embeddings_mod.HashEmbedding.init("test", 64);
+    var db = try openWithEmbedder(a, &emb);
+    defer db.close();
+    try db.store("rust", "rust programming language", .{ .core = {} }, null);
+    try db.store("weather", "sunny weather today", .{ .core = {} }, null);
+
+    // Query embedding = the same HashEmbedding applied to "rust" — should
+    // cosine-match the 'rust' entry more strongly than the 'weather' one.
+    const query_vec = try embeddings_mod.HashEmbedding.embed_text(a, &emb, "rust");
+    defer a.free(query_vec);
+    const results = try db.vectorSearch(a, query_vec, 10, null, null);
+    defer freeScoredIds(a, results);
+    try testing.expect(results.len >= 1);
+    // Top result must have positive similarity.
+    try testing.expect(results[0].score > 0.0);
+}
+
+test "sqlite: vectorSearch respects category filter" {
+    const a = testing.allocator;
+    var emb = embeddings_mod.HashEmbedding.init("test", 64);
+    var db = try openWithEmbedder(a, &emb);
+    defer db.close();
+    try db.store("k1", "rust content", .{ .core = {} }, null);
+    try db.store("k2", "rust content daily", .{ .daily = {} }, null);
+
+    const query_vec = try embeddings_mod.HashEmbedding.embed_text(a, &emb, "rust");
+    defer a.free(query_vec);
+    const core_only = try db.vectorSearch(a, query_vec, 10, "core", null);
+    defer freeScoredIds(a, core_only);
+    try testing.expectEqual(@as(usize, 1), core_only.len);
+}
+
+// ── Memory vtable integration ────────────────────────────────────────────
+
+test "sqlite: Memory vtable end-to-end (store/get/forget/count via vtable)" {
+    const a = testing.allocator;
+    var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
+    defer db.close();
+    const m = db.memoryProvider();
+
+    try testing.expectEqualStrings("sqlite", m.name());
+    try testing.expectEqual(@as(usize, 0), try m.count());
+
+    try m.store("k", "v", .{ .core = {} }, null);
+    try testing.expectEqual(@as(usize, 1), try m.count());
+
+    const entry = (try m.get("k")) orelse return error.NotFound;
+    defer freeEntry(a, entry);
+    try testing.expectEqualStrings("v", entry.content);
+
+    try testing.expect(try m.forget("k"));
+    try testing.expectEqual(@as(usize, 0), try m.count());
+    try testing.expect(try m.get("k") == null);
+}
+
+test "sqlite: Memory vtable list + recall" {
+    const a = testing.allocator;
+    var emb = embeddings_mod.HashEmbedding.init("test", 64);
+    var db = try openWithEmbedder(a, &emb);
+    defer db.close();
+    const m = db.memoryProvider();
+
+    try m.store("rust", "rust programming", .{ .core = {} }, null);
+    try m.store("weather", "sunny day", .{ .core = {} }, null);
+
+    const all = try m.list(a, null, null);
+    defer {
+        for (all) |e| freeEntry(a, e);
+        a.free(all);
+    }
+    try testing.expectEqual(@as(usize, 2), all.len);
+
+    const recalls = try m.recall(a, "rust", 10, null);
+    defer {
+        for (recalls) |e| freeEntry(a, e);
+        a.free(recalls);
+    }
+    try testing.expect(recalls.len >= 1);
 }

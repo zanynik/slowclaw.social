@@ -32,6 +32,8 @@ const testing = std.testing;
 const ranker = @import("ranker.zig");
 const embeddings = @import("embeddings.zig");
 const feed_types = @import("feed_types.zig");
+const sqlite = @import("sqlite.zig");
+const memory_types = @import("memory_types.zig");
 
 /// C allocator — pairs with `free` on the Swift side. Using this ensures Zig
 /// and Swift agree on the heap.
@@ -240,6 +242,267 @@ export fn slowclaw_feed_rank_result_free(result: *SlowclawRankResult) void {
         c_allocator.free(slice);
         result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_OK };
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// SQLite memory store — Swift-callable persistence API.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Opaque handle to a `SqliteMemory` instance.
+pub const SlowclawSqlite = opaque {};
+
+/// A memory entry returned from get/list/recall. `id`/`key`/`content`/
+/// `category`/`timestamp`/`session_id` are all Zig-owned UTF-8; the caller
+/// frees the entire result via `slowclaw_feed_sqlite_entry_free`.
+pub const SlowclawSqliteEntry = extern struct {
+    id: SlowclawString,
+    key: SlowclawString,
+    content: SlowclawString,
+    /// Lowercase category name (e.g. "core", "daily", "conversation", or the
+    /// custom name). Mirrors `MemoryCategory.toString()`.
+    category: SlowclawString,
+    timestamp: SlowclawString,
+    session_id: SlowclawString, // bytes=null when absent
+    /// Optional recall score (NaN/0 when not set).
+    score: f64,
+};
+
+/// Open (or create) a SQLite database at `path`. Pass ":memory:" for an
+/// in-memory DB. Returns null on failure.
+/// The optional embedder: pass `null` for no embeddings (keyword-only search),
+/// or a HashEmbedder handle to enable hybrid vector+keyword recall.
+export fn slowclaw_feed_sqlite_open(
+    path: [*]const u8,
+    path_len: usize,
+    embedder_handle: ?*SlowclawHashEmbedder,
+) ?*SlowclawSqlite {
+    const path_slice = path[0..path_len];
+    const emb_opt: ?embeddings.EmbeddingProvider = if (embedder_handle) |h| blk: {
+        const he: *embeddings.HashEmbedding = @ptrCast(@alignCast(h));
+        break :blk he.provider();
+    } else null;
+    const db = c_allocator.create(sqlite.SqliteMemory) catch return null;
+    db.* = sqlite.SqliteMemory.open(c_allocator, path_slice, emb_opt, 0.7, 0.3, 1024) catch {
+        c_allocator.destroy(db);
+        return null;
+    };
+    return @ptrCast(db);
+}
+
+export fn slowclaw_feed_sqlite_close(handle: ?*SlowclawSqlite) void {
+    if (handle) |h| {
+        const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(h));
+        db.close();
+        c_allocator.destroy(db);
+    }
+}
+
+export fn slowclaw_feed_sqlite_health(handle: *SlowclawSqlite) bool {
+    const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
+    return db.healthCheck();
+}
+
+/// Insert or upsert a memory. `category` is a lowercase tag ("core", "daily",
+/// "conversation", or any custom name). `session_id` is `{null, 0}` if absent.
+/// Returns 0 on success, negative on error.
+export fn slowclaw_feed_sqlite_store(
+    handle: *SlowclawSqlite,
+    key: [*]const u8,
+    key_len: usize,
+    content: [*]const u8,
+    content_len: usize,
+    category: [*]const u8,
+    category_len: usize,
+    session_id: ?[*]const u8,
+    session_id_len: usize,
+) c_int {
+    const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
+    const cat = categoryToEnum(category[0..category_len]);
+    const sid_slice: ?[]const u8 = if (session_id) |p| p[0..session_id_len] else null;
+    db.store(key[0..key_len], content[0..content_len], cat, sid_slice) catch return SLOWCLAW_ERR_INTERNAL;
+    return SLOWCLAW_OK;
+}
+
+/// Fetch a memory by key. The returned entry is Zig-owned; free via
+/// `slowclaw_feed_sqlite_entry_free`. Returns 0 if found, 1 if not found,
+/// negative on error.
+export fn slowclaw_feed_sqlite_get(
+    handle: *SlowclawSqlite,
+    key: [*]const u8,
+    key_len: usize,
+    out_entry: *SlowclawSqliteEntry,
+) c_int {
+    const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
+    const found = db.get(c_allocator, key[0..key_len]) catch return SLOWCLAW_ERR_INTERNAL;
+    if (found == null) return 1;
+    out_entry.* = entryToC(found.?);
+    return SLOWCLAW_OK;
+}
+
+/// Delete a memory by key. Returns 1 if a row was deleted, 0 if not found,
+/// negative on error.
+export fn slowclaw_feed_sqlite_forget(
+    handle: *SlowclawSqlite,
+    key: [*]const u8,
+    key_len: usize,
+) c_int {
+    const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
+    const removed = db.forget(key[0..key_len]) catch return SLOWCLAW_ERR_INTERNAL;
+    return if (removed) 1 else 0;
+}
+
+/// Count stored memories. Returns the count (>= 0) or negative on error.
+export fn slowclaw_feed_sqlite_count(handle: *SlowclawSqlite) c_int {
+    const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
+    const n = db.count() catch return SLOWCLAW_ERR_INTERNAL;
+    return @intCast(n);
+}
+
+/// Hybrid recall (FTS5 keyword + vector similarity if an embedder is set).
+/// Returns a JSON array of entries (each with id/key/content/category/timestamp/
+/// session_id/score). Free via `slowclaw_feed_sqlite_result_free`.
+export fn slowclaw_feed_sqlite_recall(
+    handle: *SlowclawSqlite,
+    query: [*]const u8,
+    query_len: usize,
+    limit: usize,
+    session_id: ?[*]const u8,
+    session_id_len: usize,
+    out_result: *SlowclawRankResult,
+) c_int {
+    const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
+    const sid_slice: ?[]const u8 = if (session_id) |p| p[0..session_id_len] else null;
+    const entries = db.recall(c_allocator, query[0..query_len], limit, sid_slice) catch {
+        out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_INTERNAL };
+        return SLOWCLAW_ERR_INTERNAL;
+    };
+    defer {
+        for (entries) |e| sqlite.freeEntry(c_allocator, e);
+        c_allocator.free(entries);
+    }
+    const json = serializeEntriesFull(c_allocator, entries) catch {
+        out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_OUT_OF_MEMORY };
+        return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    };
+    out_result.* = .{ .items_json = SlowclawString.fromOwnedSlice(json), .status = SLOWCLAW_OK };
+    return SLOWCLAW_OK;
+}
+
+export fn slowclaw_feed_sqlite_result_free(result: *SlowclawRankResult) void {
+    if (result.items_json.bytes) |b| {
+        const slice = b[0..result.items_json.len];
+        c_allocator.free(slice);
+        result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_OK };
+    }
+}
+
+/// Free an entry obtained from `slowclaw_feed_sqlite_get`.
+export fn slowclaw_feed_sqlite_entry_free(entry: *SlowclawSqliteEntry) void {
+    freeEntryCString(&entry.id);
+    freeEntryCString(&entry.key);
+    freeEntryCString(&entry.content);
+    freeEntryCString(&entry.category);
+    freeEntryCString(&entry.timestamp);
+    freeEntryCString(&entry.session_id);
+    entry.* = std.mem.zeroes(SlowclawSqliteEntry);
+}
+
+fn freeEntryCString(s: *SlowclawString) void {
+    if (s.bytes) |b| {
+        c_allocator.free(b[0..s.len]);
+        s.* = SlowclawString.empty();
+    }
+}
+
+fn categoryToEnum(s: []const u8) memory_types.MemoryCategory {
+    if (std.mem.eql(u8, s, "core")) return .{ .core = {} };
+    if (std.mem.eql(u8, s, "daily")) return .{ .daily = {} };
+    if (std.mem.eql(u8, s, "conversation")) return .{ .conversation = {} };
+    // Custom categories: dupe to a c_allocator-owned slice so the value is
+    // stable for the duration of the store call.
+    const owned = c_allocator.dupe(u8, s) catch return .{ .core = {} };
+    return .{ .custom = owned };
+}
+
+/// Convert a Zig MemoryEntry to the C-ABI SlowclawSqliteEntry. All string
+/// fields are c_allocator-owned (the caller frees them via the entry_free fn).
+fn entryToC(entry: sqlite_memory.MemoryEntry) SlowclawSqliteEntry {
+    const cat_str = entry.category.toString();
+    return .{
+        .id = cStringFromSlice(entry.id),
+        .key = cStringFromSlice(entry.key),
+        .content = cStringFromSlice(entry.content),
+        .category = cStringFromSlice(cat_str),
+        .timestamp = cStringFromSlice(entry.timestamp),
+        .session_id = if (entry.session_id) |s| cStringFromSlice(s) else SlowclawString.empty(),
+        .score = if (entry.score) |sc| sc else std.math.nan(f64),
+    };
+}
+
+const sqlite_memory = memory_types;
+
+/// Same as entryToC but takes the sqlite-owned MemoryEntry shape directly.
+fn entryToCFromSqlite(entry: memory_types.MemoryEntry) SlowclawSqliteEntry {
+    const cat_str = entry.category.toString();
+    return .{
+        .id = cStringFromSlice(entry.id),
+        .key = cStringFromSlice(entry.key),
+        .content = cStringFromSlice(entry.content),
+        // For custom categories, category.toString() returns the alias name.
+        .category = cStringFromSlice(cat_str),
+        .timestamp = cStringFromSlice(entry.timestamp),
+        .session_id = if (entry.session_id) |s| cStringFromSlice(s) else SlowclawString.empty(),
+        .score = if (entry.score) |sc| sc else std.math.nan(f64),
+    };
+}
+
+/// Dup a Zig slice to a c_allocator-owned UTF-8 buffer, returning the
+/// SlowclawString view. The caller frees via `slowclaw_feed_free` or the
+/// per-field free helpers.
+fn cStringFromSlice(s: []const u8) SlowclawString {
+    if (s.len == 0) return SlowclawString.empty();
+    const owned = c_allocator.dupe(u8, s) catch return SlowclawString.empty();
+    return .{ .bytes = owned.ptr, .len = owned.len };
+}
+
+/// Serialize full memory entries (not the abbreviated rank-item form) as JSON.
+/// Used by `slowclaw_feed_sqlite_recall`. Each entry:
+///   { "id":..., "key":..., "content":..., "category":..., "timestamp":...,
+///     "session_id":...|null, "score":...|null }
+fn serializeEntriesFull(allocator: std.mem.Allocator, items: []const memory_types.MemoryEntry) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+    for (items, 0..) |item, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"id\":");
+        try writeJsonString(allocator, &buf, item.id);
+        try buf.appendSlice(allocator, ",\"key\":");
+        try writeJsonString(allocator, &buf, item.key);
+        try buf.appendSlice(allocator, ",\"content\":");
+        try writeJsonString(allocator, &buf, item.content);
+        try buf.appendSlice(allocator, ",\"category\":");
+        try writeJsonString(allocator, &buf, item.category.toString());
+        try buf.appendSlice(allocator, ",\"timestamp\":");
+        try writeJsonString(allocator, &buf, item.timestamp);
+        try buf.appendSlice(allocator, ",\"session_id\":");
+        if (item.session_id) |s| {
+            try writeJsonString(allocator, &buf, s);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",\"score\":");
+        if (item.score) |sc| {
+            const s_str = try std.fmt.allocPrint(allocator, "{d}", .{sc});
+            defer allocator.free(s_str);
+            try buf.appendSlice(allocator, s_str);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.append(allocator, '}');
+    }
+    try buf.append(allocator, ']');
+    return buf.toOwnedSlice(allocator);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -521,4 +784,82 @@ test "ffi: writeJsonString escapes special chars" {
     defer buf.deinit(testing.allocator);
     try writeJsonString(testing.allocator, &buf, "hello \"world\"\n\t");
     try testing.expectEqualStrings("\"hello \\\"world\\\"\\n\\t\"", buf.items);
+}
+
+// ── SQLite FFI round-trip tests ───────────────────────────────────────────
+
+test "ffi: sqlite open/store/get/forget round-trip via C ABI" {
+    const handle = slowclaw_feed_sqlite_open(":memory:", ":memory:".len, null) orelse return error.OOM;
+    defer slowclaw_feed_sqlite_close(handle);
+
+    try testing.expect(slowclaw_feed_sqlite_health(handle));
+
+    // Store
+    const status = slowclaw_feed_sqlite_store(
+        handle,
+        "favorite_lang", "favorite_lang".len,
+        "Rust", "Rust".len,
+        "core", "core".len,
+        null, 0,
+    );
+    try testing.expectEqual(SLOWCLAW_OK, status);
+    try testing.expectEqual(@as(c_int, 1), slowclaw_feed_sqlite_count(handle));
+
+    // Get
+    var entry: SlowclawSqliteEntry = std.mem.zeroes(SlowclawSqliteEntry);
+    const get_status = slowclaw_feed_sqlite_get(handle, "favorite_lang", "favorite_lang".len, &entry);
+    try testing.expectEqual(SLOWCLAW_OK, get_status);
+    defer slowclaw_feed_sqlite_entry_free(&entry);
+    try testing.expectEqualStrings("favorite_lang", entry.key.bytes.?[0..entry.key.len]);
+    try testing.expectEqualStrings("Rust", entry.content.bytes.?[0..entry.content.len]);
+    try testing.expectEqualStrings("core", entry.category.bytes.?[0..entry.category.len]);
+
+    // Forget
+    try testing.expectEqual(@as(c_int, 1), slowclaw_feed_sqlite_forget(handle, "favorite_lang", "favorite_lang".len));
+    try testing.expectEqual(@as(c_int, 0), slowclaw_feed_sqlite_count(handle));
+}
+
+test "ffi: sqlite get nonexistent returns 1" {
+    const handle = slowclaw_feed_sqlite_open(":memory:", ":memory:".len, null) orelse return error.OOM;
+    defer slowclaw_feed_sqlite_close(handle);
+    var entry: SlowclawSqliteEntry = std.mem.zeroes(SlowclawSqliteEntry);
+    const status = slowclaw_feed_sqlite_get(handle, "nope", "nope".len, &entry);
+    try testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "ffi: sqlite store with session_id round-trips" {
+    const handle = slowclaw_feed_sqlite_open(":memory:", ":memory:".len, null) orelse return error.OOM;
+    defer slowclaw_feed_sqlite_close(handle);
+    _ = slowclaw_feed_sqlite_store(
+        handle,
+        "k", "k".len,
+        "v", "v".len,
+        "core", "core".len,
+        "session-abc", "session-abc".len,
+    );
+    var entry: SlowclawSqliteEntry = std.mem.zeroes(SlowclawSqliteEntry);
+    _ = slowclaw_feed_sqlite_get(handle, "k", "k".len, &entry);
+    defer slowclaw_feed_sqlite_entry_free(&entry);
+    try testing.expectEqualStrings("session-abc", entry.session_id.bytes.?[0..entry.session_id.len]);
+}
+
+test "ffi: sqlite recall returns JSON array via C ABI" {
+    // No embedder → keyword-only path; still works.
+    const handle = slowclaw_feed_sqlite_open(":memory:", ":memory:".len, null) orelse return error.OOM;
+    defer slowclaw_feed_sqlite_close(handle);
+    _ = slowclaw_feed_sqlite_store(handle, "rust", "rust".len, "rust programming language", "rust programming language".len, "core", "core".len, null, 0);
+    _ = slowclaw_feed_sqlite_store(handle, "weather", "weather".len, "sunny day today", "sunny day today".len, "core", "core".len, null, 0);
+
+    var result: SlowclawRankResult = std.mem.zeroes(SlowclawRankResult);
+    const status = slowclaw_feed_sqlite_recall(handle, "rust", "rust".len, 10, null, 0, &result);
+    try testing.expectEqual(SLOWCLAW_OK, status);
+    defer slowclaw_feed_sqlite_result_free(&result);
+
+    const json_bytes = result.items_json.bytes orelse return error.NullJson;
+    const json = json_bytes[0..result.items_json.len];
+    const Tag = std.meta.Tag(std.json.Value);
+    const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return error.JsonInvalid;
+    defer parsed.deinit();
+    try testing.expectEqual(Tag.array, std.meta.activeTag(parsed.value));
+    try testing.expect(parsed.value.array.items.len >= 1);
 }

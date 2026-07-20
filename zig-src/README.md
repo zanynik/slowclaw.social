@@ -30,6 +30,16 @@ imports it via a bridging header (TBD in the iOS shell slice). Current surface:
 | `slowclaw_feed_hash_embed(handle, text, out_dims)` | Embed one text → f32 buffer. |
 | `slowclaw_feed_rank_stage2(interests, negatives, candidates, limit, now, out_err)` | Run the keyword-path ranker over C-struct inputs; returns a JSON array of ranked items. |
 | `slowclaw_feed_rank_result_free(result)` | Free a rank result and its JSON string. |
+| `slowclaw_feed_sqlite_open(path, embedder)` | Open (or create) a SQLite memory DB. |
+| `slowclaw_feed_sqlite_close(handle)` | Close and free the DB. |
+| `slowclaw_feed_sqlite_health(handle)` | Returns true if `SELECT 1` succeeds. |
+| `slowclaw_feed_sqlite_store(handle, key, content, category, session_id)` | Insert or upsert a memory. |
+| `slowclaw_feed_sqlite_get(handle, key, out_entry)` | Fetch a memory by key → entry struct. |
+| `slowclaw_feed_sqlite_forget(handle, key)` | Delete by key. Returns 1 if removed, 0 if not found. |
+| `slowclaw_feed_sqlite_count(handle)` | Count stored memories. |
+| `slowclaw_feed_sqlite_recall(handle, query, limit, session_id, out_result)` | Hybrid FTS5+vector search → JSON array. |
+| `slowclaw_feed_sqlite_result_free(result)` | Free a recall JSON result. |
+| `slowclaw_feed_sqlite_entry_free(entry)` | Free an entry obtained from `sqlite_get`. |
 
 **Memory ownership**: strings passed in are caller-owned (Zig does not free).
 Strings/buffers passed out are Zig-allocated via `c_allocator`; the caller frees
@@ -165,9 +175,10 @@ in `src/porter_stemmer.zig`).
       (compiled by Zig; FTS5 keyword search; upsert, get, list, forget, count,
       session_id + custom-category round-trip, file persistence)
 
-**Total: 117 libc-free + 88 FFI + 32 SQLite tests = 237 tests, 0 leaks.** The
-production persistence backend works end-to-end and ships as a single staticlib
-with vendored SQLite (no system dependency at runtime).
+**Total: 117 libc-free + 123 FFI + 70 SQLite tests = 310 tests, 0 leaks.** The
+production persistence backend works end-to-end and is fully reachable from
+Swift through the C ABI: open a database, store memories, recall via hybrid
+FTS5+vector search, get/forget by key, and inspect health/count.
 
 ## Next slices (not in this branch's current scope)
 

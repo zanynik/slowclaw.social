@@ -57,18 +57,22 @@ pub fn build(b: *std.Build) void {
     sqlite_c.installHeader(b.path("vendor/sqlite/sqlite3.h"), "sqlite3.h");
     b.installArtifact(sqlite_c);
 
-    // ── FFI test module (libc-linked, no sqlite) ──────────────────────────
+    // ── FFI + SQLite test module (libc + sqlite linked) ───────────────────
+    // ffi.zig now exposes the SQLite-backed memory store through the C ABI,
+    // so the FFI tests need both libc and sqlite.
     const ffi_test_mod = b.addModule("slowclaw_feed_ffi_test", .{
         .root_source_file = b.path("src/ffi.zig"),
         .target = target,
         .optimize = optimize,
     });
     ffi_test_mod.link_libc = true;
+    ffi_test_mod.addIncludePath(b.path("vendor/sqlite"));
+    ffi_test_mod.linkLibrary(sqlite_c);
     const ffi_tests = b.addTest(.{
         .root_module = ffi_test_mod,
     });
     const run_ffi_tests = b.addRunArtifact(ffi_tests);
-    const ffi_test_step = b.step("test-ffi", "Run the C ABI tests (libc-linked, no sqlite)");
+    const ffi_test_step = b.step("test-ffi", "Run the C ABI tests (libc + sqlite linked)");
     ffi_test_step.dependOn(&run_ffi_tests.step);
 
     // ── SQLite test module (libc + sqlite linked) ─────────────────────────
