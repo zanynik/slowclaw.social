@@ -28,10 +28,11 @@ const c = @cImport({
 });
 
 // SQLITE_TRANSIENT is defined in sqlite3.h as ((sqlite3_destructor_type)-1),
-// which Zig's @cImport translator rejects on arm64 ("requires aligned
-// address"). Define it ourselves as the bitwise-equivalent cast through
-// an integer, which Zig accepts.
-const SQLITE_TRANSIENT: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+// which Zig's @cImport translator rejects on arm64 because casting -1 to a
+// function pointer creates an "unaligned address." SQLite's ABI treats the
+// destructor parameter as a raw pointer, so we use ?*anyopaque (which has no
+// alignment requirement) and cast at the call site.
+const SQLITE_TRANSIENT: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 
 const MemoryEntry = memory_types.MemoryEntry;
 const MemoryCategory = memory_types.MemoryCategory;
@@ -292,7 +293,7 @@ pub const SqliteMemory = struct {
         try bindText(stmt.?, 3, content);
         try bindText(stmt.?, 4, cat);
         if (embedding_bytes) |b| {
-            _ = c.sqlite3_bind_blob(stmt.?, 5, b.ptr, @intCast(b.len), SQLITE_TRANSIENT);
+            _ = c.sqlite3_bind_blob(stmt.?, 5, b.ptr, @intCast(b.len), @ptrCast(SQLITE_TRANSIENT));
         } else {
             _ = c.sqlite3_bind_null(stmt.?, 5);
         }
@@ -827,7 +828,7 @@ pub fn freeScoredIds(allocator: std.mem.Allocator, ids: []ScoredId) void {
 /// Bind a non-null-terminated Zig string as a SQLite text parameter. SQLite
 /// copies the bytes (SQLITE_TRANSIENT) so the caller's slice can be freed.
 fn bindText(stmt: *c.sqlite3_stmt, idx: c_int, text: []const u8) !void {
-    const rc = c.sqlite3_bind_text(stmt, idx, text.ptr, @intCast(text.len), SQLITE_TRANSIENT);
+    const rc = c.sqlite3_bind_text(stmt, idx, text.ptr, @intCast(text.len), @ptrCast(SQLITE_TRANSIENT));
     if (rc != c.SQLITE_OK) return error.BindFailed;
 }
 
