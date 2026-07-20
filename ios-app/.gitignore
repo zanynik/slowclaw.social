@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Xcode (generated on-demand per the README — never checked in)
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+build/
+
+# SwiftPM build output
+.build/
+.swiftpm/
+
+# Pods (if used)
+Pods/

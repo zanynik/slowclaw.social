@@ -28,6 +28,34 @@ pub const sqlite = @import("sqlite.zig");
 pub const markdown = @import("markdown.zig");
 pub const response_cache = @import("response_cache.zig");
 
+// Force-retain every `export fn` in ffi.zig. Zig 0.16 uses lazy compilation:
+// `@import("ffi.zig")` alone does NOT make its export functions reachable,
+// and a static-library build will omit them, producing a useless archive with
+// no linkable symbols (Zig Issue #10174). The `comptime` block below takes
+// the address of each export, which forces codegen for every one of them.
+//
+// When you add a new export fn to ffi.zig, add a matching `_ = &fn_name;`
+// line here — the linker will tell you if you forget (undefined symbol at the
+// consumer's link step).
+comptime {
+    _ = &ffi.slowclaw_feed_free;
+    _ = &ffi.slowclaw_feed_hash_embedder_new;
+    _ = &ffi.slowclaw_feed_hash_embedder_free;
+    _ = &ffi.slowclaw_feed_hash_embed;
+    _ = &ffi.slowclaw_feed_rank_stage2;
+    _ = &ffi.slowclaw_feed_rank_result_free;
+    _ = &ffi.slowclaw_feed_sqlite_open;
+    _ = &ffi.slowclaw_feed_sqlite_close;
+    _ = &ffi.slowclaw_feed_sqlite_health;
+    _ = &ffi.slowclaw_feed_sqlite_store;
+    _ = &ffi.slowclaw_feed_sqlite_get;
+    _ = &ffi.slowclaw_feed_sqlite_forget;
+    _ = &ffi.slowclaw_feed_sqlite_count;
+    _ = &ffi.slowclaw_feed_sqlite_recall;
+    _ = &ffi.slowclaw_feed_sqlite_result_free;
+    _ = &ffi.slowclaw_feed_sqlite_entry_free;
+}
+
 test {
     // Zig 0.16 only collects test blocks from the root source file of a test
     // binary; transitively-imported modules must be referenced here so their

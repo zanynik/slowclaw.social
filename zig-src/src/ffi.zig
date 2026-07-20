@@ -121,7 +121,7 @@ pub const SlowclawRankResult = extern struct {
 /// Free any pointer returned by this library. Safe to call on null.
 /// Equivalent to C `free`. Exposed so Swift doesn't need to know which
 /// allocator Zig used.
-export fn slowclaw_feed_free(ptr: ?*anyopaque) void {
+pub export fn slowclaw_feed_free(ptr: ?*anyopaque) void {
     if (ptr) |p| {
         // `c_allocator` backs every allocation in this module, so a plain
         // `free` matches. The slice's full length isn't known here, but C's
@@ -141,14 +141,14 @@ export fn slowclaw_feed_free(ptr: ?*anyopaque) void {
 /// `slowclaw_feed_hash_embedder_free`.
 pub const SlowclawHashEmbedder = opaque {};
 
-export fn slowclaw_feed_hash_embedder_new(model: [*]const u8, model_len: usize, dims: usize) ?*SlowclawHashEmbedder {
+pub export fn slowclaw_feed_hash_embedder_new(model: [*]const u8, model_len: usize, dims: usize) ?*SlowclawHashEmbedder {
     const model_slice = model[0..model_len];
     const he = c_allocator.create(embeddings.HashEmbedding) catch return null;
     he.* = embeddings.HashEmbedding.init(model_slice, dims);
     return @ptrCast(he);
 }
 
-export fn slowclaw_feed_hash_embedder_free(handle: ?*SlowclawHashEmbedder) void {
+pub export fn slowclaw_feed_hash_embedder_free(handle: ?*SlowclawHashEmbedder) void {
     if (handle) |h| {
         const he: *embeddings.HashEmbedding = @ptrCast(@alignCast(h));
         c_allocator.destroy(he);
@@ -158,7 +158,7 @@ export fn slowclaw_feed_hash_embedder_free(handle: ?*SlowclawHashEmbedder) void 
 /// Embed a single text. The returned `SlowclawString.bytes` points to a
 /// Zig-owned buffer of `dims * sizeof(f32)` bytes; the caller frees it via
 /// `slowclaw_feed_free`. On error returns a SlowclawString with null bytes.
-export fn slowclaw_feed_hash_embed(
+pub export fn slowclaw_feed_hash_embed(
     handle: *SlowclawHashEmbedder,
     text: [*]const u8,
     text_len: usize,
@@ -181,7 +181,7 @@ export fn slowclaw_feed_hash_embed(
 // needs NO embedder callback, making it the simplest end-to-end entrypoint.
 // ──────────────────────────────────────────────────────────────────────────
 
-export fn slowclaw_feed_rank_stage2(
+pub export fn slowclaw_feed_rank_stage2(
     interests: [*]const SlowclawInterest,
     interests_len: usize,
     negative_interests: [*]const SlowclawInterest,
@@ -236,7 +236,7 @@ export fn slowclaw_feed_rank_stage2(
 // Result freeing.
 // ──────────────────────────────────────────────────────────────────────────
 
-export fn slowclaw_feed_rank_result_free(result: *SlowclawRankResult) void {
+pub export fn slowclaw_feed_rank_result_free(result: *SlowclawRankResult) void {
     if (result.items_json.bytes) |b| {
         const slice = b[0..result.items_json.len];
         c_allocator.free(slice);
@@ -271,7 +271,7 @@ pub const SlowclawSqliteEntry = extern struct {
 /// in-memory DB. Returns null on failure.
 /// The optional embedder: pass `null` for no embeddings (keyword-only search),
 /// or a HashEmbedder handle to enable hybrid vector+keyword recall.
-export fn slowclaw_feed_sqlite_open(
+pub export fn slowclaw_feed_sqlite_open(
     path: [*]const u8,
     path_len: usize,
     embedder_handle: ?*SlowclawHashEmbedder,
@@ -289,7 +289,7 @@ export fn slowclaw_feed_sqlite_open(
     return @ptrCast(db);
 }
 
-export fn slowclaw_feed_sqlite_close(handle: ?*SlowclawSqlite) void {
+pub export fn slowclaw_feed_sqlite_close(handle: ?*SlowclawSqlite) void {
     if (handle) |h| {
         const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(h));
         db.close();
@@ -297,7 +297,7 @@ export fn slowclaw_feed_sqlite_close(handle: ?*SlowclawSqlite) void {
     }
 }
 
-export fn slowclaw_feed_sqlite_health(handle: *SlowclawSqlite) bool {
+pub export fn slowclaw_feed_sqlite_health(handle: *SlowclawSqlite) bool {
     const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
     return db.healthCheck();
 }
@@ -305,7 +305,7 @@ export fn slowclaw_feed_sqlite_health(handle: *SlowclawSqlite) bool {
 /// Insert or upsert a memory. `category` is a lowercase tag ("core", "daily",
 /// "conversation", or any custom name). `session_id` is `{null, 0}` if absent.
 /// Returns 0 on success, negative on error.
-export fn slowclaw_feed_sqlite_store(
+pub export fn slowclaw_feed_sqlite_store(
     handle: *SlowclawSqlite,
     key: [*]const u8,
     key_len: usize,
@@ -326,7 +326,7 @@ export fn slowclaw_feed_sqlite_store(
 /// Fetch a memory by key. The returned entry is Zig-owned; free via
 /// `slowclaw_feed_sqlite_entry_free`. Returns 0 if found, 1 if not found,
 /// negative on error.
-export fn slowclaw_feed_sqlite_get(
+pub export fn slowclaw_feed_sqlite_get(
     handle: *SlowclawSqlite,
     key: [*]const u8,
     key_len: usize,
@@ -341,7 +341,7 @@ export fn slowclaw_feed_sqlite_get(
 
 /// Delete a memory by key. Returns 1 if a row was deleted, 0 if not found,
 /// negative on error.
-export fn slowclaw_feed_sqlite_forget(
+pub export fn slowclaw_feed_sqlite_forget(
     handle: *SlowclawSqlite,
     key: [*]const u8,
     key_len: usize,
@@ -352,7 +352,7 @@ export fn slowclaw_feed_sqlite_forget(
 }
 
 /// Count stored memories. Returns the count (>= 0) or negative on error.
-export fn slowclaw_feed_sqlite_count(handle: *SlowclawSqlite) c_int {
+pub export fn slowclaw_feed_sqlite_count(handle: *SlowclawSqlite) c_int {
     const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
     const n = db.count() catch return SLOWCLAW_ERR_INTERNAL;
     return @intCast(n);
@@ -361,7 +361,7 @@ export fn slowclaw_feed_sqlite_count(handle: *SlowclawSqlite) c_int {
 /// Hybrid recall (FTS5 keyword + vector similarity if an embedder is set).
 /// Returns a JSON array of entries (each with id/key/content/category/timestamp/
 /// session_id/score). Free via `slowclaw_feed_sqlite_result_free`.
-export fn slowclaw_feed_sqlite_recall(
+pub export fn slowclaw_feed_sqlite_recall(
     handle: *SlowclawSqlite,
     query: [*]const u8,
     query_len: usize,
@@ -388,7 +388,7 @@ export fn slowclaw_feed_sqlite_recall(
     return SLOWCLAW_OK;
 }
 
-export fn slowclaw_feed_sqlite_result_free(result: *SlowclawRankResult) void {
+pub export fn slowclaw_feed_sqlite_result_free(result: *SlowclawRankResult) void {
     if (result.items_json.bytes) |b| {
         const slice = b[0..result.items_json.len];
         c_allocator.free(slice);
@@ -397,7 +397,7 @@ export fn slowclaw_feed_sqlite_result_free(result: *SlowclawRankResult) void {
 }
 
 /// Free an entry obtained from `slowclaw_feed_sqlite_get`.
-export fn slowclaw_feed_sqlite_entry_free(entry: *SlowclawSqliteEntry) void {
+pub export fn slowclaw_feed_sqlite_entry_free(entry: *SlowclawSqliteEntry) void {
     freeEntryCString(&entry.id);
     freeEntryCString(&entry.key);
     freeEntryCString(&entry.content);
