@@ -1,92 +1,80 @@
 # `ios-app/` — SlowClaw Social iOS app (Zig-backed)
 
-This is the iOS shell slice (slice 7) of the iOS-only Zig pivot. It contains
-everything needed to run the Zig core from a SwiftUI app end-to-end, proving
-the full Swift → C ABI → Zig → SQLite path works on iOS.
-
-**This is a skeleton**, not a polished app. The intent is to validate the
-integration story; the product surfaces (journal capture, feed UI, publishing)
-land in later slices on top of this foundation.
+The iOS shell of the iOS-only Zig pivot. Contains the SwiftUI app + XcodeGen
+project definition + the C ABI contract header. **The `.xcodeproj` is not in
+git** — it's regenerated from `project.yml` via XcodeGen. This keeps the
+project definition reviewable and diff-able.
 
 ## Layout
 
 ```
 ios-app/
+  project.yml                   XcodeGen spec → generates SlowClaw.xcodeproj
+  README.md                     This file
+  .gitignore                    Excludes .xcodeproj, build/, DerivedData/
+
+  SlowClawApp/                  The app target
+    SlowClawApp.swift           Minimal SwiftUI demo (open DB → store → recall)
+    Info.plist                  iOS app metadata
+
   SlowClawFeed/                 Swift package wrapping the C ABI
-    Package.swift               SwiftPM manifest
+    Package.swift               SwiftPM manifest (for SPM consumers)
     Sources/SlowClawFeed/
       SlowClawFeed.swift        Idiomatic Swift overlay (String, throws, etc.)
       include/
         slowclaw_feed.h         The C ABI contract (mirrors zig-src/src/ffi.zig)
-
-  SlowClawApp/                  Minimal SwiftUI demo app
-    SlowClawApp.swift           Open DB → store → recall round-trip UI
-
-  README.md                     This file
 ```
 
-## Build
-
-### 1. Build the Zig staticlib
+## Build (local macOS)
 
 ```bash
-cd zig-src
-zig build
-# → zig-out/lib/libslowclaw_feed.a (the staticlib Swift links)
-# → zig-out/lib/libsqlite3.a      (vendored SQLite, included transitively)
+# 1. Install prerequisites
+brew install xcodegen
+# Install Zig 0.16.0 from https://ziglang.org/download/ (or use tools/zig/)
+
+# 2. Generate the Xcode project
+cd ios-app
+xcodegen generate
+
+# 3. Open in Xcode and run on the iOS simulator
+open SlowClaw.xcodeproj
 ```
 
-### 2. Create the Xcode project
+The Xcode project's pre-build script phase runs `zig build` automatically, so
+editing Zig source and re-running in Xcode picks up the changes. The script
+detects sim vs device builds and picks the right Zig target:
+- `iphonesimulator` → `zig build -Dtarget=aarch64-ios-sim`
+- `iphoneos` → `zig build -Dtarget=aarch64-ios`
 
-The repo deliberately does not ship a checked-in `.xcodeproj` (they're noisy
-and machine-generated). To create one:
+## TestFlight (CI)
 
-1. Open Xcode → File → New → Project → iOS → App.
-2. Name it `SlowClawApp`, Swift interface, SwiftUI lifecycle.
-3. Replace the generated `ContentView.swift` / `SlowClawApp.swift` with the
-   file under `ios-app/SlowClawApp/SlowClawApp.swift`.
-4. Add the SlowClawFeed Swift package:
-   - File → Add Package Dependencies → Add Local → select `ios-app/SlowClawFeed`.
-5. Add the Zig staticlib:
-   - Target → General → Frameworks, Libraries, and Embedded Content → Add →
-     Add Other → Add Files → select `zig-src/zig-out/lib/libslowclaw_feed.a`.
-   - Target → Build Settings → Other Linker Flags → add `-lsqlite3` (iOS
-     ships libsqlite3 as a system framework).
-6. Add a build phase that runs `zig build` before each compile:
-   - Target → Build Phases → + → New Run Script Phase → drag to top.
-   - Script body:
-     ```bash
-     cd "$SRCROOT/../zig-src"
-     "$SRCROOT/../tools/zig/zig" build || exit 1
-     ```
-   - Output files: `$(SRCROOT)/../zig-src/zig-out/lib/libslowclaw_feed.a`
+The `pub-testflight-zig.yml` workflow at `.github/workflows/` builds + signs +
+uploads to TestFlight on every push to `zig-ios-pivot`. It reuses the same
+App Store Connect + signing secrets as the legacy Tauri workflow:
 
-### 3. Run
+- `APP_STORE_CONNECT_ISSUER_ID`
+- `APP_STORE_CONNECT_KEY_ID`
+- `APP_STORE_CONNECT_PRIVATE_KEY`
+- `APPLE_DEVELOPMENT_TEAM` (variable or secret)
 
-Select an iOS simulator target, ⌘R. The app opens a SQLite DB at
-`<Documents>/slowclaw.sqlite`, lets you type a memory + store it, and runs a
-hybrid keyword+vector recall across the store.
+The cert + provisioning profile are issued fresh per run via App Store Connect
+API (and stale CI profiles are cleaned up to avoid hitting Apple's limits).
+**Trigger manually** via the Actions UI → "Publish iOS TestFlight (Zig)" →
+Run workflow, or push to `zig-ios-pivot` with changes under `zig-src/`,
+`ios-app/`, or the workflow file itself.
 
-## Why this slice matters
+## Why no checked-in .xcodeproj
 
-Before this slice the Zig package was a library: well-tested, fully featured,
-but **completely uncallable from iOS**. After this slice:
+Xcode project files are verbose, machine-generated, and noisy in diffs. The
+modern idiom (used by Firefox, Wireguard, many others) is XcodeGen: a single
+human-readable `project.yml` that generates the project on demand. This makes
+the project definition reviewable and merge-conflict-free.
 
-- The C ABI is captured in a single contract header (`slowclaw_feed.h`) that
-  Swift imports directly.
-- An idiomatic Swift overlay (`SlowClawFeed.swift`) hides the (pointer, length)
-  ergonomics behind `String`/`throws`/`Data`.
-- A working SwiftUI demo proves the integration end-to-end.
+## Architectural note (slice 8)
 
-Every subsequent Zig module ported automatically becomes Swift-callable just
-by adding new `export fn`s to `ffi.zig` and declarations to the header.
-
-## Known limitations
-
-- The Zig staticlib currently links the vendored SQLite amalgamation. On iOS
-  the cleaner option is to switch `build.zig` to link the system `-lsqlite3`
-  framework instead (smaller binary, no version drift). TODO.
-- The Swift overlay exposes only the SQLite memory surface. The HashEmbedder
-  and ranker are available via the C ABI but not yet wrapped — add as needed.
-- The demo app's "list everything" uses a synthetic recall query; a real
-  list-all API would be added to the C ABI when needed.
+Per the pivot's "question the old architecture" guidance, the Zig TestFlight
+path **drops the Tauri + Rust + npm pipeline entirely** for iOS. No Cargo, no
+node, no web bundling — just Zig → staticlib → Xcode → TestFlight. The legacy
+workflow `pub-testflight-ios.yml` still exists for the `main` branch; this new
+workflow is for `zig-ios-pivot` only. When the pivot merges, the legacy one
+gets deleted.
