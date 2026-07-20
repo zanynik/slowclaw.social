@@ -43,7 +43,7 @@ public struct SlowClawMemoryEntry: Equatable {
 }
 
 /// Memory category tags. Matches the Rust enum's lowercase string form.
-public enum SlowClawMemoryCategory: String {
+public enum SlowClawMemoryCategory: String, CaseIterable {
     case core
     case daily
     case conversation

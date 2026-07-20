@@ -144,5 +144,3 @@ final class MemoryStore: ObservableObject {
         }
     }
 }
-
-extension SlowClawMemoryCategory: CaseIterable {}
