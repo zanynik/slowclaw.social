@@ -11,7 +11,8 @@
 // on iOS, validating the slice-7 deliverable.
 
 import SwiftUI
-import SlowClawFeed
+// SlowClawFeed.swift is compiled into the same target (no separate module).
+// The C ABI is imported via the bridging header (SWIFT_OBJC_BRIDGING_HEADER).
 
 @main
 struct SlowClawApp: App {
