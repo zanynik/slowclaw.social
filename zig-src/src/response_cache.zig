@@ -16,6 +16,9 @@ const c = @cImport({
     @cInclude("time.h");
 });
 
+// SQLITE_TRANSIENT workaround — see sqlite.zig for the rationale.
+const SQLITE_TRANSIENT: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+
 pub const ResponseCacheError = error{
     OpenFailed,
     PrepareFailed,
@@ -273,7 +276,7 @@ pub const ResponseCache = struct {
 };
 
 fn bindText(stmt: *c.sqlite3_stmt, idx: c_int, text: []const u8) !void {
-    const rc = c.sqlite3_bind_text(stmt, idx, text.ptr, @intCast(text.len), c.SQLITE_TRANSIENT);
+    const rc = c.sqlite3_bind_text(stmt, idx, text.ptr, @intCast(text.len), SQLITE_TRANSIENT);
     if (rc != c.SQLITE_OK) return error.BindFailed;
 }
 
