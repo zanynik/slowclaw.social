@@ -59,8 +59,10 @@ pub fn build(b: *std.Build) void {
         // both resolve it via `xcrun --sdk iphoneos --show-sdk-path`.
         const sysroot_opt = b.option([]const u8, "ios-sysroot", "Path to the iOS SDK sysroot (for cross-compiling sqlite3.c)");
         if (sysroot_opt) |sdk| {
-            const isysroot = std.fmt.allocPrint(b.allocator, "-isysroot{s}", .{sdk}) catch unreachable;
-            sqlite_flags.append(b.allocator, isysroot) catch unreachable;
+            // Clang/GCC require -isysroot as a separate argv entry from the path.
+            // (Glued form -isysroot/path is not reliably parsed.)
+            sqlite_flags.append(b.allocator, "-isysroot") catch unreachable;
+            sqlite_flags.append(b.allocator, sdk) catch unreachable;
         }
     }
 
