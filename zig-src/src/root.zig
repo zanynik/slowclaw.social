@@ -26,6 +26,7 @@ pub const embeddings = @import("embeddings.zig");
 pub const ffi = @import("ffi.zig");
 pub const sqlite = @import("sqlite.zig");
 pub const markdown = @import("markdown.zig");
+pub const response_cache = @import("response_cache.zig");
 
 test {
     // Zig 0.16 only collects test blocks from the root source file of a test

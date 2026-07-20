@@ -62,11 +62,12 @@ without going through HashEmbedding.
 
 ```bash
 cd zig-src
-zig build              # emits zig-out/libslowclaw_feed.a + zig-out/libsqlite3.a (staticlibs)
-zig build test         # libc-free unit tests (ranker, vector_math, chunker, embeddings, …)
-zig build test-ffi     # C ABI round-trip tests (libc + sqlite linked)
-zig build test-sqlite  # SQLite-backed memory store tests (libc + vendored SQLite)
-zig build test-markdown # Markdown memory backend tests (libc for file I/O)
+zig build                  # emits zig-out/libslowclaw_feed.a + zig-out/libsqlite3.a (staticlibs)
+zig build test             # libc-free unit tests (ranker, vector_math, chunker, embeddings, …)
+zig build test-ffi         # C ABI round-trip tests (libc + sqlite linked)
+zig build test-sqlite      # SQLite-backed memory store tests (libc + vendored SQLite)
+zig build test-markdown    # Markdown memory backend tests (libc for file I/O)
+zig build test-response-cache # LLM response cache tests (libc + sqlite)
 ```
 
 ## Module layout (current)
@@ -95,6 +96,8 @@ zig-src/
                         #   (FTS5 search, embedding cache, Memory trait ops)
     markdown.zig        # MarkdownMemory — file-backed append-only memory backend
                         #   (MEMORY.md + memory/YYYY-MM-DD.md, alternative to sqlite)
+    response_cache.zig  # ResponseCache — LLM response cache (SHA-256 keyed,
+                        #   TTL + LRU eviction, separate SQLite DB)
   vendor/sqlite/        # vendored SQLite 3.46 amalgamation (sqlite3.c + .h)
   README.md             # this file
 ```
@@ -178,10 +181,12 @@ in `src/porter_stemmer.zig`).
       (compiled by Zig; FTS5 keyword search; upsert, get, list, forget, count,
       session_id + custom-category round-trip, file persistence)
 
-**Total: 117 libc-free + 123 FFI + 70 SQLite tests = 310 tests, 0 leaks.** The
+**Total: 117 libc-free + 123 FFI + 70 SQLite + 14 Markdown + 10 ResponseCache = 334 tests, 0 leaks.** The
 production persistence backend works end-to-end and is fully reachable from
 Swift through the C ABI: open a database, store memories, recall via hybrid
-FTS5+vector search, get/forget by key, and inspect health/count.
+FTS5+vector search, get/forget by key, and inspect health/count. The markdown
+backend offers a plain-text audit-trail alternative; the response cache saves
+LLM tokens on repeated prompts.
 
 ## Next slices (not in this branch's current scope)
 

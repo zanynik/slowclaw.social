@@ -105,6 +105,22 @@ pub fn build(b: *std.Build) void {
     const markdown_test_step = b.step("test-markdown", "Run the Markdown memory tests (libc linked)");
     markdown_test_step.dependOn(&run_markdown_tests.step);
 
+    // ── Response-cache test module (libc + sqlite linked) ─────────────────
+    const response_cache_test_mod = b.addModule("slowclaw_feed_response_cache_test", .{
+        .root_source_file = b.path("src/response_cache.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    response_cache_test_mod.link_libc = true;
+    response_cache_test_mod.addIncludePath(b.path("vendor/sqlite"));
+    response_cache_test_mod.linkLibrary(sqlite_c);
+    const response_cache_tests = b.addTest(.{
+        .root_module = response_cache_test_mod,
+    });
+    const run_response_cache_tests = b.addRunArtifact(response_cache_tests);
+    const response_cache_test_step = b.step("test-response-cache", "Run the LLM response cache tests (libc + sqlite)");
+    response_cache_test_step.dependOn(&run_response_cache_tests.step);
+
     // ── Library artifact (libc + sqlite + ffi, ships to iOS) ─────────────
     const lib_mod = b.addModule("slowclaw_feed_lib", .{
         .root_source_file = b.path("src/root.zig"),
