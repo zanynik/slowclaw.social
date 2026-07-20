@@ -59,10 +59,12 @@ pub fn build(b: *std.Build) void {
         // both resolve it via `xcrun --sdk iphoneos --show-sdk-path`.
         const sysroot_opt = b.option([]const u8, "ios-sysroot", "Path to the iOS SDK sysroot (for cross-compiling sqlite3.c)");
         if (sysroot_opt) |sdk| {
-            // Clang/GCC require -isysroot as a separate argv entry from the path.
-            // (Glued form -isysroot/path is not reliably parsed.)
-            sqlite_flags.append(b.allocator, "-isysroot") catch unreachable;
-            sqlite_flags.append(b.allocator, sdk) catch unreachable;
+            // Add the SDK's include directories directly to the module's
+            // system include path. Zig's internal Clang doesn't reliably
+            // honor -isysroot passed via -cflags; addSystemIncludePath is
+            // the supported way to point at SDK headers.
+            sqlite_mod.addSystemIncludePath(.{ .cwd_relative = sdk });
+            sqlite_mod.addSystemIncludePath(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/usr/include", .{sdk}) catch unreachable });
         }
     }
 
