@@ -52,21 +52,27 @@ pub fn build(b: *std.Build) void {
     sqlite_flags.append(b.allocator, "-DSQLITE_ENABLE_FTS5") catch unreachable;
     sqlite_flags.append(b.allocator, "-DSQLITE_OMIT_DEPRECATED") catch unreachable;
 
+    // Resolve the iOS SDK sysroot once, for reuse across every module that
+    // does @cImport of system headers (sqlite.zig, markdown.zig, etc.).
     const target_os = target.result.os.tag;
-    if (target_os == .ios) {
-        // iOS targets need the iOS SDK sysroot for libc headers (stdio.h etc).
-        // Pass it via -Dios-sysroot=<path>. The CI workflow and project.yml
-        // both resolve it via `xcrun --sdk iphoneos --show-sdk-path`.
-        const sysroot_opt = b.option([]const u8, "ios-sysroot", "Path to the iOS SDK sysroot (for cross-compiling sqlite3.c)");
-        if (sysroot_opt) |sdk| {
-            // Add the SDK's include directories directly to the module's
-            // system include path. Zig's internal Clang doesn't reliably
-            // honor -isysroot passed via -cflags; addSystemIncludePath is
-            // the supported way to point at SDK headers.
-            sqlite_mod.addSystemIncludePath(.{ .cwd_relative = sdk });
-            sqlite_mod.addSystemIncludePath(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/usr/include", .{sdk}) catch unreachable });
+    const ios_sysroot: ?[]const u8 = blk: {
+        if (target_os != .ios) break :blk null;
+        const sysroot_opt = b.option([]const u8, "ios-sysroot", "Path to the iOS SDK sysroot (for cross-compiling sqlite3.c + @cImport)");
+        break :blk sysroot_opt;
+    };
+
+    // Helper: add iOS SDK system include paths to a module (for @cImport).
+    const addIosSysroot = struct {
+        fn add(mod: *std.Build.Module, sdk_opt: ?[]const u8, allocator: std.mem.Allocator) void {
+            const sdk = sdk_opt orelse return;
+            mod.addSystemIncludePath(.{ .cwd_relative = sdk });
+            const usr_inc = std.fmt.allocPrint(allocator, "{s}/usr/include", .{sdk}) catch return;
+            mod.addSystemIncludePath(.{ .cwd_relative = usr_inc });
         }
-    }
+    }.add;
+
+    // Apply to the sqlite module (for sqlite3.c compilation).
+    addIosSysroot(sqlite_mod, ios_sysroot, b.allocator);
 
     sqlite_mod.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
@@ -157,6 +163,7 @@ pub fn build(b: *std.Build) void {
     });
     lib_mod.link_libc = true;
     linkSqlite(lib_mod, sqlite_c);
+    addIosSysroot(lib_mod, ios_sysroot, b.allocator);
     const lib = b.addLibrary(.{
         .name = "slowclaw_feed",
         .root_module = lib_mod,
