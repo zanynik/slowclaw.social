@@ -71,7 +71,14 @@ jobs:
               working-directory: zig-src
               run: |
                   set -euo pipefail
-                  "${ZIG_BIN}" build -Dtarget=aarch64-ios -Doptimize=ReleaseSafe
+                  # Resolve the iOS SDK path so Zig can find libc headers
+                  # (stdio.h etc.) when compiling sqlite3.c. build.zig also
+                  # tries xcrun auto-discovery, but passing it explicitly is
+                  # more robust in CI.
+                  IOS_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+                  echo "iOS sysroot: ${IOS_SYSROOT}"
+                  "${ZIG_BIN}" build -Dtarget=aarch64-ios -Doptimize=ReleaseSafe \
+                    -Dios-sysroot="${IOS_SYSROOT}"
                   ls -lh zig-out/lib/
 
             - name: Generate Xcode project

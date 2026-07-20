@@ -80,10 +80,14 @@ targets:
             exit 1
           fi
           if [ "$PLATFORM_NAME" = "iphonesimulator" ]; then
-            "$ZIG" build -Dtarget=aarch64-ios-sim -Doptimize=ReleaseSafe --prefix zig-out-sim
+            SIM_SYSROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+            "$ZIG" build -Dtarget=aarch64-ios-sim -Doptimize=ReleaseSafe \
+              -Dios-sysroot="${SIM_SYSROOT}" --prefix zig-out-sim
             cp zig-out-sim/lib/libslowclaw_feed.a zig-out/lib/libslowclaw_feed.a
           else
-            "$ZIG" build -Dtarget=aarch64-ios -Doptimize=ReleaseSafe
+            IOS_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+            "$ZIG" build -Dtarget=aarch64-ios -Doptimize=ReleaseSafe \
+              -Dios-sysroot="${IOS_SYSROOT}"
           fi
           echo "Built: $(ls -lh zig-out/lib/libslowclaw_feed.a || true)"
         outputFiles:

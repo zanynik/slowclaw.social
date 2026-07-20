@@ -30,25 +30,60 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
 
     // ── SQLite source ────────────────────────────────────────────────────
-    // Always compile the vendored SQLite amalgamation. We previously tried
-    // linking the system libsqlite3 on iOS/macOS for a smaller binary, but
-    // Zig's cross-compiler can't auto-discover the iOS SDK sysroot — it would
-    // need an explicit --sysroot flag plumbed through, and the binary-size
-    // win isn't worth the fragility. The amalgamation is self-contained and
-    // identical across all targets.
+    // Always compile the vendored SQLite amalgamation. The amalgamation needs
+    // the target's libc headers (stdio.h etc.). Zig ships libc for most
+    // targets but NOT for iOS — when targeting iOS, the caller must provide
+    // the iOS SDK sysroot via the SLOWCLAW_IOS_SYSROOT env var (set by the
+    // CI workflow to `xcrun --sdk iphoneos --show-sdk-path`). We plumb it
+    // through as -isysroot for the C compile.
     const sqlite_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+
+    // Build the C compile flags. Add -isysroot when targeting iOS and a
+    // sysroot path is available; otherwise Zig's bundled libc provides the
+    // headers.
+    var sqlite_flags = std.ArrayList([]const u8).empty;
+    sqlite_flags.append(b.allocator, "-std=c11") catch unreachable;
+    sqlite_flags.append(b.allocator, "-w") catch unreachable;
+    sqlite_flags.append(b.allocator, "-DSQLITE_THREADSAFE=1") catch unreachable;
+    sqlite_flags.append(b.allocator, "-DSQLITE_ENABLE_FTS5") catch unreachable;
+    sqlite_flags.append(b.allocator, "-DSQLITE_OMIT_DEPRECATED") catch unreachable;
+
+    const target_os = target.result.os.tag;
+    if (target_os == .ios) {
+        // On macOS hosts, query the iOS SDK path via xcrun at build time.
+        // This makes local macOS dev work transparently (no option needed).
+        if (@import("builtin").os.tag == .macos) {
+            const argv = [_][]const u8{ "xcrun", "--sdk", "iphoneos", "--show-sdk-path" };
+            const result = std.process.Child.run(.{
+                .allocator = b.allocator,
+                .argv = &argv,
+            }) catch null;
+            if (result) |r| {
+                if (r.term == .Exited and r.term.Exited == 0) {
+                    const sdk_path = std.mem.trim(u8, r.stdout, " \n\r\t");
+                    if (sdk_path.len > 0) {
+                        const isysroot = std.fmt.allocPrint(b.allocator, "-isysroot{s}", .{sdk_path}) catch unreachable;
+                        sqlite_flags.append(b.allocator, isysroot) catch unreachable;
+                    }
+                }
+            }
+        }
+        // Allow an explicit override via -Dios-sysroot=<path> (for CI or
+        // non-macOS hosts that have the iOS SDK installed elsewhere).
+        const sysroot_opt = b.option([]const u8, "ios-sysroot", "Path to the iOS SDK sysroot (for cross-compiling sqlite3.c)");
+        if (sysroot_opt) |sdk| {
+            const isysroot = std.fmt.allocPrint(b.allocator, "-isysroot{s}", .{sdk}) catch unreachable;
+            sqlite_flags.append(b.allocator, isysroot) catch unreachable;
+        }
+    }
+
     sqlite_mod.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
-        .flags = &.{
-            "-std=c11", "-w",
-            "-DSQLITE_THREADSAFE=1",
-            "-DSQLITE_ENABLE_FTS5",
-            "-DSQLITE_OMIT_DEPRECATED",
-        },
+        .flags = sqlite_flags.items,
     });
     const sqlite_c = b.addLibrary(.{
         .name = "sqlite3",
