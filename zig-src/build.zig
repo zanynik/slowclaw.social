@@ -54,26 +54,9 @@ pub fn build(b: *std.Build) void {
 
     const target_os = target.result.os.tag;
     if (target_os == .ios) {
-        // On macOS hosts, query the iOS SDK path via xcrun at build time.
-        // This makes local macOS dev work transparently (no option needed).
-        if (@import("builtin").os.tag == .macos) {
-            const argv = [_][]const u8{ "xcrun", "--sdk", "iphoneos", "--show-sdk-path" };
-            const result = std.process.Child.run(.{
-                .allocator = b.allocator,
-                .argv = &argv,
-            }) catch null;
-            if (result) |r| {
-                if (r.term == .Exited and r.term.Exited == 0) {
-                    const sdk_path = std.mem.trim(u8, r.stdout, " \n\r\t");
-                    if (sdk_path.len > 0) {
-                        const isysroot = std.fmt.allocPrint(b.allocator, "-isysroot{s}", .{sdk_path}) catch unreachable;
-                        sqlite_flags.append(b.allocator, isysroot) catch unreachable;
-                    }
-                }
-            }
-        }
-        // Allow an explicit override via -Dios-sysroot=<path> (for CI or
-        // non-macOS hosts that have the iOS SDK installed elsewhere).
+        // iOS targets need the iOS SDK sysroot for libc headers (stdio.h etc).
+        // Pass it via -Dios-sysroot=<path>. The CI workflow and project.yml
+        // both resolve it via `xcrun --sdk iphoneos --show-sdk-path`.
         const sysroot_opt = b.option([]const u8, "ios-sysroot", "Path to the iOS SDK sysroot (for cross-compiling sqlite3.c)");
         if (sysroot_opt) |sdk| {
             const isysroot = std.fmt.allocPrint(b.allocator, "-isysroot{s}", .{sdk}) catch unreachable;
