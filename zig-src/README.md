@@ -64,8 +64,9 @@ without going through HashEmbedding.
 cd zig-src
 zig build              # emits zig-out/libslowclaw_feed.a + zig-out/libsqlite3.a (staticlibs)
 zig build test         # libc-free unit tests (ranker, vector_math, chunker, embeddings, …)
-zig build test-ffi     # C ABI round-trip tests (libc-linked)
+zig build test-ffi     # C ABI round-trip tests (libc + sqlite linked)
 zig build test-sqlite  # SQLite-backed memory store tests (libc + vendored SQLite)
+zig build test-markdown # Markdown memory backend tests (libc for file I/O)
 ```
 
 ## Module layout (current)
@@ -92,6 +93,8 @@ zig-src/
                         #   (deterministic fallback; Builtin/OpenAi stay FFI-injected)
     sqlite.zig          # SqliteMemory — production persistence via vendored SQLite
                         #   (FTS5 search, embedding cache, Memory trait ops)
+    markdown.zig        # MarkdownMemory — file-backed append-only memory backend
+                        #   (MEMORY.md + memory/YYYY-MM-DD.md, alternative to sqlite)
   vendor/sqlite/        # vendored SQLite 3.46 amalgamation (sqlite3.c + .h)
   README.md             # this file
 ```

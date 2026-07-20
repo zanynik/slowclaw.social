@@ -91,6 +91,20 @@ pub fn build(b: *std.Build) void {
     const sqlite_test_step = b.step("test-sqlite", "Run the SQLite-backed tests (libc + sqlite linked)");
     sqlite_test_step.dependOn(&run_sqlite_tests.step);
 
+    // ── Markdown test module (libc linked for file I/O) ───────────────────
+    const markdown_test_mod = b.addModule("slowclaw_feed_markdown_test", .{
+        .root_source_file = b.path("src/markdown.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    markdown_test_mod.link_libc = true;
+    const markdown_tests = b.addTest(.{
+        .root_module = markdown_test_mod,
+    });
+    const run_markdown_tests = b.addRunArtifact(markdown_tests);
+    const markdown_test_step = b.step("test-markdown", "Run the Markdown memory tests (libc linked)");
+    markdown_test_step.dependOn(&run_markdown_tests.step);
+
     // ── Library artifact (libc + sqlite + ffi, ships to iOS) ─────────────
     const lib_mod = b.addModule("slowclaw_feed_lib", .{
         .root_source_file = b.path("src/root.zig"),

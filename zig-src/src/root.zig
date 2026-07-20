@@ -24,6 +24,8 @@ pub const memory_types = @import("memory_types.zig");
 pub const chunker = @import("chunker.zig");
 pub const embeddings = @import("embeddings.zig");
 pub const ffi = @import("ffi.zig");
+pub const sqlite = @import("sqlite.zig");
+pub const markdown = @import("markdown.zig");
 
 test {
     // Zig 0.16 only collects test blocks from the root source file of a test
