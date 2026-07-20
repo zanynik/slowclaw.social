@@ -49,9 +49,11 @@ jobs:
                   set -euo pipefail
                   # Pin a specific Zig version for reproducible CI builds.
                   # Update in lockstep with zig-src/README.md when bumping.
+                  # The macOS runner is arm64 (macos-26-arm64), so aarch64-macos.
                   ZIG_VERSION="0.16.0"
+                  ZIG_ARCH="aarch64-macos"
                   curl -L --fail -o /tmp/zig.tar.xz \
-                    "https://ziglang.org/download/${ZIG_VERSION}/zig-macos-${ZIG_VERSION}.tar.xz"
+                    "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
                   mkdir -p tools-zig
                   tar -xf /tmp/zig.tar.xz -C tools-zig --strip-components=1
                   rm /tmp/zig.tar.xz
