@@ -1,27 +1,22 @@
 const std = @import("std");
 
-// SlowClaw Social — Zig core pilot (slice 1: feed ranker).
-//
-// This package is a port-in-progress of selected pure-logic modules from the
-// Rust core (`src/feed/ranker.rs`, `src/memory/vector.rs`, `src/util.rs`) to
-// Zig. It is intentionally additive: the Rust source remains the authoritative
-// spec until the port reaches feature parity and the iOS shell wires up.
+// SlowClaw Social — Zig core pilot.
 //
 // Build modes:
-//   zig build           → emit `zig-out/libslowclaw_feed.a` (staticlib, future iOS FFI artifact)
-//   zig build test      → run all `test {}` blocks across the package
+//   zig build           → emit `zig-out/libslowclaw_feed.a` (staticlib, includes
+//                          vendored SQLite amalgamation + the C ABI surface)
+//   zig build test      → run libc-free unit tests (excludes ffi + sqlite)
+//   zig build test-ffi  → run the libc-linked C ABI tests (excludes sqlite)
+//   zig build test-sqlite → run the SQLite-backed tests (libc + sqlite linked)
 //
-// See README.md in this directory for the port status and slice breakdown.
+// See README.md for the port status and slice breakdown.
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // ── Test module (libc-free) ────────────────────────────────────────────
-    // The test binary runs every `test {}` block in the package EXCEPT those
-    // in ffi.zig (which require libc and round-trip through `export fn`s — not
-    // useful in the test runner anyway). Keeping the test binary libc-free
-    // preserves the debug allocator's behavior the ranker tests depend on.
+    // ── Test module (libc-free, no sqlite) ────────────────────────────────
+    // Preserves the debug allocator's behavior the ranker tests depend on.
     const test_mod = b.addModule("slowclaw_feed_test", .{
         .root_source_file = b.path("src/test_root.zig"),
         .target = target,
@@ -34,10 +29,35 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all unit tests in the slowclaw_feed package (libc-free)");
     test_step.dependOn(&run_lib_tests.step);
 
-    // ── FFI tests (libc-linked) ───────────────────────────────────────────
-    // ffi.zig uses `std.c.free` for cross-language memory ownership, so its
-    // tests need libc. Compile and run them as a separate `zig build test-ffi`
-    // step so they don't change the default test binary's allocator behavior.
+    // ── Vendored SQLite amalgamation (compiled as a C static library) ────
+    // Zig compiles sqlite3.c directly; no system SQLite dependency. On iOS
+    // the resulting object code is linked into the app's staticlib.
+    const sqlite_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sqlite_mod.addCSourceFile(.{
+        .file = b.path("vendor/sqlite/sqlite3.c"),
+        // SQLITE_THREADSAFE=1 → serialized mode (matches rusqlite's usage).
+        // SQLITE_ENABLE_FTS5 → full-text search (ranker relies on it).
+        // SQLITE_OMIT_DEPRECATED keeps the binary smaller.
+        .flags = &.{
+            "-std=c11", "-w",
+            "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_ENABLE_FTS5",
+            "-DSQLITE_OMIT_DEPRECATED",
+        },
+    });
+    const sqlite_c = b.addLibrary(.{
+        .name = "sqlite3",
+        .root_module = sqlite_mod,
+        .linkage = .static,
+    });
+    sqlite_c.installHeader(b.path("vendor/sqlite/sqlite3.h"), "sqlite3.h");
+    b.installArtifact(sqlite_c);
+
+    // ── FFI test module (libc-linked, no sqlite) ──────────────────────────
     const ffi_test_mod = b.addModule("slowclaw_feed_ffi_test", .{
         .root_source_file = b.path("src/ffi.zig"),
         .target = target,
@@ -48,24 +68,38 @@ pub fn build(b: *std.Build) void {
         .root_module = ffi_test_mod,
     });
     const run_ffi_tests = b.addRunArtifact(ffi_tests);
-    const ffi_test_step = b.step("test-ffi", "Run the C ABI tests (libc-linked)");
+    const ffi_test_step = b.step("test-ffi", "Run the C ABI tests (libc-linked, no sqlite)");
     ffi_test_step.dependOn(&run_ffi_tests.step);
 
-    // ── Library artifact (libc-linked, includes the C ABI surface) ────────
-    // The staticlib that ships to iOS / Xcode MUST link libc because ffi.zig
-    // uses `std.c.free` for cross-language memory ownership. The library
-    // module is separate from the test module so adding libc here doesn't
-    // affect the test binary.
+    // ── SQLite test module (libc + sqlite linked) ─────────────────────────
+    const sqlite_test_mod = b.addModule("slowclaw_feed_sqlite_test", .{
+        .root_source_file = b.path("src/sqlite.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sqlite_test_mod.link_libc = true;
+    sqlite_test_mod.addIncludePath(b.path("vendor/sqlite"));
+    const sqlite_tests = b.addTest(.{
+        .root_module = sqlite_test_mod,
+    });
+    sqlite_test_mod.linkLibrary(sqlite_c);
+    const run_sqlite_tests = b.addRunArtifact(sqlite_tests);
+    const sqlite_test_step = b.step("test-sqlite", "Run the SQLite-backed tests (libc + sqlite linked)");
+    sqlite_test_step.dependOn(&run_sqlite_tests.step);
+
+    // ── Library artifact (libc + sqlite + ffi, ships to iOS) ─────────────
     const lib_mod = b.addModule("slowclaw_feed_lib", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     lib_mod.link_libc = true;
+    lib_mod.addIncludePath(b.path("vendor/sqlite"));
     const lib = b.addLibrary(.{
         .name = "slowclaw_feed",
         .root_module = lib_mod,
         .linkage = .static,
     });
+    lib_mod.linkLibrary(sqlite_c);
     b.installArtifact(lib);
 }

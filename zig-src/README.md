@@ -52,20 +52,21 @@ without going through HashEmbedding.
 
 ```bash
 cd zig-src
-zig build           # emits zig-out/libslowclaw_feed.a (staticlib, libc-linked, includes FFI)
-zig build test      # runs every test{} block in the package (libc-free)
-zig build test-ffi  # runs the C ABI tests in ffi.zig (libc-linked)
+zig build              # emits zig-out/libslowclaw_feed.a + zig-out/libsqlite3.a (staticlibs)
+zig build test         # libc-free unit tests (ranker, vector_math, chunker, embeddings, …)
+zig build test-ffi     # C ABI round-trip tests (libc-linked)
+zig build test-sqlite  # SQLite-backed memory store tests (libc + vendored SQLite)
 ```
 
 ## Module layout (current)
 
 ```
 zig-src/
-  build.zig             # staticlib + test runner (libc-free test + libc-linked lib)
+  build.zig             # 3 test steps + 2 staticlibs (libslowclaw_feed, libsqlite3)
   build.zig.zon         # package manifest, no external deps
   src/
-    root.zig            # library public re-exports (includes ffi)
-    test_root.zig       # test entry point (excludes ffi — see build.zig)
+    root.zig            # library public re-exports (includes ffi + sqlite)
+    test_root.zig       # libc-free test entry point (excludes ffi/sqlite)
     ffi.zig             # C ABI surface — Swift-callable export fns
     vector_math.zig     # cosine_similarity, vec<->bytes, hybrid_merge
     text_util.zig       # truncate_with_ellipsis (UTF-8 safe)
@@ -79,6 +80,9 @@ zig-src/
     chunker.zig         # line-based markdown chunker (headings→paragraphs→lines)
     embeddings.zig      # EmbeddingProvider vtable, NoopEmbedding, HashEmbedding
                         #   (deterministic fallback; Builtin/OpenAi stay FFI-injected)
+    sqlite.zig          # SqliteMemory — production persistence via vendored SQLite
+                        #   (FTS5 search, embedding cache, Memory trait ops)
+  vendor/sqlite/        # vendored SQLite 3.46 amalgamation (sqlite3.c + .h)
   README.md             # this file
 ```
 
@@ -157,11 +161,13 @@ in `src/porter_stemmer.zig`).
 - [x] ranker.Embedder unified with embeddings.EmbeddingProvider (single contract)
 - [x] ffi.zig — C ABI surface (rank_stage2, hash embedder, JSON serialization);
       build separates libc-free tests from libc-linked library artifact
+- [x] sqlite.zig — SQLite memory backend via vendored SQLite amalgamation
+      (compiled by Zig; FTS5 keyword search; upsert, get, list, forget, count,
+      session_id + custom-category round-trip, file persistence)
 
-**Total: 117 libc-free tests + 88 libc-linked FFI tests, 0 leaks.** Ported so
-far: all of `src/feed/ranker.rs` (703 LOC) plus its pure deps, the `Memory`
-trait + types, the markdown chunker, the embeddings trait + Noop + Hash
-implementations, and the C ABI boundary that makes the package Swift-callable.
+**Total: 117 libc-free + 88 FFI + 32 SQLite tests = 237 tests, 0 leaks.** The
+production persistence backend works end-to-end and ships as a single staticlib
+with vendored SQLite (no system dependency at runtime).
 
 ## Next slices (not in this branch's current scope)
 
