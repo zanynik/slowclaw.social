@@ -15,6 +15,8 @@ pub const ranker = @import("ranker.zig");
 pub const memory_types = @import("memory_types.zig");
 pub const chunker = @import("chunker.zig");
 pub const embeddings = @import("embeddings.zig");
+pub const provider = @import("provider.zig");
+pub const openai_provider = @import("openai_provider.zig");
 
 test {
     _ = vector_math;
@@ -26,6 +28,8 @@ test {
     _ = memory_types;
     _ = chunker;
     _ = embeddings;
+    _ = provider;
+    _ = openai_provider;
 
     try std.testing.expect(std.mem.eql(u8, "ok", "ok"));
 }

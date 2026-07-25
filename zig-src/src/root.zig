@@ -27,6 +27,8 @@ pub const ffi = @import("ffi.zig");
 pub const sqlite = @import("sqlite.zig");
 pub const markdown = @import("markdown.zig");
 pub const response_cache = @import("response_cache.zig");
+pub const provider = @import("provider.zig");
+pub const openai_provider = @import("openai_provider.zig");
 
 // Force-retain every `export fn` in ffi.zig. Zig 0.16 uses lazy compilation:
 // `@import("ffi.zig")` alone does NOT make its export functions reachable,
