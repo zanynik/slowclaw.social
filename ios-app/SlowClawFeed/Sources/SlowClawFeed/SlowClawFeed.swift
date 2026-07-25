@@ -224,7 +224,7 @@ public final class SlowClawSqliteMemory {
 
     private func stringFromSlowclaw(_ s: SlowclawString) -> String {
         guard let bytes = s.bytes, s.len > 0 else { return "" }
-        return String(bytes: Data(bytes: bytes, count: s.len), encoding: .utf8) ?? ""
+        return String(data: Data(bytes: UnsafeRawPointer(bytes), count: s.len), encoding: .utf8) ?? ""
     }
 }
 
@@ -379,10 +379,13 @@ private let slowClawHttpPostTrampoline: SlowclawHttpPostFn = { ctx, urlPtr, urlL
     guard let ctx else { return SlowclawString(bytes: nil, len: 0) }
     let box = Unmanaged<SlowClawHttpContextBox>.fromOpaque(ctx).takeUnretainedValue()
 
-    let url = String(bytes: Data(bytes: urlPtr, count: urlLen), encoding: .utf8) ?? ""
-    let auth = String(bytes: Data(bytes: authPtr, count: authLen), encoding: .utf8) ?? ""
-    let contentType = String(bytes: Data(bytes: ctPtr, count: ctLen), encoding: .utf8) ?? ""
-    let body = Data(bytes: bodyPtr, count: bodyLen)
+    let urlData = Data(bytes: UnsafeRawPointer(urlPtr!), count: urlLen)
+    let authData = Data(bytes: UnsafeRawPointer(authPtr!), count: authLen)
+    let ctData = Data(bytes: UnsafeRawPointer(ctPtr!), count: ctLen)
+    let body = Data(bytes: UnsafeRawPointer(bodyPtr!), count: bodyLen)
+    let url = String(data: urlData, encoding: .utf8) ?? ""
+    let auth = String(data: authData, encoding: .utf8) ?? ""
+    let contentType = String(data: ctData, encoding: .utf8) ?? ""
 
     guard let response = box.handler(url, auth, contentType, body) else {
         return SlowclawString(bytes: nil, len: 0)
