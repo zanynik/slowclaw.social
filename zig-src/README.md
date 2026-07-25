@@ -82,18 +82,25 @@ ld: 64-bit mach-o member 'libslowclaw_feed_zcu.o' not 8-byte aligned in '.../lib
 Tracked upstream as [Codeberg ziglang/zig#35280](https://codeberg.org/ziglang/zig/issues/35280);
 fixed in the 0.17-dev branch but **not** backported to any 0.16.x release.
 
-**Workaround (built into `build.zig`):** when the build host is macOS, after
-Zig emits `libslowclaw_feed.a` the build graph extracts its members with
-`xcrun ar -x` and reassembles them with `xcrun libtool -static` + `xcrun ranlib`,
-which write 8-byte-aligned members. The repacked archive is what gets installed
-to `zig-out/lib/`. Non-macOS hosts (Linux/Windows local dev) skip the repack
-and install the plain archive, since Apple `ld` is never the consumer there.
-The CI workflow additionally runs `nm -a` on the installed archive to catch a
-regression at build time rather than at the Xcode link step.
+**Workaround (built into `build.zig`):** when the build host is macOS, the build
+graph installs `libslowclaw_feed.a` normally (the static `.a` is only materialized
+by the install step), then extracts its members with `xcrun ar -x` and reassembles
+them with `xcrun libtool -static` + `xcrun ranlib` (which write 8-byte-aligned
+members), and install-copies the aligned archive over `zig-out/lib/`. Non-macOS
+hosts (Linux/Windows local dev) skip the repack and keep the plain install, since
+Apple `ld` is never the consumer there. The CI workflow additionally runs `nm -a`
+on the installed archive to catch a regression at build time rather than at the
+Xcode link step.
+
+> Local macOS incremental-build note: the repack step's input (the installed
+> archive) is passed as a plain path arg, so Zig's per-step cache doesn't
+> content-track it. If you ever see the link error again after editing Zig
+> sources, `rm -rf zig-src/.zig-cache` and rebuild. (CI runs fresh, so it is
+> unaffected.)
 
 When bumping the pinned Zig version past 0.16 (to a 0.17 release that contains
-the upstream fix), the `repackArchiveStep` branch in `build.zig` can be deleted
-and the install reverted to `b.installArtifact(lib)`.
+the upstream fix), the `repackInstalledArchiveStep` branch in `build.zig` can be
+deleted and the install reverted to `b.installArtifact(lib)`.
 
 ## Module layout (current)
 
