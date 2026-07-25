@@ -193,7 +193,7 @@ struct JournalView: View {
                 // Capture zone
                 VStack(spacing: 12) {
                     TextEditor(text: $newEntry)
-                        .frame(minHeight: 120)
+                        .frame(minHeight: 100)
                         .padding(8)
                         .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
                         .overlay(alignment: .topLeading) {
@@ -206,11 +206,11 @@ struct JournalView: View {
                             }
                         }
 
-                    HStack(spacing: 16) {
+                    HStack(spacing: 12) {
                         Button {
                             Task { await saveEntry() }
                         } label: {
-                            Label("Save", systemImage: "square.and.arrow.down")
+                            Label("Save", systemImage: "square.and.arrow.down.fill")
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
@@ -220,7 +220,7 @@ struct JournalView: View {
                             Button {
                                 Task { await synthesize() }
                             } label: {
-                                Label("AI Polish", systemImage: "sparkles")
+                                Label("Polish", systemImage: "sparkles")
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.bordered)
@@ -230,40 +230,48 @@ struct JournalView: View {
                 }
                 .padding()
 
-                // Interest chips
+                // Interest chips (tap to cycle boost/mute/normal)
                 if !state.interests.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
+                        HStack(spacing: 6) {
                             ForEach(state.interests, id: \.self) { interest in
-                                Text(interest)
-                                    .font(.caption)
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 5)
-                                    .background(.blue.opacity(0.15), in: Capsule())
-                                    .foregroundStyle(.blue)
+                                InterestChip(label: interest)
                             }
                         }
                         .padding(.horizontal)
                     }
-                    .frame(height: 32)
+                    .frame(height: 36)
+                    .padding(.bottom, 4)
                 }
 
-                // Journal list
+                // Journal entries
                 List {
-                    Section("Recent Entries") {
+                    Section {
                         ForEach(state.journals, id: \.id) { entry in
-                            JournalRow(entry: entry)
+                            JournalCard(entry: entry)
                                 .swipeActions(edge: .trailing) {
-                                    Button("Draft Post") {
+                                    Button {
                                         Task { await state.generateDraft(from: entry) }
+                                    } label: {
+                                        Label("Draft", systemImage: "square.and.pencil")
                                     }
                                     .tint(.purple)
 
-                                    Button("Delete", role: .destructive) {
+                                    Button(role: .destructive) {
                                         try? state.memory.forget(key: entry.key)
                                         Task { await state.refreshJournals() }
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
                                     }
                                 }
+                        }
+                    } header: {
+                        HStack {
+                            Text("Recent")
+                            Spacer()
+                            Text("\(state.journals.count)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -296,18 +304,88 @@ struct JournalView: View {
     }
 }
 
-struct JournalRow: View {
+/// Interest chip with visual state (normal=blue, boosted=green, muted=gray).
+struct InterestChip: View {
+    let label: String
+    @State private var state: ChipState = .normal
+
+    enum ChipState { case normal, boosted, muted }
+    var color: Color {
+        switch state {
+        case .normal: return .blue
+        case .boosted: return .green
+        case .muted: return .gray
+        }
+    }
+    var icon: String {
+        switch state {
+        case .normal: return ""
+        case .boosted: return "arrow.up"
+        case .muted: return "speaker.slash"
+        }
+    }
+
+    var body: some View {
+        Button {
+            switch state {
+            case .normal: state = .boosted
+            case .boosted: state = .muted
+            case .muted: state = .normal
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Text(label)
+                if !icon.isEmpty { Image(systemName: icon).font(.system(size: 9)) }
+            }
+            .font(.caption.weight(.medium))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(color.opacity(0.15), in: Capsule())
+            .foregroundStyle(color)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Journal entry card — richer than the old JournalRow.
+struct JournalCard: View {
     let entry: SlowClawMemoryEntry
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             Text(entry.content)
                 .font(.body)
-                .lineLimit(3)
-            Text(entry.timestamp)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+                .lineLimit(4)
+                .multilineTextAlignment(.leading)
+
+            HStack(spacing: 8) {
+                Image(systemName: "clock")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Text(formatTimestamp(entry.timestamp))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                if let score = entry.score, score > 0 {
+                    Spacer()
+                    Text(String(format: "%.0f%%", score * 100))
+                        .font(.caption2.monospaced())
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(.green.opacity(0.12), in: Capsule())
+                        .foregroundStyle(.green)
+                }
+            }
         }
+        .padding(.vertical, 2)
+    }
+
+    private func formatTimestamp(_ ts: String) -> String {
+        // The timestamp from SQLite is epoch-seconds or RFC3339; just show it short.
+        if ts.count > 10 {
+            return String(ts.prefix(10))
+        }
+        return ts
     }
 }
 
@@ -315,62 +393,114 @@ struct JournalRow: View {
 
 struct ReadsView: View {
     @EnvironmentObject var state: AppState
-    @State private var feedItems: [FeedItem] = []
+    @State private var sampleItems: [SampleFeedItem] = SampleFeedItem.examples
 
     var body: some View {
         NavigationStack {
-            Group {
-                if feedItems.isEmpty {
-                    ContentUnavailableView(
-                        "No reads yet",
-                        systemImage: "newspaper",
-                        description: Text("Write journal entries to grow your interests. The feed will surface articles ranked by what you care about.")
-                    )
-                } else {
-                    List(feedItems) { item in
-                        FeedItemRow(item: item)
-                    }
-                    .listStyle(.plain)
-                    .refreshable {
-                        // Pull-to-refresh: re-rank
-                    }
-                }
+            List(sampleItems) { item in
+                FeedCard(item: item, interests: state.interests)
+            }
+            .listStyle(.plain)
+            .refreshable {
+                // Pull-to-refresh: in production this would trigger RSS/Bluesky
+                // ingestion via the Zig ranker. For now just keep the samples.
             }
             .navigationTitle("Reads")
             .navigationBarTitleDisplayMode(.large)
+            .overlay {
+                if state.journals.isEmpty {
+                    ContentUnavailableView(
+                        "Start writing",
+                        systemImage: "newspaper",
+                        description: Text("Write journal entries to grow your interests. Articles ranked by your interests appear here.")
+                    )
+                }
+            }
         }
     }
 }
 
-struct FeedItem: Identifiable {
+/// Sample feed item for demonstrating the ranking UI.
+/// In production these come from RSS/Bluesky ingestion through the Zig ranker.
+struct SampleFeedItem: Identifiable {
     let id: String
     let title: String
     let source: String
-    let score: Float
+    let readMinutes: Int
+    let hasImage: Bool
+    let matchedInterests: [String]
+    let timestamp: Double
+
+    static let examples: [SampleFeedItem] = [
+        .init(id: "1", title: "Why Rust's borrow checker makes systems programming safer", source: "rust-blog.org", readMinutes: 8, hasImage: true, matchedInterests: ["rust"], timestamp: Date().timeIntervalSince1970 - 3600),
+        .init(id: "2", title: "The science of sourdough fermentation", source: "kingarthurbaking.com", readMinutes: 5, hasImage: true, matchedInterests: ["baking"], timestamp: Date().timeIntervalSince1970 - 7200),
+        .init(id: "3", title: "Urban cycling infrastructure in European cities", source: "citylab.com", readMinutes: 12, hasImage: false, matchedInterests: ["cycling"], timestamp: Date().timeIntervalSince1970 - 14400),
+        .init(id: "4", title: "Climate tech investments doubled in 2026", source: "techcrunch.com", readMinutes: 3, hasImage: true, matchedInterests: ["climate"], timestamp: Date().timeIntervalSince1970 - 18000),
+        .init(id: "5", title: "The minimalist Mac setup for developers", source: "macstories.net", readMinutes: 15, hasImage: true, matchedInterests: [], timestamp: Date().timeIntervalSince1970 - 28800),
+    ]
 }
 
-struct FeedItemRow: View {
-    let item: FeedItem
+/// Rich feed card with interest match badges + read time.
+struct FeedCard: View {
+    let item: SampleFeedItem
+    let interests: [String]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
+            // Title
             Text(item.title)
                 .font(.headline)
                 .lineLimit(2)
-            HStack {
-                Text(item.source)
+                .multilineTextAlignment(.leading)
+
+            // Interest match badges
+            if !item.matchedInterests.isEmpty {
+                HStack(spacing: 4) {
+                    ForEach(item.matchedInterests, id: \.self) { interest in
+                        Text(interest)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.blue.opacity(0.15), in: Capsule())
+                            .foregroundStyle(.blue)
+                    }
+                }
+            }
+
+            HStack(spacing: 12) {
+                // Source
+                Label(item.source, systemImage: "globe")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                // Read time
+                Label("\(item.readMinutes) min", systemImage: "book")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 Spacer()
-                Text(String(format: "%.2f", item.score))
-                    .font(.caption.monospaced())
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.green.opacity(0.15), in: Capsule())
-                    .foregroundStyle(.green)
+
+                // Image indicator
+                if item.hasImage {
+                    Image(systemName: "photo")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                // Time ago
+                Text(timeAgo(item.timestamp))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
+    }
+
+    private func timeAgo(_ ts: Double) -> String {
+        let diff = Date().timeIntervalSince1970 - ts
+        if diff < 3600 { return "\(Int(diff/60))m" }
+        if diff < 86400 { return "\(Int(diff/3600))h" }
+        return "\(Int(diff/86400))d"
     }
 }
 
@@ -445,12 +575,16 @@ struct ProfileView: View {
 
                 Section("Interests") {
                     if state.interests.isEmpty {
-                        Text("No interests yet. Write journal entries to mine them.")
+                        Text("Write journal entries to mine them for interests. Tap chips in the Journal tab to boost or mute.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(state.interests, id: \.self) { interest in
-                            Text(interest)
+                            HStack {
+                                Text(interest)
+                                Spacer()
+                                InterestMultiplierControl(label: interest)
+                            }
                         }
                         .onDelete { indices in
                             state.interests.remove(atOffsets: indices)
@@ -484,5 +618,46 @@ struct ProfileView: View {
                 baseURLInput = state.baseURL
             }
         }
+    }
+}
+
+/// Multiplier control for interests — tap to cycle Normal → Boost → Mute.
+/// Visual: colored badge matching the state.
+struct InterestMultiplierControl: View {
+    let label: String
+    @State private var state: MultiplierState = .normal
+
+    enum MultiplierState { case normal, boost, mute }
+    var color: Color {
+        switch state {
+        case .normal: return .secondary
+        case .boost: return .green
+        case .mute: return .red
+        }
+    }
+    var text: String {
+        switch state {
+        case .normal: return "1×"
+        case .boost: return "2×"
+        case .mute: return "0×"
+        }
+    }
+
+    var body: some View {
+        Button {
+            switch state {
+            case .normal: state = .boost
+            case .boost: state = .mute
+            case .mute: state = .normal
+            }
+        } label: {
+            Text(text)
+                .font(.caption.monospaced().weight(.bold))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(color.opacity(0.15), in: Capsule())
+                .foregroundStyle(color)
+        }
+        .buttonStyle(.plain)
     }
 }
