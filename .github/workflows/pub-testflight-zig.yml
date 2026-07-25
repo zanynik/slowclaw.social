@@ -221,6 +221,8 @@ jobs:
 
             - name: Export IPA
               working-directory: ios-app
+              env:
+                  APPLE_DEVELOPMENT_TEAM: ${{ inputs.apple_development_team || vars.APPLE_DEVELOPMENT_TEAM || secrets.APPLE_DEVELOPMENT_TEAM }}
               run: |
                   set -euo pipefail
                   EXPORT_DIR="${RUNNER_TEMP}/SlowClaw-export"
