@@ -21,6 +21,7 @@ pub const journal_agent = @import("journal_agent.zig");
 pub const feeds_ranking = @import("feeds_ranking.zig");
 pub const interest_profile = @import("interest_profile.zig");
 pub const saved_items = @import("saved_items.zig");
+pub const rss_parser = @import("rss_parser.zig");
 
 test {
     _ = vector_math;
@@ -38,6 +39,7 @@ test {
     _ = feeds_ranking;
     _ = interest_profile;
     _ = saved_items;
+    _ = rss_parser;
 
     try std.testing.expect(std.mem.eql(u8, "ok", "ok"));
 }
