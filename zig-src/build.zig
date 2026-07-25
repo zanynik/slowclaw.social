@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // SlowClaw Social — Zig core pilot.
 //
@@ -169,5 +170,75 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_mod,
         .linkage = .static,
     });
-    b.installArtifact(lib);
+
+    // ── Workaround: Apple `ld` rejects Zig's staticlib archive ───────────
+    // Zig 0.16's archive writer hardcodes the 4-byte (`.p32`) format even for
+    // 64-bit Mach-O members, so Apple's `ld` (Xcode 26.4+) fails the link with:
+    //     ld: 64-bit mach-o member 'libslowclaw_feed_zcu.o' not 8-byte aligned
+    // Tracked upstream as Codeberg ziglang/zig#35280; fixed in the 0.17-dev
+    // branch but NOT backported to any 0.16.x release. Repack the archive with
+    // Apple's `libtool`/`ranlib` (which write 8-byte-aligned members) when
+    // building on a macOS host — the only place Apple `ld` is the consumer.
+    // On non-macOS hosts (Linux/Windows local dev) the un-repacked archive is
+    // fine, so we fall back to the plain install there.
+    if (builtin.os.tag == .macos) {
+        const repack = repackArchiveStep(b, lib.getEmittedBin(), "libslowclaw_feed.a");
+        const install_aligned = b.addInstallFileWithDir(repack, .lib, "libslowclaw_feed.a");
+        b.getInstallStep().dependOn(&install_aligned.step);
+    } else {
+        b.installArtifact(lib);
+    }
+}
+
+/// Repack a static archive so its Mach-O members are 8-byte aligned, working
+/// around Zig 0.16's hardcoded `.p32` archive format (Codeberg #35280).
+///
+/// Runs only on a macOS host (caller gates this). Uses a temp dir, extracts the
+/// Zig-built members with `xcrun ar -x`, reassembles them with Apple's
+/// `libtool -static` (which writes the 8-byte-aligned members Apple `ld`
+/// requires), then rebuilds the symbol index with `ranlib`. The output path is
+/// a `Run`-step-generated file, so it integrates cleanly with the install graph.
+fn repackArchiveStep(
+    b: *std.Build,
+    input: std.Build.LazyPath,
+    out_basename: []const u8,
+) std.Build.LazyPath {
+    // Stage 1: extract members into a temp dir.
+    const extract = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\IN="$1"; DIR="$2"
+        \\rm -rf "$DIR"; mkdir -p "$DIR"
+        \\cd "$DIR"
+        \\xcrun ar -x "$IN"
+        ,
+        "--",
+    });
+    extract.addFileArg(input);
+    // A generated dir Zig cleans between builds; members land here.
+    const extracted_dir = extract.addOutputDirectoryArg("extracted");
+
+    // Stage 2: libtool -static -o <out.a> <members>, then ranlib.
+    // `chmod u+rw` first: `ar -x` can leave members read-only and `libtool`
+    // has been seen to choke on that (Codeberg #35280 comment thread).
+    // `libtool -static` then reassembles the members with correct 8-byte
+    // alignment, and `ranlib` rebuilds the archive symbol table Apple `ld`
+    // expects. `xcrun` resolves both to the active Xcode toolchain.
+    //
+    // `addOutputFileArg` passes the bare output path as `$2`, so the script
+    // supplies its own explicit `-o` (clearer than relying on glued-flag
+    // `-o<path>` semantics from `addPrefixedOutputFileArg`).
+    const repack = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\DIR="$1"; OUT="$2"
+        \\chmod u+rw "$DIR"/*.o
+        \\xcrun libtool -static -o "$OUT" "$DIR"/*.o
+        \\xcrun ranlib "$OUT"
+        ,
+        "--",
+    });
+    repack.addDirectoryArg(extracted_dir);
+    const aligned = repack.addOutputFileArg(out_basename);
+    return aligned;
 }

@@ -80,6 +80,15 @@ jobs:
                   "${ZIG_BIN}" build -Dtarget=aarch64-ios -Doptimize=ReleaseSafe \
                     -Dios-sysroot="${IOS_SYSROOT}"
                   ls -lh zig-out/lib/
+                  # Sanity-check the staticlib archive is Apple-`ld`-acceptable:
+                  # Zig 0.16 emits misaligned Mach-O members (Codeberg
+                  # ziglang/zig#35280), which build.zig repacks via
+                  # libtool/ranlib on macOS. `nm` reading the symbol table
+                  # exercises the same archive walk `ld` does, so a regression
+                  # surfaces here instead of 5 min later at the link step.
+                  echo "Verifying libslowclaw_feed.a archive layout..."
+                  nm -a zig-out/lib/libslowclaw_feed.a >/dev/null
+                  echo "Archive OK."
 
             - name: Generate Xcode project
               working-directory: ios-app

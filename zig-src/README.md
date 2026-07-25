@@ -70,6 +70,31 @@ zig build test-markdown    # Markdown memory backend tests (libc for file I/O)
 zig build test-response-cache # LLM response cache tests (libc + sqlite)
 ```
 
+## Known build issue: Apple `ld` rejects Zig 0.16's staticlib archive
+
+Zig 0.16's archive writer hardcodes the 4-byte (`.p32`) archive format even for
+64-bit Mach-O members, so Apple's `ld` (Xcode 26.4+) fails the iOS link with:
+
+```
+ld: 64-bit mach-o member 'libslowclaw_feed_zcu.o' not 8-byte aligned in '.../libslowclaw_feed.a'
+```
+
+Tracked upstream as [Codeberg ziglang/zig#35280](https://codeberg.org/ziglang/zig/issues/35280);
+fixed in the 0.17-dev branch but **not** backported to any 0.16.x release.
+
+**Workaround (built into `build.zig`):** when the build host is macOS, after
+Zig emits `libslowclaw_feed.a` the build graph extracts its members with
+`xcrun ar -x` and reassembles them with `xcrun libtool -static` + `xcrun ranlib`,
+which write 8-byte-aligned members. The repacked archive is what gets installed
+to `zig-out/lib/`. Non-macOS hosts (Linux/Windows local dev) skip the repack
+and install the plain archive, since Apple `ld` is never the consumer there.
+The CI workflow additionally runs `nm -a` on the installed archive to catch a
+regression at build time rather than at the Xcode link step.
+
+When bumping the pinned Zig version past 0.16 (to a 0.17 release that contains
+the upstream fix), the `repackArchiveStep` branch in `build.zig` can be deleted
+and the install reverted to `b.installArtifact(lib)`.
+
 ## Module layout (current)
 
 ```
