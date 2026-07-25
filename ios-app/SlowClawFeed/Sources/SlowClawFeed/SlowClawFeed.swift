@@ -248,3 +248,138 @@ private struct MemoryEntryDTO: Decodable {
                                    sessionID: session_id, score: score)
     }
 }
+
+// MARK: - LLM Provider
+
+/// A closure that performs an HTTP POST and returns the response body.
+/// Swift implements this via URLSession. The Zig core calls it for every
+/// LLM API request.
+public typealias SlowClawHttpPostHandler = (_ url: String, _ authHeader: String,
+    _ contentType: String, _ body: Data) -> Data?
+
+/// An LLM provider that talks to any OpenAI-compatible endpoint (OpenAI,
+/// OpenRouter, Ollama, LM Studio, etc.) via an injected HTTP handler.
+public final class SlowClawLLMProvider {
+
+    private var handle: OpaquePointer?
+    private let httpHandler: SlowClawHttpPostHandler
+    /// Persistent context block for the C callback (keeps the handler alive).
+    private let contextBox: SlowClawHttpContextBox
+
+    public init(baseURL: String, apiKey: String, httpHandler: @escaping SlowClawHttpPostHandler) {
+        self.httpHandler = httpHandler
+        self.contextBox = SlowClawHttpContextBox(handler: httpHandler)
+
+        let boxPtr = Unmanaged.passRetained(contextBox).toOpaque()
+        let h = baseURL.withCString { urlPtr in
+            apiKey.withCString { keyPtr in
+                slowclaw_feed_provider_new(
+                    urlPtr, baseURL.utf8.count,
+                    keyPtr, apiKey.utf8.count,
+                    boxPtr,
+                    slowClawHttpPostTrampoline
+                )
+            }
+        }
+        self.handle = h
+    }
+
+    deinit {
+        if let h = handle {
+            slowclaw_feed_provider_free(h)
+        }
+    }
+
+    /// One-shot chat: optional system prompt + user message → LLM text.
+    public func chat(systemPrompt: String?, message: String, model: String,
+                     temperature: Double = 0.7) throws -> String {
+        guard let h = handle else { throw SlowClawFeedError.internalError("closed") }
+
+        let result: SlowclawChatResult = systemPrompt.withCString { sysPtr in
+            message.withCString { msgPtr in
+                model.withCString { modelPtr in
+                    let sysLen = systemPrompt?.utf8.count ?? 0
+                    let sysArg: UnsafePointer<CChar>? = systemPrompt != nil ? sysPtr : nil
+                    return slowclaw_feed_provider_chat(h, sysArg, sysLen,
+                                                       msgPtr, message.utf8.count,
+                                                       modelPtr, model.utf8.count,
+                                                       temperature)
+                }
+            }
+        }
+        return try processChatResult(result)
+    }
+
+    /// Journal synthesis: transcript → clean journal entry.
+    public func synthesizeJournal(transcript: String, model: String) throws -> String {
+        guard let h = handle else { throw SlowClawFeedError.internalError("closed") }
+        let result = transcript.withCString { tPtr in
+            model.withCString { mPtr in
+                slowclaw_feed_synthesize_journal(h, tPtr, transcript.utf8.count, mPtr, model.utf8.count)
+            }
+        }
+        return try processChatResult(result)
+    }
+
+    /// Interest extraction: journal text → comma-separated keywords.
+    public func extractInterests(journalText: String, model: String) throws -> [String] {
+        guard let h = handle else { throw SlowClawFeedError.internalError("closed") }
+        let result = journalText.withCString { jPtr in
+            model.withCString { mPtr in
+                slowclaw_feed_extract_interests(h, jPtr, journalText.utf8.count, mPtr, model.utf8.count)
+            }
+        }
+        let csv = try processChatResult(result)
+        return csv.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+    }
+
+    /// Post drafting: journal text → short-form post draft.
+    public func draftPost(journalText: String, model: String, maxChars: Int = 300) throws -> String {
+        guard let h = handle else { throw SlowClawFeedError.internalError("closed") }
+        let result = journalText.withCString { jPtr in
+            model.withCString { mPtr in
+                slowclaw_feed_draft_post(h, jPtr, journalText.utf8.count, mPtr, model.utf8.count, maxChars)
+            }
+        }
+        return try processChatResult(result)
+    }
+
+    private func processChatResult(_ result: SlowclawChatResult) throws -> String {
+        var mutableResult = result
+        defer { slowclaw_feed_chat_result_free(&mutableResult) }
+        if result.status != SLOWCLAW_OK {
+            throw SlowClawFeedError.internalError("LLM call failed with status \(result.status)")
+        }
+        guard let bytes = result.text.bytes else { return "" }
+        return String(bytes: Data(bytes: bytes, count: result.text.len), encoding: .utf8) ?? ""
+    }
+}
+
+/// Box to keep the Swift HTTP handler alive across the C callback boundary.
+private final class SlowClawHttpContextBox {
+    let handler: SlowClawHttpPostHandler
+    init(handler: @escaping SlowClawHttpPostHandler) {
+        self.handler = handler
+    }
+}
+
+/// C-callable trampoline that routes the HTTP POST to the Swift handler.
+private let slowClawHttpPostTrampoline: SlowclawHttpPostFn = { ctx, urlPtr, urlLen, authPtr, authLen, ctPtr, ctLen, bodyPtr, bodyLen in
+    guard let ctx else { return SlowclawString(bytes: nil, len: 0) }
+    let box = Unmanaged<SlowClawHttpContextBox>.fromOpaque(ctx).takeUnretainedValue()
+
+    let url = String(bytes: Data(bytes: urlPtr, count: urlLen), encoding: .utf8) ?? ""
+    let auth = String(bytes: Data(bytes: authPtr, count: authLen), encoding: .utf8) ?? ""
+    let contentType = String(bytes: Data(bytes: ctPtr, count: ctLen), encoding: .utf8) ?? ""
+    let body = Data(bytes: bodyPtr, count: bodyLen)
+
+    guard let response = box.handler(url, auth, contentType, body) else {
+        return SlowclawString(bytes: nil, len: 0)
+    }
+
+    // Allocate the response via the Zig allocator (malloc) so Zig can free it.
+    let len = response.count
+    let buf = malloc(len)!
+    response.copyBytes(to: buf.assumingMemoryBound(to: UInt8.self), count: len)
+    return SlowclawString(bytes: buf.assumingMemoryBound(to: UInt8.self), len: len)
+}

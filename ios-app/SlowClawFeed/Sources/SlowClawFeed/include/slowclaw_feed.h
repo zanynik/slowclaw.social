@@ -164,6 +164,70 @@ int32_t slowclaw_feed_sqlite_recall(
 void slowclaw_feed_sqlite_result_free(SlowclawRankResult *result);
 void slowclaw_feed_sqlite_entry_free(SlowclawSqliteEntry *entry);
 
+// ──────────────────────────────────────────────────────────────────────────
+// LLM Provider (Swift provides HTTP transport via URLSession)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// C-side HTTP POST callback type. Swift implements this via URLSession.
+/// Returns a SlowclawString (Zig-owned, caller frees via slowclaw_feed_free).
+typedef SlowclawString (*SlowclawHttpPostFn)(
+    void *ctx,
+    const uint8_t *url, size_t url_len,
+    const uint8_t *auth_header, size_t auth_header_len,
+    const uint8_t *content_type, size_t content_type_len,
+    const uint8_t *body, size_t body_len
+);
+
+typedef struct SlowclawProvider SlowclawProvider;
+
+typedef struct {
+    SlowclawString text;  // Zig-owned; free via slowclaw_feed_chat_result_free
+    int32_t status;       // 0 = OK, negative = error
+} SlowclawChatResult;
+
+/// Create an OpenAI-compatible LLM provider.
+SlowclawProvider *slowclaw_feed_provider_new(
+    const uint8_t *base_url, size_t base_url_len,
+    const uint8_t *api_key, size_t api_key_len,
+    void *http_callback_ctx,
+    SlowclawHttpPostFn http_post_fn
+);
+
+void slowclaw_feed_provider_free(SlowclawProvider *handle);
+
+/// One-shot chat: system prompt + user message → LLM response text.
+SlowclawChatResult slowclaw_feed_provider_chat(
+    SlowclawProvider *handle,
+    const uint8_t *system_prompt, size_t system_prompt_len, // optional; pass {NULL, 0}
+    const uint8_t *message, size_t message_len,
+    const uint8_t *model, size_t model_len,
+    double temperature
+);
+
+/// Journal synthesis: transcript → clean journal entry (via LLM).
+SlowclawChatResult slowclaw_feed_synthesize_journal(
+    SlowclawProvider *handle,
+    const uint8_t *transcript, size_t transcript_len,
+    const uint8_t *model, size_t model_len
+);
+
+/// Interest extraction: journal text → comma-separated keywords (via LLM).
+SlowclawChatResult slowclaw_feed_extract_interests(
+    SlowclawProvider *handle,
+    const uint8_t *journal_text, size_t journal_text_len,
+    const uint8_t *model, size_t model_len
+);
+
+/// Post drafting: journal text → short-form post draft (via LLM).
+SlowclawChatResult slowclaw_feed_draft_post(
+    SlowclawProvider *handle,
+    const uint8_t *journal_text, size_t journal_text_len,
+    const uint8_t *model, size_t model_len,
+    size_t max_chars
+);
+
+void slowclaw_feed_chat_result_free(SlowclawChatResult *result);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
