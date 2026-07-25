@@ -18,6 +18,8 @@ pub const embeddings = @import("embeddings.zig");
 pub const provider = @import("provider.zig");
 pub const openai_provider = @import("openai_provider.zig");
 pub const journal_agent = @import("journal_agent.zig");
+pub const feeds_ranking = @import("feeds_ranking.zig");
+pub const interest_profile = @import("interest_profile.zig");
 
 test {
     _ = vector_math;
@@ -32,6 +34,8 @@ test {
     _ = provider;
     _ = openai_provider;
     _ = journal_agent;
+    _ = feeds_ranking;
+    _ = interest_profile;
 
     try std.testing.expect(std.mem.eql(u8, "ok", "ok"));
 }
