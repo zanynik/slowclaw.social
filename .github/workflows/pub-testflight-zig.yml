@@ -77,7 +77,13 @@ jobs:
                   # more robust in CI.
                   IOS_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
                   echo "iOS sysroot: ${IOS_SYSROOT}"
-                  "${ZIG_BIN}" build -Dtarget=aarch64-ios -Doptimize=ReleaseSafe \
+                  # ReleaseFast (not ReleaseSafe): Zig 0.16's std.debug calls
+                  # _dyld_get_image_header_containing_address, which is
+                  # __API_UNAVAILABLE(ios) in Apple's SDK → undefined on iOS
+                  # device (Codeberg ziglang/zig#32138, fixed in 0.17-dev).
+                  # ReleaseFast drops the safety-panic stack-walk path that
+                  # references it; the lib has no reachable @panic/unreachable.
+                  "${ZIG_BIN}" build -Dtarget=aarch64-ios -Doptimize=ReleaseFast \
                     -Dios-sysroot="${IOS_SYSROOT}"
                   ls -lh zig-out/lib/
                   # Sanity-check the staticlib archive is Apple-`ld`-acceptable:

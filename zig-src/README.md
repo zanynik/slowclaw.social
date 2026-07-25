@@ -70,37 +70,84 @@ zig build test-markdown    # Markdown memory backend tests (libc for file I/O)
 zig build test-response-cache # LLM response cache tests (libc + sqlite)
 ```
 
-## Known build issue: Apple `ld` rejects Zig 0.16's staticlib archive
+## Known iOS link issues (Zig 0.16.0)
 
-Zig 0.16's archive writer hardcodes the 4-byte (`.p32`) archive format even for
-64-bit Mach-O members, so Apple's `ld` (Xcode 26.4+) fails the iOS link with:
+Three separate Zig 0.16.0 regressions surface only when linking the staticlib
+into an iOS app (the unit tests never exercise the Xcode link). All three are
+fixed in the 0.17-dev branch and **not** backported to any 0.16.x release; the
+workarounds below are wired into `build.zig` / `ios-app/project.yml` / CI.
+
+### 1. Apple `ld` rejects Zig's staticlib archive (member alignment)
+
+Zig 0.16's archive writer hardcodes the 4-byte (`.p32`) format even for 64-bit
+Mach-O members, so Apple's `ld` (Xcode 26.4+) fails with:
 
 ```
 ld: 64-bit mach-o member 'libslowclaw_feed_zcu.o' not 8-byte aligned in '.../libslowclaw_feed.a'
 ```
 
-Tracked upstream as [Codeberg ziglang/zig#35280](https://codeberg.org/ziglang/zig/issues/35280);
-fixed in the 0.17-dev branch but **not** backported to any 0.16.x release.
+[Codeberg ziglang/zig#35280](https://codeberg.org/ziglang/zig/issues/35280).
 
-**Workaround (built into `build.zig`):** when the build host is macOS, the build
-graph installs `libslowclaw_feed.a` normally (the static `.a` is only materialized
-by the install step), then extracts its members with `xcrun ar -x` and reassembles
-them with `xcrun libtool -static` + `xcrun ranlib` (which write 8-byte-aligned
+**Workaround (in `build.zig`):** on a macOS host, the build graph installs
+`libslowclaw_feed.a` normally (the static `.a` is only materialized by the
+install step), then extracts its members with `xcrun ar -x` and reassembles them
+with `xcrun libtool -static` + `xcrun ranlib` (which write 8-byte-aligned
 members), and install-copies the aligned archive over `zig-out/lib/`. Non-macOS
-hosts (Linux/Windows local dev) skip the repack and keep the plain install, since
-Apple `ld` is never the consumer there. The CI workflow additionally runs `nm -a`
-on the installed archive to catch a regression at build time rather than at the
-Xcode link step.
+hosts skip the repack — Apple `ld` is never the consumer there. CI additionally
+runs `nm -a` on the installed archive so a regression surfaces at the Zig build
+step, not 5 min later at the Xcode link.
 
 > Local macOS incremental-build note: the repack step's input (the installed
-> archive) is passed as a plain path arg, so Zig's per-step cache doesn't
-> content-track it. If you ever see the link error again after editing Zig
-> sources, `rm -rf zig-src/.zig-cache` and rebuild. (CI runs fresh, so it is
-> unaffected.)
+> archive) is a plain path arg, so Zig's per-step cache doesn't content-track
+> it. If the link error reappears after editing Zig sources, `rm -rf
+> zig-src/.zig-cache` and rebuild. (CI runs fresh, so it is unaffected.)
 
-When bumping the pinned Zig version past 0.16 (to a 0.17 release that contains
-the upstream fix), the `repackInstalledArchiveStep` branch in `build.zig` can be
-deleted and the install reverted to `b.installArtifact(lib)`.
+### 2. SQLite is a separate archive — the app must link both
+
+`build.zig` emits **two** static archives: `libslowclaw_feed.a` (the Zig code)
+and `libsqlite3.a` (the vendored SQLite amalgamation). They are NOT merged —
+`lib_mod.linkLibrary(sqlite_c)` records a dependency, it does not bundle the
+sqlite objects into the feed archive. So the iOS app must link both:
+
+```yaml
+OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3"
+```
+
+This is set in `ios-app/project.yml` (base + target settings), and the XcodeGen
+pre-build script copies both archives from the sim prefix too. (Earlier comments
+in `project.yml` wrongly claimed SQLite was compiled "INTO" `libslowclaw_feed.a`
+— corrected.)
+
+### 3. `_dyld_get_image_header_containing_address` is unavailable on iOS
+
+Zig 0.16's `std.debug` unconditionally calls `_dyld_get_image_header_containing_address`,
+which is `__API_UNAVAILABLE(ios, tvos, watchos)` in Apple's `mach-o/dyld.h`. It
+exists on macOS (and the iOS Simulator, which links the host libdyld), so the
+failure only shows on a real iOS-device build:
+
+```
+Undefined symbols for architecture arm64:
+  "__dyld_get_image_header_containing_address", referenced from:
+      _debug.writeCurrentStackTrace in libslowclaw_feed.a(libslowclaw_feed_zcu.o)
+```
+
+Fixed upstream by [Codeberg ziglang/zig#32138](https://codeberg.org/ziglang/zig/pulls/32138)
+(falls back to `dladdr` on non-macOS). On 0.16.0, build with
+`-Doptimize=ReleaseFast` (not `ReleaseSafe`): the lib has no reachable
+`@panic`/`unreachable`, so `ReleaseFast` drops the safety-panic stack-walk path
+that references the unavailable symbol. This is set in CI and in the `project.yml`
+pre-build script (sim + device).
+
+> If a future change makes a panic path reachable in `ReleaseFast`, the residual
+> fallback is a weak C stub of the symbol returning `NULL` (see PR #32138).
+
+### Cleanup when bumping Zig past 0.16
+
+When moving to a 0.17 release that contains both upstream fixes, delete the
+`repackInstalledArchiveStep` branch in `build.zig` (revert to
+`b.installArtifact(lib)`), and the `-Doptimize=ReleaseFast` choice can be
+revisited (the SQLite dual-archive link in `project.yml` stays — that is the
+intended build.zig structure, not a bug).
 
 ## Module layout (current)
 

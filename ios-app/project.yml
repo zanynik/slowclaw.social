@@ -11,8 +11,10 @@
 # Build flow (what the Xcode build phases do):
 #   1. Run Script phase (pre-build): `zig build -Dtarget=aarch64-ios-sim` (or
 #      `-Dtarget=aarch64-ios` for device) → emits zig-out/lib/libslowclaw_feed.a
+#      AND zig-out/lib/libsqlite3.a (two separate static archives: the Zig code
+#      and the vendored SQLite amalgamation).
 #   2. Compile Swift sources (SlowClawApp.swift)
-#   3. Link against libslowclaw_feed.a + system libsqlite3
+#   3. Link against libslowclaw_feed.a + libsqlite3.a (both from zig-out/lib)
 #   4. Copy slowclaw_feed.h as a bridging header
 
 name: SlowClaw
@@ -28,8 +30,10 @@ settings:
     SWIFT_VERSION: "5.9"
     DEVELOPMENT_TEAM: "${APPLE_DEVELOPMENT_TEAM}"
     CODE_SIGN_STYLE: "Manual"
-    # The Zig staticlib path — built by the pre-build script phase.
-    OTHER_LDFLAGS: "-lslowclaw_feed"
+    # Link the Zig staticlib + the vendored SQLite staticlib. build.zig emits
+    # them as TWO separate archives (libslowclaw_feed.a + libsqlite3.a), so the
+    # app must link both — the Zig lib references the sqlite3_* symbols.
+    OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3"
     LIBRARY_SEARCH_PATHS: "$(SRCROOT)/../zig-src/zig-out/lib"
     # Header search path for the C ABI contract.
     HEADER_SEARCH_PATHS: "$(SRCROOT)/SlowClawFeed/Sources/SlowClawFeed/include"
@@ -53,10 +57,9 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: SlowClawApp/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        # Link the Zig staticlib (built by the pre-build script). SQLite is
-        # statically compiled INTO libslowclaw_feed.a via the vendored
-        # amalgamation, so no separate -lsqlite3 flag.
-        OTHER_LDFLAGS: "-lslowclaw_feed"
+        # Link the Zig staticlib + the vendored SQLite staticlib (target-level
+        # override of the base OTHER_LDFLAGS). Both come from zig-out/lib.
+        OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3"
         LIBRARY_SEARCH_PATHS: "$(SRCROOT)/../zig-src/zig-out/lib"
         ENABLE_BITCODE: NO
         TARGETED_DEVICE_FAMILY: "1,2" # iPhone + iPad
@@ -81,17 +84,28 @@ targets:
           fi
           if [ "$PLATFORM_NAME" = "iphonesimulator" ]; then
             SIM_SYSROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)"
-            "$ZIG" build -Dtarget=aarch64-ios-sim -Doptimize=ReleaseSafe \
+            "$ZIG" build -Dtarget=aarch64-ios-sim -Doptimize=ReleaseFast \
               -Dios-sysroot="${SIM_SYSROOT}" --prefix zig-out-sim
+            # The app links BOTH libslowclaw_feed.a and libsqlite3.a out of
+            # zig-out/lib, so copy both from the sim prefix.
+            mkdir -p zig-out/lib
             cp zig-out-sim/lib/libslowclaw_feed.a zig-out/lib/libslowclaw_feed.a
+            cp zig-out-sim/lib/libsqlite3.a zig-out/lib/libsqlite3.a
           else
             IOS_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
-            "$ZIG" build -Dtarget=aarch64-ios -Doptimize=ReleaseSafe \
+            # ReleaseFast (not ReleaseSafe): Zig 0.16's std.debug unconditionally
+            # calls _dyld_get_image_header_containing_address, which is
+            # __API_UNAVAILABLE(ios) in Apple's SDK → undefined on iOS device
+            # (Codeberg ziglang/zig#32138, fixed in 0.17-dev). ReleaseFast drops
+            # the safety-panic stack-walk path that references it; the lib has no
+            # reachable @panic/unreachable, so this fully removes the reference.
+            "$ZIG" build -Dtarget=aarch64-ios -Doptimize=ReleaseFast \
               -Dios-sysroot="${IOS_SYSROOT}"
           fi
-          echo "Built: $(ls -lh zig-out/lib/libslowclaw_feed.a || true)"
+          echo "Built: $(ls -lh zig-out/lib/libslowclaw_feed.a zig-out/lib/libsqlite3.a || true)"
         outputFiles:
           - $(SRCROOT)/../zig-src/zig-out/lib/libslowclaw_feed.a
+          - $(SRCROOT)/../zig-src/zig-out/lib/libsqlite3.a
 
 schemes:
   SlowClaw:
