@@ -295,15 +295,25 @@ public final class SlowClawLLMProvider {
                      temperature: Double = 0.7) throws -> String {
         guard let h = handle else { throw SlowClawFeedError.internalError("closed") }
 
-        let result: SlowclawChatResult = systemPrompt.withCString { sysPtr in
-            message.withCString { msgPtr in
+        let result: SlowclawChatResult
+        if let sys = systemPrompt {
+            result = sys.withCString { sysPtr in
+                message.withCString { msgPtr in
+                    model.withCString { modelPtr in
+                        slowclaw_feed_provider_chat(h, sysPtr, sys.utf8.count,
+                                                    msgPtr, message.utf8.count,
+                                                    modelPtr, model.utf8.count,
+                                                    temperature)
+                    }
+                }
+            }
+        } else {
+            result = message.withCString { msgPtr in
                 model.withCString { modelPtr in
-                    let sysLen = systemPrompt?.utf8.count ?? 0
-                    let sysArg: UnsafePointer<CChar>? = systemPrompt != nil ? sysPtr : nil
-                    return slowclaw_feed_provider_chat(h, sysArg, sysLen,
-                                                       msgPtr, message.utf8.count,
-                                                       modelPtr, model.utf8.count,
-                                                       temperature)
+                    slowclaw_feed_provider_chat(h, nil, 0,
+                                                msgPtr, message.utf8.count,
+                                                modelPtr, model.utf8.count,
+                                                temperature)
                 }
             }
         }
@@ -350,8 +360,9 @@ public final class SlowClawLLMProvider {
         if result.status != SLOWCLAW_OK {
             throw SlowClawFeedError.internalError("LLM call failed with status \(result.status)")
         }
-        guard let bytes = result.text.bytes else { return "" }
-        return String(bytes: Data(bytes: bytes, count: result.text.len), encoding: .utf8) ?? ""
+        guard let bytes = result.text.bytes, result.text.len > 0 else { return "" }
+        let data = Data(bytes: UnsafeRawPointer(bytes), count: result.text.len)
+        return String(data: data, encoding: .utf8) ?? ""
     }
 }
 
