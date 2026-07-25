@@ -16,6 +16,11 @@ ios-app/
   SlowClawApp/                  The app target
     SlowClawApp.swift           Minimal SwiftUI demo (open DB → store → recall)
     Info.plist                  iOS app metadata
+    Assets.xcassets/            App icon asset catalog (AppIcon.appiconset).
+                                Icons materialized from web/src-tauri/icons/ios/
+                                (the Tauri-generated set) so TestFlight's
+                                CFBundleIconName check passes. When the Tauri
+                                path is dropped, this becomes the icon source.
 
   SlowClawFeed/                 Swift package wrapping the C ABI
     Package.swift               SwiftPM manifest (for SPM consumers)
