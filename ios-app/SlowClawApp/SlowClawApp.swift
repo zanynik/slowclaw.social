@@ -200,7 +200,6 @@ struct JournalView: View {
 
                 // Text capture zone
                 VStack(spacing: 12) {
-                VStack(spacing: 12) {
                     TextEditor(text: $newEntry)
                         .frame(minHeight: 100)
                         .padding(8)
