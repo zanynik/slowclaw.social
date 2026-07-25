@@ -68,6 +68,7 @@ comptime {
     _ = &ffi.slowclaw_feed_extract_interests;
     _ = &ffi.slowclaw_feed_draft_post;
     _ = &ffi.slowclaw_feed_chat_result_free;
+    _ = &ffi.slowclaw_feed_parse_and_rank;
 }
 
 test {

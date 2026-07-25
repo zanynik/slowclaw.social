@@ -249,6 +249,95 @@ private struct MemoryEntryDTO: Decodable {
     }
 }
 
+// MARK: - RSS Feed Parsing + Ranking
+
+/// A ranked feed item returned by the Zig core.
+public struct RankedFeedItem: Identifiable, Decodable {
+    public let title: String
+    public let link: String
+    public let description: String
+    public let sourceLabel: String
+    public let score: Double
+    public let readMinutes: Int
+
+    public var id: String { link }
+
+    enum CodingKeys: String, CodingKey {
+        case title, link, description, sourceLabel, score, readMinutes
+    }
+}
+
+/// Parse RSS XML and rank it by the user's interests. The XML is fetched by
+/// Swift (via URLSession); the parsing + ranking happens in the Zig core.
+public func slowClawParseAndRankRSS(
+    xml: String,
+    sourceLabel: String,
+    topics: [SlowClawTopic] = []
+) -> [RankedFeedItem]? {
+    // Build topics JSON.
+    let topicsJson: String?
+    if topics.isEmpty {
+        topicsJson = nil
+    } else {
+        let arr = topics.map { "{\"label\":\"\(escapeJson($0.label))\",\"weight\":\($0.weight)}" }.joined(separator: ",")
+        topicsJson = "[\(arr)]"
+    }
+
+    var result = SlowclawRankResult()
+    let nowEpoch = Date().timeIntervalSince1970
+
+    let status: Int32
+    if let tj = topicsJson {
+        status = xml.withCString { xmlPtr in
+            sourceLabel.withCString { srcPtr in
+                tj.withCString { tjPtr in
+                    slowclaw_feed_parse_and_rank(
+                        xmlPtr, xml.utf8.count,
+                        srcPtr, sourceLabel.utf8.count,
+                        tjPtr, tj.utf8.count,
+                        nowEpoch,
+                        &result
+                    )
+                }
+            }
+        }
+    } else {
+        status = xml.withCString { xmlPtr in
+            sourceLabel.withCString { srcPtr in
+                slowclaw_feed_parse_and_rank(
+                    xmlPtr, xml.utf8.count,
+                    srcPtr, sourceLabel.utf8.count,
+                    nil, 0,
+                    nowEpoch,
+                    &result
+                )
+            }
+        }
+    }
+
+    guard status == SLOWCLAW_OK else { return nil }
+    defer { slowclaw_feed_rank_result_free(&result) }
+
+    guard let bytes = result.items_json.bytes else { return [] }
+    let data = Data(bytes: UnsafeRawPointer(bytes), count: result.items_json.len)
+    return try? JSONDecoder().decode([RankedFeedItem].self, from: data)
+}
+
+/// A topic for feed ranking (from the user's journal interests).
+public struct SlowClawTopic {
+    public let label: String
+    public let weight: Double
+    public init(label: String, weight: Double = 1.0) {
+        self.label = label
+        self.weight = weight
+    }
+}
+
+private func escapeJson(_ s: String) -> String {
+    s.replacingOccurrences(of: "\\", with: "\\\\")
+     .replacingOccurrences(of: "\"", with: "\\\"")
+}
+
 // MARK: - LLM Provider
 
 /// A closure that performs an HTTP POST and returns the response body.

@@ -228,6 +228,25 @@ SlowclawChatResult slowclaw_feed_draft_post(
 
 void slowclaw_feed_chat_result_free(SlowclawChatResult *result);
 
+// ──────────────────────────────────────────────────────────────────────────
+// RSS parsing + feed ranking (journal-driven "For You" pipeline)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Parse RSS/Atom XML and rank items by the user's interests.
+/// `xml` is the raw RSS/Atom XML (fetched by Swift via URLSession).
+/// `source_label` is the feed name for display.
+/// `topics_json` is a JSON array of {"label":"...","weight":N} representing
+///   the user's journal-derived interests. Pass {NULL, 0} for pure recency.
+/// Returns a JSON array of ranked items in `out_result` (free via
+/// slowclaw_feed_rank_result_free). Returns 0 on success, negative on error.
+int32_t slowclaw_feed_parse_and_rank(
+    const uint8_t *xml, size_t xml_len,
+    const uint8_t *source_label, size_t source_label_len,
+    const uint8_t *topics_json, size_t topics_json_len, // optional
+    double now_epoch,
+    SlowclawRankResult *out_result
+);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -37,6 +37,8 @@ const memory_types = @import("memory_types.zig");
 const provider_mod = @import("provider.zig");
 const openai_provider_mod = @import("openai_provider.zig");
 const journal_agent = @import("journal_agent.zig");
+const rss_parser = @import("rss_parser.zig");
+const feeds_ranking = @import("feeds_ranking.zig");
 
 /// C allocator — pairs with `free` on the Swift side. Using this ensures Zig
 /// and Swift agree on the heap.
@@ -748,6 +750,126 @@ pub export fn slowclaw_feed_chat_result_free(result: *SlowclawChatResult) void {
         c_allocator.free(b[0..result.text.len]);
         result.* = .{ .text = SlowclawString.empty(), .status = SLOWCLAW_OK };
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// RSS parsing + feed ranking — the "journal is the lens" feed pipeline.
+// Swift fetches raw XML via URLSession → Zig parses + ranks → returns JSON.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Parse RSS/Atom XML and rank items by the user's interests. Returns a JSON
+/// array of ranked items with score, title, link, description, readMinutes,
+/// sourceLabel. The caller frees via slowclaw_feed_rank_result_free.
+///
+/// `topics_json` is a JSON array of {"label":"rust","weight":1.0} objects
+/// representing the user's current journal-derived interests. Pass null/empty
+/// for pure recency ranking.
+pub export fn slowclaw_feed_parse_and_rank(
+    xml: [*]const u8,
+    xml_len: usize,
+    source_label: [*]const u8,
+    source_label_len: usize,
+    topics_json: ?[*]const u8,
+    topics_json_len: usize,
+    now_epoch: f64,
+    out_result: *SlowclawRankResult,
+) c_int {
+    const xml_slice = xml[0..xml_len];
+    const src_slice = source_label[0..source_label_len];
+
+    // Parse the RSS/Atom XML.
+    const items = rss_parser.parseFeed(c_allocator, xml_slice) catch {
+        out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_INTERNAL };
+        return SLOWCLAW_ERR_INTERNAL;
+    };
+    defer rss_parser.freeRssItems(c_allocator, items);
+
+    // Convert to FeedItems for ranking.
+    const feed_items = rss_parser.toFeedItems(items, src_slice);
+    defer c_allocator.free(feed_items);
+
+    // Parse the topics JSON if provided.
+    var topics: []feeds_ranking.Topic = &.{};
+    defer if (topics.len > 0) c_allocator.free(topics);
+    if (topics_json) |tj| {
+        const tj_slice = tj[0..topics_json_len];
+        topics = parseTopicsJson(c_allocator, tj_slice) catch &.{};
+    }
+
+    // Rank.
+    const ranked = feeds_ranking.rankReads(c_allocator, feed_items, topics, &.{}, now_epoch) catch {
+        out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_INTERNAL };
+        return SLOWCLAW_ERR_INTERNAL;
+    };
+    defer c_allocator.free(ranked);
+
+    // Serialize to JSON.
+    const json = serializeRankedFeed(c_allocator, ranked) catch {
+        out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_OUT_OF_MEMORY };
+        return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    };
+    out_result.* = .{ .items_json = SlowclawString.fromOwnedSlice(json), .status = SLOWCLAW_OK };
+    return SLOWCLAW_OK;
+}
+
+/// Parse a JSON array of {"label":"...","weight":N} into Topic structs.
+fn parseTopicsJson(allocator: std.mem.Allocator, json: []const u8) ![]feeds_ranking.Topic {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return &.{};
+    defer parsed.deinit();
+
+    if (std.meta.activeTag(parsed.value) != .array) return &.{};
+    const arr = parsed.value.array;
+    var topics = try allocator.alloc(feeds_ranking.Topic, arr.items.len);
+
+    for (arr.items, 0..) |item, i| {
+        if (std.meta.activeTag(item) != .object) {
+            topics[i] = .{ .label = "", .weight = 0 };
+            continue;
+        }
+        const label_val = item.object.get("label") orelse std.json.Value{ .string = "" };
+        const weight_val = item.object.get("weight") orelse std.json.Value{ .float = 1.0 };
+        topics[i] = .{
+            .label = switch (label_val) {
+                .string => |s| s,
+                else => "",
+            },
+            .weight = switch (weight_val) {
+                .float => |f| f,
+                .integer => |n| @floatFromInt(n),
+                else => 1.0,
+            },
+        };
+    }
+    return topics;
+}
+
+/// Serialize ranked feed items as a JSON array for Swift to decode.
+fn serializeRankedFeed(allocator: std.mem.Allocator, ranked: []const feeds_ranking.RankedItem) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+
+    for (ranked, 0..) |r, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"title\":");
+        try writeJsonString(allocator, &buf, r.item.title);
+        try buf.appendSlice(allocator, ",\"link\":");
+        try writeJsonString(allocator, &buf, r.item.id);
+        try buf.appendSlice(allocator, ",\"description\":");
+        try writeJsonString(allocator, &buf, r.item.body);
+        try buf.appendSlice(allocator, ",\"sourceLabel\":");
+        try writeJsonString(allocator, &buf, r.source_label);
+        try buf.appendSlice(allocator, ",\"score\":");
+        const score_str = try std.fmt.allocPrint(allocator, "{d:.4}", .{r.score});
+        defer allocator.free(score_str);
+        try buf.appendSlice(allocator, score_str);
+        const rm_str = try std.fmt.allocPrint(allocator, ",\"readMinutes\":{d}", .{r.read_minutes});
+        defer allocator.free(rm_str);
+        try buf.appendSlice(allocator, rm_str);
+        try buf.append(allocator, '}');
+    }
+    try buf.append(allocator, ']');
+    return buf.toOwnedSlice(allocator);
 }
 // ──────────────────────────────────────────────────────────────────────────
 

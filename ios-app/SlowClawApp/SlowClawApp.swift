@@ -401,70 +401,116 @@ struct JournalCard: View {
 
 struct ReadsView: View {
     @EnvironmentObject var state: AppState
-    @State private var sampleItems: [SampleFeedItem] = SampleFeedItem.examples
+    @State private var feedItems: [RankedFeedItem] = []
+    @State private var isLoading = false
+    @State private var loadError: String?
+
+    // Default RSS feeds to fetch on first load.
+    private let defaultFeeds: [(url: String, name: String)] = [
+        ("https://hnrss.org/frontpage", "Hacker News"),
+        ("https://www.theverge.com/rss/index.xml", "The Verge"),
+        ("https://feeds.arstechnica.com/arstechnica/index", "Ars Technica"),
+    ]
 
     var body: some View {
         NavigationStack {
-            List(sampleItems) { item in
-                FeedCard(item: item, interests: state.interests)
-            }
-            .listStyle(.plain)
-            .refreshable {
-                // Pull-to-refresh: in production this would trigger RSS/Nostr
-                // ingestion via the Zig ranker. For now just keep the samples.
+            Group {
+                if isLoading && feedItems.isEmpty {
+                    ProgressView("Fetching feeds…")
+                } else if let err = loadError, feedItems.isEmpty {
+                    ContentUnavailableView(
+                        "Couldn't load feeds",
+                        systemImage: "wifi.exclamationmark",
+                        description: Text(err)
+                    )
+                } else if feedItems.isEmpty {
+                    ContentUnavailableView(
+                        "No reads yet",
+                        systemImage: "newspaper",
+                        description: Text("Pull down to fetch RSS feeds. Write journals to grow interests that steer the ranking.")
+                    )
+                } else {
+                    List(feedItems) { item in
+                        RankedFeedCard(item: item, interests: state.interests)
+                    }
+                    .listStyle(.plain)
+                }
             }
             .navigationTitle("Reads")
             .navigationBarTitleDisplayMode(.large)
-            .overlay {
-                if state.journals.isEmpty {
-                    ContentUnavailableView(
-                        "Start writing",
-                        systemImage: "newspaper",
-                        description: Text("Write journal entries to grow your interests. Articles ranked by your interests appear here.")
-                    )
-                }
+            .refreshable { await loadFeeds() }
+            .task {
+                if feedItems.isEmpty { await loadFeeds() }
             }
         }
     }
+
+    private func loadFeeds() async {
+        isLoading = true
+        loadError = nil
+
+        // Build topics from the user's interests.
+        let topics = state.interests.map { SlowClawTopic(label: $0, weight: 1.0) }
+
+        var allRanked: [RankedFeedItem] = []
+
+        for feed in defaultFeeds {
+            // Fetch RSS XML via URLSession.
+            guard let url = URL(string: feed.url) else { continue }
+            do {
+                let (data, _) = try await URLSession.shared.data(from: url)
+                guard let xml = String(data: data, encoding: .utf8) else { continue }
+
+                // Parse + rank via the Zig core.
+                if let ranked = slowClawParseAndRankRSS(xml: xml, sourceLabel: feed.name, topics: topics) {
+                    allRanked.append(contentsOf: ranked)
+                }
+            } catch {
+                // Skip failed feeds silently; partial results are fine.
+            }
+        }
+
+        // Sort all items by score (highest first) and take top 50.
+        allRanked.sort { $0.score > $1.score }
+        feedItems = Array(allRanked.prefix(50))
+
+        if feedItems.isEmpty && !defaultFeeds.isEmpty {
+            loadError = "Could not reach any RSS feeds. Check your network connection."
+        }
+
+        isLoading = false
+    }
 }
 
-/// Sample feed item for demonstrating the ranking UI.
-/// In production these come from RSS/Nostr ingestion through the Zig ranker.
-struct SampleFeedItem: Identifiable {
-    let id: String
-    let title: String
-    let source: String
-    let readMinutes: Int
-    let hasImage: Bool
-    let matchedInterests: [String]
-    let timestamp: Double
-
-    static let examples: [SampleFeedItem] = [
-        .init(id: "1", title: "Why Rust's borrow checker makes systems programming safer", source: "rust-blog.org", readMinutes: 8, hasImage: true, matchedInterests: ["rust"], timestamp: Date().timeIntervalSince1970 - 3600),
-        .init(id: "2", title: "The science of sourdough fermentation", source: "kingarthurbaking.com", readMinutes: 5, hasImage: true, matchedInterests: ["baking"], timestamp: Date().timeIntervalSince1970 - 7200),
-        .init(id: "3", title: "Urban cycling infrastructure in European cities", source: "citylab.com", readMinutes: 12, hasImage: false, matchedInterests: ["cycling"], timestamp: Date().timeIntervalSince1970 - 14400),
-        .init(id: "4", title: "Climate tech investments doubled in 2026", source: "techcrunch.com", readMinutes: 3, hasImage: true, matchedInterests: ["climate"], timestamp: Date().timeIntervalSince1970 - 18000),
-        .init(id: "5", title: "The minimalist Mac setup for developers", source: "macstories.net", readMinutes: 15, hasImage: true, matchedInterests: [], timestamp: Date().timeIntervalSince1970 - 28800),
-    ]
-}
-
-/// Rich feed card with interest match badges + read time.
-struct FeedCard: View {
-    let item: SampleFeedItem
+/// Ranked feed card — displays a Zig-ranked RSS item with score + interest badges.
+struct RankedFeedCard: View {
+    let item: RankedFeedItem
     let interests: [String]
+
+    var matchedInterests: [String] {
+        interests.filter { interest in
+            item.title.lowercased().contains(interest) ||
+            item.description.lowercased().contains(interest)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Title
             Text(item.title)
                 .font(.headline)
-                .lineLimit(2)
-                .multilineTextAlignment(.leading)
+                .lineLimit(3)
+
+            if !item.description.isEmpty {
+                Text(item.description)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
 
             // Interest match badges
-            if !item.matchedInterests.isEmpty {
+            if !matchedInterests.isEmpty {
                 HStack(spacing: 4) {
-                    ForEach(item.matchedInterests, id: \.self) { interest in
+                    ForEach(matchedInterests, id: \.self) { interest in
                         Text(interest)
                             .font(.caption2.weight(.semibold))
                             .padding(.horizontal, 6)
@@ -476,39 +522,32 @@ struct FeedCard: View {
             }
 
             HStack(spacing: 12) {
-                // Source
-                Label(item.source, systemImage: "globe")
+                Label(item.sourceLabel, systemImage: "globe")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                // Read time
                 Label("\(item.readMinutes) min", systemImage: "book")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
                 Spacer()
 
-                // Image indicator
-                if item.hasImage {
-                    Image(systemName: "photo")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                // Time ago
-                Text(timeAgo(item.timestamp))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                // Relevance score badge
+                Text(String(format: "%.2f", item.score))
+                    .font(.caption2.monospaced())
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(scoreColor.opacity(0.15), in: Capsule())
+                    .foregroundStyle(scoreColor)
             }
         }
         .padding(.vertical, 6)
     }
 
-    private func timeAgo(_ ts: Double) -> String {
-        let diff = Date().timeIntervalSince1970 - ts
-        if diff < 3600 { return "\(Int(diff/60))m" }
-        if diff < 86400 { return "\(Int(diff/3600))h" }
-        return "\(Int(diff/86400))d"
+    private var scoreColor: Color {
+        if item.score > 1.5 { return .green }
+        if item.score > 1.0 { return .blue }
+        return .secondary
     }
 }
 
