@@ -29,6 +29,7 @@ pub const markdown = @import("markdown.zig");
 pub const response_cache = @import("response_cache.zig");
 pub const provider = @import("provider.zig");
 pub const openai_provider = @import("openai_provider.zig");
+pub const journal_agent = @import("journal_agent.zig");
 
 // Force-retain every `export fn` in ffi.zig. Zig 0.16 uses lazy compilation:
 // `@import("ffi.zig")` alone does NOT make its export functions reachable,
@@ -56,6 +57,13 @@ comptime {
     _ = &ffi.slowclaw_feed_sqlite_recall;
     _ = &ffi.slowclaw_feed_sqlite_result_free;
     _ = &ffi.slowclaw_feed_sqlite_entry_free;
+    _ = &ffi.slowclaw_feed_provider_new;
+    _ = &ffi.slowclaw_feed_provider_free;
+    _ = &ffi.slowclaw_feed_provider_chat;
+    _ = &ffi.slowclaw_feed_synthesize_journal;
+    _ = &ffi.slowclaw_feed_extract_interests;
+    _ = &ffi.slowclaw_feed_draft_post;
+    _ = &ffi.slowclaw_feed_chat_result_free;
 }
 
 test {

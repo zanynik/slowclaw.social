@@ -34,6 +34,9 @@ const embeddings = @import("embeddings.zig");
 const feed_types = @import("feed_types.zig");
 const sqlite = @import("sqlite.zig");
 const memory_types = @import("memory_types.zig");
+const provider_mod = @import("provider.zig");
+const openai_provider_mod = @import("openai_provider.zig");
+const journal_agent = @import("journal_agent.zig");
 
 /// C allocator — pairs with `free` on the Swift side. Using this ensures Zig
 /// and Swift agree on the heap.
@@ -506,7 +509,246 @@ fn serializeEntriesFull(allocator: std.mem.Allocator, items: []const memory_type
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Internal helpers — C-struct ↔ Zig-struct conversion and JSON serialization.
+// LLM Provider — Swift provides the HTTP transport via a C callback.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// C-side HTTP transport callback type. Swift implements this via URLSession.
+/// Returns the response body as a Zig-owned SlowclawString (caller frees
+/// via slowclaw_feed_free). Returns null bytes on error.
+pub const SlowclawHttpPostFn = *const fn (
+    ctx: ?*anyopaque,
+    url: [*]const u8,
+    url_len: usize,
+    auth_header: [*]const u8,
+    auth_header_len: usize,
+    content_type: [*]const u8,
+    content_type_len: usize,
+    body: [*]const u8,
+    body_len: usize,
+) callconv(.c) SlowclawString;
+
+/// Adapter: wraps the C-side callback as a Zig HttpTransport.
+/// The `ctx` is a pointer to a stored {callback_ctx, post_fn} pair.
+const TransportStorage = struct {
+    callback_ctx: ?*anyopaque,
+    post_fn: SlowclawHttpPostFn,
+};
+
+fn cHttpPost(
+    ctx: *anyopaque,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    auth_header: []const u8,
+    content_type: []const u8,
+    body: []const u8,
+) openai_provider_mod.HttpError![]u8 {
+    const storage: *TransportStorage = @ptrCast(@alignCast(ctx));
+    const result = storage.post_fn(
+        storage.callback_ctx,
+        url.ptr, url.len,
+        auth_header.ptr, auth_header.len,
+        content_type.ptr, content_type.len,
+        body.ptr, body.len,
+    );
+    if (result.bytes == null) return error.HttpFailed;
+    const slice = result.bytes.?[0..result.len];
+    const owned = allocator.dupe(u8, slice) catch return error.OutOfMemory;
+    // Free the C-side allocation (it came from Swift, freed via slowclaw_feed_free).
+    if (result.bytes) |b| std.c.free(@constCast(b));
+    return owned;
+}
+
+/// Opaque handle to an OpenAiProvider.
+pub const SlowclawProvider = opaque {};
+
+/// Create an OpenAI-compatible LLM provider. The HTTP transport is provided
+/// by Swift as a C callback function pointer + opaque context. The base_url
+/// and api_key are Zig-owned (duped from the caller's slices).
+pub export fn slowclaw_feed_provider_new(
+    base_url: [*]const u8,
+    base_url_len: usize,
+    api_key: [*]const u8,
+    api_key_len: usize,
+    http_callback_ctx: ?*anyopaque,
+    http_post_fn: SlowclawHttpPostFn,
+) ?*SlowclawProvider {
+    const url_slice = base_url[0..base_url_len];
+    const key_slice = api_key[0..api_key_len];
+
+    // Store the transport callback info in heap-allocated memory.
+    const storage_ptr = c_allocator.create(TransportStorage) catch return null;
+    storage_ptr.* = .{ .callback_ctx = http_callback_ctx, .post_fn = http_post_fn };
+
+    const provider_ptr = c_allocator.create(openai_provider_mod.OpenAiProvider) catch {
+        c_allocator.destroy(storage_ptr);
+        return null;
+    };
+
+    // Build a Zig HttpTransport that wraps the C callback.
+    const zig_transport = openai_provider_mod.HttpTransport{
+        .ctx = @ptrCast(storage_ptr),
+        .post_fn = cHttpPost,
+    };
+
+    provider_ptr.* = openai_provider_mod.OpenAiProvider.withBaseUrl(
+        c_allocator,
+        c_allocator.dupe(u8, url_slice) catch {
+            c_allocator.destroy(storage_ptr);
+            c_allocator.destroy(provider_ptr);
+            return null;
+        },
+        c_allocator.dupe(u8, key_slice) catch {
+            c_allocator.destroy(storage_ptr);
+            c_allocator.destroy(provider_ptr);
+            return null;
+        },
+        zig_transport,
+    );
+
+    return @ptrCast(provider_ptr);
+}
+
+pub export fn slowclaw_feed_provider_free(handle: ?*SlowclawProvider) void {
+    if (handle) |h| {
+        const p: *openai_provider_mod.OpenAiProvider = @ptrCast(@alignCast(h));
+        c_allocator.free(p.base_url);
+        if (p.api_key) |k| c_allocator.free(k);
+        c_allocator.destroy(p);
+    }
+}
+
+/// One-shot chat: system prompt + user message → LLM response text.
+/// Returns the response as a Zig-owned SlowclawString (caller frees via
+/// slowclaw_feed_free). On error, bytes is null and status is negative.
+pub const SlowclawChatResult = extern struct {
+    text: SlowclawString,
+    status: c_int,
+};
+
+pub export fn slowclaw_feed_provider_chat(
+    handle: *SlowclawProvider,
+    system_prompt: ?[*]const u8,
+    system_prompt_len: usize,
+    message: [*]const u8,
+    message_len: usize,
+    model: [*]const u8,
+    model_len: usize,
+    temperature: f64,
+) SlowclawChatResult {
+    const p: *openai_provider_mod.OpenAiProvider = @ptrCast(@alignCast(handle));
+    const msg_slice = message[0..message_len];
+    const model_slice = model[0..model_len];
+    const sys_slice: ?[]const u8 = if (system_prompt) |s| s[0..system_prompt_len] else null;
+
+    const result = p.chatWithSystem(c_allocator, sys_slice, msg_slice, model_slice, temperature) catch |err| {
+        const status: c_int = switch (err) {
+            error.InvalidArgument => -1,
+            error.OutOfMemory => -2,
+            error.HttpFailed => -3,
+            error.ApiError => -4,
+            error.InvalidResponse => -5,
+        };
+        return .{ .text = SlowclawString.empty(), .status = status };
+    };
+
+    return .{
+        .text = SlowclawString.fromOwnedSlice(result),
+        .status = SLOWCLAW_OK,
+    };
+}
+
+/// Journal synthesis: transcript → clean journal entry (via LLM).
+pub export fn slowclaw_feed_synthesize_journal(
+    handle: *SlowclawProvider,
+    transcript: [*]const u8,
+    transcript_len: usize,
+    model: [*]const u8,
+    model_len: usize,
+) SlowclawChatResult {
+    const p: *openai_provider_mod.OpenAiProvider = @ptrCast(@alignCast(handle));
+    const pv = p.provider_();
+    const result = journal_agent.synthesizeJournal(
+        pv,
+        c_allocator,
+        transcript[0..transcript_len],
+        model[0..model_len],
+    ) catch |err| {
+        const status: c_int = switch (err) {
+            error.InvalidArgument => -1,
+            error.OutOfMemory => -2,
+            error.HttpFailed => -3,
+            error.ApiError => -4,
+            error.InvalidResponse => -5,
+        };
+        return .{ .text = SlowclawString.empty(), .status = status };
+    };
+    return .{ .text = SlowclawString.fromOwnedSlice(result), .status = SLOWCLAW_OK };
+}
+
+/// Interest extraction: journal text → comma-separated keywords (via LLM).
+pub export fn slowclaw_feed_extract_interests(
+    handle: *SlowclawProvider,
+    journal_text: [*]const u8,
+    journal_text_len: usize,
+    model: [*]const u8,
+    model_len: usize,
+) SlowclawChatResult {
+    const p: *openai_provider_mod.OpenAiProvider = @ptrCast(@alignCast(handle));
+    const pv = p.provider_();
+    const result = journal_agent.extractInterests(
+        pv,
+        c_allocator,
+        journal_text[0..journal_text_len],
+        model[0..model_len],
+    ) catch |err| {
+        const status: c_int = switch (err) {
+            error.InvalidArgument => -1,
+            error.OutOfMemory => -2,
+            error.HttpFailed => -3,
+            error.ApiError => -4,
+            error.InvalidResponse => -5,
+        };
+        return .{ .text = SlowclawString.empty(), .status = status };
+    };
+    return .{ .text = SlowclawString.fromOwnedSlice(result), .status = SLOWCLAW_OK };
+}
+
+/// Post drafting: journal text → short-form post draft (via LLM).
+pub export fn slowclaw_feed_draft_post(
+    handle: *SlowclawProvider,
+    journal_text: [*]const u8,
+    journal_text_len: usize,
+    model: [*]const u8,
+    model_len: usize,
+    max_chars: usize,
+) SlowclawChatResult {
+    const p: *openai_provider_mod.OpenAiProvider = @ptrCast(@alignCast(handle));
+    const pv = p.provider_();
+    const result = journal_agent.draftPost(
+        pv,
+        c_allocator,
+        journal_text[0..journal_text_len],
+        model[0..model_len],
+        max_chars,
+    ) catch |err| {
+        const status: c_int = switch (err) {
+            error.InvalidArgument => -1,
+            error.OutOfMemory => -2,
+            error.HttpFailed => -3,
+            error.ApiError => -4,
+            error.InvalidResponse => -5,
+        };
+        return .{ .text = SlowclawString.empty(), .status = status };
+    };
+    return .{ .text = SlowclawString.fromOwnedSlice(result), .status = SLOWCLAW_OK };
+}
+
+pub export fn slowclaw_feed_chat_result_free(result: *SlowclawChatResult) void {
+    if (result.text.bytes) |b| {
+        c_allocator.free(b[0..result.text.len]);
+        result.* = .{ .text = SlowclawString.empty(), .status = SLOWCLAW_OK };
+    }
+}
 // ──────────────────────────────────────────────────────────────────────────
 
 fn dupInterest(ci: SlowclawInterest) feed_types.InterestVector {

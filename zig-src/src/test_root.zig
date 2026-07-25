@@ -17,6 +17,7 @@ pub const chunker = @import("chunker.zig");
 pub const embeddings = @import("embeddings.zig");
 pub const provider = @import("provider.zig");
 pub const openai_provider = @import("openai_provider.zig");
+pub const journal_agent = @import("journal_agent.zig");
 
 test {
     _ = vector_math;
@@ -30,6 +31,7 @@ test {
     _ = embeddings;
     _ = provider;
     _ = openai_provider;
+    _ = journal_agent;
 
     try std.testing.expect(std.mem.eql(u8, "ok", "ok"));
 }
