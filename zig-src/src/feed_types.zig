@@ -8,19 +8,17 @@
 const std = @import("std");
 const testing = std.testing;
 
-/// Feed ingestion protocol. Mirrors `FeedProtocol` in `src/feed/types.rs:5`.
-/// `sourceType()` mirrors the Rust impl: Bluesky is its own source_type; the
-/// other three collapse to "web".
+/// Feed ingestion protocol. Nostr is its own source_type; the others
+/// collapse to "web" for unified ranking.
 pub const FeedProtocol = enum {
-    bluesky,
     rss,
     nostr,
     web,
 
     pub fn sourceType(self: FeedProtocol) []const u8 {
         return switch (self) {
-            .bluesky => "bluesky",
-            .rss, .nostr, .web => "web",
+            .rss, .web => "web",
+            .nostr => "nostr",
         };
     }
 };
@@ -114,10 +112,9 @@ pub const FeedCandidate = struct {
 // Tests — layout + behavior (sourceType mapping is the only behavior here).
 // ──────────────────────────────────────────────────────────────────────────
 
-test "FeedProtocol.sourceType: bluesky is distinct, others collapse to web" {
-    try testing.expectEqualStrings("bluesky", FeedProtocol.bluesky.sourceType());
+test "FeedProtocol.sourceType: nostr is distinct, others collapse to web" {
+    try testing.expectEqualStrings("nostr", FeedProtocol.nostr.sourceType());
     try testing.expectEqualStrings("web", FeedProtocol.rss.sourceType());
-    try testing.expectEqualStrings("web", FeedProtocol.nostr.sourceType());
     try testing.expectEqualStrings("web", FeedProtocol.web.sourceType());
 }
 
@@ -176,7 +173,7 @@ test "FeedCandidate: round-trip construction" {
 
 test "PersonalizedFeedItem: defaults match Rust Default" {
     const item = PersonalizedFeedItem{
-        .source_type = "bluesky",
+        .source_type = "nostr",
         .feed_item_json = "{}",
     };
     try testing.expect(!item.passed_threshold);

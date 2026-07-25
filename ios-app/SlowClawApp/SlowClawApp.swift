@@ -3,7 +3,7 @@
 // Five tabs matching the product vision (AGENTS.md three loops):
 //   Reads   — journal-ranked feed (articles + social, ranked by interests)
 //   Journal — capture/compose (audio-first, grows interests)
-//   Drafts  — AI-distilled post drafts (→ Bluesky/Nostr)
+//   Drafts  — AI-distilled post drafts (→ Nostr)
 //   Profile — settings, API keys, interest management
 //
 // All data flows through the Zig core via the C ABI:
@@ -410,7 +410,7 @@ struct ReadsView: View {
             }
             .listStyle(.plain)
             .refreshable {
-                // Pull-to-refresh: in production this would trigger RSS/Bluesky
+                // Pull-to-refresh: in production this would trigger RSS/Nostr
                 // ingestion via the Zig ranker. For now just keep the samples.
             }
             .navigationTitle("Reads")
@@ -429,7 +429,7 @@ struct ReadsView: View {
 }
 
 /// Sample feed item for demonstrating the ranking UI.
-/// In production these come from RSS/Bluesky ingestion through the Zig ranker.
+/// In production these come from RSS/Nostr ingestion through the Zig ranker.
 struct SampleFeedItem: Identifiable {
     let id: String
     let title: String

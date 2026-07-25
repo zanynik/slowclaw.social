@@ -40,7 +40,7 @@ pub const FeedItem = struct {
     title: []const u8,
     body: []const u8,
     author_handle: []const u8,
-    source_platform: []const u8, // "rss" | "nostr" | "bluesky" | "web" | "youtube"
+    source_platform: []const u8, // "rss" | "nostr" | "web"
     timestamp: f64, // epoch seconds
     has_image: bool = false,
     image_url: ?[]const u8 = null,
@@ -301,13 +301,13 @@ pub fn isSocialPostAdmitted(
     return false;
 }
 
-// ── Bluesky reply-count admission ─────────────────────────────────────────
+// ── Social reply-count admission ──────────────────────────────────────────
 
-pub const DEFAULT_MIN_BLUESKY_REPLIES: u32 = 5;
+pub const DEFAULT_MIN_SOCIAL_REPLIES: u32 = 5;
 
-/// Filter Bluesky posts by minimum reply count. Posts without reply_count
-/// are dropped (treated as 0).
-pub fn filterBlueskyByReplies(
+/// Filter social posts (Nostr) by minimum reply count. Posts without
+/// reply_count are dropped (treated as 0).
+pub fn filterSocialByReplies(
     allocator: std.mem.Allocator,
     posts: []const FeedItem,
     min_replies: u32,
@@ -446,14 +446,14 @@ test "chronologicalReads: sorts by timestamp descending" {
     try testing.expectEqualStrings("old", ranked[1].item.id);
 }
 
-test "filterBlueskyByReplies: drops low-reply posts" {
+test "filterSocialByReplies: drops low-reply posts" {
     const a = testing.allocator;
     const items = [_]FeedItem{
         .{ .id = "1", .title = "T", .body = "", .author_handle = "a", .source_platform = "bluesky", .timestamp = 0, .reply_count = 10 },
         .{ .id = "2", .title = "T", .body = "", .author_handle = "b", .source_platform = "bluesky", .timestamp = 0, .reply_count = 2 },
         .{ .id = "3", .title = "T", .body = "", .author_handle = "c", .source_platform = "bluesky", .timestamp = 0 }, // no reply_count
     };
-    const filtered = try filterBlueskyByReplies(a, &items, 5);
+    const filtered = try filterSocialByReplies(a, &items, 5);
     defer a.free(filtered);
     try testing.expectEqual(@as(usize, 1), filtered.len);
     try testing.expectEqualStrings("1", filtered[0].id);
