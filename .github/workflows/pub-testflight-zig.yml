@@ -239,12 +239,7 @@ jobs:
                       <key>provisioningProfiles</key>
                       <dict>
                           <key>com.slowclaw.app</key>
-                          <dict>
-                              <key>identifier</key>
-                              <string>${APP_PROFILE_UUID}</string>
-                              <key>name</key>
-                              <string>${APP_PROFILE_NAME}</string>
-                          </dict>
+                          <string>${APP_PROFILE_NAME}</string>
                       </dict>
                       <key>signingStyle</key>
                       <string>manual</string>
