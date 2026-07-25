@@ -190,7 +190,16 @@ struct JournalView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // Capture zone
+                // Audio capture zone (audio-first)
+                AudioCaptureView()
+                    .padding(.horizontal)
+                    .padding(.top)
+
+                Divider()
+                    .padding(.vertical, 8)
+
+                // Text capture zone
+                VStack(spacing: 12) {
                 VStack(spacing: 12) {
                     TextEditor(text: $newEntry)
                         .frame(minHeight: 100)

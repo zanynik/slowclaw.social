@@ -32,6 +32,7 @@ pub const openai_provider = @import("openai_provider.zig");
 pub const journal_agent = @import("journal_agent.zig");
 pub const feeds_ranking = @import("feeds_ranking.zig");
 pub const interest_profile = @import("interest_profile.zig");
+pub const saved_items = @import("saved_items.zig");
 
 // Force-retain every `export fn` in ffi.zig. Zig 0.16 uses lazy compilation:
 // `@import("ffi.zig")` alone does NOT make its export functions reachable,
