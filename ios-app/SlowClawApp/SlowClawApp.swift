@@ -132,7 +132,7 @@ final class AppState: ObservableObject {
             if let draft = try? llm.draftPost(journalText: journal.content, model: self.model) {
                 let key = "draft_\(Date().timeIntervalSince1970)"
                 try? self.memory.store(key: key, content: draft, category: "core", sessionID: "drafts")
-                Task { @MainActor in self.refreshJournals() }
+                Task { @MainActor in await self.refreshJournals() }
             }
         }
     }
