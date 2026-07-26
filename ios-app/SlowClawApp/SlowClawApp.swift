@@ -128,6 +128,11 @@ final class AppState: ObservableObject {
     // stream is the home surface).
     @Published var selectedTab: AppTab = .reads
 
+    // Journal sidebar (matches the reference app's hamburger drawer). The
+    // selected journal's content loads into the editor; nil = fresh new entry.
+    @Published var journalSidebarOpen: Bool = false
+    @Published var selectedJournalKey: String? = nil
+
     @Published var apiKey: String {
         didSet { UserDefaults.standard.set(apiKey, forKey: "slowclaw.api_key"); setupLLM() }
     }
@@ -189,6 +194,18 @@ final class AppState: ObservableObject {
             journals = []
             drafts = []
         }
+    }
+
+    /// Clear the journal selection so the editor shows a fresh, empty entry.
+    /// Mirrors `resetJournalSession` in the reference app (the "+" button).
+    func resetJournalSession() {
+        selectedJournalKey = nil
+    }
+
+    /// The journal entry currently loaded into the editor, or nil for a new entry.
+    var selectedJournal: SlowClawMemoryEntry? {
+        guard let key = selectedJournalKey else { return nil }
+        return journals.first { $0.key == key }
     }
 
     func storeJournal(text: String) async {
@@ -268,16 +285,27 @@ struct AppShell: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             BottomNav(selection: $state.selectedTab, scheme: scheme)
         }
+        // Journal drawer (left-sliding, like the reference app's sidebar).
+        .overlay {
+            if state.selectedTab == .journal {
+                JournalSidebar(scheme: scheme)
+                    .transition(.move(edge: .leading).combined(with: .opacity))
+            }
+        }
+        .animation(.easeOut(duration: 0.25), value: state.journalSidebarOpen)
         .background(DS.bg(scheme).ignoresSafeArea())
     }
 }
 
-/// Translucent blurred top bar: "SlowClaw" wordmark + theme toggle.
-/// Matches `.topbar` in styles.css (blur(20px) saturate(1.4), sticky). The bar
-/// extends under the status bar; the inner content adds the top safe-area inset.
+/// Translucent blurred top bar: "SlowClaw" wordmark + theme toggle, plus — on
+/// the Journal tab only — a hamburger (opens the journal drawer) and a "+"
+/// (starts a fresh entry). Matches `.topbar` in styles.css (blur(20px)
+/// saturate(1.4), sticky). The bar extends under the status bar; the inner
+/// content adds the top safe-area inset.
 struct TopBar: View {
     let scheme: ColorScheme
     @Binding var themeRaw: String
+    @EnvironmentObject var state: AppState
 
     private var isDark: Bool {
         if let t = AppTheme(rawValue: themeRaw) { return t == .dark }
@@ -285,23 +313,53 @@ struct TopBar: View {
     }
 
     var body: some View {
-        HStack {
+        HStack(spacing: 10) {
+            // Journal-only actions: hamburger (open drawer) + new session.
+            if state.selectedTab == .journal {
+                Button {
+                    state.journalSidebarOpen = true
+                } label: {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(DS.muted(scheme))
+                        .frame(width: 34, height: 34)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Journals list")
+            }
+
             Text("SlowClaw")
                 .font(DS.topbarFont)
                 .foregroundStyle(DS.ink(scheme))
                 .kerning(-0.4)
+
             Spacer()
+
+            if state.selectedTab == .journal {
+                Button {
+                    state.resetJournalSession()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(DS.muted(scheme))
+                        .frame(width: 34, height: 34)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("New journal entry")
+            }
+
             Button {
                 themeRaw = (isDark ? AppTheme.light : AppTheme.dark).rawValue
             } label: {
                 Image(systemName: isDark ? "sun.max" : "moon")
                     .font(.system(size: 18, weight: .medium))
                     .foregroundStyle(DS.muted(scheme))
-                    .frame(width: 36, height: 36)
+                    .frame(width: 34, height: 34)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Toggle theme")
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 12)
         .padding(.top, 8)
         .padding(.bottom, 10)
         .background(.ultraThinMaterial)
@@ -360,6 +418,218 @@ struct BottomNav: View {
     }
 }
 
+// MARK: - Journal Sidebar (drawer)
+//
+// Mirrors the reference app's Journal drawer (web/src App.tsx
+// `.sidebar-overlay` + `.sidebar`): a flat, WhatsApp-style list of journal
+// entries (title + relative time + preview), a search filter, per-item
+// delete, and tap-to-load-into-editor. Opens via the topbar hamburger;
+// closes on backdrop tap or item selection.
+
+struct JournalSidebar: View {
+    let scheme: ColorScheme
+    @EnvironmentObject var state: AppState
+    @State private var search = ""
+
+    private var filtered: [SlowClawMemoryEntry] {
+        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return state.journals }
+        return state.journals.filter { $0.content.lowercased().contains(q) }
+    }
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            // Backdrop: tap to close.
+            if state.journalSidebarOpen {
+                Color.black.opacity(0.35)
+                    .ignoresSafeArea()
+                    .onTapGesture { state.journalSidebarOpen = false }
+            }
+
+            // Drawer panel.
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    // Header.
+                    HStack {
+                        Text("Journals")
+                            .font(DS.cardTitleFont)
+                            .foregroundStyle(DS.ink(scheme))
+                        Spacer()
+                        Button {
+                            state.journalSidebarOpen = false
+                        } label: {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(DS.muted(scheme))
+                                .frame(width: 30, height: 30)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.top, 12)
+                    .padding(.bottom, 10)
+
+                    // Search field.
+                    HStack(spacing: 6) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 13))
+                            .foregroundStyle(DS.muted(scheme))
+                        TextField("", text: $search, prompt: Text("Search title or content").foregroundColor(DS.muted(scheme)))
+                            .font(DS.bodyFont)
+                            .textFieldStyle(.plain)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+                    .padding(.horizontal, 18)
+
+                    // Count row.
+                    HStack {
+                        Text("\(filtered.count) of \(state.journals.count)")
+                            .font(DS.microFont)
+                            .foregroundStyle(DS.muted(scheme))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 22)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+
+                    // List.
+                    if state.journals.isEmpty {
+                        Spacer()
+                        VStack(spacing: 6) {
+                            Image(systemName: "book")
+                                .font(.system(size: 28))
+                                .foregroundStyle(DS.muted(scheme))
+                            Text("No journals yet")
+                                .font(DS.captionFont)
+                                .foregroundStyle(DS.muted(scheme))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.bottom, 80)
+                    } else if filtered.isEmpty {
+                        Spacer()
+                        Text("No journals match your search.")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                            .padding(.bottom, 80)
+                    } else {
+                        ScrollView {
+                            LazyVStack(spacing: 2) {
+                                ForEach(filtered, id: \.id) { entry in
+                                    journalRow(entry)
+                                }
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .frame(width: 300)
+                .frame(maxHeight: .infinity)
+                .background(DS.surface(scheme))
+                .overlay(alignment: .trailing) {
+                    Rectangle().fill(DS.line(scheme)).frame(width: 0.5)
+                }
+                .shadow(color: Color.black.opacity(scheme == .dark ? 0.4 : 0.15), radius: 16, x: 2, y: 0)
+
+                // Push the drawer to the leading edge; the rest is backdrop.
+                Spacer(minLength: 0)
+            }
+            .offset(x: state.journalSidebarOpen ? 0 : -320)
+        }
+        .allowsHitTesting(state.journalSidebarOpen)
+    }
+
+    @ViewBuilder
+    private func journalRow(_ entry: SlowClawMemoryEntry) -> some View {
+        let active = state.selectedJournalKey == entry.key
+        Button {
+            state.selectedJournalKey = entry.key
+            state.journalSidebarOpen = false
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(titleOf(entry))
+                            .font(DS.bodyFont.weight(.semibold))
+                            .foregroundStyle(DS.ink(scheme))
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Text(relativeTime(entry))
+                            .font(DS.microFont)
+                            .foregroundStyle(DS.muted(scheme))
+                    }
+                    if !previewOf(entry).isEmpty {
+                        Text(previewOf(entry))
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                            .lineLimit(1)
+                    }
+                }
+                // Delete (appears on row tap in the reference; here always
+                // visible as a small ghost button for discoverability).
+                Button(role: .destructive) {
+                    try? state.memory.forget(key: entry.key)
+                    if state.selectedJournalKey == entry.key { state.selectedJournalKey = nil }
+                    Task { await state.refreshJournals() }
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 13))
+                        .foregroundStyle(DS.muted(scheme))
+                        .frame(width: 26, height: 26)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(active ? DS.accentDim(scheme) : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// First non-empty line of the entry = its title.
+    private func titleOf(_ entry: SlowClawMemoryEntry) -> String {
+        let first = entry.content.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? entry.content
+        return first.trimmingCharacters(in: .whitespaces).isEmpty ? "Untitled" : first.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// A short single-line preview after the title.
+    private func previewOf(_ entry: SlowClawMemoryEntry) -> String {
+        let lines = entry.content.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        let body = lines.dropFirst().joined(separator: " ")
+        let trimmed = body.trimmingCharacters(in: .whitespaces)
+        return String(trimmed.prefix(60))
+    }
+
+    /// Coarse relative-time string (matches the reference's getRelativeTime
+    /// bucketing: now / Nm / Nh / Nd / Nw / Nmo, else a short date).
+    private func relativeTime(_ entry: SlowClawMemoryEntry) -> String {
+        let formatter = ISO8601DateFormatter()
+        let date = formatter.date(from: entry.timestamp)
+            ?? Date(timeIntervalSince1970: TimeInterval(entry.id) ?? 0)
+        let secs = max(0, Date().timeIntervalSince(date))
+        if secs < 60 { return "now" }
+        if secs < 3600 { return "\(Int(secs / 60))m" }
+        if secs < 86_400 { return "\(Int(secs / 3600))h" }
+        if secs < 604_800 { return "\(Int(secs / 86_400))d" }
+        if secs < 2_592_000 { return "\(Int(secs / 604_800))w" }
+        if secs < 31_536_000 { return "\(Int(secs / 2_592_000))mo" }
+        let f = DateFormatter()
+        f.locale = Locale.current
+        f.dateFormat = "MMM d"
+        return f.string(from: date)
+    }
+}
+
 // MARK: - Journal View (Capture loop)
 
 struct JournalView: View {
@@ -371,6 +641,26 @@ struct JournalView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
+                // Header: shows whether editing an existing entry or writing new.
+                HStack(alignment: .firstTextBaseline) {
+                    if let sel = state.selectedJournal {
+                        Text(titleOf(sel))
+                            .font(DS.cardTitleFont)
+                            .foregroundStyle(DS.ink(scheme))
+                            .lineLimit(1)
+                    } else {
+                        Text("New entry")
+                            .font(DS.cardTitleFont)
+                            .foregroundStyle(DS.ink(scheme))
+                    }
+                    Spacer()
+                    Text(state.selectedJournal == nil ? "draft" : "editing")
+                        .font(DS.microFont)
+                        .foregroundStyle(DS.muted(scheme))
+                        .textCase(.uppercase)
+                }
+                .padding(.horizontal, 16)
+
                 // Audio capture
                 AudioCaptureView()
                     .padding(.horizontal, 16)
@@ -430,11 +720,17 @@ struct JournalView: View {
                         .padding(.horizontal, 16)
                 }
 
-                // Journal entries
-                ForEach(state.journals, id: \.id) { entry in
-                    JournalCard(entry: entry)
+                // Recent entries (the sidebar is the primary list; this is a
+                // quick inline glance at recent journals).
+                ForEach(state.journals.prefix(8), id: \.id) { entry in
+                    JournalCard(entry: entry, highlighted: state.selectedJournalKey == entry.key)
                         .padding(.horizontal, 16)
                         .contextMenu {
+                            Button {
+                                state.selectedJournalKey = entry.key
+                            } label: {
+                                Label("Open in editor", systemImage: "pencil")
+                            }
                             Button {
                                 Task { await state.generateDraft(from: entry) }
                             } label: {
@@ -442,6 +738,7 @@ struct JournalView: View {
                             }
                             Button(role: .destructive) {
                                 try? state.memory.forget(key: entry.key)
+                                if state.selectedJournalKey == entry.key { state.selectedJournalKey = nil }
                                 Task { await state.refreshJournals() }
                             } label: {
                                 Label("Delete", systemImage: "trash")
@@ -454,13 +751,32 @@ struct JournalView: View {
         }
         .background(DS.bg(scheme))
         .task { await state.refreshJournals() }
+        // Load the selected entry into the editor when the selection changes.
+        .onChange(of: state.selectedJournalKey) {
+            newEntry = state.selectedJournal?.content ?? ""
+        }
+        .onAppear {
+            // Sync the editor with any pre-existing selection on first show.
+            if newEntry.isEmpty { newEntry = state.selectedJournal?.content ?? "" }
+        }
+    }
+
+    private func titleOf(_ entry: SlowClawMemoryEntry) -> String {
+        let first = entry.content.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? entry.content
+        let t = first.trimmingCharacters(in: .whitespaces)
+        return t.isEmpty ? "Untitled" : t
     }
 
     private func saveEntry() async {
         let text = newEntry.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        await state.storeJournal(text: text)
-        newEntry = ""
+        // Update the existing entry if one is selected, else create a new one.
+        if let key = state.selectedJournalKey {
+            try? state.memory.store(key: key, content: text, category: "daily", sessionID: nil)
+            await state.refreshJournals()
+        } else {
+            await state.storeJournal(text: text)
+        }
     }
 
     private func synthesize() async {
@@ -927,10 +1243,12 @@ extension DS {
     }
 }
 
-/// Journal entry card.
+/// Journal entry card. When `highlighted`, renders with an accent ring to show
+/// it is the entry currently loaded in the editor.
 struct JournalCard: View {
     @Environment(\.colorScheme) var scheme
     let entry: SlowClawMemoryEntry
+    var highlighted: Bool = false
 
     var body: some View {
         DS.card(scheme) {
@@ -951,6 +1269,10 @@ struct JournalCard: View {
                 }
             }
         }
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.rXl, style: .continuous)
+                .stroke(DS.accent(scheme), lineWidth: highlighted ? 1.5 : 0)
+        )
     }
 }
 
