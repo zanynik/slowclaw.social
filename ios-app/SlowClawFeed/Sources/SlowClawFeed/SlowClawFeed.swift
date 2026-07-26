@@ -395,6 +395,82 @@ public struct SlowClawTopic {
     }
 }
 
+// MARK: - Feed catalog
+
+/// A default Reads feed source. Mirrors the Rust catalog
+/// (src/gateway/feed_web_sources.rs) 1:1 — the same sources the reference app
+/// reads. The iOS app fetches each `xmlURL` client-side and parses+ranks via
+/// `slowClawParseAndRankRSS`.
+public struct SlowClawFeedSource: Decodable, Equatable {
+    public let title: String
+    public let domain: String
+    public let htmlURL: String
+    public let xmlURL: String
+
+    enum CodingKeys: String, CodingKey {
+        case title, domain
+        case htmlURL = "htmlUrl"
+        case xmlURL = "xmlUrl"
+    }
+
+    /// Label shown in the Reads card source row. The catalog's YouTube entries
+    /// are already prefixed "YouTube — …"; otherwise use the domain.
+    public var displayLabel: String { title.isEmpty ? domain : title }
+}
+
+/// Return the default Reads feed catalog (114 sources). Nil on FFI/decode error.
+public func slowClawFeedCatalog() -> [SlowClawFeedSource]? {
+    var out = SlowclawString(bytes: nil, len: 0)
+    let status = slowclaw_feed_catalog_json(&out)
+    guard status == SLOWCLAW_OK, let bytes = out.bytes, out.len > 0 else {
+        if out.bytes != nil { slowclaw_feed_free(UnsafeMutableRawPointer(out.bytes)) }
+        return nil
+    }
+    defer { slowclaw_feed_free(UnsafeMutableRawPointer(out.bytes)) }
+    let data = Data(bytes: UnsafeRawPointer(bytes), count: out.len)
+    return try? JSONDecoder().decode([SlowClawFeedSource].self, from: data)
+}
+
+// MARK: - On-device LLM (llama.cpp)
+
+/// On-device LLM availability. The llama.cpp backend is not linked into the
+/// build yet; `available` is false until it is.
+public struct LocalLLMStatus: Decodable {
+    public let available: Bool
+    public let reason: String?
+}
+
+/// The two Gemma models the reference app offers for on-device download.
+public struct LocalModelPreset: Identifiable, Equatable {
+    public let id: String
+    public let title: String
+    public let detail: String
+
+    public static let presets: [LocalModelPreset] = [
+        .init(id: "unsloth/gemma-4-E2B-it-qat-UD-Q2_K_XL",
+              title: "Gemma 4 E2B (Q2_K_XL)",
+              detail: "Smaller, faster. ~1.6 GB. Best for older devices."),
+        .init(id: "unsloth/gemma-4-E2B-it-qat-UD-Q4_K_XL",
+              title: "Gemma 4 E2B (Q4_K_XL)",
+              detail: "Higher quality. ~2.2 GB. Best for iPhone 15 Pro+."),
+    ]
+}
+
+/// Read on-device LLM status from the Zig core. Returns a not-available status
+/// on any error (so callers can render safely).
+public func slowClawLocalLLMStatus() -> LocalLLMStatus {
+    var out = SlowclawString(bytes: nil, len: 0)
+    let status = slowclaw_feed_local_llm_status(&out)
+    guard status == SLOWCLAW_OK, let bytes = out.bytes, out.len > 0 else {
+        if out.bytes != nil { slowclaw_feed_free(UnsafeMutableRawPointer(out.bytes)) }
+        return LocalLLMStatus(available: false, reason: "Status unavailable.")
+    }
+    defer { slowclaw_feed_free(UnsafeMutableRawPointer(out.bytes)) }
+    let data = Data(bytes: UnsafeRawPointer(bytes), count: out.len)
+    return (try? JSONDecoder().decode(LocalLLMStatus.self, from: data))
+        ?? LocalLLMStatus(available: false, reason: "Status decode failed.")
+}
+
 private func escapeJson(_ s: String) -> String {
     s.replacingOccurrences(of: "\\", with: "\\\\")
      .replacingOccurrences(of: "\"", with: "\\\"")

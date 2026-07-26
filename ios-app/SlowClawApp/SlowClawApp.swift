@@ -133,6 +133,19 @@ final class AppState: ObservableObject {
     @Published var journalSidebarOpen: Bool = false
     @Published var selectedJournalKey: String? = nil
 
+    // TweetClaw (post generation). The prompt is editable + persisted; processed
+    // journals are tracked so pull-to-generate picks a fresh entry each time.
+    @Published var tweetClawPrompt: String {
+        didSet { UserDefaults.standard.set(tweetClawPrompt, forKey: "slowclaw.tweetclaw.prompt") }
+    }
+    @Published var isGeneratingPosts = false
+    @Published var generateStatus: String? = nil
+
+    private var processedJournalKeys: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: "slowclaw.tweetclaw.processed") ?? []) }
+        set { UserDefaults.standard.set(Array(newValue), forKey: "slowclaw.tweetclaw.processed") }
+    }
+
     @Published var apiKey: String {
         didSet { UserDefaults.standard.set(apiKey, forKey: "slowclaw.api_key"); setupLLM() }
     }
@@ -147,6 +160,8 @@ final class AppState: ObservableObject {
         self.apiKey = UserDefaults.standard.string(forKey: "slowclaw.api_key") ?? ""
         self.model = UserDefaults.standard.string(forKey: "slowclaw.model") ?? "gpt-4o-mini"
         self.baseURL = UserDefaults.standard.string(forKey: "slowclaw.base_url") ?? "https://api.openai.com/v1"
+        self.tweetClawPrompt = UserDefaults.standard.string(forKey: "slowclaw.tweetclaw.prompt") ??
+            "You are a social media content writer. Turn the following journal entry into a concise, engaging tweet-style post (under 280 characters). Be authentic and conversational. Output ONLY the post text, no hashtags unless they add real value. No quotes around the text."
 
         let urls = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
         let dir = urls.first ?? URL(fileURLWithPath: NSTemporaryDirectory())
@@ -233,6 +248,93 @@ final class AppState: ObservableObject {
                 Task { @MainActor in await self.refreshJournals() }
             }
         }
+    }
+
+    // MARK: - TweetClaw (pull-to-generate)
+
+    /// Pull-to-generate: pick the most-recently-modified unprocessed text journal
+    /// (or a random one if all are processed) and turn it into one or more posts.
+    /// Long entries are chunked at ~3200 chars; each chunk produces its own post.
+    /// Mirrors the reference app's handleFeedPullRefresh / generatePostFromJournal.
+    func tweetClawGenerateNext() async {
+        guard let llm = llm else {
+            generateStatus = "Add an LLM API key in Profile to generate posts."
+            return
+        }
+        guard !journals.isEmpty else {
+            generateStatus = "Write a journal entry first."
+            return
+        }
+        isGeneratingPosts = true
+        generateStatus = "Generating…"
+        defer { isGeneratingPosts = false }
+
+        // Pick the next journal to process.
+        var processed = processedJournalKeys
+        let candidates = journals.filter { $0.content.trimmingCharacters(in: .whitespacesAndNewlines).count > 10 }
+        let unprocessed = candidates.filter { !processed.contains($0.key) }
+        let journal = (unprocessed.first ?? candidates.randomElement())
+        guard let journal = journal else {
+            generateStatus = "No journal entries to process."
+            return
+        }
+
+        let model = self.model
+        let prompt = self.tweetClawPrompt
+        // Snapshot the 10 most-recent existing draft texts to discourage repeats.
+        let recentDrafts = drafts.prefix(10).map { $0.content }
+
+        await withTaskGroup(of: Void.self) { group in
+            for chunk in chunkForPosts(journal.content, limit: 3200) {
+                group.addTask { [weak self] in
+                    guard let self else { return }
+                    var message = chunk
+                    if !recentDrafts.isEmpty {
+                        let dedupe = recentDrafts.prefix(10).joined(separator: "\n---\n")
+                        message += "\n\n(Avoid repeating these posts you already wrote:)\n\(dedupe)"
+                    }
+                    // chat() honors the editable TweetClaw prompt as the system prompt.
+                    if let post = try? llm.chat(systemPrompt: prompt, message: message, model: model, temperature: 0.8) {
+                        let cleaned = post.trimmingCharacters(in: .whitespacesAndNewlines)
+                            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'`"))
+                        // Acceptance gate: 11–399 chars (matches the reference).
+                        guard cleaned.count > 10, cleaned.count < 400 else { return }
+                        let key = "draft_\(Date().timeIntervalSince1970)_\(UInt.random(in: 0..<1_000_000))"
+                        let excerpt = String(chunk.prefix(80))
+                        // Store with an excerpt marker so the card can show the source.
+                        try? self.memory.store(key: key, content: cleaned, category: "core", sessionID: "drafts")
+                        // Stash the source excerpt alongside (encoded in the key's
+                        // metadata isn't supported; keep it simple — the draft body
+                        // is the post itself, matching the reference).
+                        _ = excerpt
+                    }
+                }
+            }
+        }
+
+        processed.insert(journal.key)
+        processedJournalKeys = processed
+        await refreshJournals()
+        generateStatus = nil
+    }
+
+    /// Split long text into chunks for per-chunk post generation. Mirrors the
+    /// reference's CHUNK_CHAR_LIMIT + splitIntoChunks (paragraph boundaries).
+    private func chunkForPosts(_ text: String, limit: Int) -> [String] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > limit else { return [trimmed].filter { !$0.isEmpty } }
+        var chunks: [String] = []
+        var current = ""
+        for para in trimmed.components(separatedBy: "\n\n") {
+            if current.count + para.count > limit, !current.isEmpty {
+                chunks.append(current)
+                current = para
+            } else {
+                current += (current.isEmpty ? "" : "\n\n") + para
+            }
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
     }
 }
 
@@ -802,10 +904,21 @@ struct ReadsView: View {
     @State private var isLoading = false
     @State private var loadError: String?
 
-    private let defaultFeeds: [(url: String, name: String)] = [
-        ("https://hnrss.org/frontpage", "Hacker News"),
-        ("https://www.theverge.com/rss/index.xml", "The Verge"),
-    ]
+    /// The Reads feed catalog. Loaded once from the Zig core (114 sources,
+    /// ported 1:1 from src/gateway/feed_web_sources.rs — the same sources the
+    /// reference app reads). Falls back to HN if the catalog isn't available.
+    /// Read on the main actor only (from loadFeeds, which is @MainActor).
+    private var catalog: [SlowClawFeedSource] {
+        if let cached = ReadsView.cachedCatalog { return cached }
+        if let loaded = slowClawFeedCatalog() {
+            ReadsView.cachedCatalog = loaded
+            return loaded
+        }
+        return [SlowClawFeedSource(title: "Hacker News", domain: "news.ycombinator.com",
+                                   htmlURL: "https://news.ycombinator.com",
+                                   xmlURL: "https://hnrss.org/frontpage")]
+    }
+    fileprivate static var cachedCatalog: [SlowClawFeedSource]?
 
     var body: some View {
         Group {
@@ -894,41 +1007,51 @@ struct ReadsView: View {
         isLoading = true
         loadError = nil
 
-        // Snapshot topics on the main actor, then do all the network + FFI work
-        // off the main actor. The Zig parse/rank is synchronous and blocking, so
-        // running it on a background task keeps the UI responsive.
+        // Snapshot topics + catalog on the main actor, then do all the network
+        // + FFI work off the main actor. The Zig parse/rank is synchronous and
+        // blocking, so running it on background tasks keeps the UI responsive.
         let topics = state.interests.map { SlowClawTopic(label: $0, weight: 1.0) }
-        let feeds = defaultFeeds
+        let sources = catalog
 
         let fetched: ([RankedFeedItem], String?) = await Task.detached(priority: .userInitiated) {
+            // Fetch all catalog feeds with bounded concurrency (8 at a time) so
+            // we don't open 100+ simultaneous connections. Each feed is fetched,
+            // parsed, and ranked independently; results are merged at the end.
+            let chunks = stride(from: 0, to: sources.count, by: 8).map {
+                Array(sources[$0..<min($0 + 8, sources.count)])
+            }
             var allRanked: [RankedFeedItem] = []
-            var lastError: String?
+            var reachedAny = false
 
-            for feed in feeds {
-                guard let url = URL(string: feed.url) else { continue }
-                do {
-                    let (data, response) = try await URLSession.shared.data(from: url)
-                    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                        lastError = "Feed \(feed.name) returned an error."
-                        continue
+            for batch in chunks {
+                let results = await withTaskGroup(of: [RankedFeedItem]?.self, returning: [[RankedFeedItem]].self) { group in
+                    for src in batch {
+                        group.addTask {
+                            guard let url = URL(string: src.xmlURL) else { return nil }
+                            let xml: String
+                            do {
+                                let (data, response) = try await URLSession.shared.data(from: url)
+                                guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                                      let s = String(data: data, encoding: .utf8) else { return nil }
+                                xml = s
+                            } catch { return nil }
+                            // Parse + rank via the Zig core (returns nil on error).
+                            return slowClawParseAndRankRSS(xml: xml, sourceLabel: src.displayLabel, topics: topics)
+                        }
                     }
-                    guard let xml = String(data: data, encoding: .utf8) else {
-                        lastError = "Feed \(feed.name) was not valid UTF-8."
-                        continue
-                    }
-
-                    // Parse + rank via the Zig core — returns nil on error.
-                    if let ranked = slowClawParseAndRankRSS(xml: xml, sourceLabel: feed.name, topics: topics) {
-                        allRanked.append(contentsOf: ranked)
-                    }
-                } catch {
-                    lastError = "Couldn't reach \(feed.name)."
-                    continue
+                    var got: [[RankedFeedItem]] = []
+                    for await r in group { if let r { got.append(r) } }
+                    return got
+                }
+                for r in results {
+                    if !r.isEmpty { reachedAny = true }
+                    allRanked.append(contentsOf: r)
                 }
             }
 
             allRanked.sort { $0.score > $1.score }
-            return (Array(allRanked.prefix(50)), allRanked.isEmpty ? lastError : nil)
+            // Cap the displayed list at 60; the reference paginates +12.
+            return (Array(allRanked.prefix(60)), reachedAny ? nil : "Couldn't reach any feeds. Pull to retry.")
         }.value
 
         // Hop back to the main actor to mutate UI state.
@@ -945,37 +1068,80 @@ struct DraftsView: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
-        Group {
-            if state.drafts.isEmpty {
-                VStack(spacing: 12) {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 40))
-                        .foregroundStyle(DS.muted(scheme))
-                    Text("No drafts yet")
-                        .font(DS.cardTitleFont)
-                        .foregroundStyle(DS.ink(scheme))
-                    Text("Long-press a journal entry and tap 'Draft Post' to let AI distill it into a post.")
+        ScrollView {
+            LazyVStack(spacing: 12) {
+                // TweetClaw header + status.
+                HStack(spacing: 10) {
+                    Text("🐾")
+                        .font(.system(size: 28))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("TweetClaw")
+                            .font(DS.cardTitleFont)
+                            .foregroundStyle(DS.ink(scheme))
+                        Text("Turns your journals into posts")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                    }
+                    Spacer()
+                    Button {
+                        Task { await state.tweetClawGenerateNext() }
+                    } label: {
+                        Image(systemName: state.isGeneratingPosts ? "" : "arrow.clockwise")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(DS.accent(scheme))
+                            .frame(width: 36, height: 36)
+                            .opacity(state.isGeneratingPosts ? 0 : 1)
+                            .overlay {
+                                if state.isGeneratingPosts {
+                                    ProgressView()
+                                }
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(state.isGeneratingPosts)
+                    .accessibilityLabel("Generate a post")
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 8)
+
+                if let status = state.generateStatus {
+                    Text(status)
                         .font(DS.captionFont)
                         .foregroundStyle(DS.muted(scheme))
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 32)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 22)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 12) {
-                        ForEach(state.drafts, id: \.id) { draft in
-                            DraftCard(draft: draft, sourceJournalContent: nil)
-                        }
+
+                if state.drafts.isEmpty {
+                    // Empty hero.
+                    VStack(spacing: 10) {
+                        Image(systemName: "square.and.pencil")
+                            .font(.system(size: 36))
+                            .foregroundStyle(DS.muted(scheme))
+                        Text("Turn journals into posts")
+                            .font(DS.cardTitleFont)
+                            .foregroundStyle(DS.ink(scheme))
+                        Text("Pull down, or tap the arrow above, to let TweetClaw distill a journal entry into a post. Edit, then publish to Nostr.")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 32)
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 16)
-                    .padding(.bottom, 24)
+                    .padding(.vertical, 40)
+                } else {
+                    ForEach(state.drafts, id: \.id) { draft in
+                        DraftCard(draft: draft, sourceJournalContent: nil)
+                    }
                 }
             }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 24)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.bg(scheme))
+        .refreshable {
+            await state.tweetClawGenerateNext()
+        }
     }
 }
 
@@ -1004,6 +1170,21 @@ struct DraftCard: View {
     var body: some View {
         DS.card(scheme) {
             VStack(alignment: .leading, spacing: 10) {
+                // TweetClaw byline (🐾 avatar + handle), like the reference.
+                HStack(spacing: 8) {
+                    Text("🐾")
+                        .font(.system(size: 20))
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("TweetClaw")
+                            .font(DS.captionFont.weight(.semibold))
+                            .foregroundStyle(DS.ink(scheme))
+                        Text("@tweetclaw")
+                            .font(DS.microFont)
+                            .foregroundStyle(DS.muted(scheme))
+                    }
+                    Spacer()
+                }
+
                 // Editable text or display text
                 if isEditing {
                     TextEditor(text: $editedText)
@@ -1094,6 +1275,107 @@ struct DraftCard: View {
 
 // MARK: - Profile View
 
+/// On-Device AI card. Mirrors the reference app's "On-Device AI" card: lists
+/// the Gemma model presets, shows real status from the Zig core, and a Metal
+/// (Fast Mode) toggle. The llama.cpp backend is not linked into the build yet,
+/// so status reads "not available" — this card is the UI surface that lights
+/// up the moment the backend lands.
+struct OnDeviceAICard: View {
+    let scheme: ColorScheme
+    @EnvironmentObject var state: AppState
+    @State private var status: LocalLLMStatus = LocalLLMStatus(available: false, reason: nil)
+    @AppStorage("slowclaw.localai.metal") private var metalEnabled = true
+
+    var body: some View {
+        DS.card(scheme) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("On-Device AI")
+                            .font(DS.cardTitleFont)
+                            .foregroundStyle(DS.ink(scheme))
+                        Text("Private model on your iPhone. No data leaves your device.")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                    }
+                    Spacer()
+                    // Availability dot.
+                    Circle()
+                        .fill(status.available ? DS.accent(scheme) : DS.muted(scheme))
+                        .frame(width: 10, height: 10)
+                }
+
+                // Status line.
+                if !status.available {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 12))
+                        Text(status.reason ?? "Not available.")
+                            .font(DS.microFont)
+                    }
+                    .foregroundStyle(DS.muted(scheme))
+                } else {
+                    Text("Ready")
+                        .font(DS.microFont)
+                        .foregroundStyle(DS.accent(scheme))
+                }
+
+                // Model presets.
+                ForEach(LocalModelPreset.presets) { model in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(model.title)
+                            .font(DS.bodyFont.weight(.semibold))
+                            .foregroundStyle(DS.ink(scheme))
+                        Text(model.detail)
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DS.rMd, style: .continuous)
+                            .stroke(DS.line(scheme), lineWidth: 1)
+                    )
+                }
+
+                // Metal (Fast Mode) toggle — persists, applied when backend lands.
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Fast Mode")
+                            .font(DS.bodyFont.weight(.medium))
+                            .foregroundStyle(DS.ink(scheme))
+                        Text("Use the Metal GPU")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                    }
+                    Spacer()
+                    Toggle("", isOn: $metalEnabled)
+                        .labelsHidden()
+                        .tint(DS.accentColor)
+                        .disabled(!status.available)
+                }
+
+                Button {
+                    refreshStatus()
+                } label: {
+                    Label("Refresh status", systemImage: "arrow.clockwise")
+                        .font(DS.captionFont.weight(.medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                }
+                .buttonStyle(.bordered)
+                .tint(DS.accentColor)
+            }
+        }
+        .onAppear(perform: refreshStatus)
+    }
+
+    private func refreshStatus() {
+        status = slowClawLocalLLMStatus()
+    }
+}
+
 struct ProfileView: View {
     @Environment(\.colorScheme) var scheme
     @EnvironmentObject var state: AppState
@@ -1105,6 +1387,10 @@ struct ProfileView: View {
         ScrollView {
             VStack(spacing: 12) {
                 // LLM Configuration
+                // On-Device AI (llama.cpp). Shows honest status from the Zig
+                // core: not available until the llama.cpp backend is linked.
+                OnDeviceAICard(scheme: scheme)
+
                 DS.card(scheme) {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("LLM Configuration")
@@ -1149,6 +1435,28 @@ struct ProfileView: View {
                                 .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
                                 .onChange(of: baseURLInput) { state.baseURL = baseURLInput }
                         }
+                    }
+                }
+
+                // TweetClaw prompt (editable; persists to UserDefaults).
+                DS.card(scheme) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 8) {
+                            Text("🐾")
+                                .font(.system(size: 18))
+                            Text("TweetClaw")
+                                .font(DS.cardTitleFont)
+                                .foregroundStyle(DS.ink(scheme))
+                        }
+                        Text("The system prompt used when turning a journal entry into a post. Pull the Drafts tab to generate.")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                        TextEditor(text: $state.tweetClawPrompt)
+                            .font(DS.captionFont)
+                            .frame(minHeight: 90)
+                            .scrollContentBackground(.hidden)
+                            .padding(8)
+                            .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
                     }
                 }
 

@@ -247,6 +247,33 @@ int32_t slowclaw_feed_parse_and_rank(
     SlowclawRankResult *out_result
 );
 
+/// Return the default Reads feed catalog as a JSON array of
+/// {"title","domain","htmlUrl","xmlUrl"} objects in `out_str`. The bytes are
+/// allocator-owned; free via slowclaw_feed_free. Returns 0 on success.
+int32_t slowclaw_feed_catalog_json(SlowclawString *out_str);
+
+// ── On-device LLM (llama.cpp) ─────────────────────────────────────────────
+// Status / load / unload / chat. The backend (llama.a) is not linked into this
+// build yet; status reports available:false until it is. Shape is stable.
+
+/// On-device LLM status as JSON {"available","reason"}. Bytes freed via slowclaw_feed_free.
+int32_t slowclaw_feed_local_llm_status(SlowclawString *out_str);
+
+/// Load a GGUF model. Returns 0 on success, negative on error.
+int32_t slowclaw_feed_local_llm_load(const uint8_t *model_path, size_t model_path_len);
+
+/// Unload the current model (no-op until the backend is linked).
+void slowclaw_feed_local_llm_unload(void);
+
+/// Chat completion on the loaded model. `system_prompt` is optional (NULL/0).
+int32_t slowclaw_feed_local_llm_chat(
+    const uint8_t *system_prompt, size_t system_prompt_len, // optional
+    const uint8_t *message, size_t message_len,
+    uint32_t max_tokens,
+    double temperature,
+    SlowclawChatResult *out_result
+);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

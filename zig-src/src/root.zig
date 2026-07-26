@@ -35,6 +35,7 @@ pub const interest_profile = @import("interest_profile.zig");
 pub const saved_items = @import("saved_items.zig");
 pub const rss_parser = @import("rss_parser.zig");
 pub const local_inference = @import("local_inference.zig");
+pub const feed_catalog = @import("feed_catalog.zig");
 
 // Force-retain every `export fn` in ffi.zig. Zig 0.16 uses lazy compilation:
 // `@import("ffi.zig")` alone does NOT make its export functions reachable,
@@ -70,6 +71,11 @@ comptime {
     _ = &ffi.slowclaw_feed_draft_post;
     _ = &ffi.slowclaw_feed_chat_result_free;
     _ = &ffi.slowclaw_feed_parse_and_rank;
+    _ = &ffi.slowclaw_feed_catalog_json;
+    _ = &ffi.slowclaw_feed_local_llm_status;
+    _ = &ffi.slowclaw_feed_local_llm_load;
+    _ = &ffi.slowclaw_feed_local_llm_unload;
+    _ = &ffi.slowclaw_feed_local_llm_chat;
 }
 
 test {
@@ -87,6 +93,7 @@ test {
     _ = chunker;
     _ = embeddings;
     _ = ffi;
+    _ = feed_catalog;
 
     // Sanity: std is reachable.
     try std.testing.expect(std.mem.eql(u8, "ok", "ok"));

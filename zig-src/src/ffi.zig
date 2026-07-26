@@ -39,6 +39,7 @@ const openai_provider_mod = @import("openai_provider.zig");
 const journal_agent = @import("journal_agent.zig");
 const rss_parser = @import("rss_parser.zig");
 const feeds_ranking = @import("feeds_ranking.zig");
+const feed_catalog = @import("feed_catalog.zig");
 
 /// C allocator — pairs with `free` on the Swift side. Using this ensures Zig
 /// and Swift agree on the heap.
@@ -812,6 +813,108 @@ pub export fn slowclaw_feed_parse_and_rank(
     };
     out_result.* = .{ .items_json = SlowclawString.fromOwnedSlice(json), .status = SLOWCLAW_OK };
     return SLOWCLAW_OK;
+}
+
+/// Return the default Reads feed catalog as a JSON array of
+/// {"title","domain","htmlUrl","xmlUrl"} objects. The bytes are
+/// c_allocator-owned; the caller frees via slowclaw_feed_free.
+///
+/// Mirrors src/gateway/feed_web_sources.rs (DEFAULT_FEED_WEB_SOURCES) so the
+/// iOS app reads the same sources as the reference app. Swift fetches each
+/// xml_url client-side and parses+ranks via slowclaw_feed_parse_and_rank.
+pub export fn slowclaw_feed_catalog_json(out_str: *SlowclawString) c_int {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(c_allocator);
+    buf.append(c_allocator, '[') catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    for (feed_catalog.DEFAULT_FEED_SOURCES, 0..) |src, i| {
+        if (i > 0) buf.append(c_allocator, ',') catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+        buf.appendSlice(c_allocator, "{\"title\":") catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+        writeJsonString(c_allocator, &buf, src.title) catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+        buf.appendSlice(c_allocator, ",\"domain\":") catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+        writeJsonString(c_allocator, &buf, src.domain) catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+        buf.appendSlice(c_allocator, ",\"htmlUrl\":") catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+        writeJsonString(c_allocator, &buf, src.html_url) catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+        buf.appendSlice(c_allocator, ",\"xmlUrl\":") catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+        writeJsonString(c_allocator, &buf, src.xml_url) catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+        buf.append(c_allocator, '}') catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    }
+    buf.append(c_allocator, ']') catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    const json = buf.toOwnedSlice(c_allocator) catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    out_str.* = SlowclawString.fromOwnedSlice(json);
+    return SLOWCLAW_OK;
+}
+
+test "ffi: catalog_json returns all default sources as valid JSON" {
+    var out: SlowclawString = SlowclawString.empty();
+    const status = slowclaw_feed_catalog_json(&out);
+    try testing.expectEqual(SLOWCLAW_OK, status);
+    defer if (out.bytes) |b| c_allocator.free(b[0..out.len]);
+
+    const json_bytes = out.bytes orelse return error.NullJson;
+    const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json_bytes[0..out.len], .{}) catch return error.JsonInvalid;
+    defer parsed.deinit();
+    try testing.expectEqual(std.meta.Tag(std.json.Value).array, std.meta.activeTag(parsed.value));
+    // Same count as the Rust catalog (DEFAULT_FEED_WEB_SOURCES, 1:1 port).
+    try testing.expectEqual(@as(usize, 114), parsed.value.array.items.len);
+    // First entry must be simonwillison.net.
+    const first = parsed.value.array.items[0];
+    try testing.expectEqualStrings("simonwillison.net", first.object.get("domain").?.string);
+}
+
+// ── On-device LLM (llama.cpp) ─────────────────────────────────────────────
+//
+// local_inference.zig declares the llama.cpp bindings but the actual `llama.a`
+// is NOT linked into this build yet (it's a separate, macOS-only cross-compile
+// step with Metal). Until that lands, these FFI entry points report
+// `available: false` so the Swift UI can show an honest "not available"
+// status instead of pretending. The instant llama.cpp is linked, the stub
+// bodies below are the only thing that changes — the FFI shape stays.
+
+/// Return on-device LLM status as JSON: {"available","reason"}.
+/// `available` is false until llama.cpp is linked. Bytes are c_allocator-owned;
+/// caller frees via slowclaw_feed_free.
+pub export fn slowclaw_feed_local_llm_status(out_str: *SlowclawString) c_int {
+    const json = c_allocator.dupe(u8, "{\"available\":false,\"reason\":\"llama.cpp backend not linked yet\"}") catch {
+        out_str.* = SlowclawString.empty();
+        return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    };
+    out_str.* = SlowclawString.fromOwnedSlice(json);
+    return SLOWCLAW_OK;
+}
+
+/// Load a GGUF model. Returns SLOWCLAW_ERR_INTERNAL until llama.cpp is linked.
+pub export fn slowclaw_feed_local_llm_load(
+    model_path: [*]const u8,
+    model_path_len: usize,
+) c_int {
+    _ = model_path;
+    _ = model_path_len;
+    return SLOWCLAW_ERR_INTERNAL;
+}
+
+/// Unload the current model. No-op until llama.cpp is linked.
+pub export fn slowclaw_feed_local_llm_unload() void {}
+
+/// Run a chat completion on the loaded model. Returns an error result until
+/// llama.cpp is linked. (Shape mirrors slowclaw_feed_provider_chat so the Swift
+/// overlay can switch to it once available.)
+pub export fn slowclaw_feed_local_llm_chat(
+    system_prompt: ?[*]const u8,
+    system_prompt_len: usize,
+    message: [*]const u8,
+    message_len: usize,
+    max_tokens: u32,
+    temperature: f64,
+    out_result: *SlowclawChatResult,
+) c_int {
+    _ = system_prompt;
+    _ = system_prompt_len;
+    _ = message;
+    _ = message_len;
+    _ = max_tokens;
+    _ = temperature;
+    out_result.* = .{ .text = SlowclawString.empty(), .status = SLOWCLAW_ERR_INTERNAL };
+    return SLOWCLAW_ERR_INTERNAL;
 }
 
 /// Parse a JSON array of {"label":"...","weight":N} into Topic structs.
