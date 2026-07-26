@@ -78,7 +78,7 @@ struct SlowClawApp: App {
         WindowGroup {
             MainTabView()
                 .environmentObject(appState)
-                .tint(DS.accent(scheme))
+                .tint(DS.accentColor)
         }
     }
 }
