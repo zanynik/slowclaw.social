@@ -217,14 +217,21 @@ pub fn freeRssItems(allocator: std.mem.Allocator, items: []RssItem) void {
 }
 
 /// Convert RssItems to FeedItems (for the feeds_ranking module). The caller
-/// provides the current epoch for timestamp calculation. Returns an
-/// allocator-owned slice. The RssItem strings are NOT duped — the returned
-/// FeedItems alias the RssItem strings, so don't free the RssItems until done.
+/// provides the current epoch for timestamp calculation. Returns a slice owned
+/// by `allocator` — free it with the SAME allocator (the FFI layer frees with
+/// `c_allocator`). The RssItem strings are NOT duped — the returned FeedItems
+/// alias the RssItem strings, so don't free the RssItems until done.
+///
+/// IMPORTANT: previously this used `std.heap.page_allocator` unconditionally,
+/// while the FFI freed the result with `c_allocator` — a mismatch that aborted
+/// the iOS app (malloc invalid-free → SIGABRT) on every Reads load. The
+/// allocator is now caller-supplied so allocation and free always match.
 pub fn toFeedItems(
+    allocator: std.mem.Allocator,
     items: []const RssItem,
     source_label: []const u8,
 ) []feeds_ranking.FeedItem {
-    var feed_items = std.heap.page_allocator.alloc(feeds_ranking.FeedItem, items.len) catch return &.{};
+    var feed_items = allocator.alloc(feeds_ranking.FeedItem, items.len) catch return &.{};
     for (items, 0..) |item, i| {
         feed_items[i] = .{
             .id = if (item.guid.len > 0) item.guid else item.link,
@@ -360,11 +367,12 @@ test "parseFeed: missing fields return empty strings" {
 }
 
 test "toFeedItems: converts RssItems to FeedItems for ranking" {
+    const a = testing.allocator;
     const items = [_]RssItem{
         .{ .title = "Test", .link = "https://example.com", .description = "Body", .pub_date = "", .author = "author", .guid = "guid1" },
     };
-    const feed_items = toFeedItems(&items, "test-source");
-    defer std.heap.page_allocator.free(feed_items);
+    const feed_items = toFeedItems(a, &items, "test-source");
+    defer a.free(feed_items);
     try testing.expectEqual(@as(usize, 1), feed_items.len);
     try testing.expectEqualStrings("Test", feed_items[0].title);
     try testing.expectEqualStrings("Body", feed_items[0].body);

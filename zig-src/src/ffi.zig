@@ -784,8 +784,10 @@ pub export fn slowclaw_feed_parse_and_rank(
     };
     defer rss_parser.freeRssItems(c_allocator, items);
 
-    // Convert to FeedItems for ranking.
-    const feed_items = rss_parser.toFeedItems(items, src_slice);
+    // Convert to FeedItems for ranking. Allocated with c_allocator so the
+    // defer below frees with the matching allocator (a mismatch here —
+    // page_allocator alloc + c_allocator free — was the iOS Reads SIGABRT).
+    const feed_items = rss_parser.toFeedItems(c_allocator, items, src_slice);
     defer c_allocator.free(feed_items);
 
     // Parse the topics JSON if provided.
@@ -1227,3 +1229,37 @@ test "ffi: sqlite recall returns JSON array via C ABI" {
     try testing.expectEqual(Tag.array, std.meta.activeTag(parsed.value));
     try testing.expect(parsed.value.array.items.len >= 1);
 }
+
+test "ffi: parse_and_rank frees feed_items with the matching allocator (regression for iOS Reads SIGABRT)" {
+    // Real-world RSS shape: many items, some with empty guid/link (HN-style).
+    // The original bug: rss_parser.toFeedItems allocated with page_allocator
+    // but this function freed with c_allocator → invalid free → the iOS app
+    // aborted (malloc heap-corruption SIGABRT) every time Reads loaded.
+    // This test runs the full parse→rank→serialize→free cycle through the FFI
+    // (which uses c_allocator internally) many times; a mismatch would abort.
+    const xml =
+        \\<?xml version="1.0"?>
+        \\<rss version="2.0"><channel>
+        \\<title>Hacker News</title><link>https://news.ycombinator.com/</link>
+        \\<description>HN</description>
+        \\<item><title>Rust is memory safe</title><link>https://example.com/a</link><description>A post about rust</description><guid>a</guid><pubDate>Mon, 15 Jan 2024 10:30:00 GMT</pubDate></item>
+        \\<item><title>AI news</title><link>https://example.com/b</link><description>LLM updates</description><guid>b</guid><pubDate>Mon, 15 Jan 2024 11:30:00 GMT</pubDate></item>
+        \\<item><title>No guid item</title><link>https://example.com/c</link><description>Empty guid</description><pubDate></pubDate></item>
+        \\<item><title>Empty link too</title><link></link><description>Edge case</description><pubDate></pubDate></item>
+        \\</channel></rss>
+    ;
+    const src = "Hacker News";
+    const now: f64 = 1_700_000_000.0;
+
+    var i: usize = 0;
+    while (i < 25) : (i += 1) {
+        var result: SlowclawRankResult = .{ .items_json = SlowclawString.empty(), .status = 0 };
+        const status = slowclaw_feed_parse_and_rank(
+            xml.ptr, xml.len, src.ptr, src.len, null, 0, now, &result,
+        );
+        try testing.expectEqual(SLOWCLAW_OK, status);
+        try testing.expectEqual(@as(c_int, SLOWCLAW_OK), result.status);
+        slowclaw_feed_rank_result_free(&result);
+    }
+}
+
