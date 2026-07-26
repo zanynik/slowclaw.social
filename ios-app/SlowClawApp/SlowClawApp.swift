@@ -15,25 +15,45 @@
 
 import SwiftUI
 
-// MARK: - Design System (from the original app's styles.css)
+// MARK: - Design System (from the original app's styles.css, with dark mode)
 
 enum DS {
-    // Light mode
-    static let bg = Color(red: 0.98, green: 0.98, blue: 0.976)      // #fafaf9
-    static let surface = Color.white
-    static let surface2 = Color(red: 0.969, green: 0.969, blue: 0.961) // #f7f7f5
-    static let ink = Color(red: 0.11, green: 0.11, blue: 0.102)     // #1c1c1a
-    static let ink2 = Color(red: 0.267, green: 0.267, blue: 0.243)  // #44443e
-    static let muted = Color(red: 0.549, green: 0.549, blue: 0.518) // #8c8c84
-    static let line = Color(red: 0.91, green: 0.91, blue: 0.894)    // #e8e8e4
+    // Light mode colors
+    private static let bg_l = Color(red: 0.98, green: 0.98, blue: 0.976)      // #fafaf9
+    private static let surface_l = Color.white
+    private static let surface2_l = Color(red: 0.969, green: 0.969, blue: 0.961) // #f7f7f5
+    private static let ink_l = Color(red: 0.11, green: 0.11, blue: 0.102)     // #1c1c1a
+    private static let ink2_l = Color(red: 0.267, green: 0.267, blue: 0.243)  // #44443e
+    private static let muted_l = Color(red: 0.549, green: 0.549, blue: 0.518) // #8c8c84
+    private static let line_l = Color(red: 0.91, green: 0.91, blue: 0.894)    // #e8e8e4
 
-    // Accent (the original brand green)
-    static let accent = Color(red: 0.086, green: 0.639, blue: 0.498) // #16a37f
-    static let accentDim = Color(red: 0.086, green: 0.639, blue: 0.498, opacity: 0.12)
-    static let accent2 = Color(red: 0.91, green: 0.365, blue: 0.29) // #e85d4a
+    // Dark mode colors (matching the original app's dark theme)
+    private static let bg_d = Color(red: 0.094, green: 0.094, blue: 0.106)    // #18181b
+    private static let surface_d = Color(red: 0.122, green: 0.122, blue: 0.133) // #1f1f22
+    private static let surface2_d = Color(red: 0.149, green: 0.149, blue: 0.165) // #262629
+    private static let ink_d = Color(red: 0.957, green: 0.957, blue: 0.965)   // #f4f4f7
+    private static let ink2_d = Color(red: 0.788, green: 0.788, blue: 0.808)  // #c9c9cf
+    private static let muted_d = Color(red: 0.557, green: 0.557, blue: 0.588) // #8e8e96
+    private static let line_d = Color(red: 0.196, green: 0.196, blue: 0.220)  // #323338
 
-    // Shadows
-    static let shadowSm = AnyShapeStyle(Color.black.opacity(0.04))
+    // Accent (same in both modes)
+    private static let _accent = Color(red: 0.086, green: 0.639, blue: 0.498) // #16a37f
+    private static let _accent2 = Color(red: 0.91, green: 0.365, blue: 0.29)  // #e85d4a
+
+    // Dynamic colors that adapt to light/dark
+    static func bg(_ scheme: ColorScheme) -> Color { scheme == .dark ? bg_d : bg_l }
+    static func surface(_ scheme: ColorScheme) -> Color { scheme == .dark ? surface_d : surface_l }
+    static func surface2(_ scheme: ColorScheme) -> Color { scheme == .dark ? surface2_d : surface2_l }
+    static func ink(_ scheme: ColorScheme) -> Color { scheme == .dark ? ink_d : ink_l }
+    static func ink2(_ scheme: ColorScheme) -> Color { scheme == .dark ? ink2_d : ink2_l }
+    static func muted(_ scheme: ColorScheme) -> Color { scheme == .dark ? muted_d : muted_l }
+    static func line(_ scheme: ColorScheme) -> Color { scheme == .dark ? line_d : line_l }
+    static func accent(_ scheme: ColorScheme) -> Color { _accent }
+    static func accentDim(_ scheme: ColorScheme) -> Color { _accent.opacity(0.15) }
+
+    // Static accent for tinting (tab bars, buttons)
+    static let accentColor = _accent
+    static let accent2Color = _accent2
 
     // Radii
     static let rSm: CGFloat = 8
@@ -58,7 +78,7 @@ struct SlowClawApp: App {
         WindowGroup {
             MainTabView()
                 .environmentObject(appState)
-                .tint(DS.accent)
+                .tint(DS.accent(scheme))
         }
     }
 }
@@ -186,6 +206,7 @@ enum AppTab: String, CaseIterable {
 
 struct MainTabView: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.colorScheme) var scheme
 
     var body: some View {
         TabView(selection: $state.selectedTab) {
@@ -205,12 +226,14 @@ struct MainTabView: View {
                 .tabItem { Label(AppTab.profile.label, systemImage: AppTab.profile.icon) }
                 .tag(AppTab.profile)
         }
+        .tint(DS.accentColor)
     }
 }
 
 // MARK: - Journal View (Capture loop)
 
 struct JournalView: View {
+    @Environment(\.colorScheme) var scheme
     @EnvironmentObject var state: AppState
     @State private var newEntry = ""
     @State private var isSynthesizing = false
@@ -223,7 +246,7 @@ struct JournalView: View {
                     AudioCaptureView()
                         .padding(.horizontal)
 
-                    DS.card {
+                    DS.card(scheme) {
                         TextEditor(text: $newEntry)
                             .frame(minHeight: 100)
                             .scrollContentBackground(.hidden)
@@ -231,7 +254,7 @@ struct JournalView: View {
                             .overlay(alignment: .topLeading) {
                                 if newEntry.isEmpty {
                                     Text("What's on your mind?")
-                                        .foregroundStyle(DS.muted)
+                                        .foregroundStyle(DS.muted(scheme))
                                         .padding(.horizontal, 16)
                                         .padding(.vertical, 20)
                                         .allowsHitTesting(false)
@@ -249,7 +272,7 @@ struct JournalView: View {
                                 .padding(.vertical, 6)
                         }
                         .buttonStyle(.borderedProminent)
-                        .tint(DS.accent)
+                        .tint(DS.accent(scheme))
                         .disabled(newEntry.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                         if state.llm != nil {
@@ -261,7 +284,7 @@ struct JournalView: View {
                                     .padding(.vertical, 6)
                             }
                             .buttonStyle(.bordered)
-                            .tint(DS.accent)
+                            .tint(DS.accent(scheme))
                             .disabled(newEntry.isEmpty || isSynthesizing)
                         }
                     }
@@ -294,7 +317,7 @@ struct JournalView: View {
                 }
                 .padding(.vertical)
             }
-            .background(DS.bg)
+            .background(DS.bg(scheme))
             .navigationTitle("Journal")
             .navigationBarTitleDisplayMode(.large)
             .task { await state.refreshJournals() }
@@ -325,6 +348,7 @@ struct JournalView: View {
 // MARK: - Reads View (Feed loop) — crash-safe
 
 struct ReadsView: View {
+    @Environment(\.colorScheme) var scheme
     @EnvironmentObject var state: AppState
     @State private var feedItems: [RankedFeedItem] = []
     @State private var isLoading = false
@@ -343,7 +367,7 @@ struct ReadsView: View {
                         ProgressView()
                         Text("Fetching feeds…")
                             .font(DS.captionFont)
-                            .foregroundStyle(DS.muted)
+                            .foregroundStyle(DS.muted(scheme))
                     }
                 } else if feedItems.isEmpty {
                     ContentUnavailableView(
@@ -362,7 +386,7 @@ struct ReadsView: View {
                     }
                 }
             }
-            .background(DS.bg)
+            .background(DS.bg(scheme))
             .navigationTitle("Reads")
             .navigationBarTitleDisplayMode(.large)
             .refreshable { await loadFeeds() }
@@ -401,9 +425,10 @@ struct ReadsView: View {
     }
 }
 
-// MARK: - Drafts View (Share loop)
+// MARK: - Drafts View (Share loop) — TweetClaw-style inline editing
 
 struct DraftsView: View {
+    @Environment(\.colorScheme) var scheme
     @EnvironmentObject var state: AppState
 
     var body: some View {
@@ -413,41 +438,135 @@ struct DraftsView: View {
                     ContentUnavailableView(
                         "No drafts yet",
                         systemImage: "square.and.pencil",
-                        description: Text("Long-press a journal entry and tap 'Draft Post' to let AI distill it into a shareable post.")
+                        description: Text("Long-press a journal entry and tap 'Draft Post' to let AI distill it into a post.")
                     )
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 12) {
                             ForEach(state.drafts, id: \.id) { draft in
-                                DS.card {
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        Text(draft.content)
-                                            .font(DS.bodyFont)
-                                        HStack {
-                                            Text("Draft")
-                                                .font(DS.microFont)
-                                                .foregroundStyle(DS.muted)
-                                            Spacer()
-                                        }
-                                    }
-                                }
-                                .contextMenu {
-                                    Button(role: .destructive) {
-                                        try? state.memory.forget(key: draft.key)
-                                        Task { await state.refreshJournals() }
-                                    } label: {
-                                        Label("Delete", systemImage: "trash")
-                                    }
-                                }
+                                DraftCard(draft: draft, sourceJournalContent: nil)
                             }
                         }
                         .padding()
                     }
                 }
             }
-            .background(DS.bg)
+            .background(DS.bg(scheme))
             .navigationTitle("Drafts")
             .navigationBarTitleDisplayMode(.large)
+        }
+    }
+}
+
+/// TweetClaw-style draft card with inline editing, regenerate, and character count.
+/// Mirrors the original app's inline draft editor pattern.
+struct DraftCard: View {
+    @Environment(\.colorScheme) var scheme
+    @EnvironmentObject var state: AppState
+    let draft: SlowClawMemoryEntry
+    let sourceJournalContent: String? // the journal this was drafted from (for regenerate)
+
+    @State private var editedText = ""
+    @State private var isEditing = false
+    @State private var isRegenerating = false
+    @State private var showCopyAlert = false
+
+    private let maxChars = 300
+
+    var charCount: Int { editedText.count }
+    var charCountColor: Color {
+        if charCount > maxChars { return .red }
+        if charCount > maxChars - 50 { return .orange }
+        return DS.muted(scheme)
+    }
+
+    var body: some View {
+        DS.card(scheme) {
+            VStack(alignment: .leading, spacing: 10) {
+                // Editable text or display text
+                if isEditing {
+                    TextEditor(text: $editedText)
+                        .font(DS.bodyFont)
+                        .frame(minHeight: 80)
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: 8))
+                } else {
+                    Text(editedText.isEmpty ? draft.content : editedText)
+                        .font(DS.bodyFont)
+                        .foregroundStyle(DS.ink(scheme))
+                }
+
+                // Toolbar
+                HStack(spacing: 8) {
+                    // Character count
+                    Text("\(charCount)/\(maxChars)")
+                        .font(DS.microFont.monospacedDigit())
+                        .foregroundStyle(charCountColor)
+
+                    Spacer()
+
+                    // Edit / Done toggle
+                    Button {
+                        if isEditing { editedText = editedText.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        isEditing.toggle()
+                    } label: {
+                        Image(systemName: isEditing ? "checkmark.circle.fill" : "pencil")
+                            .font(.system(size: 16))
+                            .foregroundStyle(DS.accent(scheme))
+                    }
+
+                    // Regenerate (if we have the source journal)
+                    if sourceJournalContent != nil && state.llm != nil {
+                        Button {
+                            Task { await regenerate() }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 16))
+                                .foregroundStyle(DS.accent(scheme))
+                        }
+                        .disabled(isRegenerating)
+                    }
+
+                    // Copy
+                    Button {
+                        UIPasteboard.general.string = editedText.isEmpty ? draft.content : editedText
+                        showCopyAlert = true
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 16))
+                            .foregroundStyle(DS.muted(scheme))
+                    }
+
+                    // Delete
+                    Button(role: .destructive) {
+                        try? state.memory.forget(key: draft.key)
+                        Task { await state.refreshJournals() }
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 16))
+                            .foregroundStyle(DS.accent2Color)
+                    }
+                }
+            }
+        }
+        .alert("Copied", isPresented: $showCopyAlert) {
+            Button("OK", role: .cancel) {}
+        }
+        .onAppear {
+            if editedText.isEmpty { editedText = draft.content }
+        }
+    }
+
+    private func regenerate() async {
+        guard let llm = state.llm, let source = sourceJournalContent else { return }
+        isRegenerating = true
+        defer { isRegenerating = false }
+        let model = state.model
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let newDraft = try? llm.draftPost(journalText: source, model: model) {
+                DispatchQueue.main.async { editedText = newDraft }
+            }
         }
     }
 }
@@ -455,6 +574,7 @@ struct DraftsView: View {
 // MARK: - Profile View
 
 struct ProfileView: View {
+    @Environment(\.colorScheme) var scheme
     @EnvironmentObject var state: AppState
     @State private var apiKeyInput = ""
     @State private var modelInput = "gpt-4o-mini"
@@ -476,7 +596,7 @@ struct ProfileView: View {
                     if state.interests.isEmpty {
                         Text("Write journal entries to mine them for interests.")
                             .font(DS.captionFont)
-                            .foregroundStyle(DS.muted)
+                            .foregroundStyle(DS.muted(scheme))
                     } else {
                         ForEach(state.interests, id: \.self) { interest in
                             Text(interest)
@@ -509,26 +629,27 @@ struct ProfileView: View {
 // MARK: - Shared UI Components (matching the original app's design)
 
 extension DS {
-    /// A card container with the original app's surface styling.
-    static func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    /// A card container with the original app's surface styling (dark-mode aware).
+    static func card<Content: View>(_ scheme: ColorScheme, @ViewBuilder content: () -> Content) -> some View {
         content()
             .padding(16)
-            .background(surface)
+            .background(surface(scheme))
             .clipShape(RoundedRectangle(cornerRadius: rMd, style: .continuous))
-            .shadow(color: Color.black.opacity(0.04), radius: 6, y: 1)
+            .shadow(color: Color.black.opacity(scheme == .dark ? 0.3 : 0.04), radius: 6, y: 1)
     }
 }
 
 /// Journal entry card.
 struct JournalCard: View {
+    @Environment(\.colorScheme) var scheme
     let entry: SlowClawMemoryEntry
 
     var body: some View {
-        DS.card {
+        DS.card(scheme) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(entry.content)
                     .font(DS.bodyFont)
-                    .foregroundStyle(DS.ink)
+                    .foregroundStyle(DS.ink(scheme))
                     .lineLimit(4)
 
                 if let score = entry.score, score > 0 {
@@ -536,8 +657,8 @@ struct JournalCard: View {
                         Text(String(format: "%.0f%%", score * 100))
                             .font(DS.microFont.monospacedDigit())
                             .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(DS.accentDim, in: Capsule())
-                            .foregroundStyle(DS.accent)
+                            .background(DS.accentDim(scheme), in: Capsule())
+                            .foregroundStyle(DS.accent(scheme))
                     }
                 }
             }
@@ -547,6 +668,7 @@ struct JournalCard: View {
 
 /// Interest chips row (horizontal scroll, tap to cycle boost/mute).
 struct InterestChipsRow: View {
+    @Environment(\.colorScheme) var scheme
     let interests: [String]
 
     var body: some View {
@@ -556,8 +678,8 @@ struct InterestChipsRow: View {
                     Text(interest)
                         .font(DS.captionFont.weight(.medium))
                         .padding(.horizontal, 10).padding(.vertical, 5)
-                        .background(DS.accentDim, in: Capsule())
-                        .foregroundStyle(DS.accent)
+                        .background(DS.accentDim(scheme), in: Capsule())
+                        .foregroundStyle(DS.accent(scheme))
                 }
             }
         }
@@ -567,6 +689,7 @@ struct InterestChipsRow: View {
 
 /// Ranked feed card matching the original app's feed card aesthetic.
 struct FeedCard: View {
+    @Environment(\.colorScheme) var scheme
     let item: RankedFeedItem
     let interests: [String]
 
@@ -577,19 +700,19 @@ struct FeedCard: View {
     }
 
     var body: some View {
-        DS.card {
+        DS.card(scheme) {
             VStack(alignment: .leading, spacing: 10) {
                 // Title
                 Text(item.title)
                     .font(DS.headlineFont)
-                    .foregroundStyle(DS.ink)
+                    .foregroundStyle(DS.ink(scheme))
                     .lineLimit(3)
 
                 // Description
                 if !item.description.isEmpty {
                     Text(item.description.strippingHTML())
                         .font(DS.captionFont)
-                        .foregroundStyle(DS.ink2)
+                        .foregroundStyle(DS.ink2(scheme))
                         .lineLimit(2)
                 }
 
@@ -600,8 +723,8 @@ struct FeedCard: View {
                             Text(interest)
                                 .font(DS.microFont.weight(.semibold))
                                 .padding(.horizontal, 6).padding(.vertical, 2)
-                                .background(DS.accentDim, in: Capsule())
-                                .foregroundStyle(DS.accent)
+                                .background(DS.accentDim(scheme), in: Capsule())
+                                .foregroundStyle(DS.accent(scheme))
                         }
                     }
                 }
@@ -610,11 +733,11 @@ struct FeedCard: View {
                 HStack(spacing: 12) {
                     Label(item.sourceLabel, systemImage: "globe")
                         .font(DS.microFont)
-                        .foregroundStyle(DS.muted)
+                        .foregroundStyle(DS.muted(scheme))
 
                     Label("\(item.readMinutes) min", systemImage: "book")
                         .font(DS.microFont)
-                        .foregroundStyle(DS.muted)
+                        .foregroundStyle(DS.muted(scheme))
 
                     Spacer()
 
@@ -629,9 +752,9 @@ struct FeedCard: View {
     }
 
     private var scoreColor: Color {
-        if item.score > 1.5 { return DS.accent }
+        if item.score > 1.5 { return DS.accent(scheme) }
         if item.score > 1.0 { return Color.blue }
-        return DS.muted
+        return DS.muted(scheme)
     }
 }
 
