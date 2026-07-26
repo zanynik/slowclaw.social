@@ -252,7 +252,15 @@ private struct MemoryEntryDTO: Decodable {
 // MARK: - RSS Feed Parsing + Ranking
 
 /// A ranked feed item returned by the Zig core.
-public struct RankedFeedItem: Identifiable, Decodable {
+///
+/// `id` is a Swift-synthesized stable identifier — NOT the raw `link`. The Zig
+/// core sets `FeedItem.id = guid ?? link` (`rss_parser.zig`), and real-world RSS
+/// (HN, The Verge) routinely yields items with empty or duplicate links/guids.
+/// SwiftUI's `ForEach` traps fatally on duplicate/empty `Identifiable` ids, so
+/// `id` here is synthesized to be unique and never empty (see
+/// `RankedFeedItemDTO.toRanked`). This is what makes the Reads list crash-safe.
+public struct RankedFeedItem: Identifiable {
+    public let id: String
     public let title: String
     public let link: String
     public let description: String
@@ -260,10 +268,60 @@ public struct RankedFeedItem: Identifiable, Decodable {
     public let score: Double
     public let readMinutes: Int
 
-    public var id: String { link }
+    public init(id: String, title: String, link: String, description: String,
+                sourceLabel: String, score: Double, readMinutes: Int) {
+        self.id = id
+        self.title = title
+        self.link = link
+        self.description = description
+        self.sourceLabel = sourceLabel
+        self.score = score
+        self.readMinutes = readMinutes
+    }
+}
+
+/// Decodable mirror of the JSON `serializeRankedFeed` (ffi.zig) emits. The Zig
+/// JSON never contains a guaranteed-unique id (it uses `link`), so we decode into
+/// this DTO and then synthesize a crash-safe `RankedFeedItem.id`.
+private struct RankedFeedItemDTO: Decodable {
+    let title: String
+    let link: String
+    let description: String
+    let sourceLabel: String
+    let score: Double
+    let readMinutes: Int
 
     enum CodingKeys: String, CodingKey {
         case title, link, description, sourceLabel, score, readMinutes
+    }
+
+    /// Build a crash-safe `RankedFeedItem`. Prefers `link` for identity; falls
+    /// back to a stable hash of title+description+source when link is empty, and
+    /// disambiguates collisions with the item's index in the batch.
+    func toRanked(index: Int) -> RankedFeedItem {
+        let trimmedLink = link.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeId: String
+        if !trimmedLink.isEmpty {
+            // Still append the index to guarantee uniqueness across feeds that
+            // share a link (rare, but HN comment threads sometimes do).
+            safeId = "l:\(trimmedLink)#\(index)"
+        } else {
+            // Deterministic fallback so the same item is stable across reloads.
+            var hasher = Hasher()
+            hasher.combine(title)
+            hasher.combine(description)
+            hasher.combine(sourceLabel)
+            safeId = "h:\(hasher.finalize())#\(index)"
+        }
+        return RankedFeedItem(
+            id: safeId,
+            title: title,
+            link: trimmedLink,
+            description: description,
+            sourceLabel: sourceLabel,
+            score: score,
+            readMinutes: readMinutes
+        )
     }
 }
 
@@ -320,7 +378,11 @@ public func slowClawParseAndRankRSS(
 
     guard let bytes = result.items_json.bytes else { return [] }
     let data = Data(bytes: UnsafeRawPointer(bytes), count: result.items_json.len)
-    return try? JSONDecoder().decode([RankedFeedItem].self, from: data)
+    // Decode into the DTO, then synthesize crash-safe ids (see RankedFeedItemDTO).
+    guard let dtos = try? JSONDecoder().decode([RankedFeedItemDTO].self, from: data) else {
+        return nil
+    }
+    return dtos.enumerated().map { $0.element.toRanked(index: $0.offset) }
 }
 
 /// A topic for feed ranking (from the user's journal interests).
