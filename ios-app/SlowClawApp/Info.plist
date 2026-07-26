@@ -48,6 +48,11 @@
     <string>SlowClaw needs microphone access when you record audio journal entries.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>SlowClaw uses on-device speech recognition to transcribe your audio journal entries.</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
     <key>UIFileSharingEnabled</key>

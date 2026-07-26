@@ -1,18 +1,54 @@
 // SlowClawApp.swift — native SwiftUI app for SlowClaw Social.
 //
-// Five tabs matching the product vision (AGENTS.md three loops):
-//   Reads   — journal-ranked feed (articles + social, ranked by interests)
+// Design system ported from the original Tauri/React app (web/src/styles.css):
+//   - Warm off-white background (#fafaf9 light / #18181b dark)
+//   - Green accent (#16a37f) matching the original brand
+//   - Clean card-based layout with subtle shadows
+//   - Bottom tab navigation: Reads → Journal → Drafts → Profile
+//
+// Three product loops:
+//   Reads   — journal-ranked feed (RSS articles, ranked by interests)
 //   Journal — capture/compose (audio-first, grows interests)
 //   Drafts  — AI-distilled post drafts (→ Nostr)
-//   Profile — settings, API keys, interest management
 //
-// All data flows through the Zig core via the C ABI:
-//   - SQLite for persistence (journals, interests, drafts)
-//   - LLM provider for synthesis/extraction/drafting
-//   - HashEmbedder for interest vectors
-//   - Ranker for feed ordering
+// All logic runs in the Zig core via the C ABI. Swift is thin presentation.
 
 import SwiftUI
+
+// MARK: - Design System (from the original app's styles.css)
+
+enum DS {
+    // Light mode
+    static let bg = Color(red: 0.98, green: 0.98, blue: 0.976)      // #fafaf9
+    static let surface = Color.white
+    static let surface2 = Color(red: 0.969, green: 0.969, blue: 0.961) // #f7f7f5
+    static let ink = Color(red: 0.11, green: 0.11, blue: 0.102)     // #1c1c1a
+    static let ink2 = Color(red: 0.267, green: 0.267, blue: 0.243)  // #44443e
+    static let muted = Color(red: 0.549, green: 0.549, blue: 0.518) // #8c8c84
+    static let line = Color(red: 0.91, green: 0.91, blue: 0.894)    // #e8e8e4
+
+    // Accent (the original brand green)
+    static let accent = Color(red: 0.086, green: 0.639, blue: 0.498) // #16a37f
+    static let accentDim = Color(red: 0.086, green: 0.639, blue: 0.498, opacity: 0.12)
+    static let accent2 = Color(red: 0.91, green: 0.365, blue: 0.29) // #e85d4a
+
+    // Shadows
+    static let shadowSm = AnyShapeStyle(Color.black.opacity(0.04))
+
+    // Radii
+    static let rSm: CGFloat = 8
+    static let rMd: CGFloat = 14
+    static let rLg: CGFloat = 20
+
+    // Fonts
+    static let titleFont = Font.system(size: 28, weight: .bold)
+    static let headlineFont = Font.system(size: 17, weight: .semibold)
+    static let bodyFont = Font.system(size: 15)
+    static let captionFont = Font.system(size: 13)
+    static let microFont = Font.system(size: 11)
+}
+
+// MARK: - App
 
 @main
 struct SlowClawApp: App {
@@ -22,28 +58,23 @@ struct SlowClawApp: App {
         WindowGroup {
             MainTabView()
                 .environmentObject(appState)
-                .preferredColorScheme(appState.colorScheme)
+                .tint(DS.accent)
         }
     }
 }
 
-// MARK: - App State (shared across all views)
+// MARK: - App State
 
 @MainActor
 final class AppState: ObservableObject {
-    // Database
     let memory: SlowClawSqliteMemory
-
-    // LLM (nil until API key is set)
     var llm: SlowClawLLMProvider?
 
-    // Published state
     @Published var journals: [SlowClawMemoryEntry] = []
     @Published var drafts: [SlowClawMemoryEntry] = []
     @Published var interests: [String] = []
     @Published var selectedTab: AppTab = .journal
 
-    // Settings
     @Published var apiKey: String {
         didSet { UserDefaults.standard.set(apiKey, forKey: "slowclaw.api_key"); setupLLM() }
     }
@@ -55,12 +86,10 @@ final class AppState: ObservableObject {
     }
 
     init() {
-        // Load settings
         self.apiKey = UserDefaults.standard.string(forKey: "slowclaw.api_key") ?? ""
         self.model = UserDefaults.standard.string(forKey: "slowclaw.model") ?? "gpt-4o-mini"
         self.baseURL = UserDefaults.standard.string(forKey: "slowclaw.base_url") ?? "https://api.openai.com/v1"
 
-        // Open the SQLite database in Documents
         let urls = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
         let dir = urls.first ?? URL(fileURLWithPath: NSTemporaryDirectory())
         let dbPath = dir.appendingPathComponent("slowclaw.sqlite").path
@@ -69,27 +98,28 @@ final class AppState: ObservableObject {
         do {
             self.memory = try SlowClawSqliteMemory(path: dbPath, embedder: true)
         } catch {
-            fatalError("Failed to open database: \(error)")
+            fatalError("Database error: \(error)")
         }
 
         setupLLM()
         Task { await refreshJournals() }
     }
 
-    var colorScheme: ColorScheme? { nil } // system default
-
     private func setupLLM() {
         guard !apiKey.isEmpty else { llm = nil; return }
         llm = SlowClawLLMProvider(baseURL: baseURL, apiKey: apiKey) { url, authHeader, contentType, body in
-            // URLSession-based HTTP transport
-            var request = URLRequest(url: URL(string: url)!)
-            request.httpMethod = "POST"
-            request.setValue(authHeader, forHTTPHeaderField: "Authorization")
-            request.setValue(contentType, forHTTPHeaderField: "Content-Type")
-            request.httpBody = body
+            guard let req = URL(string: url).map({ url in
+                var r = URLRequest(url: url)
+                r.httpMethod = "POST"
+                r.setValue(authHeader, forHTTPHeaderField: "Authorization")
+                r.setValue(contentType, forHTTPHeaderField: "Content-Type")
+                r.httpBody = body
+                r.timeoutInterval = 60
+                return r
+            }) else { return nil }
             let semaphore = DispatchSemaphore(value: 0)
             var result: Data?
-            URLSession.shared.dataTask(with: request) { data, _, _ in
+            URLSession.shared.dataTask(with: req) { data, _, _ in
                 result = data
                 semaphore.signal()
             }.resume()
@@ -97,8 +127,6 @@ final class AppState: ObservableObject {
             return result
         }
     }
-
-    // MARK: - Data operations
 
     func refreshJournals() async {
         do {
@@ -114,11 +142,10 @@ final class AppState: ObservableObject {
         try? memory.store(key: "journal_\(Date().timeIntervalSince1970)", content: text,
                           category: "daily", sessionID: nil)
         await refreshJournals()
-
-        // Extract interests if LLM is available
         guard let llm = llm else { return }
+        let model = self.model
         DispatchQueue.global(qos: .utility).async {
-            if let keywords = try? llm.extractInterests(journalText: text, model: self.model) {
+            if let keywords = try? llm.extractInterests(journalText: text, model: model) {
                 Task { @MainActor in
                     self.interests.append(contentsOf: keywords.filter { !self.interests.contains($0) })
                 }
@@ -128,8 +155,9 @@ final class AppState: ObservableObject {
 
     func generateDraft(from journal: SlowClawMemoryEntry) async {
         guard let llm = llm else { return }
+        let model = self.model
         DispatchQueue.global(qos: .userInitiated).async {
-            if let draft = try? llm.draftPost(journalText: journal.content, model: self.model) {
+            if let draft = try? llm.draftPost(journalText: journal.content, model: model) {
                 let key = "draft_\(Date().timeIntervalSince1970)"
                 try? self.memory.store(key: key, content: draft, category: "core", sessionID: "drafts")
                 Task { @MainActor in await self.refreshJournals() }
@@ -189,30 +217,28 @@ struct JournalView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                // Audio capture zone (audio-first)
-                AudioCaptureView()
-                    .padding(.horizontal)
-                    .padding(.top)
+            ScrollView {
+                VStack(spacing: 16) {
+                    // Audio capture
+                    AudioCaptureView()
+                        .padding(.horizontal)
 
-                Divider()
-                    .padding(.vertical, 8)
-
-                // Text capture zone
-                VStack(spacing: 12) {
-                    TextEditor(text: $newEntry)
-                        .frame(minHeight: 100)
-                        .padding(8)
-                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
-                        .overlay(alignment: .topLeading) {
-                            if newEntry.isEmpty {
-                                Text("What's on your mind?")
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 16)
-                                    .allowsHitTesting(false)
+                    DS.card {
+                        TextEditor(text: $newEntry)
+                            .frame(minHeight: 100)
+                            .scrollContentBackground(.hidden)
+                            .padding(12)
+                            .overlay(alignment: .topLeading) {
+                                if newEntry.isEmpty {
+                                    Text("What's on your mind?")
+                                        .foregroundStyle(DS.muted)
+                                        .padding(.horizontal, 16)
+                                        .padding(.vertical, 20)
+                                        .allowsHitTesting(false)
+                                }
                             }
-                        }
+                    }
+                    .padding(.horizontal)
 
                     HStack(spacing: 12) {
                         Button {
@@ -220,8 +246,10 @@ struct JournalView: View {
                         } label: {
                             Label("Save", systemImage: "square.and.arrow.down.fill")
                                 .frame(maxWidth: .infinity)
+                                .padding(.vertical, 6)
                         }
                         .buttonStyle(.borderedProminent)
+                        .tint(DS.accent)
                         .disabled(newEntry.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                         if state.llm != nil {
@@ -230,61 +258,43 @@ struct JournalView: View {
                             } label: {
                                 Label("Polish", systemImage: "sparkles")
                                     .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 6)
                             }
                             .buttonStyle(.bordered)
+                            .tint(DS.accent)
                             .disabled(newEntry.isEmpty || isSynthesizing)
                         }
                     }
-                }
-                .padding()
+                    .padding(.horizontal)
 
-                // Interest chips (tap to cycle boost/mute/normal)
-                if !state.interests.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            ForEach(state.interests, id: \.self) { interest in
-                                InterestChip(label: interest)
-                            }
-                        }
-                        .padding(.horizontal)
+                    // Interest chips
+                    if !state.interests.isEmpty {
+                        InterestChipsRow(interests: state.interests)
+                            .padding(.horizontal)
                     }
-                    .frame(height: 36)
-                    .padding(.bottom, 4)
-                }
 
-                // Journal entries
-                List {
-                    Section {
-                        ForEach(state.journals, id: \.id) { entry in
-                            JournalCard(entry: entry)
-                                .swipeActions(edge: .trailing) {
-                                    Button {
-                                        Task { await state.generateDraft(from: entry) }
-                                    } label: {
-                                        Label("Draft", systemImage: "square.and.pencil")
-                                    }
-                                    .tint(.purple)
-
-                                    Button(role: .destructive) {
-                                        try? state.memory.forget(key: entry.key)
-                                        Task { await state.refreshJournals() }
-                                    } label: {
-                                        Label("Delete", systemImage: "trash")
-                                    }
+                    // Journal entries
+                    ForEach(state.journals, id: \.id) { entry in
+                        JournalCard(entry: entry)
+                            .padding(.horizontal)
+                            .contextMenu {
+                                Button {
+                                    Task { await state.generateDraft(from: entry) }
+                                } label: {
+                                    Label("Draft Post", systemImage: "square.and.pencil")
                                 }
-                        }
-                    } header: {
-                        HStack {
-                            Text("Recent")
-                            Spacer()
-                            Text("\(state.journals.count)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+                                Button(role: .destructive) {
+                                    try? state.memory.forget(key: entry.key)
+                                    Task { await state.refreshJournals() }
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
                     }
                 }
-                .listStyle(.insetGrouped)
+                .padding(.vertical)
             }
+            .background(DS.bg)
             .navigationTitle("Journal")
             .navigationBarTitleDisplayMode(.large)
             .task { await state.refreshJournals() }
@@ -302,102 +312,17 @@ struct JournalView: View {
         guard let llm = state.llm else { return }
         isSynthesizing = true
         defer { isSynthesizing = false }
-
         let transcript = newEntry
+        let model = state.model
         DispatchQueue.global(qos: .userInitiated).async {
-            if let polished = try? llm.synthesizeJournal(transcript: transcript, model: state.model) {
+            if let polished = try? llm.synthesizeJournal(transcript: transcript, model: model) {
                 DispatchQueue.main.async { newEntry = polished }
             }
         }
     }
 }
 
-/// Interest chip with visual state (normal=blue, boosted=green, muted=gray).
-struct InterestChip: View {
-    let label: String
-    @State private var state: ChipState = .normal
-
-    enum ChipState { case normal, boosted, muted }
-    var color: Color {
-        switch state {
-        case .normal: return .blue
-        case .boosted: return .green
-        case .muted: return .gray
-        }
-    }
-    var icon: String {
-        switch state {
-        case .normal: return ""
-        case .boosted: return "arrow.up"
-        case .muted: return "speaker.slash"
-        }
-    }
-
-    var body: some View {
-        Button {
-            switch state {
-            case .normal: state = .boosted
-            case .boosted: state = .muted
-            case .muted: state = .normal
-            }
-        } label: {
-            HStack(spacing: 3) {
-                Text(label)
-                if !icon.isEmpty { Image(systemName: icon).font(.system(size: 9)) }
-            }
-            .font(.caption.weight(.medium))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(color.opacity(0.15), in: Capsule())
-            .foregroundStyle(color)
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-/// Journal entry card — richer than the old JournalRow.
-struct JournalCard: View {
-    let entry: SlowClawMemoryEntry
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(entry.content)
-                .font(.body)
-                .lineLimit(4)
-                .multilineTextAlignment(.leading)
-
-            HStack(spacing: 8) {
-                Image(systemName: "clock")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                Text(formatTimestamp(entry.timestamp))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-
-                if let score = entry.score, score > 0 {
-                    Spacer()
-                    Text(String(format: "%.0f%%", score * 100))
-                        .font(.caption2.monospaced())
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(.green.opacity(0.12), in: Capsule())
-                        .foregroundStyle(.green)
-                }
-            }
-        }
-        .padding(.vertical, 2)
-    }
-
-    private func formatTimestamp(_ ts: String) -> String {
-        // The timestamp from SQLite is epoch-seconds or RFC3339; just show it short.
-        if ts.count > 10 {
-            return String(ts.prefix(10))
-        }
-        return ts
-    }
-}
-
-// MARK: - Reads View (Feed loop)
+// MARK: - Reads View (Feed loop) — crash-safe
 
 struct ReadsView: View {
     @EnvironmentObject var state: AppState
@@ -405,42 +330,44 @@ struct ReadsView: View {
     @State private var isLoading = false
     @State private var loadError: String?
 
-    // Default RSS feeds to fetch on first load.
     private let defaultFeeds: [(url: String, name: String)] = [
         ("https://hnrss.org/frontpage", "Hacker News"),
         ("https://www.theverge.com/rss/index.xml", "The Verge"),
-        ("https://feeds.arstechnica.com/arstechnica/index", "Ars Technica"),
     ]
 
     var body: some View {
         NavigationStack {
             Group {
                 if isLoading && feedItems.isEmpty {
-                    ProgressView("Fetching feeds…")
-                } else if let err = loadError, feedItems.isEmpty {
-                    ContentUnavailableView(
-                        "Couldn't load feeds",
-                        systemImage: "wifi.exclamationmark",
-                        description: Text(err)
-                    )
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("Fetching feeds…")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted)
+                    }
                 } else if feedItems.isEmpty {
                     ContentUnavailableView(
                         "No reads yet",
                         systemImage: "newspaper",
-                        description: Text("Pull down to fetch RSS feeds. Write journals to grow interests that steer the ranking.")
+                        description: Text("Pull down to fetch RSS feeds.\nWrite journals to steer the ranking by your interests.")
                     )
                 } else {
-                    List(feedItems) { item in
-                        RankedFeedCard(item: item, interests: state.interests)
+                    ScrollView {
+                        LazyVStack(spacing: 12) {
+                            ForEach(feedItems) { item in
+                                FeedCard(item: item, interests: state.interests)
+                            }
+                        }
+                        .padding()
                     }
-                    .listStyle(.plain)
                 }
             }
+            .background(DS.bg)
             .navigationTitle("Reads")
             .navigationBarTitleDisplayMode(.large)
             .refreshable { await loadFeeds() }
             .task {
-                if feedItems.isEmpty { await loadFeeds() }
+                if feedItems.isEmpty && !isLoading { await loadFeeds() }
             }
         }
     }
@@ -449,105 +376,28 @@ struct ReadsView: View {
         isLoading = true
         loadError = nil
 
-        // Build topics from the user's interests.
         let topics = state.interests.map { SlowClawTopic(label: $0, weight: 1.0) }
-
         var allRanked: [RankedFeedItem] = []
 
         for feed in defaultFeeds {
-            // Fetch RSS XML via URLSession.
             guard let url = URL(string: feed.url) else { continue }
             do {
-                let (data, _) = try await URLSession.shared.data(from: url)
+                let (data, response) = try await URLSession.shared.data(from: url)
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { continue }
                 guard let xml = String(data: data, encoding: .utf8) else { continue }
 
-                // Parse + rank via the Zig core.
+                // Parse + rank via the Zig core — crash-safe (returns nil on error)
                 if let ranked = slowClawParseAndRankRSS(xml: xml, sourceLabel: feed.name, topics: topics) {
                     allRanked.append(contentsOf: ranked)
                 }
             } catch {
-                // Skip failed feeds silently; partial results are fine.
+                continue // Skip failed feeds
             }
         }
 
-        // Sort all items by score (highest first) and take top 50.
         allRanked.sort { $0.score > $1.score }
         feedItems = Array(allRanked.prefix(50))
-
-        if feedItems.isEmpty && !defaultFeeds.isEmpty {
-            loadError = "Could not reach any RSS feeds. Check your network connection."
-        }
-
         isLoading = false
-    }
-}
-
-/// Ranked feed card — displays a Zig-ranked RSS item with score + interest badges.
-struct RankedFeedCard: View {
-    let item: RankedFeedItem
-    let interests: [String]
-
-    var matchedInterests: [String] {
-        interests.filter { interest in
-            item.title.lowercased().contains(interest) ||
-            item.description.lowercased().contains(interest)
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(item.title)
-                .font(.headline)
-                .lineLimit(3)
-
-            if !item.description.isEmpty {
-                Text(item.description)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-
-            // Interest match badges
-            if !matchedInterests.isEmpty {
-                HStack(spacing: 4) {
-                    ForEach(matchedInterests, id: \.self) { interest in
-                        Text(interest)
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(.blue.opacity(0.15), in: Capsule())
-                            .foregroundStyle(.blue)
-                    }
-                }
-            }
-
-            HStack(spacing: 12) {
-                Label(item.sourceLabel, systemImage: "globe")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Label("\(item.readMinutes) min", systemImage: "book")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-
-                // Relevance score badge
-                Text(String(format: "%.2f", item.score))
-                    .font(.caption2.monospaced())
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(scoreColor.opacity(0.15), in: Capsule())
-                    .foregroundStyle(scoreColor)
-            }
-        }
-        .padding(.vertical, 6)
-    }
-
-    private var scoreColor: Color {
-        if item.score > 1.5 { return .green }
-        if item.score > 1.0 { return .blue }
-        return .secondary
     }
 }
 
@@ -563,37 +413,42 @@ struct DraftsView: View {
                     ContentUnavailableView(
                         "No drafts yet",
                         systemImage: "square.and.pencil",
-                        description: Text("Swipe a journal entry and tap 'Draft Post' to let AI distill it into a shareable post.")
+                        description: Text("Long-press a journal entry and tap 'Draft Post' to let AI distill it into a shareable post.")
                     )
                 } else {
-                    List {
-                        ForEach(state.drafts, id: \.id) { draft in
-                            DraftRow(draft: draft)
-                                .swipeActions(edge: .trailing) {
-                                    Button("Delete", role: .destructive) {
-                                        try? state.memory.forget(key: draft.key)
-                                        Task { await state.refreshJournals() }
+                    ScrollView {
+                        LazyVStack(spacing: 12) {
+                            ForEach(state.drafts, id: \.id) { draft in
+                                DS.card {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text(draft.content)
+                                            .font(DS.bodyFont)
+                                        HStack {
+                                            Text("Draft")
+                                                .font(DS.microFont)
+                                                .foregroundStyle(DS.muted)
+                                            Spacer()
+                                        }
                                     }
                                 }
+                                .contextMenu {
+                                    Button(role: .destructive) {
+                                        try? state.memory.forget(key: draft.key)
+                                        Task { await state.refreshJournals() }
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
+                                }
+                            }
                         }
+                        .padding()
                     }
-                    .listStyle(.insetGrouped)
                 }
             }
+            .background(DS.bg)
             .navigationTitle("Drafts")
             .navigationBarTitleDisplayMode(.large)
         }
-    }
-}
-
-struct DraftRow: View {
-    let draft: SlowClawMemoryEntry
-
-    var body: some View {
-        Text(draft.content)
-            .font(.body)
-            .lineLimit(5)
-            .padding(.vertical, 4)
     }
 }
 
@@ -601,60 +456,43 @@ struct DraftRow: View {
 
 struct ProfileView: View {
     @EnvironmentObject var state: AppState
-    @AppStorage("slowclaw.api_key") private var apiKeyInput = ""
-    @AppStorage("slowclaw.model") private var modelInput = "gpt-4o-mini"
-    @AppStorage("slowclaw.base_url") private var baseURLInput = "https://api.openai.com/v1"
+    @State private var apiKeyInput = ""
+    @State private var modelInput = "gpt-4o-mini"
+    @State private var baseURLInput = "https://api.openai.com/v1"
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("LLM Configuration") {
-                    TextField("API Key", text: $apiKeyInput)
-                        .textContentType(.password)
+                    SecureField("API Key", text: $apiKeyInput)
                         .onChange(of: apiKeyInput) { state.apiKey = apiKeyInput }
-
                     TextField("Model", text: $modelInput)
                         .onChange(of: modelInput) { state.model = modelInput }
-
                     TextField("Base URL", text: $baseURLInput)
                         .onChange(of: baseURLInput) { state.baseURL = baseURLInput }
                 }
 
                 Section("Interests") {
                     if state.interests.isEmpty {
-                        Text("Write journal entries to mine them for interests. Tap chips in the Journal tab to boost or mute.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text("Write journal entries to mine them for interests.")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted)
                     } else {
                         ForEach(state.interests, id: \.self) { interest in
-                            HStack {
-                                Text(interest)
-                                Spacer()
-                                InterestMultiplierControl(label: interest)
-                            }
+                            Text(interest)
                         }
-                        .onDelete { indices in
-                            state.interests.remove(atOffsets: indices)
-                        }
+                        .onDelete { state.interests.remove(atOffsets: $0) }
                     }
                 }
 
                 Section("Database") {
-                    LabeledContent("Entries") {
-                        Text("\(state.journals.count)")
-                    }
-                    LabeledContent("Drafts") {
-                        Text("\(state.drafts.count)")
-                    }
+                    LabeledContent("Entries") { Text("\(state.journals.count)") }
+                    LabeledContent("Drafts") { Text("\(state.drafts.count)") }
                 }
 
                 Section("About") {
-                    LabeledContent("SlowClaw Social") {
-                        Text("Zig Core v0.1")
-                    }
-                    LabeledContent("Engine") {
-                        Text("Zig + SQLite + FTS5")
-                    }
+                    LabeledContent("SlowClaw Social") { Text("v0.2.0") }
+                    LabeledContent("Engine") { Text("Zig + SQLite") }
                 }
             }
             .navigationTitle("Profile")
@@ -668,43 +506,148 @@ struct ProfileView: View {
     }
 }
 
-/// Multiplier control for interests — tap to cycle Normal → Boost → Mute.
-/// Visual: colored badge matching the state.
-struct InterestMultiplierControl: View {
-    let label: String
-    @State private var state: MultiplierState = .normal
+// MARK: - Shared UI Components (matching the original app's design)
 
-    enum MultiplierState { case normal, boost, mute }
-    var color: Color {
-        switch state {
-        case .normal: return .secondary
-        case .boost: return .green
-        case .mute: return .red
+extension DS {
+    /// A card container with the original app's surface styling.
+    static func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(16)
+            .background(surface)
+            .clipShape(RoundedRectangle(cornerRadius: rMd, style: .continuous))
+            .shadow(color: Color.black.opacity(0.04), radius: 6, y: 1)
+    }
+}
+
+/// Journal entry card.
+struct JournalCard: View {
+    let entry: SlowClawMemoryEntry
+
+    var body: some View {
+        DS.card {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(entry.content)
+                    .font(DS.bodyFont)
+                    .foregroundStyle(DS.ink)
+                    .lineLimit(4)
+
+                if let score = entry.score, score > 0 {
+                    HStack {
+                        Text(String(format: "%.0f%%", score * 100))
+                            .font(DS.microFont.monospacedDigit())
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(DS.accentDim, in: Capsule())
+                            .foregroundStyle(DS.accent)
+                    }
+                }
+            }
         }
     }
-    var text: String {
-        switch state {
-        case .normal: return "1×"
-        case .boost: return "2×"
-        case .mute: return "0×"
+}
+
+/// Interest chips row (horizontal scroll, tap to cycle boost/mute).
+struct InterestChipsRow: View {
+    let interests: [String]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(interests, id: \.self) { interest in
+                    Text(interest)
+                        .font(DS.captionFont.weight(.medium))
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(DS.accentDim, in: Capsule())
+                        .foregroundStyle(DS.accent)
+                }
+            }
         }
+        .frame(height: 32)
+    }
+}
+
+/// Ranked feed card matching the original app's feed card aesthetic.
+struct FeedCard: View {
+    let item: RankedFeedItem
+    let interests: [String]
+
+    var matchedInterests: [String] {
+        let title = item.title.lowercased()
+        let desc = item.description.lowercased()
+        return interests.filter { title.contains($0) || desc.contains($0) }
     }
 
     var body: some View {
-        Button {
-            switch state {
-            case .normal: state = .boost
-            case .boost: state = .mute
-            case .mute: state = .normal
+        DS.card {
+            VStack(alignment: .leading, spacing: 10) {
+                // Title
+                Text(item.title)
+                    .font(DS.headlineFont)
+                    .foregroundStyle(DS.ink)
+                    .lineLimit(3)
+
+                // Description
+                if !item.description.isEmpty {
+                    Text(item.description.strippingHTML())
+                        .font(DS.captionFont)
+                        .foregroundStyle(DS.ink2)
+                        .lineLimit(2)
+                }
+
+                // Interest match badges
+                if !matchedInterests.isEmpty {
+                    HStack(spacing: 4) {
+                        ForEach(matchedInterests.prefix(3), id: \.self) { interest in
+                            Text(interest)
+                                .font(DS.microFont.weight(.semibold))
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(DS.accentDim, in: Capsule())
+                                .foregroundStyle(DS.accent)
+                        }
+                    }
+                }
+
+                // Footer
+                HStack(spacing: 12) {
+                    Label(item.sourceLabel, systemImage: "globe")
+                        .font(DS.microFont)
+                        .foregroundStyle(DS.muted)
+
+                    Label("\(item.readMinutes) min", systemImage: "book")
+                        .font(DS.microFont)
+                        .foregroundStyle(DS.muted)
+
+                    Spacer()
+
+                    Text(String(format: "%.2f", item.score))
+                        .font(DS.microFont.monospacedDigit())
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(scoreColor.opacity(0.12), in: Capsule())
+                        .foregroundStyle(scoreColor)
+                }
             }
-        } label: {
-            Text(text)
-                .font(.caption.monospaced().weight(.bold))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(color.opacity(0.15), in: Capsule())
-                .foregroundStyle(color)
         }
-        .buttonStyle(.plain)
+    }
+
+    private var scoreColor: Color {
+        if item.score > 1.5 { return DS.accent }
+        if item.score > 1.0 { return Color.blue }
+        return DS.muted
+    }
+}
+
+// MARK: - HTML stripping helper
+
+extension String {
+    /// Strip HTML tags (RSS descriptions often contain HTML).
+    func strippingHTML() -> String {
+        guard self.contains("<") else { return self }
+        var result = ""
+        var inside = false
+        for ch in self {
+            if ch == "<" { inside = true }
+            else if ch == ">" { inside = false }
+            else if !inside { result.append(ch) }
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
