@@ -864,9 +864,9 @@ struct ProfileView: View {
                         Text("Database")
                             .font(DS.cardTitleFont)
                             .foregroundStyle(DS.ink(scheme))
-                        row("Entries", "\(state.journals.count))
+                        row("Entries", "\(state.journals.count)")
                         Divider().background(DS.line(scheme))
-                        row("Drafts", "\(state.drafts.count))
+                        row("Drafts", "\(state.drafts.count)")
                     }
                 }
 
