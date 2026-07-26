@@ -110,6 +110,7 @@ final class AudioRecorder: NSObject, ObservableObject {
 struct AudioCaptureView: View {
     @ObservedObject var recorder = AudioRecorder()
     @EnvironmentObject var state: AppState
+    @Environment(\.colorScheme) var scheme
     @State private var showTranscript = false
 
     var body: some View {
@@ -118,11 +119,11 @@ struct AudioCaptureView: View {
                 // Live transcript
                 ScrollView {
                     Text(recorder.transcript.isEmpty ? "Listening…" : recorder.transcript)
-                        .font(.body)
-                        .foregroundStyle(recorder.transcript.isEmpty ? .secondary : .primary)
+                        .font(DS.bodyFont)
+                        .foregroundStyle(recorder.transcript.isEmpty ? AnyShapeStyle(DS.muted(scheme)) : AnyShapeStyle(DS.ink(scheme)))
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding()
-                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                        .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
                 }
                 .frame(maxHeight: 120)
 
@@ -138,7 +139,7 @@ struct AudioCaptureView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding()
-                    .background(.red, in: RoundedRectangle(cornerRadius: 16))
+                    .background(DS.accent2Color, in: RoundedRectangle(cornerRadius: DS.rLg, style: .continuous))
                     .foregroundStyle(.white)
                 }
             } else {
@@ -152,19 +153,19 @@ struct AudioCaptureView: View {
                     VStack(spacing: 6) {
                         Image(systemName: "mic.fill")
                             .font(.system(size: 32))
-                        Text("Hold to record")
+                        Text("Tap to record")
                             .font(.subheadline)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 20)
-                    .background(.blue.opacity(0.1), in: RoundedRectangle(cornerRadius: 16))
-                    .foregroundStyle(.blue)
+                    .background(DS.accentDim(scheme), in: RoundedRectangle(cornerRadius: DS.rLg, style: .continuous))
+                    .foregroundStyle(DS.accent(scheme))
                 }
 
                 if let err = recorder.errorMessage {
                     Text(err)
-                        .font(.caption)
-                        .foregroundStyle(.red)
+                        .font(DS.captionFont)
+                        .foregroundStyle(DS.accent2Color)
                 }
             }
         }
@@ -185,6 +186,7 @@ struct TranscriptSheet: View {
 
     @Environment(\.dismiss) var dismiss
     @EnvironmentObject var state: AppState
+    @Environment(\.colorScheme) var scheme
     @State private var editedText = ""
     @State private var isPolishing = false
 
@@ -193,23 +195,28 @@ struct TranscriptSheet: View {
             VStack(spacing: 16) {
                 TextEditor(text: $editedText)
                     .frame(minHeight: 200)
+                    .scrollContentBackground(.hidden)
                     .padding(8)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                    .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rLg, style: .continuous))
 
                 if state.llm != nil {
                     Button {
                         Task { await polish() }
                     } label: {
                         Label("AI Polish", systemImage: "sparkles")
+                            .font(DS.bodyFont.weight(.semibold))
                             .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
                     }
                     .buttonStyle(.bordered)
+                    .tint(DS.accentColor)
                     .disabled(isPolishing || editedText.isEmpty)
                 }
 
                 Spacer()
             }
             .padding()
+            .background(DS.bg(scheme))
             .navigationTitle("Transcript")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
