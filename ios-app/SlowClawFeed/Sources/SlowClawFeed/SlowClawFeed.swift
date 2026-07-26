@@ -423,10 +423,10 @@ public func slowClawFeedCatalog() -> [SlowClawFeedSource]? {
     var out = SlowclawString(bytes: nil, len: 0)
     let status = slowclaw_feed_catalog_json(&out)
     guard status == SLOWCLAW_OK, let bytes = out.bytes, out.len > 0 else {
-        if out.bytes != nil { slowclaw_feed_free(UnsafeMutableRawPointer(out.bytes)) }
+        if let b = out.bytes { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: b)) }
         return nil
     }
-    defer { slowclaw_feed_free(UnsafeMutableRawPointer(out.bytes)) }
+    defer { if let b = out.bytes { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: b)) } }
     let data = Data(bytes: UnsafeRawPointer(bytes), count: out.len)
     return try? JSONDecoder().decode([SlowClawFeedSource].self, from: data)
 }
@@ -462,10 +462,10 @@ public func slowClawLocalLLMStatus() -> LocalLLMStatus {
     var out = SlowclawString(bytes: nil, len: 0)
     let status = slowclaw_feed_local_llm_status(&out)
     guard status == SLOWCLAW_OK, let bytes = out.bytes, out.len > 0 else {
-        if out.bytes != nil { slowclaw_feed_free(UnsafeMutableRawPointer(out.bytes)) }
+        if let b = out.bytes { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: b)) }
         return LocalLLMStatus(available: false, reason: "Status unavailable.")
     }
-    defer { slowclaw_feed_free(UnsafeMutableRawPointer(out.bytes)) }
+    defer { if let b = out.bytes { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: b)) } }
     let data = Data(bytes: UnsafeRawPointer(bytes), count: out.len)
     return (try? JSONDecoder().decode(LocalLLMStatus.self, from: data))
         ?? LocalLLMStatus(available: false, reason: "Status decode failed.")
