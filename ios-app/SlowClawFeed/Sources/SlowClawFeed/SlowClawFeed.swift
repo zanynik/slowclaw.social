@@ -267,9 +267,17 @@ public struct RankedFeedItem: Identifiable {
     public let sourceLabel: String
     public let score: Double
     public let readMinutes: Int
+    /// "rss" | "youtube" | "nostr". Derived in Swift from the link (YouTube
+    /// detection) or set by the fetcher (Nostr). The Zig ranker tags every RSS
+    /// item "rss"; the Swift layer re-tags YouTube links, mirroring the
+    /// reference app's toUnifiedFromWorldFeed.
+    public let sourcePlatform: String
+    /// Optional cover image (YouTube thumbnail or Nostr article image).
+    public let thumbnailURL: String?
 
     public init(id: String, title: String, link: String, description: String,
-                sourceLabel: String, score: Double, readMinutes: Int) {
+                sourceLabel: String, score: Double, readMinutes: Int,
+                sourcePlatform: String = "rss", thumbnailURL: String? = nil) {
         self.id = id
         self.title = title
         self.link = link
@@ -277,6 +285,8 @@ public struct RankedFeedItem: Identifiable {
         self.sourceLabel = sourceLabel
         self.score = score
         self.readMinutes = readMinutes
+        self.sourcePlatform = sourcePlatform
+        self.thumbnailURL = thumbnailURL
     }
 }
 
@@ -297,7 +307,9 @@ private struct RankedFeedItemDTO: Decodable {
 
     /// Build a crash-safe `RankedFeedItem`. Prefers `link` for identity; falls
     /// back to a stable hash of title+description+source when link is empty, and
-    /// disambiguates collisions with the item's index in the batch.
+    /// disambiguates collisions with the item's index in the batch. Also detects
+    /// YouTube links (mirroring the reference's extractYouTubeId) and tags them
+    /// sourcePlatform="youtube" with an i.ytimg.com thumbnail.
     func toRanked(index: Int) -> RankedFeedItem {
         let trimmedLink = link.trimmingCharacters(in: .whitespacesAndNewlines)
         let safeId: String
@@ -313,6 +325,10 @@ private struct RankedFeedItemDTO: Decodable {
             hasher.combine(sourceLabel)
             safeId = "h:\(hasher.finalize())#\(index)"
         }
+        // YouTube detection (re-tag rss -> youtube, synthesize thumbnail).
+        let ytID = SlowClawFeedSource.youTubeID(from: trimmedLink)
+        let platform = (ytID != nil) ? "youtube" : "rss"
+        let thumb = ytID.map { "https://i.ytimg.com/vi/\($0)/hqdefault.jpg" }
         return RankedFeedItem(
             id: safeId,
             title: title,
@@ -320,7 +336,9 @@ private struct RankedFeedItemDTO: Decodable {
             description: description,
             sourceLabel: sourceLabel,
             score: score,
-            readMinutes: readMinutes
+            readMinutes: readMinutes,
+            sourcePlatform: platform,
+            thumbnailURL: thumb
         )
     }
 }
@@ -416,6 +434,33 @@ public struct SlowClawFeedSource: Decodable, Equatable {
     /// Label shown in the Reads card source row. The catalog's YouTube entries
     /// are already prefixed "YouTube — …"; otherwise use the domain.
     public var displayLabel: String { title.isEmpty ? domain : title }
+
+    /// Extract the 11-char YouTube video id from a watch/embed/shorts/live/v/
+    /// education URL on youtube.com / youtube-nocookie.com / youtu.be.
+    /// Mirrors the reference app's extractYouTubeId (web/src/lib/socialFeed.ts).
+    /// Returns nil for non-YouTube URLs or unrecognized shapes.
+    public static func youTubeID(from urlString: String) -> String? {
+        guard let url = URL(string: urlString) else { return nil }
+        guard let host = url.host?.lowercased() else { return nil }
+        let isYT = host == "youtu.be" || host.hasSuffix("youtube.com") || host.hasSuffix("youtube-nocookie.com")
+        guard isYT else { return nil }
+        let idPattern = "^[A-Za-z0-9_-]{11}$"
+        if host == "youtu.be" {
+            let seg = url.path.split(separator: "/").first.map(String.init) ?? ""
+            return seg.range(of: idPattern, options: .regularExpression) != nil ? seg : nil
+        }
+        if let v = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "v" })?.value,
+           v.range(of: idPattern, options: .regularExpression) != nil {
+            return v
+        }
+        let segs = url.path.split(separator: "/").map(String.init)
+        if segs.count >= 2, ["embed", "shorts", "live", "v", "education"].contains(segs[0]),
+           segs[1].range(of: idPattern, options: .regularExpression) != nil {
+            return segs[1]
+        }
+        return nil
+    }
 }
 
 /// Return the default Reads feed catalog (114 sources). Nil on FFI/decode error.

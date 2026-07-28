@@ -133,6 +133,17 @@ final class AppState: ObservableObject {
     @Published var journalSidebarOpen: Bool = false
     @Published var selectedJournalKey: String? = nil
 
+    // Reads feed cache. Lives on AppState (not ReadsView @State) so switching
+    // tabs preserves the list — the view shows cached items instantly and a
+    // background refresh merges + re-ranks new content. `readsLoadedOnce`
+    // guards the auto-load so we don't refetch on every tab return.
+    @Published var readsItems: [RankedFeedItem] = []
+    @Published var readsLoading: Bool = false
+    @Published var readsError: String? = nil
+    @Published var readsRefreshedAt: Date? = nil
+    private var readsLoadedOnce: Bool = false
+    fileprivate static var cachedCatalog: [SlowClawFeedSource]?
+
     // TweetClaw (post generation). The prompt is editable + persisted; processed
     // journals are tracked so pull-to-generate picks a fresh entry each time.
     @Published var tweetClawPrompt: String {
@@ -221,6 +232,100 @@ final class AppState: ObservableObject {
     var selectedJournal: SlowClawMemoryEntry? {
         guard let key = selectedJournalKey else { return nil }
         return journals.first { $0.key == key }
+    }
+
+    // MARK: - Reads feed (cached + background refresh)
+
+    /// The Reads feed catalog (114 sources), cached on first access.
+    fileprivate var catalog: [SlowClawFeedSource] {
+        if let cached = AppState.cachedCatalog { return cached }
+        if let loaded = slowClawFeedCatalog() {
+            AppState.cachedCatalog = loaded
+            return loaded
+        }
+        return [SlowClawFeedSource(title: "Hacker News", domain: "news.ycombinator.com",
+                                   htmlURL: "https://news.ycombinator.com",
+                                   xmlURL: "https://hnrss.org/frontpage")]
+    }
+
+    /// Load the Reads feed. On the first call (or when forced) this replaces the
+    /// list; on subsequent calls it background-refreshes and merges new items in
+    /// so switching tabs never wipes what's already shown. Pull-to-refresh forces
+    /// a foreground refresh (spinner visible).
+    func loadReads(force: Bool = false) async {
+        let isFirst = !readsLoadedOnce || readsItems.isEmpty
+        if force || isFirst {
+            readsLoading = true
+            if !force { readsError = nil }
+        }
+        readsLoadedOnce = true
+
+        let topics = interests.map { SlowClawTopic(label: $0, weight: 1.0) }
+        let sources = catalog
+
+        // Snapshot fetch happens off the main actor.
+        let (rss, nostr, reachedAny) = await Task.detached(priority: .userInitiated) {
+            async let rssResult = Self.fetchAllRSS(sources: sources, topics: topics)
+            async let nostrResult = NostrFetcher.fetchArticles()
+            let r = await rssResult
+            let n = await nostrResult
+            return (r, n)
+        }.value
+
+        var combined = rss + nostr
+        combined.sort { $0.score > $1.score }
+        let capped = Array(combined.prefix(80))
+
+        // Merge: keep the existing list visible; replace on force/first load.
+        if force || readsItems.isEmpty {
+            readsItems = capped
+        } else {
+            // Background refresh: prepend new items not already present.
+            let existing = Set(readsItems.map { $0.id })
+            let fresh = capped.filter { !existing.contains($0.id) }
+            if !fresh.isEmpty {
+                readsItems = (fresh + readsItems).prefix(80).map { $0 }
+            }
+        }
+        readsRefreshedAt = Date()
+        if capped.isEmpty { readsError = reachedAny ? nil : "Couldn't reach any feeds. Pull to retry." }
+        else { readsError = nil }
+        readsLoading = false
+    }
+
+    /// Fetch every catalog RSS source with bounded concurrency (8 at a time),
+    /// parse + rank each via the Zig core. Static so it can run off the main actor.
+    private static func fetchAllRSS(sources: [SlowClawFeedSource], topics: [SlowClawTopic]) async -> ([RankedFeedItem], Bool) {
+        let batches = stride(from: 0, to: sources.count, by: 8).map {
+            Array(sources[$0..<min($0 + 8, sources.count)])
+        }
+        var allRanked: [RankedFeedItem] = []
+        var reachedAny = false
+        for batch in batches {
+            let results = await withTaskGroup(of: [RankedFeedItem]?.self, returning: [[RankedFeedItem]].self) { group in
+                for src in batch {
+                    group.addTask {
+                        guard let url = URL(string: src.xmlURL) else { return nil }
+                        let xml: String
+                        do {
+                            let (data, response) = try await URLSession.shared.data(from: url)
+                            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                                  let s = String(data: data, encoding: .utf8) else { return nil }
+                            xml = s
+                        } catch { return nil }
+                        return slowClawParseAndRankRSS(xml: xml, sourceLabel: src.displayLabel, topics: topics)
+                    }
+                }
+                var got: [[RankedFeedItem]] = []
+                for await r in group { if let r { got.append(r) } }
+                return got
+            }
+            for r in results {
+                if !r.isEmpty { reachedAny = true }
+                allRanked.append(contentsOf: r)
+            }
+        }
+        return (allRanked, reachedAny)
     }
 
     func storeJournal(text: String) async {
@@ -900,29 +1005,11 @@ struct JournalView: View {
 struct ReadsView: View {
     @Environment(\.colorScheme) var scheme
     @EnvironmentObject var state: AppState
-    @State private var feedItems: [RankedFeedItem] = []
-    @State private var isLoading = false
-    @State private var loadError: String?
 
-    /// The Reads feed catalog. Loaded once from the Zig core (114 sources,
-    /// ported 1:1 from src/gateway/feed_web_sources.rs — the same sources the
-    /// reference app reads). Falls back to HN if the catalog isn't available.
-    /// Read on the main actor only (from loadFeeds, which is @MainActor).
-    private var catalog: [SlowClawFeedSource] {
-        if let cached = ReadsView.cachedCatalog { return cached }
-        if let loaded = slowClawFeedCatalog() {
-            ReadsView.cachedCatalog = loaded
-            return loaded
-        }
-        return [SlowClawFeedSource(title: "Hacker News", domain: "news.ycombinator.com",
-                                   htmlURL: "https://news.ycombinator.com",
-                                   xmlURL: "https://hnrss.org/frontpage")]
-    }
-    fileprivate static var cachedCatalog: [SlowClawFeedSource]?
 
     var body: some View {
         Group {
-            if isLoading && feedItems.isEmpty {
+            if state.readsLoading && state.readsItems.isEmpty {
                 VStack(spacing: 10) {
                     ProgressView()
                     Text("Loading…")
@@ -930,8 +1017,8 @@ struct ReadsView: View {
                         .foregroundStyle(DS.muted(scheme))
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if feedItems.isEmpty {
-                if let loadError {
+            } else if state.readsItems.isEmpty {
+                if let err = state.readsError {
                     // Surface the failure instead of silently looking empty.
                     VStack(spacing: 12) {
                         Image(systemName: "exclamationmark.triangle")
@@ -940,12 +1027,12 @@ struct ReadsView: View {
                         Text("Couldn't load reads")
                             .font(DS.cardTitleFont)
                             .foregroundStyle(DS.ink(scheme))
-                        Text(loadError)
+                        Text(err)
                             .font(DS.captionFont)
                             .foregroundStyle(DS.muted(scheme))
                             .multilineTextAlignment(.center)
                             .padding(.horizontal)
-                        Button("Retry") { Task { await loadFeeds() } }
+                        Button("Retry") { Task { await state.loadReads(force: true) } }
                             .buttonStyle(.bordered)
                             .tint(DS.accentColor)
                     }
@@ -971,7 +1058,7 @@ struct ReadsView: View {
                     LazyVStack(spacing: 10) {
                         // Subtitle row matching the reference: "{N} stories · ranked by your lens".
                         HStack {
-                            Text("\(feedItems.count) stories")
+                            Text("\(state.readsItems.count) stories")
                                 .font(DS.captionFont)
                                 .foregroundStyle(DS.muted(scheme))
                             Text("·")
@@ -981,10 +1068,15 @@ struct ReadsView: View {
                                 .font(DS.captionFont)
                                 .foregroundStyle(DS.muted(scheme))
                             Spacer()
+                            if state.readsLoading {
+                                // Background refresh in progress — keep the
+                                // cached list visible (no spinner swap).
+                                ProgressView().scaleEffect(0.7).frame(width: 14, height: 14)
+                            }
                         }
                         .padding(.horizontal, 4)
 
-                        ForEach(feedItems) { item in
+                        ForEach(state.readsItems) { item in
                             FeedCard(item: item, interests: state.interests)
                         }
                     }
@@ -992,72 +1084,16 @@ struct ReadsView: View {
                     .padding(.top, 16)
                     .padding(.bottom, 24)
                 }
-                .refreshable { await loadFeeds() }
+                .refreshable { await state.loadReads(force: true) }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.bg(scheme))
         .task {
-            if feedItems.isEmpty && !isLoading { await loadFeeds() }
+            // Cached list is shown instantly if present; otherwise load. A
+            // background refresh (merge, no wipe) runs when returning to the tab.
+            await state.loadReads(force: false)
         }
-    }
-
-    @MainActor
-    private func loadFeeds() async {
-        isLoading = true
-        loadError = nil
-
-        // Snapshot topics + catalog on the main actor, then do all the network
-        // + FFI work off the main actor. The Zig parse/rank is synchronous and
-        // blocking, so running it on background tasks keeps the UI responsive.
-        let topics = state.interests.map { SlowClawTopic(label: $0, weight: 1.0) }
-        let sources = catalog
-
-        let fetched: ([RankedFeedItem], String?) = await Task.detached(priority: .userInitiated) {
-            // Fetch all catalog feeds with bounded concurrency (8 at a time) so
-            // we don't open 100+ simultaneous connections. Each feed is fetched,
-            // parsed, and ranked independently; results are merged at the end.
-            let chunks = stride(from: 0, to: sources.count, by: 8).map {
-                Array(sources[$0..<min($0 + 8, sources.count)])
-            }
-            var allRanked: [RankedFeedItem] = []
-            var reachedAny = false
-
-            for batch in chunks {
-                let results = await withTaskGroup(of: [RankedFeedItem]?.self, returning: [[RankedFeedItem]].self) { group in
-                    for src in batch {
-                        group.addTask {
-                            guard let url = URL(string: src.xmlURL) else { return nil }
-                            let xml: String
-                            do {
-                                let (data, response) = try await URLSession.shared.data(from: url)
-                                guard let http = response as? HTTPURLResponse, http.statusCode == 200,
-                                      let s = String(data: data, encoding: .utf8) else { return nil }
-                                xml = s
-                            } catch { return nil }
-                            // Parse + rank via the Zig core (returns nil on error).
-                            return slowClawParseAndRankRSS(xml: xml, sourceLabel: src.displayLabel, topics: topics)
-                        }
-                    }
-                    var got: [[RankedFeedItem]] = []
-                    for await r in group { if let r { got.append(r) } }
-                    return got
-                }
-                for r in results {
-                    if !r.isEmpty { reachedAny = true }
-                    allRanked.append(contentsOf: r)
-                }
-            }
-
-            allRanked.sort { $0.score > $1.score }
-            // Cap the displayed list at 60; the reference paginates +12.
-            return (Array(allRanked.prefix(60)), reachedAny ? nil : "Couldn't reach any feeds. Pull to retry.")
-        }.value
-
-        // Hop back to the main actor to mutate UI state.
-        feedItems = fetched.0
-        if feedItems.isEmpty { loadError = fetched.1 ?? "No stories right now. Pull to retry." }
-        isLoading = false
     }
 }
 
@@ -1659,17 +1695,44 @@ struct FeedCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // Optional cover image (YouTube thumbnail / Nostr article image).
+            if let thumb = item.thumbnailURL, let url = URL(string: thumb) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .empty:
+                        Rectangle().fill(DS.surface2(scheme))
+                            .frame(height: 160)
+                    case .success(let image):
+                        image.resizable().scaledToFill().frame(height: 160).clipped()
+                    case .failure:
+                        Color.clear.frame(height: 0)
+                    @unknown default:
+                        Color.clear.frame(height: 0)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: 160)
+                .background(DS.surface2(scheme))
+                .clipped()
+            }
+
             VStack(alignment: .leading, spacing: 6) {
-                // Source row: accent-green uppercase host + read time.
+                // Source row: accent-green uppercase host + read time / video badge.
                 HStack(spacing: 8) {
                     Text(host.uppercased())
                         .font(DS.sourceLabelFont)
                         .foregroundStyle(DS.accent(scheme))
                         .kerning(0.3)
                     Spacer()
-                    Text("⏱ \(item.readMinutes) min")
-                        .font(DS.captionFont)
-                        .foregroundStyle(DS.muted(scheme))
+                    if item.sourcePlatform == "youtube" {
+                        Text("▶ Video")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                    } else {
+                        Text("⏱ \(item.readMinutes) min")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                    }
                 }
 
                 // Title
