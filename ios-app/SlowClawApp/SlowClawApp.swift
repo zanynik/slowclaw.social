@@ -264,13 +264,15 @@ final class AppState: ObservableObject {
         let sources = catalog
 
         // Snapshot fetch happens off the main actor.
-        let (rss, nostr, reachedAny) = await Task.detached(priority: .userInitiated) {
+        let fetched = await Task.detached(priority: .userInitiated) {
             async let rssResult = Self.fetchAllRSS(sources: sources, topics: topics)
             async let nostrResult = NostrFetcher.fetchArticles()
-            let r = await rssResult
-            let n = await nostrResult
-            return (r, n)
+            // rssResult is ([RankedFeedItem], Bool); nostrResult is [RankedFeedItem].
+            return await (rssResult, nostrResult)
         }.value
+        let rss = fetched.0.0
+        let reachedAny = fetched.0.1
+        let nostr = fetched.1
 
         var combined = rss + nostr
         combined.sort { $0.score > $1.score }
