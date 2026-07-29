@@ -235,7 +235,82 @@ pub fn rankReads(
         }
     }.cmp);
 
+    // Cold start (no journal topics): a brand-new user has no "lens" yet, so a
+    // pure score sort lets one prolific source (e.g. Hacker News) own the whole
+    // top of the feed. Diversify instead — cap per source + round-robin — so the
+    // initial feed reads as "latest tech + latest news, diverse sources" rather
+    // than a wall of HN. Once the user writes journals (topics != empty), the
+    // journal-driven boost takes over and diversification is skipped.
+    if (topics.len == 0) {
+        const diversified = diversifyColdStart(allocator, ranked, 3, 60) catch return ranked;
+        allocator.free(ranked);
+        return diversified;
+    }
+
     return ranked;
+}
+
+/// Cold-start diversity pass. Given a score-sorted (desc) slice, cap each
+/// `source_label` to `max_per_source` items, then interleave the remaining
+/// items round-robin (one per source per round, score order within a source)
+/// until `limit` is reached. This prevents a single source from dominating the
+/// visible feed when the user has no journal topics yet.
+///
+/// The result is a freshly-allocated, allocator-owned slice (caller frees).
+pub fn diversifyColdStart(
+    allocator: std.mem.Allocator,
+    ranked: []const RankedItem,
+    max_per_source: usize,
+    limit: usize,
+) ![]RankedItem {
+    if (ranked.len == 0) return try allocator.alloc(RankedItem, 0);
+
+    // Per-source queues, preserving score order (ranked is already sorted desc).
+    // Each queue holds at most max_per_source items for that source.
+    var queues = std.StringHashMap(std.ArrayList(RankedItem)).init(allocator);
+    defer {
+        var it = queues.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        queues.deinit();
+    }
+    for (ranked) |r| {
+        const gop = try queues.getOrPut(r.source_label);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        if (gop.value_ptr.items.len < max_per_source) {
+            try gop.value_ptr.append(allocator, r);
+        }
+    }
+
+    const cap = if (limit == 0) ranked.len else @min(limit, ranked.len);
+    var out: std.ArrayList(RankedItem) = .empty;
+    errdefer out.deinit(allocator);
+
+    // Round-robin: each pass takes the next item from every source, score-order
+    // within a source, until the cap is filled or no source has more to give.
+    var any_left = true;
+    while (out.items.len < cap and any_left) {
+        any_left = false;
+        var it = queues.iterator();
+        while (it.next()) |entry| {
+            if (out.items.len >= cap) break;
+            const taken_from_source = countSource(out.items, entry.key_ptr.*);
+            if (taken_from_source >= max_per_source) continue;
+            if (entry.value_ptr.items.len > taken_from_source) {
+                try out.append(allocator, entry.value_ptr.items[taken_from_source]);
+                any_left = true;
+            }
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn countSource(out: []const RankedItem, source: []const u8) usize {
+    var n: usize = 0;
+    for (out) |r| {
+        if (std.mem.eql(u8, r.source_label, source)) n += 1;
+    }
+    return n;
 }
 
 // ── Chronological variant ─────────────────────────────────────────────────
@@ -493,4 +568,102 @@ test "matchesTopic: matches title, body, author" {
     try testing.expect(matchesTopic(item, "systems"));
     try testing.expect(matchesTopic(item, "rustacean"));
     try testing.expect(!matchesTopic(item, "python"));
+}
+
+// ── Cold-start diversity (TDD) ─────────────────────────────────────────────
+
+/// Helper: build a RankedItem with a given source label and score.
+fn rankedOf(id: []const u8, source_label: []const u8, score: f64) RankedItem {
+    return .{
+        .item = .{
+            .id = id,
+            .title = id,
+            .body = "",
+            .author_handle = source_label,
+            .source_platform = "rss",
+            .timestamp = 0,
+        },
+        .score = score,
+        .read_minutes = 1,
+        .source_label = source_label,
+    };
+}
+
+test "diversifyColdStart: caps per source and interleaves (no one source dominates)" {
+    const a = testing.allocator;
+    // Source "hn" has 8 items, "wsj" has 5, "arxiv" has 1 — score-sorted.
+    // Without a cap, hn would own the top 8 slots.
+    var input = std.ArrayList(RankedItem).empty;
+    defer input.deinit(a);
+    var i: usize = 0;
+    while (i < 8) : (i += 1) try input.append(a, rankedOf("hn-a", "hn", 10.0 - @as(f64, @floatFromInt(i))));
+    i = 0;
+    while (i < 5) : (i += 1) try input.append(a, rankedOf("wsj-a", "wsj", 9.0 - @as(f64, @floatFromInt(i))));
+    try input.append(a, rankedOf("arxiv-a", "arxiv", 8.0));
+
+    const out = try diversifyColdStart(a, input.items, 4, 20);
+    defer a.free(out);
+
+    // hn(8)→4, wsj(5)→4, arxiv(1)→1 = 9 capped items. Limit 20 doesn't pad.
+    try testing.expectEqual(@as(usize, 9), out.len);
+    // No source exceeds the cap of 4.
+    var counts = std.StringHashMap(usize).init(a);
+    defer counts.deinit();
+    for (out) |r| {
+        const entry = try counts.getOrPut(r.source_label);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += 1;
+        try testing.expect(entry.value_ptr.* <= 4);
+    }
+    // Each capped source contributed its full allotment.
+    try testing.expectEqual(@as(usize, 4), counts.get("hn").?);
+    try testing.expectEqual(@as(usize, 4), counts.get("wsj").?);
+    try testing.expectEqual(@as(usize, 1), counts.get("arxiv").?);
+    // Round-robin: the top 3 slots are one-per-source (3 distinct sources),
+    // regardless of which source the hash iteration visits first.
+    var topSources = std.StringHashMap(void).init(a);
+    defer topSources.deinit();
+    var k: usize = 0;
+    while (k < 3) : (k += 1) try topSources.put(out[k].source_label, {});
+    try testing.expectEqual(@as(usize, 3), topSources.count());
+}
+
+test "diversifyColdStart: passthrough when input smaller than cap total" {
+    const a = testing.allocator;
+    const input = [_]RankedItem{
+        rankedOf("a", "src1", 5.0),
+        rankedOf("b", "src1", 4.0),
+        rankedOf("c", "src2", 3.0),
+    };
+    const out = try diversifyColdStart(a, &input, 4, 20);
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 3), out.len); // all 3, no padding
+}
+
+test "rankReads: cold-start (no topics) diversifies the output" {
+    // Integration: rankReads with no topics should produce a diversified list,
+    // not let one source own every top slot.
+    const a = testing.allocator;
+    var items = std.ArrayList(FeedItem).empty;
+    defer items.deinit(a);
+    var n: usize = 0;
+    while (n < 6) : (n += 1) {
+        const id = try std.fmt.allocPrint(a, "hn-{d}", .{n});
+        defer a.free(id);
+        try items.append(a, .{ .id = id, .title = id, .body = "x", .author_handle = "hackernews", .source_platform = "rss", .timestamp = 1_000_000 - @as(f64, @floatFromInt(n)) });
+    }
+    n = 0;
+    while (n < 3) : (n += 1) {
+        const id = try std.fmt.allocPrint(a, "sim-{d}", .{n});
+        defer a.free(id);
+        try items.append(a, .{ .id = id, .title = id, .body = "x", .author_handle = "simonwillison", .source_platform = "rss", .timestamp = 900_000 - @as(f64, @floatFromInt(n)) });
+    }
+    const ranked = try rankReads(a, items.items, &.{}, &.{}, 1_000_000);
+    defer a.free(ranked);
+    // Top 4 must contain at least 2 distinct sources (diversified).
+    var seen = std.StringHashMap(void).init(a);
+    defer seen.deinit();
+    var k: usize = 0;
+    while (k < @min(ranked.len, 4)) : (k += 1) try seen.put(ranked[k].source_label, {});
+    try testing.expect(seen.count() >= 2);
 }
