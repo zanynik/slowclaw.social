@@ -134,6 +134,7 @@ enum NostrFetcher {
     /// A parsed NIP-23 article event.
     private struct Article {
         let identifier: String      // event id (hex) — used for the habla fallback link
+        let pubkey: String          // event author pubkey (hex) — used for the naddr link
         let dTag: String            // NIP-33 "d" identifier — used for the naddr link
         let title: String?
         let summary: String
@@ -144,6 +145,11 @@ enum NostrFetcher {
         init?(event: [String: Any]) {
             guard let id = event["id"] as? String else { return nil }
             identifier = id
+            // The author pubkey is a top-level field on every Nostr event.
+            // The naddr's author TLV (type 2) MUST be this 32-byte pubkey,
+            // NOT the event id — otherwise habla.news decodes a valid bech32
+            // string that points at a nonexistent (pubkey, kind, d) → 404.
+            pubkey = (event["pubkey"] as? String) ?? ""
             body = (event["content"] as? String) ?? ""
             createdAt = (event["created_at"] as? Double) ?? (event["created_at"] as? Int).map(Double.init) ?? 0
             var d = "", t: String?, sum = "", img: String?
@@ -167,9 +173,11 @@ enum NostrFetcher {
         }
 
         /// habla.news link, preferring a naddr-encoded address (mirrors
-        /// encodeNaddr in web/src/lib/nostr.ts). Falls back to the hex id.
+        /// encodeNaddr in web/src/lib/nostr.ts, which encodes the author
+        /// PUBKEY — not the event id). Falls back to the hex event id.
         var hablaURL: String {
-            if !dTag.isEmpty, let naddr = Nip19.encodeNaddr(identifier: dTag, pubkey: identifier, kind: 30023) {
+            if !dTag.isEmpty, !pubkey.isEmpty,
+               let naddr = Nip19.encodeNaddr(identifier: dTag, pubkey: pubkey, kind: 30023) {
                 return "https://habla.news/a/\(naddr)"
             }
             return "https://habla.news/a/\(identifier)"

@@ -94,6 +94,8 @@ enum AppTheme: String {
 @main
 struct SlowClawApp: App {
     @StateObject private var appState = AppState()
+    @StateObject private var voiceMemoImporter = VoiceMemoImporter()
+    @State private var pendingImports: [URL] = []
     @AppStorage("slowclaw.theme") private var themeRaw: String = ""
 
     private var preferredScheme: ColorScheme? {
@@ -108,8 +110,28 @@ struct SlowClawApp: App {
         WindowGroup {
             AppShell()
                 .environmentObject(appState)
+                .environmentObject(voiceMemoImporter)
                 .preferredColorScheme(preferredScheme)
                 .tint(DS.accentColor)
+                // Voice Memos / Files share-sheet entry point: iOS delivers the
+                // audio file URL here. Copy it into the Inbox, then transcribe
+                // (newest first) in the background.
+                .onOpenURL { url in
+                    handleIncoming(url)
+                }
+                .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { _ in }
+        }
+    }
+
+    /// Handle a shared audio file: copy into Inbox and queue for transcription.
+    private func handleIncoming(_ url: URL) {
+        guard let dest = voiceMemoImporter.copyAudio(url) else { return }
+        pendingImports.append(dest)
+        // Defer transcription until appState is fully up (memory is open).
+        Task { @MainActor in
+            voiceMemoImporter.status = "Importing…"
+            await voiceMemoImporter.transcribeAndStore(files: pendingImports, state: appState)
+            pendingImports.removeAll()
         }
     }
 }
@@ -638,6 +660,7 @@ struct BottomNav: View {
 struct JournalSidebar: View {
     let scheme: ColorScheme
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var voiceMemoImporter: VoiceMemoImporter
     @State private var search = ""
 
     private var filtered: [SlowClawMemoryEntry] {
@@ -703,6 +726,36 @@ struct JournalSidebar: View {
                     }
                     .padding(.horizontal, 22)
                     .padding(.top, 8)
+                    .padding(.bottom, 4)
+
+                    // Voice-memo import status (shown while importing or briefly
+                    // after). The share-sheet path is the primary entry; this
+                    // surfaces progress. Mirrors the reference's "Importing
+                    // voice memos…" row.
+                    if let status = voiceMemoImporter.status {
+                        HStack(spacing: 6) {
+                            if voiceMemoImporter.isImporting {
+                                ProgressView().scaleEffect(0.6).frame(width: 12, height: 12)
+                            }
+                            Text(status)
+                                .font(DS.microFont)
+                                .foregroundStyle(DS.muted(scheme))
+                            Spacer()
+                        }
+                        .padding(.horizontal, 22)
+                        .padding(.bottom, 4)
+                    }
+
+                    // Hint: how to import voice memos (share sheet → SlowClaw).
+                    HStack(spacing: 6) {
+                        Image(systemName: "waveform")
+                            .font(.system(size: 11))
+                        Text("Import voice memos via the share sheet → SlowClaw.")
+                            .font(DS.microFont)
+                        Spacer()
+                    }
+                    .foregroundStyle(DS.muted(scheme))
+                    .padding(.horizontal, 22)
                     .padding(.bottom, 4)
 
                     // List.
@@ -846,6 +899,24 @@ struct JournalView: View {
     @EnvironmentObject var state: AppState
     @State private var newEntry = ""
     @State private var isSynthesizing = false
+    // Auto-save (mirrors the reference's 700ms debounce + 60s periodic).
+    @State private var saveStatus: String? = nil
+    @State private var autosaveTask: Task<Void, Never>? = nil
+    @State private var periodicSaveTask: Task<Void, Never>? = nil
+
+    /// First-entry rotating prompts (one per day-of-month), like the reference's
+    /// FIRST_ENTRY_PROMPTS. Shown above an empty editor when no journal exists.
+    private let firstEntryPrompts = [
+        "What made today different?",
+        "Something you're figuring out right now…",
+        "A moment worth keeping.",
+        "What's been on your mind lately?",
+        "One small thing that went well.",
+    ]
+    private var firstEntryPrompt: String {
+        let day = Calendar.current.component(.day, from: Date())
+        return firstEntryPrompts[day % firstEntryPrompts.count]
+    }
 
     var body: some View {
         ScrollView {
@@ -874,16 +945,27 @@ struct JournalView: View {
                 AudioCaptureView()
                     .padding(.horizontal, 16)
 
+                // First-entry rotating prompt (italic, like the reference's
+                // .first-entry-prompt) — shown above an empty editor only when
+                // the user has no journals yet.
+                if state.journals.isEmpty && newEntry.isEmpty {
+                    Text(firstEntryPrompt)
+                        .font(DS.captionFont.italic())
+                        .foregroundStyle(DS.muted(scheme))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                }
+
                 DS.card(scheme) {
                     TextEditor(text: $newEntry)
-                        .frame(minHeight: 100)
+                        .frame(minHeight: state.journals.isEmpty ? 160 : 100)
                         .scrollContentBackground(.hidden)
                         .font(DS.bodyFont)
                         .foregroundStyle(DS.ink(scheme))
                         .padding(.vertical, 4)
                         .overlay(alignment: .topLeading) {
                             if newEntry.isEmpty {
-                                Text("What's on your mind?")
+                                Text("What's on your mind today?")
                                     .font(DS.bodyFont)
                                     .foregroundStyle(DS.muted(scheme))
                                     .padding(.horizontal, 4)
@@ -929,30 +1011,32 @@ struct JournalView: View {
                         .padding(.horizontal, 16)
                 }
 
-                // Recent entries (the sidebar is the primary list; this is a
-                // quick inline glance at recent journals).
-                ForEach(state.journals.prefix(8), id: \.id) { entry in
-                    JournalCard(entry: entry, highlighted: state.selectedJournalKey == entry.key)
-                        .padding(.horizontal, 16)
-                        .contextMenu {
-                            Button {
-                                state.selectedJournalKey = entry.key
-                            } label: {
-                                Label("Open in editor", systemImage: "pencil")
-                            }
-                            Button {
-                                Task { await state.generateDraft(from: entry) }
-                            } label: {
-                                Label("Draft Post", systemImage: "square.and.pencil")
-                            }
-                            Button(role: .destructive) {
-                                try? state.memory.forget(key: entry.key)
-                                if state.selectedJournalKey == entry.key { state.selectedJournalKey = nil }
-                                Task { await state.refreshJournals() }
-                            } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
+                // Save status (autosave feedback), mirrors the reference's
+                // journalSaveStatus line.
+                if let status = saveStatus {
+                    Text(status)
+                        .font(DS.microFont)
+                        .foregroundStyle(DS.muted(scheme))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                }
+
+                // Hint: the recent-entries list lives in the drawer (hamburger),
+                // matching the reference which keeps the list out of the editor.
+                if !state.journals.isEmpty {
+                    Button {
+                        state.journalSidebarOpen = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "line.3.horizontal")
+                                .font(.system(size: 12))
+                            Text("\(state.journals.count) journal\(state.journals.count == 1 ? "" : "s") · open list")
+                                .font(DS.captionFont)
                         }
+                        .foregroundStyle(DS.muted(scheme))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 20)
                 }
             }
             .padding(.top, 16)
@@ -964,9 +1048,59 @@ struct JournalView: View {
         .onChange(of: state.selectedJournalKey) {
             newEntry = state.selectedJournal?.content ?? ""
         }
+        // Debounced auto-save on edits (700ms, like the reference). Only saves
+        // when there's meaningful content (>=10 chars) and something to persist.
+        .onChange(of: newEntry) {
+            scheduleAutosave()
+        }
         .onAppear {
             // Sync the editor with any pre-existing selection on first show.
             if newEntry.isEmpty { newEntry = state.selectedJournal?.content ?? "" }
+            startPeriodicSave()
+        }
+        .onDisappear {
+            autosaveTask?.cancel()
+            periodicSaveTask?.cancel()
+        }
+    }
+
+    /// Schedule a debounced auto-save 700ms after the last edit.
+    private func scheduleAutosave() {
+        autosaveTask?.cancel()
+        autosaveTask = Task {
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            if Task.isCancelled { return }
+            await autosave()
+        }
+    }
+
+    /// Periodic safety-net save every 60s while the editor is open.
+    private func startPeriodicSave() {
+        periodicSaveTask?.cancel()
+        periodicSaveTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                if Task.isCancelled { return }
+                await autosave()
+            }
+        }
+    }
+
+    private func autosave() async {
+        let text = newEntry.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count >= 10 else { return } // nothing meaningful yet
+        saveStatus = "Saving…"
+        if let key = state.selectedJournalKey {
+            try? state.memory.store(key: key, content: text, category: "daily", sessionID: nil)
+            await state.refreshJournals()
+        } else {
+            await state.storeJournal(text: text)
+        }
+        saveStatus = "Saved"
+        // Clear the status after 2.5s (matches the reference's holdJournalStatus).
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            if saveStatus == "Saved" { saveStatus = nil }
         }
     }
 

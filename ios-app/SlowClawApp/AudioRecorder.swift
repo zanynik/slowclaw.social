@@ -18,17 +18,24 @@ final class AudioRecorder: NSObject, ObservableObject {
     @Published var transcript = ""
     @Published var audioLevel: Float = 0
     @Published var errorMessage: String?
+    @Published var elapsedSeconds: Int = 0
 
     private var recorder: AVAudioRecorder?
     private var speechRecognizer: SFSpeechRecognizer?
     private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
     private var speechTask: SFSpeechRecognitionTask?
     private let audioEngine = AVAudioEngine()
+    private var timer: Timer?
 
     override init() {
         super.init()
         speechRecognizer = SFSpeechRecognizer(locale: Locale.current)
         speechRecognizer?.defaultTaskHint = .dictation
+    }
+
+    /// Formatted mm:ss for the recording timer (matches the reference's capture-zen-timer).
+    var elapsedLabel: String {
+        String(format: "%d:%02d", elapsedSeconds / 60, elapsedSeconds % 60)
     }
 
     func requestPermissions() async -> Bool {
@@ -84,12 +91,18 @@ final class AudioRecorder: NSObject, ObservableObject {
             }
 
             isRecording = true
+            elapsedSeconds = 0
+            timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.elapsedSeconds += 1 }
+            }
         } catch {
             errorMessage = "Failed to start recording: \(error.localizedDescription)"
         }
     }
 
     func stopRecording() {
+        timer?.invalidate()
+        timer = nil
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
         speechRequest?.endAudio()
@@ -112,55 +125,111 @@ struct AudioCaptureView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.colorScheme) var scheme
     @State private var showTranscript = false
+    @State private var pulse = false
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 16) {
             if recorder.isRecording {
-                // Live transcript
-                ScrollView {
-                    Text(recorder.transcript.isEmpty ? "Listening…" : recorder.transcript)
-                        .font(DS.bodyFont)
-                        .foregroundStyle(recorder.transcript.isEmpty ? AnyShapeStyle(DS.muted(scheme)) : AnyShapeStyle(DS.ink(scheme)))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding()
-                        .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+                // ── Recording zen screen (mirrors the reference's .capture-zen) ──
+                // Top row: timer (right) so the user can see how long they've recorded.
+                HStack {
+                    Spacer()
+                    Text(recorder.elapsedLabel)
+                        .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(DS.muted(scheme))
                 }
-                .frame(maxHeight: 120)
 
+                // Capture stage: bordered rounded panel (like .capture-stage).
+                VStack(spacing: 12) {
+                    Text("Audio capture")
+                        .font(DS.captionFont)
+                        .foregroundStyle(DS.muted(scheme))
+
+                    // Live transcript — the focus while recording.
+                    ScrollView {
+                        Text(recorder.transcript.isEmpty ? "Listening…" : recorder.transcript)
+                            .font(DS.bodyFont)
+                            .foregroundStyle(recorder.transcript.isEmpty ? DS.muted(scheme) : DS.ink(scheme))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: 170)
+                    .padding(12)
+                    .background(DS.surface3(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+
+                    // Pulsing "Listening" feedback row.
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(DS.accent(scheme))
+                            .frame(width: 8, height: 8)
+                            .opacity(0.85)
+                        Text("Listening")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                    }
+                }
+                .padding(16)
+                .background(DS.bg(scheme), in: RoundedRectangle(cornerRadius: DS.rLg, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.rLg, style: .continuous)
+                        .stroke(DS.line(scheme), lineWidth: 1)
+                )
+
+                // Pulsing coral record button → Stop & Save.
                 Button {
                     recorder.stopRecording()
                     showTranscript = true
                 } label: {
-                    HStack {
+                    ZStack {
+                        Circle()
+                            .fill(LinearGradient(colors: [DS.accent2Color, Color(red: 0.83, green: 0.3, blue: 0.23)],
+                                                  startPoint: .topLeading, endPoint: .bottomTrailing))
+                            .frame(width: 76, height: 76)
+                            .shadow(color: DS.accent2Color.opacity(0.4), radius: 12, y: 4)
+                            .scaleEffect(1.0)
+                            .overlay {
+                                // Pulsing ring (mirrors recording-pulse).
+                                Circle()
+                                    .stroke(DS.accent2Color.opacity(0.5), lineWidth: 2)
+                                    .scaleEffect(pulse ? 1.5 : 1.0)
+                                    .opacity(pulse ? 0 : 0.6)
+                            }
+                            .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: false), value: pulse)
                         Image(systemName: "stop.fill")
-                            .font(.title2)
-                        Text("Stop & Transcribe")
-                            .font(.headline)
+                            .font(.system(size: 28))
+                            .foregroundStyle(.white)
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding()
-                    .background(DS.accent2Color, in: RoundedRectangle(cornerRadius: DS.rLg, style: .continuous))
-                    .foregroundStyle(.white)
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Stop and save")
+
+                Text("Stop & Save")
+                    .font(DS.captionFont)
+                    .foregroundStyle(DS.muted(scheme))
             } else {
-                // Record button
+                // ── Idle: round green record button (mirrors .record-btn.audio) ──
                 Button {
                     Task {
                         recorder.transcript = ""
                         await recorder.startRecording()
                     }
                 } label: {
-                    VStack(spacing: 6) {
+                    ZStack {
+                        Circle()
+                            .fill(LinearGradient(colors: [DS.accent(scheme), Color(red: 0.05, green: 0.56, blue: 0.44)],
+                                                  startPoint: .topLeading, endPoint: .bottomTrailing))
+                            .frame(width: 76, height: 76)
+                            .shadow(color: DS.accent(scheme).opacity(0.42), radius: 10, y: 4)
                         Image(systemName: "mic.fill")
-                            .font(.system(size: 32))
-                        Text("Tap to record")
-                            .font(.subheadline)
+                            .font(.system(size: 28))
+                            .foregroundStyle(.white)
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 20)
-                    .background(DS.accentDim(scheme), in: RoundedRectangle(cornerRadius: DS.rLg, style: .continuous))
-                    .foregroundStyle(DS.accent(scheme))
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Record audio")
+
+                Text("Tap to record an audio journal")
+                    .font(DS.captionFont)
+                    .foregroundStyle(DS.muted(scheme))
 
                 if let err = recorder.errorMessage {
                     Text(err)
@@ -169,6 +238,8 @@ struct AudioCaptureView: View {
                 }
             }
         }
+        .onAppear { pulse = true }
+        .onDisappear { pulse = false }
         .sheet(isPresented: $showTranscript) {
             TranscriptSheet(transcript: recorder.transcript) { polished in
                 Task { await state.storeJournal(text: polished) }

@@ -59,5 +59,28 @@
     <true/>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
+    <!-- Declare SlowClaw as a handler for audio files so iOS shows it in the
+         share sheet ("Copy to SlowClaw") from Voice Memos / Files. Alternate
+         rank keeps Voice Memos/Files as the default and SlowClaw as an option.
+         Mirrors web/src-tauri/Info.ios.plist CFBundleDocumentTypes. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Audio Recording</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.audio</string>
+                <string>public.mpeg4-audio</string>
+                <string>public.mp3</string>
+                <string>com.apple.m4a-audio</string>
+                <string>com.apple.protected-mpeg-4-audio</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
