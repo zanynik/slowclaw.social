@@ -301,11 +301,6 @@ fn buildLlamaCpp(
         mod.addSystemIncludePath(.{ .cwd_relative = sdk });
         const usr_inc = std.fmt.allocPrint(b.allocator, "{s}/usr/include", .{sdk}) catch @panic("oom");
         mod.addSystemIncludePath(.{ .cwd_relative = usr_inc });
-        // C++ stdlib headers from the iOS SDK (zig only adds its bundled
-        // libc++ headers when it also links its libc++, which iOS skips —
-        // see link_libcpp note above).
-        const cxx_inc = std.fmt.allocPrint(b.allocator, "{s}/usr/include/c++/v1", .{sdk}) catch @panic("oom");
-        mod.addSystemIncludePath(.{ .cwd_relative = cxx_inc });
     }
 
     // Definitions mirror upstream CMake (ggml/src/CMakeLists.txt):
@@ -354,6 +349,15 @@ fn buildLlamaCpp(
     if (is_generic) {
         c_flags.append(b.allocator, "-DGGML_CPU_GENERIC") catch @panic("oom");
         cxx_flags.append(b.allocator, "-DGGML_CPU_GENERIC") catch @panic("oom");
+    }
+    // C++ stdlib headers from the iOS SDK (zig only adds its bundled libc++
+    // headers when it also links its libc++, which iOS skips — see the
+    // link_libcpp note above). Scoped to C++ sources via per-file -isystem
+    // flags: a module-level system path would shadow clang's builtin header
+    // chain for the C files (stdatomic.h → 'unknown type name atomic_int').
+    if (ios_sysroot) |sdk| {
+        cxx_flags.append(b.allocator, "-isystem") catch @panic("oom");
+        cxx_flags.append(b.allocator, std.fmt.allocPrint(b.allocator, "{s}/usr/include/c++/v1", .{sdk}) catch @panic("oom")) catch @panic("oom");
     }
 
     var c_sources = std.ArrayList([]const u8).empty;
