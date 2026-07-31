@@ -30,10 +30,12 @@ settings:
     SWIFT_VERSION: "5.9"
     DEVELOPMENT_TEAM: "${APPLE_DEVELOPMENT_TEAM}"
     CODE_SIGN_STYLE: "Manual"
-    # Link the Zig staticlib + the vendored SQLite staticlib. build.zig emits
-    # them as TWO separate archives (libslowclaw_feed.a + libsqlite3.a), so the
-    # app must link both — the Zig lib references the sqlite3_* symbols.
-    OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3"
+    # Link the Zig staticlib + the vendored SQLite + llama.cpp staticlibs.
+    # build.zig emits THREE separate archives (libslowclaw_feed.a, libsqlite3.a,
+    # libllama.a), so the app must link all three — the Zig lib references the
+    # sqlite3_* symbols, and local_inference.zig references the llama_* symbols.
+    # libllama.a bundles zig's libc++, so no -lc++ is needed.
+    OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3 -lllama"
     LIBRARY_SEARCH_PATHS: "$(SRCROOT)/../zig-src/zig-out/lib"
     # Header search path for the C ABI contract.
     HEADER_SEARCH_PATHS: "$(SRCROOT)/SlowClawFeed/Sources/SlowClawFeed/include"
@@ -57,9 +59,11 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: SlowClawApp/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        # Link the Zig staticlib + the vendored SQLite staticlib (target-level
-        # override of the base OTHER_LDFLAGS). Both come from zig-out/lib.
-        OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3"
+        # Link the Zig + vendored staticlibs (target-level override of the
+        # base OTHER_LDFLAGS). All three come from zig-out/lib.
+        OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3 -lllama"
+        # Entitlements: increased memory limit so on-device GGUF models fit.
+        CODE_SIGN_ENTITLEMENTS: SlowClawApp/SlowClaw.entitlements
         LIBRARY_SEARCH_PATHS: "$(SRCROOT)/../zig-src/zig-out/lib"
         ENABLE_BITCODE: NO
         TARGETED_DEVICE_FAMILY: "1,2" # iPhone + iPad
@@ -91,6 +95,7 @@ targets:
             mkdir -p zig-out/lib
             cp zig-out-sim/lib/libslowclaw_feed.a zig-out/lib/libslowclaw_feed.a
             cp zig-out-sim/lib/libsqlite3.a zig-out/lib/libsqlite3.a
+            cp zig-out-sim/lib/libllama.a zig-out/lib/libllama.a
           else
             IOS_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
             # ReleaseFast (not ReleaseSafe): Zig 0.16's std.debug unconditionally
@@ -106,6 +111,7 @@ targets:
         outputFiles:
           - $(SRCROOT)/../zig-src/zig-out/lib/libslowclaw_feed.a
           - $(SRCROOT)/../zig-src/zig-out/lib/libsqlite3.a
+          - $(SRCROOT)/../zig-src/zig-out/lib/libllama.a
 
 schemes:
   SlowClaw:

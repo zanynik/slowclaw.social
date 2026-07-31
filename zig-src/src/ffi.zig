@@ -40,6 +40,7 @@ const journal_agent = @import("journal_agent.zig");
 const rss_parser = @import("rss_parser.zig");
 const feeds_ranking = @import("feeds_ranking.zig");
 const feed_catalog = @import("feed_catalog.zig");
+const local_inference = @import("local_inference.zig");
 
 /// C allocator — pairs with `free` on the Swift side. Using this ensures Zig
 /// and Swift agree on the heap.
@@ -863,18 +864,18 @@ test "ffi: catalog_json returns all default sources as valid JSON" {
 
 // ── On-device LLM (llama.cpp) ─────────────────────────────────────────────
 //
-// local_inference.zig declares the llama.cpp bindings but the actual `llama.a`
-// is NOT linked into this build yet (it's a separate, macOS-only cross-compile
-// step with Metal). Until that lands, these FFI entry points report
-// `available: false` so the Swift UI can show an honest "not available"
-// status instead of pretending. The instant llama.cpp is linked, the stub
-// bodies below are the only thing that changes — the FFI shape stays.
+// When the vendored llama.cpp backend is compiled in (build option
+// -Dwith-llama=true, the default for the shipped staticlib), these entry
+// points drive real on-device inference through local_inference.zig. When
+// compiled out (unit-test steps), they report `available: false` exactly
+// like the pre-llama builds — the FFI shape never changes.
 
-/// Return on-device LLM status as JSON: {"available","reason"}.
-/// `available` is false until llama.cpp is linked. Bytes are c_allocator-owned;
-/// caller frees via slowclaw_feed_free.
+/// Return on-device LLM status as JSON:
+/// {"available","loaded","modelId"?,"reason"}. `available` reflects whether
+/// the llama.cpp backend is linked; `loaded` whether a model is in memory.
+/// Bytes are c_allocator-owned; caller frees via slowclaw_feed_free.
 pub export fn slowclaw_feed_local_llm_status(out_str: *SlowclawString) c_int {
-    const json = c_allocator.dupe(u8, "{\"available\":false,\"reason\":\"llama.cpp backend not linked yet\"}") catch {
+    const json = local_inference.statusJson(c_allocator) catch {
         out_str.* = SlowclawString.empty();
         return SLOWCLAW_ERR_OUT_OF_MEMORY;
     };
@@ -882,22 +883,28 @@ pub export fn slowclaw_feed_local_llm_status(out_str: *SlowclawString) c_int {
     return SLOWCLAW_OK;
 }
 
-/// Load a GGUF model. Returns SLOWCLAW_ERR_INTERNAL until llama.cpp is linked.
+/// Load a GGUF model. Returns SLOWCLAW_OK on success; SLOWCLAW_ERR_INVALID_ARGUMENT
+/// when the file is missing/invalid/not a GGUF; SLOWCLAW_ERR_INTERNAL when
+/// llama.cpp itself rejects the model (too large, unsupported arch).
 pub export fn slowclaw_feed_local_llm_load(
     model_path: [*]const u8,
     model_path_len: usize,
 ) c_int {
-    _ = model_path;
-    _ = model_path_len;
-    return SLOWCLAW_ERR_INTERNAL;
+    local_inference.loadModel(model_path[0..model_path_len]) catch |err| return switch (err) {
+        error.OutOfMemory => SLOWCLAW_ERR_OUT_OF_MEMORY,
+        error.ModelLoadFailed => SLOWCLAW_ERR_INVALID_ARGUMENT,
+        else => SLOWCLAW_ERR_INTERNAL,
+    };
+    return SLOWCLAW_OK;
 }
 
-/// Unload the current model. No-op until llama.cpp is linked.
-pub export fn slowclaw_feed_local_llm_unload() void {}
+/// Unload the current model (frees RAM). No-op when nothing is loaded.
+pub export fn slowclaw_feed_local_llm_unload() void {
+    local_inference.unloadModel();
+}
 
-/// Run a chat completion on the loaded model. Returns an error result until
-/// llama.cpp is linked. (Shape mirrors slowclaw_feed_provider_chat so the Swift
-/// overlay can switch to it once available.)
+/// Run a chat completion on the loaded model. Shape mirrors
+/// slowclaw_feed_provider_chat so the Swift overlay can swap transports.
 pub export fn slowclaw_feed_local_llm_chat(
     system_prompt: ?[*]const u8,
     system_prompt_len: usize,
@@ -907,14 +914,77 @@ pub export fn slowclaw_feed_local_llm_chat(
     temperature: f64,
     out_result: *SlowclawChatResult,
 ) c_int {
-    _ = system_prompt;
-    _ = system_prompt_len;
-    _ = message;
-    _ = message_len;
-    _ = max_tokens;
-    _ = temperature;
-    out_result.* = .{ .text = SlowclawString.empty(), .status = SLOWCLAW_ERR_INTERNAL };
-    return SLOWCLAW_ERR_INTERNAL;
+    const sys_slice: ?[]const u8 = if (system_prompt) |s| s[0..system_prompt_len] else null;
+    const result = local_inference.chat(
+        c_allocator,
+        sys_slice,
+        message[0..message_len],
+        max_tokens,
+        @floatCast(temperature),
+    ) catch |err| {
+        const status: c_int = switch (err) {
+            error.ModelNotLoaded => SLOWCLAW_ERR_INVALID_ARGUMENT,
+            error.OutOfMemory => SLOWCLAW_ERR_OUT_OF_MEMORY,
+            else => SLOWCLAW_ERR_INTERNAL,
+        };
+        out_result.* = .{ .text = SlowclawString.empty(), .status = status };
+        return status;
+    };
+    out_result.* = .{ .text = SlowclawString.fromOwnedSlice(result), .status = SLOWCLAW_OK };
+    return SLOWCLAW_OK;
+}
+
+/// Local inference through the same journal_agent prompts the HTTP provider
+/// uses — synthesize / extract / draft behave identically on-device. `model`
+/// is accepted for call-site symmetry with the provider variants and ignored
+/// (the loaded GGUF is the model).
+fn localJournalAgentCall(
+    comptime agent_fn: anytype,
+    args: anytype,
+    out_result: *SlowclawChatResult,
+) c_int {
+    var engine = local_inference.LocalInference.init("");
+    engine.is_loaded = local_inference.isLoaded();
+    const pv = engine.provider_();
+    const result = @call(.auto, agent_fn, .{pv, c_allocator} ++ args) catch |err| {
+        const status: c_int = switch (err) {
+            error.InvalidArgument => SLOWCLAW_ERR_INVALID_ARGUMENT,
+            error.OutOfMemory => SLOWCLAW_ERR_OUT_OF_MEMORY,
+            else => SLOWCLAW_ERR_INTERNAL,
+        };
+        out_result.* = .{ .text = SlowclawString.empty(), .status = status };
+        return status;
+    };
+    out_result.* = .{ .text = SlowclawString.fromOwnedSlice(result), .status = SLOWCLAW_OK };
+    return SLOWCLAW_OK;
+}
+
+/// Journal synthesis on-device: transcript → clean journal entry.
+pub export fn slowclaw_feed_local_llm_synthesize_journal(
+    transcript: [*]const u8,
+    transcript_len: usize,
+    out_result: *SlowclawChatResult,
+) c_int {
+    return localJournalAgentCall(journal_agent.synthesizeJournal, .{ transcript[0..transcript_len], "local" }, out_result);
+}
+
+/// Interest extraction on-device: journal text → comma-separated keywords.
+pub export fn slowclaw_feed_local_llm_extract_interests(
+    journal_text: [*]const u8,
+    journal_text_len: usize,
+    out_result: *SlowclawChatResult,
+) c_int {
+    return localJournalAgentCall(journal_agent.extractInterests, .{ journal_text[0..journal_text_len], "local" }, out_result);
+}
+
+/// Post drafting on-device: journal text → short-form post draft.
+pub export fn slowclaw_feed_local_llm_draft_post(
+    journal_text: [*]const u8,
+    journal_text_len: usize,
+    max_chars: usize,
+    out_result: *SlowclawChatResult,
+) c_int {
+    return localJournalAgentCall(journal_agent.draftPost, .{ journal_text[0..journal_text_len], "local", max_chars }, out_result);
 }
 
 /// Parse a JSON array of {"label":"...","weight":N} into Topic structs.

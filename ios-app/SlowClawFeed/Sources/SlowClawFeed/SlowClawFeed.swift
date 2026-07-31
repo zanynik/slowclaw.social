@@ -478,27 +478,114 @@ public func slowClawFeedCatalog() -> [SlowClawFeedSource]? {
 
 // MARK: - On-device LLM (llama.cpp)
 
-/// On-device LLM availability. The llama.cpp backend is not linked into the
-/// build yet; `available` is false until it is.
+/// On-device LLM status reported by the Zig core. `available` means the
+/// llama.cpp backend is linked into the build; `loaded` means a GGUF model is
+/// currently in memory and chat calls will run on-device.
 public struct LocalLLMStatus: Decodable {
     public let available: Bool
+    public let loaded: Bool
+    public let modelId: String?
     public let reason: String?
+
+    public init(available: Bool, loaded: Bool = false, modelId: String? = nil, reason: String? = nil) {
+        self.available = available
+        self.loaded = loaded
+        self.modelId = modelId
+        self.reason = reason
+    }
+
+    private enum CodingKeys: String, CodingKey { case available, loaded, modelId, reason }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        available = try c.decodeIfPresent(Bool.self, forKey: .available) ?? false
+        loaded = try c.decodeIfPresent(Bool.self, forKey: .loaded) ?? false
+        modelId = try c.decodeIfPresent(String.self, forKey: .modelId)
+        reason = try c.decodeIfPresent(String.self, forKey: .reason)
+    }
 }
 
-/// The two Gemma models the reference app offers for on-device download.
+/// A downloadable on-device model. The two Gemma 4 E2B QAT quants the
+/// reference app offers, hosted on Hugging Face (unsloth).
 public struct LocalModelPreset: Identifiable, Equatable {
     public let id: String
     public let title: String
     public let detail: String
+    public let fileName: String
+    public let downloadURL: URL
+    /// Approximate download size, for free-space checks and progress fallback.
+    public let sizeBytes: Int64
+    public let sizeLabel: String
 
     public static let presets: [LocalModelPreset] = [
         .init(id: "unsloth/gemma-4-E2B-it-qat-UD-Q2_K_XL",
               title: "Gemma 4 E2B (Q2_K_XL)",
-              detail: "Smaller, faster. ~1.6 GB. Best for older devices."),
+              detail: "Smaller, faster. ~2.1 GB. Best for older devices.",
+              fileName: "gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
+              downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf")!,
+              sizeBytes: 2_190_000_000,
+              sizeLabel: "2.1 GB"),
         .init(id: "unsloth/gemma-4-E2B-it-qat-UD-Q4_K_XL",
               title: "Gemma 4 E2B (Q4_K_XL)",
-              detail: "Higher quality. ~2.2 GB. Best for iPhone 15 Pro+."),
+              detail: "Higher quality. ~2.5 GB. Best for iPhone 15 Pro+.",
+              fileName: "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+              downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf")!,
+              sizeBytes: 2_620_000_000,
+              sizeLabel: "2.5 GB"),
     ]
+}
+
+/// On-device model file management: GGUFs live in Documents/Models/.
+public enum LocalModelStore {
+    public static func modelsDirectory() throws -> URL {
+        let docs = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
+                                               appropriateFor: nil, create: true)
+        let dir = docs.appendingPathComponent("Models", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    public static func fileURL(for preset: LocalModelPreset) throws -> URL {
+        try modelsDirectory().appendingPathComponent(preset.fileName)
+    }
+
+    /// A file counts as downloaded when it exists and clears the Zig core's
+    /// own 1 KiB sanity floor by a wide margin (partial downloads are moved
+    /// into place only after completing, so existence ≈ complete).
+    public static func isDownloaded(_ preset: LocalModelPreset) -> Bool {
+        guard let url = try? fileURL(for: preset),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? Int64 else { return false }
+        return size > 1_000_000
+    }
+
+    /// Download the preset to Documents/Models/ with progress (0...1). Uses a
+    /// URLSession download task (background-thread friendly, resume-capable
+    /// transport) and moves through a `.partial` file so a killed download
+    /// never masquerades as a valid model (the GGUF magic check in the Zig
+    /// core is the second line of defense).
+    public static func download(_ preset: LocalModelPreset,
+                                progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
+        let dest = try fileURL(for: preset)
+        let tmp = dest.appendingPathExtension("partial")
+        try? FileManager.default.removeItem(at: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let delegate = ModelDownloadDelegate(tmpURL: tmp, fallbackSize: preset.sizeBytes, progress: progress)
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        try await delegate.run(in: session, url: preset.downloadURL)
+        try FileManager.default.moveItem(at: tmp, to: dest)
+        progress(1.0)
+        return dest
+    }
+
+    public static func delete(_ preset: LocalModelPreset) throws {
+        let url = try fileURL(for: preset)
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
 }
 
 /// Read on-device LLM status from the Zig core. Returns a not-available status
@@ -514,6 +601,101 @@ public func slowClawLocalLLMStatus() -> LocalLLMStatus {
     let data = Data(bytes: UnsafeRawPointer(bytes), count: out.len)
     return (try? JSONDecoder().decode(LocalLLMStatus.self, from: data))
         ?? LocalLLMStatus(available: false, reason: "Status decode failed.")
+}
+
+/// Load a GGUF model into the on-device engine. Returns nil on success, else
+/// a human-readable error. Slow (seconds) and memory-heavy — call off the
+/// main thread.
+public func slowClawLocalLLMLoad(path: String) -> String? {
+    let code = path.withCString { ptr in
+        slowclaw_feed_local_llm_load(ptr, path.utf8.count)
+    }
+    switch code {
+    case SLOWCLAW_OK: return nil
+    case SLOWCLAW_ERR_INVALID_ARGUMENT:
+        return "The file is missing, truncated, or not a GGUF model. Delete and re-download it."
+    case SLOWCLAW_ERR_OUT_OF_MEMORY:
+        return "Not enough memory to load the model."
+    default:
+        return "llama.cpp could not load this model (unsupported architecture or too large for this device)."
+    }
+}
+
+/// Unload the on-device model (frees RAM).
+public func slowClawLocalLLMUnload() {
+    slowclaw_feed_local_llm_unload()
+}
+
+private func processLocalChatResult(_ result: SlowclawChatResult) throws -> String {
+    var mutableResult = result
+    defer { slowclaw_feed_chat_result_free(&mutableResult) }
+    switch result.status {
+    case SLOWCLAW_OK: break
+    case SLOWCLAW_ERR_INVALID_ARGUMENT:
+        throw SlowClawFeedError.internalError("No on-device model is loaded.")
+    default:
+        throw SlowClawFeedError.internalError("On-device inference failed (status \(result.status))")
+    }
+    guard let bytes = result.text.bytes, result.text.len > 0 else { return "" }
+    let data = Data(bytes: UnsafeRawPointer(bytes), count: result.text.len)
+    return String(data: data, encoding: .utf8) ?? ""
+}
+
+/// Chat completion on the loaded on-device model. Mirrors
+/// `SlowClawLLMProvider.chat` so call sites can swap transports.
+public func slowClawLocalLLMChat(systemPrompt: String?, message: String,
+                                 maxTokens: UInt32 = 512, temperature: Double = 0.7) throws -> String {
+    let result: SlowclawChatResult
+    if let sys = systemPrompt {
+        result = sys.withCString { sysPtr in
+            message.withCString { msgPtr in
+                var out = SlowclawChatResult()
+                slowclaw_feed_local_llm_chat(sysPtr, sys.utf8.count, msgPtr, message.utf8.count,
+                                             maxTokens, temperature, &out)
+                return out
+            }
+        }
+    } else {
+        result = message.withCString { msgPtr in
+            var out = SlowclawChatResult()
+            slowclaw_feed_local_llm_chat(nil, 0, msgPtr, message.utf8.count,
+                                         maxTokens, temperature, &out)
+            return out
+        }
+    }
+    return try processLocalChatResult(result)
+}
+
+/// Journal synthesis on-device: transcript → clean journal entry. Uses the
+/// same prompt as the HTTP provider path (built in the Zig core).
+public func slowClawLocalSynthesizeJournal(transcript: String) throws -> String {
+    let result = transcript.withCString { ptr in
+        var out = SlowclawChatResult()
+        slowclaw_feed_local_llm_synthesize_journal(ptr, transcript.utf8.count, &out)
+        return out
+    }
+    return try processLocalChatResult(result)
+}
+
+/// Interest extraction on-device: journal text → keywords.
+public func slowClawLocalExtractInterests(journalText: String) throws -> [String] {
+    let result = journalText.withCString { ptr in
+        var out = SlowclawChatResult()
+        slowclaw_feed_local_llm_extract_interests(ptr, journalText.utf8.count, &out)
+        return out
+    }
+    let csv = try processLocalChatResult(result)
+    return csv.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+}
+
+/// Post drafting on-device: journal text → short-form post draft.
+public func slowClawLocalDraftPost(journalText: String, maxChars: Int = 300) throws -> String {
+    let result = journalText.withCString { ptr in
+        var out = SlowclawChatResult()
+        slowclaw_feed_local_llm_draft_post(ptr, journalText.utf8.count, maxChars, &out)
+        return out
+    }
+    return try processLocalChatResult(result)
 }
 
 private func escapeJson(_ s: String) -> String {
@@ -668,4 +850,62 @@ private let slowClawHttpPostTrampoline: SlowclawHttpPostFn = { ctx, urlPtr, urlL
     let buf = malloc(len)!
     response.copyBytes(to: buf.assumingMemoryBound(to: UInt8.self), count: len)
     return SlowclawString(bytes: buf.assumingMemoryBound(to: UInt8.self), len: len)
+}
+
+/// URLSession download delegate backing `LocalModelStore.download`. Moves the
+/// completed file inside `didFinishDownloadingTo` (the temp URL is invalidated
+/// when that method returns) and reports byte progress.
+private final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let tmpURL: URL
+    private let fallbackSize: Int64
+    private let progress: @Sendable (Double) -> Void
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var expected: Int64
+
+    init(tmpURL: URL, fallbackSize: Int64, progress: @escaping @Sendable (Double) -> Void) {
+        self.tmpURL = tmpURL
+        self.fallbackSize = fallbackSize
+        self.expected = fallbackSize
+        self.progress = progress
+    }
+
+    func run(in session: URLSession, url: URL) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            self.continuation = cont
+            session.downloadTask(with: url).resume()
+        }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        if totalBytesExpectedToWrite > 0 { expected = totalBytesExpectedToWrite }
+        guard expected > 0 else { return }
+        progress(min(1.0, Double(totalBytesWritten) / Double(expected)))
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        do {
+            try FileManager.default.moveItem(at: location, to: tmpURL)
+        } catch {
+            continuation?.resume(throwing: error)
+            continuation = nil
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            continuation?.resume(throwing: error)
+            continuation = nil
+            return
+        }
+        if let http = task.response as? HTTPURLResponse, http.statusCode != 200 {
+            continuation?.resume(throwing: SlowClawFeedError.internalError("Model download failed (HTTP \(http.statusCode))"))
+            continuation = nil
+            return
+        }
+        continuation?.resume()
+        continuation = nil
+    }
 }

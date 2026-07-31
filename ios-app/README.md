@@ -51,6 +51,16 @@ detects sim vs device builds and picks the right Zig target:
 - `iphonesimulator` → `zig build -Dtarget=aarch64-ios-sim`
 - `iphoneos` → `zig build -Dtarget=aarch64-ios`
 
+The app links THREE static archives out of `zig-src/zig-out/lib`:
+`libslowclaw_feed.a` (Zig core), `libsqlite3.a` (vendored SQLite), and
+`libllama.a` (vendored llama.cpp b10201, CPU backend — powers the On-Device AI
+card: model download from Hugging Face into Documents/Models/, activate/load,
+then journal synthesis, interest extraction, and post drafting all run
+on-device). `libllama.a` bundles zig's libc++, so no `-lc++` is needed. The
+app carries the `com.apple.developer.kernel.increased-memory-limit`
+entitlement (SlowClawApp/SlowClaw.entitlements) so multi-GB GGUF models fit
+in the per-app memory budget on device.
+
 ## TestFlight (CI)
 
 The `pub-testflight-zig.yml` workflow at `.github/workflows/` builds + signs +

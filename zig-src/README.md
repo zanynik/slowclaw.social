@@ -62,13 +62,23 @@ without going through HashEmbedding.
 
 ```bash
 cd zig-src
-zig build                  # emits zig-out/libslowclaw_feed.a + zig-out/libsqlite3.a (staticlibs)
+zig build                  # emits zig-out/libslowclaw_feed.a + libsqlite3.a + libllama.a (staticlibs)
 zig build test             # libc-free unit tests (ranker, vector_math, chunker, embeddings, …)
-zig build test-ffi         # C ABI round-trip tests (libc + sqlite linked)
+zig build test-ffi         # C ABI round-trip tests (libc + sqlite linked; llama stubbed)
 zig build test-sqlite      # SQLite-backed memory store tests (libc + vendored SQLite)
 zig build test-markdown    # Markdown memory backend tests (libc for file I/O)
 zig build test-response-cache # LLM response cache tests (libc + sqlite)
+SLOWCLAW_TEST_GGUF=/path/to/model.gguf zig build test-local-llm
+                           # on-device LLM smoke test: loads a real GGUF and
+                           # runs a short chat completion on-device (skips
+                           # cleanly when the env var is unset)
 ```
+
+`-Dwith-llama=false` compiles the staticlib without llama.cpp (the FFI then
+reports on-device AI as unavailable, matching pre-llama builds). The default
+build (what Xcode + CI run) compiles the vendored llama.cpp into
+`zig-out/lib/libllama.a` — a THIRD archive the app links (`-lllama`), which
+bundles zig's libc++ so no `-lc++` is needed.
 
 ## Known iOS link issues (Zig 0.16.0)
 
@@ -177,7 +187,18 @@ zig-src/
                         #   (MEMORY.md + memory/YYYY-MM-DD.md, alternative to sqlite)
     response_cache.zig  # ResponseCache — LLM response cache (SHA-256 keyed,
                         #   TTL + LRU eviction, separate SQLite DB)
+    local_inference.zig # LocalInference — on-device LLM via llama.cpp C API
+                        #   (chat template + tokenize + decode + sampler loop,
+                        #   ported from web/src-tauri/src/inference.rs).
+                        #   Compiled against the vendored llama.cpp when the
+                        #   -Dwith-llama build option is true (default for the
+                        #   shipped staticlib); a stub otherwise.
   vendor/sqlite/        # vendored SQLite 3.46 amalgamation (sqlite3.c + .h)
+  vendor/llama.cpp/     # vendored llama.cpp b10201 (MIT), CPU backend only:
+                        #   ggml/{include,src}, include/, src/ (incl. models/).
+                        #   GPU backends (Metal/CUDA/…) intentionally not
+                        #   vendored — the Tauri app defaulted to CPU on iOS
+                        #   after uncatchable Metal allocator crashes.
   README.md             # this file
 ```
 

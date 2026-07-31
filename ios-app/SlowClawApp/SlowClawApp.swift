@@ -143,6 +143,14 @@ final class AppState: ObservableObject {
     let memory: SlowClawSqliteMemory
     var llm: SlowClawLLMProvider?
 
+    // On-device LLM (llama.cpp). `localLLM.loaded` means a GGUF model is in
+    // memory and every AI surface (synthesis, interests, drafts, TweetClaw)
+    // runs on-device — the local-first path. Download progress is per-preset.
+    @Published var localLLM: LocalLLMStatus = LocalLLMStatus(available: false)
+    @Published var localModelBusy: Bool = false
+    @Published var localModelError: String? = nil
+    @Published var localModelProgress: [String: Double] = [:]
+
     @Published var journals: [SlowClawMemoryEntry] = []
     @Published var drafts: [SlowClawMemoryEntry] = []
     @Published var interests: [String] = []
@@ -225,7 +233,106 @@ final class AppState: ObservableObject {
         }
 
         setupLLM()
+        refreshLocalLLMStatus()
         Task { await refreshJournals() }
+    }
+
+    // MARK: - On-device LLM management
+
+    func refreshLocalLLMStatus() {
+        localLLM = slowClawLocalLLMStatus()
+    }
+
+    /// True when any LLM is usable: a configured remote provider OR a loaded
+    /// on-device model. Gates every AI-powered surface.
+    var anyLLMAvailable: Bool { llm != nil || localLLM.loaded }
+
+    func downloadLocalModel(_ preset: LocalModelPreset) async {
+        localModelBusy = true
+        localModelError = nil
+        defer { localModelBusy = false }
+        do {
+            _ = try await LocalModelStore.download(preset) { [weak self] p in
+                Task { @MainActor in self?.localModelProgress[preset.id] = p }
+            }
+            localModelProgress[preset.id] = 1
+        } catch {
+            localModelError = "Download failed: \(error.localizedDescription)"
+            localModelProgress[preset.id] = nil
+        }
+    }
+
+    /// Load a downloaded model into the on-device engine. Runs off-actor:
+    /// mmap-ing a multi-GB GGUF takes seconds and must not block the UI.
+    func activateLocalModel(_ preset: LocalModelPreset) async {
+        guard let url = try? LocalModelStore.fileURL(for: preset) else { return }
+        localModelBusy = true
+        localModelError = nil
+        defer { localModelBusy = false }
+        let err = await Task.detached(priority: .userInitiated) {
+            slowClawLocalLLMLoad(path: url.path)
+        }.value
+        if let err { localModelError = err }
+        refreshLocalLLMStatus()
+    }
+
+    func unloadLocalModel() {
+        slowClawLocalLLMUnload()
+        refreshLocalLLMStatus()
+    }
+
+    func deleteLocalModel(_ preset: LocalModelPreset) {
+        // Unload first if any model is active (frees RAM), then remove the file.
+        if localLLM.loaded { unloadLocalModel() }
+        try? LocalModelStore.delete(preset)
+        localModelProgress[preset.id] = nil
+        refreshLocalLLMStatus()
+    }
+
+    // MARK: - AI routing (local-first)
+
+    /// Every AI call routes through these helpers: on-device when a local
+    /// model is loaded (private, offline), else the configured remote
+    /// provider. Local inference runs in a detached task so multi-second
+    /// generations never block the main actor.
+    func aiExtractInterests(from text: String) async throws -> [String] {
+        if localLLM.loaded {
+            return try await Task.detached(priority: .utility) {
+                try slowClawLocalExtractInterests(journalText: text)
+            }.value
+        }
+        guard let llm else { throw SlowClawFeedError.internalError("no LLM configured") }
+        return try llm.extractInterests(journalText: text, model: model)
+    }
+
+    func aiDraftPost(from text: String, maxChars: Int = 300) async throws -> String {
+        if localLLM.loaded {
+            return try await Task.detached(priority: .userInitiated) {
+                try slowClawLocalDraftPost(journalText: text, maxChars: maxChars)
+            }.value
+        }
+        guard let llm else { throw SlowClawFeedError.internalError("no LLM configured") }
+        return try llm.draftPost(journalText: text, model: model, maxChars: maxChars)
+    }
+
+    func aiSynthesize(transcript: String) async throws -> String {
+        if localLLM.loaded {
+            return try await Task.detached(priority: .userInitiated) {
+                try slowClawLocalSynthesizeJournal(transcript: transcript)
+            }.value
+        }
+        guard let llm else { throw SlowClawFeedError.internalError("no LLM configured") }
+        return try llm.synthesizeJournal(transcript: transcript, model: model)
+    }
+
+    func aiChat(system: String, message: String, temperature: Double) async throws -> String {
+        if localLLM.loaded {
+            return try await Task.detached(priority: .userInitiated) {
+                try slowClawLocalLLMChat(systemPrompt: system, message: message, maxTokens: 512, temperature: temperature)
+            }.value
+        }
+        guard let llm else { throw SlowClawFeedError.internalError("no LLM configured") }
+        return try llm.chat(systemPrompt: system, message: message, model: model, temperature: temperature)
     }
 
     private func setupLLM() {
@@ -443,11 +550,10 @@ final class AppState: ObservableObject {
         try? memory.store(key: "journal_\(Date().timeIntervalSince1970)", content: text,
                           category: "daily", sessionID: nil)
         await refreshJournals()
-        guard let llm = llm else { return }
-        let model = self.model
-        DispatchQueue.global(qos: .utility).async {
-            if let keywords = try? llm.extractInterests(journalText: text, model: model) {
-                Task { @MainActor in
+        guard anyLLMAvailable else { return }
+        Task.detached(priority: .utility) {
+            if let keywords = try? await self.aiExtractInterests(from: text) {
+                await MainActor.run {
                     self.interests.append(contentsOf: keywords.filter { !self.interests.contains($0) })
                 }
             }
@@ -455,13 +561,12 @@ final class AppState: ObservableObject {
     }
 
     func generateDraft(from journal: SlowClawMemoryEntry) async {
-        guard let llm = llm else { return }
-        let model = self.model
-        DispatchQueue.global(qos: .userInitiated).async {
-            if let draft = try? llm.draftPost(journalText: journal.content, model: model) {
+        guard anyLLMAvailable else { return }
+        Task.detached(priority: .userInitiated) {
+            if let draft = try? await self.aiDraftPost(from: journal.content) {
                 let key = "draft_\(Date().timeIntervalSince1970)"
                 try? self.memory.store(key: key, content: draft, category: "core", sessionID: "drafts")
-                Task { @MainActor in await self.refreshJournals() }
+                await self.refreshJournals()
             }
         }
     }
@@ -473,8 +578,8 @@ final class AppState: ObservableObject {
     /// Long entries are chunked at ~3200 chars; each chunk produces its own post.
     /// Mirrors the reference app's handleFeedPullRefresh / generatePostFromJournal.
     func tweetClawGenerateNext() async {
-        guard let llm = llm else {
-            generateStatus = "Add an LLM API key in Profile to generate posts."
+        guard anyLLMAvailable else {
+            generateStatus = "Add an LLM API key in Profile, or activate an on-device model, to generate posts."
             return
         }
         guard !journals.isEmpty else {
@@ -495,7 +600,6 @@ final class AppState: ObservableObject {
             return
         }
 
-        let model = self.model
         let prompt = self.tweetClawPrompt
         // Snapshot the 10 most-recent existing draft texts to discourage repeats.
         let recentDrafts = drafts.prefix(10).map { $0.content }
@@ -510,7 +614,7 @@ final class AppState: ObservableObject {
                         message += "\n\n(Avoid repeating these posts you already wrote:)\n\(dedupe)"
                     }
                     // chat() honors the editable TweetClaw prompt as the system prompt.
-                    if let post = try? llm.chat(systemPrompt: prompt, message: message, model: model, temperature: 0.8) {
+                    if let post = try? await self.aiChat(system: prompt, message: message, temperature: 0.8) {
                         let cleaned = post.trimmingCharacters(in: .whitespacesAndNewlines)
                             .trimmingCharacters(in: CharacterSet(charactersIn: "\"'`"))
                         // Acceptance gate: 11–399 chars (matches the reference).
@@ -1076,7 +1180,7 @@ struct JournalView: View {
                     .tint(DS.accentColor)
                     .disabled(newEntry.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
-                    if state.llm != nil {
+                    if state.anyLLMAvailable {
                         Button {
                             Task { await synthesize() }
                         } label: {
@@ -1210,15 +1314,12 @@ struct JournalView: View {
     }
 
     private func synthesize() async {
-        guard let llm = state.llm else { return }
+        guard state.anyLLMAvailable else { return }
         isSynthesizing = true
         defer { isSynthesizing = false }
         let transcript = newEntry
-        let model = state.model
-        DispatchQueue.global(qos: .userInitiated).async {
-            if let polished = try? llm.synthesizeJournal(transcript: transcript, model: model) {
-                DispatchQueue.main.async { newEntry = polished }
-            }
+        if let polished = try? await state.aiSynthesize(transcript: transcript) {
+            newEntry = polished
         }
     }
 }
@@ -1478,7 +1579,7 @@ struct DraftCard: View {
                     }
 
                     // Regenerate (if we have the source journal)
-                    if sourceJournalContent != nil && state.llm != nil {
+                    if sourceJournalContent != nil && state.anyLLMAvailable {
                         Button {
                             Task { await regenerate() }
                         } label: {
@@ -1520,30 +1621,24 @@ struct DraftCard: View {
     }
 
     private func regenerate() async {
-        guard let llm = state.llm, let source = sourceJournalContent else { return }
+        guard state.anyLLMAvailable, let source = sourceJournalContent else { return }
         isRegenerating = true
         defer { isRegenerating = false }
-        let model = state.model
-        DispatchQueue.global(qos: .userInitiated).async {
-            if let newDraft = try? llm.draftPost(journalText: source, model: model) {
-                DispatchQueue.main.async { editedText = newDraft }
-            }
+        if let newDraft = try? await state.aiDraftPost(from: source) {
+            editedText = newDraft
         }
     }
 }
 
 // MARK: - Profile View
 
-/// On-Device AI card. Mirrors the reference app's "On-Device AI" card: lists
-/// the Gemma model presets, shows real status from the Zig core, and a Metal
-/// (Fast Mode) toggle. The llama.cpp backend is not linked into the build yet,
-/// so status reads "not available" — this card is the UI surface that lights
-/// up the moment the backend lands.
+/// On-Device AI card. Lists the Gemma model presets with download → activate
+/// → ready lifecycle, driven by real status from the Zig core (llama.cpp CPU
+/// backend). When a model is loaded, every AI surface (Polish, interests,
+/// drafts, TweetClaw) runs on-device — nothing leaves the iPhone.
 struct OnDeviceAICard: View {
     let scheme: ColorScheme
     @EnvironmentObject var state: AppState
-    @State private var status: LocalLLMStatus = LocalLLMStatus(available: false, reason: nil)
-    @AppStorage("slowclaw.localai.metal") private var metalEnabled = true
 
     var body: some View {
         DS.card(scheme) {
@@ -1558,65 +1653,44 @@ struct OnDeviceAICard: View {
                             .foregroundStyle(DS.muted(scheme))
                     }
                     Spacer()
-                    // Availability dot.
+                    // Availability dot: accent when a model is loaded.
                     Circle()
-                        .fill(status.available ? DS.accent(scheme) : DS.muted(scheme))
+                        .fill(state.localLLM.loaded ? DS.accent(scheme) : DS.muted(scheme))
                         .frame(width: 10, height: 10)
                 }
 
                 // Status line.
-                if !status.available {
+                if state.localLLM.loaded {
+                    Text("Ready — \(state.localLLM.modelId ?? "model") is running on-device")
+                        .font(DS.microFont)
+                        .foregroundStyle(DS.accent(scheme))
+                } else if !state.localLLM.available {
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle")
                             .font(.system(size: 12))
-                        Text(status.reason ?? "Not available.")
+                        Text(state.localLLM.reason ?? "Not available.")
                             .font(DS.microFont)
                     }
                     .foregroundStyle(DS.muted(scheme))
                 } else {
-                    Text("Ready")
+                    Text("Download a model to enable on-device AI.")
                         .font(DS.microFont)
-                        .foregroundStyle(DS.accent(scheme))
+                        .foregroundStyle(DS.muted(scheme))
                 }
 
-                // Model presets.
+                if let error = state.localModelError {
+                    Text(error)
+                        .font(DS.microFont)
+                        .foregroundStyle(DS.accent2Color)
+                }
+
+                // Model presets with lifecycle actions.
                 ForEach(LocalModelPreset.presets) { model in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(model.title)
-                            .font(DS.bodyFont.weight(.semibold))
-                            .foregroundStyle(DS.ink(scheme))
-                        Text(model.detail)
-                            .font(DS.captionFont)
-                            .foregroundStyle(DS.muted(scheme))
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-                    .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.rMd, style: .continuous)
-                            .stroke(DS.line(scheme), lineWidth: 1)
-                    )
-                }
-
-                // Metal (Fast Mode) toggle — persists, applied when backend lands.
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Fast Mode")
-                            .font(DS.bodyFont.weight(.medium))
-                            .foregroundStyle(DS.ink(scheme))
-                        Text("Use the Metal GPU")
-                            .font(DS.captionFont)
-                            .foregroundStyle(DS.muted(scheme))
-                    }
-                    Spacer()
-                    Toggle("", isOn: $metalEnabled)
-                        .labelsHidden()
-                        .tint(DS.accentColor)
-                        .disabled(!status.available)
+                    modelRow(model)
                 }
 
                 Button {
-                    refreshStatus()
+                    state.refreshLocalLLMStatus()
                 } label: {
                     Label("Refresh status", systemImage: "arrow.clockwise")
                         .font(DS.captionFont.weight(.medium))
@@ -1627,11 +1701,99 @@ struct OnDeviceAICard: View {
                 .tint(DS.accentColor)
             }
         }
-        .onAppear(perform: refreshStatus)
+        .onAppear { state.refreshLocalLLMStatus() }
     }
 
-    private func refreshStatus() {
-        status = slowClawLocalLLMStatus()
+    @ViewBuilder
+    private func modelRow(_ model: LocalModelPreset) -> some View {
+        let downloaded = LocalModelStore.isDownloaded(model)
+        let progress = state.localModelProgress[model.id]
+        let isLoaded = state.localLLM.loaded
+
+        VStack(alignment: .leading, spacing: 6) {
+            Text(model.title)
+                .font(DS.bodyFont.weight(.semibold))
+                .foregroundStyle(DS.ink(scheme))
+            Text(model.detail)
+                .font(DS.captionFont)
+                .foregroundStyle(DS.muted(scheme))
+
+            if let progress, progress < 1, !downloaded {
+                // Download in progress.
+                ProgressView(value: progress)
+                    .tint(DS.accentColor)
+                Text("\(Int(progress * 100))% of \(model.sizeLabel)")
+                    .font(DS.microFont)
+                    .foregroundStyle(DS.muted(scheme))
+            } else if !downloaded {
+                Button {
+                    Task { await state.downloadLocalModel(model) }
+                } label: {
+                    Label("Download (\(model.sizeLabel))", systemImage: "arrow.down.circle")
+                        .font(DS.captionFont.weight(.medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                }
+                .buttonStyle(.bordered)
+                .tint(DS.accentColor)
+                .disabled(state.localModelBusy)
+            } else if !isLoaded {
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await state.activateLocalModel(model) }
+                    } label: {
+                        Label(state.localModelBusy ? "Loading…" : "Activate", systemImage: "bolt.circle")
+                            .font(DS.captionFont.weight(.medium))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(DS.accentColor)
+                    .disabled(state.localModelBusy)
+
+                    Button(role: .destructive) {
+                        state.deleteLocalModel(model)
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 13))
+                            .padding(6)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(DS.accent2Color)
+                    .disabled(state.localModelBusy)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Button {
+                        state.unloadLocalModel()
+                    } label: {
+                        Label("Unload", systemImage: "eject.circle")
+                            .font(DS.captionFont.weight(.medium))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(DS.accentColor)
+
+                    Button(role: .destructive) {
+                        state.deleteLocalModel(model)
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 13))
+                            .padding(6)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(DS.accent2Color)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.rMd, style: .continuous)
+                .stroke(DS.line(scheme), lineWidth: 1)
+        )
     }
 }
 

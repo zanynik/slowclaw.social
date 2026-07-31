@@ -253,8 +253,9 @@ int32_t slowclaw_feed_parse_and_rank(
 int32_t slowclaw_feed_catalog_json(SlowclawString *out_str);
 
 // ── On-device LLM (llama.cpp) ─────────────────────────────────────────────
-// Status / load / unload / chat. The backend (llama.a) is not linked into this
-// build yet; status reports available:false until it is. Shape is stable.
+// Status / load / unload / chat + on-device journal-agent calls, backed by
+// the vendored llama.cpp (libllama.a, CPU). When the backend is compiled out
+// (zig build -Dwith-llama=false), status reports available:false.
 
 /// On-device LLM status as JSON {"available","reason"}. Bytes freed via slowclaw_feed_free.
 int32_t slowclaw_feed_local_llm_status(SlowclawString *out_str);
@@ -271,6 +272,24 @@ int32_t slowclaw_feed_local_llm_chat(
     const uint8_t *message, size_t message_len,
     uint32_t max_tokens,
     double temperature,
+    SlowclawChatResult *out_result
+);
+
+/// On-device journal-agent calls: same prompts as the HTTP provider variants
+/// (built in the Zig core), running on the loaded local model.
+int32_t slowclaw_feed_local_llm_synthesize_journal(
+    const uint8_t *transcript, size_t transcript_len,
+    SlowclawChatResult *out_result
+);
+
+int32_t slowclaw_feed_local_llm_extract_interests(
+    const uint8_t *journal_text, size_t journal_text_len,
+    SlowclawChatResult *out_result
+);
+
+int32_t slowclaw_feed_local_llm_draft_post(
+    const uint8_t *journal_text, size_t journal_text_len,
+    size_t max_chars,
     SlowclawChatResult *out_result
 );
 

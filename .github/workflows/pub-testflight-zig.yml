@@ -92,9 +92,10 @@ jobs:
                   # libtool/ranlib on macOS. `nm` reading the symbol table
                   # exercises the same archive walk `ld` does, so a regression
                   # surfaces here instead of 5 min later at the link step.
-                  echo "Verifying libslowclaw_feed.a archive layout..."
+                  echo "Verifying staticlib archive layouts..."
                   nm -a zig-out/lib/libslowclaw_feed.a >/dev/null
-                  echo "Archive OK."
+                  nm -a zig-out/lib/libllama.a >/dev/null
+                  echo "Archives OK."
 
             - name: Generate Xcode project
               working-directory: ios-app

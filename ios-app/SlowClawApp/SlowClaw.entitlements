@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- On-device LLM: GGUF models are 1.5–2.5 GB and llama.cpp mmaps them.
+         The default per-app memory limit on iOS kills the app long before a
+         model fits; this entitlement raises it (App Store–allowed, used by
+         every local-LLM app). -->
+    <key>com.apple.developer.kernel.increased-memory-limit</key>
+    <true/>
+</dict>
+</plist>

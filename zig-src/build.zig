@@ -16,6 +16,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ── On-device LLM (llama.cpp) ────────────────────────────────────────
+    // Compiles the vendored llama.cpp (b10201, CPU backend) into libllama.a
+    // and wires it into local_inference.zig. Test steps pass
+    // -Dwith-llama=false so they stay fast and C++-free; the FFI then reports
+    // "not available" exactly like the pre-llama builds did.
+    const with_llama = b.option(bool, "with-llama", "Compile the vendored llama.cpp backend into the staticlib") orelse true;
+    const llama_opts = b.addOptions();
+    llama_opts.addOption(bool, "with_llama", with_llama);
+    const llama_opts_mod = llama_opts.createModule();
+    const no_llama_opts = b.addOptions();
+    no_llama_opts.addOption(bool, "with_llama", false);
+    const no_llama_opts_mod = no_llama_opts.createModule();
+
     // ── Test module (libc-free, no sqlite) ────────────────────────────────
     // Preserves the debug allocator's behavior the ranker tests depend on.
     const test_mod = b.addModule("slowclaw_feed_test", .{
@@ -23,6 +36,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Tests build the stub local-inference backend (no llama.cpp compile).
+    test_mod.addImport("build_options", no_llama_opts_mod);
     const lib_tests = b.addTest(.{
         .root_module = test_mod,
     });
@@ -105,6 +120,8 @@ pub fn build(b: *std.Build) void {
     });
     ffi_test_mod.link_libc = true;
     linkSqlite(ffi_test_mod, sqlite_c);
+    // Tests build the stub local-inference backend (no llama.cpp compile).
+    ffi_test_mod.addImport("build_options", no_llama_opts_mod);
     const ffi_tests = b.addTest(.{
         .root_module = ffi_test_mod,
     });
@@ -165,11 +182,47 @@ pub fn build(b: *std.Build) void {
     lib_mod.link_libc = true;
     linkSqlite(lib_mod, sqlite_c);
     addIosSysroot(lib_mod, ios_sysroot, b.allocator);
+    lib_mod.addImport("build_options", llama_opts_mod);
+
+    // ── llama.cpp staticlib (vendored, CPU backend) ──────────────────────
+    // Emitted as a THIRD archive (libllama.a) next to libslowclaw_feed.a and
+    // libsqlite3.a; the iOS app links all three plus libc++ (-lllama -lc++).
+    const llama_lib = if (with_llama) buildLlamaCpp(b, target, optimize, ios_sysroot) else null;
+    if (llama_lib) |ll| {
+        lib_mod.linkLibrary(ll);
+        // For the @cInclude("llama.h") in local_inference.zig (llama.h
+        // itself includes ggml.h, so both include roots are needed).
+        lib_mod.addIncludePath(b.path("vendor/llama.cpp/include"));
+        lib_mod.addIncludePath(b.path("vendor/llama.cpp/ggml/include"));
+    }
+
     const lib = b.addLibrary(.{
         .name = "slowclaw_feed",
         .root_module = lib_mod,
         .linkage = .static,
     });
+
+    // ── On-device LLM smoke test (opt-in; needs a real GGUF model) ───────
+    //   SLOWCLAW_TEST_GGUF=/path/to/model.gguf zig build test-local-llm
+    // Loads the model through the same code path the iOS app uses and runs a
+    // short chat completion. Skips cleanly when the env var is unset.
+    if (llama_lib) |ll| {
+        const llm_test_mod = b.addModule("slowclaw_feed_llm_test", .{
+            .root_source_file = b.path("src/local_inference.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        llm_test_mod.link_libc = true;
+        llm_test_mod.link_libcpp = true;
+        llm_test_mod.addImport("build_options", llama_opts_mod);
+        llm_test_mod.addIncludePath(b.path("vendor/llama.cpp/include"));
+        llm_test_mod.addIncludePath(b.path("vendor/llama.cpp/ggml/include"));
+        llm_test_mod.linkLibrary(ll);
+        const llm_tests = b.addTest(.{ .root_module = llm_test_mod });
+        const run_llm_tests = b.addRunArtifact(llm_tests);
+        const llm_test_step = b.step("test-local-llm", "Run the on-device LLM smoke test (set SLOWCLAW_TEST_GGUF)");
+        llm_test_step.dependOn(&run_llm_tests.step);
+    }
 
     // ── Workaround: Apple `ld` rejects Zig's staticlib archive ───────────
     // Zig 0.16's archive writer hardcodes the 4-byte (`.p32`) format even for
@@ -194,6 +247,183 @@ pub fn build(b: *std.Build) void {
         const install_aligned = b.addInstallFileWithDir(aligned, .lib, "libslowclaw_feed.a");
         install_aligned.step.dependOn(&install_lib.step);
         b.getInstallStep().dependOn(&install_aligned.step);
+
+        // libllama.a has ~180 members — far more likely than libsqlite3.a to
+        // place a member at a non-8-aligned offset, so it needs the same
+        // repack for Apple `ld` (Codeberg ziglang/zig#35280).
+        if (llama_lib) |ll| {
+            const install_llama = b.addInstallArtifact(ll, .{});
+            b.getInstallStep().dependOn(&install_llama.step);
+            const aligned_llama = repackInstalledArchiveStep(b, install_llama, "libllama.a");
+            const install_aligned_llama = b.addInstallFileWithDir(aligned_llama, .lib, "libllama.a");
+            install_aligned_llama.step.dependOn(&install_llama.step);
+            b.getInstallStep().dependOn(&install_aligned_llama.step);
+        }
+    } else if (llama_lib) |ll| {
+        b.installArtifact(ll);
+    }
+}
+
+/// Compile the vendored llama.cpp (ggml + llama, CPU backend only) into a
+/// static archive. Mirrors the CMake source lists from upstream b10201:
+/// ggml-base + ggml + ggml-cpu (+ arch-specific kernels) + src/*.cpp +
+/// src/models/*.cpp. Metal/CUDA/other backends are intentionally not
+/// vendored — the Rust/Tauri app defaulted to CPU on iOS for stability
+/// (uncatchable Metal allocator crashes), so CPU + NEON is the v1 target.
+fn buildLlamaCpp(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ios_sysroot: ?[]const u8,
+) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // Zig bundles libc++ (headers + a compiled archive) for the target. This
+    // makes the build self-contained — no Xcode SDK C++ headers needed — and
+    // the resulting archive carries the C++ stdlib symbols llama.cpp needs,
+    // so the iOS app links it without adding -lc++ to the Xcode target.
+    mod.link_libcpp = true;
+
+    const includes: []const []const u8 = &.{
+        "vendor/llama.cpp/include",
+        "vendor/llama.cpp/ggml/include",
+        "vendor/llama.cpp/ggml/src",
+        "vendor/llama.cpp/ggml/src/ggml-cpu",
+        "vendor/llama.cpp/src",
+    };
+    for (includes) |inc| mod.addIncludePath(b.path(inc));
+    if (ios_sysroot) |sdk| {
+        mod.addSystemIncludePath(.{ .cwd_relative = sdk });
+        const usr_inc = std.fmt.allocPrint(b.allocator, "{s}/usr/include", .{sdk}) catch @panic("oom");
+        mod.addSystemIncludePath(.{ .cwd_relative = usr_inc });
+    }
+
+    // Definitions mirror upstream CMake (ggml/src/CMakeLists.txt):
+    // _XOPEN_SOURCE=600 everywhere but OpenBSD/AIX, _DARWIN_C_SOURCE on
+    // Apple. GGML_VERSION/GGML_COMMIT are string literals CMake passes in.
+    // -fno-sanitize=undefined: Zig compiles C/C++ with UB traps in safety-
+    // enabled builds, but ggml intentionally does null-relative pointer
+    // arithmetic (ggml_graph_nbytes starts at p = 0). Upstream builds with
+    // plain clang — match that, even for local Debug test builds.
+    var c_flags = std.ArrayList([]const u8).empty;
+    c_flags.appendSlice(b.allocator, &.{
+        "-std=c11",
+        "-w",
+        "-fno-sanitize=undefined",
+        "-D_XOPEN_SOURCE=600",
+        "-DGGML_VERSION=\"b10201\"",
+        "-DGGML_COMMIT=\"b10201\"",
+        "-DGGML_USE_LLAMAFILE",
+        "-DGGML_USE_CPU",
+    }) catch @panic("oom");
+    var cxx_flags = std.ArrayList([]const u8).empty;
+    cxx_flags.appendSlice(b.allocator, &.{
+        "-std=c++17",
+        "-w",
+        "-fno-sanitize=undefined",
+        "-D_XOPEN_SOURCE=600",
+        "-DGGML_VERSION=\"b10201\"",
+        "-DGGML_COMMIT=\"b10201\"",
+        "-DGGML_USE_LLAMAFILE",
+        "-DGGML_USE_CPU",
+    }) catch @panic("oom");
+    switch (target.result.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => {
+            c_flags.append(b.allocator, "-D_DARWIN_C_SOURCE") catch @panic("oom");
+            cxx_flags.append(b.allocator, "-D_DARWIN_C_SOURCE") catch @panic("oom");
+        },
+        else => {},
+    }
+
+    const arch_dir: []const u8 = switch (target.result.cpu.arch) {
+        .aarch64 => "arm",
+        .x86_64 => "x86",
+        else => "", // generic fallback kernels (GGML_CPU_GENERIC)
+    };
+    const is_generic = arch_dir.len == 0;
+    if (is_generic) {
+        c_flags.append(b.allocator, "-DGGML_CPU_GENERIC") catch @panic("oom");
+        cxx_flags.append(b.allocator, "-DGGML_CPU_GENERIC") catch @panic("oom");
+    }
+
+    var c_sources = std.ArrayList([]const u8).empty;
+    c_sources.appendSlice(b.allocator, &.{
+        "ggml/src/ggml.c",
+        "ggml/src/ggml-alloc.c",
+        "ggml/src/ggml-quants.c",
+        "ggml/src/ggml-cpu/ggml-cpu.c",
+        "ggml/src/ggml-cpu/quants.c",
+    }) catch @panic("oom");
+    var cxx_sources = std.ArrayList([]const u8).empty;
+    cxx_sources.appendSlice(b.allocator, &.{
+        "ggml/src/ggml.cpp",
+        "ggml/src/ggml-backend.cpp",
+        "ggml/src/ggml-backend-meta.cpp",
+        "ggml/src/ggml-backend-dl.cpp",
+        "ggml/src/ggml-backend-reg.cpp",
+        "ggml/src/ggml-opt.cpp",
+        "ggml/src/ggml-threading.cpp",
+        "ggml/src/gguf.cpp",
+        "ggml/src/ggml-cpu/ggml-cpu.cpp",
+        "ggml/src/ggml-cpu/repack.cpp",
+        "ggml/src/ggml-cpu/hbm.cpp",
+        "ggml/src/ggml-cpu/traits.cpp",
+        "ggml/src/ggml-cpu/amx/amx.cpp",
+        "ggml/src/ggml-cpu/amx/mmq.cpp",
+        "ggml/src/ggml-cpu/binary-ops.cpp",
+        "ggml/src/ggml-cpu/unary-ops.cpp",
+        "ggml/src/ggml-cpu/vec.cpp",
+        "ggml/src/ggml-cpu/ops.cpp",
+        "ggml/src/ggml-cpu/llamafile/sgemm.cpp",
+    }) catch @panic("oom");
+    if (!is_generic) {
+        c_sources.append(b.allocator, b.fmt("ggml/src/ggml-cpu/arch/{s}/quants.c", .{arch_dir})) catch @panic("oom");
+        cxx_sources.append(b.allocator, b.fmt("ggml/src/ggml-cpu/arch/{s}/repack.cpp", .{arch_dir})) catch @panic("oom");
+    }
+
+    // llama library itself: src/*.cpp (top level, per upstream CMakeLists)
+    // plus the per-architecture model files under src/models/ (globbed in
+    // upstream; enumerated from the vendored tree here so new model files
+    // picked up by a vendor bump are compiled without editing this list).
+    appendVendoredCpp(b, &cxx_sources, "vendor/llama.cpp/src");
+    appendVendoredCpp(b, &cxx_sources, "vendor/llama.cpp/src/models");
+
+    for (c_sources.items) |src| {
+        mod.addCSourceFile(.{
+            .file = b.path(b.fmt("vendor/llama.cpp/{s}", .{src})),
+            .flags = c_flags.items,
+        });
+    }
+    for (cxx_sources.items) |src| {
+        mod.addCSourceFile(.{
+            .file = b.path(b.fmt("vendor/llama.cpp/{s}", .{src})),
+            .flags = cxx_flags.items,
+        });
+    }
+
+    return b.addLibrary(.{
+        .name = "llama",
+        .root_module = mod,
+        .linkage = .static,
+    });
+}
+
+/// Append every *.cpp directly inside a vendored directory (non-recursive)
+/// to `sources`, as paths relative to the zig-src build root.
+fn appendVendoredCpp(b: *std.Build, sources: *std.ArrayList([]const u8), dir_path: []const u8) void {
+    const io = b.graph.io;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch @panic("vendored llama.cpp tree missing");
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch @panic("dir iterate failed")) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".cpp")) continue;
+        const rel = std.fmt.allocPrint(b.allocator, "{s}/{s}", .{ dir_path, entry.name }) catch @panic("oom");
+        // Strip the leading "vendor/llama.cpp/" — callers prepend it.
+        sources.append(b.allocator, rel["vendor/llama.cpp/".len..]) catch @panic("oom");
     }
 }
 
@@ -214,21 +444,31 @@ fn repackInstalledArchiveStep(
     const installed_path = b.getInstallPath(.lib, lib_basename);
 
     // Stage 1: extract the archive's members into a temp dir under the cache.
-    // `ar -x` can leave members read-only, so `chmod u+rw` before reassembly
-    // (Codeberg #35280 comment thread reports `libtool` choking otherwise).
+    // Duplicate member basenames are expected (ggml.c + ggml.cpp both become
+    // ggml.o, quants.c lives in three dirs, …) and a plain `ar -x` extracts
+    // them onto the same path — silently losing members. Apple's `ar` has no
+    // instance modifier, so extraction uses `zig ar xN <n>` (llvm-ar) with a
+    // per-name instance counter, renaming each member to `<n>-<name>` for
+    // uniqueness. `chmod u+rw` because ar leaves members read-only, which
+    // libtool otherwise chokes on (Codeberg #35280 comment thread).
     const extract = b.addSystemCommand(&.{
         "sh", "-c",
         \\set -eu
-        \\IN="$1"; DIR="$2"
+        \\IN="$1"; ZIG="$2"; DIR="$3"
         \\rm -rf "$DIR"; mkdir -p "$DIR"
         \\cd "$DIR"
-        \\xcrun ar -x "$IN"
-        \\chmod u+rw "$DIR"/*.o
+        \\"$ZIG" ar t "$IN" | awk '{c[$1]++; print c[$1], $1}' | while read -r n name; do
+        \\    case "$name" in __.SYMDEF*) continue ;; esac
+        \\    "$ZIG" ar xN "$n" "$IN" "$name"
+        \\    chmod u+rw "$name"
+        \\    mv "$name" "$n-$name"
+        \\done
         ,
         "--",
     });
     extract.step.dependOn(&install_lib.step);
     extract.addArg(installed_path);
+    extract.addArg(b.graph.zig_exe);
     const extracted_dir = extract.addOutputDirectoryArg("extracted");
 
     // Stage 2: `libtool -static` reassembles the members with correct 8-byte
