@@ -34,8 +34,10 @@ settings:
     # build.zig emits THREE separate archives (libslowclaw_feed.a, libsqlite3.a,
     # libllama.a), so the app must link all three — the Zig lib references the
     # sqlite3_* symbols, and local_inference.zig references the llama_* symbols.
-    # -lc++: zig doesn't emit its bundled libc++ for iOS targets, so the
-    # llama.cpp objects link Apple's libc++ (same 21.1 ABI generation).
+    # -lc++: llama.cpp is compiled for iOS by Apple's toolchain (xcrun clang++),
+    # so its objects reference Apple's libc++ — linked here. zig's bundled
+    # libc++ 21.1 is ABI-incompatible with the iOS 17/18 device runtime
+    # (emits internals like __hash_memory that dyld can't resolve at launch).
     OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3 -lllama -lc++"
     LIBRARY_SEARCH_PATHS: "$(SRCROOT)/../zig-src/zig-out/lib"
     # Header search path for the C ABI contract.
@@ -61,8 +63,7 @@ targets:
         INFOPLIST_FILE: SlowClawApp/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # Link the Zig + vendored staticlibs (target-level override of the
-        # base OTHER_LDFLAGS). All three come from zig-out/lib. -lc++ for the
-        # llama.cpp objects (see base note).
+        # base OTHER_LDFLAGS). All three come from zig-out/lib.
         OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3 -lllama -lc++"
         LIBRARY_SEARCH_PATHS: "$(SRCROOT)/../zig-src/zig-out/lib"
         ENABLE_BITCODE: NO

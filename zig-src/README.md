@@ -76,11 +76,22 @@ SLOWCLAW_TEST_GGUF=/path/to/model.gguf zig build test-local-llm
 
 `-Dwith-llama=false` compiles the staticlib without llama.cpp (the FFI then
 reports on-device AI as unavailable, matching pre-llama builds). The default
-build (what Xcode + CI run) compiles the vendored llama.cpp into
-`zig-out/lib/libllama.a` — a THIRD archive the app links (`-lllama`). On iOS
-the app also links Apple's libc++ (`-lc++` in project.yml): zig doesn't emit
-its bundled libc++ for iOS targets, and zig 0.16's bundled libc++ (21.1) is
-the same ABI generation as Xcode 26's, so the objects bind cleanly.
+build compiles the vendored llama.cpp into `zig-out/lib/libllama.a` — a THIRD
+archive the app links (`-lllama`).
+
+**Two build paths, depending on target:**
+- **iOS (`-Dtarget=aarch64-ios`):** compiled with Apple's toolchain
+  (`xcrun clang/clang++ -target arm64-apple-ios17.0`), NOT zig's clang. This is
+  REQUIRED — zig's bundled libc++ 21.1 headers emit references to runtime
+  internals (e.g. `std::__1::__hash_memory`) that are absent from iOS 17/18's
+  `libc++.1.dylib`, so an app linking zig-compiled llama objects aborts at
+  launch (`DYLD Symbol missing`). Apple's headers + the 17.0 deployment target
+  emit only device-compatible symbols. The app links Apple's libc++ (`-lc++`).
+- **macOS native (local test/dev):** zig's own clang + bundled libc++ (matches
+  the macOS runtime there — the `test-local-llm` smoke test uses this path).
+
+The iOS archive is already 8-byte-aligned (`libtool`), so it skips the Zig
+archive repack that the macOS-built archives need.
 
 ## Known iOS link issues (Zig 0.16.0)
 

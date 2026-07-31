@@ -96,6 +96,19 @@ jobs:
                   nm -a zig-out/lib/libslowclaw_feed.a >/dev/null
                   nm -a zig-out/lib/libllama.a >/dev/null
                   echo "Archives OK."
+                  # Regression guard for the build 56/58 launch crash: libllama.a
+                  # must NOT reference libc++ 21.1-only internals (e.g.
+                  # __hash_memory) that are absent from the iOS 17/18 device
+                  # runtime. The iOS build compiles llama.cpp with Apple's
+                  # toolchain (xcrun clang++) so such symbols are never emitted;
+                  # if this guard trips, the iOS build fell back to zig's clang
+                  # (wrong libc++ headers) and the app would abort at launch
+                  # with "DYLD Symbol missing".
+                  if nm -u zig-out/lib/libllama.a 2>/dev/null | grep -q __hash_memory; then
+                    echo "::error::libllama.a still references __hash_memory (libc++ 21.1-only) — iOS launch crash"
+                    exit 1
+                  fi
+                  echo "No libc++-21.1-only undefined symbols in libllama.a."
 
             - name: Generate Xcode project
               working-directory: ios-app

@@ -187,11 +187,28 @@ pub fn build(b: *std.Build) void {
     // ── llama.cpp staticlib (vendored, CPU backend) ──────────────────────
     // Emitted as a THIRD archive (libllama.a) next to libslowclaw_feed.a and
     // libsqlite3.a; the iOS app links all three plus libc++ (-lllama -lc++).
-    const llama_lib = if (with_llama) buildLlamaCpp(b, target, optimize, ios_sysroot) else null;
+    //
+    // iOS: compiled with Apple's toolchain (xcrun clang++) so the C++ objects
+    // only reference libc++ symbols present in the device runtime. zig's
+    // bundled libc++ 21.1 headers emit internals (e.g. __hash_memory) that are
+    // absent from iOS 17/18's libc++.dylib → dyld "Symbol missing" at launch
+    // (the build 56/58 TestFlight crash). Apple's own headers + the 17.0
+    // deployment target avoid this. Non-iOS (macOS native test/dev) keeps the
+    // zig build (its libc++ matches the macOS runtime there).
+    const use_ios_clang_llama = with_llama and
+        target.result.os.tag == .ios and ios_sysroot != null;
+    const llama_lib = if (with_llama and !use_ios_clang_llama)
+        buildLlamaCpp(b, target, optimize, ios_sysroot)
+    else
+        null;
     if (llama_lib) |ll| {
         lib_mod.linkLibrary(ll);
-        // For the @cInclude("llama.h") in local_inference.zig (llama.h
-        // itself includes ggml.h, so both include roots are needed).
+    }
+    if (with_llama) {
+        // Include roots for the @cInclude("llama.h") in local_inference.zig
+        // (llama.h itself includes ggml.h, so both roots are needed). Needed
+        // on iOS too (the zig lib still @cImports llama.h for declarations;
+        // the symbols resolve at the Xcode link step via -lllama).
         lib_mod.addIncludePath(b.path("vendor/llama.cpp/include"));
         lib_mod.addIncludePath(b.path("vendor/llama.cpp/ggml/include"));
     }
@@ -251,7 +268,14 @@ pub fn build(b: *std.Build) void {
         // libllama.a has ~180 members — far more likely than libsqlite3.a to
         // place a member at a non-8-aligned offset, so it needs the same
         // repack for Apple `ld` (Codeberg ziglang/zig#35280).
-        if (llama_lib) |ll| {
+        if (use_ios_clang_llama) {
+            // iOS: Apple's `libtool` already writes 8-byte-aligned members, so
+            // the system-clang-built libllama.a needs NO repack — install it
+            // straight to zig-out/lib/.
+            const llama_a = buildLlamaCppIOS(b, target, optimize, ios_sysroot.?);
+            const install_llama = b.addInstallFileWithDir(llama_a, .lib, "libllama.a");
+            b.getInstallStep().dependOn(&install_llama.step);
+        } else if (llama_lib) |ll| {
             const install_llama = b.addInstallArtifact(ll, .{});
             b.getInstallStep().dependOn(&install_llama.step);
             const aligned_llama = repackInstalledArchiveStep(b, install_llama, "libllama.a");
@@ -262,6 +286,138 @@ pub fn build(b: *std.Build) void {
     } else if (llama_lib) |ll| {
         b.installArtifact(ll);
     }
+}
+
+/// The llama.cpp source list (paths relative to vendor/llama.cpp/), shared by
+/// the zig-clang build (buildLlamaCpp, for macOS native test/dev) and the iOS
+/// Apple-toolchain build (buildLlamaCppIOS). Mirrors upstream CMake: ggml-base
+/// + ggml + ggml-cpu (+ arch kernels) + src/*.cpp + src/models/*.cpp.
+const LlamaSourceList = struct {
+    c: []const []const u8,
+    cxx: []const []const u8,
+};
+
+fn collectLlamaSources(b: *std.Build, target: std.Build.ResolvedTarget) LlamaSourceList {
+    const arch_dir: []const u8 = switch (target.result.cpu.arch) {
+        .aarch64 => "arm",
+        .x86_64 => "x86",
+        else => "", // generic fallback kernels (GGML_CPU_GENERIC)
+    };
+    const is_generic = arch_dir.len == 0;
+
+    var c = std.ArrayList([]const u8).empty;
+    c.appendSlice(b.allocator, &.{
+        "ggml/src/ggml.c",
+        "ggml/src/ggml-alloc.c",
+        "ggml/src/ggml-quants.c",
+        "ggml/src/ggml-cpu/ggml-cpu.c",
+        "ggml/src/ggml-cpu/quants.c",
+    }) catch @panic("oom");
+    var cxx = std.ArrayList([]const u8).empty;
+    cxx.appendSlice(b.allocator, &.{
+        "ggml/src/ggml.cpp",
+        "ggml/src/ggml-backend.cpp",
+        "ggml/src/ggml-backend-meta.cpp",
+        "ggml/src/ggml-backend-dl.cpp",
+        "ggml/src/ggml-backend-reg.cpp",
+        "ggml/src/ggml-opt.cpp",
+        "ggml/src/ggml-threading.cpp",
+        "ggml/src/gguf.cpp",
+        "ggml/src/ggml-cpu/ggml-cpu.cpp",
+        "ggml/src/ggml-cpu/repack.cpp",
+        "ggml/src/ggml-cpu/hbm.cpp",
+        "ggml/src/ggml-cpu/traits.cpp",
+        "ggml/src/ggml-cpu/amx/amx.cpp",
+        "ggml/src/ggml-cpu/amx/mmq.cpp",
+        "ggml/src/ggml-cpu/binary-ops.cpp",
+        "ggml/src/ggml-cpu/unary-ops.cpp",
+        "ggml/src/ggml-cpu/vec.cpp",
+        "ggml/src/ggml-cpu/ops.cpp",
+        "ggml/src/ggml-cpu/llamafile/sgemm.cpp",
+    }) catch @panic("oom");
+    if (!is_generic) {
+        c.append(b.allocator, b.fmt("ggml/src/ggml-cpu/arch/{s}/quants.c", .{arch_dir})) catch @panic("oom");
+        cxx.append(b.allocator, b.fmt("ggml/src/ggml-cpu/arch/{s}/repack.cpp", .{arch_dir})) catch @panic("oom");
+    }
+    appendVendoredCpp(b, &cxx, "vendor/llama.cpp/src");
+    appendVendoredCpp(b, &cxx, "vendor/llama.cpp/src/models");
+    return .{ .c = c.items, .cxx = cxx.items };
+}
+
+/// Build libllama.a for iOS with Apple's toolchain (xcrun clang/clang++). This
+/// is REQUIRED for the device: zig's bundled libc++ 21.1 headers emit
+/// references to runtime internals (e.g. std::__1::__hash_memory) that do not
+/// exist in iOS 17/18's libc++.1.dylib, so an app linking zig-compiled llama
+/// objects aborts at launch (dyld "Symbol missing"). Compiling with
+/// `-target arm64-apple-ios17.0 -isysroot <sdk>` uses Apple's own patched
+/// libc++ headers and the deployment target, which emit only runtime-
+/// compatible symbols. Apple's `libtool` writes 8-byte-aligned members, so the
+/// result needs no Zig-archive repack. The deployment target (17.0) must match
+/// ios-app/project.yml.
+fn buildLlamaCppIOS(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ios_sysroot: []const u8,
+) std.Build.LazyPath {
+    const sources = collectLlamaSources(b, target);
+    const is_sim = std.mem.indexOf(u8, ios_sysroot, "Simulator") != null;
+    const triple: []const u8 = if (is_sim) "arm64-apple-ios17.0-simulator" else "arm64-apple-ios17.0";
+    const opt_flag: []const u8 = switch (optimize) {
+        .Debug => "-O0",
+        .ReleaseFast, .ReleaseSafe => "-O3",
+        .ReleaseSmall => "-Oz",
+    };
+
+    const compile = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        \\set -eu
+        \\SDK="$1"; TRIPLE="$2"; OPT="$3"; OUT="$4"; shift 4
+        \\OBJDIR="$(dirname "$OUT")/llama_obj"
+        \\rm -rf "$OBJDIR"; mkdir -p "$OBJDIR"
+        \\OBJS=""
+        \\i=0
+        \\for src in "$@"; do
+        \\    i=$((i+1))
+        \\    obj="$OBJDIR/o${i}.o"
+        \\    full="vendor/llama.cpp/$src"
+        \\    case "$src" in
+        \\      *.cpp)
+        \\        xcrun clang++ -target "$TRIPLE" -isysroot "$SDK" -std=c++17 "$OPT" \\
+        \\          -fno-sanitize=undefined -w \\
+        \\          -DGGML_USE_CPU -DGGML_USE_LLAMAFILE -D_DARWIN_C_SOURCE -D_XOPEN_SOURCE=600 \\
+        \\          '-DGGML_VERSION="b10201"' '-DGGML_COMMIT="b10201"' \\
+        \\          -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include \\
+        \\          -Ivendor/llama.cpp/ggml/src -Ivendor/llama.cpp/ggml/src/ggml-cpu \\
+        \\          -Ivendor/llama.cpp/src \\
+        \\          -c "$full" -o "$obj"
+        \\        ;;
+        \\      *.c)
+        \\        xcrun clang -target "$TRIPLE" -isysroot "$SDK" -std=c11 "$OPT" \\
+        \\          -fno-sanitize=undefined -w \\
+        \\          -DGGML_USE_CPU -DGGML_USE_LLAMAFILE -D_DARWIN_C_SOURCE -D_XOPEN_SOURCE=600 \\
+        \\          '-DGGML_VERSION="b10201"' '-DGGML_COMMIT="b10201"' \\
+        \\          -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include \\
+        \\          -Ivendor/llama.cpp/ggml/src -Ivendor/llama.cpp/ggml/src/ggml-cpu \\
+        \\          -Ivendor/llama.cpp/src \\
+        \\          -c "$full" -o "$obj"
+        \\        ;;
+        \\    esac
+        \\    OBJS="$OBJS $obj"
+        \\done
+        \\xcrun libtool -static -o "$OUT" $OBJS
+        \\xcrun ranlib "$OUT"
+        ,
+        "--",
+    });
+    compile.addArg(ios_sysroot);
+    compile.addArg(triple);
+    compile.addArg(opt_flag);
+    const out = compile.addOutputFileArg("libllama.a");
+    for (sources.c) |s| compile.addArg(s);
+    for (sources.cxx) |s| compile.addArg(s);
+    return out;
 }
 
 /// Compile the vendored llama.cpp (ggml + llama, CPU backend only) into a
@@ -352,55 +508,15 @@ fn buildLlamaCpp(
         cxx_flags.append(b.allocator, "-DGGML_CPU_GENERIC") catch @panic("oom");
     }
 
-    var c_sources = std.ArrayList([]const u8).empty;
-    c_sources.appendSlice(b.allocator, &.{
-        "ggml/src/ggml.c",
-        "ggml/src/ggml-alloc.c",
-        "ggml/src/ggml-quants.c",
-        "ggml/src/ggml-cpu/ggml-cpu.c",
-        "ggml/src/ggml-cpu/quants.c",
-    }) catch @panic("oom");
-    var cxx_sources = std.ArrayList([]const u8).empty;
-    cxx_sources.appendSlice(b.allocator, &.{
-        "ggml/src/ggml.cpp",
-        "ggml/src/ggml-backend.cpp",
-        "ggml/src/ggml-backend-meta.cpp",
-        "ggml/src/ggml-backend-dl.cpp",
-        "ggml/src/ggml-backend-reg.cpp",
-        "ggml/src/ggml-opt.cpp",
-        "ggml/src/ggml-threading.cpp",
-        "ggml/src/gguf.cpp",
-        "ggml/src/ggml-cpu/ggml-cpu.cpp",
-        "ggml/src/ggml-cpu/repack.cpp",
-        "ggml/src/ggml-cpu/hbm.cpp",
-        "ggml/src/ggml-cpu/traits.cpp",
-        "ggml/src/ggml-cpu/amx/amx.cpp",
-        "ggml/src/ggml-cpu/amx/mmq.cpp",
-        "ggml/src/ggml-cpu/binary-ops.cpp",
-        "ggml/src/ggml-cpu/unary-ops.cpp",
-        "ggml/src/ggml-cpu/vec.cpp",
-        "ggml/src/ggml-cpu/ops.cpp",
-        "ggml/src/ggml-cpu/llamafile/sgemm.cpp",
-    }) catch @panic("oom");
-    if (!is_generic) {
-        c_sources.append(b.allocator, b.fmt("ggml/src/ggml-cpu/arch/{s}/quants.c", .{arch_dir})) catch @panic("oom");
-        cxx_sources.append(b.allocator, b.fmt("ggml/src/ggml-cpu/arch/{s}/repack.cpp", .{arch_dir})) catch @panic("oom");
-    }
+    const sources = collectLlamaSources(b, target);
 
-    // llama library itself: src/*.cpp (top level, per upstream CMakeLists)
-    // plus the per-architecture model files under src/models/ (globbed in
-    // upstream; enumerated from the vendored tree here so new model files
-    // picked up by a vendor bump are compiled without editing this list).
-    appendVendoredCpp(b, &cxx_sources, "vendor/llama.cpp/src");
-    appendVendoredCpp(b, &cxx_sources, "vendor/llama.cpp/src/models");
-
-    for (c_sources.items) |src| {
+    for (sources.c) |src| {
         mod.addCSourceFile(.{
             .file = b.path(b.fmt("vendor/llama.cpp/{s}", .{src})),
             .flags = c_flags.items,
         });
     }
-    for (cxx_sources.items) |src| {
+    for (sources.cxx) |src| {
         mod.addCSourceFile(.{
             .file = b.path(b.fmt("vendor/llama.cpp/{s}", .{src})),
             .flags = cxx_flags.items,
