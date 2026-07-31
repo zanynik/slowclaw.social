@@ -85,6 +85,28 @@ async function request(token, method, path, body) {
     throw new Error(`Bundle ID ${bundleId} was not found in App Store Connect.`);
   }
 
+  // The app carries com.apple.developer.kernel.increased-memory-limit (for
+  // on-device GGUF models), so the App ID must have that capability enabled
+  // — otherwise freshly issued profiles reject the entitlement at archive
+  // time ("profile doesn't include the Increased Memory Limit capability").
+  // Idempotent: a 409 means it's already enabled.
+  try {
+    await request(token, "POST", "/v1/bundleIdCapabilities", {
+      data: {
+        type: "bundleIdCapabilities",
+        attributes: { capabilityType: "INCREASED_MEMORY_LIMIT" },
+        relationships: { bundleId: { data: { type: "bundleIds", id: bundleRecord.id } } }
+      }
+    });
+    console.log("Enabled INCREASED_MEMORY_LIMIT capability on the App ID.");
+  } catch (err) {
+    if (/already exists|ENTITY_ERROR/i.test(String(err))) {
+      console.log("INCREASED_MEMORY_LIMIT already enabled on the App ID.");
+    } else {
+      throw err;
+    }
+  }
+
   // Revoke stale SlowClaw CI profiles + their associated distribution certs
   // before issuing fresh ones (Apple limits both).
   const staleProfiles = await request(token, "GET", "/v1/profiles?filter[profileType]=IOS_APP_STORE&limit=200");
