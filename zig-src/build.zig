@@ -301,6 +301,11 @@ fn buildLlamaCpp(
         mod.addSystemIncludePath(.{ .cwd_relative = sdk });
         const usr_inc = std.fmt.allocPrint(b.allocator, "{s}/usr/include", .{sdk}) catch @panic("oom");
         mod.addSystemIncludePath(.{ .cwd_relative = usr_inc });
+        // C++ stdlib headers from the iOS SDK (zig only adds its bundled
+        // libc++ headers when it also links its libc++, which iOS skips —
+        // see link_libcpp note above).
+        const cxx_inc = std.fmt.allocPrint(b.allocator, "{s}/usr/include/c++/v1", .{sdk}) catch @panic("oom");
+        mod.addSystemIncludePath(.{ .cwd_relative = cxx_inc });
     }
 
     // Definitions mirror upstream CMake (ggml/src/CMakeLists.txt):
