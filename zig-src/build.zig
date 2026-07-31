@@ -384,24 +384,10 @@ fn buildLlamaCppIOS(
         \\    full="vendor/llama.cpp/$src"
         \\    case "$src" in
         \\      *.cpp)
-        \\        xcrun clang++ -target "$TRIPLE" -isysroot "$SDK" -std=c++17 "$OPT" \\
-        \\          -fno-sanitize=undefined -w \\
-        \\          -DGGML_USE_CPU -DGGML_USE_LLAMAFILE -D_DARWIN_C_SOURCE -D_XOPEN_SOURCE=600 \\
-        \\          '-DGGML_VERSION="b10201"' '-DGGML_COMMIT="b10201"' \\
-        \\          -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include \\
-        \\          -Ivendor/llama.cpp/ggml/src -Ivendor/llama.cpp/ggml/src/ggml-cpu \\
-        \\          -Ivendor/llama.cpp/src \\
-        \\          -c "$full" -o "$obj"
+        \\        xcrun clang++ -target "$TRIPLE" -isysroot "$SDK" -std=c++17 "$OPT" -fno-sanitize=undefined -w -DGGML_USE_CPU -DGGML_USE_LLAMAFILE -D_DARWIN_C_SOURCE -D_XOPEN_SOURCE=600 '-DGGML_VERSION="b10201"' '-DGGML_COMMIT="b10201"' -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include -Ivendor/llama.cpp/ggml/src -Ivendor/llama.cpp/ggml/src/ggml-cpu -Ivendor/llama.cpp/src -c "$full" -o "$obj"
         \\        ;;
         \\      *.c)
-        \\        xcrun clang -target "$TRIPLE" -isysroot "$SDK" -std=c11 "$OPT" \\
-        \\          -fno-sanitize=undefined -w \\
-        \\          -DGGML_USE_CPU -DGGML_USE_LLAMAFILE -D_DARWIN_C_SOURCE -D_XOPEN_SOURCE=600 \\
-        \\          '-DGGML_VERSION="b10201"' '-DGGML_COMMIT="b10201"' \\
-        \\          -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include \\
-        \\          -Ivendor/llama.cpp/ggml/src -Ivendor/llama.cpp/ggml/src/ggml-cpu \\
-        \\          -Ivendor/llama.cpp/src \\
-        \\          -c "$full" -o "$obj"
+        \\        xcrun clang -target "$TRIPLE" -isysroot "$SDK" -std=c11 "$OPT" -fno-sanitize=undefined -w -DGGML_USE_CPU -DGGML_USE_LLAMAFILE -D_DARWIN_C_SOURCE -D_XOPEN_SOURCE=600 '-DGGML_VERSION="b10201"' '-DGGML_COMMIT="b10201"' -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include -Ivendor/llama.cpp/ggml/src -Ivendor/llama.cpp/ggml/src/ggml-cpu -Ivendor/llama.cpp/src -c "$full" -o "$obj"
         \\        ;;
         \\    esac
         \\    OBJS="$OBJS $obj"
