@@ -18,11 +18,24 @@ enum Nip19 {
 
     /// Encode an naddr. Returns nil if the pubkey isn't a valid 32-byte hex.
     /// `identifier` is the "d" tag; `pubkey` is the 64-char hex pubkey; `kind` is the event kind.
-    static func encodeNaddr(identifier: String, pubkey: String, kind: UInt32) -> String? {
+    static func encodeNaddr(
+        identifier: String,
+        pubkey: String,
+        kind: UInt32,
+        relay: String? = nil
+    ) -> String? {
         guard let pkBytes = hexBytes(pubkey), pkBytes.count == 32 else { return nil }
         var tlv: [UInt8] = []
         let idBytes = Array(identifier.utf8)
+        // TLV lengths are one byte. Reject oversized values instead of
+        // truncating them into an naddr that resolves to another article.
+        guard idBytes.count <= Int(UInt8.max) else { return nil }
         pushTlv(&tlv, type: 0, value: idBytes)
+        if let relay, !relay.isEmpty {
+            let relayBytes = Array(relay.utf8)
+            guard relayBytes.count <= Int(UInt8.max) else { return nil }
+            pushTlv(&tlv, type: 1, value: relayBytes)
+        }
         pushTlv(&tlv, type: 2, value: pkBytes)
         pushTlv(&tlv, type: 3, value: [
             UInt8((kind >> 24) & 0xff), UInt8((kind >> 16) & 0xff),
@@ -41,7 +54,7 @@ enum Nip19 {
 
     private static func pushTlv(_ out: inout [UInt8], type: UInt8, value: [UInt8]) {
         out.append(type)
-        out.append(UInt8(value.count & 0xff))
+        out.append(UInt8(value.count))
         out.append(contentsOf: value)
     }
 

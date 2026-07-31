@@ -259,7 +259,7 @@ private struct MemoryEntryDTO: Decodable {
 /// SwiftUI's `ForEach` traps fatally on duplicate/empty `Identifiable` ids, so
 /// `id` here is synthesized to be unique and never empty (see
 /// `RankedFeedItemDTO.toRanked`). This is what makes the Reads list crash-safe.
-public struct RankedFeedItem: Identifiable {
+public struct RankedFeedItem: Identifiable, Codable {
     public let id: String
     public let title: String
     public let link: String

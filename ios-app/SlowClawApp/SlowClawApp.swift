@@ -165,6 +165,15 @@ final class AppState: ObservableObject {
     @Published var readsRefreshedAt: Date? = nil
     private var readsLoadedOnce: Bool = false
     fileprivate static var cachedCatalog: [SlowClawFeedSource]?
+    private static let readsCacheVersion = 1
+    private static let readsCacheMaxAge: TimeInterval = 30 * 60
+    private static let rssSourceLimit = 24
+
+    private struct ReadsCache: Codable {
+        let version: Int
+        let refreshedAt: Date
+        let items: [RankedFeedItem]
+    }
 
     // TweetClaw (post generation). The prompt is editable + persisted; processed
     // journals are tracked so pull-to-generate picks a fresh entry each time.
@@ -205,6 +214,14 @@ final class AppState: ObservableObject {
             self.memory = try SlowClawSqliteMemory(path: dbPath, embedder: true)
         } catch {
             fatalError("Database error: \(error)")
+        }
+
+        // Hydrate synchronously so relaunches paint the last good Reads list
+        // before any network work begins.
+        if let cache = Self.loadReadsCache() {
+            self.readsItems = cache.items
+            self.readsRefreshedAt = cache.refreshedAt
+            self.readsLoadedOnce = true
         }
 
         setupLLM()
@@ -275,6 +292,16 @@ final class AppState: ObservableObject {
     /// so switching tabs never wipes what's already shown. Pull-to-refresh forces
     /// a foreground refresh (spinner visible).
     func loadReads(force: Bool = false) async {
+        // A just-refreshed disk cache is the normal relaunch path. It was
+        // hydrated in init, so do not fetch the world again until it is stale;
+        // pull-to-refresh is always an explicit bypass.
+        if !force,
+           !readsItems.isEmpty,
+           let refreshedAt = readsRefreshedAt,
+           Date().timeIntervalSince(refreshedAt) < Self.readsCacheMaxAge {
+            return
+        }
+
         let isFirst = !readsLoadedOnce || readsItems.isEmpty
         if force || isFirst {
             readsLoading = true
@@ -288,7 +315,7 @@ final class AppState: ObservableObject {
         // Snapshot fetch happens off the main actor.
         let fetched = await Task.detached(priority: .userInitiated) {
             async let rssResult = Self.fetchAllRSS(sources: sources, topics: topics)
-            async let nostrResult = NostrFetcher.fetchArticles()
+            async let nostrResult = NostrFetcher.fetchArticles(topics: topics.map(\.label))
             // rssResult is ([RankedFeedItem], Bool); nostrResult is [RankedFeedItem].
             return await (rssResult, nostrResult)
         }.value
@@ -299,6 +326,14 @@ final class AppState: ObservableObject {
         var combined = rss + nostr
         combined.sort { $0.score > $1.score }
         let capped = Array(combined.prefix(80))
+
+        // Never replace a usable snapshot with an empty failed refresh. A stale
+        // local feed is more useful than a blank loading/error state.
+        if capped.isEmpty {
+            readsError = reachedAny ? nil : "Couldn't reach any feeds. Pull to retry."
+            readsLoading = false
+            return
+        }
 
         // Merge: keep the existing list visible; replace on force/first load.
         if force || readsItems.isEmpty {
@@ -312,44 +347,96 @@ final class AppState: ObservableObject {
             }
         }
         readsRefreshedAt = Date()
-        if capped.isEmpty { readsError = reachedAny ? nil : "Couldn't reach any feeds. Pull to retry." }
-        else { readsError = nil }
+        Self.saveReadsCache(items: readsItems, refreshedAt: readsRefreshedAt!)
+        readsError = nil
         readsLoading = false
     }
 
-    /// Fetch every catalog RSS source with bounded concurrency (8 at a time),
-    /// parse + rank each via the Zig core. Static so it can run off the main actor.
+    /// Fetch a bounded catalog slice with a per-source timeout, then parse +
+    /// rank through Zig. The previous implementation walked all 114 sources in
+    /// sequential batches, making a cold launch wait for slow or dead feeds.
     private static func fetchAllRSS(sources: [SlowClawFeedSource], topics: [SlowClawTopic]) async -> ([RankedFeedItem], Bool) {
-        let batches = stride(from: 0, to: sources.count, by: 8).map {
-            Array(sources[$0..<min($0 + 8, sources.count)])
-        }
-        var allRanked: [RankedFeedItem] = []
-        var reachedAny = false
-        for batch in batches {
-            let results = await withTaskGroup(of: [RankedFeedItem]?.self, returning: [[RankedFeedItem]].self) { group in
-                for src in batch {
-                    group.addTask {
-                        guard let url = URL(string: src.xmlURL) else { return nil }
-                        let xml: String
-                        do {
-                            let (data, response) = try await URLSession.shared.data(from: url)
-                            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
-                                  let s = String(data: data, encoding: .utf8) else { return nil }
-                            xml = s
-                        } catch { return nil }
+        let selected = selectRSSSources(sources, topics: topics)
+        let results = await withTaskGroup(of: [RankedFeedItem]?.self, returning: [[RankedFeedItem]].self) { group in
+            for src in selected {
+                group.addTask {
+                    guard let url = URL(string: src.xmlURL) else { return nil }
+                    var request = URLRequest(url: url)
+                    request.timeoutInterval = 6
+                    do {
+                        let (data, response) = try await URLSession.shared.data(for: request)
+                        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                              let xml = String(data: data, encoding: .utf8) else { return nil }
                         return slowClawParseAndRankRSS(xml: xml, sourceLabel: src.displayLabel, topics: topics)
+                    } catch {
+                        return nil
                     }
                 }
-                var got: [[RankedFeedItem]] = []
-                for await r in group { if let r { got.append(r) } }
-                return got
             }
-            for r in results {
-                if !r.isEmpty { reachedAny = true }
-                allRanked.append(contentsOf: r)
+            var got: [[RankedFeedItem]] = []
+            for await result in group {
+                if let result { got.append(result) }
             }
+            return got
         }
-        return (allRanked, reachedAny)
+        let allRanked = results.flatMap { $0 }
+        return (allRanked, !allRanked.isEmpty)
+    }
+
+    /// The full catalog is intentionally broad, but a refresh should start
+    /// with sources whose public title/domain agrees with the journal lens.
+    /// The catalog does not yet carry Rust's richer source-topic metadata, so
+    /// this is a conservative first-pass and fills any remaining slots in the
+    /// stable catalog order for cold starts.
+    private static func selectRSSSources(
+        _ sources: [SlowClawFeedSource],
+        topics: [SlowClawTopic]
+    ) -> [SlowClawFeedSource] {
+        let labels = topics.map { $0.label.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.count >= 3 }
+        guard !labels.isEmpty else { return Array(sources.prefix(rssSourceLimit)) }
+
+        let matching = sources.filter { source in
+            let metadata = "\(source.title) \(source.domain)".lowercased()
+            return labels.contains { metadata.contains($0) }
+        }
+        guard matching.count < rssSourceLimit else {
+            return Array(matching.prefix(rssSourceLimit))
+        }
+        let selectedDomains = Set(matching.map(\.domain))
+        let fallback = sources.filter { !selectedDomains.contains($0.domain) }
+        return Array((matching + fallback).prefix(rssSourceLimit))
+    }
+
+    private static var readsCacheURL: URL? {
+        guard let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        return directory.appendingPathComponent("reads-feed-v1.json")
+    }
+
+    private static func loadReadsCache() -> ReadsCache? {
+        guard let url = readsCacheURL,
+              let data = try? Data(contentsOf: url),
+              let cache = try? JSONDecoder().decode(ReadsCache.self, from: data),
+              cache.version == readsCacheVersion,
+              !cache.items.isEmpty else { return nil }
+        return ReadsCache(
+            version: cache.version,
+            refreshedAt: cache.refreshedAt,
+            items: Array(cache.items.prefix(80))
+        )
+    }
+
+    private static func saveReadsCache(items: [RankedFeedItem], refreshedAt: Date) {
+        guard let url = readsCacheURL, !items.isEmpty else { return }
+        let cache = ReadsCache(
+            version: readsCacheVersion,
+            refreshedAt: refreshedAt,
+            items: Array(items.prefix(80))
+        )
+        guard let data = try? JSONEncoder().encode(cache) else { return }
+        try? data.write(to: url, options: .atomic)
     }
 
     func storeJournal(text: String) async {

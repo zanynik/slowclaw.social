@@ -24,7 +24,7 @@ enum NostrFetcher {
 
     /// Fetch up to ~20 recent long-form articles (kind 30023) with a title tag
     /// and >200-char body. Tolerates partial relay failures; 8s timeout each.
-    static func fetchArticles() async -> [RankedFeedItem] {
+    static func fetchArticles(topics: [String]) async -> [RankedFeedItem] {
         var seen = Set<String>()
         var events: [[String: Any]] = []
         // Fan out to all relays concurrently; merge results.
@@ -42,24 +42,24 @@ enum NostrFetcher {
             }
         }
 
-        // Client filter (mirrors fetchLongFormArticles): title tag + >200 body.
-        let articles = events.compactMap { Article(event: $0) }
-            .filter { $0.title != nil && $0.body.count > 200 }
-            .sorted { $0.createdAt > $1.createdAt }
-            .prefix(20)
+        // Port the pre-pivot React feed's admission step before ranking:
+        // language/script, obvious spam and content warnings, plus a per-author
+        // cap. A global relay feed is otherwise dominated by bot traffic.
+        let articles = filterArticles(events.compactMap { Article(event: $0) })
 
         // Score: simple recency curve (newest = highest), so articles sort
         // alongside RSS items by the unified sort in AppState.loadReads.
         let now = Date().timeIntervalSince1970
         return articles.enumerated().map { idx, art in
             let ageHours = max(0, (now - art.createdAt) / 3600)
-            // Half-life ~72h, baseline so articles stay visible early.
-            let score = 1.0 + 0.5 * pow(0.5, ageHours / 72.0) - Double(idx) * 0.001
+            // Journal relevance dominates recency, matching the Reads ranker.
+            let score = 1.0 + 0.5 * pow(0.5, ageHours / 72.0)
+                + topicBoost(article: art, topics: topics) - Double(idx) * 0.001
             let minutes = max(1, art.body.count / 900) // ~150 wpm-ish
             return RankedFeedItem(
                 id: "nostr:\(art.identifier)",
                 title: art.title ?? "Untitled",
-                link: art.hablaURL,
+                link: art.articleURL,
                 description: art.summary.isEmpty ? String(art.body.prefix(280)) : art.summary,
                 sourceLabel: "Nostr",
                 score: score,
@@ -97,7 +97,11 @@ enum NostrFetcher {
                       let kind = arr[0] as? String else { continue }
                 if kind == "EOSE" { break }
                 if kind == "EVENT", let ev = arr[2] as? [String: Any] {
-                    collected.append(ev)
+                    // Type-1 NIP-19 relay hints give Habla a concrete location
+                    // for an article it has not indexed yet.
+                    var annotated = ev
+                    annotated["slowclaw_relay"] = urlString
+                    collected.append(annotated)
                 }
             case .data:
                 continue
@@ -129,6 +133,43 @@ enum NostrFetcher {
         return try? JSONSerialization.jsonObject(with: data) as? [Any]
     }
 
+    // MARK: - Quality and relevance
+
+    private static func filterArticles(_ input: [Article]) -> [Article] {
+        var seen = Set<String>()
+        var perAuthor: [String: Int] = [:]
+        var accepted: [Article] = []
+
+        for article in input.sorted(by: { $0.createdAt > $1.createdAt }) {
+            guard seen.insert(article.identifier).inserted,
+                  article.title != nil,
+                  article.body.count > 200,
+                  article.isLanguageAllowed,
+                  !article.isSpam else { continue }
+
+            let count = (perAuthor[article.pubkey] ?? 0) + 1
+            guard count <= 2 else { continue }
+            perAuthor[article.pubkey] = count
+            accepted.append(article)
+            if accepted.count == 20 { break }
+        }
+        return accepted
+    }
+
+    private static func topicBoost(article: Article, topics: [String]) -> Double {
+        var boost = 0.0
+        var firstMatch = true
+        let searchable = "\(article.title ?? "") \(article.summary) \(article.body)".lowercased()
+        for topic in topics.map({ $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }) where !topic.isEmpty {
+            if searchable.contains(topic) {
+                boost += firstMatch ? 0.8 : 0.3
+                firstMatch = false
+                if boost >= 1.2 { return 1.2 }
+            }
+        }
+        return boost
+    }
+
     // MARK: - Article model
 
     /// A parsed NIP-23 article event.
@@ -141,6 +182,9 @@ enum NostrFetcher {
         let image: String?
         let body: String
         let createdAt: TimeInterval
+        let relay: String?
+        let hasContentWarning: Bool
+        let declaredLanguage: String?
 
         init?(event: [String: Any]) {
             guard let id = event["id"] as? String else { return nil }
@@ -152,7 +196,10 @@ enum NostrFetcher {
             pubkey = (event["pubkey"] as? String) ?? ""
             body = (event["content"] as? String) ?? ""
             createdAt = (event["created_at"] as? Double) ?? (event["created_at"] as? Int).map(Double.init) ?? 0
+            relay = event["slowclaw_relay"] as? String
             var d = "", t: String?, sum = "", img: String?
+            var contentWarning = false
+            var language: String?
             if let tags = event["tags"] as? [[Any]] {
                 for tag in tags {
                     guard tag.count >= 2, let name = tag[0] as? String else { continue }
@@ -162,6 +209,11 @@ enum NostrFetcher {
                     case "title": t = val.isEmpty ? nil : val
                     case "summary": sum = val
                     case "image": img = val.isEmpty ? nil : val
+                    case "content-warning": contentWarning = true
+                    case "L", "cl":
+                        if val.range(of: "^[a-z]{2}(-[a-z0-9]+)?$", options: [.regularExpression, .caseInsensitive]) != nil {
+                            language = val.lowercased()
+                        }
                     default: break
                     }
                 }
@@ -170,17 +222,61 @@ enum NostrFetcher {
             title = t
             summary = sum
             image = img
+            hasContentWarning = contentWarning
+            declaredLanguage = language
+        }
+
+        /// Default to Latin-script content, with an explicit language tag able
+        /// to reject known non-English articles. This is the old local filter's
+        /// intentionally lightweight, dependency-free language signal.
+        var isLanguageAllowed: Bool {
+            if let declaredLanguage, !declaredLanguage.hasPrefix("en") { return false }
+            let sample = (title ?? "") + " " + String(body.prefix(400))
+            var latin = 0
+            var nonLatin = 0
+            for scalar in sample.unicodeScalars {
+                switch scalar.value {
+                case 65...90, 97...122, 0x00c0...0x024f:
+                    latin += 1
+                case 0x0400...0x052f, 0x0590...0x05ff, 0x0600...0x06ff,
+                     0x0900...0x097f, 0x0e00...0x0e7f, 0x3040...0x30ff,
+                     0x3400...0x9fff, 0xac00...0xd7af:
+                    nonLatin += 1
+                default:
+                    continue
+                }
+            }
+            return nonLatin == 0 || latin >= nonLatin
+        }
+
+        var isSpam: Bool {
+            let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard text.count >= 3, !hasContentWarning else { return true }
+            let hashtagCount = text.components(separatedBy: "#").dropFirst().count
+            guard hashtagCount <= 6 else { return true }
+            let stripped = text
+                .replacingOccurrences(of: "https?://\\S+", with: "", options: .regularExpression)
+                .replacingOccurrences(of: "#[A-Za-z0-9_]+", with: "", options: .regularExpression)
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .joined()
+            guard stripped.count >= 3 else { return true }
+            let lowered = text.lowercased()
+            return lowered.hasPrefix("block found!") ||
+                lowered.hasPrefix("network: testnet") ||
+                lowered.hasPrefix("lightning address")
         }
 
         /// habla.news link, preferring a naddr-encoded address (mirrors
         /// encodeNaddr in web/src/lib/nostr.ts, which encodes the author
-        /// PUBKEY — not the event id). Falls back to the hex event id.
-        var hablaURL: String {
+        /// PUBKEY — not the event id). An article without a valid NIP-33
+        /// coordinate cannot resolve at Habla; use a generic Nostr viewer for
+        /// that malformed case rather than creating a known 404.
+        var articleURL: String {
             if !dTag.isEmpty, !pubkey.isEmpty,
-               let naddr = Nip19.encodeNaddr(identifier: dTag, pubkey: pubkey, kind: 30023) {
+               let naddr = Nip19.encodeNaddr(identifier: dTag, pubkey: pubkey, kind: 30023, relay: relay) {
                 return "https://habla.news/a/\(naddr)"
             }
-            return "https://habla.news/a/\(identifier)"
+            return "https://njump.me/\(identifier)"
         }
     }
 }
