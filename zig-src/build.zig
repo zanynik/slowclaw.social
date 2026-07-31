@@ -350,14 +350,20 @@ fn buildLlamaCpp(
         c_flags.append(b.allocator, "-DGGML_CPU_GENERIC") catch @panic("oom");
         cxx_flags.append(b.allocator, "-DGGML_CPU_GENERIC") catch @panic("oom");
     }
-    // C++ stdlib headers from the iOS SDK (zig only adds its bundled libc++
-    // headers when it also links its libc++, which iOS skips — see the
-    // link_libcpp note above). Scoped to C++ sources via per-file -isystem
-    // flags: a module-level system path would shadow clang's builtin header
-    // chain for the C files (stdatomic.h → 'unknown type name atomic_int').
-    if (ios_sysroot) |sdk| {
+    // C++ stdlib headers on iOS: zig only wires up its bundled libc++ when
+    // link_libcpp is set, and link_libcpp must stay OFF for iOS (zig can't
+    // build libc++ for iOS targets — the app links Apple's libc++ instead,
+    // same 21.1 ABI generation). So compile against zig's bundled libc++
+    // headers explicitly, scoped to C++ sources via per-file -isystem flags
+    // (a module-level path would shadow clang's builtin header chain for the
+    // C files — stdatomic.h — and the SDK's c++/v1 breaks on header-order
+    // rules of its own). These are the exact headers the working macOS
+    // native build uses.
+    if (target.result.os.tag == .ios) {
         cxx_flags.append(b.allocator, "-isystem") catch @panic("oom");
-        cxx_flags.append(b.allocator, std.fmt.allocPrint(b.allocator, "{s}/usr/include/c++/v1", .{sdk}) catch @panic("oom")) catch @panic("oom");
+        cxx_flags.append(b.allocator, b.pathJoin(&.{ b.lib_dir, "libcxx", "include" })) catch @panic("oom");
+        cxx_flags.append(b.allocator, "-isystem") catch @panic("oom");
+        cxx_flags.append(b.allocator, b.pathJoin(&.{ b.lib_dir, "libcxxabi", "include" })) catch @panic("oom");
     }
 
     var c_sources = std.ArrayList([]const u8).empty;
