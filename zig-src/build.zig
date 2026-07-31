@@ -281,13 +281,14 @@ fn buildLlamaCpp(
         .optimize = optimize,
         .link_libc = true,
     });
-    // Zig bundles libc++ (headers + compiled objects) for native/desktop
-    // targets, making local builds + the smoke test self-contained. For iOS
-    // zig does NOT emit its libc++ into the archive (unsupported target), so
-    // there the compiled objects reference the system C++ runtime and the
-    // iOS app links Apple's libc++ (-lc++ in project.yml). ABI-compatible:
+    // Always link_libcpp: zig wires up its bundled libc++ headers (plus a
+    // generated __config_site) correctly ONLY on this path. On native/desktop
+    // targets it also compiles libc++ into the archive (self-contained smoke
+    // test); on iOS it silently skips the libc++ build (unsupported target),
+    // leaving the C++ stdlib symbols undefined in the archive — the iOS app
+    // resolves them from Apple's libc++ (-lc++ in project.yml). ABI-compatible:
     // zig 0.16's bundled libc++ is 21.1, same generation as Xcode 26's.
-    mod.link_libcpp = target.result.os.tag != .ios;
+    mod.link_libcpp = true;
 
     const includes: []const []const u8 = &.{
         "vendor/llama.cpp/include",
@@ -349,22 +350,6 @@ fn buildLlamaCpp(
     if (is_generic) {
         c_flags.append(b.allocator, "-DGGML_CPU_GENERIC") catch @panic("oom");
         cxx_flags.append(b.allocator, "-DGGML_CPU_GENERIC") catch @panic("oom");
-    }
-    // C++ stdlib headers on iOS: zig only wires up its bundled libc++ when
-    // link_libcpp is set, and link_libcpp must stay OFF for iOS (zig can't
-    // build libc++ for iOS targets — the app links Apple's libc++ instead,
-    // same 21.1 ABI generation). So compile against zig's bundled libc++
-    // headers explicitly, scoped to C++ sources via per-file -isystem flags
-    // (a module-level path would shadow clang's builtin header chain for the
-    // C files — stdatomic.h — and the SDK's c++/v1 breaks on header-order
-    // rules of its own). These are the exact headers the working macOS
-    // native build uses.
-    if (target.result.os.tag == .ios) {
-        const zig_lib = b.graph.zig_lib_directory.path orelse @panic("zig lib dir unknown");
-        cxx_flags.append(b.allocator, "-isystem") catch @panic("oom");
-        cxx_flags.append(b.allocator, b.pathJoin(&.{ zig_lib, "libcxx", "include" })) catch @panic("oom");
-        cxx_flags.append(b.allocator, "-isystem") catch @panic("oom");
-        cxx_flags.append(b.allocator, b.pathJoin(&.{ zig_lib, "libcxxabi", "include" })) catch @panic("oom");
     }
 
     var c_sources = std.ArrayList([]const u8).empty;
