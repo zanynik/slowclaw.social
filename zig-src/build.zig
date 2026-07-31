@@ -360,10 +360,11 @@ fn buildLlamaCpp(
     // rules of its own). These are the exact headers the working macOS
     // native build uses.
     if (target.result.os.tag == .ios) {
+        const zig_lib = b.graph.zig_lib_directory.path orelse @panic("zig lib dir unknown");
         cxx_flags.append(b.allocator, "-isystem") catch @panic("oom");
-        cxx_flags.append(b.allocator, b.pathJoin(&.{ b.lib_dir, "libcxx", "include" })) catch @panic("oom");
+        cxx_flags.append(b.allocator, b.pathJoin(&.{ zig_lib, "libcxx", "include" })) catch @panic("oom");
         cxx_flags.append(b.allocator, "-isystem") catch @panic("oom");
-        cxx_flags.append(b.allocator, b.pathJoin(&.{ b.lib_dir, "libcxxabi", "include" })) catch @panic("oom");
+        cxx_flags.append(b.allocator, b.pathJoin(&.{ zig_lib, "libcxxabi", "include" })) catch @panic("oom");
     }
 
     var c_sources = std.ArrayList([]const u8).empty;
