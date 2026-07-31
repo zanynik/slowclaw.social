@@ -789,7 +789,10 @@ pub export fn slowclaw_feed_parse_and_rank(
     // Convert to FeedItems for ranking. Allocated with c_allocator so the
     // defer below frees with the matching allocator (a mismatch here —
     // page_allocator alloc + c_allocator free — was the iOS Reads SIGABRT).
-    const feed_items = rss_parser.toFeedItems(c_allocator, items, src_slice);
+    const feed_items = rss_parser.toFeedItems(c_allocator, items, src_slice) catch {
+        out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_OUT_OF_MEMORY };
+        return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    };
     defer c_allocator.free(feed_items);
 
     // Parse the topics JSON if provided. Labels are duped into c_allocator

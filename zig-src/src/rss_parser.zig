@@ -230,8 +230,12 @@ pub fn toFeedItems(
     allocator: std.mem.Allocator,
     items: []const RssItem,
     source_label: []const u8,
-) []feeds_ranking.FeedItem {
-    var feed_items = allocator.alloc(feeds_ranking.FeedItem, items.len) catch return &.{};
+) error{OutOfMemory}![]feeds_ranking.FeedItem {
+    // Propagate OOM rather than returning a static `&.{}`: the FFI frees the
+    // result with c_allocator, and c_allocator.free() calls libc free()
+    // unconditionally (no zero-len guard), so freeing a static pointer would
+    // abort. On OOM, let the caller decide (the FFI sets an empty result).
+    var feed_items = try allocator.alloc(feeds_ranking.FeedItem, items.len);
     for (items, 0..) |item, i| {
         feed_items[i] = .{
             .id = if (item.guid.len > 0) item.guid else item.link,
@@ -371,7 +375,7 @@ test "toFeedItems: converts RssItems to FeedItems for ranking" {
     const items = [_]RssItem{
         .{ .title = "Test", .link = "https://example.com", .description = "Body", .pub_date = "", .author = "author", .guid = "guid1" },
     };
-    const feed_items = toFeedItems(a, &items, "test-source");
+    const feed_items = try toFeedItems(a, &items, "test-source");
     defer a.free(feed_items);
     try testing.expectEqual(@as(usize, 1), feed_items.len);
     try testing.expectEqualStrings("Test", feed_items[0].title);
