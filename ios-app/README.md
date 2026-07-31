@@ -56,10 +56,12 @@ The app links THREE static archives out of `zig-src/zig-out/lib`:
 `libllama.a` (vendored llama.cpp b10201, CPU backend — powers the On-Device AI
 card: model download from Hugging Face into Documents/Models/, activate/load,
 then journal synthesis, interest extraction, and post drafting all run
-on-device). `libllama.a` bundles zig's libc++, so no `-lc++` is needed. The
-app carries the `com.apple.developer.kernel.increased-memory-limit`
-entitlement (SlowClawApp/SlowClaw.entitlements) so multi-GB GGUF models fit
-in the per-app memory budget on device.
+on-device). `libllama.a` bundles zig's libc++, so no `-lc++` is needed. Models are
+mmap'd (pages stay file-backed) and the context is capped at 1536 tokens to
+stay inside the default per-app memory budget — matching the Tauri app,
+which shipped GGUF inference without a memory entitlement. (The
+`increased-memory-limit` entitlement only survives signing with
+Xcode-managed profiles, which this CI pipeline doesn't use.)
 
 ## TestFlight (CI)
 

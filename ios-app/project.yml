@@ -62,8 +62,6 @@ targets:
         # Link the Zig + vendored staticlibs (target-level override of the
         # base OTHER_LDFLAGS). All three come from zig-out/lib.
         OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3 -lllama"
-        # Entitlements: increased memory limit so on-device GGUF models fit.
-        CODE_SIGN_ENTITLEMENTS: SlowClawApp/SlowClaw.entitlements
         LIBRARY_SEARCH_PATHS: "$(SRCROOT)/../zig-src/zig-out/lib"
         ENABLE_BITCODE: NO
         TARGETED_DEVICE_FAMILY: "1,2" # iPhone + iPad
