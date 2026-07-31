@@ -10,6 +10,7 @@
 //! append-only — `forget` is a documented no-op (preserves the audit trail).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const memory_types = @import("memory_types.zig");
 
@@ -20,6 +21,11 @@ const c = @cImport({
     @cInclude("dirent.h");
     @cInclude("time.h");
     @cInclude("stdlib.h");
+    // rmdir() lives in unistd.h on POSIX (Windows uses _rmdir from direct.h;
+    // mkdirCompat below already handles the split).
+    if (builtin.os.tag != .windows) {
+        @cInclude("unistd.h");
+    }
 });
 
 const MemoryEntry = memory_types.MemoryEntry;
