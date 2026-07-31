@@ -56,7 +56,8 @@ The app links THREE static archives out of `zig-src/zig-out/lib`:
 `libllama.a` (vendored llama.cpp b10201, CPU backend — powers the On-Device AI
 card: model download from Hugging Face into Documents/Models/, activate/load,
 then journal synthesis, interest extraction, and post drafting all run
-on-device). `libllama.a` bundles zig's libc++, so no `-lc++` is needed. Models are
+on-device). The app also links Apple's libc++ (`-lc++`) for the llama.cpp
+objects — zig doesn't emit its bundled libc++ for iOS targets. Models are
 mmap'd (pages stay file-backed) and the context is capped at 1536 tokens to
 stay inside the default per-app memory budget — matching the Tauri app,
 which shipped GGUF inference without a memory entitlement. (The

@@ -281,11 +281,13 @@ fn buildLlamaCpp(
         .optimize = optimize,
         .link_libc = true,
     });
-    // Zig bundles libc++ (headers + a compiled archive) for the target. This
-    // makes the build self-contained — no Xcode SDK C++ headers needed — and
-    // the resulting archive carries the C++ stdlib symbols llama.cpp needs,
-    // so the iOS app links it without adding -lc++ to the Xcode target.
-    mod.link_libcpp = true;
+    // Zig bundles libc++ (headers + compiled objects) for native/desktop
+    // targets, making local builds + the smoke test self-contained. For iOS
+    // zig does NOT emit its libc++ into the archive (unsupported target), so
+    // there the compiled objects reference the system C++ runtime and the
+    // iOS app links Apple's libc++ (-lc++ in project.yml). ABI-compatible:
+    // zig 0.16's bundled libc++ is 21.1, same generation as Xcode 26's.
+    mod.link_libcpp = target.result.os.tag != .ios;
 
     const includes: []const []const u8 = &.{
         "vendor/llama.cpp/include",

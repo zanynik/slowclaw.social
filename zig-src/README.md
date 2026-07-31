@@ -77,8 +77,10 @@ SLOWCLAW_TEST_GGUF=/path/to/model.gguf zig build test-local-llm
 `-Dwith-llama=false` compiles the staticlib without llama.cpp (the FFI then
 reports on-device AI as unavailable, matching pre-llama builds). The default
 build (what Xcode + CI run) compiles the vendored llama.cpp into
-`zig-out/lib/libllama.a` — a THIRD archive the app links (`-lllama`), which
-bundles zig's libc++ so no `-lc++` is needed.
+`zig-out/lib/libllama.a` — a THIRD archive the app links (`-lllama`). On iOS
+the app also links Apple's libc++ (`-lc++` in project.yml): zig doesn't emit
+its bundled libc++ for iOS targets, and zig 0.16's bundled libc++ (21.1) is
+the same ABI generation as Xcode 26's, so the objects bind cleanly.
 
 ## Known iOS link issues (Zig 0.16.0)
 
