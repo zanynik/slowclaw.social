@@ -792,9 +792,12 @@ pub export fn slowclaw_feed_parse_and_rank(
     const feed_items = rss_parser.toFeedItems(c_allocator, items, src_slice);
     defer c_allocator.free(feed_items);
 
-    // Parse the topics JSON if provided.
+    // Parse the topics JSON if provided. Labels are duped into c_allocator
+    // by parseTopicsJson (the JSON arena is freed inside it), so free with
+    // freeTopics — NOT a bare slice free (which would leak the labels and,
+    // before the dup fix, read freed arena memory → heap corruption).
     var topics: []feeds_ranking.Topic = &.{};
-    defer if (topics.len > 0) c_allocator.free(topics);
+    defer freeTopics(c_allocator, topics);
     if (topics_json) |tj| {
         const tj_slice = tj[0..topics_json_len];
         topics = parseTopicsJson(c_allocator, tj_slice) catch &.{};
@@ -990,11 +993,25 @@ pub export fn slowclaw_feed_local_llm_draft_post(
 /// Parse a JSON array of {"label":"...","weight":N} into Topic structs.
 fn parseTopicsJson(allocator: std.mem.Allocator, json: []const u8) ![]feeds_ranking.Topic {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return &.{};
+    // NOTE: must not `defer parsed.deinit()` here and then return slices that
+    // alias it. std.json stores ESCAPED strings in the parsed arena (and
+    // unescaped strings as slices into the caller's `json` buffer). The
+    // returned Topic labels must outlive this function — they're read by
+    // rankReads after we return — so dup every label into `allocator` (which
+    // is c_allocator in the FFI path) before the arena is freed. Failing to
+    // dup was a use-after-free → heap corruption → SIGABRT on the next free
+    // for any label containing a JSON escape.
     defer parsed.deinit();
 
     if (std.meta.activeTag(parsed.value) != .array) return &.{};
     const arr = parsed.value.array;
     var topics = try allocator.alloc(feeds_ranking.Topic, arr.items.len);
+    // Track how many labels we duped so an alloc failure below frees what's
+    // already owned before unwinding (the slice itself is freed by `errdefer`).
+    errdefer {
+        for (topics) |t| if (t.label.len > 0) allocator.free(t.label);
+        allocator.free(topics);
+    }
 
     for (arr.items, 0..) |item, i| {
         if (std.meta.activeTag(item) != .object) {
@@ -1003,11 +1020,21 @@ fn parseTopicsJson(allocator: std.mem.Allocator, json: []const u8) ![]feeds_rank
         }
         const label_val = item.object.get("label") orelse std.json.Value{ .string = "" };
         const weight_val = item.object.get("weight") orelse std.json.Value{ .float = 1.0 };
+        const raw_label = switch (label_val) {
+            .string => |s| s,
+            else => "",
+        };
+        // Own the label: arena (escaped) and input buffer (unescaped) are both
+        // gone by the time rankReads reads this, so dup into `allocator`.
+        const owned_label = if (raw_label.len == 0)
+            ""
+        else
+            (allocator.dupe(u8, raw_label) catch {
+                topics[i] = .{ .label = "", .weight = 0 };
+                continue;
+            });
         topics[i] = .{
-            .label = switch (label_val) {
-                .string => |s| s,
-                else => "",
-            },
+            .label = owned_label,
             .weight = switch (weight_val) {
                 .float => |f| f,
                 .integer => |n| @floatFromInt(n),
@@ -1016,6 +1043,15 @@ fn parseTopicsJson(allocator: std.mem.Allocator, json: []const u8) ![]feeds_rank
         };
     }
     return topics;
+}
+
+/// Free a topics slice produced by `parseTopicsJson`. Each label was duped
+/// into `allocator`, so free them individually, then the slice. Safe on the
+/// `&.{}` fallback (len 0 → no-op) and on entries whose label is the static
+/// "" (len 0 → not freed).
+fn freeTopics(allocator: std.mem.Allocator, topics: []feeds_ranking.Topic) void {
+    for (topics) |t| if (t.label.len > 0) allocator.free(t.label);
+    if (topics.len > 0) allocator.free(topics);
 }
 
 /// Serialize ranked feed items as a JSON array for Swift to decode.
@@ -1432,6 +1468,43 @@ test "ffi: parse_and_rank frees feed_items with the matching allocator (regressi
         );
         try testing.expectEqual(SLOWCLAW_OK, status);
         try testing.expectEqual(@as(c_int, SLOWCLAW_OK), result.status);
+        slowclaw_feed_rank_result_free(&result);
+    }
+}
+
+test "ffi: parse_and_rank with topics incl. escaped label does not corrupt the heap (UAF regression)" {
+    // std.json stores ESCAPED strings in its parsed arena and unescaped
+    // strings as slices into the caller's input buffer. parseTopicsJson must
+    // dup every label into c_allocator because the arena is freed (defer
+    // parsed.deinit()) before rankReads reads the topics — and the caller's
+    // input buffer only lives for the FFI call. Before the dup fix, an escaped
+    // label (the "a\"b" below) was a dangling arena pointer → rankReads read
+    // freed memory → heap corruption → SIGABRT at the next free. Run many
+    // iterations so a freed arena page is more likely to be reused/overwritten.
+    const xml =
+        \\<?xml version="1.0"?>
+        \\<rss version="2.0"><channel>
+        \\<title>Tech</title><link>https://example.com/</link><description>Tech news</description>
+        \\<item><title>Rust async runtime</title><link>https://example.com/a</link><description>tokio internals</description><guid>a</guid><pubDate>Mon, 15 Jan 2024 10:30:00 GMT</pubDate></item>
+        \\<item><title>Cycling in Berlin</title><link>https://example.com/b</link><description>urban riding</description><guid>b</guid><pubDate>Mon, 15 Jan 2024 11:30:00 GMT</pubDate></item>
+        \\</channel></rss>
+    ;
+    // The "a\"b" label is a JSON-escaped string — forces the arena path.
+    const topics_json =
+        \\[{"label":"a\"b","weight":1.0},{"label":"rust","weight":2.0}]
+    ;
+    const src = "Tech";
+    const now: f64 = 1_700_000_000.0;
+
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        var result: SlowclawRankResult = .{ .items_json = SlowclawString.empty(), .status = 0 };
+        const status = slowclaw_feed_parse_and_rank(
+            xml.ptr, xml.len, src.ptr, src.len, topics_json.ptr, topics_json.len, now, &result,
+        );
+        try testing.expectEqual(SLOWCLAW_OK, status);
+        try testing.expectEqual(@as(c_int, SLOWCLAW_OK), result.status);
+        try testing.expect(result.items_json.len > 0);
         slowclaw_feed_rank_result_free(&result);
     }
 }
