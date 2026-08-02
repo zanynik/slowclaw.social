@@ -583,8 +583,15 @@ final class AppState: ObservableObject {
     }
 
     func storeJournal(text: String) async {
+        await storeJournal(text: text, source: nil, mediaURL: nil)
+    }
+
+    /// Store a journal entry with optional provenance (source + media_url).
+    /// The audio recorder passes source="audio_recorded" + the m4a path so the
+    /// entry links back to its durable audio file for replay.
+    func storeJournal(text: String, source: String?, mediaURL: String?) async {
         try? memory.store(key: "journal_\(Date().timeIntervalSince1970)", content: text,
-                          category: "daily", sessionID: nil)
+                          category: "daily", sessionID: nil, source: source, mediaURL: mediaURL)
         await refreshJournals()
         guard anyLLMAvailable else { return }
         Task.detached(priority: .utility) {

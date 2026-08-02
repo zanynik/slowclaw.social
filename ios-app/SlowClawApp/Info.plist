@@ -48,6 +48,14 @@
     <string>SlowClaw needs microphone access when you record audio journal entries.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>SlowClaw uses on-device speech recognition to transcribe your audio journal entries.</string>
+    <!-- Background audio: lets a recording in progress survive screen lock
+         and backgrounding (long audio journals). Pairs with the .playAndRecord
+         AVAudioSession category in AudioRecorder.swift. No entitlement file
+         is required for the `audio` background mode. -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>audio</string>
+    </array>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>
