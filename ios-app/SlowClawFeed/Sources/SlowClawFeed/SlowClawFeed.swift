@@ -29,9 +29,15 @@ public struct SlowClawMemoryEntry: Equatable {
     public let timestamp: String
     public let sessionID: String?
     public let score: Double?
+    /// Provenance: "audio_recorded" (in-app recorder), "audio_imported"
+    /// (Voice Memos share-sheet), or "text". Nil for legacy rows.
+    public let source: String?
+    /// Documents-relative path to the linked audio file, or nil.
+    public let mediaURL: String?
 
     public init(id: String, key: String, content: String, category: String,
-                timestamp: String, sessionID: String?, score: Double?) {
+                timestamp: String, sessionID: String?, score: Double?,
+                source: String? = nil, mediaURL: String? = nil) {
         self.id = id
         self.key = key
         self.content = content
@@ -39,6 +45,8 @@ public struct SlowClawMemoryEntry: Equatable {
         self.timestamp = timestamp
         self.sessionID = sessionID
         self.score = score
+        self.source = source
+        self.mediaURL = mediaURL
     }
 }
 
@@ -103,24 +111,25 @@ public final class SlowClawSqliteMemory {
     }
 
     /// Insert or upsert a memory. Custom categories pass through verbatim.
+    /// `source`/`mediaURL` are optional provenance fields (see SlowClawMemoryEntry).
     public func store(key: String, content: String, category: String,
-                      sessionID: String? = nil) throws {
+                      sessionID: String? = nil, source: String? = nil,
+                      mediaURL: String? = nil) throws {
         guard let h = handle else { throw SlowClawFeedError.internalError("closed") }
         let status = key.withCString { keyPtr in
             content.withCString { contentPtr in
                 category.withCString { catPtr in
-                    if let sid = sessionID {
-                        return sid.withCString { sidPtr in
-                            slowclaw_feed_sqlite_store(h, keyPtr, key.utf8.count,
-                                                       contentPtr, content.utf8.count,
-                                                       catPtr, category.utf8.count,
-                                                       sidPtr, sid.utf8.count)
+                    withOptionalCString(sessionID) { sidPtr, sidLen in
+                        withOptionalCString(source) { srcPtr, srcLen in
+                            withOptionalCString(mediaURL) { mediaPtr, mediaLen in
+                                slowclaw_feed_sqlite_store(h, keyPtr, key.utf8.count,
+                                                           contentPtr, content.utf8.count,
+                                                           catPtr, category.utf8.count,
+                                                           sidPtr, sidLen,
+                                                           srcPtr, srcLen,
+                                                           mediaPtr, mediaLen)
+                            }
                         }
-                    } else {
-                        return slowclaw_feed_sqlite_store(h, keyPtr, key.utf8.count,
-                                                          contentPtr, content.utf8.count,
-                                                          catPtr, category.utf8.count,
-                                                          nil, 0)
                     }
                 }
             }
@@ -132,8 +141,10 @@ public final class SlowClawSqliteMemory {
 
     /// Convenience overload using the typed category enum.
     public func store(key: String, content: String, category: SlowClawMemoryCategory,
-                      sessionID: String? = nil) throws {
-        try store(key: key, content: content, category: category.rawValue, sessionID: sessionID)
+                      sessionID: String? = nil, source: String? = nil,
+                      mediaURL: String? = nil) throws {
+        try store(key: key, content: content, category: category.rawValue,
+                  sessionID: sessionID, source: source, mediaURL: mediaURL)
     }
 
     /// Fetch a memory by key. Returns nil if not found.
@@ -217,15 +228,29 @@ public final class SlowClawSqliteMemory {
         let category = stringFromSlowclaw(entry.category)
         let timestamp = stringFromSlowclaw(entry.timestamp)
         let sessionID: String? = entry.session_id.bytes.map { _ in stringFromSlowclaw(entry.session_id) }
+        let source: String? = entry.source.bytes.map { _ in stringFromSlowclaw(entry.source) }
+        let mediaURL: String? = entry.media_url.bytes.map { _ in stringFromSlowclaw(entry.media_url) }
         let score = entry.score.isNaN ? nil : entry.score
         return SlowClawMemoryEntry(id: id, key: key, content: content, category: category,
-                                   timestamp: timestamp, sessionID: sessionID, score: score)
+                                   timestamp: timestamp, sessionID: sessionID, score: score,
+                                   source: source, mediaURL: mediaURL)
     }
 
     private func stringFromSlowclaw(_ s: SlowclawString) -> String {
         guard let bytes = s.bytes, s.len > 0 else { return "" }
         return String(data: Data(bytes: UnsafeRawPointer(bytes), count: s.len), encoding: .utf8) ?? ""
     }
+}
+
+/// Bridge an optional Swift String to the C ABI's `(ptr, len)` convention.
+/// Absent → `(nil, 0)`; present → the string's UTF-8 pointer + byte count,
+/// valid for the duration of `body`. Mirrors how the recall/store paths pass
+/// optional session_id/source/media_url across the boundary.
+@inline(__always)
+private func withOptionalCString<R>(_ s: String?,
+                                    _ body: (UnsafePointer<CChar>?, Int) -> R) -> R {
+    guard let s else { return body(nil, 0) }
+    return s.withCString { ptr in body(ptr, s.utf8.count) }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -240,12 +265,15 @@ private struct MemoryEntryDTO: Decodable {
     let category: String
     let timestamp: String
     let session_id: String?
+    let source: String?
+    let media_url: String?
     let score: Double?
 
     func toSwift() -> SlowClawMemoryEntry {
         return SlowClawMemoryEntry(id: id, key: key, content: content,
                                    category: category, timestamp: timestamp,
-                                   sessionID: session_id, score: score)
+                                   sessionID: session_id, score: score,
+                                   source: source, mediaURL: media_url)
     }
 }
 

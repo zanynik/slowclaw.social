@@ -325,6 +325,8 @@ pub const MarkdownMemory = struct {
         content: []const u8,
         category: MemoryCategory,
         _: ?[]const u8,
+        _: ?[]const u8,
+        _: ?[]const u8,
     ) !void {
         const entry_line = try std.fmt.allocPrint(self.allocator, "- **{s}**: {s}", .{ key, content });
         defer self.allocator.free(entry_line);
@@ -498,9 +500,11 @@ pub const MarkdownMemory = struct {
         content: []const u8,
         category: MemoryCategory,
         session_id: ?[]const u8,
+        source: ?[]const u8,
+        media_url: ?[]const u8,
     ) MemoryError!void {
         const self: *MarkdownMemory = @ptrCast(@alignCast(ctx));
-        self.store(key, content, category, session_id) catch return error.BackendFailed;
+        self.store(key, content, category, session_id, source, media_url) catch return error.BackendFailed;
     }
 
     fn vtableRecall(
@@ -668,7 +672,7 @@ test "markdown: store core appends to MEMORY.md" {
     defer freeTempWorkspace(a, dir);
     var mem = try MarkdownMemory.init(a, dir);
     defer mem.deinit();
-    try mem.store("pref", "User likes Rust", .{ .core = {} }, null);
+    try mem.store("pref", "User likes Rust", .{ .core = {} }, null, null, null);
 
     const core_path = try mem.corePath(a);
     defer a.free(core_path);
@@ -684,7 +688,7 @@ test "markdown: store daily goes to memory/YYYY-MM-DD.md" {
     defer freeTempWorkspace(a, dir);
     var mem = try MarkdownMemory.init(a, dir);
     defer mem.deinit();
-    try mem.store("note", "Finished tests", .{ .daily = {} }, null);
+    try mem.store("note", "Finished tests", .{ .daily = {} }, null, null, null);
 
     const daily_path = try mem.dailyPath(a);
     defer a.free(daily_path);
@@ -700,9 +704,9 @@ test "markdown: recall keyword finds matches" {
     defer freeTempWorkspace(a, dir);
     var mem = try MarkdownMemory.init(a, dir);
     defer mem.deinit();
-    try mem.store("a", "Rust is fast", .{ .core = {} }, null);
-    try mem.store("b", "Python is slow", .{ .core = {} }, null);
-    try mem.store("c", "Rust and safety", .{ .core = {} }, null);
+    try mem.store("a", "Rust is fast", .{ .core = {} }, null, null, null);
+    try mem.store("b", "Python is slow", .{ .core = {} }, null, null, null);
+    try mem.store("c", "Rust and safety", .{ .core = {} }, null, null, null);
 
     const results = try mem.recall(a, "Rust", 10, null);
     defer {
@@ -723,7 +727,7 @@ test "markdown: recall with no match returns empty" {
     defer freeTempWorkspace(a, dir);
     var mem = try MarkdownMemory.init(a, dir);
     defer mem.deinit();
-    try mem.store("a", "Rust is great", .{ .core = {} }, null);
+    try mem.store("a", "Rust is great", .{ .core = {} }, null, null, null);
     const results = try mem.recall(a, "javascript", 10, null);
     defer {
         for (results) |e| freeEntry(a, e);
@@ -738,8 +742,8 @@ test "markdown: count tracks stored entries" {
     defer freeTempWorkspace(a, dir);
     var mem = try MarkdownMemory.init(a, dir);
     defer mem.deinit();
-    try mem.store("a", "first", .{ .core = {} }, null);
-    try mem.store("b", "second", .{ .core = {} }, null);
+    try mem.store("a", "first", .{ .core = {} }, null, null, null);
+    try mem.store("b", "second", .{ .core = {} }, null, null, null);
     const n = try mem.count(a);
     try testing.expect(n >= 2);
 }
@@ -750,8 +754,8 @@ test "markdown: list filters by category" {
     defer freeTempWorkspace(a, dir);
     var mem = try MarkdownMemory.init(a, dir);
     defer mem.deinit();
-    try mem.store("a", "core fact", .{ .core = {} }, null);
-    try mem.store("b", "daily note", .{ .daily = {} }, null);
+    try mem.store("a", "core fact", .{ .core = {} }, null, null, null);
+    try mem.store("b", "daily note", .{ .daily = {} }, null, null, null);
 
     const core = try mem.list(a, .{ .core = {} }, null);
     defer {
@@ -774,7 +778,7 @@ test "markdown: forget is always a no-op" {
     defer freeTempWorkspace(a, dir);
     var mem = try MarkdownMemory.init(a, dir);
     defer mem.deinit();
-    try mem.store("a", "permanent", .{ .core = {} }, null);
+    try mem.store("a", "permanent", .{ .core = {} }, null, null, null);
     const removed = try mem.forget("a");
     try testing.expect(!removed);
 }

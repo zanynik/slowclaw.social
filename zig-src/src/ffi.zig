@@ -259,8 +259,8 @@ pub export fn slowclaw_feed_rank_result_free(result: *SlowclawRankResult) void {
 pub const SlowclawSqlite = opaque {};
 
 /// A memory entry returned from get/list/recall. `id`/`key`/`content`/
-/// `category`/`timestamp`/`session_id` are all Zig-owned UTF-8; the caller
-/// frees the entire result via `slowclaw_feed_sqlite_entry_free`.
+/// `category`/`timestamp`/`session_id`/`source`/`media_url` are all Zig-owned
+/// UTF-8; the caller frees the entire result via `slowclaw_feed_sqlite_entry_free`.
 pub const SlowclawSqliteEntry = extern struct {
     id: SlowclawString,
     key: SlowclawString,
@@ -270,6 +270,11 @@ pub const SlowclawSqliteEntry = extern struct {
     category: SlowclawString,
     timestamp: SlowclawString,
     session_id: SlowclawString, // bytes=null when absent
+    /// Provenance tag ("audio_recorded"/"audio_imported"/"text"). bytes=null
+    /// for legacy rows or typed entries that didn't set it.
+    source: SlowclawString,
+    /// Documents-relative path to the linked audio file. bytes=null when absent.
+    media_url: SlowclawString,
     /// Optional recall score (NaN/0 when not set).
     score: f64,
 };
@@ -310,8 +315,8 @@ pub export fn slowclaw_feed_sqlite_health(handle: *SlowclawSqlite) bool {
 }
 
 /// Insert or upsert a memory. `category` is a lowercase tag ("core", "daily",
-/// "conversation", or any custom name). `session_id` is `{null, 0}` if absent.
-/// Returns 0 on success, negative on error.
+/// "conversation", or any custom name). `session_id`, `source`, and `media_url`
+/// are `{null, 0}` if absent. Returns 0 on success, negative on error.
 pub export fn slowclaw_feed_sqlite_store(
     handle: *SlowclawSqlite,
     key: [*]const u8,
@@ -322,11 +327,17 @@ pub export fn slowclaw_feed_sqlite_store(
     category_len: usize,
     session_id: ?[*]const u8,
     session_id_len: usize,
+    source: ?[*]const u8,
+    source_len: usize,
+    media_url: ?[*]const u8,
+    media_url_len: usize,
 ) c_int {
     const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
     const cat = categoryToEnum(category[0..category_len]);
     const sid_slice: ?[]const u8 = if (session_id) |p| p[0..session_id_len] else null;
-    db.store(key[0..key_len], content[0..content_len], cat, sid_slice) catch return SLOWCLAW_ERR_INTERNAL;
+    const src_slice: ?[]const u8 = if (source) |p| p[0..source_len] else null;
+    const media_slice: ?[]const u8 = if (media_url) |p| p[0..media_url_len] else null;
+    db.store(key[0..key_len], content[0..content_len], cat, sid_slice, src_slice, media_slice) catch return SLOWCLAW_ERR_INTERNAL;
     return SLOWCLAW_OK;
 }
 
@@ -411,6 +422,8 @@ pub export fn slowclaw_feed_sqlite_entry_free(entry: *SlowclawSqliteEntry) void 
     freeEntryCString(&entry.category);
     freeEntryCString(&entry.timestamp);
     freeEntryCString(&entry.session_id);
+    freeEntryCString(&entry.source);
+    freeEntryCString(&entry.media_url);
     entry.* = std.mem.zeroes(SlowclawSqliteEntry);
 }
 
@@ -442,6 +455,8 @@ fn entryToC(entry: sqlite_memory.MemoryEntry) SlowclawSqliteEntry {
         .category = cStringFromSlice(cat_str),
         .timestamp = cStringFromSlice(entry.timestamp),
         .session_id = if (entry.session_id) |s| cStringFromSlice(s) else SlowclawString.empty(),
+        .source = if (entry.source) |src| cStringFromSlice(src) else SlowclawString.empty(),
+        .media_url = if (entry.media_url) |m| cStringFromSlice(m) else SlowclawString.empty(),
         .score = if (entry.score) |sc| sc else std.math.nan(f64),
     };
 }
@@ -459,6 +474,8 @@ fn entryToCFromSqlite(entry: memory_types.MemoryEntry) SlowclawSqliteEntry {
         .category = cStringFromSlice(cat_str),
         .timestamp = cStringFromSlice(entry.timestamp),
         .session_id = if (entry.session_id) |s| cStringFromSlice(s) else SlowclawString.empty(),
+        .source = if (entry.source) |src| cStringFromSlice(src) else SlowclawString.empty(),
+        .media_url = if (entry.media_url) |m| cStringFromSlice(m) else SlowclawString.empty(),
         .score = if (entry.score) |sc| sc else std.math.nan(f64),
     };
 }
@@ -475,7 +492,8 @@ fn cStringFromSlice(s: []const u8) SlowclawString {
 /// Serialize full memory entries (not the abbreviated rank-item form) as JSON.
 /// Used by `slowclaw_feed_sqlite_recall`. Each entry:
 ///   { "id":..., "key":..., "content":..., "category":..., "timestamp":...,
-///     "session_id":...|null, "score":...|null }
+///     "session_id":...|null, "source":...|null, "media_url":...|null,
+///     "score":...|null }
 fn serializeEntriesFull(allocator: std.mem.Allocator, items: []const memory_types.MemoryEntry) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
@@ -495,6 +513,18 @@ fn serializeEntriesFull(allocator: std.mem.Allocator, items: []const memory_type
         try buf.appendSlice(allocator, ",\"session_id\":");
         if (item.session_id) |s| {
             try writeJsonString(allocator, &buf, s);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",\"source\":");
+        if (item.source) |src| {
+            try writeJsonString(allocator, &buf, src);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+        try buf.appendSlice(allocator, ",\"media_url\":");
+        if (item.media_url) |m| {
+            try writeJsonString(allocator, &buf, m);
         } else {
             try buf.appendSlice(allocator, "null");
         }
@@ -1379,6 +1409,8 @@ test "ffi: sqlite open/store/get/forget round-trip via C ABI" {
         "Rust", "Rust".len,
         "core", "core".len,
         null, 0,
+        null, 0,
+        null, 0,
     );
     try testing.expectEqual(SLOWCLAW_OK, status);
     try testing.expectEqual(@as(c_int, 1), slowclaw_feed_sqlite_count(handle));
@@ -1414,6 +1446,8 @@ test "ffi: sqlite store with session_id round-trips" {
         "v", "v".len,
         "core", "core".len,
         "session-abc", "session-abc".len,
+        null, 0,
+        null, 0,
     );
     var entry: SlowclawSqliteEntry = std.mem.zeroes(SlowclawSqliteEntry);
     _ = slowclaw_feed_sqlite_get(handle, "k", "k".len, &entry);
@@ -1425,8 +1459,8 @@ test "ffi: sqlite recall returns JSON array via C ABI" {
     // No embedder → keyword-only path; still works.
     const handle = slowclaw_feed_sqlite_open(":memory:", ":memory:".len, null) orelse return error.OOM;
     defer slowclaw_feed_sqlite_close(handle);
-    _ = slowclaw_feed_sqlite_store(handle, "rust", "rust".len, "rust programming language", "rust programming language".len, "core", "core".len, null, 0);
-    _ = slowclaw_feed_sqlite_store(handle, "weather", "weather".len, "sunny day today", "sunny day today".len, "core", "core".len, null, 0);
+    _ = slowclaw_feed_sqlite_store(handle, "rust", "rust".len, "rust programming language", "rust programming language".len, "core", "core".len, null, 0, null, 0, null, 0);
+    _ = slowclaw_feed_sqlite_store(handle, "weather", "weather".len, "sunny day today", "sunny day today".len, "core", "core".len, null, 0, null, 0, null, 0);
 
     var result: SlowclawRankResult = std.mem.zeroes(SlowclawRankResult);
     const status = slowclaw_feed_sqlite_recall(handle, "rust", "rust".len, 10, null, 0, &result);

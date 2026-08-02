@@ -135,7 +135,9 @@ pub const SqliteMemory = struct {
             \\    embedding   BLOB,
             \\    created_at  TEXT NOT NULL,
             \\    updated_at  TEXT NOT NULL,
-            \\    session_id  TEXT
+            \\    session_id  TEXT,
+            \\    source      TEXT,
+            \\    media_url   TEXT
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             \\CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
@@ -166,6 +168,63 @@ pub const SqliteMemory = struct {
             \\CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);
         ;
         try self.exec(sql);
+        try self.runMigrations();
+    }
+
+    /// Schema migrations for existing on-disk DBs. `CREATE TABLE IF NOT EXISTS`
+    /// (above) is a no-op on old DBs, so additive columns need an explicit
+    /// `ALTER TABLE` guarded by `PRAGMA user_version`. Each migration bumps the
+    /// version; idempotent and backward-compatible (new columns are nullable).
+    ///
+    /// v1 (2026-08): add `source` + `media_url` to `memories` for journal
+    /// provenance (audio_recorded / audio_imported / text) and audio replay.
+    fn runMigrations(self: *SqliteMemory) !void {
+        const current = try self.userVersion();
+        if (current >= 1) return;
+
+        // v1: provenance columns. ALTER TABLE ADD COLUMN fails if the column
+        // already exists, so guard with a presence probe (cheap and portable).
+        if (!try self.hasColumn("memories", "source")) {
+            try self.exec("ALTER TABLE memories ADD COLUMN source TEXT");
+        }
+        if (!try self.hasColumn("memories", "media_url")) {
+            try self.exec("ALTER TABLE memories ADD COLUMN media_url TEXT");
+        }
+        try self.exec("PRAGMA user_version = 1");
+    }
+
+    fn userVersion(self: *SqliteMemory) !i64 {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "PRAGMA user_version";
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+        if (c.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return error.StepFailed;
+        return c.sqlite3_column_int64(stmt.?, 0);
+    }
+
+    /// Probe whether a column exists via `PRAGMA table_info`. Used to make
+    /// ALTER TABLE additive migrations idempotent across re-runs.
+    fn hasColumn(self: *SqliteMemory, table: []const u8, column: []const u8) !bool {
+        // Note: table is interpolated as-is. It is always a hard-coded literal
+        // ("memories") in this codebase, never user input, so this is safe.
+        const sql = try std.fmt.allocPrint(self.allocator, "PRAGMA table_info({s})", .{table});
+        defer self.allocator.free(sql);
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        while (true) {
+            const rc = c.sqlite3_step(stmt.?);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+            // column 1 of PRAGMA table_info is the name.
+            const col_name = columnText(stmt.?, 1);
+            if (std.mem.eql(u8, col_name, column)) return true;
+        }
+        return false;
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -260,6 +319,8 @@ pub const SqliteMemory = struct {
         content: []const u8,
         category: MemoryCategory,
         session_id: ?[]const u8,
+        source: ?[]const u8,
+        media_url: ?[]const u8,
     ) !void {
         const id = try newId(self.allocator);
         defer self.allocator.free(id);
@@ -288,14 +349,16 @@ pub const SqliteMemory = struct {
         }
 
         const sql =
-            \\INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id)
-            \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            \\INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, source, media_url)
+            \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             \\ON CONFLICT(key) DO UPDATE SET
             \\  content = excluded.content,
             \\  category = excluded.category,
             \\  embedding = excluded.embedding,
             \\  updated_at = excluded.updated_at,
-            \\  session_id = excluded.session_id
+            \\  session_id = excluded.session_id,
+            \\  source = excluded.source,
+            \\  media_url = excluded.media_url
         ;
 
         var stmt: ?*c.sqlite3_stmt = null;
@@ -322,6 +385,16 @@ pub const SqliteMemory = struct {
         } else {
             _ = c.sqlite3_bind_null(stmt.?, 8);
         }
+        if (source) |src| {
+            try bindText(stmt.?, 9, src);
+        } else {
+            _ = c.sqlite3_bind_null(stmt.?, 9);
+        }
+        if (media_url) |m| {
+            try bindText(stmt.?, 10, m);
+        } else {
+            _ = c.sqlite3_bind_null(stmt.?, 10);
+        }
 
         const rc = c.sqlite3_step(stmt.?);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -330,7 +403,7 @@ pub const SqliteMemory = struct {
     /// Fetch a memory by key. Returns null if not found.
     /// Mirrors `get` in sqlite.rs:655.
     pub fn get(self: *SqliteMemory, allocator: std.mem.Allocator, key: []const u8) !?MemoryEntry {
-        const sql = "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1";
+        const sql = "SELECT id, key, content, category, created_at, session_id, source, media_url FROM memories WHERE key = ?1";
         var stmt: ?*c.sqlite3_stmt = null;
         const sql_z = try self.allocator.dupeZ(u8, sql);
         defer self.allocator.free(sql_z);
@@ -361,9 +434,9 @@ pub const SqliteMemory = struct {
 
         var stmt: ?*c.sqlite3_stmt = null;
         const sql = if (category != null)
-            "SELECT id, key, content, category, created_at, session_id FROM memories WHERE category = ?1 ORDER BY rowid DESC LIMIT 1000"
+            "SELECT id, key, content, category, created_at, session_id, source, media_url FROM memories WHERE category = ?1 ORDER BY rowid DESC LIMIT 1000"
         else
-            "SELECT id, key, content, category, created_at, session_id FROM memories ORDER BY rowid DESC LIMIT 1000";
+            "SELECT id, key, content, category, created_at, session_id, source, media_url FROM memories ORDER BY rowid DESC LIMIT 1000";
         const sql_z = try self.allocator.dupeZ(u8, sql);
         defer self.allocator.free(sql_z);
         if (c.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
@@ -459,9 +532,11 @@ pub const SqliteMemory = struct {
         content: []const u8,
         category: MemoryCategory,
         session_id: ?[]const u8,
+        source: ?[]const u8,
+        media_url: ?[]const u8,
     ) memory_types.MemoryError!void {
         const self: *SqliteMemory = @ptrCast(@alignCast(ctx));
-        self.store(key, content, category, session_id) catch return error.BackendFailed;
+        self.store(key, content, category, session_id, source, media_url) catch return error.BackendFailed;
     }
 
     fn vtableRecall(
@@ -721,7 +796,7 @@ pub const SqliteMemory = struct {
         // Build "WHERE id IN (?1, ?2, ...)".
         var sql_buf = std.ArrayList(u8).empty;
         defer sql_buf.deinit(self.allocator);
-        try sql_buf.appendSlice(self.allocator, "SELECT id, key, content, category, created_at, session_id FROM memories WHERE id IN (");
+        try sql_buf.appendSlice(self.allocator, "SELECT id, key, content, category, created_at, session_id, source, media_url FROM memories WHERE id IN (");
         for (ids, 0..) |_, i| {
             if (i > 0) try sql_buf.append(self.allocator, ',');
             const placeholder = try std.fmt.allocPrint(self.allocator, "?{d}", .{i + 1});
@@ -791,8 +866,12 @@ fn dupeEntry(allocator: std.mem.Allocator, entry: MemoryEntry) !MemoryEntry {
         .timestamp = try allocator.dupe(u8, entry.timestamp),
         .session_id = null,
         .score = entry.score,
+        .source = null,
+        .media_url = null,
     };
     if (entry.session_id) |s| copy.session_id = try allocator.dupe(u8, s);
+    if (entry.source) |src| copy.source = try allocator.dupe(u8, src);
+    if (entry.media_url) |m| copy.media_url = try allocator.dupe(u8, m);
     return copy;
 }
 
@@ -892,6 +971,16 @@ fn readRow(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !MemoryEntry {
         session_id = try allocator.dupe(u8, columnText(stmt, 5));
     }
 
+    var source: ?[]const u8 = null;
+    if (c.sqlite3_column_type(stmt, 6) != c.SQLITE_NULL) {
+        source = try allocator.dupe(u8, columnText(stmt, 6));
+    }
+
+    var media_url: ?[]const u8 = null;
+    if (c.sqlite3_column_type(stmt, 7) != c.SQLITE_NULL) {
+        media_url = try allocator.dupe(u8, columnText(stmt, 7));
+    }
+
     return .{
         .id = id,
         .key = key,
@@ -899,6 +988,8 @@ fn readRow(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !MemoryEntry {
         .category = category,
         .timestamp = ts,
         .session_id = session_id,
+        .source = source,
+        .media_url = media_url,
     };
 }
 
@@ -914,6 +1005,8 @@ pub fn freeEntry(allocator: std.mem.Allocator, entry: MemoryEntry) void {
         else => {},
     }
     if (entry.session_id) |sid| allocator.free(sid);
+    if (entry.source) |src| allocator.free(src);
+    if (entry.media_url) |m| allocator.free(m);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -933,7 +1026,7 @@ test "sqlite: store and get round-trip" {
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
 
-    try db.store("favorite_language", "Rust", .{ .core = {} }, null);
+    try db.store("favorite_language", "Rust", .{ .core = {} }, null, null, null);
     const entry = (try db.get(a, "favorite_language")) orelse return error.NotFound;
     defer freeEntry(a, entry);
     try testing.expectEqualStrings("favorite_language", entry.key);
@@ -946,8 +1039,8 @@ test "sqlite: store is upsert (same key replaces)" {
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
 
-    try db.store("k", "v1", .{ .core = {} }, null);
-    try db.store("k", "v2", .{ .daily = {} }, null);
+    try db.store("k", "v1", .{ .core = {} }, null, null, null);
+    try db.store("k", "v2", .{ .daily = {} }, null, null, null);
     const entry = (try db.get(a, "k")) orelse return error.NotFound;
     defer freeEntry(a, entry);
     try testing.expectEqualStrings("v2", entry.content);
@@ -971,9 +1064,9 @@ test "sqlite: count is zero on empty database" {
 test "sqlite: count reflects stored entries" {
     var db = try SqliteMemory.openNoEmbedder(testing.allocator, ":memory:");
     defer db.close();
-    try db.store("k1", "c1", .{ .core = {} }, null);
-    try db.store("k2", "c2", .{ .core = {} }, null);
-    try db.store("k3", "c3", .{ .core = {} }, null);
+    try db.store("k1", "c1", .{ .core = {} }, null, null, null);
+    try db.store("k2", "c2", .{ .core = {} }, null, null, null);
+    try db.store("k3", "c3", .{ .core = {} }, null, null, null);
     try testing.expectEqual(@as(usize, 3), try db.count());
 }
 
@@ -981,7 +1074,7 @@ test "sqlite: forget deletes by key" {
     const a = testing.allocator;
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
-    try db.store("k", "v", .{ .core = {} }, null);
+    try db.store("k", "v", .{ .core = {} }, null, null, null);
     try testing.expect(try db.forget("k"));
     try testing.expect(try db.get(a, "k") == null);
 }
@@ -996,8 +1089,8 @@ test "sqlite: list returns all entries" {
     const a = testing.allocator;
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
-    try db.store("k1", "c1", .{ .core = {} }, null);
-    try db.store("k2", "c2", .{ .daily = {} }, null);
+    try db.store("k1", "c1", .{ .core = {} }, null, null, null);
+    try db.store("k2", "c2", .{ .daily = {} }, null, null, null);
 
     const entries = try db.list(a, null, null);
     defer {
@@ -1011,9 +1104,9 @@ test "sqlite: list filters by category" {
     const a = testing.allocator;
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
-    try db.store("k1", "c1", .{ .core = {} }, null);
-    try db.store("k2", "c2", .{ .daily = {} }, null);
-    try db.store("k3", "c3", .{ .daily = {} }, null);
+    try db.store("k1", "c1", .{ .core = {} }, null, null, null);
+    try db.store("k2", "c2", .{ .daily = {} }, null, null, null);
+    try db.store("k3", "c3", .{ .daily = {} }, null, null, null);
 
     const daily = try db.list(a, .{ .daily = {} }, null);
     defer {
@@ -1028,9 +1121,9 @@ test "sqlite: list filters by session_id" {
     const a = testing.allocator;
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
-    try db.store("k1", "c1", .{ .core = {} }, "session-a");
-    try db.store("k2", "c2", .{ .core = {} }, "session-b");
-    try db.store("k3", "c3", .{ .core = {} }, "session-a");
+    try db.store("k1", "c1", .{ .core = {} }, "session-a", null, null);
+    try db.store("k2", "c2", .{ .core = {} }, "session-b", null, null);
+    try db.store("k3", "c3", .{ .core = {} }, "session-a", null, null);
 
     const a_entries = try db.list(a, null, "session-a");
     defer {
@@ -1045,7 +1138,7 @@ test "sqlite: session_id round-trips as null when not set" {
     const a = testing.allocator;
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
-    try db.store("k", "v", .{ .core = {} }, null);
+    try db.store("k", "v", .{ .core = {} }, null, null, null);
     const entry = (try db.get(a, "k")) orelse return error.NotFound;
     defer freeEntry(a, entry);
     try testing.expect(entry.session_id == null);
@@ -1055,7 +1148,7 @@ test "sqlite: session_id round-trips when set" {
     const a = testing.allocator;
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
-    try db.store("k", "v", .{ .core = {} }, "my-session");
+    try db.store("k", "v", .{ .core = {} }, "my-session", null, null);
     const entry = (try db.get(a, "k")) orelse return error.NotFound;
     defer freeEntry(a, entry);
     try testing.expectEqualStrings("my-session", entry.session_id.?);
@@ -1065,7 +1158,7 @@ test "sqlite: category custom round-trips" {
     const a = testing.allocator;
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
-    try db.store("k", "v", .{ .custom = "project_notes" }, null);
+    try db.store("k", "v", .{ .custom = "project_notes" }, null, null, null);
     const entry = (try db.get(a, "k")) orelse return error.NotFound;
     defer freeEntry(a, entry);
     try testing.expect(entry.category.eql(.{ .custom = "project_notes" }));
@@ -1075,9 +1168,9 @@ test "sqlite: fts5 keyword search finds matches" {
     const a = testing.allocator;
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
-    try db.store("rust", "Rust is a systems programming language", .{ .core = {} }, null);
-    try db.store("python", "Python is great for scripting", .{ .core = {} }, null);
-    try db.store("rust-2", "More about the Rust programming language", .{ .core = {} }, null);
+    try db.store("rust", "Rust is a systems programming language", .{ .core = {} }, null, null, null);
+    try db.store("python", "Python is great for scripting", .{ .core = {} }, null, null, null);
+    try db.store("rust-2", "More about the Rust programming language", .{ .core = {} }, null, null, null);
 
     const results = try db.fts5Search(a, "rust programming", 10);
     defer freeScoredIds(a, results);
@@ -1088,7 +1181,7 @@ test "sqlite: fts5 search with empty query returns empty" {
     const a = testing.allocator;
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
-    try db.store("k", "some content", .{ .core = {} }, null);
+    try db.store("k", "some content", .{ .core = {} }, null, null, null);
     const results = try db.fts5Search(a, "   ", 10);
     try testing.expectEqual(@as(usize, 0), results.len);
 }
@@ -1097,7 +1190,7 @@ test "sqlite: fts5 search with no match returns empty" {
     const a = testing.allocator;
     var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
     defer db.close();
-    try db.store("k", "hello world", .{ .core = {} }, null);
+    try db.store("k", "hello world", .{ .core = {} }, null, null, null);
     const results = try db.fts5Search(a, "nonexistentword", 10);
     defer freeScoredIds(a, results);
     try testing.expectEqual(@as(usize, 0), results.len);
@@ -1108,7 +1201,7 @@ test "sqlite: database persists across close (file-backed)" {
     const tmp_path = "test-sqlite-persist.db";
     {
         var db = try SqliteMemory.openNoEmbedder(a, tmp_path);
-        try db.store("k", "persisted-value", .{ .core = {} }, null);
+        try db.store("k", "persisted-value", .{ .core = {} }, null, null, null);
         db.close();
     }
     defer _ = c.remove(tmp_path);
@@ -1164,8 +1257,8 @@ test "sqlite: recall keyword path finds matches" {
     var emb = embeddings_mod.HashEmbedding.init("test", 64);
     var db = try openWithEmbedder(a, &emb);
     defer db.close();
-    try db.store("rust-fact", "Rust is a systems programming language", .{ .core = {} }, null);
-    try db.store("unrelated", "The weather is sunny today", .{ .core = {} }, null);
+    try db.store("rust-fact", "Rust is a systems programming language", .{ .core = {} }, null, null, null);
+    try db.store("unrelated", "The weather is sunny today", .{ .core = {} }, null, null, null);
 
     const results = try db.recall(a, "rust programming", 10, null);
     defer {
@@ -1186,8 +1279,8 @@ test "sqlite: recall respects session_id filter" {
     var emb = embeddings_mod.HashEmbedding.init("test", 64);
     var db = try openWithEmbedder(a, &emb);
     defer db.close();
-    try db.store("shared-key", "rust content for session-a", .{ .core = {} }, "session-a");
-    try db.store("shared-key-b", "rust content for session-b", .{ .core = {} }, "session-b");
+    try db.store("shared-key", "rust content for session-a", .{ .core = {} }, "session-a", null, null);
+    try db.store("shared-key-b", "rust content for session-b", .{ .core = {} }, "session-b", null, null);
 
     const a_results = try db.recall(a, "rust", 10, "session-a");
     defer {
@@ -1204,7 +1297,7 @@ test "sqlite: recall with no keyword match falls back to vector path (with embed
     var emb = embeddings_mod.HashEmbedding.init("test", 64);
     var db = try openWithEmbedder(a, &emb);
     defer db.close();
-    try db.store("k", "hello world", .{ .core = {} }, null);
+    try db.store("k", "hello world", .{ .core = {} }, null, null, null);
     // With an embedder configured, "nonexistentword" still produces a hash
     // embedding that may cosine-match the stored entry. The Rust recall
     // applies the same `sim > 0.0` cutoff. We assert the result set is small
@@ -1222,8 +1315,8 @@ test "sqlite: vectorSearch returns cosine similarity" {
     var emb = embeddings_mod.HashEmbedding.init("test", 64);
     var db = try openWithEmbedder(a, &emb);
     defer db.close();
-    try db.store("rust", "rust programming language", .{ .core = {} }, null);
-    try db.store("weather", "sunny weather today", .{ .core = {} }, null);
+    try db.store("rust", "rust programming language", .{ .core = {} }, null, null, null);
+    try db.store("weather", "sunny weather today", .{ .core = {} }, null, null, null);
 
     // Query embedding = the same HashEmbedding applied to "rust" — should
     // cosine-match the 'rust' entry more strongly than the 'weather' one.
@@ -1241,8 +1334,8 @@ test "sqlite: vectorSearch respects category filter" {
     var emb = embeddings_mod.HashEmbedding.init("test", 64);
     var db = try openWithEmbedder(a, &emb);
     defer db.close();
-    try db.store("k1", "rust content", .{ .core = {} }, null);
-    try db.store("k2", "rust content daily", .{ .daily = {} }, null);
+    try db.store("k1", "rust content", .{ .core = {} }, null, null, null);
+    try db.store("k2", "rust content daily", .{ .daily = {} }, null, null, null);
 
     const query_vec = try embeddings_mod.HashEmbedding.embed_text(a, &emb, "rust");
     defer a.free(query_vec);
@@ -1262,7 +1355,7 @@ test "sqlite: Memory vtable end-to-end (store/get/forget/count via vtable)" {
     try testing.expectEqualStrings("sqlite", m.name());
     try testing.expectEqual(@as(usize, 0), try m.count());
 
-    try m.store("k", "v", .{ .core = {} }, null);
+    try m.store("k", "v", .{ .core = {} }, null, null, null);
     try testing.expectEqual(@as(usize, 1), try m.count());
 
     const entry = (try m.get("k")) orelse return error.NotFound;
@@ -1281,8 +1374,8 @@ test "sqlite: Memory vtable list + recall" {
     defer db.close();
     const m = db.memoryProvider();
 
-    try m.store("rust", "rust programming", .{ .core = {} }, null);
-    try m.store("weather", "sunny day", .{ .core = {} }, null);
+    try m.store("rust", "rust programming", .{ .core = {} }, null, null, null);
+    try m.store("weather", "sunny day", .{ .core = {} }, null, null, null);
 
     const all = try m.list(a, null, null);
     defer {
@@ -1297,4 +1390,143 @@ test "sqlite: Memory vtable list + recall" {
         a.free(recalls);
     }
     try testing.expect(recalls.len >= 1);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Provenance (source + media_url) + schema migration tests.
+// ──────────────────────────────────────────────────────────────────────────
+
+test "sqlite: source and media_url round-trip" {
+    const a = testing.allocator;
+    var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
+    defer db.close();
+
+    try db.store("journal_1", "today I recorded an audio journal", .{ .daily = {} },
+        null, "audio_recorded", "Recordings/journal_1.m4a");
+    const entry = (try db.get(a, "journal_1")) orelse return error.NotFound;
+    defer freeEntry(a, entry);
+    try testing.expectEqualStrings("audio_recorded", entry.source.?);
+    try testing.expectEqualStrings("Recordings/journal_1.m4a", entry.media_url.?);
+}
+
+test "sqlite: source and media_url default to null when not set" {
+    const a = testing.allocator;
+    var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
+    defer db.close();
+
+    try db.store("typed_entry", "a plain typed note", .{ .daily = {} }, null, null, null);
+    const entry = (try db.get(a, "typed_entry")) orelse return error.NotFound;
+    defer freeEntry(a, entry);
+    try testing.expect(entry.source == null);
+    try testing.expect(entry.media_url == null);
+}
+
+test "sqlite: store upsert updates source and media_url" {
+    const a = testing.allocator;
+    var db = try SqliteMemory.openNoEmbedder(a, ":memory:");
+    defer db.close();
+
+    // First write: typed entry (no provenance).
+    try db.store("k", "v1", .{ .daily = {} }, null, null, null);
+    // Upsert: now it's an audio recording.
+    try db.store("k", "v2", .{ .daily = {} }, null, "audio_imported", "Inbox/123.m4a");
+    const entry = (try db.get(a, "k")) orelse return error.NotFound;
+    defer freeEntry(a, entry);
+    try testing.expectEqualStrings("v2", entry.content);
+    try testing.expectEqualStrings("audio_imported", entry.source.?);
+    try testing.expectEqualStrings("Inbox/123.m4a", entry.media_url.?);
+}
+
+test "sqlite: migration adds source + media_url to a legacy DB" {
+    // Simulate a pre-v1 DB: old schema (no source/media_url columns),
+    // user_version = 0, one legacy row already present. open() must migrate
+    // it without losing data, and the legacy row must read back with nulls.
+    const a = testing.allocator;
+    const tmp_path = "test-sqlite-migrate-legacy.db";
+    defer _ = c.remove(tmp_path);
+
+    // Phase 1: build a legacy DB using the RAW sqlite C API (not via
+    // SqliteMemory.open, which would run the new initSchema). This emulates a
+    // file written by a prior app version that predates source/media_url.
+    {
+        var raw_db: ?*c.sqlite3 = null;
+        const path_z = try a.dupeZ(u8, tmp_path);
+        defer a.free(path_z);
+        try testing.expectEqual(c.SQLITE_OK, c.sqlite3_open(path_z.ptr, &raw_db));
+        defer _ = c.sqlite3_close(raw_db);
+
+        var errmsg: [*c]u8 = null;
+        const old_schema =
+            \\CREATE TABLE memories (
+            \\    id          TEXT PRIMARY KEY,
+            \\    key         TEXT NOT NULL UNIQUE,
+            \\    content     TEXT NOT NULL,
+            \\    category    TEXT NOT NULL DEFAULT 'core',
+            \\    embedding   BLOB,
+            \\    created_at  TEXT NOT NULL,
+            \\    updated_at  TEXT NOT NULL,
+            \\    session_id  TEXT
+            \\);
+            \\CREATE VIRTUAL TABLE memories_fts USING fts5(
+            \\    key, content, content=memories, content_rowid=rowid
+            \\);
+            \\INSERT INTO memories (id, key, content, category, created_at, updated_at, session_id)
+            \\VALUES ('legacy-1', 'legacy_key', 'legacy content', 'daily', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL);
+        ;
+        // sqlite3_exec needs a null-terminated SQL string; dupeZ the literal.
+        const old_schema_z = try a.dupeZ(u8, old_schema);
+        defer a.free(old_schema_z);
+        const rc = c.sqlite3_exec(raw_db, old_schema_z.ptr, null, null, &errmsg);
+        if (errmsg) |e| c.sqlite3_free(e);
+        try testing.expectEqual(c.SQLITE_OK, rc);
+        // user_version defaults to 0 on a fresh DB.
+    }
+
+    // Phase 2: open via SqliteMemory — initSchema runs runMigrations, which
+    // must ALTER TABLE to add the two columns and bump user_version to 1,
+    // preserving the legacy row.
+    var db2 = try SqliteMemory.openNoEmbedder(a, tmp_path);
+    defer db2.close();
+    try testing.expectEqual(@as(i64, 1), try db2.userVersion());
+    try testing.expect(try db2.hasColumn("memories", "source"));
+    try testing.expect(try db2.hasColumn("memories", "media_url"));
+
+    const entry = (try db2.get(a, "legacy_key")) orelse return error.NotFound;
+    defer freeEntry(a, entry);
+    try testing.expectEqualStrings("legacy content", entry.content);
+    // Legacy rows have no provenance → both null.
+    try testing.expect(entry.source == null);
+    try testing.expect(entry.media_url == null);
+
+    // The migrated DB must accept new writes with provenance.
+    try db2.store("new_key", "new content", .{ .daily = {} }, null,
+        "audio_recorded", "Recordings/new.m4a");
+    const entry2 = (try db2.get(a, "new_key")) orelse return error.NotFound;
+    defer freeEntry(a, entry2);
+    try testing.expectEqualStrings("audio_recorded", entry2.source.?);
+}
+
+test "sqlite: migration is idempotent (re-open does not re-ALTER)" {
+    // After v1 is applied, opening again must not error (hasColumn guard +
+    // user_version >= 1 short-circuit). Uses the same temp file as above but
+    // a distinct name to avoid cross-test interference.
+    const a = testing.allocator;
+    const tmp_path = "test-sqlite-migrate-idempotent.db";
+    defer _ = c.remove(tmp_path);
+
+    {
+        var db = try SqliteMemory.openNoEmbedder(a, tmp_path);
+        try db.store("k", "v", .{ .core = {} }, null, "text", null);
+        db.close();
+    }
+    // Re-open N times; each must succeed and preserve the row + provenance.
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var db = try SqliteMemory.openNoEmbedder(a, tmp_path);
+        defer db.close();
+        try testing.expectEqual(@as(i64, 1), try db.userVersion());
+        const entry = (try db.get(a, "k")) orelse return error.NotFound;
+        defer freeEntry(a, entry);
+        try testing.expectEqualStrings("text", entry.source.?);
+    }
 }

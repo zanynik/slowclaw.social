@@ -50,6 +50,11 @@ pub const MemoryCategory = union(enum) {
 
 /// A single memory entry. Mirrors `MemoryEntry` in `src/memory/traits.rs:6`.
 /// String fields are borrowed slices; the caller (or backend) owns the storage.
+///
+/// `source` and `media_url` were added to carry journal provenance so the UI
+/// can distinguish a typed entry from an audio recording/import and replay the
+/// linked audio file. Both default to null (legacy rows read back as null and
+/// are treated as `text`/no-media by callers).
 pub const MemoryEntry = struct {
     id: []const u8,
     key: []const u8,
@@ -58,6 +63,14 @@ pub const MemoryEntry = struct {
     timestamp: []const u8,
     session_id: ?[]const u8 = null,
     score: ?f64 = null,
+    /// Provenance: "audio_recorded" (in-app recorder), "audio_imported"
+    /// (Voice Memos share-sheet), or "text" (typed/AI-polished). Null for
+    /// rows written before this column existed.
+    source: ?[]const u8 = null,
+    /// Documents-relative path to the linked audio file (e.g.
+    /// "Recordings/journal_1234.m4a"), so the UI can replay it. Null for
+    /// typed entries and legacy rows.
+    media_url: ?[]const u8 = null,
 };
 
 /// Error set for Memory operations. Backends return these from the vtable.
@@ -86,6 +99,8 @@ pub const Memory = struct {
         content: []const u8,
         category: MemoryCategory,
         session_id: ?[]const u8,
+        source: ?[]const u8,
+        media_url: ?[]const u8,
     ) MemoryError!void,
     recall_fn: *const fn (
         ctx: *anyopaque,
@@ -115,8 +130,10 @@ pub const Memory = struct {
         content: []const u8,
         category: MemoryCategory,
         session_id: ?[]const u8,
+        source: ?[]const u8,
+        media_url: ?[]const u8,
     ) MemoryError!void {
-        return self.store_fn(self.ctx, key, content, category, session_id);
+        return self.store_fn(self.ctx, key, content, category, session_id, source, media_url);
     }
 
     pub fn recall(

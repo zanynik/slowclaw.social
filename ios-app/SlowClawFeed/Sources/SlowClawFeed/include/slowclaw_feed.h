@@ -119,6 +119,8 @@ typedef struct {
     SlowclawString category;   // lowercase tag: "core", "daily", "conversation", or custom
     SlowclawString timestamp;
     SlowclawString session_id; // bytes=NULL when absent
+    SlowclawString source;     // bytes=NULL when absent; "audio_recorded"/"audio_imported"/"text"
+    SlowclawString media_url;  // bytes=NULL when absent; Documents-relative audio path
     double score;              // NaN when not set
 } SlowclawSqliteEntry;
 
@@ -132,12 +134,15 @@ void slowclaw_feed_sqlite_close(SlowclawSqlite *handle);
 bool slowclaw_feed_sqlite_health(SlowclawSqlite *handle);
 
 /// Insert or upsert. Returns SLOWCLAW_OK on success.
+/// source/media_url are optional; pass {NULL, 0} when absent.
 int32_t slowclaw_feed_sqlite_store(
     SlowclawSqlite *handle,
     const uint8_t *key, size_t key_len,
     const uint8_t *content, size_t content_len,
     const uint8_t *category, size_t category_len,
-    const uint8_t *session_id, size_t session_id_len // optional; pass {NULL, 0}
+    const uint8_t *session_id, size_t session_id_len, // optional; pass {NULL, 0}
+    const uint8_t *source, size_t source_len,         // optional; pass {NULL, 0}
+    const uint8_t *media_url, size_t media_url_len    // optional; pass {NULL, 0}
 );
 
 /// Fetch by key. Returns 0 if found (entry written to *out_entry), 1 if not
