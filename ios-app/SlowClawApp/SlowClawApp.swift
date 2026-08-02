@@ -95,7 +95,6 @@ enum AppTheme: String {
 struct SlowClawApp: App {
     @StateObject private var appState = AppState()
     @StateObject private var voiceMemoImporter = VoiceMemoImporter()
-    @State private var pendingImports: [URL] = []
     @AppStorage("slowclaw.theme") private var themeRaw: String = ""
 
     private var preferredScheme: ColorScheme? {
@@ -114,26 +113,36 @@ struct SlowClawApp: App {
                 .preferredColorScheme(preferredScheme)
                 .tint(DS.accentColor)
                 // Voice Memos / Files share-sheet entry point: iOS delivers the
-                // audio file URL here. Copy it into the Inbox, then transcribe
-                // (newest first) in the background.
+                // audio file URL here. enqueue copies it into the Inbox and
+                // hands it to the importer's single serial transcription worker.
                 .onOpenURL { url in
-                    handleIncoming(url)
+                    voiceMemoImporter.enqueue(url)
                 }
                 .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { _ in }
+                // Imported-memo review sheet (mirrors the live-recording flow:
+                // transcript → edit/AI-polish → save as journal). Driven by the
+                // importer's pendingTranscript so the worker waits for review
+                // before pulling the next file.
+                .sheet(item: Binding(
+                    get: { voiceMemoImporter.pendingTranscript.map { ImportTranscript(text: $0) } },
+                    set: { newValue in
+                        if newValue == nil { voiceMemoImporter.pendingTranscript = nil }
+                    }
+                )) { item in
+                    TranscriptSheet(transcript: item.text) { polished in
+                        Task { await appState.storeJournal(text: polished) }
+                        voiceMemoImporter.pendingTranscript = nil
+                    }
+                    .environmentObject(appState)
+                }
         }
     }
+}
 
-    /// Handle a shared audio file: copy into Inbox and queue for transcription.
-    private func handleIncoming(_ url: URL) {
-        guard let dest = voiceMemoImporter.copyAudio(url) else { return }
-        pendingImports.append(dest)
-        // Defer transcription until appState is fully up (memory is open).
-        Task { @MainActor in
-            voiceMemoImporter.status = "Importing…"
-            await voiceMemoImporter.transcribeAndStore(files: pendingImports, state: appState)
-            pendingImports.removeAll()
-        }
-    }
+/// Identifiable wrapper so a transcript string can drive a `.sheet(item:)`.
+private struct ImportTranscript: Identifiable {
+    let text: String
+    var id: String { text }
 }
 
 // MARK: - App State
@@ -382,6 +391,31 @@ final class AppState: ObservableObject {
 
     // MARK: - Reads feed (cached + background refresh)
 
+    /// On-disk cache of the last ranked Reads feed, so the list survives app
+    /// restarts and shows instantly instead of re-fetching 100+ feeds every
+    /// launch. Lives in Documents/reads_cache.json.
+    private static var readsCacheURL: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return docs.appendingPathComponent("reads_cache.json")
+    }
+
+    /// Load the cached Reads feed from disk (instant). Returns nil if none.
+    func loadCachedReads() {
+        guard let data = try? Data(contentsOf: Self.readsCacheURL),
+              let items = try? JSONDecoder().decode([RankedFeedItem].self, from: data),
+              !items.isEmpty else { return }
+        readsItems = items
+        readsLoadedOnce = true
+    }
+
+    /// Persist the current Reads feed to disk for next launch.
+    private func saveCachedReads() {
+        guard !readsItems.isEmpty,
+              let data = try? JSONEncoder().encode(readsItems) else { return }
+        try? data.write(to: Self.readsCacheURL, options: .atomic)
+    }
+
     /// The Reads feed catalog (114 sources), cached on first access.
     fileprivate var catalog: [SlowClawFeedSource] {
         if let cached = AppState.cachedCatalog { return cached }
@@ -457,6 +491,8 @@ final class AppState: ObservableObject {
         Self.saveReadsCache(items: readsItems, refreshedAt: readsRefreshedAt!)
         readsError = nil
         readsLoading = false
+        // Persist for next launch.
+        saveCachedReads()
     }
 
     /// Fetch a bounded catalog slice with a per-source timeout, then parse +
@@ -937,14 +973,27 @@ struct JournalSidebar: View {
                         .padding(.bottom, 4)
                     }
 
-                    // Hint: how to import voice memos (share sheet → SlowClaw).
-                    HStack(spacing: 6) {
-                        Image(systemName: "waveform")
-                            .font(.system(size: 11))
-                        Text("Import voice memos via the share sheet → SlowClaw.")
-                            .font(DS.microFont)
-                        Spacer()
+                    // Import hint + shortcut: open Voice Memos, then Share →
+                    // SlowClaw. Tapping tries the system URL scheme; if Voice
+                    // Memos isn't installed the row is still informational.
+                    Button {
+                        if let url = URL(string: "voicememos://") {
+                            UIApplication.shared.open(url)
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "waveform")
+                                .font(.system(size: 11))
+                            Text("Record in Voice Memos, then Share → SlowClaw.")
+                                .font(DS.microFont)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9))
+                                .opacity(0.6)
+                        }
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                     .foregroundStyle(DS.muted(scheme))
                     .padding(.horizontal, 22)
                     .padding(.bottom, 4)
