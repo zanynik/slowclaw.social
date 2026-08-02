@@ -140,7 +140,9 @@ final class VoiceMemoImporter: ObservableObject {
             return nil
         }
         // On-device gate: refuse to fall back to cloud (local-first).
-        if #available(iOS 13, *), !SFSpeechRecognizer.supportsOnDeviceRecognition(for: Locale.current) {
+        // supportsOnDeviceRecognition is an instance property — query the
+        // recognizer we already constructed (not the type).
+        if #available(iOS 13, *), !recognizer.supportsOnDeviceRecognition {
             status = "On-device speech not downloaded for this language. Add it in Settings → Accessibility → Spoken Content."
             return nil
         }

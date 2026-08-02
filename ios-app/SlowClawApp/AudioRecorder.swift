@@ -132,7 +132,9 @@ final class AudioRecorder: NSObject, ObservableObject {
             // Only start the engine/speech path when on-device recognition is
             // available for this locale; otherwise we still record the file
             // (trust > live UX) and the user transcribes later if desired.
-            let onDeviceAvailable = SFSpeechRecognizer.supportsOnDeviceRecognition(for: Locale.current)
+            // supportsOnDeviceRecognition is an instance property, not a type
+            // method — query the recognizer we already constructed.
+            let onDeviceAvailable = speechRecognizer?.supportsOnDeviceRecognition ?? false
             if onDeviceAvailable {
                 speechRequest = SFSpeechAudioBufferRecognitionRequest()
                 speechRequest?.shouldReportPartialResults = true
@@ -224,7 +226,7 @@ final class AudioRecorder: NSObject, ObservableObject {
         nc.addObserver(self, selector: #selector(handleRouteChange(_:)),
                        name: AVAudioSession.routeChangeNotification, object: nil)
         nc.addObserver(self, selector: #selector(handleMediaServicesReset(_:)),
-                       name: AVAudioSession.mediaServicesResetNotification, object: nil)
+                       name: AVAudioSession.mediaServicesWereResetNotification, object: nil)
     }
 
     /// An interruption (incoming call, Siri) pauses or stops the recording.

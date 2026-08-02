@@ -393,28 +393,7 @@ final class AppState: ObservableObject {
 
     /// On-disk cache of the last ranked Reads feed, so the list survives app
     /// restarts and shows instantly instead of re-fetching 100+ feeds every
-    /// launch. Lives in Documents/reads_cache.json.
-    private static var readsCacheURL: URL {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        return docs.appendingPathComponent("reads_cache.json")
-    }
-
-    /// Load the cached Reads feed from disk (instant). Returns nil if none.
-    func loadCachedReads() {
-        guard let data = try? Data(contentsOf: Self.readsCacheURL),
-              let items = try? JSONDecoder().decode([RankedFeedItem].self, from: data),
-              !items.isEmpty else { return }
-        readsItems = items
-        readsLoadedOnce = true
-    }
-
-    /// Persist the current Reads feed to disk for next launch.
-    private func saveCachedReads() {
-        guard !readsItems.isEmpty,
-              let data = try? JSONEncoder().encode(readsItems) else { return }
-        try? data.write(to: Self.readsCacheURL, options: .atomic)
-    }
+    /// launch. Lives in Caches/reads-feed-v1.json (see readsCacheURL above).
 
     /// The Reads feed catalog (114 sources), cached on first access.
     fileprivate var catalog: [SlowClawFeedSource] {
@@ -491,8 +470,6 @@ final class AppState: ObservableObject {
         Self.saveReadsCache(items: readsItems, refreshedAt: readsRefreshedAt!)
         readsError = nil
         readsLoading = false
-        // Persist for next launch.
-        saveCachedReads()
     }
 
     /// Fetch a bounded catalog slice with a per-source timeout, then parse +
