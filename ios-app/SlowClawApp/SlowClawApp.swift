@@ -119,30 +119,8 @@ struct SlowClawApp: App {
                     voiceMemoImporter.enqueue(url)
                 }
                 .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { _ in }
-                // Imported-memo review sheet (mirrors the live-recording flow:
-                // transcript → edit/AI-polish → save as journal). Driven by the
-                // importer's pendingTranscript so the worker waits for review
-                // before pulling the next file.
-                .sheet(item: Binding(
-                    get: { voiceMemoImporter.pendingTranscript.map { ImportTranscript(text: $0) } },
-                    set: { newValue in
-                        if newValue == nil { voiceMemoImporter.pendingTranscript = nil }
-                    }
-                )) { item in
-                    TranscriptSheet(transcript: item.text) { polished in
-                        Task { await appState.storeJournal(text: polished) }
-                        voiceMemoImporter.pendingTranscript = nil
-                    }
-                    .environmentObject(appState)
-                }
         }
     }
-}
-
-/// Identifiable wrapper so a transcript string can drive a `.sheet(item:)`.
-private struct ImportTranscript: Identifiable {
-    let text: String
-    var id: String { text }
 }
 
 // MARK: - App State
@@ -704,9 +682,9 @@ enum AppTab: String, CaseIterable {
 
 struct AppShell: View {
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var voiceMemoImporter: VoiceMemoImporter
     @Environment(\.colorScheme) var scheme
     @AppStorage("slowclaw.theme") private var themeRaw: String = ""
-
     var body: some View {
         Group {
             switch state.selectedTab {
@@ -736,6 +714,42 @@ struct AppShell: View {
         }
         .animation(.easeOut(duration: 0.25), value: state.journalSidebarOpen)
         .background(DS.bg(scheme).ignoresSafeArea())
+        // Imported-memo review sheet (mirrors the live-recording flow:
+        // transcript → edit/AI-polish → save as journal). Attached at the
+        // AppShell (a View) rather than the App scene so SwiftUI reliably
+        // re-renders when the importer's pendingImport changes. Driven by the
+        // importer so the worker waits for review before pulling the next file.
+        // The audio file is ALWAYS linked via source/media_url, even when the
+        // transcript is empty (on-device speech unavailable) — the file was
+        // copied to the Inbox and must not be silently dropped.
+        .sheet(item: $voiceMemoImporter.pendingImport) { importItem in
+            TranscriptSheet(transcript: importItem.transcript.isEmpty
+                ? "🎙 Imported audio (no transcript)"
+                : importItem.transcript) { polished in
+                let mediaURL = Self.documentsRelativePath(for: importItem.url)
+                Task {
+                    await state.storeJournal(text: polished,
+                                             source: "audio_imported",
+                                             mediaURL: mediaURL)
+                }
+                voiceMemoImporter.pendingImport = nil
+            }
+            .environmentObject(state)
+        }
+    }
+
+    /// Documents-relative path for a file URL (e.g. "Inbox/123-name.m4a"),
+    /// suitable for the journal media_url column. Returns nil if the URL
+    /// isn't under Documents.
+    static func documentsRelativePath(for url: URL) -> String? {
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let docsPath = docs.standardizedFileURL.path
+        let urlPath = url.standardizedFileURL.path
+        guard urlPath.hasPrefix(docsPath) else { return nil }
+        let rel = String(urlPath.dropFirst(docsPath.count))
+        return rel.hasPrefix("/") ? String(rel.dropFirst()) : rel
     }
 }
 

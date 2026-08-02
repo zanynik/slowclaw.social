@@ -12,10 +12,12 @@
 //   2. A long-lived Task drains the queue one file at a time (newest-first),
 //      transcribing each off the main actor with SFSpeechURLRecognitionRequest,
 //      FORCING on-device recognition (no cloud fallback — see hardening note).
-//   3. Each finished transcript is published via `pendingTranscript`; the App
-//      observes it and presents an edit/preview step (same TranscriptSheet
-//      live recordings use), instead of auto-storing. Audio never leaves the
-//      device.
+//   3. Each finished (or failed) import is published via `pendingImport`
+//      (carrying the audio URL + whatever transcript we got); AppShell
+//      presents an edit/preview step (same TranscriptSheet live recordings
+//      use), instead of auto-storing. The file is ALWAYS presented — even
+//      when on-device speech was unavailable — so it's never silently
+//      dropped. Audio never leaves the device.
 //
 // Hardening (vs. the original auto-store design):
 //   - Serial queue: previously every incoming URL appended to a shared array
@@ -42,15 +44,26 @@ struct PendingVoiceMemo: Equatable {
     let queuedAt: Date
 }
 
+/// An imported file awaiting user review: the audio URL (always present) and
+/// whatever transcript we got (may be empty if on-device speech was unavailable
+/// or failed — the user can still save the audio).
+struct PendingImport: Identifiable {
+    let url: URL
+    let transcript: String
+    var id: String { url.path }
+}
+
 @MainActor
 final class VoiceMemoImporter: ObservableObject {
     @Published var isImporting = false
     @Published var status: String? = nil
 
-    /// A freshly-transcribed import awaiting user review, or nil. The App
-    /// observes this via `.onChange` and presents TranscriptSheet when set to
-    /// a non-empty value. Set back to nil after the sheet saves/cancels.
-    @Published var pendingTranscript: String? = nil
+    /// A finished import awaiting the user's review, or nil. Carries the audio
+    /// URL + transcript so even a failed transcription (empty transcript) can
+    /// be saved as an audio journal — the file was already copied to the Inbox
+    /// and must not be silently dropped. The App observes this and presents
+    /// TranscriptSheet. Set back to nil after the sheet saves/cancels.
+    @Published var pendingImport: PendingImport? = nil
 
     private var queue: [PendingVoiceMemo] = []
     private var worker: Task<Void, Never>? = nil
@@ -115,15 +128,15 @@ final class VoiceMemoImporter: ObservableObject {
                 status = remaining == 0 ? "Transcribing…" : "Transcribing, \(remaining) more queued"
 
                 let transcript = await transcribeFile(next.url) ?? ""
-                // Hand the transcript to the App for review/edit. Only present
-                // if there's something to show; failures keep the status msg.
-                if !transcript.isEmpty {
-                    pendingTranscript = transcript
-                    // Wait for the UI to consume this one before pulling the
-                    // next file, so sheets don't stack / overwrite each other.
-                    while pendingTranscript != nil && !Task.isCancelled {
-                        try? await Task.sleep(nanoseconds: 200_000_000)
-                    }
+                // ALWAYS present the file for review, even with an empty
+                // transcript (on-device speech may be unavailable). The file
+                // was copied to the Inbox and must not be silently dropped —
+                // the user decides whether to save it as an audio journal.
+                pendingImport = PendingImport(url: next.url, transcript: transcript)
+                // Wait for the UI to consume this one before pulling the
+                // next file, so sheets don't stack / overwrite each other.
+                while pendingImport != nil && !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
                 }
             }
             status = nil

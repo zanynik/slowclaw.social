@@ -6,23 +6,42 @@
 // the user sees the text appear as they speak.
 //
 // Design notes (see the "bring Voice-Memos-level trust" plan):
-//   - AVAudioRecorder writes AAC/m4a to Documents/Recordings/<key>.m4a,
-//     flushing to disk as it goes. This is what survives a phone call or a
-//     crash — the file is on disk the whole time, not held in memory.
-//   - AVAudioEngine taps the mic in parallel and feeds PCM buffers to
-//     SFSpeechAudioBufferRecognitionRequest for the live transcript. Both
-//     run under one .playAndRecord session.
+//   - The mic is owned by ONE AVAudioEngine. Its input tap does two jobs per
+//     PCM buffer: (a) write to an AVAudioFile (the durable m4a on disk) and
+//     (b) append to the SFSpeechAudioBufferRecognitionRequest (live text).
+//     This is the only supported way to record + transcribe simultaneously —
+//     AVAudioRecorder + AVAudioEngine on the same session conflict and the
+//     recorder silently stops writing.
+//   - SFSpeechRecognizer caps each recognitionTask at ~1 minute of audio.
+//     When the task finishes (no error), we restart it and carry forward the
+//     accumulated transcript, so long recordings don't lose text or freeze.
 //   - Interruption (call/Siri), route change (AirPods unplug), and
-//     mediaServicesReset are observed so the recording either resumes or
-//     stops cleanly instead of silently dying with isRecording stuck true.
+//     mediaServicesWereReset are observed so the recording stops cleanly
+//     instead of silently dying with isRecording stuck true. The partial
+//     file written so far is already on disk and safe.
 //   - Speech recognition is forced on-device (requiresOnDeviceRecognition =
 //     true); audio never leaves the phone. Matches the hardened importer.
-//
-// The recorder field is no longer dead code.
 
 import SwiftUI
 import AVFoundation
 import Speech
+
+/// Nonisolated holder for the mutable audio-pipe state that is touched from
+/// BOTH the main actor (start/stop) and the AVAudioEngine input-node tap
+/// closure (which runs on an audio thread). The tap writes PCM buffers to
+/// `audioFile` and appends them to `speechRequest`; start/stop open/close
+/// those objects. Because `AudioRecorder` is `@MainActor`, these ivars can't
+/// live on it directly without a concurrency violation — this class gives the
+/// tap closure a shared, nonisolated handle. AVAudioEngine serializes tap
+/// callbacks, and start/stop run on main before/after the tap's lifetime, so
+/// the two sides never mutate the same field concurrently.
+final class AudioPipeState: @unchecked Sendable {
+    var audioFile: AVAudioFile?
+    var speechRequest: SFSpeechAudioBufferRecognitionRequest?
+    /// Last level-publish timestamp (uptime nanoseconds); used to throttle
+    /// meter updates from the audio-thread tap to ~10 Hz.
+    var lastLevelTs: UInt64 = 0
+}
 
 /// Audio recording + live transcription view model.
 @MainActor
@@ -34,22 +53,34 @@ final class AudioRecorder: NSObject, ObservableObject {
     @Published var elapsedSeconds: Int = 0
 
     /// The on-disk m4a URL of the most recent recording, or nil if no file
-    /// was produced (e.g. stopped before any audio captured, or an error).
-    /// The caller stores the journal with source="audio_recorded" and
-    /// media_url set to this path's Documents-relative form.
+    /// was produced. The caller stores the journal with source="audio_recorded"
+    /// and media_url set to this path's Documents-relative form.
     @Published var recordedFileURL: URL?
 
-    private var recorder: AVAudioRecorder?
-    private var speechRecognizer: SFSpeechRecognizer?
-    private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var speechTask: SFSpeechRecognitionTask?
+    // Engine-owned state (single mic source for record + transcribe).
     private let audioEngine = AVAudioEngine()
-    private var timer: Timer?
-    /// True iff the inputNode tap was installed in startRecording. Tracked so
-    /// stopRecording only removes it when present (removeTap on an un-tapped
-    /// node is a runtime error). The tap is conditional on on-device speech
-    /// being available for the locale.
+    private var tapFormat: AVAudioFormat?
+
+    // Live-transcription state.
+    private var speechRecognizer: SFSpeechRecognizer?
+    private var speechTask: SFSpeechRecognitionTask?
+    /// True iff the inputNode tap was installed. Tracked so stopRecording
+    /// only removes it when present (removeTap on an un-tapped node errors).
     private var tapInstalled = false
+    /// Carried-forward text from prior recognitionTask segments (the engine
+    /// restarts the task each ~1 min to dodge SFSpeech's per-task limit).
+    private var committedTranscript = ""
+
+    private var timer: Timer?
+
+    /// Mutable state shared between the main actor (start/stop) and the
+    /// audio-thread tap closure (which writes buffers + feeds speech). These
+    /// can't live on the @MainActor-isolated self because the tap runs off the
+    /// main actor; a small nonisolated reference holder gives both sides safe
+    /// access. The engine serializes tap callbacks, and start/stop happen on
+    /// main before/after the tap's lifetime, so the two never race on the same
+    /// field at the same time.
+    private let shared = AudioPipeState()
 
     /// Where recordings live, as a Documents-relative string. Stored in the
     /// journal's media_url column so the UI can replay it later.
@@ -90,6 +121,7 @@ final class AudioRecorder: NSObject, ObservableObject {
 
         // Reset state from any prior session.
         transcript = ""
+        committedTranscript = ""
         errorMessage = nil
         recordedFileURL = nil
         audioLevel = 0
@@ -105,67 +137,73 @@ final class AudioRecorder: NSObject, ObservableObject {
                                     options: [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
 
-            // ── Durable file write (the trust foundation) ───────────────────
-            // AVAudioRecorder flushes to disk incrementally, so the file is
-            // recoverable even if the app crashes mid-recording.
+            // ── Single mic source: the engine owns the input ───────────────
+            // The tap writes each buffer to the durable file AND appends to the
+            // speech request. AVAudioRecorder cannot share the session with the
+            // engine; using both was why the file silently went missing.
             let key = "journal_\(Int(Date().timeIntervalSince1970))"
             let destDir = Self.recordingsDirectory()
             try? FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
             let destURL = destDir.appendingPathComponent("\(key).m4a")
 
-            let settings: [String: Any] = [
+            let inputNode = audioEngine.inputNode
+            // Use the hardware input format so both the file write and the
+            // speech request see the same PCM layout.
+            let format = inputNode.outputFormat(forBus: 0)
+            tapFormat = format
+
+            // Open the file BEFORE installing the tap so the first buffer is
+            // captured. AVAudioFile(forWriting:settings:) derives the channel
+            // layout from AVNumberOfChannelsKey, so we don't need to pass an
+            // explicit AVChannelLayoutKey (which would require packing a C
+            // AudioChannelLayout into NSData). Writing AAC into an .m4a keeps
+            // the file small and playable everywhere.
+            let fileSettings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: 44100,
-                AVNumberOfChannelsKey: 1,
+                AVSampleRateKey: format.sampleRate,
+                AVNumberOfChannelsKey: format.channelCount,
                 AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
             ]
-            let rec = try AVAudioRecorder(url: destURL, settings: settings)
-            rec.isMeteringEnabled = true   // drives the level meter
-            guard rec.record() else {
-                errorMessage = "Could not start the audio recorder."
-                return
-            }
-            recorder = rec
+            shared.audioFile = try AVAudioFile(forWriting: destURL, settings: fileSettings)
             recordedFileURL = destURL
 
-            // ── Live transcript (on-device) ────────────────────────────────
-            // Only start the engine/speech path when on-device recognition is
-            // available for this locale; otherwise we still record the file
-            // (trust > live UX) and the user transcribes later if desired.
-            // supportsOnDeviceRecognition is an instance property, not a type
-            // method — query the recognizer we already constructed.
-            let onDeviceAvailable = speechRecognizer?.supportsOnDeviceRecognition ?? false
-            if onDeviceAvailable {
-                speechRequest = SFSpeechAudioBufferRecognitionRequest()
-                speechRequest?.shouldReportPartialResults = true
-                speechRequest?.requiresOnDeviceRecognition = true
-
-                let inputNode = audioEngine.inputNode
-                let recordingFormat = inputNode.outputFormat(forBus: 0)
-                inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
-                    self?.speechRequest?.append(buffer)
+            // Capture `shared` strongly so the audio-thread tap doesn't depend
+            // on `self` (which is @MainActor-isolated). The tap writes the
+            // buffer to the file and feeds the speech request via this holder.
+            let pipe = shared
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+                // (a) durable write — the trust foundation. Write from the
+                // audio thread is fine; AVAudioFile is designed for this.
+                do {
+                    try pipe.audioFile?.write(from: buffer)
+                } catch {
+                    // Swallow per-buffer write errors; the recording continues
+                    // and the user still gets the transcript. A gap in the file
+                    // is preferable to losing the whole journal.
                 }
-                tapInstalled = true
-
-                audioEngine.prepare()
-                try audioEngine.start()
-
-                speechTask = speechRecognizer?.recognitionTask(with: speechRequest!) { [weak self] result, error in
+                // (b) live transcript.
+                pipe.speechRequest?.append(buffer)
+                // (c) level meter: compute RMS (pure) and throttle the main-
+                // actor publish to ~10 Hz via the shared holder's timestamp.
+                let now = DispatchTime.now().uptimeNanoseconds
+                if now &- pipe.lastLevelTs > 100_000_000 {
+                    pipe.lastLevelTs = now
+                    let level = Self.rmsLevel(of: buffer)
                     Task { @MainActor in
-                        guard let self else { return }
-                        if let result = result {
-                            self.transcript = result.bestTranscription.formattedString
-                        }
-                        if error != nil {
-                            // Speech task failed (e.g. recognizer busy, ~1/min
-                            // limit). DON'T stop the durable recording — the
-                            // file keeps writing; only the live text stops.
-                            self.speechTask?.cancel()
-                            self.speechTask = nil
-                        }
+                        self?.audioLevel = level
                     }
                 }
             }
+            tapInstalled = true
+
+            audioEngine.prepare()
+            try audioEngine.start()
+
+            // ── Live transcript (on-device) ────────────────────────────────
+            // Always attempt the live transcript; if on-device isn't available
+            // we still record the file (trust > live UX). supportsOnDevice-
+            // Recognition is an instance property — query the recognizer.
+            startSpeechTask()
 
             isRecording = true
             elapsedSeconds = 0
@@ -173,12 +211,6 @@ final class AudioRecorder: NSObject, ObservableObject {
                 Task { @MainActor in
                     guard let self else { return }
                     self.elapsedSeconds += 1
-                    // Poll the recorder's meter for the level UI.
-                    self.recorder?.updateMeters()
-                    // averagePower is in dBFS [-160..0]; normalize to [0..1].
-                    let db = self.recorder?.averagePower(forChannel: 0) ?? -160
-                    let norm = max(0, min(1, (db + 60) / 60))
-                    self.audioLevel = norm
                 }
             }
         } catch {
@@ -188,24 +220,97 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
     }
 
+    /// Build/restart the SFSpeech recognition task. Called once at start and
+    /// again whenever the prior task finishes (Apple caps each task at ~1 min;
+    /// we carry `committedTranscript` forward so nothing is lost).
+    private func startSpeechTask() {
+        guard let recognizer = speechRecognizer, recognizer.isAvailable else { return }
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        if recognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
+        // Publish on the shared holder so the audio-thread tap can append
+        // buffers to it (the tap runs off the main actor).
+        shared.speechRequest = request
+        speechTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            Task { @MainActor in
+                guard let self else { return }
+                if let result = result {
+                    // Prepend the committed (prior-task) text so the live
+                    // display shows the full running transcript, not just the
+                    // current ~1-min segment.
+                    let segment = result.bestTranscription.formattedString
+                    self.transcript = self.committedTranscript.isEmpty
+                        ? segment
+                        : "\(self.committedTranscript) \(segment)"
+                }
+                if error != nil {
+                    // Hard error (e.g. not authorized). Stop only the speech
+                    // path; the durable recording must keep writing.
+                    self.speechTask?.cancel()
+                    self.speechTask = nil
+                    return
+                }
+                if result?.isFinal == true || (result == nil && error == nil) {
+                    // The task ended cleanly (the ~1-min limit fires this path
+                    // on iOS). Commit the final segment of this task and start
+                    // a fresh one so recognition continues for long journals.
+                    if let r = result, r.isFinal {
+                        let seg = r.bestTranscription.formattedString
+                        self.committedTranscript = self.committedTranscript.isEmpty
+                            ? seg
+                            : "\(self.committedTranscript) \(seg)"
+                    }
+                    self.speechTask?.cancel()
+                    self.shared.speechRequest = nil
+                    self.speechTask = nil
+                    if self.isRecording {
+                        self.startSpeechTask()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compute a normalized [0..1] level from a PCM buffer's RMS. Pure — safe
+    /// to call from the audio-thread tap; the result is published on main.
+    private static func rmsLevel(of buffer: AVAudioPCMBuffer) -> Float {
+        guard let data = buffer.floatChannelData else { return 0 }
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return 0 }
+        let ch = data[0]
+        var sum: Float = 0
+        for i in 0..<frames {
+            let s = ch[i]
+            sum += s * s
+        }
+        let rms = sqrt(sum / Float(frames)) // [0..1] for float PCM
+        // Perceptual scaling so quiet speech still moves the meter.
+        return max(0, min(1, rms * 3.0))
+    }
+
     func stopRecording() {
         timer?.invalidate()
         timer = nil
 
-        // Tear down the speech path.
+        // Tear down the speech path first (stop appending buffers).
+        speechTask?.cancel()
+        shared.speechRequest?.endAudio()
+        shared.speechRequest = nil
+        speechTask = nil
+
+        // Stop the engine + remove the tap (no more buffer writes).
         audioEngine.stop()
         if tapInstalled {
             audioEngine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
         }
-        speechRequest?.endAudio()
-        speechTask?.cancel()
-        speechRequest = nil
-        speechTask = nil
 
-        // Finalize the file. stop() flushes and closes the m4a.
-        recorder?.stop()
-        recorder = nil
+        // Finalize the file. Dropping the AVAudioFile reference flushes +
+        // closes the m4a.
+        shared.audioFile = nil
+        tapFormat = nil
 
         isRecording = false
         audioLevel = 0
@@ -231,7 +336,7 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     /// An interruption (incoming call, Siri) pauses or stops the recording.
     /// The file written so far is already on disk and safe; we just stop
-    /// cleanly on began/resumed so isRecording never lies.
+    /// cleanly so isRecording never lies.
     @objc private func handleInterruption(_ note: Notification) {
         guard let info = note.userInfo,
               let typeRaw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
@@ -242,10 +347,7 @@ final class AudioRecorder: NSObject, ObservableObject {
             // the partial m4a is already on disk.
             if isRecording { stopRecording() }
         case .ended:
-            // We stopped on .began, so there's nothing to resume. (Resuming
-            // an AVAudioRecorder mid-file requires prepareToRecord + record
-            // again and would append; we intentionally keep it simple —
-            // Voice Memos also stops on call interruption.)
+            // Voice Memos also stops on call interruption; we don't auto-resume.
             break
         @unknown default:
             break
@@ -271,7 +373,7 @@ final class AudioRecorder: NSObject, ObservableObject {
         errorMessage = "Audio system reset. Please start the recording again."
     }
 
-    // MARK: - Paths
+    // MARK: - Paths + helpers
 
     /// Absolute URL of Documents/Recordings/.
     static func recordingsDirectory() -> URL {
