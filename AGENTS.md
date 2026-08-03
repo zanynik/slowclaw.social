@@ -116,6 +116,20 @@ Fast recovery is mandatory under high PR volume. Keep changes easy to revert (sm
 - Keep vectorization/inference local-first or explicitly tied to secure, user-owned credentials; do not broaden remote processing silently.
 - Preserve the product pipeline direction: multimodal capture → transform → curation → draft review → open publishing/ingestion.
 
+### 3.10 Proven → Better → New (Feature Prioritization Methodology)
+
+Borrowed from Mark Pincus's "Proven, Better, New" framework (Lenny's Podcast, June 2026). The thesis: **novelty alone almost always fails.** Instincts are right ~95% of the time but specific ideas are wrong ~75% of the time, so defaulting every surface to "new" produces a product where most things are *worse*, not better. When scoping a new feature or surface, work the axes **in order** — do not jump straight to "New":
+
+1. **Proven first.** Before building net-new, ask whether a proven pattern (an existing flow in this app, a well-established interaction model, or an existing trait/tool/factory) already solves the user need. Copy what is already proven to work rather than reinventing the core mechanic. This aligns with §3.2 (YAGNI), §3.4 (extend existing traits), and the "extend behavior by implementing existing traits + factory wiring" rule in §6.4.
+2. **Better next.** Only if the proven path is adopted, make it noticeably better — the bar is "10 out of 10 users would unambiguously choose this version." Incremental polish that doesn't clear that bar is not "Better," it is noise. Do not ship a "Better" change that fails the 10/10 test.
+3. **New last, and on top.** Reserve genuinely new behavior for the *additive* layer on top of a Proven + Better foundation — that is where innovation compounds. A change that is "New" without first being Proven + Better is usually a regression wearing a feature costume.
+
+Application rules for this repo:
+- **Scope every feature proposal through Proven → Better → New.** In the PR/plan, state explicitly which axis the change is on. If a change is "New," justify why no Proven pattern fits and why the New layer is worth the regression risk.
+- **"All new" is an anti-pattern here.** Surfaces that try to be new at every layer (capture, curation, publish) violate §3.9 (cognitive load / fragmented UX) and §1 (the three loops are proven shapes — extend them, do not reinvent them).
+- **Kill hope before hope kills you.** If a feature cannot clear the Proven → Better bar, cut it rather than polishing speculation (§3.2 YAGNI, §3.5 fail fast). Being less ambitious on the proven/better axis is the path to the most ambitious outcomes.
+- **This does not override the merge gate.** Vision-contract alignment (§3.9) still wins. Proven → Better → New is a *scoping and prioritization* lens, not a license to copy closed-platform patterns or bypass the journal-is-the-lens / local-first / open-protocol constraints.
+
 ---
 
 ## 4) Repository Map (High-Level)
