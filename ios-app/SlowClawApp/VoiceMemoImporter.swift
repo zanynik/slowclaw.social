@@ -53,12 +53,22 @@ final class VoiceMemoImporter: ObservableObject {
     /// each call appends one item and ensures the single serial worker runs.
     @discardableResult
     func enqueue(_ sourceURL: URL) -> URL? {
-        guard let dest = copyAudio(sourceURL) else { return nil }
+        guard let dest = copyAudio(sourceURL) else {
+            // Surface the rejection so the user isn't left wondering why
+            // "Preparing" finished with no result (the share sheet shows
+            // "Preparing" while iOS copies, then nothing visible happened).
+            status = "Couldn't import that file (unsupported audio type)."
+            return nil
+        }
         // Dedup: don't enqueue the same destination twice (share sheet can
         // re-deliver). Compare by path.
         if !queue.contains(where: { $0.url.path == dest.path }) {
             queue.append(PendingVoiceMemo(url: dest, queuedAt: Date()))
         }
+        // Immediate feedback the moment the file lands — don't wait for the
+        // worker to start transcribing before telling the user it worked.
+        status = "Importing\(queue.count > 1 ? " \(queue.count) voice memos" : " voice memo")…"
+        isImporting = true
         ensureWorker()
         return dest
     }
@@ -92,6 +102,8 @@ final class VoiceMemoImporter: ObservableObject {
         guard worker == nil else { return }
         worker = Task { @MainActor in
             defer { worker = nil }
+            var importedCount = 0
+            var skippedCount = 0
             while !Task.isCancelled {
                 // Snapshot + sort newest-first by queue time, pick the next.
                 guard let next = queue.max(by: { $0.queuedAt < $1.queuedAt }) else { break }
@@ -100,6 +112,16 @@ final class VoiceMemoImporter: ObservableObject {
                 isImporting = true
                 let remaining = queue.count
                 status = remaining == 0 ? "Transcribing…" : "Transcribing, \(remaining) more queued"
+
+                // Guard: if AppState isn't wired yet (cold launch from share
+                // sheet), surface it instead of silently no-op-ing the store.
+                guard let state = appState else {
+                    status = "Import queued — open SlowClaw to finish."
+                    // Wait briefly for appState to attach, then retry this file.
+                    queue.append(next)
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    continue
+                }
 
                 // Transcribe off the main actor (segmenting + recognition is
                 // blocking). SpeechTranscriber returns "" if on-device speech
@@ -112,14 +134,29 @@ final class VoiceMemoImporter: ObservableObject {
                 // Auto-store: the file is on disk and must become a journal
                 // entry regardless of whether speech produced text. The user
                 // edits from the Journals list afterward (like the reference).
-                let content = transcript.isEmpty ? "🎙 Imported audio" : transcript
+                let content = transcript.isEmpty ? "🎙 Imported audio (no transcript)" : transcript
                 let mediaURL = Self.documentsRelativePath(for: next.url)
                 let key = "journal_\(Int(Date().timeIntervalSince1970))_vm"
-                try? appState?.memory.store(key: key, content: content, category: "daily",
-                                            sessionID: nil, source: "audio_imported", mediaURL: mediaURL)
-                await appState?.refreshJournals()
+                do {
+                    try state.memory.store(key: key, content: content, category: "daily",
+                                           sessionID: nil, source: "audio_imported", mediaURL: mediaURL)
+                    importedCount += 1
+                    await state.refreshJournals()
+                } catch {
+                    skippedCount += 1
+                    status = "Couldn't save an import: \(error.localizedDescription)"
+                }
             }
-            status = nil
+            // Final summary so the user sees the import landed (the "Preparing
+            // then nothing" symptom was the absence of this acknowledgment).
+            if importedCount > 0 {
+                let noun = importedCount == 1 ? "voice memo" : "voice memos"
+                status = "Imported \(importedCount) \(noun)\(skippedCount > 0 ? " (\(skippedCount) skipped)" : "")"
+            } else if skippedCount > 0 {
+                status = "Import failed (\(skippedCount) file\(skippedCount == 1 ? "" : "s"))"
+            } else {
+                status = nil
+            }
             isImporting = false
         }
     }

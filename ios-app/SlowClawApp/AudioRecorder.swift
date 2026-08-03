@@ -26,6 +26,9 @@ final class AudioRecorder: NSObject, ObservableObject {
     @Published var audioLevel: Float = 0
     @Published var errorMessage: String?
     @Published var elapsedSeconds: Int = 0
+    /// Rolling window of recent RMS levels (~60 samples ≈ 6s at 10 Hz) that
+    /// drives the waveform during recording. Newest sample is last.
+    @Published var samples: [Float] = []
 
     /// The on-disk m4a URL of the most recent recording. The caller stores the
     /// journal with source="audio_recorded" and media_url = its Documents-
@@ -83,6 +86,7 @@ final class AudioRecorder: NSObject, ObservableObject {
         errorMessage = nil
         recordedFileURL = nil
         audioLevel = 0
+        samples = []
         tapInstalled = false
 
         do {
@@ -133,7 +137,11 @@ final class AudioRecorder: NSObject, ObservableObject {
                     pipe.lastLevelTs = now
                     let level = Self.rmsLevel(of: buffer)
                     Task { @MainActor in
-                        self?.audioLevel = level
+                        guard let self else { return }
+                        self.audioLevel = level
+                        // Rolling window for the waveform (keep ~60 samples).
+                        self.samples.append(level)
+                        if self.samples.count > 60 { self.samples.removeFirst(self.samples.count - 60) }
                     }
                 }
             }
@@ -175,6 +183,7 @@ final class AudioRecorder: NSObject, ObservableObject {
 
         isRecording = false
         audioLevel = 0
+        samples = []
 
         try? AVAudioSession.sharedInstance().setActive(
             false, options: .notifyOthersOnDeactivation
@@ -317,12 +326,11 @@ struct AudioCaptureView: View {
                         .font(DS.captionFont)
                         .foregroundStyle(DS.muted(scheme))
 
-                    // Level meter bar — the focus while recording (no live text).
-                    VStack(spacing: 8) {
-                        RoundedRectangle(cornerRadius: 3, style: .continuous)
-                            .fill(DS.accent2Color.opacity(0.85))
-                            .frame(width: max(8, CGFloat(recorder.audioLevel) * 220), height: 8)
-                            .animation(.easeOut(duration: 0.06), value: recorder.audioLevel)
+                    // Rolling waveform — the focus while recording (no live text).
+                    // Mirrors Voice Memos / ChatGPT: trailing bars that decay.
+                    VStack(spacing: 10) {
+                        WaveformView(samples: recorder.samples, color: DS.accent2Color)
+                            .frame(height: 64)
                         Text("Recording…")
                             .font(DS.bodyFont)
                             .foregroundStyle(DS.ink(scheme))
@@ -603,5 +611,56 @@ struct AudioPreviewBar: View {
                 }
             }
         }
+    }
+}
+
+/// A rolling waveform of recent RMS samples — Voice Memos / ChatGPT style.
+/// Renders trailing bars that grow with loudness and decay over time. Newest
+/// sample is on the right; older samples drift left and shrink.
+struct WaveformView: View {
+    let samples: [Float]
+    var color: Color
+    /// Number of bars to render. More bars = denser, finer wave.
+    private let barCount: Int = 48
+
+    var body: some View {
+        GeometryReader { geo in
+            HStack(alignment: .center, spacing: barSpacing(width: geo.size.width)) {
+                ForEach(0..<barCount, id: \.self) { i in
+                    bar(for: mappedSample(at: i))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        }
+    }
+
+    /// Map the rolling samples window onto the fixed bar grid. The newest
+    /// samples (end of the array) map to the rightmost bars; missing/old
+    /// slots on the left fall back to a small floor so the wave looks alive.
+    private func mappedSample(at barIndex: Int) -> Float {
+        // Right-align: the rightmost bar is the newest sample.
+        let offset = barCount - 1 - barIndex
+        let idx = samples.count - 1 - offset
+        if idx >= 0 && idx < samples.count {
+            return samples[idx]
+        }
+        // Floor for slots without data yet (keeps the wave symmetric).
+        return 0.04
+    }
+
+    private func bar(for level: Float) -> some View {
+        let height = max(3, CGFloat(level) * 64)
+        return RoundedRectangle(cornerRadius: 2, style: .continuous)
+            .fill(color.opacity(0.55 + CGFloat(level) * 0.45))
+            .frame(height: height)
+            .animation(.easeOut(duration: 0.08), value: samples)
+    }
+
+    private func barSpacing(width: CGFloat) -> CGFloat {
+        // ~70% bars, 30% gaps for a clean wave look.
+        let totalWidth = width
+        let approxBarWidth: CGFloat = 4
+        let gap = max(1, (totalWidth - CGFloat(barCount) * approxBarWidth) / CGFloat(barCount))
+        return gap
     }
 }

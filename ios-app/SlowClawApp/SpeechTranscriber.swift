@@ -47,11 +47,33 @@ enum SpeechTranscriber {
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
 
-        let wholeDuration = audioDurationSeconds(url)
-        // Decide segment URLs: split if long, else the whole file.
+        // Decide whether to segment. We must split long audio because on-device
+        // SFSpeechRecognizer truncates a single recognitionTask to ~60s. Decide
+        // from the FRAME COUNT (via AVAudioFile.length), NOT from the container's
+        // duration metadata: m4a files written live by AVAudioFile often lack a
+        // readable duration track immediately after close, so audioDuration-
+        // Seconds returns 0 and segmentation never triggers — that was the root
+        // cause of "only the last few lines were transcribed." Frame count is
+        // deterministic and container-independent.
+        let needsSegmenting: Bool
+        if let probe = try? AVAudioFile(forReading: url) {
+            let sampleRate = probe.processingFormat.sampleRate
+            let totalFrames = probe.length
+            if sampleRate > 0 {
+                let duration = Double(totalFrames) / sampleRate
+                needsSegmenting = duration > segmentSeconds
+            } else {
+                // Fallback: if the format is unreadable, trust container metadata.
+                needsSegmenting = audioDurationSeconds(url) > segmentSeconds
+            }
+        } else {
+            // Can't open to probe — try container duration, else single-shot.
+            needsSegmenting = audioDurationSeconds(url) > segmentSeconds
+        }
+
         var tempDir: URL? = nil
         let segmentURLs: [URL]
-        if wholeDuration > segmentSeconds {
+        if needsSegmenting {
             let (segs, dir) = splitAudioIntoSegments(url, maxSeconds: segmentSeconds)
             segmentURLs = segs
             tempDir = dir
