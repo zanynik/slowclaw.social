@@ -349,17 +349,93 @@ final class AppState: ObservableObject {
 
     func refreshJournals() async {
         do {
-            // Journals: all entries EXCEPT drafts (sessionID="drafts"). Drafts
-            // (TweetClaw-generated posts) belong in the Drafts tab only, not the
-            // Journals list. recall doesn't support an exclude-session filter, so
-            // fetch a wider set and drop drafts client-side. Order newest-first.
+            // Journals: all entries EXCEPT drafts (sessionID="drafts") and
+            // soft-deleted keys. Drafts (TweetClaw-generated posts) belong in
+            // the Drafts tab only; soft-deleted entries sit in Recently Deleted
+            // for 30 days. recall doesn't support an exclude-session filter, so
+            // fetch a wider set and drop both client-side. Order newest-first.
             let all = try memory.recall(query: "the a an of to and", limit: 60)
-            journals = all.filter { ($0.sessionID ?? "") != "drafts" }
+            let deletedKeys = Set(Self.softDeletedKeys().keys)
+            journals = all.filter { ($0.sessionID ?? "") != "drafts" && !deletedKeys.contains($0.key) }
             drafts = try memory.recall(query: "draft post", limit: 20, sessionID: "drafts")
         } catch {
             journals = []
             drafts = []
         }
+    }
+
+    // MARK: - Recently Deleted (30-day soft-delete safety net)
+    //
+    // Voice Memos moves a deleted recording to "Recently Deleted" for 30 days.
+    // For an audio journal — often the only record of a private thought — a
+    // stray delete being gone forever is a trust killer. Soft-delete keeps the
+    // SQLite row untouched (no schema change), tracking deleted keys +
+    // timestamps in UserDefaults. Entries auto-expire after 30 days; the user
+    // can restore or empty the trash from the Profile screen.
+
+    private static let softDeleteKey = "slowclaw.softdeleted"   // [journalKey: epochTimestamp]
+    private static let softDeleteTTL: TimeInterval = 30 * 24 * 3600
+
+    /// The soft-delete map, pruned of entries older than the TTL.
+    static func softDeletedKeys() -> [String: Double] {
+        let now = Date().timeIntervalSince1970
+        guard let raw = UserDefaults.standard.dictionary(forKey: softDeleteKey) as? [String: Double] else {
+            return [:]
+        }
+        let live = raw.filter { now - $0.value < softDeleteTTL }
+        if live.count != raw.count {
+            UserDefaults.standard.set(live, forKey: softDeleteKey)
+        }
+        return live
+    }
+
+    /// Journals that are currently soft-deleted (for the Profile "Recently
+    /// Deleted" list). Fetches each by key from the store (they're excluded
+    /// from the main journals list) so the UI can show title + timestamp +
+    /// a restore button.
+    var recentlyDeleted: [SlowClawMemoryEntry] {
+        let timestamps = Self.softDeletedKeys()
+        var entries: [SlowClawMemoryEntry] = []
+        for (key, ts) in timestamps {
+            if let entry = try? memory.get(key: key), let e = entry {
+                entries.append(e)
+            } else {
+                // Row already gone (empty-trash ran, or never existed). Track a
+                // stub so the entry's deletion timestamp still shows for prune.
+                entries.append(SlowClawMemoryEntry(
+                    id: key, key: key, content: "(permanently deleted)",
+                    category: "deleted", timestamp: "", sessionID: nil, score: nil))
+            }
+        }
+        // Newest-deleted first.
+        return entries.sorted { (timestamps[$0.key] ?? 0) > (timestamps[$1.key] ?? 0) }
+    }
+
+    /// Soft-delete a journal entry (moves it to Recently Deleted; the row stays
+    /// in the store). Idempotent.
+    func softDelete(key: String) {
+        var live = Self.softDeletedKeys()
+        live[key] = Date().timeIntervalSince1970
+        UserDefaults.standard.set(live, forKey: Self.softDeleteKey)
+        if selectedJournalKey == key { selectedJournalKey = nil }
+        Task { await refreshJournals() }
+    }
+
+    /// Restore a soft-deleted entry (removes it from Recently Deleted).
+    func restore(key: String) {
+        var live = Self.softDeletedKeys()
+        live.removeValue(forKey: key)
+        UserDefaults.standard.set(live, forKey: Self.softDeleteKey)
+        Task { await refreshJournals() }
+    }
+
+    /// Permanently delete all soft-deleted entries (empty the trash). Also
+    /// removes the underlying rows.
+    func emptyTrash() {
+        let keys = Array(Self.softDeletedKeys().keys)
+        for key in keys { try? memory.forget(key: key) }
+        UserDefaults.standard.removeObject(forKey: Self.softDeleteKey)
+        Task { await refreshJournals() }
     }
 
     /// Clear the journal selection so the editor shows a fresh, empty entry.
@@ -1048,12 +1124,10 @@ struct JournalSidebar: View {
                             .lineLimit(1)
                     }
                 }
-                // Delete (appears on row tap in the reference; here always
-                // visible as a small ghost button for discoverability).
+                // Delete → moves to Recently Deleted (30-day soft-delete, like
+                // Voice Memos). Restore is on the Profile screen.
                 Button(role: .destructive) {
-                    try? state.memory.forget(key: entry.key)
-                    if state.selectedJournalKey == entry.key { state.selectedJournalKey = nil }
-                    Task { await state.refreshJournals() }
+                    state.softDelete(key: entry.key)
                 } label: {
                     Image(systemName: "trash")
                         .font(.system(size: 13))
@@ -1951,6 +2025,11 @@ struct ProfileView: View {
                         row("Engine", "Zig + SQLite")
                     }
                 }
+
+                // Recently Deleted (30-day soft-delete, like Voice Memos).
+                // Shows entries the user deleted from Journals, with restore +
+                // empty-trash. Auto-expire after 30 days.
+                RecentlyDeletedCard(scheme: scheme)
             }
             .padding(.horizontal, 16)
             .padding(.top, 16)
@@ -1977,8 +2056,81 @@ struct ProfileView: View {
     }
 }
 
-// MARK: - Shared UI Components (matching the original app's design)
+/// "Recently Deleted" card for the Profile screen. Lists soft-deleted journals
+/// (kept for 30 days, like Voice Memos), with per-entry restore and an
+/// empty-trash action. Auto-expires entries older than 30 days on read.
+struct RecentlyDeletedCard: View {
+    let scheme: ColorScheme
+    @EnvironmentObject var state: AppState
 
+    private var deleted: [SlowClawMemoryEntry] { state.recentlyDeleted }
+
+    var body: some View {
+        DS.card(scheme) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Recently Deleted")
+                        .font(DS.cardTitleFont)
+                        .foregroundStyle(DS.ink(scheme))
+                    Spacer()
+                    if !deleted.isEmpty {
+                        Button(role: .destructive) {
+                            state.emptyTrash()
+                        } label: {
+                            Text("Empty")
+                                .font(DS.captionFont.weight(.semibold))
+                                .foregroundStyle(DS.accent2Color)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                if deleted.isEmpty {
+                    Text("Deleted journals stay here for 30 days.")
+                        .font(DS.captionFont)
+                        .foregroundStyle(DS.muted(scheme))
+                } else {
+                    ForEach(deleted, id: \.key) { entry in
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(entry.content.split(separator: "\n").first.map(String.init) ?? entry.content)
+                                    .font(DS.captionFont.weight(.semibold))
+                                    .foregroundStyle(DS.ink(scheme))
+                                    .lineLimit(1)
+                                Text(deletedAt(entry))
+                                    .font(DS.microFont)
+                                    .foregroundStyle(DS.muted(scheme))
+                            }
+                            Spacer()
+                            Button("Restore") {
+                                state.restore(key: entry.key)
+                            }
+                            .font(DS.captionFont.weight(.semibold))
+                            .foregroundStyle(DS.accentColor)
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.vertical, 4)
+                        if entry.key != deleted.last?.key {
+                            Divider().opacity(0.4)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// "Deleted 3d ago" / "Deleted just now" from the soft-delete timestamp.
+    private func deletedAt(_ entry: SlowClawMemoryEntry) -> String {
+        let ts = AppState.softDeletedKeys()[entry.key] ?? 0
+        let interval = Date().timeIntervalSince1970 - ts
+        if interval < 60 { return "Deleted just now" }
+        if interval < 3600 { return "Deleted \(Int(interval / 60))m ago" }
+        if interval < 86400 { return "Deleted \(Int(interval / 3600))h ago" }
+        return "Deleted \(Int(interval / 86400))d ago"
+    }
+}
+
+// MARK: - Shared UI Components (matching the original app's design)
 extension DS {
     /// Primary card container matching `.card` in styles.css: large 28px radius,
     /// surface bg, 1px line border, subtle shadow. Dark-mode aware.

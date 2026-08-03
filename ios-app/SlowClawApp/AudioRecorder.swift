@@ -14,6 +14,7 @@
 // Audio never leaves the device. On-device speech only.
 
 import SwiftUI
+import UIKit
 import AVFoundation
 import Speech
 
@@ -21,6 +22,9 @@ import Speech
 @MainActor
 final class AudioRecorder: NSObject, ObservableObject {
     @Published var isRecording = false
+    /// True when recording is paused (engine stopped, file kept open so resume
+    /// appends to the same continuous m4a).
+    @Published var isPaused = false
     @Published var isTranscribing = false
     @Published var transcript = ""
     @Published var audioLevel: Float = 0
@@ -29,6 +33,9 @@ final class AudioRecorder: NSObject, ObservableObject {
     /// Rolling window of recent RMS levels (~60 samples ≈ 6s at 10 Hz) that
     /// drives the waveform during recording. Newest sample is last.
     @Published var samples: [Float] = []
+    /// Optional title the user can type while recording (Voice Memos lets you
+    /// rename mid-recording). Stored as the journal's first line on save.
+    @Published var title = ""
 
     /// The on-disk m4a URL of the most recent recording. The caller stores the
     /// journal with source="audio_recorded" and media_url = its Documents-
@@ -88,6 +95,9 @@ final class AudioRecorder: NSObject, ObservableObject {
         audioLevel = 0
         samples = []
         tapInstalled = false
+        isPaused = false
+
+        Self.haptic(.impact)
 
         do {
             let session = AVAudioSession.sharedInstance()
@@ -163,15 +173,77 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// Stop the recording and transcribe the file on-device. Sets `transcript`
+    /// Pause the recording. The engine stops and the tap is removed (no more
+    /// buffer writes), but the AVAudioFile is KEPT OPEN so resume appends to
+    /// the same continuous m4a. The timer pauses so elapsedSeconds holds.
+    /// Use finishRecording() to end the session and transcribe.
+    func pauseRecording() {
+        guard isRecording, !isPaused else { return }
+        timer?.invalidate()
+        timer = nil
+        audioEngine.stop()
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        // Intentionally do NOT nil shared.audioFile — resume reuses it.
+        isPaused = true
+        audioLevel = 0
+        Self.haptic(.light)
+    }
+
+    /// Resume after a pause. Reinstalls the tap and restarts the engine; buffers
+    /// keep appending to the same open AVAudioFile, producing one continuous
+    /// recording across the pause.
+    func resumeRecording() async {
+        guard isRecording, isPaused else { return }
+        do {
+            try AVAudioSession.sharedInstance().setActive(true, options: .notifyOthersOnDeactivation)
+            let inputNode = audioEngine.inputNode
+            let format = inputNode.outputFormat(forBus: 0)
+            // Reinstall the tap onto the same open file.
+            let pipe = shared
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+                do {
+                    try pipe.audioFile?.write(from: buffer)
+                } catch {}
+                let now = DispatchTime.now().uptimeNanoseconds
+                if now &- pipe.lastLevelTs > 100_000_000 {
+                    pipe.lastLevelTs = now
+                    let level = Self.rmsLevel(of: buffer)
+                    Task { @MainActor in
+                        guard let self else { return }
+                        self.audioLevel = level
+                        self.samples.append(level)
+                        if self.samples.count > 60 { self.samples.removeFirst(self.samples.count - 60) }
+                    }
+                }
+            }
+            tapInstalled = true
+            audioEngine.prepare()
+            try audioEngine.start()
+            isPaused = false
+            timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.elapsedSeconds += 1 }
+            }
+            Self.haptic(.light)
+        } catch {
+            errorMessage = "Could not resume: \(error.localizedDescription)"
+            // Fall back to finishing so the partial file is still saved.
+            finishRecording()
+        }
+    }
+
+    /// End the session: finalize the file and transcribe it. Sets `transcript`
     /// and `recordedFileURL`; the caller presents the review sheet when
-    /// `isTranscribing` returns to false.
-    func stopRecording() {
+    /// `isTranscribing` returns to false. This is the "Stop & Save" action.
+    func finishRecording() {
         guard isRecording else { return }
         timer?.invalidate()
         timer = nil
 
-        // Stop the engine + remove the tap (no more buffer writes).
+        // Stop the engine + remove the tap if still installed (pause may have
+        // already removed it).
         audioEngine.stop()
         if tapInstalled {
             audioEngine.inputNode.removeTap(onBus: 0)
@@ -182,9 +254,11 @@ final class AudioRecorder: NSObject, ObservableObject {
         shared.audioFile = nil
 
         isRecording = false
+        isPaused = false
         audioLevel = 0
         samples = []
 
+        Self.haptic(.success)
         try? AVAudioSession.sharedInstance().setActive(
             false, options: .notifyOthersOnDeactivation
         )
@@ -202,6 +276,9 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
     }
 
+    /// Legacy alias kept for call sites that mean "end and transcribe."
+    @inlinable func stopRecording() { finishRecording() }
+
     // MARK: - Session observers
 
     private func registerSessionObservers() {
@@ -218,9 +295,12 @@ final class AudioRecorder: NSObject, ObservableObject {
         guard let info = note.userInfo,
               let typeRaw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
-        if type == .began, isRecording {
-            // Another app took audio. Stop recording; the partial file is on disk.
-            stopRecording()
+        if type == .began, isRecording, !isPaused {
+            // Another app took audio (call, Siri). PAUSE (don't hard-stop) so
+            // the user can resume and keep the same continuous file — Voice
+            // Memos behavior. The partial file is on disk and safe.
+            pauseRecording()
+            errorMessage = "Paused by interruption. Tap resume to continue."
         }
     }
 
@@ -228,13 +308,16 @@ final class AudioRecorder: NSObject, ObservableObject {
         guard let info = note.userInfo,
               let reasonRaw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
               let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw) else { return }
-        if reason == .oldDeviceUnavailable, isRecording {
-            stopRecording()
+        if reason == .oldDeviceUnavailable, isRecording, !isPaused {
+            // Mic physically gone (AirPods unplugged) — pause so the user can
+            // reconnect and resume, rather than abruptly ending.
+            pauseRecording()
+            errorMessage = "Paused — audio device disconnected."
         }
     }
 
     @objc private func handleMediaServicesReset(_ note: Notification) {
-        if isRecording { stopRecording() }
+        if isRecording { finishRecording() }
         errorMessage = "Audio system reset. Please start the recording again."
     }
 
@@ -274,6 +357,24 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
         let rms = sqrt(sum / Float(frames))
         return max(0, min(1, rms * 3.0))
+    }
+
+    // MARK: - Haptics
+
+    private enum HapticKind { case impact, light, success }
+
+    /// Physical confirmation that the capture state changed — a big part of why
+    /// Voice Memos feels reliable. impact = record start; light = pause/resume;
+    /// success = finished (saved).
+    private static func haptic(_ kind: HapticKind) {
+        switch kind {
+        case .impact:
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        case .light:
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        case .success:
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        }
     }
 }
 
@@ -315,6 +416,12 @@ struct AudioCaptureView: View {
             } else if recorder.isRecording {
                 // ── Recording zen screen ──
                 HStack {
+                    // Editable title while recording (Voice Memos lets you
+                    // rename mid-recording). Becomes the journal's first line.
+                    TextField("Recording title (optional)", text: $recorder.title)
+                        .font(DS.bodyFont)
+                        .textFieldStyle(.plain)
+                        .foregroundStyle(DS.ink(scheme))
                     Spacer()
                     Text(recorder.elapsedLabel)
                         .font(.system(size: 15, weight: .semibold, design: .monospaced))
@@ -331,7 +438,7 @@ struct AudioCaptureView: View {
                     VStack(spacing: 10) {
                         WaveformView(samples: recorder.samples, color: DS.accent2Color)
                             .frame(height: 64)
-                        Text("Recording…")
+                        Text(recorder.isPaused ? "Paused" : "Recording…")
                             .font(DS.bodyFont)
                             .foregroundStyle(DS.ink(scheme))
                     }
@@ -339,10 +446,10 @@ struct AudioCaptureView: View {
 
                     HStack(spacing: 8) {
                         Circle()
-                            .fill(DS.accent2Color)
+                            .fill(recorder.isPaused ? DS.muted(scheme) : DS.accent2Color)
                             .frame(width: 8, height: 8)
                             .opacity(0.85)
-                        Text("Listening")
+                        Text(recorder.isPaused ? "Paused" : "Listening")
                             .font(DS.captionFont)
                             .foregroundStyle(DS.muted(scheme))
                     }
@@ -354,32 +461,53 @@ struct AudioCaptureView: View {
                         .stroke(DS.line(scheme), lineWidth: 1)
                 )
 
-                // Pulsing coral stop button → Stop & Save.
-                Button {
-                    recorder.stopRecording()
-                    // Present the sheet once transcription finishes. Use a
-                    // small delay + observe isTranscribing via onChange.
-                } label: {
-                    ZStack {
-                        Circle()
-                            .fill(LinearGradient(colors: [DS.accent2Color, Color(red: 0.83, green: 0.3, blue: 0.23)],
-                                                  startPoint: .topLeading, endPoint: .bottomTrailing))
-                            .frame(width: 76, height: 76)
-                            .shadow(color: DS.accent2Color.opacity(0.4), radius: 12, y: 4)
-                            .overlay {
-                                Circle()
-                                    .stroke(DS.accent2Color.opacity(0.5), lineWidth: 2)
-                                    .scaleEffect(pulse ? 1.5 : 1.0)
-                                    .opacity(pulse ? 0 : 0.6)
-                            }
-                            .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: false), value: pulse)
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 28))
-                            .foregroundStyle(.white)
+                // Pause/Resume + Stop row.
+                HStack(spacing: 20) {
+                    // Pause / resume toggle.
+                    Button {
+                        if recorder.isPaused {
+                            Task { await recorder.resumeRecording() }
+                        } else {
+                            recorder.pauseRecording()
+                        }
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(DS.surface3(scheme))
+                                .frame(width: 60, height: 60)
+                            Image(systemName: recorder.isPaused ? "play.fill" : "pause.fill")
+                                .font(.system(size: 22))
+                                .foregroundStyle(DS.ink(scheme))
+                        }
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(recorder.isPaused ? "Resume" : "Pause")
+
+                    // Pulsing coral stop button → finish + transcribe.
+                    Button {
+                        recorder.finishRecording()
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(LinearGradient(colors: [DS.accent2Color, Color(red: 0.83, green: 0.3, blue: 0.23)],
+                                                      startPoint: .topLeading, endPoint: .bottomTrailing))
+                                .frame(width: 76, height: 76)
+                                .shadow(color: DS.accent2Color.opacity(0.4), radius: 12, y: 4)
+                                .overlay {
+                                    Circle()
+                                        .stroke(DS.accent2Color.opacity(0.5), lineWidth: 2)
+                                        .scaleEffect(pulse ? 1.5 : 1.0)
+                                        .opacity(pulse ? 0 : 0.6)
+                                }
+                                .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: false), value: pulse)
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 28))
+                                .foregroundStyle(.white)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Stop and transcribe")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Stop and transcribe")
 
                 Text("Stop & Transcribe")
                     .font(DS.captionFont)
@@ -444,11 +572,16 @@ struct AudioCaptureView: View {
                 audioURL: recorder.recordedFileURL
             ) { polished in
                 let mediaURL = recorder.recordedFileURL.flatMap(AudioRecorder.documentsRelativePath(for:))
+                // Prepend the title (if the user typed one mid-recording) so
+                // it becomes the journal's first line / display title.
+                let title = recorder.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let body = title.isEmpty ? polished : "\(title)\n\n\(polished)"
                 Task {
-                    await state.storeJournal(text: polished,
+                    await state.storeJournal(text: body,
                                              source: "audio_recorded",
                                              mediaURL: mediaURL)
                 }
+                recorder.title = ""
                 recorder.transcript = ""
                 recorder.recordedFileURL = nil
                 showTranscript = false
