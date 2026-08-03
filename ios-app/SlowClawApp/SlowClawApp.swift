@@ -430,7 +430,12 @@ final class AppState: ObservableObject {
 
         var combined = rss + nostr
         combined.sort { $0.score > $1.score }
-        let capped = Array(combined.prefix(80))
+        // Apply the post-merge production filter the iOS app was missing:
+        // quality gate (drop spam/empty), URL dedup (collapse cross-feed
+        // reposts), and a per-source cap + round-robin so one feed can't
+        // dominate. This is the curation the reference does in the Rust
+        // gateway ranker.rs; we do it client-side on the merged batch.
+        let capped = slowClawFilterAndDiversify(combined, maxPerSource: 5, limit: 80)
 
         // Never replace a usable snapshot with an empty failed refresh. A stale
         // local feed is more useful than a blank loading/error state.

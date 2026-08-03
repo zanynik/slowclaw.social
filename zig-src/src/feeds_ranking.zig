@@ -313,6 +313,55 @@ fn countSource(out: []const RankedItem, source: []const u8) usize {
     return n;
 }
 
+/// Post-merge production filter (the curation the iOS app was missing — the
+/// reference does this in the Rust gateway `ranker.rs`). Apply to the merged,
+/// score-sorted batch from many feeds AFTER rankReads:
+///   1. Quality gate — drop items with no title AND no body (spam/empty).
+///   2. Dedup by link (item.id — the RSS link/guid). Input is score-sorted
+///      desc, so first occurrence wins (highest-scored survives). Collapses
+///      cross-feed reposts and HN→blog mirrors.
+///   3. Per-source cap + round-robin (`diversifyColdStart`) so one feed can't
+///      dominate the merged output. Runs UNCONDITIONALLY.
+/// Returns an allocator-owned slice (caller frees).
+pub fn filterAndDiversify(
+    allocator: std.mem.Allocator,
+    ranked: []const RankedItem,
+    max_per_source: usize,
+    limit: usize,
+) ![]RankedItem {
+    if (ranked.len == 0) return try allocator.alloc(RankedItem, 0);
+
+    // (1) Quality gate: drop items with no title AND no body.
+    var quality: std.ArrayList(RankedItem) = .empty;
+    errdefer quality.deinit(allocator);
+    for (ranked) |r| {
+        if (r.item.title.len > 0 or r.item.body.len > 0) {
+            try quality.append(allocator, r);
+        }
+    }
+
+    // (2) Dedup by link (item.id), first-wins (input is score-sorted desc).
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    var deduped: std.ArrayList(RankedItem) = .empty;
+    errdefer deduped.deinit(allocator);
+    for (quality.items) |r| {
+        // Empty link — keep (can't dedup; rare). Non-empty — first wins.
+        if (r.item.id.len == 0) {
+            try deduped.append(allocator, r);
+            continue;
+        }
+        const gop = try seen.getOrPut(r.item.id);
+        if (!gop.found_existing) try deduped.append(allocator, r);
+    }
+    quality.deinit(allocator);
+
+    // (3) Per-source cap + round-robin (reuse diversifyColdStart's logic).
+    const capped = try diversifyColdStart(allocator, deduped.items, max_per_source, limit);
+    deduped.deinit(allocator);
+    return capped;
+}
+
 // ── Chronological variant ─────────────────────────────────────────────────
 
 /// Rank by timestamp (newest first). Returns allocator-owned slice.
@@ -666,4 +715,90 @@ test "rankReads: cold-start (no topics) diversifies the output" {
     var k: usize = 0;
     while (k < @min(ranked.len, 4)) : (k += 1) try seen.put(ranked[k].source_label, {});
     try testing.expect(seen.count() >= 2);
+}
+
+// ── Quality filtering + dedup (TDD) ────────────────────────────────────────
+//
+// filterAndDiversify is the post-merge production filter the iOS app was
+// missing (the reference does this in the Rust gateway ranker.rs). It runs on
+// the merged, score-sorted batch from many feeds: drop empty/spam items,
+// dedupe by URL/title keeping the highest-scored, then cap per source.
+
+test "filterAndDiversify: drops items with no title AND no body (spam/empty)" {
+    const a = testing.allocator;
+    // Input score-sorted desc: a spam item (empty title+body) ranks highest,
+    // proving the quality gate drops it regardless of score.
+    const input = [_]RankedItem{
+        .{
+            .item = .{ .id = "spam", .title = "", .body = "", .author_handle = "src1", .source_platform = "rss", .timestamp = 0 },
+            .score = 9.0, .read_minutes = 1, .source_label = "src1",
+        },
+        rankedOf("good-a", "src1", 5.0),
+        rankedOf("good-b", "src2", 4.0),
+    };
+    const out = try filterAndDiversify(a, &input, 6, 80);
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len); // spam dropped
+    // Spam id must never appear (round-robin reorders, so check membership).
+    for (out) |r| try testing.expect(!std.mem.eql(u8, r.item.id, "spam"));
+}
+
+test "filterAndDiversify: dedupes by link (item.id), keeps highest-scored" {
+    const a = testing.allocator;
+    // Two items share the SAME link (item.id); input is score-sorted desc so
+    // the first (higher-scored) is the one that survives (first-wins).
+    const dup_hi: RankedItem = .{
+        .item = .{ .id = "https://example.com/same", .title = "Hi", .body = "body", .author_handle = "src1", .source_platform = "rss", .timestamp = 0 },
+        .score = 8.0, .read_minutes = 2, .source_label = "src1",
+    };
+    const dup_lo: RankedItem = .{
+        .item = .{ .id = "https://example.com/same", .title = "Lo", .body = "body", .author_handle = "src2", .source_platform = "rss", .timestamp = 0 },
+        .score = 5.0, .read_minutes = 2, .source_label = "src2",
+    };
+    const other = rankedOf("other", "src3", 3.0);
+    const input = [_]RankedItem{ dup_hi, dup_lo, other };
+    const out = try filterAndDiversify(a, &input, 6, 80);
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len); // dup collapsed
+    // The higher-scored dup must be the survivor.
+    var survivor_score: f64 = -1;
+    for (out) |r| if (std.mem.eql(u8, r.item.id, "https://example.com/same")) {
+        survivor_score = r.score;
+    };
+    try testing.expectEqual(@as(f64, 8.0), survivor_score);
+}
+
+test "filterAndDiversify: per-source cap applies unconditionally" {
+    // Unlike diversifyColdStart (cold-only), filterAndDiversify caps sources
+    // on EVERY batch so one prolific feed can't dominate the merged output.
+    const a = testing.allocator;
+    var input = std.ArrayList(RankedItem).empty;
+    defer input.deinit(a);
+    // Keep the id strings alive for the test's lifetime (RankedItem.item.id
+    // borrows them; freeing mid-build would be a use-after-free).
+    var ids = std.ArrayList([]u8).empty;
+    defer {
+        for (ids.items) |s| a.free(s);
+        ids.deinit(a);
+    }
+    var n: usize = 0;
+    while (n < 9) : (n += 1) {
+        const id = try std.fmt.allocPrint(a, "hn-{d}", .{n});
+        try ids.append(a, id);
+        try input.append(a, rankedOf(id, "hackernews", @as(f64, @floatFromInt(10 - n))));
+    }
+    try input.append(a, rankedOf("other", "simon", 1.0));
+    const out = try filterAndDiversify(a, input.items, 3, 80);
+    defer a.free(out);
+    // hackernews capped to 3; "other" survives -> 4 total.
+    try testing.expectEqual(@as(usize, 4), out.len);
+    var hn = std.StringHashMap(usize).init(a);
+    defer hn.deinit();
+    for (out) |r| {
+        const e = try hn.getOrPut(r.source_label);
+        if (!e.found_existing) e.value_ptr.* = 0;
+        e.value_ptr.* += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), hn.get("hackernews").?);
+    try testing.expectEqual(@as(usize, 1), hn.get("simon").?);
 }

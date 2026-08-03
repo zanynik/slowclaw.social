@@ -431,6 +431,65 @@ public func slowClawParseAndRankRSS(
     return dtos.enumerated().map { $0.element.toRanked(index: $0.offset) }
 }
 
+/// Post-merge production filter (the curation the iOS app was missing — the
+/// reference does this in the Rust gateway ranker.rs). Runs on the merged,
+/// score-sorted batch from many feeds:
+///   1. Quality gate — drop items with no title AND no body (spam/empty).
+///   2. Dedup by link, keeping the highest-scored (input must be score-sorted
+///      desc so first occurrence wins). Collapses cross-feed reposts.
+///   3. Per-source cap + round-robin so one feed can't dominate the output.
+/// Mirrors the Zig feeds_ranking.filterAndDiversify (kept in Swift because the
+/// merge happens client-side across many Zig-ranked feeds).
+public func slowClawFilterAndDiversify(
+    _ items: [RankedFeedItem],
+    maxPerSource: Int = 6,
+    limit: Int = 80
+) -> [RankedFeedItem] {
+    guard !items.isEmpty else { return [] }
+
+    // (1) Quality gate + (2) dedup by link (first wins, input is score-sorted).
+    var seen = Set<String>()
+    var deduped: [RankedFeedItem] = []
+    deduped.reserveCapacity(items.count)
+    for item in items {
+        let hasTitle = !item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasBody = !item.description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard hasTitle || hasBody else { continue } // drop empty/spam
+        // Dedup key: the link when present, else a synthetic per-id key (no dedup).
+        let key = item.link.isEmpty ? "id:\(item.id)" : "link:\(item.link)"
+        if seen.insert(key).inserted { deduped.append(item) }
+    }
+
+    // (3) Per-source cap + round-robin interleave.
+    // Group by sourceLabel preserving score order, cap each, then round-robin.
+    var queues: [[RankedFeedItem]] = []
+    var queueLabels: [String] = []
+    var bySource: [String: [RankedFeedItem]] = [:]
+    for item in deduped {
+        if bySource[item.sourceLabel] == nil { queueLabels.append(item.sourceLabel) }
+        var q = bySource[item.sourceLabel] ?? []
+        if q.count < maxPerSource { q.append(item) }
+        bySource[item.sourceLabel] = q
+    }
+    for label in queueLabels { queues.append(bySource[label] ?? []) }
+
+    var out: [RankedFeedItem] = []
+    out.reserveCapacity(min(deduped.count, limit))
+    var anyLeft = true
+    while out.count < limit && anyLeft {
+        anyLeft = false
+        for qi in queues.indices where out.count < limit {
+            let taken = out.filter { $0.sourceLabel == queueLabels[qi] }.count
+            if taken >= maxPerSource { continue }
+            if queues[qi].count > taken {
+                out.append(queues[qi][taken])
+                anyLeft = true
+            }
+        }
+    }
+    return out
+}
+
 /// A topic for feed ranking (from the user's journal interests).
 public struct SlowClawTopic {
     public let label: String
