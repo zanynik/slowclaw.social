@@ -343,6 +343,67 @@ final class AudioRecorder: NSObject, ObservableObject {
         return rel.hasPrefix("/") ? String(rel.dropFirst()) : rel
     }
 
+    /// Resolve a stored media_url (e.g. "Recordings/journal_123.m4a") back to
+    /// an absolute file URL under Documents. The inverse of
+    /// documentsRelativePath(for:). Used by the playback UI to play a saved
+    /// recording. Returns nil if the path is empty.
+    static func absoluteURL(forMediaRelativePath rel: String?) -> URL? {
+        guard let rel, !rel.isEmpty else { return nil }
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return docs.appendingPathComponent(rel)
+    }
+
+    /// Decode an audio file and bucket its PCM into ~N RMS levels for a static
+    /// playback waveform. `buckets` defaults to 48 to match WaveformView's bar
+    /// count. Each level is normalized [0..1]. Runs on the calling thread; the
+    /// detail view calls it once on appear via a detached Task.
+    static func extractLevels(from url: URL, buckets: Int = 48) -> [Float] {
+        guard let file = try? AVAudioFile(forReading: url) else { return [] }
+        let format = file.processingFormat
+        let totalFrames = AVAudioFrameCount(file.length)
+        guard totalFrames > 0 else { return [] }
+        let framesPerBucket = max(1, Int(totalFrames) / buckets)
+        let framesPerBuffer = AVAudioFrameCount(min(Int(framesPerBucket), 8192))
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: framesPerBuffer) else {
+            return []
+        }
+
+        var levels: [Float] = []
+        var framesRead: AVAudioFrameCount = 0
+        var sumSq: Float = 0
+        var samplesInBucket: Int = 0
+
+        while framesRead < totalFrames {
+            let remaining = totalFrames - framesRead
+            let toRead = min(framesPerBuffer, remaining)
+            do {
+                try file.read(into: buffer, frameCount: toRead)
+            } catch {
+                break
+            }
+            guard let data = buffer.floatChannelData else { break }
+            let ch = data[0]
+            for i in 0..<Int(toRead) {
+                let s = ch[i]
+                sumSq += s * s
+                samplesInBucket += 1
+                if samplesInBucket >= framesPerBucket {
+                    let rms = sqrt(sumSq / Float(samplesInBucket))
+                    levels.append(min(1, rms * 3.0))
+                    sumSq = 0
+                    samplesInBucket = 0
+                    if levels.count >= buckets { break }
+                }
+            }
+            framesRead += toRead
+            if levels.count >= buckets { break }
+        }
+        // Pad to the requested bucket count so the wave looks symmetric.
+        while levels.count < buckets { levels.append(0.04) }
+        return levels
+    }
+
     /// Normalized [0..1] level from a PCM buffer's RMS. Pure — safe from the
     /// audio-thread tap; the result is published on main.
     private static func rmsLevel(of buffer: AVAudioPCMBuffer) -> Float {

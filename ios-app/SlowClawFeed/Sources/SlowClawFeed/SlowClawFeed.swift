@@ -21,7 +21,7 @@ public enum SlowClawFeedError: Error, Equatable {
 }
 
 /// A stored memory entry.
-public struct SlowClawMemoryEntry: Equatable {
+public struct SlowClawMemoryEntry: Identifiable, Equatable {
     public let id: String
     public let key: String
     public let content: String

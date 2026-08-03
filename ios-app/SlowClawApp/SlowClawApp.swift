@@ -14,6 +14,7 @@
 // All logic runs in the Zig core via the C ABI. Swift is thin presentation.
 
 import SwiftUI
+import AVFoundation
 
 // MARK: - Design System (from the original app's styles.css, with dark mode)
 
@@ -792,14 +793,8 @@ struct AppShell: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             BottomNav(selection: $state.selectedTab, scheme: scheme)
         }
-        // Journal drawer (left-sliding, like the reference app's sidebar).
-        .overlay {
-            if state.selectedTab == .journal {
-                JournalSidebar(scheme: scheme)
-                    .transition(.move(edge: .leading).combined(with: .opacity))
-            }
-        }
-        .animation(.easeOut(duration: 0.25), value: state.journalSidebarOpen)
+        // The Journal tab is now a Voice Memos-style list with the record +
+        // pen buttons at its base; the sidebar drawer is removed.
         .background(DS.bg(scheme).ignoresSafeArea())
         // Voice-memo imports auto-store (transcribe on-device → journal entry),
         // matching the reference app — no review gate. The sidebar shows
@@ -824,39 +819,15 @@ struct TopBar: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            // Journal-only actions: hamburger (open drawer) + new session.
-            if state.selectedTab == .journal {
-                Button {
-                    state.journalSidebarOpen = true
-                } label: {
-                    Image(systemName: "line.3.horizontal")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(DS.muted(scheme))
-                        .frame(width: 34, height: 34)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Journals list")
-            }
-
+            // Journal tab is now a Voice Memos-style list with its own base
+            // record/pen bar; the hamburger drawer and "+" new-entry button are
+            // removed. Other tabs keep their wordmark + theme toggle.
             Text("SlowClaw")
                 .font(DS.topbarFont)
                 .foregroundStyle(DS.ink(scheme))
                 .kerning(-0.4)
 
             Spacer()
-
-            if state.selectedTab == .journal {
-                Button {
-                    state.resetJournalSession()
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(DS.muted(scheme))
-                        .frame(width: 34, height: 34)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("New journal entry")
-            }
 
             Button {
                 themeRaw = (isDark ? AppTheme.light : AppTheme.dark).rawValue
@@ -928,274 +899,480 @@ struct BottomNav: View {
     }
 }
 
-// MARK: - Journal Sidebar (drawer)
-//
-// Mirrors the reference app's Journal drawer (web/src App.tsx
-// `.sidebar-overlay` + `.sidebar`): a flat, WhatsApp-style list of journal
-// entries (title + relative time + preview), a search filter, per-item
-// delete, and tap-to-load-into-editor. Opens via the topbar hamburger;
-// closes on backdrop tap or item selection.
+// MARK: - Journal helpers (shared by the list, detail, and sidebar)
 
-struct JournalSidebar: View {
-    let scheme: ColorScheme
+/// First non-empty line of the entry = its display title.
+func journalTitleOf(_ entry: SlowClawMemoryEntry) -> String {
+    let first = entry.content.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? entry.content
+    return first.trimmingCharacters(in: .whitespaces).isEmpty ? "Untitled" : first.trimmingCharacters(in: .whitespaces)
+}
+
+/// A short single-line preview after the title.
+func journalPreviewOf(_ entry: SlowClawMemoryEntry) -> String {
+    let lines = entry.content.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+    let body = lines.dropFirst().joined(separator: " ")
+    let trimmed = body.trimmingCharacters(in: .whitespaces)
+    return String(trimmed.prefix(60))
+}
+
+/// Coarse relative-time string (now / Nm / Nh / Nd / Nw / Nmo, else MMM d).
+func journalRelativeTime(_ entry: SlowClawMemoryEntry) -> String {
+    let formatter = ISO8601DateFormatter()
+    let date = formatter.date(from: entry.timestamp)
+        ?? Date(timeIntervalSince1970: TimeInterval(entry.id) ?? 0)
+    let secs = max(0, Date().timeIntervalSince(date))
+    if secs < 60 { return "now" }
+    if secs < 3600 { return "\(Int(secs / 60))m" }
+    if secs < 86_400 { return "\(Int(secs / 3600))h" }
+    if secs < 604_800 { return "\(Int(secs / 86_400))d" }
+    if secs < 2_592_000 { return "\(Int(secs / 604_800))w" }
+    if secs < 31_536_000 { return "\(Int(secs / 2_592_000))mo" }
+    let f = DateFormatter()
+    f.locale = Locale.current
+    f.dateFormat = "MMM d"
+    return f.string(from: date)
+}
+
+/// mm:ss for an audio player position/duration.
+func audioClock(_ seconds: TimeInterval) -> String {
+    guard seconds.isFinite, seconds >= 0 else { return "0:00" }
+    let s = Int(seconds)
+    return String(format: "%d:%02d", s / 60, s % 60)
+}
+
+// MARK: - Journal detail (fullscreen player + transcript)
+
+/// Fullscreen detail for a journal entry. For audio recordings: a player with
+/// play / -15 / +15 / scrub / speed, a static waveform, and the transcript
+/// below. For text entries: just the title + body. Title is editable (rename)
+/// via the existing memory.store upsert. Audio is shared via a system share
+/// link.
+struct JournalDetailView: View {
+    let entry: SlowClawMemoryEntry
+    @Environment(\.dismiss) var dismiss
+    @Environment(\.colorScheme) var scheme
     @EnvironmentObject var state: AppState
-    @EnvironmentObject var voiceMemoImporter: VoiceMemoImporter
-    @State private var search = ""
 
-    private var filtered: [SlowClawMemoryEntry] {
-        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !q.isEmpty else { return state.journals }
-        return state.journals.filter { $0.content.lowercased().contains(q) }
+    @State private var player: AVAudioPlayer?
+    @State private var isPlaying = false
+    @State private var progress: Double = 0
+    @State private var speed: Float = 1.0
+    @State private var pollTimer: Timer?
+    @State private var waveformLevels: [Float] = []
+    @State private var editedBody: String
+    @State private var isEditingTitle = false
+    @State private var titleDraft: String
+    @State private var isPolishing = false
+    @State private var showShareSheet = false
+
+    /// Absolute URL of the recording, if this is an audio entry with a file.
+    private var audioURL: URL? {
+        guard entry.source == "audio_recorded" || entry.source == "audio_imported" else { return nil }
+        return AudioRecorder.absoluteURL(forMediaRelativePath: entry.mediaURL)
+    }
+
+    init(entry: SlowClawMemoryEntry) {
+        self.entry = entry
+        _editedBody = State(initialValue: entry.content)
+        _titleDraft = State(initialValue: journalTitleOf(entry))
     }
 
     var body: some View {
-        ZStack(alignment: .leading) {
-            // Backdrop: tap to close.
-            if state.journalSidebarOpen {
-                Color.black.opacity(0.35)
-                    .ignoresSafeArea()
-                    .onTapGesture { state.journalSidebarOpen = false }
-            }
-
-            // Drawer panel.
-            HStack(spacing: 0) {
-                VStack(spacing: 0) {
-                    // Header.
-                    HStack {
-                        Text("Journals")
-                            .font(DS.cardTitleFont)
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 18) {
+                    // ── Title (editable on tap) ──
+                    if isEditingTitle {
+                        TextField("Title", text: $titleDraft)
+                            .font(DS.titleFont)
+                            .textFieldStyle(.plain)
                             .foregroundStyle(DS.ink(scheme))
-                        Spacer()
+                            .padding(.horizontal, 16)
+                            .onSubmit { commitTitle() }
+                    } else {
                         Button {
-                            state.journalSidebarOpen = false
+                            isEditingTitle = true
+                            titleDraft = journalTitleOf(entry)
                         } label: {
-                            Image(systemName: "chevron.left")
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(DS.muted(scheme))
-                                .frame(width: 30, height: 30)
+                            HStack {
+                                Text(journalTitleOf(entry))
+                                    .font(DS.titleFont)
+                                    .foregroundStyle(DS.ink(scheme))
+                                    .multilineTextAlignment(.leading)
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                    }
-                    .padding(.horizontal, 18)
-                    .padding(.top, 12)
-                    .padding(.bottom, 10)
-
-                    // Search field.
-                    HStack(spacing: 6) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 13))
-                            .foregroundStyle(DS.muted(scheme))
-                        TextField("", text: $search, prompt: Text("Search title or content").foregroundColor(DS.muted(scheme)))
-                            .font(DS.bodyFont)
-                            .textFieldStyle(.plain)
-                            .autocorrectionDisabled()
-                            .textInputAutocapitalization(.never)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
-                    .padding(.horizontal, 18)
-
-                    // Count row.
-                    HStack {
-                        Text("\(filtered.count) of \(state.journals.count)")
-                            .font(DS.microFont)
-                            .foregroundStyle(DS.muted(scheme))
-                        Spacer()
-                    }
-                    .padding(.horizontal, 22)
-                    .padding(.top, 8)
-                    .padding(.bottom, 4)
-
-                    // Voice-memo import status (shown while importing or briefly
-                    // after). The share-sheet path is the primary entry; this
-                    // surfaces progress. Mirrors the reference's "Importing
-                    // voice memos…" row.
-                    if let status = voiceMemoImporter.status {
-                        HStack(spacing: 6) {
-                            if voiceMemoImporter.isImporting {
-                                ProgressView().scaleEffect(0.6).frame(width: 12, height: 12)
-                            }
-                            Text(status)
-                                .font(DS.microFont)
-                                .foregroundStyle(DS.muted(scheme))
-                            Spacer()
-                        }
-                        .padding(.horizontal, 22)
-                        .padding(.bottom, 4)
+                        .padding(.horizontal, 16)
                     }
 
-                    // Import hint + shortcut: open Voice Memos, then Share →
-                    // SlowClaw. Tapping tries the system URL scheme; if Voice
-                    // Memos isn't installed the row is still informational.
-                    Button {
-                        if let url = URL(string: "voicememos://") {
-                            UIApplication.shared.open(url)
-                        }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "waveform")
-                                .font(.system(size: 11))
-                            Text("Record in Voice Memos, then Share → SlowClaw.")
-                                .font(DS.microFont)
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 9))
-                                .opacity(0.6)
-                        }
-                        .contentShape(Rectangle())
+                    // ── Audio player (only for audio entries with a file) ──
+                    if let url = audioURL, FileManager.default.fileExists(atPath: url.path) {
+                        playerSection(url: url)
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(DS.muted(scheme))
-                    .padding(.horizontal, 22)
-                    .padding(.bottom, 4)
 
-                    // List.
-                    if state.journals.isEmpty {
-                        Spacer()
-                        VStack(spacing: 6) {
-                            Image(systemName: "book")
-                                .font(.system(size: 28))
-                                .foregroundStyle(DS.muted(scheme))
-                            Text("No journals yet")
-                                .font(DS.captionFont)
-                                .foregroundStyle(DS.muted(scheme))
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.bottom, 80)
-                    } else if filtered.isEmpty {
-                        Spacer()
-                        Text("No journals match your search.")
-                            .font(DS.captionFont)
-                            .foregroundStyle(DS.muted(scheme))
-                            .padding(.bottom, 80)
-                    } else {
-                        ScrollView {
-                            LazyVStack(spacing: 2) {
-                                ForEach(filtered, id: \.id) { entry in
-                                    journalRow(entry)
+                    // ── Body / transcript ──
+                    DS.card(scheme) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text(entry.source?.hasPrefix("audio") == true ? "Transcript" : "Body")
+                                    .font(DS.eyebrowFont)
+                                    .foregroundStyle(DS.muted(scheme))
+                                    .textCase(.uppercase)
+                                Spacer()
+                                if state.llm != nil {
+                                    Button {
+                                        Task { await polish() }
+                                    } label: {
+                                        Label("Polish", systemImage: "sparkles")
+                                            .font(DS.captionFont.weight(.semibold))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .tint(DS.accentColor)
+                                    .disabled(isPolishing)
                                 }
                             }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
+                            TextEditor(text: $editedBody)
+                                .frame(minHeight: 180)
+                                .scrollContentBackground(.hidden)
+                                .font(DS.bodyFont)
+                                .foregroundStyle(DS.ink(scheme))
+                                .onChange(of: editedBody) { scheduleBodyAutosave() }
                         }
                     }
-                    Spacer(minLength: 0)
+                    .padding(.horizontal, 16)
                 }
-                .frame(width: 300)
-                .frame(maxHeight: .infinity)
-                .background(DS.surface(scheme))
-                .overlay(alignment: .trailing) {
-                    Rectangle().fill(DS.line(scheme)).frame(width: 0.5)
-                }
-                .shadow(color: Color.black.opacity(scheme == .dark ? 0.4 : 0.15), radius: 16, x: 2, y: 0)
-
-                // Push the drawer to the leading edge; the rest is backdrop.
-                Spacer(minLength: 0)
+                .padding(.top, 8)
+                .padding(.bottom, 32)
             }
-            .offset(x: state.journalSidebarOpen ? 0 : -320)
+            .background(DS.bg(scheme))
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        player?.stop()
+                        pollTimer?.invalidate()
+                        commitTitle()
+                        commitBody()
+                        dismiss()
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 16, weight: .semibold))
+                    }
+                }
+                if audioURL != nil {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            showShareSheet = true
+                        } label: {
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                    }
+                }
+            }
         }
-        .allowsHitTesting(state.journalSidebarOpen)
+        .onAppear {
+            preparePlayerIfNeeded()
+            extractWaveformIfNeeded()
+        }
+        .onDisappear {
+            pollTimer?.invalidate()
+            player?.stop()
+        }
+        .sheet(isPresented: $showShareSheet) {
+            if let url = audioURL {
+                ShareLink(item: url)
+            }
+        }
     }
+
+    // MARK: - Player section
 
     @ViewBuilder
-    private func journalRow(_ entry: SlowClawMemoryEntry) -> some View {
-        let active = state.selectedJournalKey == entry.key
-        Button {
-            state.selectedJournalKey = entry.key
-            state.journalSidebarOpen = false
-        } label: {
-            HStack(alignment: .top, spacing: 8) {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(titleOf(entry))
-                            .font(DS.bodyFont.weight(.semibold))
-                            .foregroundStyle(DS.ink(scheme))
-                            .lineLimit(1)
-                        Spacer(minLength: 4)
-                        Text(relativeTime(entry))
-                            .font(DS.microFont)
-                            .foregroundStyle(DS.muted(scheme))
-                    }
-                    if !previewOf(entry).isEmpty {
-                        Text(previewOf(entry))
-                            .font(DS.captionFont)
-                            .foregroundStyle(DS.muted(scheme))
-                            .lineLimit(1)
+    private func playerSection(url: URL) -> some View {
+        VStack(spacing: 14) {
+            // Static waveform from the decoded file.
+            WaveformView(samples: waveformLevels, color: DS.accent2Color)
+                .frame(height: 56)
+                .padding(.horizontal, 16)
+
+            // Scrubber.
+            Slider(value: Binding(
+                get: { progress },
+                set: { newValue in
+                    progress = newValue
+                    if let p = player, p.duration > 0 {
+                        p.currentTime = newValue * p.duration
                     }
                 }
-                // Delete → moves to Recently Deleted (30-day soft-delete, like
-                // Voice Memos). Restore is on the Profile screen.
-                Button(role: .destructive) {
-                    state.softDelete(key: entry.key)
-                } label: {
-                    Image(systemName: "trash")
-                        .font(.system(size: 13))
-                        .foregroundStyle(DS.muted(scheme))
-                        .frame(width: 26, height: 26)
+            ), in: 0...1)
+            .tint(DS.accent2Color)
+            .padding(.horizontal, 20)
+
+            // Time labels.
+            HStack {
+                Text(audioClock(player?.currentTime ?? 0))
+                Spacer()
+                Text(audioClock(player?.duration ?? 0))
+            }
+            .font(DS.microFont.monospacedDigit())
+            .foregroundStyle(DS.muted(scheme))
+            .padding(.horizontal, 20)
+
+            // Transport: -15 / play-pause / +15.
+            HStack(spacing: 40) {
+                Button { skip(by: -15) } label: {
+                    Image(systemName: "gobackward.15")
+                        .font(.system(size: 26))
+                        .foregroundStyle(DS.ink(scheme))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Back 15 seconds")
+
+                Button { togglePlayback() } label: {
+                    ZStack {
+                        Circle()
+                            .fill(DS.accent2Color)
+                            .frame(width: 64, height: 64)
+                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 24))
+                            .foregroundStyle(.white)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isPlaying ? "Pause" : "Play")
+
+                Button { skip(by: 15) } label: {
+                    Image(systemName: "goforward.15")
+                        .font(.system(size: 26))
+                        .foregroundStyle(DS.ink(scheme))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Forward 15 seconds")
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(active ? DS.accentDim(scheme) : Color.clear)
-            )
-            .contentShape(Rectangle())
+            .padding(.top, 2)
+
+            // Speed toggle.
+            Button {
+                cycleSpeed()
+            } label: {
+                Text(String(format: "%g×", speed))
+                    .font(DS.captionFont.weight(.semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(DS.surface3(scheme), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .tint(DS.ink(scheme))
         }
-        .buttonStyle(.plain)
+        .padding(.vertical, 16)
+        .background(DS.surface(scheme), in: RoundedRectangle(cornerRadius: DS.rLg, style: .continuous))
+        .padding(.horizontal, 16)
     }
 
-    /// First non-empty line of the entry = its title.
-    private func titleOf(_ entry: SlowClawMemoryEntry) -> String {
-        let first = entry.content.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? entry.content
-        return first.trimmingCharacters(in: .whitespaces).isEmpty ? "Untitled" : first.trimmingCharacters(in: .whitespaces)
+    // MARK: - Player logic
+
+    private func preparePlayerIfNeeded() {
+        guard let url = audioURL, FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try AVAudioSession.sharedInstance().setActive(true)
+            let p = try AVAudioPlayer(contentsOf: url)
+            p.enableRate = true
+            p.rate = speed
+            p.prepareToPlay()
+            player = p
+        } catch {
+            player = nil
+        }
     }
 
-    /// A short single-line preview after the title.
-    private func previewOf(_ entry: SlowClawMemoryEntry) -> String {
+    private func extractWaveformIfNeeded() {
+        guard let url = audioURL, FileManager.default.fileExists(atPath: url.path) else { return }
+        // Decode off the main thread; one-shot on appear.
+        Task.detached(priority: .utility) {
+            let levels = AudioRecorder.extractLevels(from: url)
+            await MainActor.run { waveformLevels = levels }
+        }
+    }
+
+    private func togglePlayback() {
+        guard let p = player else { return }
+        if p.isPlaying {
+            p.pause()
+            isPlaying = false
+            pollTimer?.invalidate()
+        } else {
+            p.rate = speed
+            p.play()
+            isPlaying = true
+            pollTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+                guard let p = player else { return }
+                if p.duration > 0 { progress = p.currentTime / p.duration }
+                if !p.isPlaying {
+                    isPlaying = false
+                    progress = 0
+                    pollTimer?.invalidate()
+                }
+            }
+        }
+    }
+
+    private func skip(by seconds: TimeInterval) {
+        guard let p = player else { return }
+        p.currentTime = max(0, min(p.duration, p.currentTime + seconds))
+        if p.duration > 0 { progress = p.currentTime / p.duration }
+    }
+
+    private func cycleSpeed() {
+        // 1.0 → 1.5 → 2.0 → 0.5 → 1.0
+        switch speed {
+        case 1.0: speed = 1.5
+        case 1.5: speed = 2.0
+        case 2.0: speed = 0.5
+        case 0.5: speed = 1.0
+        default: speed = 1.0
+        }
+        player?.rate = isPlaying ? speed : speed
+    }
+
+    // MARK: - Edit persistence
+
+    @State private var bodyAutosaveTask: Task<Void, Never>?
+
+    private func scheduleBodyAutosave() {
+        bodyAutosaveTask?.cancel()
+        bodyAutosaveTask = Task {
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            if Task.isCancelled { return }
+            await MainActor.run { commitBody() }
+        }
+    }
+
+    private func commitBody() {
+        let trimmed = editedBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        // Preserve source/mediaURL on edit (upsert by key).
+        try? state.memory.store(key: entry.key, content: editedBody, category: entry.category,
+                                sessionID: entry.sessionID, source: entry.source, mediaURL: entry.mediaURL)
+        Task { await state.refreshJournals() }
+    }
+
+    private func commitTitle() {
+        guard isEditingTitle else { return }
+        isEditingTitle = false
+        let newTitle = titleDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newTitle.isEmpty, newTitle != journalTitleOf(entry) else { return }
+        // Rewrite: title becomes the first line, body preserved.
         let lines = entry.content.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-        let body = lines.dropFirst().joined(separator: " ")
-        let trimmed = body.trimmingCharacters(in: .whitespaces)
-        return String(trimmed.prefix(60))
+        let body = lines.dropFirst().joined(separator: "\n")
+        let newContent = body.isEmpty ? newTitle : "\(newTitle)\n\(body)"
+        try? state.memory.store(key: entry.key, content: newContent, category: entry.category,
+                                sessionID: entry.sessionID, source: entry.source, mediaURL: entry.mediaURL)
+        Task { await state.refreshJournals() }
     }
 
-    /// Coarse relative-time string (matches the reference's getRelativeTime
-    /// bucketing: now / Nm / Nh / Nd / Nw / Nmo, else a short date).
-    private func relativeTime(_ entry: SlowClawMemoryEntry) -> String {
-        let formatter = ISO8601DateFormatter()
-        let date = formatter.date(from: entry.timestamp)
-            ?? Date(timeIntervalSince1970: TimeInterval(entry.id) ?? 0)
-        let secs = max(0, Date().timeIntervalSince(date))
-        if secs < 60 { return "now" }
-        if secs < 3600 { return "\(Int(secs / 60))m" }
-        if secs < 86_400 { return "\(Int(secs / 3600))h" }
-        if secs < 604_800 { return "\(Int(secs / 86_400))d" }
-        if secs < 2_592_000 { return "\(Int(secs / 604_800))w" }
-        if secs < 31_536_000 { return "\(Int(secs / 2_592_000))mo" }
-        let f = DateFormatter()
-        f.locale = Locale.current
-        f.dateFormat = "MMM d"
-        return f.string(from: date)
+    private func polish() async {
+        guard let llm = state.llm else { return }
+        isPolishing = true
+        defer { isPolishing = false }
+        let raw = editedBody
+        let model = state.model
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let polished = try? llm.synthesizeJournal(transcript: raw, model: model) {
+                DispatchQueue.main.async { editedBody = polished }
+            }
+        }
     }
 }
 
-// MARK: - Journal View (Capture loop)
+// MARK: - Text compose sheet (pen button)
+
+/// Clean fullscreen compose surface for a text journal. Title + large editor +
+/// Save. No autosave complexity — the user is writing fresh.
+struct TextComposeSheet: View {
+    @Environment(\.dismiss) var dismiss
+    @Environment(\.colorScheme) var scheme
+    @EnvironmentObject var state: AppState
+
+    @State private var title = ""
+    @State private var body = ""
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                TextField("Title (optional)", text: $title)
+                    .font(DS.cardTitleFont)
+                    .textFieldStyle(.plain)
+                    .foregroundStyle(DS.ink(scheme))
+                    .padding(.horizontal, 4)
+
+                DS.card(scheme) {
+                    TextEditor(text: $body)
+                        .frame(minHeight: 240)
+                        .scrollContentBackground(.hidden)
+                        .font(DS.bodyFont)
+                        .foregroundStyle(DS.ink(scheme))
+                        .overlay(alignment: .topLeading) {
+                            if body.isEmpty {
+                                Text("What's on your mind today?")
+                                    .font(DS.bodyFont)
+                                    .foregroundStyle(DS.muted(scheme))
+                                    .padding(.top, 6)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                }
+                Spacer()
+            }
+            .padding(16)
+            .background(DS.bg(scheme))
+            .navigationTitle("New Entry")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        Task { await save() }
+                    }
+                    .disabled(body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+    }
+
+    private func save() async {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !b.isEmpty else { return }
+        let content = t.isEmpty ? b : "\(t)\n\n\(b)"
+        await state.storeJournal(text: content, source: "text", mediaURL: nil)
+        dismiss()
+    }
+}
+
+// MARK: - Journal View (Voice Memos-style list)
 
 struct JournalView: View {
     @Environment(\.colorScheme) var scheme
     @EnvironmentObject var state: AppState
-    @State private var newEntry = ""
-    @State private var isSynthesizing = false
-    // Auto-save (mirrors the reference's 700ms debounce + 60s periodic).
-    @State private var saveStatus: String? = nil
-    @State private var autosaveTask: Task<Void, Never>? = nil
-    @State private var periodicSaveTask: Task<Void, Never>? = nil
+    @EnvironmentObject var voiceMemoImporter: VoiceMemoImporter
 
-    /// First-entry rotating prompts (one per day-of-month), like the reference's
-    /// FIRST_ENTRY_PROMPTS. Shown above an empty editor when no journal exists.
+    // The recorder is owned here so the base record button + the recording
+    // controls + the post-finish TranscriptSheet all share one state machine.
+    @StateObject private var recorder = AudioRecorder()
+
+    @State private var search = ""
+    @State private var selectedDetail: SlowClawMemoryEntry?
+    @State private var showCompose = false
+    @State private var showTranscript = false
+
+    /// First-entry rotating prompts (one per day-of-month). Shown in the empty
+    /// state hero.
     private let firstEntryPrompts = [
         "What made today different?",
         "Something you're figuring out right now…",
@@ -1208,217 +1385,320 @@ struct JournalView: View {
         return firstEntryPrompts[day % firstEntryPrompts.count]
     }
 
+    private var filtered: [SlowClawMemoryEntry] {
+        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return state.journals }
+        return state.journals.filter { $0.content.lowercased().contains(q) }
+    }
+
     var body: some View {
-        ScrollView {
-            VStack(spacing: 16) {
-                // Header: shows whether editing an existing entry or writing new.
-                HStack(alignment: .firstTextBaseline) {
-                    if let sel = state.selectedJournal {
-                        Text(titleOf(sel))
-                            .font(DS.cardTitleFont)
-                            .foregroundStyle(DS.ink(scheme))
-                            .lineLimit(1)
-                    } else {
-                        Text("New entry")
-                            .font(DS.cardTitleFont)
-                            .foregroundStyle(DS.ink(scheme))
-                    }
-                    Spacer()
-                    Text(state.selectedJournal == nil ? "draft" : "editing")
-                        .font(DS.microFont)
-                        .foregroundStyle(DS.muted(scheme))
-                        .textCase(.uppercase)
-                }
-                .padding(.horizontal, 16)
-
-                // Audio capture
-                AudioCaptureView()
-                    .padding(.horizontal, 16)
-
-                // First-entry rotating prompt (italic, like the reference's
-                // .first-entry-prompt) — shown above an empty editor only when
-                // the user has no journals yet.
-                if state.journals.isEmpty && newEntry.isEmpty {
-                    Text(firstEntryPrompt)
-                        .font(DS.captionFont.italic())
-                        .foregroundStyle(DS.muted(scheme))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 20)
-                }
-
-                DS.card(scheme) {
-                    TextEditor(text: $newEntry)
-                        .frame(minHeight: state.journals.isEmpty ? 160 : 100)
-                        .scrollContentBackground(.hidden)
-                        .font(DS.bodyFont)
-                        .foregroundStyle(DS.ink(scheme))
-                        .padding(.vertical, 4)
-                        .overlay(alignment: .topLeading) {
-                            if newEntry.isEmpty {
-                                Text("What's on your mind today?")
-                                    .font(DS.bodyFont)
-                                    .foregroundStyle(DS.muted(scheme))
-                                    .padding(.horizontal, 4)
-                                    .padding(.vertical, 8)
-                                    .allowsHitTesting(false)
-                            }
-                        }
-                }
-                .padding(.horizontal, 16)
-
-                HStack(spacing: 12) {
-                    Button {
-                        Task { await saveEntry() }
-                    } label: {
-                        Label("Save", systemImage: "square.and.arrow.down.fill")
-                            .font(DS.bodyFont.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(DS.accentColor)
-                    .disabled(newEntry.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                    if state.anyLLMAvailable {
-                        Button {
-                            Task { await synthesize() }
-                        } label: {
-                            Label("Polish", systemImage: "sparkles")
-                                .font(DS.bodyFont.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 10)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(DS.accentColor)
-                        .disabled(newEntry.isEmpty || isSynthesizing)
-                    }
-                }
-                .padding(.horizontal, 16)
-
-                // Interest chips
-                if !state.interests.isEmpty {
-                    InterestChipsRow(interests: state.interests)
-                        .padding(.horizontal, 16)
-                }
-
-                // Save status (autosave feedback), mirrors the reference's
-                // journalSaveStatus line.
-                if let status = saveStatus {
-                    Text(status)
-                        .font(DS.microFont)
-                        .foregroundStyle(DS.muted(scheme))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 20)
-                }
-
-                // Hint: the recent-entries list lives in the drawer (hamburger),
-                // matching the reference which keeps the list out of the editor.
-                if !state.journals.isEmpty {
-                    Button {
-                        state.journalSidebarOpen = true
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "line.3.horizontal")
-                                .font(.system(size: 12))
-                            Text("\(state.journals.count) journal\(state.journals.count == 1 ? "" : "s") · open list")
-                                .font(DS.captionFont)
-                        }
-                        .foregroundStyle(DS.muted(scheme))
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, 20)
-                }
+        Group {
+            if recorder.isRecording || recorder.isPaused {
+                // ── Recording zen screen (replaces the list while recording) ──
+                recordingScreen
+            } else if recorder.isTranscribing {
+                transcribingState
+            } else {
+                journalList
             }
-            .padding(.top, 16)
-            .padding(.bottom, 24)
         }
         .background(DS.bg(scheme))
         .task { await state.refreshJournals() }
-        // Load the selected entry into the editor when the selection changes.
-        .onChange(of: state.selectedJournalKey) {
-            newEntry = state.selectedJournal?.content ?? ""
+        // Present the recording transcript review when transcription finishes.
+        .onChange(of: recorder.isTranscribing) { _, now in
+            if !now && recorder.recordedFileURL != nil { showTranscript = true }
         }
-        // Debounced auto-save on edits (700ms, like the reference). Only saves
-        // when there's meaningful content (>=10 chars) and something to persist.
-        .onChange(of: newEntry) {
-            scheduleAutosave()
+        .sheet(isPresented: $showCompose) {
+            TextComposeSheet()
+                .environmentObject(state)
         }
-        .onAppear {
-            // Sync the editor with any pre-existing selection on first show.
-            if newEntry.isEmpty { newEntry = state.selectedJournal?.content ?? "" }
-            startPeriodicSave()
-        }
-        .onDisappear {
-            autosaveTask?.cancel()
-            periodicSaveTask?.cancel()
+        .sheet(isPresented: $showTranscript) {
+            TranscriptSheet(
+                transcript: recorder.transcript.isEmpty
+                    ? "🎙 Audio journal (no transcript)"
+                    : recorder.transcript,
+                audioURL: recorder.recordedFileURL
+            ) { polished in
+                let mediaURL = recorder.recordedFileURL.flatMap(AudioRecorder.documentsRelativePath(for:))
+                let title = recorder.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let body = title.isEmpty ? polished : "\(title)\n\n\(polished)"
+                Task {
+                    await state.storeJournal(text: body, source: "audio_recorded", mediaURL: mediaURL)
+                }
+                recorder.title = ""
+                recorder.transcript = ""
+                recorder.recordedFileURL = nil
+                showTranscript = false
+            }
+            .environmentObject(state)
         }
     }
 
-    /// Schedule a debounced auto-save 700ms after the last edit.
-    private func scheduleAutosave() {
-        autosaveTask?.cancel()
-        autosaveTask = Task {
-            try? await Task.sleep(nanoseconds: 700_000_000)
-            if Task.isCancelled { return }
-            await autosave()
-        }
-    }
+    // MARK: - List
 
-    /// Periodic safety-net save every 60s while the editor is open.
-    private func startPeriodicSave() {
-        periodicSaveTask?.cancel()
-        periodicSaveTask = Task {
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 60_000_000_000)
-                if Task.isCancelled { return }
-                await autosave()
+    private var journalList: some View {
+        VStack(spacing: 0) {
+            // Search + import status (migrated from the sidebar).
+            VStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 13))
+                        .foregroundStyle(DS.muted(scheme))
+                    TextField("", text: $search, prompt: Text("Search journals").foregroundColor(DS.muted(scheme)))
+                        .font(DS.bodyFont)
+                        .textFieldStyle(.plain)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+                .padding(.horizontal, 16)
+
+                if let status = voiceMemoImporter.status {
+                    HStack(spacing: 6) {
+                        if voiceMemoImporter.isImporting {
+                            ProgressView().scaleEffect(0.6).frame(width: 12, height: 12)
+                        }
+                        Text(status)
+                            .font(DS.microFont)
+                            .foregroundStyle(DS.muted(scheme))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 22)
+                }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform").font(.system(size: 11))
+                    Text("Import voice memos via the share sheet → SlowClaw.")
+                        .font(DS.microFont)
+                    Spacer()
+                }
+                .foregroundStyle(DS.muted(scheme))
+                .padding(.horizontal, 22)
+            }
+            .padding(.top, 10)
+
+            // The list.
+            if filtered.isEmpty && search.isEmpty {
+                emptyState
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        if filtered.isEmpty {
+                            Text("No journals match your search.")
+                                .font(DS.captionFont)
+                                .foregroundStyle(DS.muted(scheme))
+                                .padding(.top, 40)
+                        } else {
+                            ForEach(filtered, id: \.key) { entry in
+                                journalRow(entry)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { selectedDetail = entry }
+                                    .contextMenu {
+                                        Button(role: .destructive) {
+                                            state.softDelete(key: entry.key)
+                                        } label: { Label("Delete", systemImage: "trash") }
+                                    }
+                            }
+                        }
+                    }
+                    .padding(.bottom, 120) // clearance for the base bar.
+                }
             }
         }
-    }
-
-    private func autosave() async {
-        let text = newEntry.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard text.count >= 10 else { return } // nothing meaningful yet
-        saveStatus = "Saving…"
-        if let key = state.selectedJournalKey {
-            try? state.memory.store(key: key, content: text, category: "daily", sessionID: nil)
-            await state.refreshJournals()
-        } else {
-            await state.storeJournal(text: text)
-        }
-        saveStatus = "Saved"
-        // Clear the status after 2.5s (matches the reference's holdJournalStatus).
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
-            if saveStatus == "Saved" { saveStatus = nil }
+        .safeAreaInset(edge: .bottom, spacing: 0) { baseBar }
+        // Fullscreen detail.
+        .fullScreenCover(item: $selectedDetail) { entry in
+            JournalDetailView(entry: entry)
+                .environmentObject(state)
         }
     }
 
-    private func titleOf(_ entry: SlowClawMemoryEntry) -> String {
-        let first = entry.content.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? entry.content
-        let t = first.trimmingCharacters(in: .whitespaces)
-        return t.isEmpty ? "Untitled" : t
+    /// One list row: waveform glyph (audio) + title + time + preview.
+    private func journalRow(_ entry: SlowClawMemoryEntry) -> some View {
+        let isAudio = entry.source?.hasPrefix("audio") == true
+        return HStack(alignment: .top, spacing: 12) {
+            // Audio glyph / waveform mini.
+            Image(systemName: isAudio ? "waveform" : "text.alignleft")
+                .font(.system(size: 16))
+                .foregroundStyle(isAudio ? DS.accent2Color : DS.muted(scheme))
+                .frame(width: 24, height: 24)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(journalTitleOf(entry))
+                        .font(DS.bodyFont.weight(.semibold))
+                        .foregroundStyle(DS.ink(scheme))
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(journalRelativeTime(entry))
+                        .font(DS.microFont)
+                        .foregroundStyle(DS.muted(scheme))
+                }
+                let preview = journalPreviewOf(entry)
+                if !preview.isEmpty {
+                    Text(preview)
+                        .font(DS.captionFont)
+                        .foregroundStyle(DS.muted(scheme))
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
     }
 
-    private func saveEntry() async {
-        let text = newEntry.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        // Update the existing entry if one is selected, else create a new one.
-        if let key = state.selectedJournalKey {
-            try? state.memory.store(key: key, content: text, category: "daily", sessionID: nil)
-            await state.refreshJournals()
-        } else {
-            await state.storeJournal(text: text)
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "waveform")
+                .font(.system(size: 36))
+                .foregroundStyle(DS.muted(scheme))
+            Text(firstEntryPrompt)
+                .font(DS.captionFont.italic())
+                .foregroundStyle(DS.muted(scheme))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+            Text("Tap the red button to record, or the pen to write.")
+                .font(DS.microFont)
+                .foregroundStyle(DS.muted(scheme))
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: - Base bar (record + pen, or recording controls)
+
+    private var baseBar: some View {
+        VStack(spacing: 0) {
+            Divider().opacity(0.4)
+            HStack(spacing: 28) {
+                // Pen → text compose.
+                Button {
+                    showCompose = true
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(DS.ink(scheme))
+                        .frame(width: 56, height: 56)
+                        .background(DS.surface3(scheme), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Write a text journal")
+
+                Spacer()
+
+                // Big red record button.
+                Button {
+                    Task {
+                        recorder.title = ""
+                        recorder.transcript = ""
+                        await recorder.startRecording()
+                    }
+                } label: {
+                    ZStack {
+                        Circle()
+                            .fill(DS.accent2Color)
+                            .frame(width: 70, height: 70)
+                            .shadow(color: DS.accent2Color.opacity(0.35), radius: 8, y: 3)
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 26))
+                            .foregroundStyle(.white)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Record an audio journal")
+            }
+            .padding(.horizontal, 36)
+            .padding(.top, 12)
+            .padding(.bottom, 12)
+            .background(.ultraThinMaterial)
         }
     }
 
-    private func synthesize() async {
-        guard state.anyLLMAvailable else { return }
-        isSynthesizing = true
-        defer { isSynthesizing = false }
-        let transcript = newEntry
-        if let polished = try? await state.aiSynthesize(transcript: transcript) {
-            newEntry = polished
+    // MARK: - Recording zen screen
+
+    private var recordingScreen: some View {
+        VStack {
+            Spacer()
+            VStack(spacing: 18) {
+                // Title field.
+                HStack {
+                    TextField("Recording title (optional)", text: $recorder.title)
+                        .font(DS.bodyFont)
+                        .textFieldStyle(.plain)
+                        .foregroundStyle(DS.ink(scheme))
+                    Spacer()
+                    Text(recorder.elapsedLabel)
+                        .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(DS.muted(scheme))
+                }
+                .padding(.horizontal, 24)
+
+                WaveformView(samples: recorder.samples, color: DS.accent2Color)
+                    .frame(height: 72)
+                    .padding(.horizontal, 16)
+
+                Text(recorder.isPaused ? "Paused" : "Recording…")
+                    .font(DS.bodyFont)
+                    .foregroundStyle(DS.ink(scheme))
+
+                HStack(spacing: 28) {
+                    Button {
+                        if recorder.isPaused {
+                            Task { await recorder.resumeRecording() }
+                        } else {
+                            recorder.pauseRecording()
+                        }
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(DS.surface3(scheme))
+                                .frame(width: 58, height: 58)
+                            Image(systemName: recorder.isPaused ? "play.fill" : "pause.fill")
+                                .font(.system(size: 22))
+                                .foregroundStyle(DS.ink(scheme))
+                        }
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        recorder.finishRecording()
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(DS.accent2Color)
+                                .frame(width: 70, height: 70)
+                                .shadow(color: DS.accent2Color.opacity(0.35), radius: 8, y: 3)
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 26))
+                                .foregroundStyle(.white)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if let err = recorder.errorMessage {
+                    Text(err)
+                        .font(DS.captionFont)
+                        .foregroundStyle(DS.accent2Color)
+                        .padding(.horizontal, 24)
+                }
+            }
+            Spacer()
+        }
+    }
+
+    private var transcribingState: some View {
+        VStack(spacing: 10) {
+            Spacer()
+            ProgressView().scaleEffect(0.9)
+            Text("Transcribing…")
+                .font(DS.captionFont)
+                .foregroundStyle(DS.muted(scheme))
+            Spacer()
         }
     }
 }
