@@ -264,13 +264,23 @@ final class AudioRecorder: NSObject, ObservableObject {
         )
 
         // Transcribe the file on-device, off the main actor. The UI shows a
-        // "Transcribing…" state via isTranscribing.
+        // "Transcribing…" state via isTranscribing. First trim leading/trailing
+        // silence so the transcript (and the saved file) start at the first
+        // speech — Voice Memos trims dead air for the same reason.
         guard let url = recordedFileURL else { return }
         isTranscribing = true
         Task {
-            let transcript = await Task.detached(priority: .userInitiated) {
-                await SpeechTranscriber.transcribe(url: url)
+            let transcribeURL = await Task.detached(priority: .userInitiated) {
+                await Self.trimSilence(from: url) ?? url
             }.value
+            let transcript = await Task.detached(priority: .userInitiated) {
+                await SpeechTranscriber.transcribe(url: transcribeURL)
+            }.value
+            // If trimming produced a different file, swap the recorded URL so
+            // the saved/reviewed audio is the trimmed one.
+            if transcribeURL != url {
+                self.recordedFileURL = transcribeURL
+            }
             self.transcript = transcript
             self.isTranscribing = false
         }
@@ -278,6 +288,91 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     /// Legacy alias kept for call sites that mean "end and transcribe."
     @inlinable func stopRecording() { finishRecording() }
+
+    /// Trim leading/trailing silence from a recording. Scans the PCM for the
+    /// first/last frame above a low-RMS threshold, then exports that range to a
+    /// trimmed m4a in the temp dir. Returns nil on any failure (caller falls
+    /// back to the original file — trimming is a nicety, not a requirement).
+    /// Voice Memos does the same: dead air before the first word and after the
+    /// last is cut so the saved file and transcript are tight.
+    static func trimSilence(from url: URL) async -> URL? {
+        guard let file = try? AVAudioFile(forReading: url) else { return nil }
+        let format = file.processingFormat
+        let totalFrames = AVAudioFrameCount(file.length)
+        guard totalFrames > 0 else { return nil }
+        let sampleRate = format.sampleRate
+        guard sampleRate > 0 else { return nil }
+
+        // Read the whole file to scan for speech boundaries. Recordings are
+        // short journals (minutes), so this is bounded.
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: totalFrames) else { return nil }
+        do {
+            try file.read(into: buffer, frameCount: totalFrames)
+        } catch {
+            return nil
+        }
+        guard let data = buffer.floatChannelData else { return nil }
+        let ch = data[0]
+        let frameCount = Int(buffer.frameLength)
+
+        // Silence threshold: RMS below this is "silent". Tuned for typical
+        // mic gain; conservative so we don't clip quiet speech.
+        let silenceRMS: Float = 0.012
+        // Analyze in windows of ~50ms.
+        let window = max(1, Int(0.05 * sampleRate))
+
+        // Find first loud window (leading silence end).
+        var firstFrame = 0
+        outerLead: for start in stride(from: 0, to: frameCount, by: window) {
+            let end = min(start + window, frameCount)
+            var sum: Float = 0
+            for i in start..<end { sum += ch[i] * ch[i] }
+            let rms = sqrt(sum / Float(end - start))
+            if rms > silenceRMS { firstFrame = start; break outerLead }
+        }
+
+        // Find last loud window (trailing silence start).
+        var lastFrame = frameCount
+        outerTrail: for start in stride(from: max(0, frameCount - window), through: 0, by: -window) {
+            let end = min(start + window, frameCount)
+            var sum: Float = 0
+            for i in start..<end { sum += ch[i] * ch[i] }
+            let rms = sqrt(sum / Float(end - start))
+            if rms > silenceRMS { lastFrame = end; break outerTrail }
+        }
+
+        // If nothing to trim (or the whole file is silent), bail.
+        guard lastFrame > firstFrame else { return nil }
+        let trimmedFrames = lastFrame - firstFrame
+        // Only trim if we'd remove >0.5s total (avoid trivial re-encodes).
+        let framesSaved = frameCount - trimmedFrames
+        guard Double(framesSaved) / sampleRate > 0.5 else { return nil }
+
+        let startTime = Double(firstFrame) / sampleRate
+        let duration = Double(trimmedFrames) / sampleRate
+
+        // Export the trimmed range to a fresh m4a.
+        let asset = AVURLAsset(url: url)
+        guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
+            return nil
+        }
+        let startCM = CMTime(seconds: startTime, preferredTimescale: 600)
+        let durCM = CMTime(seconds: duration, preferredTimescale: 600)
+        session.timeRange = CMTimeRange(start: startCM, duration: durCM)
+        let outURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("slowclaw-trimmed-\(UUID().uuidString).m4a")
+        // Remove any stale temp file (export fails if the output exists).
+        try? FileManager.default.removeItem(at: outURL)
+        session.outputURL = outURL
+        session.outputFileType = .m4a
+        // Use the completion-based API (available iOS 4+) rather than the
+        // async `export()` property (iOS 18+), since the deployment target is
+        // iOS 17. Wrap in a continuation.
+        let ok: AVAssetExportSession.Status = await withCheckedContinuation { cont in
+            session.exportAsynchronously { cont.resume(returning: session.status) }
+        }
+        return ok == .completed ? outURL : nil
+    }
 
     // MARK: - Session observers
 
