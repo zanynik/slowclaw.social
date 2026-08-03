@@ -396,9 +396,9 @@ final class AppState: ObservableObject {
     var recentlyDeleted: [SlowClawMemoryEntry] {
         let timestamps = Self.softDeletedKeys()
         var entries: [SlowClawMemoryEntry] = []
-        for (key, ts) in timestamps {
-            if let entry = try? memory.get(key: key), let e = entry {
-                entries.append(e)
+        for key in timestamps.keys {
+            if let entry = try? memory.get(key: key) {
+                entries.append(entry)
             } else {
                 // Row already gone (empty-trash ran, or never existed). Track a
                 // stub so the entry's deletion timestamp still shows for prune.
