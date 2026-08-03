@@ -1298,7 +1298,7 @@ struct TextComposeSheet: View {
     @EnvironmentObject var state: AppState
 
     @State private var title = ""
-    @State private var body = ""
+    @State private var bodyText = ""
 
     var body: some View {
         NavigationStack {
@@ -1310,13 +1310,13 @@ struct TextComposeSheet: View {
                     .padding(.horizontal, 4)
 
                 DS.card(scheme) {
-                    TextEditor(text: $body)
+                    TextEditor(text: $bodyText)
                         .frame(minHeight: 240)
                         .scrollContentBackground(.hidden)
                         .font(DS.bodyFont)
                         .foregroundStyle(DS.ink(scheme))
                         .overlay(alignment: .topLeading) {
-                            if body.isEmpty {
+                            if bodyText.isEmpty {
                                 Text("What's on your mind today?")
                                     .font(DS.bodyFont)
                                     .foregroundStyle(DS.muted(scheme))
@@ -1339,7 +1339,7 @@ struct TextComposeSheet: View {
                     Button("Save") {
                         Task { await save() }
                     }
-                    .disabled(body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
         }
@@ -1347,7 +1347,7 @@ struct TextComposeSheet: View {
 
     private func save() async {
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let b = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !b.isEmpty else { return }
         let content = t.isEmpty ? b : "\(t)\n\n\(b)"
         await state.storeJournal(text: content, source: "text", mediaURL: nil)
