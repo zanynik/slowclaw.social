@@ -1,41 +1,28 @@
 // VoiceMemoImporter.swift — import shared voice memos and transcribe them.
 //
-// Mirrors the reference app's importAndTranscribeVoiceMemos (web/src/App.tsx)
-// + importVoiceMemos (web/src-tauri/src/lib.rs), but in pure Swift: no Tauri,
-// no Rust gateway. When iOS delivers a shared audio file (Voice Memos → Share
-// → "Copy to SlowClaw"), it arrives as a file URL via .onOpenURL on the App.
+// Mirrors the reference app's importAndTranscribeVoiceMemos (web/src/App.tsx):
+// when iOS delivers a shared audio file (Voice Memos → Share → "Copy to
+// SlowClaw"), it arrives as a file URL via .onOpenURL on the App.
 //
 // Flow:
 //   1. enqueue(_:) copies the shared file into Documents/Inbox with a unique
-//      timestamped name (so re-imports don't collide) and appends it to a
-//      single serial queue owned by this importer.
-//   2. A long-lived Task drains the queue one file at a time (newest-first),
-//      transcribing each off the main actor with SFSpeechURLRecognitionRequest,
-//      FORCING on-device recognition (no cloud fallback — see hardening note).
-//   3. Each finished (or failed) import is published via `pendingImport`
-//      (carrying the audio URL + whatever transcript we got); AppShell
-//      presents an edit/preview step (same TranscriptSheet live recordings
-//      use), instead of auto-storing. The file is ALWAYS presented — even
-//      when on-device speech was unavailable — so it's never silently
-//      dropped. Audio never leaves the device.
+//      timestamped name and appends it to a single serial queue.
+//   2. A long-lived Task drains the queue one file at a time, transcribing
+//      each on-device via SpeechTranscriber (which segments long audio to
+//      dodge SFSpeech's ~1-min per-task limit) and AUTO-STORES the result as
+//      a journal entry. No review gate — the user edits from the Journals
+//      list afterward, exactly like the reference app.
+//   3. The audio file is ALWAYS linked via source="audio_imported" + media_url,
+//      even when on-device speech is unavailable (the entry then stores a
+//      placeholder). Nothing copied to the Inbox is ever silently dropped.
 //
-// Hardening (vs. the original auto-store design):
-//   - Serial queue: previously every incoming URL appended to a shared array
-//     AND spawned a fresh Task that transcribed the whole array, so two files
-//     shared in quick succession were double-transcribed and a later task
-//     could clear items an earlier task hadn't processed. Now one Task owns
-//     the queue; enqueue is O(1) and thread-safe via @MainActor isolation.
-//   - On-device speech: `requiresOnDeviceRecognition = true` (was false). If
-//     the locale lacks on-device support, the import surfaces a clear status
-//     instead of silently sending audio to Apple servers. Aligns with the
-//     local-first vision contract and the NSSpeechRecognitionUsageDescription
-//     copy ("on-device speech recognition").
-//   - Edit step: imported transcripts are no longer auto-stored; the caller
-//     decides whether to save (matching the live-recording UX).
+// Audio never leaves the device. Speech recognition is forced on-device.
+//
+// Concurrency: one serial Task owns the queue (earlier versions raced by
+// spawning a Task per incoming URL). @MainActor isolation keeps enqueue/worker
+// coordination thread-safe.
 
 import Foundation
-import AVFoundation
-import Speech
 
 /// One pending import. `url` is the copied-into-Inbox destination (already
 /// on disk, so it survives app backgrounding/crash before transcription).
@@ -44,26 +31,10 @@ struct PendingVoiceMemo: Equatable {
     let queuedAt: Date
 }
 
-/// An imported file awaiting user review: the audio URL (always present) and
-/// whatever transcript we got (may be empty if on-device speech was unavailable
-/// or failed — the user can still save the audio).
-struct PendingImport: Identifiable {
-    let url: URL
-    let transcript: String
-    var id: String { url.path }
-}
-
 @MainActor
 final class VoiceMemoImporter: ObservableObject {
     @Published var isImporting = false
     @Published var status: String? = nil
-
-    /// A finished import awaiting the user's review, or nil. Carries the audio
-    /// URL + transcript so even a failed transcription (empty transcript) can
-    /// be saved as an audio journal — the file was already copied to the Inbox
-    /// and must not be silently dropped. The App observes this and presents
-    /// TranscriptSheet. Set back to nil after the sheet saves/cancels.
-    @Published var pendingImport: PendingImport? = nil
 
     private var queue: [PendingVoiceMemo] = []
     private var worker: Task<Void, Never>? = nil
@@ -77,9 +48,9 @@ final class VoiceMemoImporter: ObservableObject {
     }
 
     /// Copy a shared audio file URL into the workspace Inbox and enqueue it
-    /// for transcription. Returns the destination URL, or nil if the source
-    /// isn't an audio file / copy fails. Safe to call repeatedly; each call
-    /// appends one item and ensures the single serial worker is running.
+    /// for transcription + auto-store. Returns the destination URL, or nil if
+    /// the source isn't an audio file / copy fails. Safe to call repeatedly;
+    /// each call appends one item and ensures the single serial worker runs.
     @discardableResult
     func enqueue(_ sourceURL: URL) -> URL? {
         guard let dest = copyAudio(sourceURL) else { return nil }
@@ -113,7 +84,10 @@ final class VoiceMemoImporter: ObservableObject {
     }
 
     /// Lazily start the single serial worker if it isn't already running.
-    /// The worker drains `queue` newest-first, one file at a time, until empty.
+    /// The worker drains `queue` newest-first, one file at a time, transcribing
+    /// each on-device (via SpeechTranscriber, which segments long audio to dodge
+    /// SFSpeech's ~1-min limit) and auto-storing the result as a journal —
+    /// matching the reference app (no review gate).
     private func ensureWorker() {
         guard worker == nil else { return }
         worker = Task { @MainActor in
@@ -127,64 +101,32 @@ final class VoiceMemoImporter: ObservableObject {
                 let remaining = queue.count
                 status = remaining == 0 ? "Transcribing…" : "Transcribing, \(remaining) more queued"
 
-                let transcript = await transcribeFile(next.url) ?? ""
-                // ALWAYS present the file for review, even with an empty
-                // transcript (on-device speech may be unavailable). The file
-                // was copied to the Inbox and must not be silently dropped —
-                // the user decides whether to save it as an audio journal.
-                pendingImport = PendingImport(url: next.url, transcript: transcript)
-                // Wait for the UI to consume this one before pulling the
-                // next file, so sheets don't stack / overwrite each other.
-                while pendingImport != nil && !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 200_000_000)
-                }
+                // Transcribe off the main actor (segmenting + recognition is
+                // blocking). SpeechTranscriber returns "" if on-device speech
+                // is unavailable for the locale.
+                let url = next.url
+                let transcript = await Task.detached(priority: .userInitiated) {
+                    await SpeechTranscriber.transcribe(url: url)
+                }.value
+
+                // Auto-store: the file is on disk and must become a journal
+                // entry regardless of whether speech produced text. The user
+                // edits from the Journals list afterward (like the reference).
+                let content = transcript.isEmpty ? "🎙 Imported audio" : transcript
+                let mediaURL = Self.documentsRelativePath(for: next.url)
+                let key = "journal_\(Int(Date().timeIntervalSince1970))_vm"
+                try? appState?.memory.store(key: key, content: content, category: "daily",
+                                            sessionID: nil, source: "audio_imported", mediaURL: mediaURL)
+                await appState?.refreshJournals()
             }
             status = nil
             isImporting = false
         }
     }
 
-    /// Transcribe one audio file via SFSpeechURLRecognitionRequest, forcing
-    /// on-device recognition. Returns the full transcript, or nil.
-    private func transcribeFile(_ url: URL) async -> String? {
-        let recognizer = SFSpeechRecognizer(locale: Locale.current)
-        guard let recognizer = recognizer, recognizer.isAvailable else {
-            status = "Speech recognition unavailable."
-            return nil
-        }
-        // On-device gate: refuse to fall back to cloud (local-first).
-        // supportsOnDeviceRecognition is an instance property — query the
-        // recognizer we already constructed (not the type).
-        if #available(iOS 13, *), !recognizer.supportsOnDeviceRecognition {
-            status = "On-device speech not downloaded for this language. Add it in Settings → Accessibility → Spoken Content."
-            return nil
-        }
-
-        return await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
-            let request = SFSpeechURLRecognitionRequest(url: url)
-            request.shouldReportPartialResults = false
-            if #available(iOS 13, *) { request.requiresOnDeviceRecognition = true }
-            request.taskHint = .dictation
-            let task = recognizer.recognitionTask(with: request) { result, error in
-                if let error = error {
-                    cont.resume(returning: nil)
-                    return
-                }
-                if let result = result, result.isFinal {
-                    cont.resume(returning: result.bestTranscription.formattedString)
-                } else if result == nil {
-                    cont.resume(returning: nil)
-                }
-            }
-            // Fallback timeout: long audio files can take a while, but never hang.
-            DispatchQueue.global().asyncAfter(deadline: .now() + 120) {
-                if task.state != .completed && task.state != .canceling {
-                    task.cancel()
-                    cont.resume(returning: nil)
-                }
-            }
-        }
-    }
+    /// Weak ref to AppState so the worker can store journals without retaining
+    /// it. Set by the App when wiring up the importer.
+    weak var appState: AppState?
 
     private func isAudioFile(_ url: URL) -> Bool {
         // Keep in sync with Info.plist LSItemContentTypes. mp4 audio (e.g.
@@ -202,5 +144,18 @@ final class VoiceMemoImporter: ObservableObject {
             else { out.append("-") }
         }
         return out.isEmpty ? "voice-memo" : out
+    }
+
+    /// Documents-relative path for an imported file, suitable for the journal
+    /// media_url column (e.g. "Inbox/123-name.m4a").
+    static func documentsRelativePath(for url: URL) -> String? {
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let docsPath = docs.standardizedFileURL.path
+        let urlPath = url.standardizedFileURL.path
+        guard urlPath.hasPrefix(docsPath) else { return nil }
+        let rel = String(urlPath.dropFirst(docsPath.count))
+        return rel.hasPrefix("/") ? String(rel.dropFirst()) : rel
     }
 }

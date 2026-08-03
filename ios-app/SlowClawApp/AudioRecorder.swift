@@ -1,85 +1,47 @@
 // AudioRecorder.swift — audio-first journal capture.
 //
-// A trustworthy recorder modeled on Apple's Voice Memos: audio is written to
-// a durable m4a file incrementally (so it survives crashes, interruptions,
-// and screen lock), AND live-transcribed on-device via SFSpeechRecognizer so
-// the user sees the text appear as they speak.
+// Records a durable m4a to disk, then transcribes the whole file after stop.
+// This matches the proven reference (web/src App.tsx + SpeechTranscriber.swift):
+// record-then-transcribe, NOT live transcription. Live streaming SFSpeech past
+// ~1 minute is unreliable on iOS < 26; segmenting the file post-stop is the
+// robust path (see SpeechTranscriber.swift).
 //
-// Design notes (see the "bring Voice-Memos-level trust" plan):
-//   - The mic is owned by ONE AVAudioEngine. Its input tap does two jobs per
-//     PCM buffer: (a) write to an AVAudioFile (the durable m4a on disk) and
-//     (b) append to the SFSpeechAudioBufferRecognitionRequest (live text).
-//     This is the only supported way to record + transcribe simultaneously —
-//     AVAudioRecorder + AVAudioEngine on the same session conflict and the
-//     recorder silently stops writing.
-//   - SFSpeechRecognizer caps each recognitionTask at ~1 minute of audio.
-//     When the task finishes (no error), we restart it and carry forward the
-//     accumulated transcript, so long recordings don't lose text or freeze.
-//   - Interruption (call/Siri), route change (AirPods unplug), and
-//     mediaServicesWereReset are observed so the recording stops cleanly
-//     instead of silently dying with isRecording stuck true. The partial
-//     file written so far is already on disk and safe.
-//   - Speech recognition is forced on-device (requiresOnDeviceRecognition =
-//     true); audio never leaves the phone. Matches the hardened importer.
+// Flow:
+//   startRecording → engine tap writes PCM to AVAudioFile (m4a on disk)
+//   stopRecording  → finalize file → SpeechTranscriber.transcribe(url)
+//   TranscriptSheet shows the transcript + audio preview, user saves.
+//
+// Audio never leaves the device. On-device speech only.
 
 import SwiftUI
 import AVFoundation
 import Speech
 
-/// Nonisolated holder for the mutable audio-pipe state that is touched from
-/// BOTH the main actor (start/stop) and the AVAudioEngine input-node tap
-/// closure (which runs on an audio thread). The tap writes PCM buffers to
-/// `audioFile` and appends them to `speechRequest`; start/stop open/close
-/// those objects. Because `AudioRecorder` is `@MainActor`, these ivars can't
-/// live on it directly without a concurrency violation — this class gives the
-/// tap closure a shared, nonisolated handle. AVAudioEngine serializes tap
-/// callbacks, and start/stop run on main before/after the tap's lifetime, so
-/// the two sides never mutate the same field concurrently.
-final class AudioPipeState: @unchecked Sendable {
-    var audioFile: AVAudioFile?
-    var speechRequest: SFSpeechAudioBufferRecognitionRequest?
-    /// Last level-publish timestamp (uptime nanoseconds); used to throttle
-    /// meter updates from the audio-thread tap to ~10 Hz.
-    var lastLevelTs: UInt64 = 0
-}
-
-/// Audio recording + live transcription view model.
+/// Audio recording view model. Records to a file, then transcribes after stop.
 @MainActor
 final class AudioRecorder: NSObject, ObservableObject {
     @Published var isRecording = false
+    @Published var isTranscribing = false
     @Published var transcript = ""
     @Published var audioLevel: Float = 0
     @Published var errorMessage: String?
     @Published var elapsedSeconds: Int = 0
 
-    /// The on-disk m4a URL of the most recent recording, or nil if no file
-    /// was produced. The caller stores the journal with source="audio_recorded"
-    /// and media_url set to this path's Documents-relative form.
+    /// The on-disk m4a URL of the most recent recording. The caller stores the
+    /// journal with source="audio_recorded" and media_url = its Documents-
+    /// relative path. Reset to nil after the journal is saved.
     @Published var recordedFileURL: URL?
 
-    // Engine-owned state (single mic source for record + transcribe).
+    // Engine-owned state (single mic source for the file write).
     private let audioEngine = AVAudioEngine()
-    private var tapFormat: AVAudioFormat?
-
-    // Live-transcription state.
-    private var speechRecognizer: SFSpeechRecognizer?
-    private var speechTask: SFSpeechRecognitionTask?
-    /// True iff the inputNode tap was installed. Tracked so stopRecording
-    /// only removes it when present (removeTap on an un-tapped node errors).
-    private var tapInstalled = false
-    /// Carried-forward text from prior recognitionTask segments (the engine
-    /// restarts the task each ~1 min to dodge SFSpeech's per-task limit).
-    private var committedTranscript = ""
-
     private var timer: Timer?
+    /// True iff the inputNode tap was installed. Tracked so stopRecording only
+    /// removes it when present (removeTap on an un-tapped node errors).
+    private var tapInstalled = false
 
     /// Mutable state shared between the main actor (start/stop) and the
-    /// audio-thread tap closure (which writes buffers + feeds speech). These
-    /// can't live on the @MainActor-isolated self because the tap runs off the
-    /// main actor; a small nonisolated reference holder gives both sides safe
-    /// access. The engine serializes tap callbacks, and start/stop happen on
-    /// main before/after the tap's lifetime, so the two never race on the same
-    /// field at the same time.
+    /// audio-thread tap closure (which writes buffers). These can't live on
+    /// @MainActor-isolated self because the tap runs off the main actor.
     private let shared = AudioPipeState()
 
     /// Where recordings live, as a Documents-relative string. Stored in the
@@ -88,8 +50,6 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        speechRecognizer = SFSpeechRecognizer(locale: Locale.current)
-        speechRecognizer?.defaultTaskHint = .dictation
         registerSessionObservers()
     }
 
@@ -97,13 +57,12 @@ final class AudioRecorder: NSObject, ObservableObject {
         NotificationCenter.default.removeObserver(self)
     }
 
-    /// Formatted mm:ss for the recording timer (matches the reference's capture-zen-timer).
+    /// Formatted mm:ss for the recording timer.
     var elapsedLabel: String {
         String(format: "%d:%02d", elapsedSeconds / 60, elapsedSeconds % 60)
     }
 
     func requestPermissions() async -> Bool {
-        // Request microphone + speech recognition permissions.
         let micGranted = await AVAudioApplication.requestRecordPermission()
         let speechGranted = await withCheckedContinuation { continuation in
             SFSpeechRecognizer.requestAuthorization { status in
@@ -121,7 +80,6 @@ final class AudioRecorder: NSObject, ObservableObject {
 
         // Reset state from any prior session.
         transcript = ""
-        committedTranscript = ""
         errorMessage = nil
         recordedFileURL = nil
         audioLevel = 0
@@ -129,34 +87,25 @@ final class AudioRecorder: NSObject, ObservableObject {
 
         do {
             let session = AVAudioSession.sharedInstance()
-            // .playAndRecord (not .record) so the session survives backgrounding
-            // with the audio background mode and lets us play back later.
-            // .defaultToSpeaker avoids the earpiece; .allowBluetooth covers AirPods.
+            // .playAndRecord survives backgrounding with the audio background
+            // mode and lets us play back later. .defaultToSpeaker avoids the
+            // earpiece; .allowBluetooth covers AirPods.
             try session.setCategory(.playAndRecord,
                                     mode: .default,
                                     options: [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
 
-            // ── Single mic source: the engine owns the input ───────────────
-            // The tap writes each buffer to the durable file AND appends to the
-            // speech request. AVAudioRecorder cannot share the session with the
-            // engine; using both was why the file silently went missing.
             let key = "journal_\(Int(Date().timeIntervalSince1970))"
             let destDir = Self.recordingsDirectory()
             try? FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
             let destURL = destDir.appendingPathComponent("\(key).m4a")
 
             let inputNode = audioEngine.inputNode
-            // Use the hardware input format so both the file write and the
-            // speech request see the same PCM layout.
             let format = inputNode.outputFormat(forBus: 0)
-            tapFormat = format
 
             // Open the file BEFORE installing the tap so the first buffer is
             // captured. AVAudioFile(forWriting:settings:) derives the channel
-            // layout from AVNumberOfChannelsKey, so we don't need to pass an
-            // explicit AVChannelLayoutKey (which would require packing a C
-            // AudioChannelLayout into NSData). Writing AAC into an .m4a keeps
+            // layout from AVNumberOfChannelsKey. Writing AAC into an .m4a keeps
             // the file small and playable everywhere.
             let fileSettings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -168,23 +117,17 @@ final class AudioRecorder: NSObject, ObservableObject {
             recordedFileURL = destURL
 
             // Capture `shared` strongly so the audio-thread tap doesn't depend
-            // on `self` (which is @MainActor-isolated). The tap writes the
-            // buffer to the file and feeds the speech request via this holder.
+            // on @MainActor-isolated self. The tap writes the buffer to the file.
             let pipe = shared
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-                // (a) durable write — the trust foundation. Write from the
-                // audio thread is fine; AVAudioFile is designed for this.
                 do {
                     try pipe.audioFile?.write(from: buffer)
                 } catch {
-                    // Swallow per-buffer write errors; the recording continues
-                    // and the user still gets the transcript. A gap in the file
-                    // is preferable to losing the whole journal.
+                    // Swallow per-buffer write errors; a gap beats losing the
+                    // whole journal.
                 }
-                // (b) live transcript.
-                pipe.speechRequest?.append(buffer)
-                // (c) level meter: compute RMS (pure) and throttle the main-
-                // actor publish to ~10 Hz via the shared holder's timestamp.
+                // Level meter: compute RMS (pure) and throttle the main-actor
+                // publish to ~10 Hz via the shared holder's timestamp.
                 let now = DispatchTime.now().uptimeNanoseconds
                 if now &- pipe.lastLevelTs > 100_000_000 {
                     pipe.lastLevelTs = now
@@ -199,106 +142,26 @@ final class AudioRecorder: NSObject, ObservableObject {
             audioEngine.prepare()
             try audioEngine.start()
 
-            // ── Live transcript (on-device) ────────────────────────────────
-            // Always attempt the live transcript; if on-device isn't available
-            // we still record the file (trust > live UX). supportsOnDevice-
-            // Recognition is an instance property — query the recognizer.
-            startSpeechTask()
-
             isRecording = true
             elapsedSeconds = 0
             timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 Task { @MainActor in
-                    guard let self else { return }
-                    self.elapsedSeconds += 1
+                    self?.elapsedSeconds += 1
                 }
             }
         } catch {
             errorMessage = "Failed to start recording: \(error.localizedDescription)"
-            // Clean up any half-started state so isRecording stays honest.
             stopRecording()
         }
     }
 
-    /// Build/restart the SFSpeech recognition task. Called once at start and
-    /// again whenever the prior task finishes (Apple caps each task at ~1 min;
-    /// we carry `committedTranscript` forward so nothing is lost).
-    private func startSpeechTask() {
-        guard let recognizer = speechRecognizer, recognizer.isAvailable else { return }
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        if recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
-        // Publish on the shared holder so the audio-thread tap can append
-        // buffers to it (the tap runs off the main actor).
-        shared.speechRequest = request
-        speechTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            Task { @MainActor in
-                guard let self else { return }
-                if let result = result {
-                    // Prepend the committed (prior-task) text so the live
-                    // display shows the full running transcript, not just the
-                    // current ~1-min segment.
-                    let segment = result.bestTranscription.formattedString
-                    self.transcript = self.committedTranscript.isEmpty
-                        ? segment
-                        : "\(self.committedTranscript) \(segment)"
-                }
-                if error != nil {
-                    // Hard error (e.g. not authorized). Stop only the speech
-                    // path; the durable recording must keep writing.
-                    self.speechTask?.cancel()
-                    self.speechTask = nil
-                    return
-                }
-                if result?.isFinal == true || (result == nil && error == nil) {
-                    // The task ended cleanly (the ~1-min limit fires this path
-                    // on iOS). Commit the final segment of this task and start
-                    // a fresh one so recognition continues for long journals.
-                    if let r = result, r.isFinal {
-                        let seg = r.bestTranscription.formattedString
-                        self.committedTranscript = self.committedTranscript.isEmpty
-                            ? seg
-                            : "\(self.committedTranscript) \(seg)"
-                    }
-                    self.speechTask?.cancel()
-                    self.shared.speechRequest = nil
-                    self.speechTask = nil
-                    if self.isRecording {
-                        self.startSpeechTask()
-                    }
-                }
-            }
-        }
-    }
-
-    /// Compute a normalized [0..1] level from a PCM buffer's RMS. Pure — safe
-    /// to call from the audio-thread tap; the result is published on main.
-    private static func rmsLevel(of buffer: AVAudioPCMBuffer) -> Float {
-        guard let data = buffer.floatChannelData else { return 0 }
-        let frames = Int(buffer.frameLength)
-        guard frames > 0 else { return 0 }
-        let ch = data[0]
-        var sum: Float = 0
-        for i in 0..<frames {
-            let s = ch[i]
-            sum += s * s
-        }
-        let rms = sqrt(sum / Float(frames)) // [0..1] for float PCM
-        // Perceptual scaling so quiet speech still moves the meter.
-        return max(0, min(1, rms * 3.0))
-    }
-
+    /// Stop the recording and transcribe the file on-device. Sets `transcript`
+    /// and `recordedFileURL`; the caller presents the review sheet when
+    /// `isTranscribing` returns to false.
     func stopRecording() {
+        guard isRecording else { return }
         timer?.invalidate()
         timer = nil
-
-        // Tear down the speech path first (stop appending buffers).
-        speechTask?.cancel()
-        shared.speechRequest?.endAudio()
-        shared.speechRequest = nil
-        speechTask = nil
 
         // Stop the engine + remove the tap (no more buffer writes).
         audioEngine.stop()
@@ -306,23 +169,31 @@ final class AudioRecorder: NSObject, ObservableObject {
             audioEngine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
         }
-
         // Finalize the file. Dropping the AVAudioFile reference flushes +
         // closes the m4a.
         shared.audioFile = nil
-        tapFormat = nil
 
         isRecording = false
         audioLevel = 0
 
-        // Deactivate audio session (let other apps resume). Only when we're
-        // truly done — defer deactivation so background audio isn't cut.
         try? AVAudioSession.sharedInstance().setActive(
             false, options: .notifyOthersOnDeactivation
         )
+
+        // Transcribe the file on-device, off the main actor. The UI shows a
+        // "Transcribing…" state via isTranscribing.
+        guard let url = recordedFileURL else { return }
+        isTranscribing = true
+        Task {
+            let transcript = await Task.detached(priority: .userInitiated) {
+                await SpeechTranscriber.transcribe(url: url)
+            }.value
+            self.transcript = transcript
+            self.isTranscribing = false
+        }
     }
 
-    // MARK: - Session observers (interruptions, route changes, media reset)
+    // MARK: - Session observers
 
     private func registerSessionObservers() {
         let nc = NotificationCenter.default
@@ -334,40 +205,25 @@ final class AudioRecorder: NSObject, ObservableObject {
                        name: AVAudioSession.mediaServicesWereResetNotification, object: nil)
     }
 
-    /// An interruption (incoming call, Siri) pauses or stops the recording.
-    /// The file written so far is already on disk and safe; we just stop
-    /// cleanly so isRecording never lies.
     @objc private func handleInterruption(_ note: Notification) {
         guard let info = note.userInfo,
               let typeRaw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
-        switch type {
-        case .began:
-            // Another app took audio. Stop recording to keep state honest;
-            // the partial m4a is already on disk.
-            if isRecording { stopRecording() }
-        case .ended:
-            // Voice Memos also stops on call interruption; we don't auto-resume.
-            break
-        @unknown default:
-            break
+        if type == .began, isRecording {
+            // Another app took audio. Stop recording; the partial file is on disk.
+            stopRecording()
         }
     }
 
-    /// Route changes (headset unplug, Bluetooth disconnect). A device-removal
-    /// while recording would leave the input dangling; stop cleanly so the
-    /// file is finalized with whatever was captured.
     @objc private func handleRouteChange(_ note: Notification) {
         guard let info = note.userInfo,
               let reasonRaw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
               let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw) else { return }
-        if reason == .oldDeviceUnavailable {
-            if isRecording { stopRecording() }
+        if reason == .oldDeviceUnavailable, isRecording {
+            stopRecording()
         }
     }
 
-    /// Media services reset is rare (e.g. device watchdog). Re-init would be
-    /// invasive; stop cleanly so the user can restart intentionally.
     @objc private func handleMediaServicesReset(_ note: Notification) {
         if isRecording { stopRecording() }
         errorMessage = "Audio system reset. Please start the recording again."
@@ -382,9 +238,8 @@ final class AudioRecorder: NSObject, ObservableObject {
         return docs.appendingPathComponent(recordingsDirName, isDirectory: true)
     }
 
-    /// Documents-relative path string for a recording URL, suitable for the
-    /// `media_url` journal column (e.g. "Recordings/journal_1234.m4a"). Returns
-    /// nil if the URL isn't under Documents.
+    /// Documents-relative path for a recording URL, suitable for the journal
+    /// media_url column. Returns nil if the URL isn't under Documents.
     static func documentsRelativePath(for url: URL) -> String? {
         guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
             return nil
@@ -392,14 +247,42 @@ final class AudioRecorder: NSObject, ObservableObject {
         let docsPath = docs.standardizedFileURL.path
         let urlPath = url.standardizedFileURL.path
         guard urlPath.hasPrefix(docsPath) else { return nil }
-        // Drop the docs prefix + the leading slash.
         let rel = String(urlPath.dropFirst(docsPath.count))
         return rel.hasPrefix("/") ? String(rel.dropFirst()) : rel
     }
+
+    /// Normalized [0..1] level from a PCM buffer's RMS. Pure — safe from the
+    /// audio-thread tap; the result is published on main.
+    private static func rmsLevel(of buffer: AVAudioPCMBuffer) -> Float {
+        guard let data = buffer.floatChannelData else { return 0 }
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return 0 }
+        let ch = data[0]
+        var sum: Float = 0
+        for i in 0..<frames {
+            let s = ch[i]
+            sum += s * s
+        }
+        let rms = sqrt(sum / Float(frames))
+        return max(0, min(1, rms * 3.0))
+    }
 }
 
-/// Audio recording UI — a record button + live transcript display.
-/// Designed to be embedded in the Journal tab.
+/// Nonisolated holder for the mutable audio-pipe state shared between the main
+/// actor (start/stop) and the AVAudioEngine tap closure (audio thread). The
+/// engine serializes tap callbacks, and start/stop run on main before/after
+/// the tap's lifetime, so the two sides never mutate the same field concurrently.
+final class AudioPipeState: @unchecked Sendable {
+    var audioFile: AVAudioFile?
+    /// Last level-publish timestamp (uptime nanoseconds); throttles meter
+    /// updates from the audio-thread tap to ~10 Hz.
+    var lastLevelTs: UInt64 = 0
+}
+
+// MARK: - Capture UI
+
+/// Audio recording UI — record button, recording state, transcribing state.
+/// Embedded in the Journal tab.
 struct AudioCaptureView: View {
     @StateObject var recorder = AudioRecorder()
     @EnvironmentObject var state: AppState
@@ -409,9 +292,19 @@ struct AudioCaptureView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            if recorder.isRecording {
-                // ── Recording zen screen (mirrors the reference's .capture-zen) ──
-                // Top row: timer (right) so the user can see how long they've recorded.
+            if recorder.isTranscribing {
+                // ── Transcribing: the file is recorded, speech is running ──
+                VStack(spacing: 10) {
+                    ProgressView()
+                        .scaleEffect(0.9)
+                    Text("Transcribing…")
+                        .font(DS.captionFont)
+                        .foregroundStyle(DS.muted(scheme))
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 40)
+            } else if recorder.isRecording {
+                // ── Recording zen screen ──
                 HStack {
                     Spacer()
                     Text(recorder.elapsedLabel)
@@ -419,27 +312,26 @@ struct AudioCaptureView: View {
                         .foregroundStyle(DS.muted(scheme))
                 }
 
-                // Capture stage: bordered rounded panel (like .capture-stage).
                 VStack(spacing: 12) {
                     Text("Audio capture")
                         .font(DS.captionFont)
                         .foregroundStyle(DS.muted(scheme))
 
-                    // Live transcript — the focus while recording.
-                    ScrollView {
-                        Text(recorder.transcript.isEmpty ? "Listening…" : recorder.transcript)
+                    // Level meter bar — the focus while recording (no live text).
+                    VStack(spacing: 8) {
+                        RoundedRectangle(cornerRadius: 3, style: .continuous)
+                            .fill(DS.accent2Color.opacity(0.85))
+                            .frame(width: max(8, CGFloat(recorder.audioLevel) * 220), height: 8)
+                            .animation(.easeOut(duration: 0.06), value: recorder.audioLevel)
+                        Text("Recording…")
                             .font(DS.bodyFont)
-                            .foregroundStyle(recorder.transcript.isEmpty ? DS.muted(scheme) : DS.ink(scheme))
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .foregroundStyle(DS.ink(scheme))
                     }
-                    .frame(maxWidth: .infinity, maxHeight: 170)
-                    .padding(12)
-                    .background(DS.surface3(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+                    .frame(maxWidth: .infinity, minHeight: 150)
 
-                    // Pulsing "Listening" feedback row.
                     HStack(spacing: 8) {
                         Circle()
-                            .fill(DS.accent(scheme))
+                            .fill(DS.accent2Color)
                             .frame(width: 8, height: 8)
                             .opacity(0.85)
                         Text("Listening")
@@ -454,10 +346,11 @@ struct AudioCaptureView: View {
                         .stroke(DS.line(scheme), lineWidth: 1)
                 )
 
-                // Pulsing coral record button → Stop & Save.
+                // Pulsing coral stop button → Stop & Save.
                 Button {
                     recorder.stopRecording()
-                    showTranscript = true
+                    // Present the sheet once transcription finishes. Use a
+                    // small delay + observe isTranscribing via onChange.
                 } label: {
                     ZStack {
                         Circle()
@@ -465,9 +358,7 @@ struct AudioCaptureView: View {
                                                   startPoint: .topLeading, endPoint: .bottomTrailing))
                             .frame(width: 76, height: 76)
                             .shadow(color: DS.accent2Color.opacity(0.4), radius: 12, y: 4)
-                            .scaleEffect(1.0)
                             .overlay {
-                                // Pulsing ring (mirrors recording-pulse).
                                 Circle()
                                     .stroke(DS.accent2Color.opacity(0.5), lineWidth: 2)
                                     .scaleEffect(pulse ? 1.5 : 1.0)
@@ -480,13 +371,13 @@ struct AudioCaptureView: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Stop and save")
+                .accessibilityLabel("Stop and transcribe")
 
-                Text("Stop & Save")
+                Text("Stop & Transcribe")
                     .font(DS.captionFont)
                     .foregroundStyle(DS.muted(scheme))
             } else {
-                // ── Idle: round green record button (mirrors .record-btn.audio) ──
+                // ── Idle: round green record button ──
                 Button {
                     Task {
                         recorder.transcript = ""
@@ -520,16 +411,30 @@ struct AudioCaptureView: View {
         }
         .onAppear { pulse = true }
         .onDisappear { pulse = false }
+        // When transcription finishes, present the review sheet with the
+        // transcript + audio preview.
+        .onChange(of: recorder.isTranscribing) { _, nowTranscribing in
+            if !nowTranscribing && recorder.recordedFileURL != nil {
+                showTranscript = true
+            }
+        }
+        // Also present immediately if there's a recorded file but transcription
+        // never started (e.g. on-device speech unavailable edge case).
+        .onChange(of: recorder.isRecording) { _, nowRecording in
+            if !nowRecording && !recorder.isTranscribing && recorder.recordedFileURL != nil {
+                showTranscript = true
+            }
+        }
         .sheet(isPresented: $showTranscript) {
-            // If live transcription wasn't available (unsupported locale) or
-            // produced nothing, seed the sheet with a placeholder so the user
-            // can still save the recording — the audio file is linked via
-            // media_url regardless of text content.
-            TranscriptSheet(transcript: recorder.transcript.isEmpty
-                ? "🎙 Audio journal (no transcript)"
-                : recorder.transcript) { polished in
-                // Link the journal to its durable audio file via the
-                // provenance columns added in Phase 2a.
+            // Seed with the transcript, or a placeholder when speech produced
+            // nothing (unsupported locale / silent recording). The audio file is
+            // always linked via media_url regardless of text content.
+            TranscriptSheet(
+                transcript: recorder.transcript.isEmpty
+                    ? "🎙 Audio journal (no transcript)"
+                    : recorder.transcript,
+                audioURL: recorder.recordedFileURL
+            ) { polished in
                 let mediaURL = recorder.recordedFileURL.flatMap(AudioRecorder.documentsRelativePath(for:))
                 Task {
                     await state.storeJournal(text: polished,
@@ -544,9 +449,13 @@ struct AudioCaptureView: View {
     }
 }
 
-/// Sheet showing the transcript with options to save or AI-polish.
+// MARK: - Transcript sheet (with audio preview)
+
+/// Sheet showing the transcript with an audio preview + AI-polish option.
 struct TranscriptSheet: View {
     let transcript: String
+    /// Optional audio file to preview before saving.
+    var audioURL: URL?
     var onSave: (String) -> Void
 
     @Environment(\.dismiss) var dismiss
@@ -554,10 +463,16 @@ struct TranscriptSheet: View {
     @Environment(\.colorScheme) var scheme
     @State private var editedText = ""
     @State private var isPolishing = false
+    @State private var audioPlayer: AVAudioPlayer?
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 16) {
+                // Audio preview (if a recording file is available).
+                if let url = audioURL {
+                    AudioPreviewBar(url: url, player: $audioPlayer)
+                }
+
                 TextEditor(text: $editedText)
                     .frame(minHeight: 200)
                     .scrollContentBackground(.hidden)
@@ -582,16 +497,18 @@ struct TranscriptSheet: View {
             }
             .padding()
             .background(DS.bg(scheme))
-            .navigationTitle("Transcript")
+            .navigationTitle(audioURL != nil ? "Recording" : "Transcript")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
+                        audioPlayer?.stop()
                         dismiss()
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
+                        audioPlayer?.stop()
                         onSave(editedText)
                     }
                     .disabled(editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -610,6 +527,80 @@ struct TranscriptSheet: View {
         DispatchQueue.global(qos: .userInitiated).async {
             if let polished = try? llm.synthesizeJournal(transcript: raw, model: state.model) {
                 DispatchQueue.main.async { editedText = polished }
+            }
+        }
+    }
+}
+
+/// A compact play/pause + scrub bar for previewing a recording before saving.
+struct AudioPreviewBar: View {
+    let url: URL
+    @Binding var player: AVAudioPlayer?
+    @Environment(\.colorScheme) var scheme
+    @State private var isPlaying = false
+    @State private var progress: Double = 0
+    @State private var timer: Timer?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button {
+                togglePlayback()
+            } label: {
+                Image(systemName: isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                    .font(.system(size: 30))
+                    .foregroundStyle(DS.accent2Color)
+            }
+            .buttonStyle(.plain)
+
+            VStack(spacing: 4) {
+                ProgressView(value: progress, total: 1.0)
+                    .tint(DS.accent2Color)
+                Text(url.lastPathComponent)
+                    .font(DS.microFont)
+                    .foregroundStyle(DS.muted(scheme))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .padding(10)
+        .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+        .onAppear { preparePlayer() }
+        .onDisappear {
+            timer?.invalidate()
+            player?.stop()
+        }
+    }
+
+    private func preparePlayer() {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try AVAudioSession.sharedInstance().setActive(true)
+            let p = try AVAudioPlayer(contentsOf: url)
+            p.prepareToPlay()
+            player = p
+        } catch {
+            // No preview available — the bar stays, but playback is a no-op.
+        }
+    }
+
+    private func togglePlayback() {
+        guard let p = player else { return }
+        if p.isPlaying {
+            p.pause()
+            isPlaying = false
+            timer?.invalidate()
+        } else {
+            p.play()
+            isPlaying = true
+            timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+                if p.duration > 0 {
+                    progress = p.currentTime / p.duration
+                }
+                if !p.isPlaying {
+                    isPlaying = false
+                    progress = 0
+                    timer?.invalidate()
+                }
             }
         }
     }

@@ -1,0 +1,229 @@
+// SpeechTranscriber.swift — on-device transcription of an audio file.
+//
+// Ports the proven segmentation logic from the reference Tauri app's
+// web/src-tauri/ios/SpeechTranscriber/SpeechTranscriber.swift. On-device
+// SFSpeechRecognizer has a hard ~60-second limit per recognitionTask; for
+// files longer than that a single request can be truncated or fail silently.
+// Fix: split the file into ≤50s segments and run one SFSpeechURLRecognitionRequest
+// per segment, concatenating the finals.
+//
+// Audio never leaves the device (requiresOnDeviceRecognition = true). If the
+// locale lacks on-device support, returns an empty string (the caller decides
+// whether to store the audio without a transcript).
+
+import Foundation
+import AVFoundation
+import Speech
+
+/// On-device transcription of an audio file at `url`. Returns the concatenated
+/// transcript, or "" if no speech was recognized / on-device unavailable.
+///
+/// Thread-safe: runs the blocking semaphore-based recognition on the calling
+/// thread. Callers should `await` it off the main actor (e.g. inside a
+/// `Task.detached` or `Task { await ... }` from MainActor).
+enum SpeechTranscriber {
+    /// Max segment length. Below the ~60s per-task SFSpeech ceiling with margin.
+    private static let segmentSeconds: TimeInterval = 50
+    /// Per-segment safety timeout so a stuck recognizer can't wedge a batch.
+    private static let segmentTimeout: Int = 180
+
+    /// Outcome of recognizing a single segment.
+    private enum SegmentOutcome {
+        case text(String)
+        case noSpeech
+        case error
+        case timedOut
+    }
+
+    static func transcribe(url: URL) async -> String {
+        guard let recognizer = SFSpeechRecognizer(locale: Locale.current),
+              recognizer.isAvailable,
+              recognizer.supportsOnDeviceRecognition else {
+            // No on-device model for this locale — can't transcribe locally.
+            return ""
+        }
+
+        // Start security-scoped access (share-sheet URLs may need it).
+        let didStart = url.startAccessingSecurityScopedResource()
+        defer { if didStart { url.stopAccessingSecurityScopedResource() } }
+
+        let wholeDuration = audioDurationSeconds(url)
+        // Decide segment URLs: split if long, else the whole file.
+        var tempDir: URL? = nil
+        let segmentURLs: [URL]
+        if wholeDuration > segmentSeconds {
+            let (segs, dir) = splitAudioIntoSegments(url, maxSeconds: segmentSeconds)
+            segmentURLs = segs
+            tempDir = dir
+        } else {
+            segmentURLs = [url]
+        }
+        defer {
+            if let dir = tempDir { try? FileManager.default.removeItem(at: dir) }
+        }
+
+        guard !segmentURLs.isEmpty else { return "" }
+
+        // Recognize each segment sequentially, concatenating finals.
+        var parts: [String] = []
+        for segmentURL in segmentURLs {
+            switch recognizeSingleSegment(at: segmentURL, with: recognizer) {
+            case .text(let s):
+                parts.append(s)
+            case .noSpeech:
+                continue  // skip empty segments; don't fail the whole transcript
+            case .error, .timedOut:
+                // A bad segment shouldn't abort the rest; keep what we have.
+                continue
+            }
+        }
+        return parts.joined(separator: " ")
+    }
+
+    // MARK: - Helpers (ported from the reference SpeechTranscriber.swift)
+
+    /// Read the playback duration of an audio file in seconds. Returns 0 if it
+    /// cannot be determined (caller then takes the single-file path).
+    private static func audioDurationSeconds(_ url: URL) -> TimeInterval {
+        let asset = AVURLAsset(url: url)
+        if let track = asset.tracks(withMediaType: .audio).first {
+            let duration = track.timeRange.duration
+            if duration.isValid, !duration.isIndefinite {
+                return CMTimeGetSeconds(duration)
+            }
+        }
+        let duration = asset.duration
+        if duration.isValid, !duration.isIndefinite {
+            return CMTimeGetSeconds(duration)
+        }
+        return 0
+    }
+
+    /// Split an audio file into ≤`maxSeconds` segments written as temporary
+    /// `.caf` files. Returns `(segmentURLs, tempDir)`; the caller removes
+    /// `tempDir`. Returns `([], nil)` if the source can't be opened.
+    private static func splitAudioIntoSegments(_ sourceURL: URL, maxSeconds: TimeInterval) -> ([URL], URL?) {
+        guard let audioFile = try? AVAudioFile(forReading: sourceURL) else {
+            return ([], nil)
+        }
+        let processingFormat = audioFile.processingFormat
+        let totalFrames = AVAudioFramePosition(audioFile.length)
+        guard totalFrames > 0 else { return ([], nil) }
+        let sampleRate = processingFormat.sampleRate
+        let framesPerSegment = AVAudioFramePosition(maxSeconds * sampleRate)
+        guard framesPerSegment > 0 else { return ([], nil) }
+        let segmentCount = Int((totalFrames + framesPerSegment - 1) / framesPerSegment)
+
+        let sessionDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("slowclaw-transcribe-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+        } catch {
+            return ([], nil)
+        }
+
+        var segmentURLs: [URL] = []
+        var startFrame: AVAudioFramePosition = 0
+        for index in 0..<segmentCount {
+            let remaining = totalFrames - startFrame
+            let chunkFrames = AVAudioFrameCount(min(framesPerSegment, remaining))
+            guard chunkFrames > 0 else { break }
+            guard let readBuffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: chunkFrames) else { break }
+            do {
+                audioFile.framePosition = startFrame
+                try audioFile.read(into: readBuffer, frameCount: chunkFrames)
+            } catch {
+                break
+            }
+            let segmentURL = sessionDir.appendingPathComponent("segment-\(index).caf")
+            do {
+                // Write as CAF in the processing format — lossless and reliably
+                // accepted by SFSpeechURLRecognitionRequest.
+                let outFile = try AVAudioFile(
+                    forWriting: segmentURL,
+                    settings: processingFormat.settings,
+                    commonFormat: processingFormat.commonFormat,
+                    interleaved: processingFormat.isInterleaved
+                )
+                try outFile.write(from: readBuffer)
+            } catch {
+                break
+            }
+            segmentURLs.append(segmentURL)
+            startFrame += AVAudioFramePosition(chunkFrames)
+        }
+        return (segmentURLs, sessionDir)
+    }
+
+    /// Run one recognition task on a single segment URL, appending every final
+    /// result and signaling completion via a 0.8s settle timer.
+    private static func recognizeSingleSegment(
+        at url: URL,
+        with recognizer: SFSpeechRecognizer
+    ) -> SegmentOutcome {
+        let request = SFSpeechURLRecognitionRequest(url: url)
+        request.shouldReportPartialResults = false
+        request.requiresOnDeviceRecognition = true
+        if #available(iOS 16.0, *) {
+            request.addsPunctuation = true
+        }
+
+        let resultSemaphore = DispatchSemaphore(value: 0)
+        final class ResultBox {
+            var text: String?
+            var error: Error?
+        }
+        let box = ResultBox()
+        let settleQueue = DispatchQueue.global(qos: .userInitiated)
+        let settleTimer = DispatchSource.makeTimerSource(queue: settleQueue)
+        var signaled = false
+        let signalOnce: () -> Void = {
+            if !signaled {
+                signaled = true
+                resultSemaphore.signal()
+            }
+        }
+        settleTimer.schedule(deadline: .now() + .seconds(segmentTimeout), repeating: .never)
+        settleTimer.setEventHandler { signalOnce() }
+        settleTimer.activate()
+        func rearmSettle(_ delay: TimeInterval) {
+            settleTimer.schedule(deadline: .now() + delay, repeating: .never)
+        }
+
+        let task = recognizer.recognitionTask(with: request) { result, error in
+            if let error = error {
+                box.error = error
+                settleTimer.cancel()
+                signalOnce()
+                return
+            }
+            guard let result = result else {
+                settleTimer.cancel()
+                signalOnce()
+                return
+            }
+            if result.isFinal {
+                let segment = result.bestTranscription.formattedString
+                if let existing = box.text, !existing.isEmpty {
+                    box.text = existing + " " + segment
+                } else {
+                    box.text = segment
+                }
+                rearmSettle(0.8)
+            }
+        }
+
+        let waitResult = resultSemaphore.wait(timeout: .now() + .seconds(segmentTimeout))
+        if waitResult == .timedOut {
+            task.cancel()
+            return .timedOut
+        }
+        if box.error != nil {
+            return .error
+        }
+        guard let transcript = box.text, !transcript.isEmpty else {
+            return .noSpeech
+        }
+        return .text(transcript)
+    }
+}

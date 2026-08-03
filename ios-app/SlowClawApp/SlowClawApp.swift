@@ -113,12 +113,14 @@ struct SlowClawApp: App {
                 .preferredColorScheme(preferredScheme)
                 .tint(DS.accentColor)
                 // Voice Memos / Files share-sheet entry point: iOS delivers the
-                // audio file URL here. enqueue copies it into the Inbox and
-                // hands it to the importer's single serial transcription worker.
+                // audio file URL here. enqueue copies it into the Inbox and the
+                // serial worker transcribes on-device + auto-stores as a journal.
                 .onOpenURL { url in
+                    voiceMemoImporter.appState = appState
                     voiceMemoImporter.enqueue(url)
                 }
                 .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { _ in }
+                .onAppear { voiceMemoImporter.appState = appState }
         }
     }
 }
@@ -347,7 +349,12 @@ final class AppState: ObservableObject {
 
     func refreshJournals() async {
         do {
-            journals = try memory.recall(query: "the a an of to and", limit: 50)
+            // Journals: all entries EXCEPT drafts (sessionID="drafts"). Drafts
+            // (TweetClaw-generated posts) belong in the Drafts tab only, not the
+            // Journals list. recall doesn't support an exclude-session filter, so
+            // fetch a wider set and drop drafts client-side. Order newest-first.
+            let all = try memory.recall(query: "the a an of to and", limit: 60)
+            journals = all.filter { ($0.sessionID ?? "") != "drafts" }
             drafts = try memory.recall(query: "draft post", limit: 20, sessionID: "drafts")
         } catch {
             journals = []
@@ -682,7 +689,6 @@ enum AppTab: String, CaseIterable {
 
 struct AppShell: View {
     @EnvironmentObject var state: AppState
-    @EnvironmentObject var voiceMemoImporter: VoiceMemoImporter
     @Environment(\.colorScheme) var scheme
     @AppStorage("slowclaw.theme") private var themeRaw: String = ""
     var body: some View {
@@ -714,42 +720,9 @@ struct AppShell: View {
         }
         .animation(.easeOut(duration: 0.25), value: state.journalSidebarOpen)
         .background(DS.bg(scheme).ignoresSafeArea())
-        // Imported-memo review sheet (mirrors the live-recording flow:
-        // transcript → edit/AI-polish → save as journal). Attached at the
-        // AppShell (a View) rather than the App scene so SwiftUI reliably
-        // re-renders when the importer's pendingImport changes. Driven by the
-        // importer so the worker waits for review before pulling the next file.
-        // The audio file is ALWAYS linked via source/media_url, even when the
-        // transcript is empty (on-device speech unavailable) — the file was
-        // copied to the Inbox and must not be silently dropped.
-        .sheet(item: $voiceMemoImporter.pendingImport) { importItem in
-            TranscriptSheet(transcript: importItem.transcript.isEmpty
-                ? "🎙 Imported audio (no transcript)"
-                : importItem.transcript) { polished in
-                let mediaURL = Self.documentsRelativePath(for: importItem.url)
-                Task {
-                    await state.storeJournal(text: polished,
-                                             source: "audio_imported",
-                                             mediaURL: mediaURL)
-                }
-                voiceMemoImporter.pendingImport = nil
-            }
-            .environmentObject(state)
-        }
-    }
-
-    /// Documents-relative path for a file URL (e.g. "Inbox/123-name.m4a"),
-    /// suitable for the journal media_url column. Returns nil if the URL
-    /// isn't under Documents.
-    static func documentsRelativePath(for url: URL) -> String? {
-        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        let docsPath = docs.standardizedFileURL.path
-        let urlPath = url.standardizedFileURL.path
-        guard urlPath.hasPrefix(docsPath) else { return nil }
-        let rel = String(urlPath.dropFirst(docsPath.count))
-        return rel.hasPrefix("/") ? String(rel.dropFirst()) : rel
+        // Voice-memo imports auto-store (transcribe on-device → journal entry),
+        // matching the reference app — no review gate. The sidebar shows
+        // progress via voiceMemoImporter.status while the serial worker runs.
     }
 }
 
