@@ -965,10 +965,14 @@ struct JournalDetailView: View {
     @State private var isPolishing = false
     @State private var showShareSheet = false
 
-    /// Absolute URL of the recording, if this is an audio entry with a file.
+    /// Absolute URL of the recording, if this entry has a linked audio file.
+    /// Treat any entry with a non-empty mediaURL as playable (don't require a
+    /// specific source string — older entries or imports may carry a path
+    /// without a matching source tag). The player is gated on file existence
+    /// at render time so a stale path just hides the player rather than erroring.
     private var audioURL: URL? {
-        guard entry.source == "audio_recorded" || entry.source == "audio_imported" else { return nil }
-        return AudioRecorder.absoluteURL(forMediaRelativePath: entry.mediaURL)
+        guard let rel = entry.mediaURL, !rel.isEmpty else { return nil }
+        return AudioRecorder.absoluteURL(forMediaRelativePath: rel)
     }
 
     init(entry: SlowClawMemoryEntry) {
@@ -1288,6 +1292,326 @@ struct JournalDetailView: View {
     }
 }
 
+// MARK: - Recording review (post-stop, pre-save)
+
+/// Shown immediately after the user stops recording, replacing the old blank
+/// "Transcribing…" screen. Mirrors the journal detail: a player at top, an
+/// auto-generated title (date/time), and the transcript area below — which
+/// shows "Transcribing…" inline until on-device recognition finishes. Save
+/// persists the journal with source="audio_recorded" + the media_url.
+///
+/// This is the same screen the user sees when tapping a recording in the list
+/// (JournalDetailView), opened proactively so the post-stop experience is
+/// continuous rather than a dead spinner.
+struct RecordingReviewView: View {
+    @ObservedObject var recorder: AudioRecorder
+    @Environment(\.dismiss) var dismiss
+    @Environment(\.colorScheme) var scheme
+    @EnvironmentObject var state: AppState
+
+    @State private var player: AVAudioPlayer?
+    @State private var isPlaying = false
+    @State private var progress: Double = 0
+    @State private var speed: Float = 1.0
+    @State private var pollTimer: Timer?
+    @State private var waveformLevels: [Float] = []
+    @State private var editedBody: String = ""
+    @State private var titleText: String = ""
+    @State private var isPolishing = false
+
+    private var audioURL: URL? { recorder.recordedFileURL }
+
+    /// Voice-Memos-style default title: "New Recording" + localized date/time.
+    private static func defaultTitle() -> String {
+        let f = DateFormatter()
+        f.locale = Locale.current
+        f.dateFormat = "MMM d, h:mm a"
+        return "New Recording · \(f.string(from: Date()))"
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 18) {
+                    // ── Title (editable) ──
+                    TextField("Title", text: $titleText)
+                        .font(DS.titleFont)
+                        .textFieldStyle(.plain)
+                        .foregroundStyle(DS.ink(scheme))
+                        .padding(.horizontal, 16)
+
+                    // ── Player ──
+                    if let url = audioURL, FileManager.default.fileExists(atPath: url.path) {
+                        playerSection(url: url)
+                    }
+
+                    // ── Transcript area ──
+                    DS.card(scheme) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text("Transcript")
+                                    .font(DS.eyebrowFont)
+                                    .foregroundStyle(DS.muted(scheme))
+                                    .textCase(.uppercase)
+                                Spacer()
+                                if recorder.isTranscribing {
+                                    HStack(spacing: 5) {
+                                        ProgressView().scaleEffect(0.55)
+                                        Text("Transcribing…")
+                                            .font(DS.captionFont)
+                                            .foregroundStyle(DS.muted(scheme))
+                                    }
+                                } else if state.llm != nil {
+                                    Button {
+                                        Task { await polish() }
+                                    } label: {
+                                        Label("Polish", systemImage: "sparkles")
+                                            .font(DS.captionFont.weight(.semibold))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .tint(DS.accentColor)
+                                    .disabled(isPolishing || editedBody.isEmpty)
+                                }
+                            }
+
+                            if recorder.isTranscribing && editedBody.isEmpty {
+                                // Placeholder while recognition runs, before any
+                                // text has arrived.
+                                Text("Listening back…")
+                                    .font(DS.bodyFont)
+                                    .foregroundStyle(DS.muted(scheme))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.vertical, 8)
+                            } else {
+                                TextEditor(text: $editedBody)
+                                    .frame(minHeight: 180)
+                                    .scrollContentBackground(.hidden)
+                                    .font(DS.bodyFont)
+                                    .foregroundStyle(DS.ink(scheme))
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                }
+                .padding(.top, 8)
+                .padding(.bottom, 32)
+            }
+            .background(DS.bg(scheme))
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Discard") {
+                        player?.stop()
+                        pollTimer?.invalidate()
+                        // Delete the temp recording file so discarded audio
+                        // doesn't linger in Recordings.
+                        if let url = recorder.recordedFileURL {
+                            try? FileManager.default.removeItem(at: url)
+                        }
+                        recorder.recordedFileURL = nil
+                        recorder.transcript = ""
+                        recorder.title = ""
+                        dismiss()
+                    }
+                    .foregroundStyle(DS.accent2Color)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Save") {
+                        Task { await save() }
+                    }
+                    .fontWeight(.semibold)
+                    .disabled(recorder.isTranscribing)
+                }
+            }
+        }
+        .onAppear {
+            if titleText.isEmpty { titleText = Self.defaultTitle() }
+            preparePlayerIfNeeded()
+            extractWaveformIfNeeded()
+        }
+        .onDisappear {
+            pollTimer?.invalidate()
+            player?.stop()
+        }
+        // As the transcript streams in (isTranscribing still true but transcript
+        // non-empty), mirror it into the editor so the user sees progress. Once
+        // transcription completes, seed the editor if the user hasn't edited.
+        .onChange(of: recorder.transcript) { _, newTranscript in
+            if editedBody.isEmpty {
+                editedBody = newTranscript.isEmpty ? "" : newTranscript
+            }
+        }
+        .onChange(of: recorder.isTranscribing) { _, nowTranscribing in
+            if !nowTranscribing && editedBody.isEmpty {
+                editedBody = recorder.transcript
+            }
+        }
+    }
+
+    // MARK: - Player section
+
+    @ViewBuilder
+    private func playerSection(url: URL) -> some View {
+        VStack(spacing: 14) {
+            WaveformView(samples: waveformLevels, color: DS.accent2Color)
+                .frame(height: 56)
+                .padding(.horizontal, 16)
+
+            Slider(value: Binding(
+                get: { progress },
+                set: { newValue in
+                    progress = newValue
+                    if let p = player, p.duration > 0 {
+                        p.currentTime = newValue * p.duration
+                    }
+                }
+            ), in: 0...1)
+            .tint(DS.accent2Color)
+            .padding(.horizontal, 20)
+
+            HStack {
+                Text(audioClock(player?.currentTime ?? 0))
+                Spacer()
+                Text(audioClock(player?.duration ?? 0))
+            }
+            .font(DS.microFont.monospacedDigit())
+            .foregroundStyle(DS.muted(scheme))
+            .padding(.horizontal, 20)
+
+            HStack(spacing: 40) {
+                Button { skip(by: -15) } label: {
+                    Image(systemName: "gobackward.15")
+                        .font(.system(size: 26))
+                        .foregroundStyle(DS.ink(scheme))
+                }
+                .buttonStyle(.plain)
+
+                Button { togglePlayback() } label: {
+                    ZStack {
+                        Circle()
+                            .fill(DS.accent2Color)
+                            .frame(width: 64, height: 64)
+                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 24))
+                            .foregroundStyle(.white)
+                    }
+                }
+                .buttonStyle(.plain)
+
+                Button { skip(by: 15) } label: {
+                    Image(systemName: "goforward.15")
+                        .font(.system(size: 26))
+                        .foregroundStyle(DS.ink(scheme))
+                }
+                .buttonStyle(.plain)
+            }
+
+            Button {
+                cycleSpeed()
+            } label: {
+                Text(String(format: "%g×", speed))
+                    .font(DS.captionFont.weight(.semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(DS.surface3(scheme), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .tint(DS.ink(scheme))
+        }
+        .padding(.vertical, 16)
+        .background(DS.surface(scheme), in: RoundedRectangle(cornerRadius: DS.rLg, style: .continuous))
+        .padding(.horizontal, 16)
+    }
+
+    // MARK: - Player logic
+
+    private func preparePlayerIfNeeded() {
+        guard let url = audioURL, FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try AVAudioSession.sharedInstance().setActive(true)
+            let p = try AVAudioPlayer(contentsOf: url)
+            p.enableRate = true
+            p.rate = speed
+            p.prepareToPlay()
+            player = p
+        } catch {
+            player = nil
+        }
+    }
+
+    private func extractWaveformIfNeeded() {
+        guard let url = audioURL, FileManager.default.fileExists(atPath: url.path) else { return }
+        Task.detached(priority: .utility) {
+            let levels = AudioRecorder.extractLevels(from: url)
+            await MainActor.run { waveformLevels = levels }
+        }
+    }
+
+    private func togglePlayback() {
+        guard let p = player else { return }
+        if p.isPlaying {
+            p.pause(); isPlaying = false; pollTimer?.invalidate()
+        } else {
+            p.rate = speed; p.play(); isPlaying = true
+            pollTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+                guard let p = player else { return }
+                if p.duration > 0 { progress = p.currentTime / p.duration }
+                if !p.isPlaying { isPlaying = false; progress = 0; pollTimer?.invalidate() }
+            }
+        }
+    }
+
+    private func skip(by seconds: TimeInterval) {
+        guard let p = player else { return }
+        p.currentTime = max(0, min(p.duration, p.currentTime + seconds))
+        if p.duration > 0 { progress = p.currentTime / p.duration }
+    }
+
+    private func cycleSpeed() {
+        switch speed {
+        case 1.0: speed = 1.5
+        case 1.5: speed = 2.0
+        case 2.0: speed = 0.5
+        case 0.5: speed = 1.0
+        default: speed = 1.0
+        }
+        player?.rate = isPlaying ? speed : speed
+    }
+
+    // MARK: - Save
+
+    private func save() async {
+        let body = editedBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (recorder.transcript.isEmpty ? "🎙 Audio journal (no transcript)" : recorder.transcript)
+            : editedBody
+        let title = titleText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = title.isEmpty ? body : "\(title)\n\n\(body)"
+        let mediaURL = recorder.recordedFileURL.flatMap(AudioRecorder.documentsRelativePath(for:))
+        await state.storeJournal(text: content, source: "audio_recorded", mediaURL: mediaURL)
+        player?.stop()
+        pollTimer?.invalidate()
+        recorder.recordedFileURL = nil
+        recorder.transcript = ""
+        recorder.title = ""
+        dismiss()
+    }
+
+    private func polish() async {
+        guard let llm = state.llm else { return }
+        isPolishing = true
+        defer { isPolishing = false }
+        let raw = editedBody.isEmpty ? recorder.transcript : editedBody
+        let model = state.model
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let polished = try? llm.synthesizeJournal(transcript: raw, model: model) {
+                DispatchQueue.main.async { editedBody = polished }
+            }
+        }
+    }
+}
+
 // MARK: - Text compose sheet (pen button)
 
 /// Clean fullscreen compose surface for a text journal. Title + large editor +
@@ -1369,7 +1693,9 @@ struct JournalView: View {
     @State private var search = ""
     @State private var selectedDetail: SlowClawMemoryEntry?
     @State private var showCompose = false
-    @State private var showTranscript = false
+    /// Opens the post-stop recording review (player + title + transcript) as
+    /// a fullscreen cover. Set true the moment a recording finishes.
+    @State private var reviewingRecording = false
 
     /// First-entry rotating prompts (one per day-of-month). Shown in the empty
     /// state hero.
@@ -1396,41 +1722,28 @@ struct JournalView: View {
             if recorder.isRecording || recorder.isPaused {
                 // ── Recording zen screen (replaces the list while recording) ──
                 recordingScreen
-            } else if recorder.isTranscribing {
-                transcribingState
             } else {
                 journalList
             }
         }
         .background(DS.bg(scheme))
         .task { await state.refreshJournals() }
-        // Present the recording transcript review when transcription finishes.
-        .onChange(of: recorder.isTranscribing) { _, now in
-            if !now && recorder.recordedFileURL != nil { showTranscript = true }
+        // Open the recording review the instant a recording finishes (whether
+        // or not transcription has completed). The review view shows the player
+        // + an auto date/time title + "Transcribing…" inline in the transcript
+        // area until on-device recognition finishes — no more blank spinner.
+        .onChange(of: recorder.isRecording) { _, nowRecording in
+            if !nowRecording && recorder.recordedFileURL != nil && !reviewingRecording {
+                reviewingRecording = true
+            }
+        }
+        .fullScreenCover(isPresented: $reviewingRecording) {
+            RecordingReviewView(recorder: recorder)
+                .environmentObject(state)
         }
         .sheet(isPresented: $showCompose) {
             TextComposeSheet()
                 .environmentObject(state)
-        }
-        .sheet(isPresented: $showTranscript) {
-            TranscriptSheet(
-                transcript: recorder.transcript.isEmpty
-                    ? "🎙 Audio journal (no transcript)"
-                    : recorder.transcript,
-                audioURL: recorder.recordedFileURL
-            ) { polished in
-                let mediaURL = recorder.recordedFileURL.flatMap(AudioRecorder.documentsRelativePath(for:))
-                let title = recorder.title.trimmingCharacters(in: .whitespacesAndNewlines)
-                let body = title.isEmpty ? polished : "\(title)\n\n\(polished)"
-                Task {
-                    await state.storeJournal(text: body, source: "audio_recorded", mediaURL: mediaURL)
-                }
-                recorder.title = ""
-                recorder.transcript = ""
-                recorder.recordedFileURL = nil
-                showTranscript = false
-            }
-            .environmentObject(state)
         }
     }
 
@@ -1687,17 +2000,6 @@ struct JournalView: View {
                         .padding(.horizontal, 24)
                 }
             }
-            Spacer()
-        }
-    }
-
-    private var transcribingState: some View {
-        VStack(spacing: 10) {
-            Spacer()
-            ProgressView().scaleEffect(0.9)
-            Text("Transcribing…")
-                .font(DS.captionFont)
-                .foregroundStyle(DS.muted(scheme))
             Spacer()
         }
     }
