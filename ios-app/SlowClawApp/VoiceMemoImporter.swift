@@ -74,7 +74,10 @@ final class VoiceMemoImporter: ObservableObject {
     }
 
     private func copyAudio(_ sourceURL: URL) -> URL? {
-        guard isAudioFile(sourceURL) else { return nil }
+        guard isAudioFile(sourceURL) else {
+            status = "Import skipped: '\(sourceURL.pathExtension)' isn't an audio file."
+            return nil
+        }
         // Re-resolve security-scoped URLs (share-sheet imports are scoped).
         let didStart = sourceURL.startAccessingSecurityScopedResource()
         defer { if didStart { sourceURL.stopAccessingSecurityScopedResource() } }
@@ -88,8 +91,13 @@ final class VoiceMemoImporter: ObservableObject {
             return dest
         } catch {
             // Fall back to a move if copy fails across volumes.
-            try? FileManager.default.moveItem(at: sourceURL, to: dest)
-            return FileManager.default.fileExists(atPath: dest.path) ? dest : nil
+            do {
+                try FileManager.default.moveItem(at: sourceURL, to: dest)
+                return dest
+            } catch {
+                status = "Import failed: \(error.localizedDescription)"
+                return nil
+            }
         }
     }
 

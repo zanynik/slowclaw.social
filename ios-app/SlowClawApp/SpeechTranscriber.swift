@@ -22,10 +22,14 @@ import Speech
 /// thread. Callers should `await` it off the main actor (e.g. inside a
 /// `Task.detached` or `Task { await ... }` from MainActor).
 enum SpeechTranscriber {
-    /// Max segment length. Below the ~60s per-task SFSpeech ceiling with margin.
-    private static let segmentSeconds: TimeInterval = 50
+    /// Max segment length. Well below the ~60s per-task SFSpeech ceiling with
+    /// margin (40s) so even a slow recognizer can finish before the cap.
+    private static let segmentSeconds: TimeInterval = 40
     /// Per-segment safety timeout so a stuck recognizer can't wedge a batch.
     private static let segmentTimeout: Int = 180
+    /// Last diagnostic: how many segments were processed. Observable for
+    /// surfacing in the UI / status when debugging truncation.
+    @MainActor static var lastSegmentCount: Int = 0
 
     /// Outcome of recognizing a single segment.
     private enum SegmentOutcome {
@@ -84,7 +88,10 @@ enum SpeechTranscriber {
             if let dir = tempDir { try? FileManager.default.removeItem(at: dir) }
         }
 
-        guard !segmentURLs.isEmpty else { return "" }
+        guard !segmentURLs.isEmpty else {
+            await MainActor.run { Self.lastSegmentCount = 0 }
+            return ""
+        }
 
         // Recognize each segment sequentially, concatenating finals.
         var parts: [String] = []
@@ -99,6 +106,7 @@ enum SpeechTranscriber {
                 continue
             }
         }
+        await MainActor.run { Self.lastSegmentCount = segmentURLs.count }
         return parts.joined(separator: " ")
     }
 
@@ -177,8 +185,12 @@ enum SpeechTranscriber {
         return (segmentURLs, sessionDir)
     }
 
-    /// Run one recognition task on a single segment URL, appending every final
-    /// result and signaling completion via a 0.8s settle timer.
+    /// Run one recognition task on a single segment URL. Captures the
+    /// best-transcription text from EVERY result callback (iOS often delivers
+    /// the full text in a non-`isFinal` result, then ends with `result == nil`),
+    /// so the prior version that only read `isFinal` results returned nothing
+    /// for most segments — the root cause of "only the last sentence."
+    /// A 0.8s settle after the last result lets late finals arrive.
     private static func recognizeSingleSegment(
         at url: URL,
         with recognizer: SFSpeechRecognizer
@@ -219,19 +231,21 @@ enum SpeechTranscriber {
                 signalOnce()
                 return
             }
-            guard let result = result else {
+            if let result = result {
+                // Capture the full running transcript from EVERY result, final
+                // or not. iOS frequently delivers the complete text in a
+                // non-final result and then signals end via result == nil;
+                // reading only isFinal misses it entirely.
+                let text = result.bestTranscription.formattedString
+                if !text.isEmpty { box.text = text }
+                if result.isFinal {
+                    // Final result: arm a short settle for any straggler, then done.
+                    rearmSettle(0.8)
+                }
+            } else {
+                // result == nil, error == nil → recognition finished. Done.
                 settleTimer.cancel()
                 signalOnce()
-                return
-            }
-            if result.isFinal {
-                let segment = result.bestTranscription.formattedString
-                if let existing = box.text, !existing.isEmpty {
-                    box.text = existing + " " + segment
-                } else {
-                    box.text = segment
-                }
-                rearmSettle(0.8)
             }
         }
 

@@ -14,6 +14,7 @@
 // All logic runs in the Zig core via the C ABI. Swift is thin presentation.
 
 import SwiftUI
+import UIKit
 import AVFoundation
 
 // MARK: - Design System (from the original app's styles.css, with dark mode)
@@ -96,6 +97,12 @@ enum AppTheme: String {
 struct SlowClawApp: App {
     @StateObject private var appState = AppState()
     @StateObject private var voiceMemoImporter = VoiceMemoImporter()
+    // Catches URLs delivered during cold launch from a share sheet (Voice Memos
+    // → Share → SlowClaw). SwiftUI's .onOpenURL reliably fires for foreground
+    // share-sheet deliveries, but on a COLD launch (app not yet running) the URL
+    // can arrive before .onOpenURL is wired. The delegate captures it and the
+    // App flushes pending URLs on first appear.
+    @UIApplicationDelegateAdaptor(ShareURLDelegate.self) private var urlDelegate
     @AppStorage("slowclaw.theme") private var themeRaw: String = ""
 
     private var preferredScheme: ColorScheme? {
@@ -121,8 +128,38 @@ struct SlowClawApp: App {
                     voiceMemoImporter.enqueue(url)
                 }
                 .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { _ in }
-                .onAppear { voiceMemoImporter.appState = appState }
+                .onAppear {
+                    voiceMemoImporter.appState = appState
+                    // Flush any URL the delegate captured during cold launch.
+                    for pending in urlDelegate.flushPending() {
+                        voiceMemoImporter.enqueue(pending)
+                    }
+                }
         }
+    }
+}
+
+/// Captures share-sheet / file-open URLs delivered during cold launch (before
+/// SwiftUI's .onOpenURL is wired). The App flushes them on first appear.
+final class ShareURLDelegate: NSObject, UIApplicationDelegate {
+    private let pendingLock = NSLock()
+    private var pending: [URL] = []
+
+    func application(_ app: UIApplication, open url: URL,
+                     options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+        pendingLock.lock()
+        pending.append(url)
+        pendingLock.unlock()
+        return true
+    }
+
+    /// Returns and clears any URLs captured before SwiftUI was ready.
+    func flushPending() -> [URL] {
+        pendingLock.lock()
+        let out = pending
+        pending.removeAll()
+        pendingLock.unlock()
+        return out
     }
 }
 
