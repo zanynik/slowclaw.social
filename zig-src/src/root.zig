@@ -76,6 +76,9 @@ comptime {
     _ = &ffi.slowclaw_feed_local_llm_load;
     _ = &ffi.slowclaw_feed_local_llm_unload;
     _ = &ffi.slowclaw_feed_local_llm_chat;
+    _ = &ffi.slowclaw_feed_local_llm_synthesize_journal;
+    _ = &ffi.slowclaw_feed_local_llm_extract_interests;
+    _ = &ffi.slowclaw_feed_local_llm_draft_post;
 }
 
 test {
