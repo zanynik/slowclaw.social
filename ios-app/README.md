@@ -1,5 +1,11 @@
 # `ios-app/` — SlowClaw Social iOS app (Zig-backed)
 
+> **Architecture source of truth:** the root [`README.md`](../README.md) holds the
+> system-wide diagrams (two-layer architecture, C ABI contract, capture/feed/AI
+> loops, CI pipeline). This file covers **XcodeGen, signing, and the pre-build
+> `zig build` script specific to the iOS shell**. If anything here disagrees with
+> the root README, the root README wins.
+
 The iOS shell of the iOS-only Zig pivot. Contains the SwiftUI app + XcodeGen
 project definition + the C ABI contract header. **The `.xcodeproj` is not in
 git** — it's regenerated from `project.yml` via XcodeGen. This keeps the

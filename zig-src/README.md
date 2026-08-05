@@ -1,5 +1,11 @@
 # `zig-src/` — SlowClaw Social Zig core
 
+> **Architecture source of truth:** the root [`README.md`](../README.md) holds the
+> system-wide diagrams (two-layer architecture, C ABI contract, capture/feed/AI
+> loops, CI pipeline). This file covers **build-graph and module-level details
+> specific to the Zig core**. If anything here disagrees with the root README,
+> the root README wins.
+
 This is the **engine** of the iOS-only Zig pivot. It is a Zig static library
 exposed through a C ABI and consumed by the native Swift shell in `ios-app/`.
 (The original Rust/Tauri/React codebase it ported from has been removed from
