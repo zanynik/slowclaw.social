@@ -17,10 +17,8 @@ ios-app/
     SlowClawApp.swift           Minimal SwiftUI demo (open DB → store → recall)
     Info.plist                  iOS app metadata
     Assets.xcassets/            App icon asset catalog (AppIcon.appiconset).
-                                Icons materialized from web/src-tauri/icons/ios/
-                                (the Tauri-generated set) so TestFlight's
-                                CFBundleIconName check passes. When the Tauri
-                                path is dropped, this becomes the icon source.
+                                The SlowClaw mark; TestFlight's CFBundleIconName
+                                check passes against this set.
 
   SlowClawFeed/                 Swift package wrapping the C ABI
     Package.swift               SwiftPM manifest (for SPM consumers)
@@ -67,8 +65,9 @@ Xcode-managed profiles, which this CI pipeline doesn't use.)
 ## TestFlight (CI)
 
 The `pub-testflight-zig.yml` workflow at `.github/workflows/` builds + signs +
-uploads to TestFlight on every push to `zig-ios-pivot`. It reuses the same
-App Store Connect + signing secrets as the legacy Tauri workflow:
+uploads to TestFlight on every push to `main` (when `zig-src/`, `ios-app/`,
+or the workflow file change). It uses these repo-wide App Store Connect +
+signing secrets:
 
 - `APP_STORE_CONNECT_ISSUER_ID`
 - `APP_STORE_CONNECT_KEY_ID`
@@ -78,8 +77,8 @@ App Store Connect + signing secrets as the legacy Tauri workflow:
 The cert + provisioning profile are issued fresh per run via App Store Connect
 API (and stale CI profiles are cleaned up to avoid hitting Apple's limits).
 **Trigger manually** via the Actions UI → "Publish iOS TestFlight (Zig)" →
-Run workflow, or push to `zig-ios-pivot` with changes under `zig-src/`,
-`ios-app/`, or the workflow file itself.
+Run workflow, or push to `main` with changes under `zig-src/`, `ios-app/`,
+or the workflow file itself.
 
 ## Why no checked-in .xcodeproj
 
@@ -88,11 +87,10 @@ modern idiom (used by Firefox, Wireguard, many others) is XcodeGen: a single
 human-readable `project.yml` that generates the project on demand. This makes
 the project definition reviewable and merge-conflict-free.
 
-## Architectural note (slice 8)
+## Architectural note
 
-Per the pivot's "question the old architecture" guidance, the Zig TestFlight
-path **drops the Tauri + Rust + npm pipeline entirely** for iOS. No Cargo, no
-node, no web bundling — just Zig → staticlib → Xcode → TestFlight. The legacy
-workflow `pub-testflight-ios.yml` still exists for the `main` branch; this new
-workflow is for `zig-ios-pivot` only. When the pivot merges, the legacy one
-gets deleted.
+This app **dropped the Tauri + Rust + npm pipeline entirely** for iOS. No
+Cargo, no node, no web bundling — just Zig → staticlib → Xcode → TestFlight.
+The old `pub-testflight-ios.yml` workflow and the entire `src/`, `web/`, and
+`crates/` trees from the Rust-era fork were removed during the pivot
+consolidation; `pub-testflight-zig.yml` is the only publish path.

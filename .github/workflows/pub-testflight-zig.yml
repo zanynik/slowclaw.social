@@ -1,20 +1,21 @@
 name: Publish iOS TestFlight (Zig)
 
-# Zig-only TestFlight build. Replaces the Tauri/Rust pipeline on the
-# zig-ios-pivot branch — no Cargo, no npm, no web bundling.
+# Zig-only TestFlight build. No Cargo, no npm, no web bundling — just the
+# Zig core (zig-src/) compiled for iOS + the native Swift app (ios-app/).
 #
-# Triggered on push to zig-ios-pivot OR manually via workflow_dispatch. The
-# App Store Connect + signing secrets are reused from the existing
-# pub-testflight-ios.yml setup — they're repo-wide secrets, not per-workflow.
+# Manual-only for now (workflow_dispatch) so the consolidation push to main
+# does not auto-fire a TestFlight build. To re-enable automatic builds on
+# push to main, uncomment the `push:` block below.
+# The App Store Connect + signing secrets are repo-wide secrets, not per-workflow.
 
 on:
-    push:
-        branches:
-            - zig-ios-pivot
-        paths:
-            - ".github/workflows/pub-testflight-zig.yml"
-            - "zig-src/**"
-            - "ios-app/**"
+    # push:
+    #     branches:
+    #         - main
+    #     paths:
+    #         - ".github/workflows/pub-testflight-zig.yml"
+    #         - "zig-src/**"
+    #         - "ios-app/**"
     workflow_dispatch:
         inputs:
             build_number:

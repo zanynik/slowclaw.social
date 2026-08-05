@@ -1,9 +1,9 @@
-# `zig-src/` — SlowClaw Social Zig core pilot
+# `zig-src/` — SlowClaw Social Zig core
 
-This is **slice 1** of the iOS-only Zig pivot (branch `zig-ios-pivot`). It is a
-**port-in-progress**, intentionally additive: the Rust source under `src/` stays
-the authoritative spec until the port reaches feature parity and the iOS shell
-wires up. No Rust code is deleted in this slice.
+This is the **engine** of the iOS-only Zig pivot. It is a Zig static library
+exposed through a C ABI and consumed by the native Swift shell in `ios-app/`.
+(The original Rust/Tauri/React codebase it ported from has been removed from
+the repo — the Zig core is now authoritative, not a "port-in-progress".)
 
 ## Scope of slice 1
 
@@ -261,17 +261,21 @@ capture expected values (`cargo test --lib memory::vector`,
   and surfaced to the ranker via the same `EmbeddingProvider` vtable through the
   C ABI in a later slice.
 
-## Cross-validation against Rust
+## Cross-validation against Rust (historical)
 
-Shared spec tests run on both sides and agree within `1e-6`:
-- `cargo test --lib memory::vector` → **30/30 pass** (Rust)
-- `cargo test --lib feed::ranker` → **3/3 pass** (the `negative_keyword_penalty`
-  trio — ported verbatim to Zig with identical assertions and tolerances)
+During the port, shared spec tests ran on both the Rust original and the Zig
+port and agreed within `1e-6`:
+- `cargo test --lib memory::vector` → **30/30 pass** (Rust, original)
+- `cargo test --lib feed::ranker` → **3/3 pass** (Rust, original; the
+  `negative_keyword_penalty` trio — ported verbatim to Zig with identical
+  assertions and tolerances)
 - `zig build test` → **85/85 pass, 0 leaks** (Zig; includes the verbatim ports)
 
-The golden stemmer pairs were captured from `rust_stemmers` via a standalone
-Rust probe binary (see the test block `stem: golden pairs from rust_stemmers`
-in `src/porter_stemmer.zig`).
+The Rust originals have since been removed from the repo (the Zig core is now
+authoritative); these numbers are preserved as the parity record. The golden
+stemmer pairs were captured from `rust_stemmers` via a standalone Rust probe
+binary (see the test block `stem: golden pairs from rust_stemmers` in
+`src/porter_stemmer.zig`).
 
 ## Status
 
@@ -301,19 +305,11 @@ FTS5+vector search, get/forget by key, and inspect health/count. The markdown
 backend offers a plain-text audit-trail alternative; the response cache saves
 LLM tokens on repeated prompts.
 
-## Next slices (not in this branch's current scope)
+## Status
 
-- **Slice 3 (config):** port `src/config/` (7,737 LOC) — schema + loading +
-  env-var merging. Pure data + parsing; biggest unblocking win for everything
-  downstream (providers, gateway, tools all read config).
-- **Slice 4 (security core):** port `src/security/{policy,pairing,secrets,traits}.rs`
-  — the iOS-relevant subset (skip landlock/firejail/bubblewrap/docker which are
-  desktop-Linux sandboxing only).
-- **Slice 5 (memory backends):** port `src/memory/sqlite.rs` (66K — the
-  production backend) + `markdown.rs`. These are the real persistence path.
-- **Slice 6 (feed/mod.rs):** port the network-heavy 5,601-line Bluesky/Nostr/RSS
-  layer. Largest single chunk.
-- **Slice 7 (FFI):** expose rank_candidates, Memory, EmbeddingProvider behind a
-  C ABI; wire Swift callbacks for the embedder; parse `feed_item_json`.
-- **Later:** iOS native shell (SwiftUI + Zig staticlib), drop Tauri, remove
-  desktop/CLI/gateway surfaces, CI surgery.
+The port is feature-complete for the shipped iOS app and the Rust originals
+have been removed. The C ABI surface in `ffi.zig` is wired end-to-end with the
+Swift shell, on-device LLM inference works through the vendored llama.cpp
+(CPU backend), and the SQLite + markdown memory backends are the production
+persistence path. No "next slices" remain against the original Rust spec —
+net-new work goes directly in Zig + Swift.
