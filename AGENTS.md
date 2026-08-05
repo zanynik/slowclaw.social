@@ -27,8 +27,6 @@ The workspace lets a single user:
 
 > **🎯 iOS is the primary and only target.** macOS/desktop, the CLI, gateway, and daemon surfaces from the earlier Rust-era fork have been removed. When adding AI-powered features (generation, extraction, synthesis, summarization, transcription), **default to the on-device path** — the Zig core's `local_inference.zig` (llama.cpp/GGUF) and the Swift `SpeechTranscriber.swift` (iOS `SFSpeechRecognizer`). Treat the on-device LLM + journal synthesis + TweetClaw-style post drafting as the **reference pattern** for any new AI feature.
 
-> **📖 Canonical product thesis.** [`docs/vision-contract.md`](docs/vision-contract.md) (where present) is the authoritative statement of the vision (three loops; journal-is-the-lens; audio-first capture; local-first AI; open publishing; read-only ingestion incl. video/YouTube). This section is a summary; when they appear to conflict, the vision contract wins.
-
 - Repo: `slowclaw.social`
 - iOS bundle id: `com.slowclaw.app`, product name **SlowClaw Social**
 
@@ -43,16 +41,9 @@ The workspace lets a single user:
    - `project.yml` is the XcodeGen spec; the `.xcodeproj` is **not** in git and is regenerated on demand.
    - The Xcode pre-build script runs `zig build` automatically for the right target (sim vs device).
 
-### Legacy identifiers still in code (do NOT "fix" opportunistically)
-
-These are intentional legacy names carried over from the fork. Renaming any of them is a **separate, tracked migration** with its own blast radius — never bundle a rename into an unrelated change:
-
-- Library artifact name `libslowclaw_feed.a` (and the Zig package name `slowclaw_feed`) — historical; the shipped app is **SlowClaw Social**.
-- Any `zeroclaw` / `ZEROCLAW_*` identifiers that may still appear in vendored or test fixtures.
-
 ### Product direction (merge gate)
 
-Treat the product description in [`README.md`](README.md) and any vision-contract doc as merge gates, not commentary. The pipeline is the **three loops**: **multimodal capture (audio-first, on-device) → journal-driven curation (the journal is the lens; articles + news + video incl. YouTube) → draft review → open publishing/ingestion (Nostr / RSS / Atom).** Video/YouTube is a first-class *ingestion* source (read-only) while the user's own content and publishing stay open-protocol-bound. Reject changes that add cognitive load, fragmented UX, or closed-platform lock-in without a documented user-value reason. New ranking/curation surfaces must be journal-driven (or justify the exception).
+The pipeline is the **three loops**: **multimodal capture (audio-first, on-device) → journal-driven curation (the journal is the lens; articles + news + video incl. YouTube) → draft review → open publishing/ingestion (Nostr / RSS / Atom).** Video/YouTube is a first-class *ingestion* source (read-only) while the user's own content and publishing stay open-protocol-bound. Reject changes that add cognitive load, fragmented UX, or closed-platform lock-in without a documented user-value reason. New ranking/curation surfaces must be journal-driven (or justify the exception).
 
 ---
 
@@ -102,13 +93,7 @@ Reliable CI and low-latency triage depend on deterministic behavior. Prefer repr
 ### 3.8 Reversibility + Rollback-First Thinking
 Keep changes easy to revert (small scope, clear blast radius). For risky changes, define the rollback path before merge. Avoid mixed mega-patches that block safe rollback.
 
-### 3.9 Product Vision Alignment (Required)
-- Treat the README product description and any vision-contract doc as merge gates.
-- Reject changes that add cognitive load, fragmented UX, or avoidable configuration without a documented user-value reason.
-- Prefer open protocols (Nostr, RSS, Atom) over closed-platform lock-in for core surfaces.
-- Preserve the product pipeline direction: multimodal capture → transform → curation → draft review → open publishing/ingestion.
-
-### 3.10 Proven → Better → New (Feature Prioritization Methodology)
+### 3.9 Proven → Better → New (Feature Prioritization Methodology)
 
 The thesis: **novelty alone almost always fails.** When scoping a new feature, work the axes in order — do not jump straight to "New":
 
@@ -191,13 +176,6 @@ When uncertain, classify as higher risk.
 - If the change is large, split into multiple small commits (each independently buildable), per §3.8.
 - Re-confirm the current branch with `git rev-parse --abbrev-ref HEAD` before committing if in doubt.
 
-### 6.1.2 Never Trigger CI/CD or TestFlight Automatically (Required)
-**Agents must NEVER trigger release workflows (TestFlight or any `.github/workflows/*` run) automatically — not after a commit, not after a push, not as a "convenience".** Triggering a build is an explicit, human-only decision.
-- This includes `gh workflow run`, `workflow_dispatch`, pushing to trigger a `push:`-gated workflow intentionally, or any equivalent.
-- Builds cost real money (macOS runners), consume Apple signing-certificate slots, and land in TestFlight where they're visible to testers.
-- If the user says "ship it", "deploy", "release", "trigger TestFlight", or explicitly names a workflow, that is authorization for that one run only.
-- Pushing the branch is the checkpoint (per §6.1.1). The human decides when to build/release.
-
 ### 6.2 Code Naming Contract (Required)
 - Zig casing: modules/files `snake_case.zig`, types `PascalCase`, functions/variables `snake_case`, constants `SCREAMING_SNAKE_CASE`.
 - FFI export prefix: `slowclaw_feed_*` (lowercase, stable, C-callable).
@@ -244,9 +222,6 @@ cd ios-app && xcodegen generate
 open SlowClaw.xcodeproj      # run on simulator or device
 ```
 The Xcode pre-build script runs `zig build` automatically for the right target.
-
-### TestFlight (CI — human-triggered only, per §6.1.2)
-`.github/workflows/pub-testflight-zig.yml` — do not trigger automatically.
 
 ### Additional expectations by change type
 - **FFI change:** update `zig-src/src/ffi.zig` and `ios-app/SlowClawFeed/include/slowclaw_feed.h` together; add a `test-ffi` case.
