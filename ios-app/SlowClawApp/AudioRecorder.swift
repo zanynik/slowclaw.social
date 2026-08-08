@@ -74,8 +74,6 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     /// The live on-device transcription session (nil when not recording).
     private var liveSession: SpeechTranscriber.LiveSession?
-    /// Converts mic-format buffers to the analyzer format (set on start).
-    private var analyzerConverter: AVAudioConverter?
 
     /// Mutable state shared between the main actor (start/stop) and the
     /// audio-thread tap closure (which writes buffers + feeds the analyzer).
@@ -179,7 +177,7 @@ final class AudioRecorder: NSObject, ObservableObject {
                     // whole journal.
                 }
                 // Feed the analyzer the same buffer (converted to its format).
-                if let sessionRef, let converter = sessionRef.analyzerConverter as AVAudioConverter? {
+                if let sessionRef, let converter = pipe.converter {
                     sessionRef.process(Self.convert(buffer, with: converter))
                 }
                 // Level meter: compute RMS (pure) and throttle the main-actor
@@ -246,7 +244,7 @@ final class AudioRecorder: NSObject, ObservableObject {
                 do {
                     try pipe.audioFile?.write(from: buffer)
                 } catch {}
-                if let sessionRef, let converter = sessionRef.analyzerConverter as AVAudioConverter? {
+                if let sessionRef, let converter = pipe.converter {
                     sessionRef.process(Self.convert(buffer, with: converter))
                 }
                 let now = DispatchTime.now().uptimeNanoseconds
@@ -312,7 +310,7 @@ final class AudioRecorder: NSObject, ObservableObject {
         // updates the entry.
         let session = liveSession
         liveSession = nil
-        analyzerConverter = nil
+        shared.converter = nil
         Task { await session?.stop() }
     }
 
@@ -336,7 +334,9 @@ final class AudioRecorder: NSObject, ObservableObject {
             // transcription; the caller stores a placeholder on save.
             return
         }
-        analyzerConverter = AVAudioConverter(from: micFormat, to: session.analyzerFormat)
+        // Store the mic→analyzer converter on the shared (non-isolated) holder
+        // so the audio-thread tap can read it without crossing actor isolation.
+        shared.converter = AVAudioConverter(from: micFormat, to: session.analyzerFormat)
         liveSession = session
         session.start()
     }
@@ -553,6 +553,9 @@ final class AudioRecorder: NSObject, ObservableObject {
 /// the tap's lifetime, so the two sides never mutate the same field concurrently.
 final class AudioPipeState: @unchecked Sendable {
     var audioFile: AVAudioFile?
+    /// Mic→analyzer format converter, set when the live session starts. Read
+    /// from the audio-thread tap to feed converted buffers to the analyzer.
+    var converter: AVAudioConverter?
     /// Last level-publish timestamp (uptime nanoseconds); throttles meter
     /// updates from the audio-thread tap to ~10 Hz.
     var lastLevelTs: UInt64 = 0

@@ -671,10 +671,20 @@ final class AppState: ObservableObject {
     /// The audio recorder passes source="audio_recorded" + the m4a path so the
     /// entry links back to its durable audio file for replay.
     func storeJournal(text: String, source: String?, mediaURL: String?) async {
-        try? memory.store(key: "journal_\(Date().timeIntervalSince1970)", content: text,
+        _ = await storeJournalNow(text: text, source: source, mediaURL: mediaURL)
+    }
+
+    /// Like storeJournal, but returns the generated key so the caller can upsert
+    /// the same entry later (used by auto-save-on-stop: the journal is stored
+    /// immediately with a placeholder, then the transcript lands and the key is
+    /// updated via storeJournalUpdate).
+    @discardableResult
+    func storeJournalNow(text: String, source: String?, mediaURL: String?) async -> String {
+        let key = "journal_\(Date().timeIntervalSince1970)"
+        try? memory.store(key: key, content: text,
                           category: "daily", sessionID: nil, source: source, mediaURL: mediaURL)
         await refreshJournals()
-        guard anyLLMAvailable else { return }
+        guard anyLLMAvailable else { return key }
         Task.detached(priority: .utility) {
             if let keywords = try? await self.aiExtractInterests(from: text) {
                 await MainActor.run {
@@ -682,7 +692,104 @@ final class AppState: ObservableObject {
                 }
             }
         }
+        return key
     }
+
+    /// Upsert an existing journal entry's content, preserving its provenance
+    /// (source / media_url / category / sessionID). Used to fill in a transcript
+    /// after the entry was auto-saved with a placeholder.
+    func storeJournalUpdate(key: String, content: String) async {
+        guard let existing = try? memory.get(key: key) else { return }
+        try? memory.store(key: key, content: content, category: existing.category,
+                          sessionID: existing.sessionID, source: existing.source, mediaURL: existing.mediaURL)
+        await refreshJournals()
+    }
+
+    /// Shared placeholder body stored when an audio journal is saved before its
+    /// transcript has landed. The journal row shows a spinner while the content
+    /// equals this; the background drain (or a late final) replaces it.
+    static let transcribingPlaceholder = "🎙 Audio journal — transcribing…"
+
+    /// True iff an entry's content is the transcribing placeholder (a journal
+    /// saved before its transcript landed). Drives the per-row loader.
+    static func isTranscribingPlaceholder(_ content: String?) -> Bool {
+        guard let content else { return false }
+        return content.trimmingCharacters(in: .whitespacesAndNewlines) == transcribingPlaceholder
+    }
+
+    // MARK: - Pending transcription queue
+
+    /// A journal saved before its transcript landed, awaiting on-device
+    /// transcription. Persisted to disk so it survives the app being killed
+    /// and is drained by a background task or on next launch.
+    struct PendingTranscription: Codable, Equatable {
+        let key: String
+        let mediaPath: String
+    }
+
+    /// File URL of the on-disk pending-transcription queue (Documents).
+    static var pendingTranscriptionsURL: URL? {
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        return docs.appendingPathComponent("pending_transcriptions.json")
+    }
+
+    /// Add a journal to the pending-transcription queue (persisted to disk).
+    /// Called by auto-save when the transcript wasn't ready at stop. The queue
+    /// is drained by drainPendingTranscriptions() (BGTask / launch).
+    func enqueuePendingTranscription(key: String, mediaPath: String) async {
+        guard let url = Self.pendingTranscriptionsURL else { return }
+        var items = Self.loadPendingTranscriptions(at: url)
+        let entry = PendingTranscription(key: key, mediaPath: mediaPath)
+        if !items.contains(entry) { items.append(entry) }
+        Self.savePendingTranscriptions(items, at: url)
+        // Try to drain immediately (foreground) — usually the asset is warm and
+        // the transcript lands within a couple seconds.
+        await drainPendingTranscriptions()
+    }
+
+    /// Transcribe every queued journal and update its content, removing each
+    /// from the queue as it completes. Safe to call from any context; no-ops
+    /// when the queue is empty. Runs each transcription off the main actor.
+    func drainPendingTranscriptions() async {
+        guard let url = Self.pendingTranscriptionsURL else { return }
+        var items = Self.loadPendingTranscriptions(at: url)
+        guard !items.isEmpty else { return }
+
+        for entry in items {
+            guard let absURL = AudioRecorder.absoluteURL(forMediaRelativePath: entry.mediaPath),
+                  FileManager.default.fileExists(atPath: absURL.path) else {
+                // File gone — drop the pending entry so it doesn't wedge.
+                continue
+            }
+            let transcript = await Task.detached(priority: .userInitiated) {
+                await SpeechTranscriber.transcribe(url: absURL)
+            }.value
+            let body = transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "🎙 Audio journal (no transcript)"
+                : transcript
+            await storeJournalUpdate(key: entry.key, content: body)
+        }
+        // All drained — clear the queue file.
+        Self.savePendingTranscriptions([], at: url)
+    }
+
+    /// Load the pending-transcription queue from disk (empty on any error).
+    static func loadPendingTranscriptions(at url: URL) -> [PendingTranscription] {
+        guard let data = try? Data(contentsOf: url),
+              let items = try? JSONDecoder().decode([PendingTranscription].self, from: data) else {
+            return []
+        }
+        return items
+    }
+
+    /// Persist the pending-transcription queue to disk (atomic).
+    static func savePendingTranscriptions(_ items: [PendingTranscription], at url: URL) {
+        guard let data = try? JSONEncoder().encode(items) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
 
     func generateDraft(from journal: SlowClawMemoryEntry) async {
         guard anyLLMAvailable else { return }
@@ -938,17 +1045,28 @@ struct BottomNav: View {
 
 // MARK: - Journal helpers (shared by the list, detail, and sidebar)
 
-/// First non-empty line of the entry = its display title.
+/// First non-empty line of the entry = its display title. A lone transcribing
+/// placeholder (no user title) shows "New Recording" (Voice Memos style).
 func journalTitleOf(_ entry: SlowClawMemoryEntry) -> String {
-    let first = entry.content.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? entry.content
-    return first.trimmingCharacters(in: .whitespaces).isEmpty ? "Untitled" : first.trimmingCharacters(in: .whitespaces)
+    let lines = entry.content.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+    let first = lines.first ?? entry.content
+    let title = first.trimmingCharacters(in: .whitespaces)
+    // Placeholder-only entry (no user title) → Voice-Memos-style default.
+    if AppState.isTranscribingPlaceholder(title) {
+        return "New Recording"
+    }
+    return title.isEmpty ? "Untitled" : title
 }
 
-/// A short single-line preview after the title.
+/// A short single-line preview after the title. A transcribing entry shows
+/// "Transcribing…" instead of the raw placeholder text.
 func journalPreviewOf(_ entry: SlowClawMemoryEntry) -> String {
     let lines = entry.content.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
     let body = lines.dropFirst().joined(separator: " ")
     let trimmed = body.trimmingCharacters(in: .whitespaces)
+    if AppState.isTranscribingPlaceholder(trimmed) {
+        return "Transcribing…"
+    }
     return String(trimmed.prefix(60))
 }
 
@@ -1730,9 +1848,6 @@ struct JournalView: View {
     @State private var search = ""
     @State private var selectedDetail: SlowClawMemoryEntry?
     @State private var showCompose = false
-    /// Opens the post-stop recording review (player + title + transcript) as
-    /// a fullscreen cover. Set true the moment a recording finishes.
-    @State private var reviewingRecording = false
 
     /// First-entry rotating prompts (one per day-of-month). Shown in the empty
     /// state hero.
@@ -1765,22 +1880,60 @@ struct JournalView: View {
         }
         .background(DS.bg(scheme))
         .task { await state.refreshJournals() }
-        // Open the recording review the instant a recording finishes (whether
-        // or not transcription has completed). The review view shows the player
-        // + an auto date/time title + "Transcribing…" inline in the transcript
-        // area until on-device recognition finishes — no more blank spinner.
+        // Voice-Memos flow: the moment a recording finishes, auto-save the
+        // journal with the transcript-so-far (or a "transcribing…" placeholder
+        // when the live transcript produced nothing yet) and return to the
+        // list. No review gate. The row shows a spinner until the transcript
+        // lands; the user edits from the list afterward.
         .onChange(of: recorder.isRecording) { _, nowRecording in
-            if !nowRecording && recorder.recordedFileURL != nil && !reviewingRecording {
-                reviewingRecording = true
+            if !nowRecording, let url = recorder.recordedFileURL {
+                autoSaveRecording(fileURL: url)
             }
-        }
-        .fullScreenCover(isPresented: $reviewingRecording) {
-            RecordingReviewView(recorder: recorder)
-                .environmentObject(state)
         }
         .sheet(isPresented: $showCompose) {
             TextComposeSheet()
                 .environmentObject(state)
+        }
+    }
+
+    /// Auto-save a finished recording as a journal immediately (Voice Memos).
+    /// The transcript-so-far is used if present; otherwise a placeholder is
+    /// stored and the entry is enqueued for background transcription, so the
+    /// row shows a spinner and fills in when the transcript lands.
+    private func autoSaveRecording(fileURL: URL) {
+        let mediaURL = AudioRecorder.documentsRelativePath(for: fileURL)
+        let title = recorder.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let transcript = recorder.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasTranscript = !transcript.isEmpty
+
+        // Body = title (if any) on the first line, then transcript/placeholder.
+        let body: String
+        if hasTranscript {
+            body = title.isEmpty ? transcript : "\(title)\n\n\(transcript)"
+        } else {
+            body = title.isEmpty
+                ? AppState.transcribingPlaceholder
+                : "\(title)\n\n\(AppState.transcribingPlaceholder)"
+        }
+
+        // Snapshot recorder state before clearing it.
+        let recordedURL = recorder.recordedFileURL
+
+        Task {
+            let key = await state.storeJournalNow(text: body,
+                                                  source: "audio_recorded",
+                                                  mediaURL: mediaURL)
+            // If the transcript wasn't ready at stop, enqueue the audio for
+            // background transcription so the placeholder resolves later.
+            if !hasTranscript, let url = recordedURL {
+                await state.enqueuePendingTranscription(key: key, mediaPath: mediaURL)
+            }
+            // Reset recorder state for the next recording.
+            await MainActor.run {
+                recorder.recordedFileURL = nil
+                recorder.transcript = ""
+                recorder.title = ""
+            }
         }
     }
 
@@ -1865,16 +2018,26 @@ struct JournalView: View {
         }
     }
 
-    /// One list row: waveform glyph (audio) + title + time + preview.
+    /// One list row: waveform glyph (audio) + title + time + preview. When the
+    /// entry is still being transcribed (placeholder body), shows a circular
+    /// loader + "Transcribing…" so the user sees the transcript is pending.
     private func journalRow(_ entry: SlowClawMemoryEntry) -> some View {
         let isAudio = entry.source?.hasPrefix("audio") == true
+        let transcribing = AppState.isTranscribingPlaceholder(entry.content)
         return HStack(alignment: .top, spacing: 12) {
-            // Audio glyph / waveform mini.
-            Image(systemName: isAudio ? "waveform" : "text.alignleft")
-                .font(.system(size: 16))
-                .foregroundStyle(isAudio ? DS.accent2Color : DS.muted(scheme))
-                .frame(width: 24, height: 24)
-                .padding(.top, 2)
+            // Audio glyph / waveform mini — or a spinner while transcribing.
+            if transcribing {
+                ProgressView()
+                    .scaleEffect(0.7)
+                    .frame(width: 24, height: 24)
+                    .padding(.top, 2)
+            } else {
+                Image(systemName: isAudio ? "waveform" : "text.alignleft")
+                    .font(.system(size: 16))
+                    .foregroundStyle(isAudio ? DS.accent2Color : DS.muted(scheme))
+                    .frame(width: 24, height: 24)
+                    .padding(.top, 2)
+            }
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline) {
