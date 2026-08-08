@@ -150,7 +150,7 @@ final class AudioRecorder: NSObject, ObservableObject {
             // layout from AVNumberOfChannelsKey. Writing AAC into an .m4a keeps
             // the file small and playable everywhere.
             let fileSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AC,
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVSampleRateKey: micFormat.sampleRate,
                 AVNumberOfChannelsKey: micFormat.channelCount,
                 AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,

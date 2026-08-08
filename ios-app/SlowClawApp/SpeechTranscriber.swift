@@ -60,7 +60,9 @@ enum Transcriber {
             attributeOptions: []
         )
         let analyzer = SpeechAnalyzer(modules: [transcriber])
-        let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+            return ""
+        }
         guard let converter = AVAudioConverter(from: file.processingFormat, to: analyzerFormat) else {
             return ""
         }
@@ -181,7 +183,9 @@ enum Transcriber {
             attributeOptions: []
         )
         let analyzer = SpeechAnalyzer(modules: [transcriber])
-        let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+            return nil
+        }
         let (inputStream, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
         return LiveSession(transcriber: transcriber,
                            analyzer: analyzer,
