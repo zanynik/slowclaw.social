@@ -56,6 +56,14 @@
     <array>
         <string>audio</string>
     </array>
+    <!-- Permitted background task identifiers. The transcription task lets iOS
+         resume on-device transcription of an audio journal that was auto-saved
+         before its transcript landed, even after the app was killed. Best-effort
+         (OS-gated). Registered in ShareURLDelegate at launch. -->
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array>
+        <string>com.slowclaw.app.transcription</string>
+    </array>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>

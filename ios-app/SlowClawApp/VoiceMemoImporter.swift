@@ -23,6 +23,7 @@
 // coordination thread-safe.
 
 import Foundation
+import UIKit
 
 /// One pending import. `url` is the copied-into-Inbox destination (already
 /// on disk, so it survives app backgrounding/crash before transcription).
@@ -131,13 +132,19 @@ final class VoiceMemoImporter: ObservableObject {
                     continue
                 }
 
-                // Transcribe off the main actor (segmenting + recognition is
+                // Transcribe off the main actor (SpeechAnalyzer recognition is
                 // blocking). SpeechTranscriber returns "" if on-device speech
-                // is unavailable for the locale.
+                // is unavailable for the locale. Wrap in a background-task
+                // assertion so iOS grants CPU time to finish if the app
+                // backgrounds mid-import (~30s).
                 let url = next.url
+                let bgID = UIApplication.shared.beginBackgroundTask(withName: "slowclaw.voiceMemo.import")
                 let transcript = await Task.detached(priority: .userInitiated) {
                     await SpeechTranscriber.transcribe(url: url)
                 }.value
+                if bgID != .invalid {
+                    UIApplication.shared.endBackgroundTask(bgID)
+                }
 
                 // Auto-store: the file is on disk and must become a journal
                 // entry regardless of whether speech produced text. The user

@@ -347,12 +347,12 @@ fn collectLlamaSources(b: *std.Build, target: std.Build.ResolvedTarget) LlamaSou
 /// Build libllama.a for iOS with Apple's toolchain (xcrun clang/clang++). This
 /// is REQUIRED for the device: zig's bundled libc++ 21.1 headers emit
 /// references to runtime internals (e.g. std::__1::__hash_memory) that do not
-/// exist in iOS 17/18's libc++.1.dylib, so an app linking zig-compiled llama
+/// exist in iOS's libc++.1.dylib, so an app linking zig-compiled llama
 /// objects aborts at launch (dyld "Symbol missing"). Compiling with
-/// `-target arm64-apple-ios17.0 -isysroot <sdk>` uses Apple's own patched
+/// `-target arm64-apple-ios26.0 -isysroot <sdk>` uses Apple's own patched
 /// libc++ headers and the deployment target, which emit only runtime-
 /// compatible symbols. Apple's `libtool` writes 8-byte-aligned members, so the
-/// result needs no Zig-archive repack. The deployment target (17.0) must match
+/// result needs no Zig-archive repack. The deployment target (26.0) must match
 /// ios-app/project.yml.
 fn buildLlamaCppIOS(
     b: *std.Build,
@@ -362,7 +362,7 @@ fn buildLlamaCppIOS(
 ) std.Build.LazyPath {
     const sources = collectLlamaSources(b, target);
     const is_sim = std.mem.indexOf(u8, ios_sysroot, "Simulator") != null;
-    const triple: []const u8 = if (is_sim) "arm64-apple-ios17.0-simulator" else "arm64-apple-ios17.0";
+    const triple: []const u8 = if (is_sim) "arm64-apple-ios26.0-simulator" else "arm64-apple-ios26.0";
     const opt_flag: []const u8 = switch (optimize) {
         .Debug => "-O0",
         .ReleaseFast, .ReleaseSafe => "-O3",
