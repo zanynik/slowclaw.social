@@ -21,7 +21,7 @@ name: SlowClaw
 options:
   bundleIdPrefix: com.slowclaw
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "26.0"
   createIntermediateGroups: true
   generateEmptyDirectories: true
 
@@ -36,7 +36,7 @@ settings:
     # sqlite3_* symbols, and local_inference.zig references the llama_* symbols.
     # -lc++: llama.cpp is compiled for iOS by Apple's toolchain (xcrun clang++),
     # so its objects reference Apple's libc++ — linked here. zig's bundled
-    # libc++ 21.1 is ABI-incompatible with the iOS 17/18 device runtime
+    # libc++ 21.1 is ABI-incompatible with the iOS device runtime
     # (emits internals like __hash_memory that dyld can't resolve at launch).
     OTHER_LDFLAGS: "-lslowclaw_feed -lsqlite3 -lllama -lc++"
     LIBRARY_SEARCH_PATHS: "$(SRCROOT)/../zig-src/zig-out/lib"
@@ -48,7 +48,7 @@ targets:
   SlowClaw:
     type: application
     platform: iOS
-    deploymentTarget: "17.0"
+    deploymentTarget: "26.0"
     sources:
       - path: SlowClawApp
       - path: SlowClawFeed/Sources/SlowClawFeed
