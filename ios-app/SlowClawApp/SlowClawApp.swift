@@ -758,11 +758,13 @@ final class AppState: ObservableObject {
     /// Shared placeholder body stored when an audio journal is saved before its
     /// transcript has landed. The journal row shows a spinner while the content
     /// equals this; the background drain (or a late final) replaces it.
-    static let transcribingPlaceholder = "🎙 Audio journal — transcribing…"
+    /// nonisolated so it's callable from free helpers (journalTitleOf etc.).
+    nonisolated static let transcribingPlaceholder = "🎙 Audio journal — transcribing…"
 
     /// True iff an entry's content is the transcribing placeholder (a journal
     /// saved before its transcript landed). Drives the per-row loader.
-    static func isTranscribingPlaceholder(_ content: String?) -> Bool {
+    /// nonisolated so it's callable from free helpers (journalTitleOf etc.).
+    nonisolated static func isTranscribingPlaceholder(_ content: String?) -> Bool {
         guard let content else { return false }
         return content.trimmingCharacters(in: .whitespacesAndNewlines) == transcribingPlaceholder
     }
