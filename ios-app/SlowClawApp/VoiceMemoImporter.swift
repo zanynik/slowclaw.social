@@ -140,7 +140,7 @@ final class VoiceMemoImporter: ObservableObject {
                 let url = next.url
                 let bgID = UIApplication.shared.beginBackgroundTask(withName: "slowclaw.voiceMemo.import")
                 let transcript = await Task.detached(priority: .userInitiated) {
-                    await SpeechTranscriber.transcribe(url: url)
+                    await Transcriber.transcribe(url: url)
                 }.value
                 if bgID != .invalid {
                     UIApplication.shared.endBackgroundTask(bgID)

@@ -814,7 +814,7 @@ final class AppState: ObservableObject {
                 continue
             }
             let transcript = await Task.detached(priority: .userInitiated) {
-                await SpeechTranscriber.transcribe(url: absURL)
+                await Transcriber.transcribe(url: absURL)
             }.value
             let body = transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "🎙 Audio journal (no transcript)"
@@ -1682,9 +1682,10 @@ struct JournalView: View {
                                                   source: "audio_recorded",
                                                   mediaURL: mediaURL)
             // If the transcript wasn't ready at stop, enqueue the audio for
-            // background transcription so the placeholder resolves later.
-            if !hasTranscript, let url = recordedURL {
-                await state.enqueuePendingTranscription(key: key, mediaPath: mediaURL)
+            // background transcription so the placeholder resolves later. Only
+            // enqueue when there's a media path to transcribe from.
+            if !hasTranscript, recordedURL != nil, let mediaPath = mediaURL {
+                await state.enqueuePendingTranscription(key: key, mediaPath: mediaPath)
             }
             // Reset recorder state for the next recording.
             await MainActor.run {

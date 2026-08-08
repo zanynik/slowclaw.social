@@ -73,7 +73,7 @@ final class AudioRecorder: NSObject, ObservableObject {
     private var tapInstalled = false
 
     /// The live on-device transcription session (nil when not recording).
-    private var liveSession: SpeechTranscriber.LiveSession?
+    private var liveSession: Transcriber.LiveSession?
 
     /// Mutable state shared between the main actor (start/stop) and the
     /// audio-thread tap closure (which writes buffers + feeds the analyzer).
@@ -323,7 +323,7 @@ final class AudioRecorder: NSObject, ObservableObject {
     /// up the format converter from the mic format. On final results, appends
     /// to `transcript`. No-op (graceful) if the locale asset is unavailable.
     private func beginLiveSession(micFormat: AVAudioFormat) async {
-        let session = await SpeechTranscriber.makeLiveSession { [weak self] chunk in
+        let session = await Transcriber.makeLiveSession { [weak self] chunk in
             // Append finalized chunk to the running transcript.
             guard let self else { return }
             let combined = self.transcript.isEmpty ? chunk : "\(self.transcript) \(chunk)"
@@ -360,8 +360,9 @@ final class AudioRecorder: NSObject, ObservableObject {
             return buffer
         }
         var error: NSError?
-        let written = converter.convert(to: out, error: &error, withInputFrom: inputBlock)
-        return written > 0 ? out : buffer
+        let status = converter.convert(to: out, error: &error, withInputFrom: inputBlock)
+        // Return the converted buffer only when conversion produced data.
+        return (status == .haveData || out.frameLength > 0) ? out : buffer
     }
 
     // MARK: - Wall-clock timer
