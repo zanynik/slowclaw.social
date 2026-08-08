@@ -1,265 +1,259 @@
-// SpeechTranscriber.swift — on-device transcription of an audio file.
+// SpeechTranscriber.swift — on-device transcription via the modern Speech
+// framework (iOS 26+ SpeechAnalyzer / SpeechTranscriber).
 //
-// Ports the proven segmentation logic from the reference Tauri app's
-// web/src-tauri/ios/SpeechTranscriber/SpeechTranscriber.swift. On-device
-// SFSpeechRecognizer has a hard ~60-second limit per recognitionTask; for
-// files longer than that a single request can be truncated or fail silently.
-// Fix: split the file into ≤50s segments and run one SFSpeechURLRecognitionRequest
-// per segment, concatenating the finals.
+// Replaces the legacy SFSpeech* request-per-file approach. SpeechAnalyzer
+// streams results as buffers are fed in, with no per-task ~60s ceiling and no
+// file segmentation — so long audio journals transcribe in full instead of
+// being silently truncated at segment boundaries. This is the on-device path
+// (Apple Intelligence); audio never leaves the device.
 //
-// Audio never leaves the device (requiresOnDeviceRecognition = true). If the
-// locale lacks on-device support, returns an empty string (the caller decides
-// whether to store the audio without a transcript).
+// Two entry points:
+//   - transcribe(url:)            — transcribe an existing audio FILE to a
+//                                   final string (used by VoiceMemoImporter).
+//   - makeLiveSession(onFinal:)   — a streaming session the AudioRecorder
+//                                   feeds from its AVAudioEngine tap during
+//                                   capture; finals accumulate via onFinal.
+//
+// Permission: SpeechAnalyzer still requires SFSpeechRecognizer authorization,
+// so callers request it before starting a session.
 
 import Foundation
 import AVFoundation
 import Speech
 
-/// On-device transcription of an audio file at `url`. Returns the concatenated
-/// transcript, or "" if no speech was recognized / on-device unavailable.
-///
-/// Thread-safe: runs the blocking semaphore-based recognition on the calling
-/// thread. Callers should `await` it off the main actor (e.g. inside a
-/// `Task.detached` or `Task { await ... }` from MainActor).
+/// On-device speech transcription backed by SpeechAnalyzer (iOS 26+).
 enum SpeechTranscriber {
-    /// Max segment length. Well below the ~60s per-task SFSpeech ceiling with
-    /// margin (40s) so even a slow recognizer can finish before the cap.
-    private static let segmentSeconds: TimeInterval = 40
-    /// Per-segment safety timeout so a stuck recognizer can't wedge a batch.
-    private static let segmentTimeout: Int = 180
-    /// Last diagnostic: how many segments were processed. Observable for
-    /// surfacing in the UI / status when debugging truncation.
-    @MainActor static var lastSegmentCount: Int = 0
-
-    /// Outcome of recognizing a single segment.
-    private enum SegmentOutcome {
-        case text(String)
-        case noSpeech
-        case error
-        case timedOut
+    /// Best-effort ensure the on-device language asset for the current locale
+    /// is installed. SpeechAnalyzer's models aren't bundled and may need a
+    /// one-time download. Returns false if the locale can't be satisfied.
+    static func ensureLocaleAsset() async -> Bool {
+        let target = Locale.current.identifier(.bcp47)
+        let installed = await Set(SpeechTranscriber.installedLocales.map { $0.identifier(.bcp47) })
+        if installed.contains(target) { return true }
+        let req = AssetInventory.assetInstallationRequest(supporting: [SpeechTranscriber.self])
+        do {
+            try await req.downloadAndInstall()
+            return true
+        } catch {
+            return false
+        }
     }
 
-    static func transcribe(url: URL) async -> String {
-        guard let recognizer = SFSpeechRecognizer(locale: Locale.current),
-              recognizer.isAvailable,
-              recognizer.supportsOnDeviceRecognition else {
-            // No on-device model for this locale — can't transcribe locally.
-            return ""
-        }
+    // MARK: - File transcription (VoiceMemoImporter + background-drain path)
 
-        // Start security-scoped access (share-sheet URLs may need it).
+    /// Transcribe an existing audio file at `url` to a single string on-device.
+    /// Returns "" if on-device speech is unavailable / nothing was recognized.
+    /// Reads the file's PCM buffers and feeds them to a SpeechAnalyzer session,
+    /// accumulating final results. Replaces the legacy 40s-segment + semaphore
+    /// approach that could silently drop segments.
+    ///
+    /// Thread-safe: blocking recognition runs on the calling thread; callers
+    /// await it off the main actor (e.g. inside a Task.detached).
+    static func transcribe(url: URL) async -> String {
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
 
-        // Decide whether to segment. We must split long audio because on-device
-        // SFSpeechRecognizer truncates a single recognitionTask to ~60s. Decide
-        // from the FRAME COUNT (via AVAudioFile.length), NOT from the container's
-        // duration metadata: m4a files written live by AVAudioFile often lack a
-        // readable duration track immediately after close, so audioDuration-
-        // Seconds returns 0 and segmentation never triggers — that was the root
-        // cause of "only the last few lines were transcribed." Frame count is
-        // deterministic and container-independent.
-        let needsSegmenting: Bool
-        if let probe = try? AVAudioFile(forReading: url) {
-            let sampleRate = probe.processingFormat.sampleRate
-            let totalFrames = probe.length
-            if sampleRate > 0 {
-                let duration = Double(totalFrames) / sampleRate
-                needsSegmenting = duration > segmentSeconds
-            } else {
-                // Fallback: if the format is unreadable, trust container metadata.
-                needsSegmenting = audioDurationSeconds(url) > segmentSeconds
-            }
-        } else {
-            // Can't open to probe — try container duration, else single-shot.
-            needsSegmenting = audioDurationSeconds(url) > segmentSeconds
-        }
-
-        var tempDir: URL? = nil
-        let segmentURLs: [URL]
-        if needsSegmenting {
-            let (segs, dir) = splitAudioIntoSegments(url, maxSeconds: segmentSeconds)
-            segmentURLs = segs
-            tempDir = dir
-        } else {
-            segmentURLs = [url]
-        }
-        defer {
-            if let dir = tempDir { try? FileManager.default.removeItem(at: dir) }
-        }
-
-        guard !segmentURLs.isEmpty else {
-            await MainActor.run { Self.lastSegmentCount = 0 }
-            return ""
-        }
-
-        // Recognize each segment sequentially, concatenating finals.
-        var parts: [String] = []
-        for segmentURL in segmentURLs {
-            switch recognizeSingleSegment(at: segmentURL, with: recognizer) {
-            case .text(let s):
-                parts.append(s)
-            case .noSpeech:
-                continue  // skip empty segments; don't fail the whole transcript
-            case .error, .timedOut:
-                // A bad segment shouldn't abort the rest; keep what we have.
-                continue
-            }
-        }
-        await MainActor.run { Self.lastSegmentCount = segmentURLs.count }
-        return parts.joined(separator: " ")
+        guard let audioFile = try? AVAudioFile(forReading: url) else { return "" }
+        return await transcribe(file: audioFile)
     }
 
-    // MARK: - Helpers (ported from the reference SpeechTranscriber.swift)
+    /// Shared file→string transcription used by transcribe(url:) and the
+    /// background drain. Takes an already-opened AVAudioFile.
+    static func transcribe(file: AVAudioFile) async -> String {
+        guard await ensureLocaleAsset() else { return "" }
 
-    /// Read the playback duration of an audio file in seconds. Returns 0 if it
-    /// cannot be determined (caller then takes the single-file path).
-    private static func audioDurationSeconds(_ url: URL) -> TimeInterval {
-        let asset = AVURLAsset(url: url)
-        if let track = asset.tracks(withMediaType: .audio).first {
-            let duration = track.timeRange.duration
-            if duration.isValid, !duration.isIndefinite {
-                return CMTimeGetSeconds(duration)
-            }
-        }
-        let duration = asset.duration
-        if duration.isValid, !duration.isIndefinite {
-            return CMTimeGetSeconds(duration)
-        }
-        return 0
-    }
+        let transcriber = SpeechTranscriber(
+            locale: Locale.current,
+            transcriptionOptions: [],
+            reportingOptions: [],
+            attributeOptions: []
+        )
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+        guard let analyzerFormat else { return "" }
 
-    /// Split an audio file into ≤`maxSeconds` segments written as temporary
-    /// `.caf` files. Returns `(segmentURLs, tempDir)`; the caller removes
-    /// `tempDir`. Returns `([], nil)` if the source can't be opened.
-    private static func splitAudioIntoSegments(_ sourceURL: URL, maxSeconds: TimeInterval) -> ([URL], URL?) {
-        guard let audioFile = try? AVAudioFile(forReading: sourceURL) else {
-            return ([], nil)
-        }
-        let processingFormat = audioFile.processingFormat
-        let totalFrames = AVAudioFramePosition(audioFile.length)
-        guard totalFrames > 0 else { return ([], nil) }
-        let sampleRate = processingFormat.sampleRate
-        let framesPerSegment = AVAudioFramePosition(maxSeconds * sampleRate)
-        guard framesPerSegment > 0 else { return ([], nil) }
-        let segmentCount = Int((totalFrames + framesPerSegment - 1) / framesPerSegment)
+        let (inputStream, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+        let converter = AVAudioConverter(from: file.processingFormat, to: analyzerFormat)
+        guard let converter else { return "" }
 
-        let sessionDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("slowclaw-transcribe-\(UUID().uuidString)", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
-        } catch {
-            return ([], nil)
-        }
-
-        var segmentURLs: [URL] = []
-        var startFrame: AVAudioFramePosition = 0
-        for index in 0..<segmentCount {
-            let remaining = totalFrames - startFrame
-            let chunkFrames = AVAudioFrameCount(min(framesPerSegment, remaining))
-            guard chunkFrames > 0 else { break }
-            guard let readBuffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: chunkFrames) else { break }
-            do {
-                audioFile.framePosition = startFrame
-                try audioFile.read(into: readBuffer, frameCount: chunkFrames)
-            } catch {
-                break
-            }
-            let segmentURL = sessionDir.appendingPathComponent("segment-\(index).caf")
-            do {
-                // Write as CAF in the processing format — lossless and reliably
-                // accepted by SFSpeechURLRecognitionRequest.
-                let outFile = try AVAudioFile(
-                    forWriting: segmentURL,
-                    settings: processingFormat.settings,
-                    commonFormat: processingFormat.commonFormat,
-                    interleaved: processingFormat.isInterleaved
-                )
-                try outFile.write(from: readBuffer)
-            } catch {
-                break
-            }
-            segmentURLs.append(segmentURL)
-            startFrame += AVAudioFramePosition(chunkFrames)
-        }
-        return (segmentURLs, sessionDir)
-    }
-
-    /// Run one recognition task on a single segment URL. Captures the
-    /// best-transcription text from EVERY result callback (iOS often delivers
-    /// the full text in a non-`isFinal` result, then ends with `result == nil`),
-    /// so the prior version that only read `isFinal` results returned nothing
-    /// for most segments — the root cause of "only the last sentence."
-    /// A 0.8s settle after the last result lets late finals arrive.
-    private static func recognizeSingleSegment(
-        at url: URL,
-        with recognizer: SFSpeechRecognizer
-    ) -> SegmentOutcome {
-        let request = SFSpeechURLRecognitionRequest(url: url)
-        request.shouldReportPartialResults = false
-        request.requiresOnDeviceRecognition = true
-        if #available(iOS 16.0, *) {
-            request.addsPunctuation = true
-        }
-
-        let resultSemaphore = DispatchSemaphore(value: 0)
-        final class ResultBox {
-            var text: String?
-            var error: Error?
-        }
-        let box = ResultBox()
-        let settleQueue = DispatchQueue.global(qos: .userInitiated)
-        let settleTimer = DispatchSource.makeTimerSource(queue: settleQueue)
-        var signaled = false
-        let signalOnce: () -> Void = {
-            if !signaled {
-                signaled = true
-                resultSemaphore.signal()
-            }
-        }
-        settleTimer.schedule(deadline: .now() + .seconds(segmentTimeout), repeating: .never)
-        settleTimer.setEventHandler { signalOnce() }
-        settleTimer.activate()
-        func rearmSettle(_ delay: TimeInterval) {
-            settleTimer.schedule(deadline: .now() + delay, repeating: .never)
-        }
-
-        let task = recognizer.recognitionTask(with: request) { result, error in
-            if let error = error {
-                box.error = error
-                settleTimer.cancel()
-                signalOnce()
-                return
-            }
-            if let result = result {
-                // Capture the full running transcript from EVERY result, final
-                // or not. iOS frequently delivers the complete text in a
-                // non-final result and then signals end via result == nil;
-                // reading only isFinal misses it entirely.
-                let text = result.bestTranscription.formattedString
-                if !text.isEmpty { box.text = text }
+        // Accumulate finals as they stream in (off the main actor).
+        let collected = FinalCollector()
+        let recognizerTask = Task {
+            for try await result in transcriber.results {
                 if result.isFinal {
-                    // Final result: arm a short settle for any straggler, then done.
-                    rearmSettle(0.8)
+                    collected.append(String(result.text.characters))
                 }
-            } else {
-                // result == nil, error == nil → recognition finished. Done.
-                settleTimer.cancel()
-                signalOnce()
             }
         }
 
-        let waitResult = resultSemaphore.wait(timeout: .now() + .seconds(segmentTimeout))
-        if waitResult == .timedOut {
-            task.cancel()
-            return .timedOut
+        // Feed the file's PCM buffers (converted to the analyzer format) into
+        // the input stream. Run feeding + analyzer concurrently: the analyzer
+        // consumes the stream while we fill it, then finalize flushes finals.
+        async let feedingDone = feed(file: file, converter: converter,
+                                     into: inputBuilder, format: analyzerFormat)
+        do {
+            try await analyzer.start(inputSequence: inputStream)
+            await feedingDone
+            inputBuilder.finish()
+            try await analyzer.finalizeAndFinishThroughEndOfInput()
+        } catch {
+            inputBuilder.finish()
         }
-        if box.error != nil {
-            return .error
+        recognizerTask.cancel()
+        return collected.text()
+    }
+
+    // MARK: - Live transcription session (AudioRecorder path)
+
+    /// A streaming on-device transcription session. The recorder yields
+    /// converted mic buffers via `process(_:)`; finalized transcript chunks are
+    /// delivered on the main actor through `onFinal`. Call `start()` once, feed
+    /// buffers, then `stop()` to flush. `analyzerFormat` is the AVAudioFormat
+    /// the recorder must convert its tap buffers to before yielding.
+    final class LiveSession {
+        private let transcriber: SpeechTranscriber
+        private let analyzer: SpeechAnalyzer
+        private let inputStream: AsyncStream<AnalyzerInput>
+        private let inputBuilder: AsyncStream<AnalyzerInput>.Continuation
+        private var recognizerTask: Task<Void, Never>?
+        let analyzerFormat: AVAudioFormat
+        let onFinal: @MainActor (String) -> Void
+
+        init(transcriber: SpeechTranscriber,
+             analyzer: SpeechAnalyzer,
+             analyzerFormat: AVAudioFormat,
+             inputStream: AsyncStream<AnalyzerInput>,
+             inputBuilder: AsyncStream<AnalyzerInput>.Continuation,
+             onFinal: @escaping @MainActor (String) -> Void) {
+            self.transcriber = transcriber
+            self.analyzer = analyzer
+            self.analyzerFormat = analyzerFormat
+            self.inputStream = inputStream
+            self.inputBuilder = inputBuilder
+            self.onFinal = onFinal
         }
-        guard let transcript = box.text, !transcript.isEmpty else {
-            return .noSpeech
+
+        /// Start the analyzer + the result-collection task. Must be called once
+        /// before feeding buffers. Non-blocking: the analyzer consumes
+        /// `inputStream` on an internal task that lives until `stop()`, so the
+        /// caller is free to keep running its AVAudioEngine. Buffers yielded via
+        /// `process(_:)` (on the audio thread) drive recognition.
+        func start() {
+            recognizerTask = Task { [transcriber, analyzer, inputStream] in
+                // Collect finals off the audio thread.
+                for try await result in transcriber.results {
+                    if result.isFinal {
+                        let text = String(result.text.characters)
+                        await MainActor.run { self.onFinal(text) }
+                    }
+                }
+            }
+            // Drive the analyzer for the lifetime of inputStream. It suspends
+            // until the stream finishes (stop() calls inputBuilder.finish()).
+            Task { try? await analyzer.start(inputSequence: inputStream) }
         }
-        return .text(transcript)
+
+        /// Feed one converted PCM buffer to the analyzer. The recorder converts
+        /// from the mic format to `analyzerFormat` before calling this. Safe to
+        /// call from the AVAudioEngine tap thread.
+        func process(_ buffer: AVAudioPCMBuffer) {
+            inputBuilder.yield(AnalyzerInput(buffer: buffer))
+        }
+
+        /// Stop the session: finish the stream and finalize so any in-flight
+        /// finals flush. Safe to call multiple times.
+        func stop() async {
+            inputBuilder.finish()
+            try? await analyzer.finalizeAndFinishThroughEndOfInput()
+            recognizerTask?.cancel()
+            recognizerTask = nil
+        }
+    }
+
+    /// Build a live session for the current locale. Returns nil if the on-device
+    /// asset can't be installed. The caller starts it once recording begins.
+    static func makeLiveSession(onFinal: @escaping @MainActor (String) -> Void) async -> LiveSession? {
+        guard await ensureLocaleAsset() else { return nil }
+        let transcriber = SpeechTranscriber(
+            locale: Locale.current,
+            transcriptionOptions: [],
+            reportingOptions: [],
+            attributeOptions: []
+        )
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+            return nil
+        }
+        let (inputStream, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+        return LiveSession(transcriber: transcriber,
+                           analyzer: analyzer,
+                           analyzerFormat: analyzerFormat,
+                           inputStream: inputStream,
+                           inputBuilder: inputBuilder,
+                           onFinal: onFinal)
+    }
+
+    // MARK: - File feeding
+
+    /// Read an AVAudioFile's PCM in chunks, convert each to `format`, and yield
+    /// to the builder. Conversion uses the standard AVAudioConverter path.
+    private static func feed(file: AVAudioFile,
+                             converter: AVAudioConverter,
+                             into builder: AsyncStream<AnalyzerInput>.Continuation,
+                             format: AVAudioFormat) async {
+        let totalFrames = AVAudioFrameCount(file.length)
+        guard totalFrames > 0 else { return }
+        let chunkFrames: AVAudioFrameCount = min(8192, totalFrames)
+        guard let readBuffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: chunkFrames) else {
+            return
+        }
+
+        var framesRead: AVAudioFrameCount = 0
+        while framesRead < totalFrames {
+            let remaining = totalFrames - framesRead
+            let toRead = min(chunkFrames, remaining)
+            do {
+                try file.read(into: readBuffer, frameCount: toRead)
+            } catch {
+                break
+            }
+            // Convert the chunk to the analyzer format. AVAudioConverter is
+            // sample-rate / channel aware; we feed the input block once.
+            let ratio = format.sampleRate / file.processingFormat.sampleRate
+            let outCap = AVAudioFrameCount(Double(toRead) * ratio) + 32
+            guard let outBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: outCap) else { break }
+            var consumedAll = false
+            let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+                if consumedAll {
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                consumedAll = true
+                outStatus.pointee = .haveData
+                return readBuffer
+            }
+            var error: NSError?
+            let converted = converter.convert(to: outBuffer, error: &error, withInputFrom: inputBlock)
+            if converted > 0 {
+                builder.yield(AnalyzerInput(buffer: outBuffer))
+            }
+            framesRead += toRead
+        }
+    }
+}
+
+/// Thread-safe collector for final transcript chunks (file path).
+private final class FinalCollector: @unchecked Sendable {
+    private var parts: [String] = []
+    private let lock = NSLock()
+
+    func append(_ s: String) {
+        lock.lock(); defer { lock.unlock() }
+        parts.append(s)
+    }
+
+    func text() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return parts.joined(separator: " ")
     }
 }
