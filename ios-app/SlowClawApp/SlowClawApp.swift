@@ -16,6 +16,7 @@
 import SwiftUI
 import UIKit
 import AVFoundation
+import BackgroundTasks
 
 // MARK: - Design System (from the original app's styles.css, with dark mode)
 
@@ -130,10 +131,14 @@ struct SlowClawApp: App {
                 .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { _ in }
                 .onAppear {
                     voiceMemoImporter.appState = appState
+                    urlDelegate.appState = appState
                     // Flush any URL the delegate captured during cold launch.
                     for pending in urlDelegate.flushPending() {
                         voiceMemoImporter.enqueue(pending)
                     }
+                    // Resume any pending transcriptions left from a killed-app
+                    // session, and schedule a background drain as backup.
+                    Task { await appState.resumePendingTranscriptionsOnLaunch() }
                 }
         }
     }
@@ -144,6 +149,25 @@ struct SlowClawApp: App {
 final class ShareURLDelegate: NSObject, UIApplicationDelegate {
     private let pendingLock = NSLock()
     private var pending: [URL] = []
+    /// Weak ref to AppState so the BGTask handler can drain pending
+    /// transcriptions. Set by the App when appState is wired up.
+    weak var appState: AppState?
+
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // Register the background transcription task. Must happen before the
+        // app finishes launching. iOS fires it (best-effort) to drain pending
+        // transcriptions — audio journals saved before their transcript landed.
+        let identifier = AppState.backgroundTranscriptionTaskID
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) { [weak self] task in
+            guard let task = task as? BGProcessingTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            Self.handleBackgroundTranscription(task: task, appState: self?.appState)
+        }
+        return true
+    }
 
     func application(_ app: UIApplication, open url: URL,
                      options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
@@ -160,6 +184,32 @@ final class ShareURLDelegate: NSObject, UIApplicationDelegate {
         pending.removeAll()
         pendingLock.unlock()
         return out
+    }
+
+    /// Drain pending transcriptions inside a BGProcessingTask. Requests a
+    /// background execution assertion so the work isn't suspended, drains the
+    /// queue, then completes the task and schedules the next one if anything
+    /// remains. Best-effort — iOS decides when (and whether) to run it.
+    private static func handleBackgroundTranscription(task: BGProcessingTask, appState: AppState?) {
+        guard let appState else {
+            task.setTaskCompleted(success: false)
+            return
+        }
+        // Keep the app alive for the duration of the drain.
+        let bgID = UIApplication.shared.beginBackgroundTask(withName: "slowclaw.transcribe.drain")
+        let work = Task { @MainActor in
+            await appState.drainPendingTranscriptions()
+            task.setTaskCompleted(success: true)
+            if bgID != .invalid {
+                UIApplication.shared.endBackgroundTask(bgID)
+            }
+            // If the queue still has items (e.g. a failed segment), reschedule.
+            await appState.scheduleNextBackgroundTranscription()
+        }
+        // If iOS reclaims the task before we finish, cancel the drain.
+        task.expirationHandler = {
+            work.cancel()
+        }
     }
 }
 
@@ -788,6 +838,33 @@ final class AppState: ObservableObject {
     static func savePendingTranscriptions(_ items: [PendingTranscription], at url: URL) {
         guard let data = try? JSONEncoder().encode(items) else { return }
         try? data.write(to: url, options: .atomic)
+    }
+
+    /// Background-processing task identifier (must match
+    /// BGTaskSchedulerPermittedIdentifiers in Info.plist). Registered in
+    /// ShareURLDelegate at launch.
+    static let backgroundTranscriptionTaskID = "com.slowclaw.app.transcription"
+
+    /// Submit a BGProcessingRequest so iOS drains the pending-transcription
+    /// queue later (best-effort, OS-gated). Called after a drain that left
+    /// items behind, and at app launch. No-ops when the queue is empty.
+    func scheduleNextBackgroundTranscription() async {
+        guard let url = Self.pendingTranscriptionsURL else { return }
+        let remaining = Self.loadPendingTranscriptions(at: url)
+        guard !remaining.isEmpty else { return }
+        let request = BGProcessingTaskRequest(identifier: Self.backgroundTranscriptionTaskID)
+        request.requiresNetworkConnectivity = false
+        request.requiresExternalPower = false
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 60) // at least 1 min out
+        try? BGTaskScheduler.shared.submit(request)
+    }
+
+    /// Launch-time drain + reschedule. Called once from the App's onAppear so
+    /// any pending transcriptions left from a killed-app session are resolved
+    /// promptly when the user returns.
+    func resumePendingTranscriptionsOnLaunch() async {
+        await drainPendingTranscriptions()
+        await scheduleNextBackgroundTranscription()
     }
 
 
