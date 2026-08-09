@@ -13,4 +13,6 @@ The previous Rust/Tauri/React documentation was removed during the
 - [`../AGENTS.md`](../AGENTS.md) — agent engineering protocol.
 - [`../zig-src/README.md`](../zig-src/README.md) — Zig core: build targets, FFI, modules.
 - [`../ios-app/README.md`](../ios-app/README.md) — iOS app: Xcode project, signing, build flow.
+- [`../windows-app/README.md`](../windows-app/README.md) — Windows companion shell (LAN sync, non-product).
+- [`../windows-app/PROTOCOL.md`](../windows-app/PROTOCOL.md) — the LAN QR-paired sync wire protocol.
 - [`../.github/workflows/pub-testflight-zig.yml`](../.github/workflows/pub-testflight-zig.yml) — TestFlight publish pipeline.

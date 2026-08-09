@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>SlowClawSync</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x86;x64;ARM64</Platforms>
+    <RuntimeIdentifiers>win-x64;win-x86;win-arm64</RuntimeIdentifiers>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackage>false</WindowsPackage>
+    <!-- Unpackaged: HttpListener LAN binding works without MSIX capabilities,
+         and the app runs as a normal .exe (no Store packaging needed). -->
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.5.240607001" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1" />
+    <!-- QRCoder: MIT-licensed, dependency-free QR rendering. PngByteQRCode
+         returns raw PNG bytes with no System.Drawing (GDI+) dependency. -->
+    <PackageReference Include="QRCoder" Version="1.6.0" />
+  </ItemGroup>
+
+  <!-- ── Build the Zig core for Windows + copy the native lib ──────────────
+       Runs before C# compile. Builds libslowclaw_feed (llama disabled — the
+       sync shell does no on-device inference) and copies it next to the .exe
+       so the P/Invoke DllImport("slowclaw_feed") resolves at runtime. The Zig
+       toolchain is expected at ../../tools/zig/zig.exe (local) or on PATH. -->
+  <Target Name="BuildZigCore" BeforeTargets="BeforeBuild">
+    <PropertyGroup>
+      <ZigExe>$(MSBuildThisFileDirectory)..\..\tools\zig\zig.exe</ZigExe>
+      <ZigSrcDir>$(MSBuildThisFileDirectory)..\..\zig-src</ZigSrcDir>
+    </PropertyGroup>
+    <Exec Command="&quot;$(ZigExe)&quot; build -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseFast -Dwith-llama=false"
+          WorkingDirectory="$(ZigSrcDir)"
+          Condition="Exists('$(ZigExe)')" />
+    <ItemGroup>
+      <NativeLibs Include="$(ZigSrcDir)\zig-out\lib\slowclaw_feed.lib" />
+    </ItemGroup>
+    <Copy SourceFiles="@(NativeLibs)"
+          DestinationFolder="$(OutDir)"
+          Condition="Exists('%(Identity)')" />
+  </Target>
+
+</Project>

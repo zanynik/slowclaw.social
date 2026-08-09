@@ -45,3 +45,10 @@ ios-app/build/
 DerivedData/
 *.xcuserstate
 xcuserdata/
+
+# --- Windows companion shell ---
+# .NET build output (bin/obj) and user-local settings. The native
+# slowclaw_feed.lib is rebuilt from zig-src by the csproj pre-build target.
+windows-app/**/bin/
+windows-app/**/obj/
+windows-app/**/*.user

@@ -462,18 +462,24 @@ slowclaw.social/
 │   │                       #   rss_parser, feed_catalog, journal_agent, …
 │   ├── vendor/sqlite/      # vendored SQLite 3.46 amalgamation
 │   └── vendor/llama.cpp/   # vendored llama.cpp (b10201, CPU backend)
-├── ios-app/                # the native Swift shell
+├── ios-app/                # the native Swift shell (primary product surface)
 │   ├── project.yml         # XcodeGen spec (SlowClaw.xcodeproj is gitignored)
-│   ├── SlowClawApp/        # SwiftUI app + audio + speech + Nostr fetch
+│   ├── SlowClawApp/        # SwiftUI app + audio + speech + Nostr + sync client
 │   │   ├── SlowClawApp.swift       # AppShell + AppState + all tab views
 │   │   ├── AudioRecorder.swift     # m4a recording, pause/resume, levels
 │   │   ├── SpeechTranscriber.swift # on-device SFSpeech (segments long audio)
 │   │   ├── VoiceMemoImporter.swift # share-sheet import, serial worker
 │   │   ├── NostrFetcher.swift      # WebSocket article fetch + filter/score
-│   │   └── Nip19.swift             # bech32 naddr encoder
+│   │   ├── Nip19.swift             # bech32 naddr encoder
+│   │   ├── SyncView.swift          # QR-paired LAN sync (camera scan + UI)
+│   │   └── SyncClient.swift        # URLSession sync transport
 │   └── SlowClawFeed/       # Swift package wrapping the C ABI
 │       ├── Sources/SlowClawFeed/SlowClawFeed.swift   # Swift overlay
 │       └── include/slowclaw_feed.h                   # C ABI contract
+├── windows-app/            # Windows companion shell (non-product, sync-only)
+│   ├── SlowClawSync.sln    # VS solution (net8.0-windows, WinUI 3)
+│   ├── PROTOCOL.md         # the LAN sync wire protocol
+│   └── SlowClawSync/       # QR display + HttpListener server + P/Invoke to core
 ├── docs/README.md          # docs entry point (slim)
 ├── .github/workflows/
 │   ├── pub-testflight-zig.yml   # the ONLY publish path
