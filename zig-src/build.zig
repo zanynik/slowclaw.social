@@ -173,6 +173,24 @@ pub fn build(b: *std.Build) void {
     const response_cache_test_step = b.step("test-response-cache", "Run the LLM response cache tests (libc + sqlite)");
     response_cache_test_step.dependOn(&run_response_cache_tests.step);
 
+    // ── Sync engine test module (libc + sqlite linked) ─────────────────────
+    // The manifest-diff/apply round-trip is the deterministic proxy for
+    // cross-device sync correctness (AGENTS.md §7). Needs sqlite (real
+    // :memory: store) + libc (same as test-sqlite).
+    const sync_test_mod = b.addModule("slowclaw_feed_sync_test", .{
+        .root_source_file = b.path("src/sync_engine.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sync_test_mod.link_libc = true;
+    linkSqlite(sync_test_mod, sqlite_c);
+    const sync_tests = b.addTest(.{
+        .root_module = sync_test_mod,
+    });
+    const run_sync_tests = b.addRunArtifact(sync_tests);
+    const sync_test_step = b.step("test-sync", "Run the sync engine tests (libc + sqlite)");
+    sync_test_step.dependOn(&run_sync_tests.step);
+
     // ── Library artifact (libc + sqlite + ffi, ships to iOS) ─────────────
     const lib_mod = b.addModule("slowclaw_feed_lib", .{
         .root_source_file = b.path("src/root.zig"),

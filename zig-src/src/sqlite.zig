@@ -296,8 +296,14 @@ pub const SqliteMemory = struct {
         const m: u64 = if (mp < 10) mp + 3 else mp - 9;
         const year: i64 = if (m <= 2) y + 1 else y;
 
+        // Format as unsigned so the fill/alignment spec ("0>N") does not emit
+        // a leading '+' for positive values (Zig 0.16's {d} includes the sign
+        // when a fill is given). A leading '+' would break RFC3339 parsing and
+        // — critically for sync — lexicographic timestamp comparison, since
+        // '+' (0x2B) sorts before every digit. year is always positive for any
+        // plausible epoch; cast is therefore safe.
         return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-            year, m, d, hour, minute, second,
+            @as(u64, @intCast(year)), m, d, hour, minute, second,
         });
     }
 
@@ -464,6 +470,114 @@ pub const SqliteMemory = struct {
         }
 
         return results.toOwnedSlice(allocator);
+    }
+
+    /// A row in the sync manifest projection: the columns the sync engine
+    /// needs to build a manifest + apply remote entries. `updated_at` is the
+    /// last-writer-wins timestamp (NOT `created_at`, which the vtable's
+    /// `timestamp` field carries and which is overwritten on every upsert).
+    /// `media_url` is the Documents-relative audio path or null.
+    pub const SyncRow = struct {
+        key: []const u8,
+        content: []const u8,
+        updated_at: []const u8,
+        category: []const u8,
+        session_id: ?[]const u8,
+        source: ?[]const u8,
+        media_url: ?[]const u8,
+    };
+
+    /// Free a `SyncRow` produced by `listForSync` (all fields are allocator-owned).
+    pub fn freeSyncRow(allocator: std.mem.Allocator, row: SyncRow) void {
+        allocator.free(row.key);
+        allocator.free(row.content);
+        allocator.free(row.updated_at);
+        allocator.free(row.category);
+        if (row.session_id) |s| allocator.free(s);
+        if (row.source) |s| allocator.free(s);
+        if (row.media_url) |s| allocator.free(s);
+    }
+
+    /// List every memories row projected onto the sync shape, ordered by key.
+    /// Used by `sync_engine.buildManifest`. The existing `list` reader exposes
+    /// `created_at` as `timestamp` rather than the `updated_at` sync needs, so
+    /// the sync engine reads its own projection here (keeps each module
+    /// single-purpose — AGENTS.md §3.4).
+    pub fn listForSync(self: *SqliteMemory, allocator: std.mem.Allocator) ![]SyncRow {
+        var out = std.ArrayList(SyncRow).empty;
+        errdefer {
+            for (out.items) |r| freeSyncRow(allocator, r);
+            out.deinit(allocator);
+        }
+
+        const sql = "SELECT key, content, updated_at, category, session_id, source, media_url FROM memories ORDER BY key";
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt.?);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+            const key = try allocator.dupe(u8, columnText(stmt.?, 0));
+            errdefer allocator.free(key);
+            const content = try allocator.dupe(u8, columnText(stmt.?, 1));
+            errdefer allocator.free(content);
+            const updated_at = try allocator.dupe(u8, columnText(stmt.?, 2));
+            errdefer allocator.free(updated_at);
+            const category = try allocator.dupe(u8, columnText(stmt.?, 3));
+            errdefer allocator.free(category);
+
+            var session_id: ?[]const u8 = null;
+            if (c.sqlite3_column_type(stmt.?, 4) != c.SQLITE_NULL) {
+                session_id = try allocator.dupe(u8, columnText(stmt.?, 4));
+            }
+            errdefer if (session_id) |s| allocator.free(s);
+
+            var source: ?[]const u8 = null;
+            if (c.sqlite3_column_type(stmt.?, 5) != c.SQLITE_NULL) {
+                source = try allocator.dupe(u8, columnText(stmt.?, 5));
+            }
+            errdefer if (source) |s| allocator.free(s);
+
+            var media_url: ?[]const u8 = null;
+            if (c.sqlite3_column_type(stmt.?, 6) != c.SQLITE_NULL) {
+                media_url = try allocator.dupe(u8, columnText(stmt.?, 6));
+            }
+            errdefer if (media_url) |s| allocator.free(s);
+
+            try out.append(allocator, .{
+                .key = key,
+                .content = content,
+                .updated_at = updated_at,
+                .category = category,
+                .session_id = session_id,
+                .source = source,
+                .media_url = media_url,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Return the `updated_at` of the row with `key`, or null if absent.
+    /// Used by `sync_engine.applyEntries` for last-writer-wins defense.
+    /// The returned slice is allocator-owned (caller frees); null means absent.
+    pub fn updatedAt(self: *SqliteMemory, allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {
+        const sql = "SELECT updated_at FROM memories WHERE key = ?1";
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt.?, 1, key);
+
+        const rc = c.sqlite3_step(stmt.?);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        return try allocator.dupe(u8, columnText(stmt.?, 0));
     }
 
     /// Delete a memory by key. Returns true if a row was removed.
@@ -942,10 +1056,7 @@ fn columnText(stmt: *c.sqlite3_stmt, col: c_int) []const u8 {
 /// (for the custom case) aliases the input — caller must dupe if it needs to
 /// outlive the source buffer.
 fn textToCategory(s: []const u8) MemoryCategory {
-    if (std.mem.eql(u8, s, "core")) return .{ .core = {} };
-    if (std.mem.eql(u8, s, "daily")) return .{ .daily = {} };
-    if (std.mem.eql(u8, s, "conversation")) return .{ .conversation = {} };
-    return .{ .custom = s };
+    return MemoryCategory.fromText(s);
 }
 
 /// Read the current row of `stmt` into an owned MemoryEntry. Caller frees with

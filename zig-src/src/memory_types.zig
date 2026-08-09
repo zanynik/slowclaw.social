@@ -46,6 +46,18 @@ pub const MemoryCategory = union(enum) {
             else => true,
         };
     }
+
+    /// Parse a lowercase tag back into a category. Mirrors the parsing the
+    /// SQLite backend does on readRow; shared here so the sync engine (and
+    /// any future caller) applies the same mapping. `text` is borrowed for
+    /// the call only — the `.custom` variant aliases it, so the caller must
+    /// dupe if it needs to outlive `text` (sync_engine does this via store).
+    pub fn fromText(text: []const u8) MemoryCategory {
+        if (std.mem.eql(u8, text, "core")) return .{ .core = {} };
+        if (std.mem.eql(u8, text, "daily")) return .{ .daily = {} };
+        if (std.mem.eql(u8, text, "conversation")) return .{ .conversation = {} };
+        return .{ .custom = text };
+    }
 };
 
 /// A single memory entry. Mirrors `MemoryEntry` in `src/memory/traits.rs:6`.

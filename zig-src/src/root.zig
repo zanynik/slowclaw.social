@@ -36,6 +36,7 @@ pub const saved_items = @import("saved_items.zig");
 pub const rss_parser = @import("rss_parser.zig");
 pub const local_inference = @import("local_inference.zig");
 pub const feed_catalog = @import("feed_catalog.zig");
+pub const sync_engine = @import("sync_engine.zig");
 
 // Force-retain every `export fn` in ffi.zig. Zig 0.16 uses lazy compilation:
 // `@import("ffi.zig")` alone does NOT make its export functions reachable,
