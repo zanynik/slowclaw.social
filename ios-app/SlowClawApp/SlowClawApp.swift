@@ -913,9 +913,6 @@ final class AppState: ObservableObject {
         let remaining = Self.loadPendingTranscriptions(at: url).filter { !completedKeys.contains($0.key) }
         Self.savePendingTranscriptions(remaining, at: url)
     }
-        // All drained — clear the queue file.
-        Self.savePendingTranscriptions([], at: url)
-    }
 
     /// Load the pending-transcription queue from disk (empty on any error).
     static func loadPendingTranscriptions(at url: URL) -> [PendingTranscription] {
