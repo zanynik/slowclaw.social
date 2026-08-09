@@ -60,20 +60,43 @@ var g_backend_init: bool = false;
 var g_model: ?*anyopaque = null;
 var g_model_id: []u8 = &.{};
 
-// Raw pthread mutex: the 0.16 std.Io.Mutex needs an Io interface we don't
-// have at the FFI boundary, and this module must also compile libc-free
-// (the `test` step) — pthread symbols are only referenced from have_llama
-// code paths, which the libc-free test build never emits.
-var g_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+// Engine mutex. Two implementations:
+//   - POSIX (macOS/iOS/Linux): raw pthread mutex. The 0.16 std.Io.Mutex
+//     needs an Io interface we don't have at the FFI boundary, so a raw
+//     pthread_mutex_t is the simplest option that also compiles libc-free
+//     (the `test` step) — pthread symbols are only referenced from
+//     have_llama code paths, which the libc-free test build never emits.
+//   - Windows: std.atomic.Mutex (libc-free spinlock — no pthreads in
+//     Windows libc, and std.Io.Mutex has the same Io-interface problem).
+//     The Windows companion shell builds with -Dwith-llama=false, so this
+//     lock is never contended in practice; it exists only so the module
+//     type-checks on Windows. The spin-wait is acceptable for the brief
+//     model load/unload critical section.
+const on_windows = builtin.os.tag == .windows;
+const EngineMutex = if (on_windows) std.atomic.Mutex else std.c.pthread_mutex_t;
+var g_mutex: EngineMutex = if (on_windows)
+    .unlocked
+else
+    std.c.PTHREAD_MUTEX_INITIALIZER;
 
 fn lockEngine() void {
     if (!have_llama) return;
-    _ = std.c.pthread_mutex_lock(&g_mutex);
+    if (on_windows) {
+        while (!std.atomic.Mutex.tryLock(&g_mutex)) {
+            std.atomic.spinLoopHint();
+        }
+    } else {
+        _ = std.c.pthread_mutex_lock(&g_mutex);
+    }
 }
 
 fn unlockEngine() void {
     if (!have_llama) return;
-    _ = std.c.pthread_mutex_unlock(&g_mutex);
+    if (on_windows) {
+        std.atomic.Mutex.unlock(&g_mutex);
+    } else {
+        _ = std.c.pthread_mutex_unlock(&g_mutex);
+    }
 }
 
 fn ensureBackendInit() void {
