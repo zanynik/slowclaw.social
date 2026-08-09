@@ -25,21 +25,31 @@ The workspace lets a single user:
 - A **Zig core** (`zig-src/`) — compiled to a static library (`libslowclaw_feed.a`) that exposes a C ABI. Owns ranking, memory, SQLite persistence, RSS parsing, on-device LLM inference (llama.cpp), and the speech/transcription logic is delegated to iOS-native frameworks.
 - A **thin native Swift shell** (`ios-app/`) — SwiftUI app that links the Zig staticlib + vendored SQLite + vendored llama.cpp (CPU backend) and calls the core through the C ABI. There is no Rust, no Tauri, no React, no npm, no web bundle, no embedded HTTP gateway.
 
-> **🎯 iOS is the primary and only target.** macOS/desktop, the CLI, gateway, and daemon surfaces from the earlier Rust-era fork have been removed. When adding AI-powered features (generation, extraction, synthesis, summarization, transcription), **default to the on-device path** — the Zig core's `local_inference.zig` (llama.cpp/GGUF) and the Swift `SpeechTranscriber.swift` (iOS `SFSpeechRecognizer`). Treat the on-device LLM + journal synthesis + TweetClaw-style post drafting as the **reference pattern** for any new AI feature.
+> **🎯 iOS is the primary and only product target.** macOS/desktop-as-a-product, the CLI, gateway, and daemon surfaces from the earlier Rust-era fork have been removed. When adding AI-powered features (generation, extraction, synthesis, summarization, transcription), **default to the on-device path** — the Zig core's `local_inference.zig` (llama.cpp/GGUF) and the Swift `SpeechTranscriber.swift` (iOS `SFSpeechRecognizer`). Treat the on-device LLM + journal synthesis + TweetClaw-style post drafting as the **reference pattern** for any new AI feature.
+
+> **🖥️ Companion surface exception (Windows sync shell).** A single **optional Windows desktop companion app** (`windows-app/`) is authorized as a *non-product* companion surface whose only role is **LAN-only, QR-paired, user-initiated sync** of the user's own journals + audio media between the user's own two devices. Hard scope rules (any change widening these must re-open the merge gate):
+> - **Transport:** same-LAN HTTP/JSON only. The desktop shell runs the listener; iOS scans the QR and acts as client. **No relay, no cloud, no public exposure**, no open-protocol surface (this is a peer transport, **not** the content gateway forbidden in §9).
+> - **Sync unit:** journal `memories` rows + audio media files referenced by `media_url` (`Recordings/*`, `Inbox/*`) only. Excludes GGUF models and regenerable feed cache.
+> - **Lifecycle:** the listener starts only when the user opens the Sync screen and stops on window close. It is never a background daemon.
+> - **Architecture:** the Zig core stays transport-agnostic — sync logic lives in `sync_engine.zig` and is driven through the C ABI; each **shell owns its own wire transport** (mirroring the injected `SlowclawHttpPostFn` precedent). No new networking enters the Zig core.
+> - **No publish-path impact:** this surface does not change the iOS-only TestFlight pipeline.
 
 - Repo: `slowclaw.social`
 - iOS bundle id: `com.slowclaw.app`, product name **SlowClaw Social**
 
-### Architecture shape (two layers)
+### Architecture shape (three layers: one core, two shells)
 
 1. **Zig core / static library** — `zig-src/`
    - `build.zig` emits three static archives: `libslowclaw_feed.a` (the Zig core), `libsqlite3.a` (vendored SQLite amalgamation), and `libllama.a` (vendored llama.cpp, CPU backend).
-   - Exposes a C ABI in `src/ffi.zig`; Swift consumes it via the bridging header in `ios-app/SlowClawFeed/include/slowclaw_feed.h`.
-   - Module layout (ranker, memory, embeddings, chunker, sqlite, markdown, response_cache, local_inference, rss_parser, feed_catalog, journal_agent, interest_profile, ffi, …) is documented in [`zig-src/README.md`](zig-src/README.md).
-2. **Native Swift shell** — `ios-app/`
-   - SwiftUI app (`SlowClawApp/SlowClawApp.swift`), audio capture (`AudioRecorder.swift`), on-device speech (`SpeechTranscriber.swift`), voice-memo import (`VoiceMemoImporter.swift`), Nostr fetch (`NostrFetcher.swift`, `Nip19.swift`).
+   - Exposes a C ABI in `src/ffi.zig`; Swift consumes it via the bridging header in `ios-app/SlowClawFeed/include/slowclaw_feed.h`. The Windows companion consumes the **same** C ABI via P/Invoke.
+   - Module layout (ranker, memory, embeddings, chunker, sqlite, markdown, response_cache, local_inference, rss_parser, feed_catalog, journal_agent, interest_profile, sync_engine, ffi, …) is documented in [`zig-src/README.md`](zig-src/README.md).
+2. **Native Swift shell (primary product surface)** — `ios-app/`
+   - SwiftUI app (`SlowClawApp/SlowClawApp.swift`), audio capture (`AudioRecorder.swift`), on-device speech (`SpeechTranscriber.swift`), voice-memo import (`VoiceMemoImporter.swift`), Nostr fetch (`NostrFetcher.swift`, `Nip19.swift`), QR-paired sync client (`SyncView.swift`, `SyncClient.swift`).
    - `project.yml` is the XcodeGen spec; the `.xcodeproj` is **not** in git and is regenerated on demand.
    - The Xcode pre-build script runs `zig build` automatically for the right target (sim vs device).
+3. **Windows companion shell (non-product, sync-only)** — `windows-app/`
+   - C# WinUI 3 app that links `libslowclaw_feed` via P/Invoke and renders the pairing QR. Runs a token-gated LAN HTTP listener for the sync wire protocol (see [`windows-app/PROTOCOL.md`](windows-app/PROTOCOL.md)).
+   - **Not** a product surface: no capture, no curation, no publishing. Its sole role is the §1 companion-surface exception (LAN-only QR-paired sync of journals + audio).
 
 ### Product direction (merge gate)
 
@@ -51,13 +61,13 @@ The pipeline is the **three loops**: **multimodal capture (audio-first, on-devic
 
 These codebase realities drive every design decision:
 
-1. **Two layers with a small Zig core.**
-   - The Zig core in `zig-src/src/` is the stability backbone (ranking, memory, persistence, inference). The Swift shell is a thin surface over the C ABI.
-   - Extend behavior by adding Zig modules + FFI exports and Swift call-sites; avoid cross-cutting rewrites.
+1. **One small Zig core, two thin shells (iOS + Windows).**
+   - The Zig core in `zig-src/src/` is the stability backbone (ranking, memory, persistence, inference, sync logic). Both shells are thin surfaces over the C ABI.
+   - Extend behavior by adding Zig modules + FFI exports and shell call-sites; avoid cross-cutting rewrites.
 2. **On-device AI/transcription is a product goal, not a convenience.**
    - On-device LLM (`local_inference.zig` + vendored llama.cpp) and iOS Speech (`SpeechTranscriber.swift`) must stay cheap and self-contained. Convenience dependencies and broad abstractions silently regress the per-app memory budget.
-3. **The C ABI is the public contract between Zig and Swift.**
-   - `zig-src/src/ffi.zig` and `ios-app/SlowClawFeed/include/slowclaw_feed.h` must stay in sync. Memory ownership rules (caller frees via `slowclaw_feed_free`) are mandatory; a mismatch is a use-after-free.
+3. **The C ABI is the public contract between Zig and every shell.**
+   - `zig-src/src/ffi.zig` and `ios-app/SlowClawFeed/include/slowclaw_feed.h` must stay in sync; the Windows companion consumes the same header via P/Invoke. Memory ownership rules (caller frees via `slowclaw_feed_free`) are mandatory; a mismatch is a use-after-free.
 4. **Build determinism and archive shape matter.**
    - The Zig build has known iOS-specific workarounds (Apple-`ld` archive alignment, dual SQLite archive, `_dyld_get_image_header` unavailability on iOS). These are documented in [`zig-src/README.md`](zig-src/README.md) — read that before touching `build.zig` or `project.yml`.
 5. **Signing and CI are cost-sensitive.**
@@ -114,15 +124,20 @@ Application rules:
 - `zig-src/` — Zig 0.16 project
   - `build.zig` — build graph: 3 static archives + multiple test steps; iOS-specific workarounds documented inline and in the README.
   - `build.zig.zon` — package manifest, no external deps.
-  - `src/` — core modules (`ffi.zig`, `ranker.zig`, `sqlite.zig`, `markdown.zig`, `embeddings.zig`, `chunker.zig`, `local_inference.zig`, `rss_parser.zig`, `feed_catalog.zig`, `feeds_ranking.zig`, `journal_agent.zig`, `interest_profile.zig`, `response_cache.zig`, `provider.zig`, `openai_provider.zig`, `saved_items.zig`, `memory_types.zig`, `feed_types.zig`, `tokenize.zig`, `porter_stemmer.zig`, `vector_math.zig`, `text_util.zig`, `root.zig`, `test_root.zig`).
+  - `src/` — core modules (`ffi.zig`, `ranker.zig`, `sqlite.zig`, `markdown.zig`, `embeddings.zig`, `chunker.zig`, `local_inference.zig`, `rss_parser.zig`, `feed_catalog.zig`, `feeds_ranking.zig`, `journal_agent.zig`, `interest_profile.zig`, `sync_engine.zig`, `response_cache.zig`, `provider.zig`, `openai_provider.zig`, `saved_items.zig`, `memory_types.zig`, `feed_types.zig`, `tokenize.zig`, `porter_stemmer.zig`, `vector_math.zig`, `text_util.zig`, `root.zig`, `test_root.zig`).
   - `vendor/sqlite/` — vendored SQLite 3.46 amalgamation.
   - `vendor/llama.cpp/` — vendored llama.cpp (b10201, MIT), CPU backend only.
 
-### iOS app (the shell)
+### iOS app (primary shell)
 - `ios-app/`
   - `project.yml` — XcodeGen spec (generates `SlowClaw.xcodeproj`, not in git).
-  - `SlowClawApp/` — app target: `SlowClawApp.swift`, `AudioRecorder.swift`, `SpeechTranscriber.swift`, `VoiceMemoImporter.swift`, `NostrFetcher.swift`, `Nip19.swift`, `Info.plist`, `Assets.xcassets/`.
+  - `SlowClawApp/` — app target: `SlowClawApp.swift`, `AudioRecorder.swift`, `SpeechTranscriber.swift`, `VoiceMemoImporter.swift`, `NostrFetcher.swift`, `Nip19.swift`, `SyncView.swift` (QR-paired sync client UI), `SyncClient.swift` (LAN sync transport), `Info.plist`, `Assets.xcassets/`.
   - `SlowClawFeed/` — Swift package wrapping the C ABI (`Sources/SlowClawFeed/SlowClawFeed.swift`, `include/slowclaw_feed.h`).
+
+### Windows companion shell (non-product, sync-only)
+- `windows-app/`
+  - C# WinUI 3 app (`SlowClawSync/`) that links `libslowclaw_feed` via P/Invoke (`Native/SlowClawNative.cs`), renders the pairing QR, and runs the LAN sync listener (`Sync/SyncServer.cs`). On-device LLM (llama.cpp) is **disabled** on Windows (`-Dwith-llama=false`); the shell does no capture/curation/publishing.
+  - `SlowClawSync.sln`, `PROTOCOL.md` (the sync wire protocol), `README.md`.
 
 ### Docs / metadata
 - `docs/README.md` — docs entry point (slim; the Rust-era docs hub was removed in the pivot).
@@ -142,10 +157,11 @@ Application rules:
 
 When uncertain, classify as higher risk.
 
-- **Low risk:** docs-only changes; Swift UI changes that don't touch the C ABI or signing.
-- **Medium risk:** Zig core logic changes without ABI/security impact; new FFI exports that are additive; `ios-app/project.yml` non-signing changes.
+- **Low risk:** docs-only changes; Swift UI changes that don't touch the C ABI or signing; Windows shell UI-only changes that don't touch the sync transport or P/Invoke surface.
+- **Medium risk:** Zig core logic changes without ABI/security impact; new FFI exports that are additive; `ios-app/project.yml` non-signing changes; `windows-app/` build/packaging and `SyncServer` transport changes; `ios-app/SlowClawApp/Info.plist` *additive* usage descriptions (`NSCameraUsageDescription`, `NSLocalNetworkUsageDescription`).
 - **High risk:**
-  - `zig-src/src/ffi.zig` and the matching `ios-app/SlowClawFeed/include/slowclaw_feed.h` — the C ABI contract (memory ownership, lifetimes).
+  - `zig-src/src/ffi.zig` and the matching `ios-app/SlowClawFeed/include/slowclawFeed.h` — the C ABI contract (memory ownership, lifetimes) — including the `slowclaw_feed_sync_*` exports consumed by **both** shells.
+  - `zig-src/src/sync_engine.zig` — the manifest-diff / apply correctness that both shells depend on (a bug here corrupts journals on either device).
   - `zig-src/build.zig` and `ios-app/project.yml` signing/build-script sections — iOS link workarounds are fragile.
   - `zig-src/vendor/` — vendored SQLite/llama.cpp bumps (size + supply-chain + iOS symbol-compatibility impact).
   - `ios-app/SlowClawApp/Info.plist` — usage descriptions, entitlements.
@@ -185,9 +201,10 @@ When uncertain, classify as higher risk.
 - Use **SlowClaw-native labels only** in tests/examples (`SlowClawAgent`, `slowclaw_user`) — never real identity data.
 
 ### 6.3 Architecture Boundary Contract (Required)
-- The Swift shell talks to the Zig core **only** through the C ABI declared in `slowclaw_feed.h`. Do not reach into Zig internals from Swift, and do not have the Zig core call back into Swift except through documented FFI callbacks (e.g. the embedder callback).
-- Keep dependency direction **inward**: Swift → C ABI → Zig core → vendored C/C++ (sqlite, llama.cpp).
-- Keep responsibilities single-purpose: ranking in `ranker.zig`/`feeds_ranking.zig`, persistence in `sqlite.zig`/`markdown.zig`, inference in `local_inference.zig`, FFI surface in `ffi.zig`, presentation in Swift.
+- Both shells talk to the Zig core **only** through the C ABI declared in `slowclaw_feed.h`. Do not reach into Zig internals from Swift or C#, and do not have the Zig core call back into a shell except through documented FFI callbacks (e.g. the embedder callback, the LLM HTTP callback).
+- Keep dependency direction **inward**: `iOS shell / Windows shell → C ABI → Zig core → vendored C/C++ (sqlite, llama.cpp)`. No shell reaches another shell directly; cross-device data movement flows through the C-ABI-owned sync engine (`sync_engine.zig`) plus each shell's own LAN transport.
+- Keep responsibilities single-purpose: ranking in `ranker.zig`/`feeds_ranking.zig`, persistence in `sqlite.zig`/`markdown.zig`, inference in `local_inference.zig`, manifest-diff/apply sync logic in `sync_engine.zig`, FFI surface in `ffi.zig`, presentation + LAN transport in the shells (Swift `SyncClient.swift`, C# `SyncServer.cs`).
+- The Zig core is **transport-agnostic**: no networking lives in the core. Sync wire transport is owned by the shells (mirroring the injected `SlowclawHttpPostFn` precedent for LLM HTTP).
 - Introduce new shared abstractions only after repeated use (rule-of-three), with at least one real current caller.
 
 ### 6.4 Evidence-Driven Execution (Required)
@@ -223,8 +240,16 @@ open SlowClaw.xcodeproj      # run on simulator or device
 ```
 The Xcode pre-build script runs `zig build` automatically for the right target.
 
+### Windows companion shell (requires Windows + .NET 8 SDK)
+```bash
+cd zig-src && zig build -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseFast -Dwith-llama=false
+cd ../windows-app && dotnet build SlowClawSync.sln     # the csproj pre-build copies the .lib
+```
+On-device LLM (llama.cpp) is intentionally disabled on Windows for the sync companion (`-Dwith-llama=false`).
+
 ### Additional expectations by change type
-- **FFI change:** update `zig-src/src/ffi.zig` and `ios-app/SlowClawFeed/include/slowclaw_feed.h` together; add a `test-ffi` case.
+- **FFI change:** update `zig-src/src/ffi.zig` and `ios-app/SlowClawFeed/include/slowclaw_feed.h` together; add a `test-ffi` case. If the export is consumed by the Windows shell, confirm the P/Invoke signature in `windows-app/SlowClawSync/Native/SlowClawNative.cs` matches.
+- **Sync engine change:** run `zig build test-ffi` (the manifest round-trip case is the deterministic proxy for cross-device correctness); the same code path runs on both shells, so a failure here means data corruption on either device.
 - **Vendored dep bump (sqlite/llama.cpp):** rebuild and confirm the iOS link still works (archive alignment + libc++ symbols); note size delta.
 - **`build.zig` / `project.yml`:** validate on the iOS target (sim and/or device), since the iOS-specific workarounds only surface there.
 - **Info.plist (usage descriptions / entitlements):** review the diff for scope creep.
@@ -253,6 +278,7 @@ If full checks are impractical, run the most relevant subset and document what w
 - Do not add heavy vendored deps for minor convenience (per-app memory budget matters on iOS).
 - Do not silently weaken app-sandbox filesystem scope or signing/entitlement boundaries.
 - Do not re-introduce removed surfaces (Rust core, Tauri host, React web UI, embedded HTTP gateway, CLI, daemon, external chat channels, PocketBase).
+  - **Scoped exception — LAN sync transport (authorized in §1):** the forbidden "embedded HTTP gateway" means a *general content/publish/ingest gateway* (third-party ingestion, feed publishing, open-protocol exposure, cloud relay). A **LAN-only, QR-paired, user-initiated sync transport between the user's own two devices** (the `windows-app/` companion + iOS `SyncClient`) is explicitly permitted when it stays within the §1 hard scope (same-LAN, journals + audio media only, listener starts/stops with the Sync screen, Zig core stays transport-agnostic). Widening that scope re-opens the merge gate.
 - Do not add speculative config/build options/FFI functions "just in case".
 - Do not opportunistically rename legacy identifiers (`slowclaw_feed` artifact name, any residual `zeroclaw`/`ZEROCLAW_*` in vendored code) outside a dedicated migration.
 - Do not mix massive formatting-only changes with functional changes.
