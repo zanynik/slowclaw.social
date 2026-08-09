@@ -785,6 +785,16 @@ public func slowClawLocalDraftPost(journalText: String, maxChars: Int = 300) thr
     return try processLocalChatResult(result)
 }
 
+/// Title generation on-device: transcript/text → concise title.
+public func slowClawLocalGenerateTitle(transcript: String) throws -> String {
+    let result = transcript.withCString { ptr in
+        var out = SlowclawChatResult()
+        slowclaw_feed_local_llm_generate_title(ptr, transcript.utf8.count, &out)
+        return out
+    }
+    return try processLocalChatResult(result)
+}
+
 private func escapeJson(_ s: String) -> String {
     s.replacingOccurrences(of: "\\", with: "\\\\")
      .replacingOccurrences(of: "\"", with: "\\\"")

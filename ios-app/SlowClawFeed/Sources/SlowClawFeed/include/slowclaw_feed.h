@@ -298,6 +298,11 @@ int32_t slowclaw_feed_local_llm_draft_post(
     SlowclawChatResult *out_result
 );
 
+int32_t slowclaw_feed_local_llm_generate_title(
+    const uint8_t *transcript, size_t transcript_len,
+    SlowclawChatResult *out_result
+);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

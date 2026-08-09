@@ -147,6 +147,30 @@ pub fn draftPost(
     return p.chatWithSystem(allocator, system_prompt, journal_text, model, 0.6);
 }
 
+/// Generate a concise title for a journal entry from its transcript/text.
+///
+/// The prompt asks the LLM for a short, descriptive title (max ~8 words) that
+/// captures the entry's essence. Used as the audio journal's display title
+/// when AI is available; otherwise the UI falls back to a date-time default.
+/// Returns the title text (allocator-owned).
+pub fn generateTitle(
+    p: provider.Provider,
+    allocator: std.mem.Allocator,
+    transcript: []const u8,
+    model: []const u8,
+) provider.ProviderError![]u8 {
+    const system_prompt =
+        \\You write a concise, descriptive title for a journal entry.
+        \\
+        \\Rules:
+        \\- Maximum 8 words. Capture the main topic or moment.
+        \\- Title case is fine. No trailing period, no quotes, no preamble.
+        \\- Reflect what the entry is actually about, not a generic label like "Journal Entry".
+        \\- Output ONLY the title text, nothing else.
+    ;
+    return p.chatWithSystem(allocator, system_prompt, transcript, model, 0.4);
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Tests (with a stub provider)
 // ──────────────────────────────────────────────────────────────────────────
