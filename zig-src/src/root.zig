@@ -80,6 +80,12 @@ comptime {
     _ = &ffi.slowclaw_feed_local_llm_synthesize_journal;
     _ = &ffi.slowclaw_feed_local_llm_extract_interests;
     _ = &ffi.slowclaw_feed_local_llm_draft_post;
+    _ = &ffi.slowclaw_feed_local_llm_generate_title;
+    _ = &ffi.slowclaw_feed_sync_build_manifest;
+    _ = &ffi.slowclaw_feed_sync_diff;
+    _ = &ffi.slowclaw_feed_sync_result_free;
+    _ = &ffi.slowclaw_feed_sync_apply_entries;
+    _ = &ffi.slowclaw_feed_sync_entry_for_transfer;
 }
 
 test {

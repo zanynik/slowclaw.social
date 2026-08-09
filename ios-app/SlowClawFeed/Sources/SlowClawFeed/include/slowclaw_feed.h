@@ -303,6 +303,56 @@ int32_t slowclaw_feed_local_llm_generate_title(
     SlowclawChatResult *out_result
 );
 
+// ──────────────────────────────────────────────────────────────────────────
+// Sync engine — LAN QR-paired sync (AGENTS.md §1/§9 companion exception).
+// Transport-agnostic: the shell owns the wire; these exports cover manifest
+// build/exchange/diff/apply. Consumed by both the iOS shell (Swift) and the
+// Windows companion (C# P/Invoke).
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Build a sync manifest for the store. `media_root` is the absolute dir under
+/// which `media_url` paths resolve (iOS Documents/ or Windows equivalent); pass
+/// {NULL, 0} to skip media file sizing. On success writes a Zig-owned JSON
+/// manifest to *out_json (caller frees via slowclaw_feed_free). Returns
+/// SLOWCLAW_OK on success, negative on error.
+int32_t slowclaw_feed_sync_build_manifest(
+    SlowclawSqlite *handle,
+    const uint8_t *media_root, size_t media_root_len, // optional; pass {NULL, 0}
+    SlowclawString *out_json
+);
+
+/// Diff local vs remote manifests (both JSON in build_manifest's shape). Writes
+/// a Zig-owned JSON diff ({"to_pull":[...],"to_push":[...],"conflicts":[...]})
+/// to *out_result. Free via slowclaw_feed_sync_result_free. Returns
+/// SLOWCLAW_OK on success, SLOWCLAW_ERR_INVALID_ARGUMENT on malformed JSON.
+int32_t slowclaw_feed_sync_diff(
+    const uint8_t *local_json, size_t local_len,
+    const uint8_t *remote_json, size_t remote_len,
+    SlowclawRankResult *out_result
+);
+
+/// Free a diff result from slowclaw_feed_sync_diff. Safe on a zeroed result.
+void slowclaw_feed_sync_result_free(SlowclawRankResult *result);
+
+/// Apply a batch of remote entries to the store. `entries_json` is a JSON
+/// array of TransferEntry objects (the shell fetches each entry's content
+/// from the peer, batches them, then calls this). Last-writer-wins: entries
+/// whose local updated_at is newer are skipped. Returns SLOWCLAW_OK on success.
+int32_t slowclaw_feed_sync_apply_entries(
+    SlowclawSqlite *handle,
+    const uint8_t *entries_json, size_t entries_len
+);
+
+/// Fetch one full entry (content + metadata) by key, for transfer to a peer.
+/// Writes a Zig-owned SlowclawSqliteEntry to *out_entry (caller frees via
+/// slowclaw_feed_sqlite_entry_free). Returns 0 if found, 1 if not found,
+/// negative on error.
+int32_t slowclaw_feed_sync_entry_for_transfer(
+    SlowclawSqlite *handle,
+    const uint8_t *key, size_t key_len,
+    SlowclawSqliteEntry *out_entry
+);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -34,6 +34,7 @@ const embeddings = @import("embeddings.zig");
 const feed_types = @import("feed_types.zig");
 const sqlite = @import("sqlite.zig");
 const memory_types = @import("memory_types.zig");
+const sync_engine = @import("sync_engine.zig");
 const provider_mod = @import("provider.zig");
 const openai_provider_mod = @import("openai_provider.zig");
 const journal_agent = @import("journal_agent.zig");
@@ -1032,6 +1033,125 @@ pub export fn slowclaw_feed_local_llm_generate_title(
     return localJournalAgentCall(journal_agent.generateTitle, .{ transcript[0..transcript_len], "local" }, out_result);
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Sync engine — LAN QR-paired sync (AGENTS.md §1/§9 companion exception).
+// Transport-agnostic: the shell owns the wire; these exports cover manifest
+// build/exchange/diff/apply. The same surface is consumed by both the iOS
+// shell (Swift) and the Windows companion (C# P/Invoke).
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Build a sync manifest for the given SQLite store. `media_root` is the
+/// absolute directory under which `media_url` paths resolve (iOS Documents/
+/// or the Windows equivalent); pass {null, 0} to skip media file sizing.
+/// On success writes a Zig-owned JSON manifest to `out_json` (caller frees
+/// via `slowclaw_feed_free`). Returns 0 on success, negative on error.
+pub export fn slowclaw_feed_sync_build_manifest(
+    handle: *SlowclawSqlite,
+    media_root: ?[*]const u8,
+    media_root_len: usize,
+    out_json: *SlowclawString,
+) c_int {
+    const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
+    const root_slice: []const u8 = if (media_root) |p| p[0..media_root_len] else &.{};
+    var manifest = sync_engine.buildManifest(c_allocator, db, root_slice) catch {
+        out_json.* = SlowclawString.empty();
+        return SLOWCLAW_ERR_INTERNAL;
+    };
+    defer manifest.deinit(c_allocator);
+    const json = sync_engine.serializeManifest(c_allocator, manifest) catch {
+        out_json.* = SlowclawString.empty();
+        return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    };
+    out_json.* = SlowclawString.fromOwnedSlice(json);
+    return SLOWCLAW_OK;
+}
+
+/// Diff a local manifest against a remote manifest. Both are JSON blobs in
+/// the shape produced by `slowclaw_feed_sync_build_manifest`. Writes a
+/// Zig-owned JSON diff ({ "to_pull":[...], "to_push":[...], "conflicts":[...] })
+/// to `out_result`. Returns 0 on success, negative on error (incl. malformed
+/// manifest JSON → SLOWCLAW_ERR_INVALID_ARGUMENT). Free via
+/// `slowclaw_feed_sync_result_free`.
+pub export fn slowclaw_feed_sync_diff(
+    local_json: [*]const u8,
+    local_len: usize,
+    remote_json: [*]const u8,
+    remote_len: usize,
+    out_result: *SlowclawRankResult,
+) c_int {
+    var local = sync_engine.parseManifest(c_allocator, local_json[0..local_len]) catch {
+        out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_INVALID_ARGUMENT };
+        return SLOWCLAW_ERR_INVALID_ARGUMENT;
+    };
+    defer local.deinit(c_allocator);
+    var remote = sync_engine.parseManifest(c_allocator, remote_json[0..remote_len]) catch {
+        out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_INVALID_ARGUMENT };
+        return SLOWCLAW_ERR_INVALID_ARGUMENT;
+    };
+    defer remote.deinit(c_allocator);
+
+    var d = sync_engine.diff(c_allocator, local, remote) catch {
+        out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_INTERNAL };
+        return SLOWCLAW_ERR_INTERNAL;
+    };
+    defer d.deinit(c_allocator);
+
+    const json = sync_engine.serializeDiff(c_allocator, d) catch {
+        out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_OUT_OF_MEMORY };
+        return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    };
+    out_result.* = .{ .items_json = SlowclawString.fromOwnedSlice(json), .status = SLOWCLAW_OK };
+    return SLOWCLAW_OK;
+}
+
+/// Free a diff result from `slowclaw_feed_sync_diff`. Safe on a zeroed result.
+pub export fn slowclaw_feed_sync_result_free(result: *SlowclawRankResult) void {
+    if (result.items_json.bytes) |b| {
+        c_allocator.free(b[0..result.items_json.len]);
+        result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_OK };
+    }
+}
+
+/// Apply a batch of remote entries to the local store. `entries_json` is a
+/// JSON array of full TransferEntry objects (the shell fetches each entry's
+/// content from the peer, batches them, then calls this). Last-writer-wins:
+/// entries whose local `updated_at` is newer are skipped. Returns 0 on
+/// success, negative on error.
+///
+/// TransferEntry JSON shape:
+///   [{"key":"...","content":"...","category":"daily","updated_at":"...",
+///     "session_id":"..."|null,"source":"..."|null,"media_url":"..."|null}, ...]
+pub export fn slowclaw_feed_sync_apply_entries(
+    handle: *SlowclawSqlite,
+    entries_json: [*]const u8,
+    entries_len: usize,
+) c_int {
+    const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
+    const entries = sync_engine.parseTransferEntries(c_allocator, entries_json[0..entries_len]) catch {
+        return SLOWCLAW_ERR_INVALID_ARGUMENT;
+    };
+    defer sync_engine.freeTransferEntries(c_allocator, entries);
+    sync_engine.applyEntries(c_allocator, db, entries) catch return SLOWCLAW_ERR_INTERNAL;
+    return SLOWCLAW_OK;
+}
+
+/// Fetch one full entry (content + metadata) by key, for transfer to the
+/// peer. Writes a Zig-owned SlowclawSqliteEntry to `out_entry` (caller frees
+/// via `slowclaw_feed_sqlite_entry_free`). Returns 0 if found, 1 if not
+/// found, negative on error.
+pub export fn slowclaw_feed_sync_entry_for_transfer(
+    handle: *SlowclawSqlite,
+    key: [*]const u8,
+    key_len: usize,
+    out_entry: *SlowclawSqliteEntry,
+) c_int {
+    const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
+    const found = db.get(c_allocator, key[0..key_len]) catch return SLOWCLAW_ERR_INTERNAL;
+    if (found == null) return 1;
+    out_entry.* = entryToC(found.?);
+    return SLOWCLAW_OK;
+}
+
 /// Parse a JSON array of {"label":"...","weight":N} into Topic structs.
 fn parseTopicsJson(allocator: std.mem.Allocator, json: []const u8) ![]feeds_ranking.Topic {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return &.{};
@@ -1553,5 +1673,100 @@ test "ffi: parse_and_rank with topics incl. escaped label does not corrupt the h
         try testing.expect(result.items_json.len > 0);
         slowclaw_feed_rank_result_free(&result);
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Sync FFI round-trip: the deterministic proxy for cross-device sync
+// correctness (AGENTS.md §7). build_manifest → diff → entry_for_transfer →
+// apply_entries must converge two stores through the C ABI.
+// ──────────────────────────────────────────────────────────────────────────
+
+test "ffi: sync manifest build/diff/apply round-trip via C ABI" {
+    // Device A: two journal entries.
+    const handle_a = slowclaw_feed_sqlite_open(":memory:", ":memory:".len, null) orelse return error.OOM;
+    defer slowclaw_feed_sqlite_close(handle_a);
+    try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sqlite_store(
+        handle_a,
+        "slowclaw_user_key_1", "slowclaw_user_key_1".len,
+        "journal from A1", "journal from A1".len,
+        "daily", "daily".len,
+        null, 0, "text", "text".len, null, 0,
+    ));
+    try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sqlite_store(
+        handle_a,
+        "slowclaw_user_key_2", "slowclaw_user_key_2".len,
+        "journal from A2", "journal from A2".len,
+        "daily", "daily".len,
+        null, 0, "text", "text".len, null, 0,
+    ));
+
+    // Device B: empty.
+    const handle_b = slowclaw_feed_sqlite_open(":memory:", ":memory:".len, null) orelse return error.OOM;
+    defer slowclaw_feed_sqlite_close(handle_b);
+
+    // A builds its manifest.
+    var manifest_a_json = SlowclawString.empty();
+    try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sync_build_manifest(handle_a, null, 0, &manifest_a_json));
+    defer if (manifest_a_json.bytes) |b| c_allocator.free(b[0..manifest_a_json.len]);
+    try testing.expect(manifest_a_json.len > 0);
+
+    // B builds its (empty) manifest.
+    var manifest_b_json = SlowclawString.empty();
+    try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sync_build_manifest(handle_b, null, 0, &manifest_b_json));
+    defer if (manifest_b_json.bytes) |b| c_allocator.free(b[0..manifest_b_json.len]);
+
+    // B diffs: local=B(empty), remote=A. Both keys should be in to_pull.
+    var diff_result: SlowclawRankResult = .{ .items_json = SlowclawString.empty(), .status = 0 };
+    const diff_status = slowclaw_feed_sync_diff(
+        manifest_b_json.bytes.?, manifest_b_json.len,
+        manifest_a_json.bytes.?, manifest_a_json.len,
+        &diff_result,
+    );
+    try testing.expectEqual(SLOWCLAW_OK, diff_status);
+    defer slowclaw_feed_sync_result_free(&diff_result);
+    try testing.expect(diff_result.items_json.len > 0);
+    const diff_slice = diff_result.items_json.bytes.?[0..diff_result.items_json.len];
+    try testing.expect(std.mem.indexOf(u8, diff_slice, "slowclaw_user_key_1") != null);
+    try testing.expect(std.mem.indexOf(u8, diff_slice, "slowclaw_user_key_2") != null);
+
+    // Fetch each entry from A (proves entry_for_transfer works) then apply on B.
+    var e1: SlowclawSqliteEntry = std.mem.zeroes(SlowclawSqliteEntry);
+    try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sync_entry_for_transfer(handle_a, "slowclaw_user_key_1", "slowclaw_user_key_1".len, &e1));
+    defer slowclaw_feed_sqlite_entry_free(&e1);
+    try testing.expectEqualStrings("journal from A1", e1.content.bytes.?[0..e1.content.len]);
+
+    // The shell builds the transfer JSON; here we hand-roll it for the test.
+    const transfer_json =
+        "[{\"key\":\"slowclaw_user_key_1\",\"content\":\"journal from A1\",\"category\":\"daily\",\"updated_at\":\"2026-01-01T00:00:00Z\",\"source\":\"text\"}," ++
+        "{\"key\":\"slowclaw_user_key_2\",\"content\":\"journal from A2\",\"category\":\"daily\",\"updated_at\":\"2026-01-01T00:00:00Z\",\"source\":\"text\"}]";
+    try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sync_apply_entries(handle_b, transfer_json.ptr, transfer_json.len));
+    try testing.expectEqual(@as(c_int, 2), slowclaw_feed_sqlite_count(handle_b));
+
+    // B's manifest now matches A's content (same keys).
+    var manifest_b_after = SlowclawString.empty();
+    try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sync_build_manifest(handle_b, null, 0, &manifest_b_after));
+    defer if (manifest_b_after.bytes) |b| c_allocator.free(b[0..manifest_b_after.len]);
+    const after_slice = manifest_b_after.bytes.?[0..manifest_b_after.len];
+    try testing.expect(std.mem.indexOf(u8, after_slice, "slowclaw_user_key_1") != null);
+    try testing.expect(std.mem.indexOf(u8, after_slice, "slowclaw_user_key_2") != null);
+
+    // Re-diff A vs B's new manifest: nothing to transfer.
+    var diff2: SlowclawRankResult = .{ .items_json = SlowclawString.empty(), .status = 0 };
+    try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sync_diff(
+        manifest_a_json.bytes.?, manifest_a_json.len,
+        manifest_b_after.bytes.?, manifest_b_after.len,
+        &diff2,
+    ));
+    defer slowclaw_feed_sync_result_free(&diff2);
+    const d2_slice = diff2.items_json.bytes.?[0..diff2.items_json.len];
+    try testing.expect(std.mem.indexOf(u8, d2_slice, "\"to_pull\":[]") != null);
+    try testing.expect(std.mem.indexOf(u8, d2_slice, "\"to_push\":[]") != null);
+}
+
+test "ffi: sync entry_for_transfer returns 1 for missing key" {
+    const handle = slowclaw_feed_sqlite_open(":memory:", ":memory:".len, null) orelse return error.OOM;
+    defer slowclaw_feed_sqlite_close(handle);
+    var entry: SlowclawSqliteEntry = std.mem.zeroes(SlowclawSqliteEntry);
+    try testing.expectEqual(@as(c_int, 1), slowclaw_feed_sync_entry_for_transfer(handle, "missing", "missing".len, &entry));
 }
 

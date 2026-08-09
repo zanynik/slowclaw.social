@@ -508,6 +508,122 @@ fn localNewer(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Diff JSON serialization (for the FFI surface)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Serialize a SyncDiff as JSON for the C ABI. Shape:
+///   {"to_pull":["k1",...],"to_push":["k2",...],
+///    "conflicts":[{"key":"k","local_updated_at":"...","remote_updated_at":"...","winner":"local|remote"}]}
+pub fn serializeDiff(allocator: std.mem.Allocator, d: SyncDiff) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"to_pull\":[");
+    for (d.to_pull, 0..) |k, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.append(allocator, '"');
+        try writeJsonString(allocator, &buf, k);
+        try buf.append(allocator, '"');
+    }
+    try buf.appendSlice(allocator, "],\"to_push\":[");
+    for (d.to_push, 0..) |k, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.append(allocator, '"');
+        try writeJsonString(allocator, &buf, k);
+        try buf.append(allocator, '"');
+    }
+    try buf.appendSlice(allocator, "],\"conflicts\":[");
+    for (d.conflicts, 0..) |cf, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.append(allocator, '{');
+        try writeJsonStringField(allocator, &buf, "key", cf.key);
+        try buf.append(allocator, ',');
+        try writeJsonStringField(allocator, &buf, "local_updated_at", cf.local_updated_at);
+        try buf.append(allocator, ',');
+        try writeJsonStringField(allocator, &buf, "remote_updated_at", cf.remote_updated_at);
+        try buf.appendSlice(allocator, ",\"winner\":\"");
+        try buf.appendSlice(allocator, @tagName(cf.winner));
+        try buf.appendSlice(allocator, "\"}");
+    }
+    try buf.appendSlice(allocator, "]}");
+    return buf.toOwnedSlice(allocator);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// TransferEntry JSON parsing (for apply_entries over the FFI)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Parse a JSON array of TransferEntry objects. All strings are
+/// allocator-owned; free with `freeTransferEntries`.
+pub fn parseTransferEntries(allocator: std.mem.Allocator, json: []const u8) ![]TransferEntry {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return error.InvalidManifest;
+    defer parsed.deinit();
+
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return error.InvalidManifest,
+    };
+
+    var out = std.ArrayList(TransferEntry).empty;
+    errdefer {
+        for (out.items) |e| freeTransferEntry(allocator, e);
+        out.deinit(allocator);
+    }
+
+    for (arr.items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => return error.InvalidManifest,
+        };
+        const key = jsonFieldDup(allocator, obj, "key") catch return error.OutOfMemory;
+        errdefer allocator.free(key);
+        const content = jsonFieldDup(allocator, obj, "content") catch return error.OutOfMemory;
+        errdefer allocator.free(content);
+        const category = jsonFieldDup(allocator, obj, "category") catch return error.OutOfMemory;
+        errdefer allocator.free(category);
+        const updated_at = jsonFieldDup(allocator, obj, "updated_at") catch return error.OutOfMemory;
+        errdefer allocator.free(updated_at);
+
+        out.append(allocator, .{
+            .key = key,
+            .content = content,
+            .category = category,
+            .updated_at = updated_at,
+            .session_id = jsonOptionalFieldDup(allocator, obj, "session_id") catch return error.OutOfMemory,
+            .source = jsonOptionalFieldDup(allocator, obj, "source") catch return error.OutOfMemory,
+            .media_url = jsonOptionalFieldDup(allocator, obj, "media_url") catch return error.OutOfMemory,
+        }) catch return error.OutOfMemory;
+    }
+    return out.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
+/// Free a slice of TransferEntry (and each entry's owned strings).
+pub fn freeTransferEntries(allocator: std.mem.Allocator, entries: []TransferEntry) void {
+    for (entries) |e| freeTransferEntry(allocator, e);
+    allocator.free(entries);
+}
+
+fn freeTransferEntry(allocator: std.mem.Allocator, e: TransferEntry) void {
+    allocator.free(e.key);
+    allocator.free(e.content);
+    allocator.free(e.category);
+    allocator.free(e.updated_at);
+    if (e.session_id) |s| allocator.free(s);
+    if (e.source) |s| allocator.free(s);
+    if (e.media_url) |s| allocator.free(s);
+}
+
+/// Like jsonFieldDup but returns null when the field is absent or JSON null
+/// (rather than an empty string). Used for the optional TransferEntry fields.
+fn jsonOptionalFieldDup(allocator: std.mem.Allocator, obj: std.json.ObjectMap, name: []const u8) !?[]const u8 {
+    const v = obj.get(name) orelse return null;
+    return switch (v) {
+        .string => |s| try allocator.dupe(u8, s),
+        else => null,
+    };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Tests
 //
 // Hermetic and deterministic: every test uses a `:memory:` SQLite DB and no
