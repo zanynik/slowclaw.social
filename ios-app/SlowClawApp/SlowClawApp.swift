@@ -1149,11 +1149,34 @@ func journalPreviewOf(_ entry: SlowClawMemoryEntry) -> String {
     return String(trimmed.prefix(60))
 }
 
+/// Resolve a journal entry's creation Date. Tries, in order: the `timestamp`
+/// field as ISO8601/RFC3339 (lenient — with and without fractional seconds),
+/// then the epoch embedded in the `key` (e.g. `journal_<epoch>`). Returns nil
+/// only if none parse. The old code fell back to `entry.id`, which is a UUID
+/// (not epoch) and silently produced Jan 1, 1970 — hence the "Jan 1" bug.
+func journalDate(_ entry: SlowClawMemoryEntry) -> Date? {
+    // 1) ISO8601 / RFC3339 from the timestamp column.
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if !entry.timestamp.isEmpty, let d = iso.date(from: entry.timestamp) { return d }
+    iso.formatOptions = [.withInternetDateTime]
+    if !entry.timestamp.isEmpty, let d = iso.date(from: entry.timestamp) { return d }
+    // 2) Epoch from the key ("journal_<epoch>" or "draft_<epoch>...").
+    let prefix = entry.key.split(separator: "_").first.map(String.init) ?? ""
+    let rest = entry.key.hasPrefix(prefix + "_")
+        ? String(entry.key.dropFirst(prefix.count + 1))
+        : entry.key
+    // The draft key can have a trailing "_<rand>"; take the leading numeric run.
+    let numeric = rest.split(separator: "_").first.map(String.init) ?? rest
+    if let secs = TimeInterval(numeric), secs > 0 {
+        return Date(timeIntervalSince1970: secs)
+    }
+    return nil
+}
+
 /// Coarse relative-time string (now / Nm / Nh / Nd / Nw / Nmo, else MMM d).
 func journalRelativeTime(_ entry: SlowClawMemoryEntry) -> String {
-    let formatter = ISO8601DateFormatter()
-    let date = formatter.date(from: entry.timestamp)
-        ?? Date(timeIntervalSince1970: TimeInterval(entry.id) ?? 0)
+    let date = journalDate(entry) ?? Date(timeIntervalSince1970: 0)
     let secs = max(0, Date().timeIntervalSince(date))
     if secs < 60 { return "now" }
     if secs < 3600 { return "\(Int(secs / 60))m" }
