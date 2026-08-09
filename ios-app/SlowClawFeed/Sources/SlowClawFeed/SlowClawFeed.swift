@@ -240,6 +240,82 @@ public final class SlowClawSqliteMemory {
         guard let bytes = s.bytes, s.len > 0 else { return "" }
         return String(data: Data(bytes: UnsafeRawPointer(bytes), count: s.len), encoding: .utf8) ?? ""
     }
+
+    // ── Sync (LAN QR-paired sync with the Windows companion) ────────────
+    // Thin Swift overlay over slowclaw_feed_sync_*. The shell owns the wire
+    // transport (SyncClient.swift); these methods own the core side only.
+
+    /// Build a sync manifest as a JSON string (the `SyncManifest` shape from
+    /// `windows-app/PROTOCOL.md`). `mediaRoot` is the absolute dir under which
+    /// `media_url` paths resolve (the iOS Documents dir); pass nil to skip
+    /// media sizing.
+    public func syncBuildManifest(mediaRoot: String? = nil) throws -> String {
+        guard let h = handle else { throw SlowClawFeedError.internalError("closed") }
+        var out = SlowclawString(bytes: nil, len: 0)
+        let status = withOptionalCString(mediaRoot) { rootPtr, rootLen in
+            slowclaw_feed_sync_build_manifest(h, rootPtr, rootLen, &out)
+        }
+        guard status == SLOWCLAW_OK else {
+            if let b = out.bytes { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: b)) }
+            throw SlowClawFeedError.internalError("sync_build_manifest returned \(status)")
+        }
+        defer { if let b = out.bytes { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: b)) } }
+        return stringFromSlowclaw(out)
+    }
+
+    /// Diff a local manifest against a remote manifest. Both are JSON strings
+    /// in the manifest shape. Returns the diff JSON
+    /// (`{to_pull,to_push,conflicts}`).
+    public func syncDiff(local: String, remote: String) throws -> String {
+        var result = SlowclawRankResult()
+        let status = local.withCString { lPtr in
+            remote.withCString { rPtr in
+                slowclaw_feed_sync_diff(lPtr, local.utf8.count,
+                                        rPtr, remote.utf8.count, &result)
+            }
+        }
+        guard status == SLOWCLAW_OK else {
+            slowclaw_feed_sync_result_free(&result)
+            throw SlowClawFeedError.invalidArgument("sync_diff returned \(status)")
+        }
+        defer { slowclaw_feed_sync_result_free(&result) }
+        guard let bytes = result.items_json.bytes else { return "{}" }
+        return String(data: Data(bytes: bytes, count: result.items_json.len), encoding: .utf8) ?? "{}"
+    }
+
+    /// Apply a batch of remote entries. `entriesJSON` is a JSON array of
+    /// TransferEntry objects (the shell fetches each from the peer, batches
+    /// them, then calls this). Last-writer-wins.
+    public func syncApplyEntries(_ entriesJSON: String) throws {
+        guard let h = handle else { throw SlowClawFeedError.internalError("closed") }
+        let status = entriesJSON.withCString { ptr in
+            slowclaw_feed_sync_apply_entries(h, ptr, entriesJSON.utf8.count)
+        }
+        guard status == SLOWCLAW_OK else {
+            throw SlowClawFeedError.internalError("sync_apply_entries returned \(status)")
+        }
+    }
+
+    /// Fetch one full entry by key, for transfer to the peer. Returns nil if
+    /// the key is absent.
+    public func syncEntryForTransfer(key: String) throws -> SlowClawMemoryEntry? {
+        guard let h = handle else { throw SlowClawFeedError.internalError("closed") }
+        var entry = SlowclawSqliteEntry()
+        let status = key.withCString { ptr in
+            slowclaw_feed_sync_entry_for_transfer(h, ptr, key.utf8.count, &entry)
+        }
+        if status == 1 { return nil } // not found
+        guard status == SLOWCLAW_OK else {
+            throw SlowClawFeedError.getFailed("sync_entry_for_transfer returned \(status)")
+        }
+        defer { slowclaw_feed_sqlite_entry_free(&entry) }
+        return entryToSwift(entry)
+    }
+
+    /// The raw opaque handle, for the sync client's direct use (e.g. building
+    /// the iOS manifest from the same connection the app uses). The sync
+    /// client must not close or free it.
+    public var syncHandle: OpaquePointer? { handle }
 }
 
 /// Bridge an optional Swift String to the C ABI's `(ptr, len)` convention.

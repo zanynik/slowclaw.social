@@ -2584,6 +2584,7 @@ struct ProfileView: View {
     @State private var apiKeyInput = ""
     @State private var modelInput = "gpt-4o-mini"
     @State private var baseURLInput = "https://api.openai.com/v1"
+    @State private var showSync = false
 
     var body: some View {
         ScrollView {
@@ -2708,6 +2709,29 @@ struct ProfileView: View {
                     }
                 }
 
+                // Sync with the Windows companion (LAN QR-paired). Opens the
+                // camera-scan flow; the desktop renders the QR + runs the
+                // listener (AGENTS.md §1/§9 bounded companion exception).
+                DS.card(scheme) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Sync")
+                            .font(DS.cardTitleFont)
+                            .foregroundStyle(DS.ink(scheme))
+                        Text("Sync your journals with the SlowClaw Sync app on your computer over your local network.")
+                            .font(.subheadline)
+                            .foregroundStyle(DS.muted(scheme))
+                        Button {
+                            showSync = true
+                        } label: {
+                            Text("Sync with Desktop")
+                                .font(.body.weight(.medium))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+
                 // Recently Deleted (30-day soft-delete, like Voice Memos).
                 // Shows entries the user deleted from Journals, with restore +
                 // empty-trash. Auto-expire after 30 days.
@@ -2722,6 +2746,10 @@ struct ProfileView: View {
             apiKeyInput = state.apiKey
             modelInput = state.model
             baseURLInput = state.baseURL
+        }
+        .sheet(isPresented: $showSync) {
+            SyncView()
+                .environmentObject(state)
         }
     }
 

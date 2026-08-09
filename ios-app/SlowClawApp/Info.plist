@@ -48,6 +48,14 @@
     <string>SlowClaw needs microphone access when you record audio journal entries.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>SlowClaw uses on-device speech recognition to transcribe your audio journal entries.</string>
+    <!-- Camera: used only by the Sync screen to scan the desktop companion's
+         pairing QR. No photos/videos are captured or stored. -->
+    <key>NSCameraUsageDescription</key>
+    <string>SlowClaw uses the camera to scan the pairing QR code on your computer during sync.</string>
+    <!-- Local network: required by iOS 14+ for outbound connections to a
+         device on the LAN (the Windows companion's sync server). -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>SlowClaw connects to the SlowClaw Sync app on your computer over your local network to sync journals.</string>
     <!-- Background audio: lets a recording in progress survive screen lock
          and backgrounding (long audio journals). Pairs with the .playAndRecord
          AVAudioSession category in AudioRecorder.swift. No entitlement file
