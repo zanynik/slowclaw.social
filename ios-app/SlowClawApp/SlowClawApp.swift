@@ -136,6 +136,9 @@ struct SlowClawApp: App {
                     for pending in urlDelegate.flushPending() {
                         voiceMemoImporter.enqueue(pending)
                     }
+                    // Auto-activate the on-device model so AI is ready whenever
+                    // the app is open (local-first path).
+                    Task { await appState.ensureLocalModelActivated() }
                     // Resume any pending transcriptions left from a killed-app
                     // session, and schedule a background drain as backup.
                     Task { await appState.resumePendingTranscriptionsOnLaunch() }
@@ -368,6 +371,22 @@ final class AppState: ObservableObject {
         try? LocalModelStore.delete(preset)
         localModelProgress[preset.id] = nil
         refreshLocalLLMStatus()
+    }
+
+    /// Auto-activate the on-device model when the app is open or AI is needed.
+    /// If the llama.cpp backend is compiled in but no model is loaded, picks
+    /// the first downloaded preset and loads it. No-op when no preset is
+    /// downloaded (won't auto-download a 2GB model without consent) or when a
+    /// model is already loaded. Safe to call repeatedly.
+    func ensureLocalModelActivated() async {
+        // Re-read status in case it changed (e.g. the OS reclaimed the model).
+        refreshLocalLLMStatus()
+        guard localLLM.available, !localLLM.loaded, !localModelBusy else { return }
+        // Prefer the first downloaded preset. Presets are ordered smaller-first.
+        guard let preset = LocalModelPreset.presets.first(where: { LocalModelStore.isDownloaded($0) }) else {
+            return
+        }
+        await activateLocalModel(preset)
     }
 
     // MARK: - AI routing (local-first)
@@ -786,6 +805,8 @@ final class AppState: ObservableObject {
             pendingTitleKeys.remove(key)
             return
         }
+        // Ensure the on-device model is active before asking it for a title.
+        await ensureLocalModelActivated()
         pendingTitleKeys.insert(key)
         defer { pendingTitleKeys.remove(key) }
         guard let title = try? await aiTitle(transcript: trimmed),
@@ -1064,6 +1085,7 @@ enum AppTab: String, CaseIterable {
 struct AppShell: View {
     @EnvironmentObject var state: AppState
     @Environment(\.colorScheme) var scheme
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("slowclaw.theme") private var themeRaw: String = ""
     var body: some View {
         Group {
@@ -1091,6 +1113,13 @@ struct AppShell: View {
         // Voice-memo imports auto-store (transcribe on-device → journal entry),
         // matching the reference app — no review gate. The sidebar shows
         // progress via voiceMemoImporter.status while the serial worker runs.
+        // Re-activate the on-device model when returning to the foreground (the
+        // OS may have reclaimed it), so AI is ready whenever the app is open.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                Task { await state.ensureLocalModelActivated() }
+            }
+        }
     }
 }
 
