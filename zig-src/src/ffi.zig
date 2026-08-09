@@ -1023,6 +1023,15 @@ pub export fn slowclaw_feed_local_llm_draft_post(
     return localJournalAgentCall(journal_agent.draftPost, .{ journal_text[0..journal_text_len], "local", max_chars }, out_result);
 }
 
+/// Title generation on-device: transcript/text → concise title.
+pub export fn slowclaw_feed_local_llm_generate_title(
+    transcript: [*]const u8,
+    transcript_len: usize,
+    out_result: *SlowclawChatResult,
+) c_int {
+    return localJournalAgentCall(journal_agent.generateTitle, .{ transcript[0..transcript_len], "local" }, out_result);
+}
+
 /// Parse a JSON array of {"label":"...","weight":N} into Topic structs.
 fn parseTopicsJson(allocator: std.mem.Allocator, json: []const u8) ![]feeds_ranking.Topic {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return &.{};
