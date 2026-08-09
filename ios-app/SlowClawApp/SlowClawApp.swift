@@ -436,10 +436,11 @@ final class AppState: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         guard let llm else { throw SlowClawFeedError.internalError("no LLM configured") }
-        let title = try await Task.detached(priority: .userInitiated) {
-            try llm.chat(systemPrompt: "You write a concise, descriptive title for a journal entry. Maximum 8 words. Capture the main topic or moment. No trailing period, no quotes, no preamble. Output ONLY the title text.",
-                         message: transcript, model: model, temperature: 0.4)
-        }.value
+        // Remote path: call the provider directly (it's async/network, doesn't
+        // block the actor like local inference does — matches aiSynthesize).
+        let title = try await llm.chat(
+            systemPrompt: "You write a concise, descriptive title for a journal entry. Maximum 8 words. Capture the main topic or moment. No trailing period, no quotes, no preamble. Output ONLY the title text.",
+            message: transcript, model: model, temperature: 0.4)
         return title.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
