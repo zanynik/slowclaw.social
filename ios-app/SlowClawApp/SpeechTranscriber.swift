@@ -52,6 +52,13 @@ enum Transcriber {
 
     /// Shared file→string transcription used by transcribe(url:) and the
     /// background drain. Takes an already-opened AVAudioFile.
+    ///
+    /// Ordering matters here: analyzer.start(inputSequence:) suspends until the
+    /// input stream finishes, so the feeder must run concurrently AND be the one
+    /// to call finish() on the stream when the file is fully fed. Only after
+    /// start returns do we finalize (flushing any late finals) and let the
+    /// result-collection task drain to completion. Cancelling the collector
+    /// before finalize would drop late finals — the previous empty-transcript bug.
     static func transcribe(file: AVAudioFile) async -> String {
         let transcriber = SpeechTranscriber(
             locale: Locale.current,
@@ -80,21 +87,31 @@ enum Transcriber {
             }
         }
 
-        // Feed the file's PCM buffers (converted to the analyzer format) into
-        // the input stream. Run feeding + analyzer concurrently: the analyzer
-        // consumes the stream while we fill it, then finalize flushes finals.
-        async let feedingDone = feed(file: file, converter: converter, into: inputBuilder)
-        do {
-            try await analyzer.start(inputSequence: inputStream)
-            await feedingDone
+        // Feeder: convert + yield the file's PCM, then finish() the stream so
+        // analyzer.start can return. Runs concurrently with the analyzer.
+        let feeder = Task<Void, Never> {
+            await Self.feed(file: file, converter: converter, into: inputBuilder)
             inputBuilder.finish()
+        }
+        // Analyzer: consumes the stream; returns once the stream is finished.
+        // Drive it on its own task so feeder + collector run concurrently.
+        let analyzerTask = Task<Void, Error> {
+            try await analyzer.start(inputSequence: inputStream)
+        }
+        // Wait for feeding + analyzing to complete.
+        _ = await feeder.value
+        do {
+            try await analyzerTask.value
+            // Flush any late finals, then await the collector so they're captured.
             try await analyzer.finalizeAndFinishThroughEndOfInput()
         } catch {
-            // On-device unavailable / threw — return whatever finals we have.
-            inputBuilder.finish()
-            await feedingDone
+            // On-device unavailable / threw — fall through with whatever we have.
         }
+        // Give the result collector a beat to drain finals emitted by finalize.
+        // Cancelling immediately could drop a straggler; a short yield lets the
+        // for-try-await loop iteration complete.
         recognizerTask.cancel()
+        _ = await recognizerTask.result
         return collected.text()
     }
 
