@@ -374,7 +374,9 @@ final class AppState: ObservableObject {
     }
 
     /// Load a downloaded model into the on-device engine. Runs off-actor:
-    /// mmap-ing a multi-GB GGUF takes seconds and must not block the UI.
+    /// mmap-ing a multi-GB GGUF takes seconds and must not block the UI. When
+    /// the preset has an audio mmproj that's already downloaded, also loads
+    /// the projector so the mtmd audio engine becomes available.
     func activateLocalModel(_ preset: LocalModelPreset) async {
         guard let url = try? LocalModelStore.fileURL(for: preset) else { return }
         localModelBusy = true
@@ -385,19 +387,39 @@ final class AppState: ObservableObject {
         }.value
         if let err { localModelError = err }
         refreshLocalLLMStatus()
+
+        // If this preset has an audio mmproj and it's downloaded, load it so
+        // the mtmd audio engine is ready. Best-effort — a missing/bad mmproj
+        // doesn't block the text model; the audio toggle just stays inactive.
+        if localLLM.loaded, preset.hasAudioMmproj,
+           let mmprojURL = try? LocalModelStore.mmprojFileURL(for: preset),
+           LocalModelStore.isMmprojDownloaded(preset) {
+            let mmprojErr = await Task.detached(priority: .userInitiated) {
+                slowClawLocalAudioLoadMMProj(path: mmprojURL.path)
+            }.value
+            if let mmprojErr { localModelError = mmprojErr }
+        }
+        refreshLocalAudioStatus()
     }
 
     func unloadLocalModel() {
+        // Unload the audio mmproj first (it attaches to the text model), then
+        // the text model, then refresh both statuses.
+        slowClawLocalAudioUnload()
         slowClawLocalLLMUnload()
         refreshLocalLLMStatus()
+        refreshLocalAudioStatus()
     }
 
     func deleteLocalModel(_ preset: LocalModelPreset) {
-        // Unload first if any model is active (frees RAM), then remove the file.
+        // Unload first if any model is active (frees RAM), then remove the
+        // files (text GGUF + mmproj if present).
         if localLLM.loaded { unloadLocalModel() }
         try? LocalModelStore.delete(preset)
+        try? LocalModelStore.deleteMmproj(preset)
         localModelProgress[preset.id] = nil
         refreshLocalLLMStatus()
+        refreshLocalAudioStatus()
     }
 
     /// Auto-activate the on-device model when the app is open or AI is needed.
