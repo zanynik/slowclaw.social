@@ -50,6 +50,7 @@ pub const AudioError = error{
     NoTextModel,
     TokenizationFailed,
     EncodingFailed,
+    ContextCreateFailed,
     InferenceFailed,
     OutOfMemory,
 };
