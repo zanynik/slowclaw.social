@@ -77,12 +77,12 @@ enum AudioSTT {
         let targetRate = Double(status.sampleRate)
 
         // Decode + resample to mono F32 at the target rate.
-        guard let pcm = await Task.detached(priority: .userInitiated) {
+        let pcmOpt = await Task.detached(priority: .userInitiated) {
             decodeToMonoF32(url: url, sampleRate: targetRate)
-        }.value else {
+        }.value
+        guard let pcm = pcmOpt, !pcm.isEmpty else {
             return nil
         }
-        if pcm.isEmpty { return nil }
 
         // Hand the PCM to the Zig core. This runs the full mtmd pipeline
         // (audio encoder → projector → LLM decode → transcript generation).
