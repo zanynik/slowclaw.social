@@ -80,6 +80,11 @@ comptime {
     _ = &ffi.slowclaw_feed_local_llm_synthesize_journal;
     _ = &ffi.slowclaw_feed_local_llm_extract_interests;
     _ = &ffi.slowclaw_feed_local_llm_draft_post;
+    _ = &ffi.slowclaw_feed_local_llm_generate_title;
+    _ = &ffi.slowclaw_feed_local_audio_status;
+    _ = &ffi.slowclaw_feed_local_audio_load_mmproj;
+    _ = &ffi.slowclaw_feed_local_audio_unload;
+    _ = &ffi.slowclaw_feed_local_audio_transcribe;
 }
 
 test {

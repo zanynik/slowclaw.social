@@ -795,6 +795,126 @@ public func slowClawLocalGenerateTitle(transcript: String) throws -> String {
     return try processLocalChatResult(result)
 }
 
+// MARK: - On-device audio transcription (mtmd / multimodal)
+
+/// On-device audio engine status. `available` reflects whether the mtmd
+/// backend is linked; `supported` whether an audio-capable mmproj is loaded;
+/// `sampleRate` the rate the projector expects (0 if none).
+public struct LocalAudioStatus: Decodable {
+    public let available: Bool
+    public let supported: Bool
+    public let sampleRate: Int
+    public let reason: String?
+
+    public init(available: Bool = false, supported: Bool = false,
+                sampleRate: Int = 0, reason: String? = nil) {
+        self.available = available
+        self.supported = supported
+        self.sampleRate = sampleRate
+        self.reason = reason
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case available, supported, sampleRate, reason
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        available = try c.decodeIfPresent(Bool.self, forKey: .available) ?? false
+        supported = try c.decodeIfPresent(Bool.self, forKey: .supported) ?? false
+        sampleRate = try c.decodeIfPresent(Int.self, forKey: .sampleRate) ?? 0
+        reason = try c.decodeIfPresent(String.self, forKey: .reason)
+    }
+}
+
+/// Per-transcription timing (milliseconds). The locked-phone experiment reads
+/// these to determine whether the process got CPU time while the screen was
+/// locked. Mirrors SlowclawAudioTimings in the C header.
+public struct AudioTimings {
+    public let loadMs: Int64
+    public let encodeMs: Int64
+    public let decodeMs: Int64
+    public let totalMs: Int64
+
+    public init(loadMs: Int64 = 0, encodeMs: Int64 = 0, decodeMs: Int64 = 0, totalMs: Int64 = 0) {
+        self.loadMs = loadMs
+        self.encodeMs = encodeMs
+        self.decodeMs = decodeMs
+        self.totalMs = totalMs
+    }
+}
+
+/// Result of an on-device transcription: the transcript text + timings.
+public struct LocalAudioTranscription {
+    public let text: String
+    public let timings: AudioTimings
+}
+
+/// Read on-device audio engine status from the Zig core. Returns a
+/// not-available status on any error (so callers can render safely).
+public func slowClawLocalAudioStatus() -> LocalAudioStatus {
+    var out = SlowclawString(bytes: nil, len: 0)
+    let status = slowclaw_feed_local_audio_status(&out)
+    guard status == SLOWCLAW_OK, let bytes = out.bytes, out.len > 0 else {
+        if let b = out.bytes { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: b)) }
+        return LocalAudioStatus(available: false, reason: "Status unavailable.")
+    }
+    defer { if let b = out.bytes { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: b)) } }
+    let data = Data(bytes: UnsafeRawPointer(bytes), count: out.len)
+    return (try? JSONDecoder().decode(LocalAudioStatus.self, from: data))
+        ?? LocalAudioStatus(available: false, reason: "Status decode failed.")
+}
+
+/// Load the audio multimodal projector (mmproj GGUF). The text model must be
+/// loaded first via slowClawLocalLLMLoad. Returns nil on success, else a
+/// human-readable error. Slow + memory-heavy — call off the main thread.
+public func slowClawLocalAudioLoadMMProj(path: String) -> String? {
+    let code = path.withCString { ptr in
+        slowclaw_feed_local_audio_load_mmproj(ptr, path.utf8.count)
+    }
+    switch code {
+    case SLOWCLAW_OK: return nil
+    case SLOWCLAW_ERR_INVALID_ARGUMENT:
+        return "The mmproj is missing, invalid, or does not support audio. Load the text model first."
+    case SLOWCLAW_ERR_OUT_OF_MEMORY:
+        return "Not enough memory to load the audio projector."
+    default:
+        return "mtmd could not load this projector (unsupported or too large for this device)."
+    }
+}
+
+/// Unload the audio mmproj (frees RAM).
+public func slowClawLocalAudioUnload() {
+    slowclaw_feed_local_audio_unload()
+}
+
+/// Transcribe mono PCM F32 samples into text on-device. `pcm` is raw 32-bit
+/// float samples at the rate from slowClawLocalAudioStatus().sampleRate
+/// (typically 16000). The caller decodes + resamples the audio file to this
+/// format before calling. Returns the transcript + timings; throws on error.
+public func slowClawLocalAudioTranscribe(pcm: [Float], maxTokens: UInt32 = 256,
+                                          temperature: Double = 0.0) throws -> LocalAudioTranscription {
+    precondition(MemoryLayout<Float>.size == 4, "Float must be 32-bit")
+    var out = SlowclawChatResult()
+    var timings = SlowclawAudioTimings()
+    let code: Int32 = pcm.withUnsafeBufferPointer { buf in
+        let ptr = buf.baseAddress
+        return slowclaw_feed_local_audio_transcribe(
+            ptr, pcm.count, maxTokens, temperature, &out, &timings)
+    }
+    let text = try processLocalChatResult(SlowclawChatResult(
+        text: out.text, status: code == SLOWCLAW_OK ? SLOWCLAW_OK : out.status))
+    return LocalAudioTranscription(
+        text: text,
+        timings: AudioTimings(
+            loadMs: timings.load_ms,
+            encodeMs: timings.encode_ms,
+            decodeMs: timings.decode_ms,
+            totalMs: timings.total_ms
+        )
+    )
+}
+
 private func escapeJson(_ s: String) -> String {
     s.replacingOccurrences(of: "\\", with: "\\\\")
      .replacingOccurrences(of: "\"", with: "\\\"")
