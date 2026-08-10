@@ -35,7 +35,7 @@ pub const have_mtmd = build_options.with_llama;
 const mtmd = if (have_mtmd) @cImport({
     @cInclude("mtmd.h");
 }) else struct {};
-const llama = if (have_mtmd) local_inference.llama_symbols else struct {};
+const llama = if (have_mtmd) local_inference.llama else struct {};
 
 const c_stdlib = @cImport({
     @cInclude("stdlib.h");
