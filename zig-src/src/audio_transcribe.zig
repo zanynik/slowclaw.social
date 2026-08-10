@@ -116,7 +116,7 @@ pub fn loadMmproj(mmproj_path: []const u8) AudioError!void {
     params.print_timings = false;
     params.n_threads = 4; // conservative for iOS; avoids saturating under RAM pressure
 
-    const ctx = mtmd.mtmd_init_from_file(path_z.ptr, text_model, params) orelse return error.MmprojLoadFailed;
+    const ctx = mtmd.mtmd_init_from_file(path_z.ptr, @ptrCast(text_model), params) orelse return error.MmprojLoadFailed;
 
     // Verify the projector actually supports audio input.
     if (!mtmd.mtmd_support_audio(ctx)) {
@@ -223,7 +223,7 @@ pub fn transcribe(
     const chunks = mtmd.mtmd_input_chunks_init() orelse return error.OutOfMemory;
     defer mtmd.mtmd_input_chunks_free(chunks);
 
-    const tok_ok = mtmd.mtmd_tokenize(mctx, chunks, &input_text, @ptrCast(&bitmaps), bitmaps.len);
+    const tok_ok = mtmd.mtmd_tokenize(mctx, chunks, &input_text, @constCast(&bitmaps), bitmaps.len);
     if (tok_ok != 0) return error.TokenizationFailed;
 
     timings.load_ms = nowMs() - load_start;
@@ -354,9 +354,15 @@ pub fn transcribe(
 }
 
 fn nowMs() i64 {
-    // std.time.milliTimestamp is portable (no libc) and monotonic enough for
-    // timing deltas; the locked-phone experiment reads deltas, not absolute time.
-    return std.time.milliTimestamp();
+    // Zig 0.16 moved std.time behind the Io interface; at the FFI boundary libc
+    // is linked, so use clock_gettime (CLOCK_MONOTONIC) for timing deltas —
+    // monotonic, unaffected by wall-clock changes. Matches local_inference's
+    // libc-at-the-boundary approach. Falls back to time() * 1000 on error.
+    var ts: c_stdlib.timespec = undefined;
+    if (c_stdlib.clock_gettime(c_stdlib.CLOCK_MONOTONIC, &ts) == 0) {
+        return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+    }
+    return @as(i64, @intCast(c_stdlib.time(null))) * 1000;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
