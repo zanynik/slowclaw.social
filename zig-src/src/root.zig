@@ -37,6 +37,7 @@ pub const rss_parser = @import("rss_parser.zig");
 pub const local_inference = @import("local_inference.zig");
 pub const audio_transcribe = @import("audio_transcribe.zig");
 pub const feed_catalog = @import("feed_catalog.zig");
+pub const model_catalog = @import("model_catalog.zig");
 
 // Force-retain every `export fn` in ffi.zig. Zig 0.16 uses lazy compilation:
 // `@import("ffi.zig")` alone does NOT make its export functions reachable,
@@ -73,6 +74,7 @@ comptime {
     _ = &ffi.slowclaw_feed_chat_result_free;
     _ = &ffi.slowclaw_feed_parse_and_rank;
     _ = &ffi.slowclaw_feed_catalog_json;
+    _ = &ffi.slowclaw_feed_model_catalog_json;
     _ = &ffi.slowclaw_feed_filter_and_diversify;
     _ = &ffi.slowclaw_feed_local_llm_status;
     _ = &ffi.slowclaw_feed_local_llm_load;

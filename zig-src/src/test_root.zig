@@ -24,6 +24,7 @@ pub const saved_items = @import("saved_items.zig");
 pub const rss_parser = @import("rss_parser.zig");
 pub const local_inference = @import("local_inference.zig");
 pub const audio_transcribe = @import("audio_transcribe.zig");
+pub const model_catalog = @import("model_catalog.zig");
 
 test {
     _ = vector_math;
@@ -44,6 +45,7 @@ test {
     _ = rss_parser;
     _ = local_inference;
     _ = audio_transcribe;
+    _ = model_catalog;
 
     try std.testing.expect(std.mem.eql(u8, "ok", "ok"));
 }

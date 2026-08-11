@@ -629,41 +629,44 @@ public struct LocalModelPreset: Identifiable, Equatable {
     /// True when this preset carries an audio mmproj (mtmd-capable).
     public var hasAudioMmproj: Bool { mmprojFileName != nil }
 
-    public static let presets: [LocalModelPreset] = [
-        .init(id: "unsloth/gemma-4-E2B-it-qat-UD-Q2_K_XL",
-              title: "Gemma 4 E2B (Q2_K_XL)",
-              detail: "Smaller, faster. ~2.1 GB. Best for older devices.",
-              fileName: "gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
-              downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf")!,
-              sizeBytes: 2_190_000_000,
-              sizeLabel: "2.1 GB"),
-        .init(id: "unsloth/gemma-4-E2B-it-qat-UD-Q4_K_XL",
-              title: "Gemma 4 E2B (Q4_K_XL)",
-              detail: "Higher quality. ~2.5 GB. Best for iPhone 15 Pro+.",
-              fileName: "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
-              downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf")!,
-              sizeBytes: 2_620_000_000,
-              sizeLabel: "2.5 GB"),
-        // 🔬 Experimental audio model: Gemma 3n E4B (multimodal: text + audio).
-        // The text GGUF is from unsloth. The mmproj (audio encoder + projector)
-        // must be generated from the checkpoint via convert_hf_to_gguf.py
-        // --mmproj and hosted — it is NOT in the unsloth GGUF repo. Until a
-        // hosted mmproj URL exists, the audio engine can't be used end-to-end;
-        // the placeholder below is marked so it's obvious what to fill in.
-        // The code path (download + load + transcribe) is fully wired regardless.
-        .init(id: "unsloth/gemma-3n-E4B-it-audio",
-              title: "Gemma 3n E4B Audio (experimental)",
-              detail: "Multimodal: text + audio. Enables on-device transcription via mtmd. Needs the mmproj (see preset).",
-              fileName: "gemma-3n-E4B-it-UD-Q4_K_XL.gguf",
-              downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-3n-E4B-it-GGUF/resolve/main/gemma-3n-E4B-it-UD-Q4_K_XL.gguf")!,
-              sizeBytes: 5_390_000_000,
-              sizeLabel: "5.4 GB",
-              // TODO: replace with a hosted mmproj URL once generated.
-              // Generate via: python convert_hf_to_gguf.py <gemma-3n-E4B-it> --mmproj
-              mmprojFileName: "gemma-3n-E4B-it-mmproj-f16.gguf",
-              mmprojDownloadURL: nil, // set once the mmproj is hosted
-              mmprojSizeLabel: "~500 MB"),
-    ]
+    /// The catalog is owned by the Zig core (model_catalog.zig) and read via
+    /// the C ABI so every shell (iOS, Flutter) sees the same list. Falls back
+    /// to an empty array if the core can't be reached (never crashes the UI).
+    public static var presets: [LocalModelPreset] {
+        var out = SlowclawString(bytes: nil, len: 0)
+        guard slowclaw_feed_model_catalog_json(&out) == SLOWCLAW_OK,
+              let bytes = out.bytes, out.len > 0 else {
+            if let b = out.bytes { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: b)) }
+            return []
+        }
+        defer { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: bytes)) }
+        let data = Data(bytes: UnsafeRawPointer(bytes), count: out.len)
+        return (try? JSONDecoder().decode([LocalModelPreset].self, from: data)) ?? []
+    }
+}
+
+extension LocalModelPreset: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case id, title, detail
+        case fileName, downloadURL, sizeBytes, sizeLabel
+        case mmprojFileName, mmprojDownloadURL, mmprojSizeLabel
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        detail = try c.decode(String.self, forKey: .detail)
+        fileName = try c.decode(String.self, forKey: .fileName)
+        let urlStr = try c.decode(String.self, forKey: .downloadURL)
+        downloadURL = URL(string: urlStr) ?? URL(fileURLWithPath: "")
+        sizeBytes = try c.decode(Int64.self, forKey: .sizeBytes)
+        sizeLabel = try c.decode(String.self, forKey: .sizeLabel)
+        mmprojFileName = try c.decodeIfPresent(String.self, forKey: .mmprojFileName)
+        let mmprojURLStr = try c.decodeIfPresent(String.self, forKey: .mmprojDownloadURL)
+        mmprojDownloadURL = (mmprojURLStr?.isEmpty == false) ? URL(string: mmprojURLStr!) : nil
+        mmprojSizeLabel = try c.decodeIfPresent(String.self, forKey: .mmprojSizeLabel)
+    }
 }
 
 /// On-device model file management: GGUFs live in Documents/Models/.

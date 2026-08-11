@@ -42,6 +42,7 @@ const feeds_ranking = @import("feeds_ranking.zig");
 const feed_catalog = @import("feed_catalog.zig");
 const local_inference = @import("local_inference.zig");
 const audio_transcribe = @import("audio_transcribe.zig");
+const model_catalog = @import("model_catalog.zig");
 
 /// C allocator — pairs with `free` on the Swift side. Using this ensures Zig
 /// and Swift agree on the heap.
@@ -878,6 +879,19 @@ pub export fn slowclaw_feed_catalog_json(out_str: *SlowclawString) c_int {
     }
     buf.append(c_allocator, ']') catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
     const json = buf.toOwnedSlice(c_allocator) catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    out_str.* = SlowclawString.fromOwnedSlice(json);
+    return SLOWCLAW_OK;
+}
+
+/// Return the on-device model catalog as a JSON array of preset objects
+/// (mirrors the Swift LocalModelPreset shape). The catalog is DATA owned by
+/// the Zig core so every shell reads the same list. Bytes are
+/// c_allocator-owned; caller frees via slowclaw_feed_free.
+pub export fn slowclaw_feed_model_catalog_json(out_str: *SlowclawString) c_int {
+    const json = model_catalog.catalogJson(c_allocator) catch {
+        out_str.* = SlowclawString.empty();
+        return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    };
     out_str.* = SlowclawString.fromOwnedSlice(json);
     return SLOWCLAW_OK;
 }

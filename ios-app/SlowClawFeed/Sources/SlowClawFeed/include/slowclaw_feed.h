@@ -269,6 +269,10 @@ int32_t slowclaw_feed_filter_and_diversify(
     SlowclawString *out_str
 );
 
+/// On-device model catalog as a JSON array of preset objects (mirrors the
+/// LocalModelPreset shape). Bytes freed via slowclaw_feed_free.
+int32_t slowclaw_feed_model_catalog_json(SlowclawString *out_str);
+
 // ── On-device LLM (llama.cpp) ─────────────────────────────────────────────
 // Status / load / unload / chat + on-device journal-agent calls, backed by
 // the vendored llama.cpp (libllama.a, CPU). When the backend is compiled out
