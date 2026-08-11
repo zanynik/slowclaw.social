@@ -1222,6 +1222,144 @@ fn serializeRankedFeed(allocator: std.mem.Allocator, ranked: []const feeds_ranki
     try buf.append(allocator, ']');
     return buf.toOwnedSlice(allocator);
 }
+
+/// Parse a JSON array produced by `serializeRankedFeed` back into RankedItem
+/// slices (allocator-owned). Inverse of serializeRankedFeed: reads
+/// {title,link,description,sourceLabel,score,readMinutes} and defaults the
+/// other FeedItem fields (empty/zero). Used by filter_and_diversify so the
+/// post-merge curation can run entirely in the Zig core — no shell-side
+/// reimplementation (the Swift slowClawFilterAndDiversify mirrors this and
+/// is being retired in favor of this export).
+fn parseRankedFeed(allocator: std.mem.Allocator, json: []const u8) ![]feeds_ranking.RankedItem {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return &.{};
+    defer parsed.deinit();
+    if (parsed.value != .array) return &.{};
+
+    const arr = parsed.value.array.items;
+    const out = try allocator.alloc(feeds_ranking.RankedItem, arr.len);
+    // On error, free every string allocated so far + the slice.
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |r| {
+            allocator.free(r.item.id);
+            allocator.free(r.item.title);
+            allocator.free(r.item.body);
+            allocator.free(r.source_label);
+        }
+        allocator.free(out);
+    }
+    for (arr) |v| {
+        if (v != .object) {
+            out[filled] = .{
+                .item = .{ .id = "", .title = "", .body = "", .author_handle = "", .source_platform = "rss", .timestamp = 0 },
+                .score = 0,
+                .read_minutes = 0,
+                .source_label = "",
+            };
+            filled += 1;
+            continue;
+        }
+        const o = v.object;
+        const get = struct {
+            fn s(obj: std.json.ObjectMap, key: []const u8, alloc: std.mem.Allocator) []const u8 {
+                const val = obj.get(key) orelse return "";
+                if (val != .string) return "";
+                return alloc.dupe(u8, val.string) catch "";
+            }
+            fn n(obj: std.json.ObjectMap, key: []const u8) f64 {
+                const val = obj.get(key) orelse return 0;
+                return switch (val) {
+                    .float => val.float,
+                    .integer => @floatFromInt(val.integer),
+                    else => 0,
+                };
+            }
+            fn u(obj: std.json.ObjectMap, key: []const u8) u32 {
+                const f = n(obj, key);
+                return @intFromFloat(@max(0.0, f));
+            }
+        };
+        out[filled] = .{
+            .item = .{
+                .id = get.s(o, "link", allocator),
+                .title = get.s(o, "title", allocator),
+                .body = get.s(o, "description", allocator),
+                .author_handle = "",
+                .source_platform = "rss",
+                .timestamp = 0,
+            },
+            .score = get.n(o, "score"),
+            .read_minutes = get.u(o, "readMinutes"),
+            .source_label = get.s(o, "sourceLabel", allocator),
+        };
+        filled += 1;
+    }
+    return out;
+}
+
+/// Free a RankedItem slice produced by parseRankedFeed (each item owns its
+/// id/title/body/source_label strings).
+fn freeRankedFeed(allocator: std.mem.Allocator, ranked: []feeds_ranking.RankedItem) void {
+    for (ranked) |r| {
+        if (r.item.id.len > 0) allocator.free(r.item.id);
+        if (r.item.title.len > 0) allocator.free(r.item.title);
+        if (r.item.body.len > 0) allocator.free(r.item.body);
+        if (r.source_label.len > 0) allocator.free(r.source_label);
+    }
+    allocator.free(ranked);
+}
+
+/// Free ONLY the slice container, not the per-item strings. Used for slices
+/// returned by filterAndDiversify, whose items alias the input's strings
+/// (pointer-copied by value) — the input slice owns the strings and must be
+/// the one to free them. Calling freeRankedFeed on both would double-free.
+fn freeRankedSliceOnly(allocator: std.mem.Allocator, ranked: []feeds_ranking.RankedItem) void {
+    allocator.free(ranked);
+}
+
+/// Post-merge feed curation: quality gate + dedup by link + per-source cap +
+/// round-robin interleave. Takes the merged ranked JSON (the output of many
+/// slowclaw_feed_parse_and_rank calls concatenated into one array) and returns
+/// a diversified subset as the same JSON shape. This is the portable
+/// counterpart of the Swift slowClawFilterAndDiversify — one shell-agnostic
+/// code path for iOS, Flutter, and any future shell.
+///
+/// `items_json` is a JSON array of {title,link,description,sourceLabel,score,
+/// readMinutes}. `out_str` receives the diversified JSON; caller frees via
+/// slowclaw_feed_free.
+pub export fn slowclaw_feed_filter_and_diversify(
+    items_json: [*]const u8,
+    items_json_len: usize,
+    max_per_source: usize,
+    limit: usize,
+    out_str: *SlowclawString,
+) c_int {
+    const ranked = parseRankedFeed(c_allocator, items_json[0..items_json_len]) catch {
+        out_str.* = SlowclawString.empty();
+        return SLOWCLAW_ERR_INTERNAL;
+    };
+
+    const diversified = feeds_ranking.filterAndDiversify(c_allocator, ranked, max_per_source, limit) catch {
+        freeRankedFeed(c_allocator, ranked);
+        out_str.* = SlowclawString.empty();
+        return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    };
+
+    // diversified's items alias ranked's strings (pointer-copied by value),
+    // so serialize FIRST (reads strings), then free the containers. ranked
+    // owns the strings; diversified is container-only.
+    const json = serializeRankedFeed(c_allocator, diversified) catch {
+        freeRankedSliceOnly(c_allocator, diversified);
+        freeRankedFeed(c_allocator, ranked);
+        out_str.* = SlowclawString.empty();
+        return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    };
+    freeRankedSliceOnly(c_allocator, diversified);
+    freeRankedFeed(c_allocator, ranked);
+
+    out_str.* = SlowclawString.fromOwnedSlice(json);
+    return SLOWCLAW_OK;
+}
 // ──────────────────────────────────────────────────────────────────────────
 
 fn dupInterest(ci: SlowclawInterest) feed_types.InterestVector {
@@ -1693,5 +1831,72 @@ test "ffi: local_audio_transcribe fails with no projector loaded" {
     // No transcript bytes allocated on the error path.
     try testing.expect(out_result.text.bytes == null);
     try testing.expectEqual(@as(i64, 0), out_timings.total_ms);
+}
+
+test "ffi: filter_and_diversify round-trips ranked JSON" {
+    // Feed shape matches serializeRankedFeed output (and parse_and_rank).
+    // Two sources, one dominant (8 items) + one sparse (2 items), max_per_source=3.
+    // Expected: the dominant source is capped at 3; round-robin interleaves.
+    const items_json =
+        \\[
+        \\{"title":"a","link":"http://a/1","description":"d","sourceLabel":"alpha","score":9.0,"readMinutes":1},
+        \\{"title":"b","link":"http://a/2","description":"d","sourceLabel":"alpha","score":8.0,"readMinutes":1},
+        \\{"title":"c","link":"http://a/3","description":"d","sourceLabel":"alpha","score":7.0,"readMinutes":1},
+        \\{"title":"d","link":"http://a/4","description":"d","sourceLabel":"alpha","score":6.0,"readMinutes":1},
+        \\{"title":"e","link":"http://b/1","description":"d","sourceLabel":"beta","score":5.0,"readMinutes":1},
+        \\{"title":"f","link":"http://b/2","description":"d","sourceLabel":"beta","score":4.0,"readMinutes":1},
+        \\{"title":"","link":"","description":"","sourceLabel":"alpha","score":3.0,"readMinutes":1}
+        \\]
+    ;
+    var out = SlowclawString.empty();
+    const status = slowclaw_feed_filter_and_diversify(
+        items_json.ptr, items_json.len, 3, 100, &out,
+    );
+    try testing.expectEqual(SLOWCLAW_OK, status);
+    const bytes_ptr = out.bytes orelse return error.NullOut;
+    defer slowclaw_feed_free(@constCast(bytes_ptr));
+    const result = bytes_ptr[0..out.len];
+
+    // The empty-title+empty-body item is dropped by the quality gate.
+    // alpha is capped at 3, beta has 2 → total 5.
+    const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{}) catch return error.JsonInvalid;
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 5), parsed.value.array.items.len);
+
+    // alpha items present (the dominant source, capped at 3).
+    var alpha_count: usize = 0;
+    for (parsed.value.array.items) |v| {
+        if (std.mem.eql(u8, v.object.get("sourceLabel").?.string, "alpha")) alpha_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), alpha_count);
+}
+
+test "ffi: filter_and_diversify dedups by link" {
+    // Same link twice → only the first (higher-scored) survives.
+    const items_json =
+        \\[
+        \\{"title":"a","link":"http://x/1","description":"d","sourceLabel":"s","score":9.0,"readMinutes":1},
+        \\{"title":"b","link":"http://x/1","description":"d","sourceLabel":"s","score":8.0,"readMinutes":1}
+        \\]
+    ;
+    var out = SlowclawString.empty();
+    const status = slowclaw_feed_filter_and_diversify(
+        items_json.ptr, items_json.len, 10, 100, &out,
+    );
+    try testing.expectEqual(SLOWCLAW_OK, status);
+    const bytes_ptr = out.bytes orelse return error.NullOut;
+    defer slowclaw_feed_free(@constCast(bytes_ptr));
+    const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, bytes_ptr[0..out.len], .{}) catch return error.JsonInvalid;
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+}
+
+test "ffi: filter_and_diversify empty input returns empty array" {
+    var out = SlowclawString.empty();
+    const status = slowclaw_feed_filter_and_diversify("[]".ptr, 2, 5, 100, &out);
+    try testing.expectEqual(SLOWCLAW_OK, status);
+    const bytes_ptr = out.bytes orelse return error.NullOut;
+    defer slowclaw_feed_free(@constCast(bytes_ptr));
+    try testing.expectEqualStrings("[]", bytes_ptr[0..out.len]);
 }
 

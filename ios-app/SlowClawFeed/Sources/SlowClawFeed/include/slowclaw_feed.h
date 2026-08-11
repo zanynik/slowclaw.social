@@ -257,6 +257,18 @@ int32_t slowclaw_feed_parse_and_rank(
 /// allocator-owned; free via slowclaw_feed_free. Returns 0 on success.
 int32_t slowclaw_feed_catalog_json(SlowclawString *out_str);
 
+/// Post-merge feed curation: quality gate + dedup by link + per-source cap +
+/// round-robin interleave. `items_json` is a JSON array of the same shape
+/// slowclaw_feed_parse_and_rank emits ({title,link,description,sourceLabel,
+/// score,readMinutes}). `out_str` receives the diversified subset; free via
+/// slowclaw_feed_free. Returns 0 on success.
+int32_t slowclaw_feed_filter_and_diversify(
+    const uint8_t *items_json, size_t items_json_len,
+    size_t max_per_source,
+    size_t limit,
+    SlowclawString *out_str
+);
+
 // ── On-device LLM (llama.cpp) ─────────────────────────────────────────────
 // Status / load / unload / chat + on-device journal-agent calls, backed by
 // the vendored llama.cpp (libllama.a, CPU). When the backend is compiled out

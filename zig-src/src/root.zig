@@ -73,6 +73,7 @@ comptime {
     _ = &ffi.slowclaw_feed_chat_result_free;
     _ = &ffi.slowclaw_feed_parse_and_rank;
     _ = &ffi.slowclaw_feed_catalog_json;
+    _ = &ffi.slowclaw_feed_filter_and_diversify;
     _ = &ffi.slowclaw_feed_local_llm_status;
     _ = &ffi.slowclaw_feed_local_llm_load;
     _ = &ffi.slowclaw_feed_local_llm_unload;
