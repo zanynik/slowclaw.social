@@ -22,6 +22,13 @@ pub fn build(b: *std.Build) void {
     // -Dwith-llama=false so they stay fast and C++-free; the FFI then reports
     // "not available" exactly like the pre-llama builds did.
     const with_llama = b.option(bool, "with-llama", "Compile the vendored llama.cpp backend into the staticlib") orelse true;
+    // ── Shared library for dart:ffi desktop ─────────────────────────────
+    // When set, ALSO emit a dynamic library (dll/dylib/so) alongside the
+    // static archive, for Flutter desktop (dart:ffi loads a dynamic lib, not a
+    // static archive). Off by default — the iOS/macOS-static path doesn't need
+    // it. The Flutter plugin's build script runs `zig build -Dshared` (plus
+    // -Dwith-llama=false on Windows, where the llama pthread path is unported).
+    const shared = b.option(bool, "shared", "Also emit a shared library (dll/dylib/so) for dart:ffi desktop consumption") orelse false;
     const llama_opts = b.addOptions();
     llama_opts.addOption(bool, "with_llama", with_llama);
     const llama_opts_mod = llama_opts.createModule();
@@ -261,6 +268,20 @@ pub fn build(b: *std.Build) void {
     // the consumer there. See README for the local-incremental-cache caveat.
     const install_lib = b.addInstallArtifact(lib, .{});
     b.getInstallStep().dependOn(&install_lib.step);
+
+    // ── Shared library (dart:ffi desktop) ─────────────────────────────────
+    // Emits libslowclaw_feed.{dll,dylib,so} from the same root module. dart:ffi
+    // loads a dynamic library, not a static archive, so the Flutter desktop
+    // shell needs this. Same with_llama flow as the static lib (Windows desktop
+    // builds pass -Dwith-llama=false due to the unported pthread path).
+    if (shared) {
+        const shared_lib = b.addLibrary(.{
+            .name = "slowclaw_feed",
+            .root_module = lib_mod,
+            .linkage = .dynamic,
+        });
+        b.installArtifact(shared_lib);
+    }
 
     if (builtin.os.tag == .macos) {
         const aligned = repackInstalledArchiveStep(b, install_lib, "libslowclaw_feed.a");
