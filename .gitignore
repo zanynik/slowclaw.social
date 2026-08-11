@@ -33,6 +33,10 @@ credentials.json
 # CI downloads its own copy to tools-zig/ (different path, also ignored below).
 tools/
 tools-zig/
+# Vendored llama.cpp ships tools/mtmd/ (the multimodal layer). The broad
+# `tools/` rule above is for the local zig toolchain; un-ignore ONLY the
+# vendored mtmd source so it's tracked like the rest of vendor/llama.cpp.
+!zig-src/vendor/llama.cpp/tools/
 
 # Zig build cache + install output
 zig-src/.zig-cache/

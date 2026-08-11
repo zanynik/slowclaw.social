@@ -41,6 +41,7 @@ const rss_parser = @import("rss_parser.zig");
 const feeds_ranking = @import("feeds_ranking.zig");
 const feed_catalog = @import("feed_catalog.zig");
 const local_inference = @import("local_inference.zig");
+const audio_transcribe = @import("audio_transcribe.zig");
 
 /// C allocator — pairs with `free` on the Swift side. Using this ensures Zig
 /// and Swift agree on the heap.
@@ -1032,6 +1033,103 @@ pub export fn slowclaw_feed_local_llm_generate_title(
     return localJournalAgentCall(journal_agent.generateTitle, .{ transcript[0..transcript_len], "local" }, out_result);
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// On-device audio transcription (mtmd / multimodal) — the audio STT engine.
+// Backed by the vendored mtmd layer (libllama.a). Requires a text model
+// loaded via slowclaw_feed_local_llm_load AND an audio mmproj loaded via
+// slowclaw_feed_local_audio_load_mmproj. When mtmd is compiled out
+// (-Dwith-llama=false), status reports available:false.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Per-transcription timing in milliseconds, mirrored across the ABI for the
+/// locked-phone experiment (Swift reads these to decide whether the process
+/// got CPU time while the screen was locked). All fields are 0 when mtmd is
+/// unavailable or no transcription has run.
+pub const SlowclawAudioTimings = extern struct {
+    load_ms: i64,
+    encode_ms: i64,
+    decode_ms: i64,
+    total_ms: i64,
+};
+
+/// On-device audio engine status as JSON:
+/// {"available","supported","sampleRate","reason"}. `available` reflects
+/// whether the mtmd backend is linked; `supported` whether an audio-capable
+/// mmproj is loaded; `sampleRate` the rate the projector expects (0 if none).
+/// Bytes are c_allocator-owned; caller frees via slowclaw_feed_free.
+pub export fn slowclaw_feed_local_audio_status(out_str: *SlowclawString) c_int {
+    const json = audio_transcribe.statusJson(c_allocator) catch {
+        out_str.* = SlowclawString.empty();
+        return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    };
+    out_str.* = SlowclawString.fromOwnedSlice(json);
+    return SLOWCLAW_OK;
+}
+
+/// Load the multimodal projector (mmproj GGUF) against the currently-loaded
+/// text model. The text model MUST be loaded first via
+/// slowclaw_feed_local_llm_load. Returns SLOWCLAW_OK on success;
+/// SLOWCLAW_ERR_INVALID_ARGUMENT when no text model is loaded / the file is
+/// missing/invalid/not a GGUF / the projector doesn't support audio;
+/// SLOWCLAW_ERR_INTERNAL when mtmd itself rejects the projector.
+pub export fn slowclaw_feed_local_audio_load_mmproj(
+    mmproj_path: [*]const u8,
+    mmproj_path_len: usize,
+) c_int {
+    audio_transcribe.loadMmproj(mmproj_path[0..mmproj_path_len]) catch |err| return switch (err) {
+        error.OutOfMemory => SLOWCLAW_ERR_OUT_OF_MEMORY,
+        error.NoTextModel, error.MmprojLoadFailed, error.AudioNotSupported => SLOWCLAW_ERR_INVALID_ARGUMENT,
+        else => SLOWCLAW_ERR_INTERNAL,
+    };
+    return SLOWCLAW_OK;
+}
+
+/// Unload the audio mmproj (frees RAM). No-op when nothing is loaded.
+pub export fn slowclaw_feed_local_audio_unload() void {
+    audio_transcribe.unloadMmproj();
+}
+
+/// Transcribe mono PCM F32 samples into text. `pcm` is raw 32-bit float
+/// samples at the rate returned by slowclaw_feed_local_audio_status
+/// (sampleRate, typically 16000). The caller (Swift) decodes + resamples the
+/// audio file to this format before calling. Returns the transcript via
+/// `out_result` (same SlowclawChatResult shape as the LLM calls; free via
+/// slowclaw_feed_chat_result_free). Timings are written to `out_timings`.
+pub export fn slowclaw_feed_local_audio_transcribe(
+    pcm: [*]const f32,
+    pcm_len: usize,
+    max_tokens: u32,
+    temperature: f64,
+    out_result: *SlowclawChatResult,
+    out_timings: *SlowclawAudioTimings,
+) c_int {
+    var timings = audio_transcribe.AudioTimings{};
+    const transcript = audio_transcribe.transcribe(
+        c_allocator,
+        pcm[0..pcm_len],
+        max_tokens,
+        @floatCast(temperature),
+        &timings,
+    ) catch |err| {
+        const status: c_int = switch (err) {
+            error.OutOfMemory => SLOWCLAW_ERR_OUT_OF_MEMORY,
+            error.NoTextModel, error.MmprojNotLoaded => SLOWCLAW_ERR_INVALID_ARGUMENT,
+            else => SLOWCLAW_ERR_INTERNAL,
+        };
+        out_result.* = .{ .text = SlowclawString.empty(), .status = status };
+        out_timings.* = .{ .load_ms = 0, .encode_ms = 0, .decode_ms = 0, .total_ms = 0 };
+        return status;
+    };
+    out_result.* = .{ .text = SlowclawString.fromOwnedSlice(transcript), .status = SLOWCLAW_OK };
+    out_timings.* = .{
+        .load_ms = timings.load_ms,
+        .encode_ms = timings.encode_ms,
+        .decode_ms = timings.decode_ms,
+        .total_ms = timings.total_ms,
+    };
+    return SLOWCLAW_OK;
+}
+
 /// Parse a JSON array of {"label":"...","weight":N} into Topic structs.
 fn parseTopicsJson(allocator: std.mem.Allocator, json: []const u8) ![]feeds_ranking.Topic {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return &.{};
@@ -1553,5 +1651,47 @@ test "ffi: parse_and_rank with topics incl. escaped label does not corrupt the h
         try testing.expect(result.items_json.len > 0);
         slowclaw_feed_rank_result_free(&result);
     }
+}
+
+test "ffi: local_audio_status returns valid JSON via the C ABI" {
+    // The test steps build with -Dwith-llama=false, so mtmd is compiled out
+    // and status must report available:false. The real (available:true) path
+    // is exercised only on-device / via TestFlight (needs a GGUF + mmproj).
+    var out = SlowclawString.empty();
+    const status = slowclaw_feed_local_audio_status(&out);
+    try testing.expectEqual(SLOWCLAW_OK, status);
+    const bytes_ptr = out.bytes orelse return;
+    defer slowclaw_feed_free(@constCast(bytes_ptr));
+    try testing.expect(out.len > 0);
+    const json = bytes_ptr[0..out.len];
+    // Stub mode: mtmd backend not linked.
+    const have_mtmd = @import("audio_transcribe.zig").have_mtmd;
+    if (!have_mtmd) {
+        try testing.expect(std.mem.indexOf(u8, json, "\"available\":false") != null);
+        try testing.expect(std.mem.indexOf(u8, json, "mtmd backend not linked") != null);
+    }
+}
+
+test "ffi: local_audio_load_mmproj fails with no text model loaded" {
+    // No text model loaded in tests → EINVAL (the projector attaches to the
+    // text model, which must be loaded first).
+    const path = "/nonexistent/mmproj.gguf";
+    const status = slowclaw_feed_local_audio_load_mmproj(path.ptr, path.len);
+    try testing.expectEqual(SLOWCLAW_ERR_INVALID_ARGUMENT, status);
+}
+
+test "ffi: local_audio_transcribe fails with no projector loaded" {
+    var out_result: SlowclawChatResult = .{ .text = SlowclawString.empty(), .status = 0 };
+    var out_timings = SlowclawAudioTimings{ .load_ms = 0, .encode_ms = 0, .decode_ms = 0, .total_ms = 0 };
+    const pcm = [_]f32{ 0.0, 0.1, 0.2, 0.3 };
+    const status = slowclaw_feed_local_audio_transcribe(
+        @ptrCast(&pcm), pcm.len, 64, 0.0, &out_result, &out_timings,
+    );
+    // No text model + no projector → error (EINVAL in stub, INTERNAL otherwise).
+    try testing.expect(status != SLOWCLAW_OK);
+    try testing.expectEqual(status, out_result.status);
+    // No transcript bytes allocated on the error path.
+    try testing.expect(out_result.text.bytes == null);
+    try testing.expectEqual(@as(i64, 0), out_timings.total_ms);
 }
 

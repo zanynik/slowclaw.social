@@ -603,6 +603,31 @@ public struct LocalModelPreset: Identifiable, Equatable {
     /// Approximate download size, for free-space checks and progress fallback.
     public let sizeBytes: Int64
     public let sizeLabel: String
+    /// Optional multimodal projector (mmproj) for audio/vision models. When
+    /// present, activating the model also downloads + loads the mmproj so the
+    /// Zig core's mtmd layer can ingest audio. nil for text-only models.
+    public let mmprojFileName: String?
+    public let mmprojDownloadURL: URL?
+    public let mmprojSizeLabel: String?
+
+    public init(id: String, title: String, detail: String, fileName: String,
+                downloadURL: URL, sizeBytes: Int64, sizeLabel: String,
+                mmprojFileName: String? = nil, mmprojDownloadURL: URL? = nil,
+                mmprojSizeLabel: String? = nil) {
+        self.id = id
+        self.title = title
+        self.detail = detail
+        self.fileName = fileName
+        self.downloadURL = downloadURL
+        self.sizeBytes = sizeBytes
+        self.sizeLabel = sizeLabel
+        self.mmprojFileName = mmprojFileName
+        self.mmprojDownloadURL = mmprojDownloadURL
+        self.mmprojSizeLabel = mmprojSizeLabel
+    }
+
+    /// True when this preset carries an audio mmproj (mtmd-capable).
+    public var hasAudioMmproj: Bool { mmprojFileName != nil }
 
     public static let presets: [LocalModelPreset] = [
         .init(id: "unsloth/gemma-4-E2B-it-qat-UD-Q2_K_XL",
@@ -619,6 +644,25 @@ public struct LocalModelPreset: Identifiable, Equatable {
               downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf")!,
               sizeBytes: 2_620_000_000,
               sizeLabel: "2.5 GB"),
+        // 🔬 Experimental audio model: Gemma 3n E4B (multimodal: text + audio).
+        // The text GGUF is from unsloth. The mmproj (audio encoder + projector)
+        // must be generated from the checkpoint via convert_hf_to_gguf.py
+        // --mmproj and hosted — it is NOT in the unsloth GGUF repo. Until a
+        // hosted mmproj URL exists, the audio engine can't be used end-to-end;
+        // the placeholder below is marked so it's obvious what to fill in.
+        // The code path (download + load + transcribe) is fully wired regardless.
+        .init(id: "unsloth/gemma-3n-E4B-it-audio",
+              title: "Gemma 3n E4B Audio (experimental)",
+              detail: "Multimodal: text + audio. Enables on-device transcription via mtmd. Needs the mmproj (see preset).",
+              fileName: "gemma-3n-E4B-it-UD-Q4_K_XL.gguf",
+              downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-3n-E4B-it-GGUF/resolve/main/gemma-3n-E4B-it-UD-Q4_K_XL.gguf")!,
+              sizeBytes: 5_390_000_000,
+              sizeLabel: "5.4 GB",
+              // TODO: replace with a hosted mmproj URL once generated.
+              // Generate via: python convert_hf_to_gguf.py <gemma-3n-E4B-it> --mmproj
+              mmprojFileName: "gemma-3n-E4B-it-mmproj-f16.gguf",
+              mmprojDownloadURL: nil, // set once the mmproj is hosted
+              mmprojSizeLabel: "~500 MB"),
     ]
 }
 
@@ -669,6 +713,56 @@ public enum LocalModelStore {
 
     public static func delete(_ preset: LocalModelPreset) throws {
         let url = try fileURL(for: preset)
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
+    // MARK: - Multimodal projector (mmproj) for audio/vision models
+
+    /// File URL for a preset's mmproj (audio encoder + projector). Same
+    /// Documents/Models/ dir as the text GGUF.
+    public static func mmprojFileURL(for preset: LocalModelPreset) throws -> URL? {
+        guard let name = preset.mmprojFileName else { return nil }
+        return try modelsDirectory().appendingPathComponent(name)
+    }
+
+    /// True when the mmproj is downloaded (for presets that have one).
+    public static func isMmprojDownloaded(_ preset: LocalModelPreset) -> Bool {
+        guard preset.hasAudioMmproj,
+              let url = try? mmprojFileURL(for: preset),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? Int64 else { return false }
+        return size > 100_000
+    }
+
+    /// Download the mmproj for a preset. Same partial-file + URLSession path
+    /// as the text model download. Throws if the preset has no mmproj or no
+    /// hosted mmproj URL (the Gemma 3n mmproj must be generated + hosted first).
+    public static func downloadMmproj(_ preset: LocalModelPreset,
+                                       progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
+        guard let name = preset.mmprojFileName,
+              let srcURL = preset.mmprojDownloadURL else {
+            throw NSError(domain: "SlowClawFeed", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "This model's mmproj has no hosted download URL yet."])
+        }
+        let dest = try modelsDirectory().appendingPathComponent(name)
+        let tmp = dest.appendingPathExtension("partial")
+        try? FileManager.default.removeItem(at: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let delegate = ModelDownloadDelegate(tmpURL: tmp, fallbackSize: 500_000_000, progress: progress)
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        try await delegate.run(in: session, url: srcURL)
+        try FileManager.default.moveItem(at: tmp, to: dest)
+        progress(1.0)
+        return dest
+    }
+
+    /// Delete the mmproj file for a preset (no-op if the preset has none).
+    public static func deleteMmproj(_ preset: LocalModelPreset) throws {
+        guard let url = try? mmprojFileURL(for: preset) else { return }
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
         }
@@ -793,6 +887,126 @@ public func slowClawLocalGenerateTitle(transcript: String) throws -> String {
         return out
     }
     return try processLocalChatResult(result)
+}
+
+// MARK: - On-device audio transcription (mtmd / multimodal)
+
+/// On-device audio engine status. `available` reflects whether the mtmd
+/// backend is linked; `supported` whether an audio-capable mmproj is loaded;
+/// `sampleRate` the rate the projector expects (0 if none).
+public struct LocalAudioStatus: Decodable {
+    public let available: Bool
+    public let supported: Bool
+    public let sampleRate: Int
+    public let reason: String?
+
+    public init(available: Bool = false, supported: Bool = false,
+                sampleRate: Int = 0, reason: String? = nil) {
+        self.available = available
+        self.supported = supported
+        self.sampleRate = sampleRate
+        self.reason = reason
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case available, supported, sampleRate, reason
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        available = try c.decodeIfPresent(Bool.self, forKey: .available) ?? false
+        supported = try c.decodeIfPresent(Bool.self, forKey: .supported) ?? false
+        sampleRate = try c.decodeIfPresent(Int.self, forKey: .sampleRate) ?? 0
+        reason = try c.decodeIfPresent(String.self, forKey: .reason)
+    }
+}
+
+/// Per-transcription timing (milliseconds). The locked-phone experiment reads
+/// these to determine whether the process got CPU time while the screen was
+/// locked. Mirrors SlowclawAudioTimings in the C header.
+public struct AudioTimings {
+    public let loadMs: Int64
+    public let encodeMs: Int64
+    public let decodeMs: Int64
+    public let totalMs: Int64
+
+    public init(loadMs: Int64 = 0, encodeMs: Int64 = 0, decodeMs: Int64 = 0, totalMs: Int64 = 0) {
+        self.loadMs = loadMs
+        self.encodeMs = encodeMs
+        self.decodeMs = decodeMs
+        self.totalMs = totalMs
+    }
+}
+
+/// Result of an on-device transcription: the transcript text + timings.
+public struct LocalAudioTranscription {
+    public let text: String
+    public let timings: AudioTimings
+}
+
+/// Read on-device audio engine status from the Zig core. Returns a
+/// not-available status on any error (so callers can render safely).
+public func slowClawLocalAudioStatus() -> LocalAudioStatus {
+    var out = SlowclawString(bytes: nil, len: 0)
+    let status = slowclaw_feed_local_audio_status(&out)
+    guard status == SLOWCLAW_OK, let bytes = out.bytes, out.len > 0 else {
+        if let b = out.bytes { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: b)) }
+        return LocalAudioStatus(available: false, reason: "Status unavailable.")
+    }
+    defer { if let b = out.bytes { slowclaw_feed_free(UnsafeMutableRawPointer(mutating: b)) } }
+    let data = Data(bytes: UnsafeRawPointer(bytes), count: out.len)
+    return (try? JSONDecoder().decode(LocalAudioStatus.self, from: data))
+        ?? LocalAudioStatus(available: false, reason: "Status decode failed.")
+}
+
+/// Load the audio multimodal projector (mmproj GGUF). The text model must be
+/// loaded first via slowClawLocalLLMLoad. Returns nil on success, else a
+/// human-readable error. Slow + memory-heavy — call off the main thread.
+public func slowClawLocalAudioLoadMMProj(path: String) -> String? {
+    let code = path.withCString { ptr in
+        slowclaw_feed_local_audio_load_mmproj(ptr, path.utf8.count)
+    }
+    switch code {
+    case SLOWCLAW_OK: return nil
+    case SLOWCLAW_ERR_INVALID_ARGUMENT:
+        return "The mmproj is missing, invalid, or does not support audio. Load the text model first."
+    case SLOWCLAW_ERR_OUT_OF_MEMORY:
+        return "Not enough memory to load the audio projector."
+    default:
+        return "mtmd could not load this projector (unsupported or too large for this device)."
+    }
+}
+
+/// Unload the audio mmproj (frees RAM).
+public func slowClawLocalAudioUnload() {
+    slowclaw_feed_local_audio_unload()
+}
+
+/// Transcribe mono PCM F32 samples into text on-device. `pcm` is raw 32-bit
+/// float samples at the rate from slowClawLocalAudioStatus().sampleRate
+/// (typically 16000). The caller decodes + resamples the audio file to this
+/// format before calling. Returns the transcript + timings; throws on error.
+public func slowClawLocalAudioTranscribe(pcm: [Float], maxTokens: UInt32 = 256,
+                                          temperature: Double = 0.0) throws -> LocalAudioTranscription {
+    precondition(MemoryLayout<Float>.size == 4, "Float must be 32-bit")
+    var out = SlowclawChatResult()
+    var timings = SlowclawAudioTimings()
+    let code: Int32 = pcm.withUnsafeBufferPointer { buf in
+        let ptr = buf.baseAddress
+        return slowclaw_feed_local_audio_transcribe(
+            ptr, pcm.count, maxTokens, temperature, &out, &timings)
+    }
+    let text = try processLocalChatResult(SlowclawChatResult(
+        text: out.text, status: code == SLOWCLAW_OK ? SLOWCLAW_OK : out.status))
+    return LocalAudioTranscription(
+        text: text,
+        timings: AudioTimings(
+            loadMs: timings.load_ms,
+            encodeMs: timings.encode_ms,
+            decodeMs: timings.decode_ms,
+            totalMs: timings.total_ms
+        )
+    )
 }
 
 private func escapeJson(_ s: String) -> String {

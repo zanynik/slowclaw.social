@@ -35,6 +35,7 @@ pub const interest_profile = @import("interest_profile.zig");
 pub const saved_items = @import("saved_items.zig");
 pub const rss_parser = @import("rss_parser.zig");
 pub const local_inference = @import("local_inference.zig");
+pub const audio_transcribe = @import("audio_transcribe.zig");
 pub const feed_catalog = @import("feed_catalog.zig");
 
 // Force-retain every `export fn` in ffi.zig. Zig 0.16 uses lazy compilation:
@@ -79,6 +80,11 @@ comptime {
     _ = &ffi.slowclaw_feed_local_llm_synthesize_journal;
     _ = &ffi.slowclaw_feed_local_llm_extract_interests;
     _ = &ffi.slowclaw_feed_local_llm_draft_post;
+    _ = &ffi.slowclaw_feed_local_llm_generate_title;
+    _ = &ffi.slowclaw_feed_local_audio_status;
+    _ = &ffi.slowclaw_feed_local_audio_load_mmproj;
+    _ = &ffi.slowclaw_feed_local_audio_unload;
+    _ = &ffi.slowclaw_feed_local_audio_transcribe;
 }
 
 test {

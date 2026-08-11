@@ -140,7 +140,9 @@ final class VoiceMemoImporter: ObservableObject {
                 let url = next.url
                 let bgID = UIApplication.shared.beginBackgroundTask(withName: "slowclaw.voiceMemo.import")
                 let transcript = await Task.detached(priority: .userInitiated) {
-                    await Transcriber.transcribe(url: url)
+                    // Route through the shared STT router: experimental
+                    // Gemma-audio when eligible, else SpeechAnalyzer.
+                    await AudioSTT.transcribe(url: url, useGemmaAudio: state.gemmaAudioEligible)
                 }.value
                 if bgID != .invalid {
                     UIApplication.shared.endBackgroundTask(bgID)
@@ -149,7 +151,8 @@ final class VoiceMemoImporter: ObservableObject {
                 // Auto-store: the file is on disk and must become a journal
                 // entry regardless of whether speech produced text. The user
                 // edits from the Journals list afterward (like the reference).
-                let content = transcript.isEmpty ? "🎙 Imported audio (no transcript)" : transcript
+                let transcriptText = transcript.text
+                let content = transcriptText.isEmpty ? "🎙 Imported audio (no transcript)" : transcriptText
                 let mediaURL = Self.documentsRelativePath(for: next.url)
                 let key = "journal_\(Int(Date().timeIntervalSince1970))_vm"
                 do {

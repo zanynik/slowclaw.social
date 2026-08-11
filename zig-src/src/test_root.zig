@@ -23,6 +23,7 @@ pub const interest_profile = @import("interest_profile.zig");
 pub const saved_items = @import("saved_items.zig");
 pub const rss_parser = @import("rss_parser.zig");
 pub const local_inference = @import("local_inference.zig");
+pub const audio_transcribe = @import("audio_transcribe.zig");
 
 test {
     _ = vector_math;
@@ -42,6 +43,7 @@ test {
     _ = saved_items;
     _ = rss_parser;
     _ = local_inference;
+    _ = audio_transcribe;
 
     try std.testing.expect(std.mem.eql(u8, "ok", "ok"));
 }
