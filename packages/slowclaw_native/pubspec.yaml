@@ -1,0 +1,22 @@
+name: slowclaw_native
+description: >-
+  Dart FFI bindings over the SlowClaw Zig core (libslowclaw_feed). Gives the
+  Flutter UI direct access to the C ABI — memory store, ranking, on-device
+  LLM, audio transcription — with no method-channel hop for the pure-Zig
+  functions. Platform-specific surfaces (mic, Speech STT, background tasks)
+  stay behind a method channel.
+version: 0.1.0
+publish_to: "none"
+
+environment:
+  sdk: ">=3.6.0 <4.0.0"
+
+dependencies:
+  ffi: ^2.1.0
+
+# This is a plain Dart package (Dart FFI bindings only), NOT a Flutter plugin
+# with platform build hooks. The native library (libslowclaw_feed) is built
+# and bundled by the consuming app's platform build (e.g. flutter_app's
+# windows/CMakeLists.txt runs `zig build -Dshared`). At runtime dart:ffi loads
+# the shared lib by name (slowclaw_feed.dll / .dylib / .so) from the loader
+# path.
