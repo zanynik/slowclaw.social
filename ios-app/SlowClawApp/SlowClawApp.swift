@@ -362,9 +362,29 @@ final class AppState: ObservableObject {
         localModelBusy = true
         localModelError = nil
         defer { localModelBusy = false }
+        // Audio presets carry two files (text GGUF + mmproj). Report progress
+        // across BOTH: each file's share is weighted by its expected size so
+        // the bar reflects total bytes, not per-file jumps.
+        let mmprojSize = preset.mmprojSizeBytes ?? 0
+        let totalBytes = preset.sizeBytes + mmprojSize
+        let textWeight = totalBytes > 0 ? Double(preset.sizeBytes) / Double(totalBytes) : 1.0
         do {
-            _ = try await LocalModelStore.download(preset) { [weak self] p in
-                Task { @MainActor in self?.localModelProgress[preset.id] = p }
+            // Skip the text GGUF when it's already on disk — the audio preset
+            // shares its GGUF with the text-only presets, so switching to the
+            // audio engine shouldn't re-download 2.5 GB.
+            if !LocalModelStore.isDownloaded(preset) {
+                _ = try await LocalModelStore.download(preset) { [weak self] p in
+                    Task { @MainActor in self?.localModelProgress[preset.id] = p * textWeight }
+                }
+            }
+            // Fetch the mmproj too (audio presets only). Store it next to the
+            // text GGUF; activation loads it via slowClawLocalAudioLoadMMProj.
+            if preset.hasAudioMmproj, !LocalModelStore.isMmprojDownloaded(preset) {
+                _ = try await LocalModelStore.downloadMmproj(preset) { [weak self] p in
+                    Task { @MainActor in
+                        self?.localModelProgress[preset.id] = textWeight + p * (1.0 - textWeight)
+                    }
+                }
             }
             localModelProgress[preset.id] = 1
         } catch {
@@ -431,10 +451,14 @@ final class AppState: ObservableObject {
         // Re-read status in case it changed (e.g. the OS reclaimed the model).
         refreshLocalLLMStatus()
         guard localLLM.available, !localLLM.loaded, !localModelBusy else { return }
-        // Prefer the first downloaded preset. Presets are ordered smaller-first.
-        guard let preset = LocalModelPreset.presets.first(where: { LocalModelStore.isDownloaded($0) }) else {
-            return
-        }
+        // Prefer an audio-capable preset when the experimental engine is ON
+        // (so the mmproj loads and Gemma-audio transcription is eligible),
+        // else the first downloaded preset. Never auto-download.
+        let downloaded = LocalModelPreset.presets.filter { LocalModelStore.isDownloaded($0) }
+        let preset = (experimentalAudioEngine
+            ? downloaded.first(where: { $0.hasAudioMmproj && LocalModelStore.isMmprojDownloaded($0) })
+            : nil) ?? downloaded.first
+        guard let preset else { return }
         await activateLocalModel(preset)
     }
 
