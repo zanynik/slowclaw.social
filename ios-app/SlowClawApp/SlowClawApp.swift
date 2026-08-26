@@ -271,6 +271,21 @@ final class AppState: ObservableObject {
     @Published var journalSidebarOpen: Bool = false
     @Published var selectedJournalKey: String? = nil
 
+    // In-app browser destination. Set by `openWebLink(_:)` — the single
+    // funnel for opening web content — and presented as a sheet by AppShell,
+    // so every link (Reads cards, article viewers) opens inside the app
+    // instead of bouncing out to Safari.
+    @Published var activeWebLink: WebLink? = nil
+
+    /// Open a web link inside the app (SFSafariViewController sheet).
+    /// Non-http(s) schemes are rejected — the app only ever links articles.
+    func openWebLink(_ url: URL) {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            return
+        }
+        activeWebLink = WebLink(url: url)
+    }
+
     // Reads feed cache. Lives on AppState (not ReadsView @State) so switching
     // tabs preserves the list — the view shows cached items instantly and a
     // background refresh merges + re-ranks new content. `readsLoadedOnce`
@@ -279,6 +294,11 @@ final class AppState: ObservableObject {
     @Published var readsLoading: Bool = false
     @Published var readsError: String? = nil
     @Published var readsRefreshedAt: Date? = nil
+    // Session-scoped like/dislike marks for Reads cards. Kept on AppState (not
+    // card @State) so recycled LazyVStack rows and list refreshes don't lose
+    // the user's taps.
+    @Published var likedReadIDs: Set<String> = []
+    @Published var dislikedReadIDs: Set<String> = []
     private var readsLoadedOnce: Bool = false
     fileprivate static var cachedCatalog: [SlowClawFeedSource]?
     private static let readsCacheVersion = 1
@@ -738,9 +758,15 @@ final class AppState: ObservableObject {
         if force || readsItems.isEmpty {
             readsItems = capped
         } else {
-            // Background refresh: prepend new items not already present.
+            // Background refresh: prepend new items not already present. Dedup
+            // on BOTH id and link — ids embed the item's batch index, which
+            // shifts as feeds update, so id-only dedup let the same article
+            // back in on the next refresh (duplicates in the list).
             let existing = Set(readsItems.map { $0.id })
-            let fresh = capped.filter { !existing.contains($0.id) }
+            let existingLinks = Set(readsItems.map { $0.link }.filter { !$0.isEmpty })
+            let fresh = capped.filter {
+                !existing.contains($0.id) && ($0.link.isEmpty || !existingLinks.contains($0.link))
+            }
             if !fresh.isEmpty {
                 readsItems = (fresh + readsItems).prefix(80).map { $0 }
             }
@@ -1204,6 +1230,11 @@ struct AppShell: View {
         // The Journal tab is now a Voice Memos-style list with the record +
         // pen buttons at its base; the sidebar drawer is removed.
         .background(DS.bg(scheme).ignoresSafeArea())
+        // In-app browser for ALL web links (Reads cards, article viewers) —
+        // presented above every tab, never an external Safari jump.
+        .sheet(item: $state.activeWebLink) { _ in
+            InAppBrowserSheet()
+        }
         // Voice-memo imports auto-store (transcribe on-device → journal entry),
         // matching the reference app — no review gate. The sidebar shows
         // progress via voiceMemoImporter.status while the serial worker runs.
@@ -3135,11 +3166,14 @@ struct FlowChips: View {
 /// 3-line summary, 👍/👎 actions, and a "✨ {topic}" rationale chip.
 struct FeedCard: View {
     @Environment(\.colorScheme) var scheme
+    @EnvironmentObject var state: AppState
     let item: RankedFeedItem
     let interests: [String]
 
-    @State private var liked = false
-    @State private var disliked = false
+    // Backed by AppState sets (session-stable) instead of @State, which the
+    // LazyVStack recycles on scroll — likes used to reset silently.
+    private var liked: Bool { state.likedReadIDs.contains(item.id) }
+    private var disliked: Bool { state.dislikedReadIDs.contains(item.id) }
 
     private var host: String {
         guard let url = URL(string: item.link), let h = url.host else {
@@ -3157,7 +3191,9 @@ struct FeedCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Optional cover image (YouTube thumbnail / Nostr article image).
+            // Optional cover image (RSS media cover / YouTube thumbnail /
+            // Nostr article image). Failed loads render NOTHING — a dead
+            // image URL must not leave a reserved gray block on the card.
             if let thumb = item.thumbnailURL, let url = URL(string: thumb) {
                 AsyncImage(url: url) { phase in
                     switch phase {
@@ -3167,15 +3203,12 @@ struct FeedCard: View {
                     case .success(let image):
                         image.resizable().scaledToFill().frame(height: 160).clipped()
                     case .failure:
-                        Color.clear.frame(height: 0)
+                        EmptyView()
                     @unknown default:
-                        Color.clear.frame(height: 0)
+                        EmptyView()
                     }
                 }
                 .frame(maxWidth: .infinity)
-                .frame(height: 160)
-                .background(DS.surface2(scheme))
-                .clipped()
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -3198,7 +3231,7 @@ struct FeedCard: View {
                 }
 
                 // Title
-                Text(item.title.isEmpty ? "Untitled" : item.title)
+                Text(item.title.isEmpty ? "Untitled" : item.title.decodingHTMLEntities())
                     .font(DS.readsTitleFont)
                     .foregroundStyle(DS.ink(scheme))
                     .lineLimit(3)
@@ -3226,8 +3259,12 @@ struct FeedCard: View {
                 // Like / dislike actions.
                 HStack(spacing: 18) {
                     Button {
-                        liked.toggle()
-                        if liked { disliked = false }
+                        if liked {
+                            state.likedReadIDs.remove(item.id)
+                        } else {
+                            state.likedReadIDs.insert(item.id)
+                            state.dislikedReadIDs.remove(item.id)
+                        }
                         UISelectionFeedbackGenerator().selectionChanged()
                     } label: {
                         Image(systemName: liked ? "hand.thumbsup.fill" : "hand.thumbsup")
@@ -3237,8 +3274,12 @@ struct FeedCard: View {
                     .buttonStyle(.plain)
 
                     Button {
-                        disliked.toggle()
-                        if disliked { liked = false }
+                        if disliked {
+                            state.dislikedReadIDs.remove(item.id)
+                        } else {
+                            state.dislikedReadIDs.insert(item.id)
+                            state.likedReadIDs.remove(item.id)
+                        }
                         UISelectionFeedbackGenerator().selectionChanged()
                     } label: {
                         Image(systemName: disliked ? "hand.thumbsdown.fill" : "hand.thumbsdown")
@@ -3250,7 +3291,8 @@ struct FeedCard: View {
                     Spacer()
 
                     if let url = URL(string: item.link), !item.link.isEmpty {
-                        Image(systemName: "arrow.up.right.square")
+                        // In-app reader affordance (SFSafariViewController).
+                        Image(systemName: "safari")
                             .font(.system(size: 14))
                             .foregroundStyle(DS.muted(scheme))
                     }
@@ -3270,17 +3312,23 @@ struct FeedCard: View {
         .contentShape(Rectangle())
         .onTapGesture {
             guard let url = URL(string: item.link), !item.link.isEmpty else { return }
-            UIApplication.shared.open(url)
+            // All web links open inside the app (SFSafariViewController),
+            // never an external Safari window.
+            state.openWebLink(url)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(host), \(item.title), \(item.readMinutes) minute read")
+        .accessibilityAddTraits(.isButton)
     }
 }
 
 // MARK: - HTML stripping helper
 
 extension String {
-    /// Strip HTML tags (RSS descriptions often contain HTML).
+    /// Strip HTML tags (RSS descriptions often contain HTML), then decode the
+    /// common XML/HTML entities so Reads cards render "A &amp; B" as "A & B".
     func strippingHTML() -> String {
-        guard self.contains("<") else { return self }
+        guard self.contains("<") else { return self.decodingHTMLEntities() }
         var result = ""
         var inside = false
         for ch in self {
@@ -3288,7 +3336,64 @@ extension String {
             else if ch == ">" { inside = false }
             else if !inside { result.append(ch) }
         }
-        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+        return result.decodingHTMLEntities()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Decode the handful of entities real feeds emit: the five XML
+    /// predefined ones plus numeric (&#8212; / &#x2014;) references.
+    func decodingHTMLEntities() -> String {
+        guard contains("&") else { return self }
+        var out = ""
+        var i = startIndex
+        while i < endIndex {
+            let ch = self[i]
+            if ch == "&", let semi = self[i...].firstIndex(of: ";"),
+               distance(from: i, to: semi) <= 10 {
+                let entity = String(self[self.index(after: i)..<semi])
+                if let decoded = Self.decodeEntity(entity) {
+                    out.append(decoded)
+                    i = index(after: semi)
+                    continue
+                }
+            }
+            out.append(ch)
+            i = index(after: i)
+        }
+        return out
+    }
+
+    private static func decodeEntity(_ entity: String) -> Character? {
+        switch entity {
+        case "amp": return "&"
+        case "lt": return "<"
+        case "gt": return ">"
+        case "quot": return "\""
+        case "apos": return "'"
+        case "nbsp": return " "
+        case "#39", "#x27": return "'"
+        case "#8217", "rsquo": return "’"
+        case "lsquo": return "‘"
+        case "ldquo": return "“"
+        case "rdquo": return "”"
+        case "#8212", "#x2014", "mdash": return "—"
+        case "#8211", "#x2013", "ndash": return "–"
+        case "#8230", "#x2026", "hellip": return "…"
+        default:
+            // Numeric decimal (&#8220) or hex (&#x201C) scalar references.
+            if entity.hasPrefix("#") {
+                let value: UInt32?
+                if entity.hasPrefix("#x") || entity.hasPrefix("#X") {
+                    value = UInt32(String(entity.dropFirst(2)), radix: 16)
+                } else {
+                    value = UInt32(String(entity.dropFirst()))
+                }
+                if let value, value > 0, let scalar = Unicode.Scalar(value), scalar.properties.isPrintable {
+                    return Character(scalar)
+                }
+            }
+            return nil
+        }
     }
 }
 

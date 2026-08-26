@@ -328,9 +328,13 @@ private struct RankedFeedItemDTO: Decodable {
     let sourceLabel: String
     let score: Double
     let readMinutes: Int
+    /// Cover image URL extracted by the Zig core (media:thumbnail /
+    /// media:content / image enclosure / first <img>). "" when none —
+    /// older core builds omit the key entirely, hence decodeIfPresent.
+    let thumbnail: String?
 
     enum CodingKeys: String, CodingKey {
-        case title, link, description, sourceLabel, score, readMinutes
+        case title, link, description, sourceLabel, score, readMinutes, thumbnail
     }
 
     /// Build a crash-safe `RankedFeedItem`. Prefers `link` for identity; falls
@@ -356,7 +360,8 @@ private struct RankedFeedItemDTO: Decodable {
         // YouTube detection (re-tag rss -> youtube, synthesize thumbnail).
         let ytID = SlowClawFeedSource.youTubeID(from: trimmedLink)
         let platform = (ytID != nil) ? "youtube" : "rss"
-        let thumb = ytID.map { "https://i.ytimg.com/vi/\($0)/hqdefault.jpg" }
+        let ytThumb = ytID.map { "https://i.ytimg.com/vi/\($0)/hqdefault.jpg" }
+        let rssThumb = thumbnail?.trimmingCharacters(in: .whitespacesAndNewlines)
         return RankedFeedItem(
             id: safeId,
             title: title,
@@ -366,7 +371,7 @@ private struct RankedFeedItemDTO: Decodable {
             score: score,
             readMinutes: readMinutes,
             sourcePlatform: platform,
-            thumbnailURL: thumb
+            thumbnailURL: ytThumb ?? (rssThumb?.isEmpty == false ? rssThumb : nil)
         )
     }
 }
