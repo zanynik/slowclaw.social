@@ -73,8 +73,14 @@
     <true/>
     <key>UIFileSharingEnabled</key>
     <true/>
+    <!-- SlowClaw COPIES shared audio into its own Documents/Inbox (see
+         VoiceMemoImporter.copyAudio); it never edits the source file in place.
+         Declaring in-place support here made iOS take the open-in-place route
+         for Voice Memos shares, which stalls at the share sheet's "Preparing"
+         spinner and then silently dismisses without launching the app.
+         Copy-style import is what we want, so declare NO. -->
     <key>LSSupportsOpeningDocumentsInPlace</key>
-    <true/>
+    <false/>
     <!-- Declare SlowClaw as a handler for audio files so iOS shows it in the
          share sheet ("Copy to SlowClaw") from Voice Memos / Files. Alternate
          rank keeps Voice Memos/Files as the default and SlowClaw as an option.

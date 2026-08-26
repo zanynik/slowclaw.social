@@ -35,10 +35,14 @@ enum Transcriber {
     // MARK: - File transcription (VoiceMemoImporter + background-drain path)
 
     /// Transcribe an existing audio file at `url` to a single string on-device.
-    /// Returns "" if on-device speech is unavailable / nothing was recognized /
-    /// the analyzer threw. Reads the file's PCM buffers and feeds them to a
-    /// SpeechAnalyzer session, accumulating final results. Replaces the legacy
-    /// 40s-segment + semaphore approach that could silently drop segments.
+    /// Returns "" if nothing was recognized. Reads the file's PCM buffers and
+    /// feeds them to a SpeechAnalyzer session, accumulating final results.
+    ///
+    /// Fallback chain: modern SpeechAnalyzer first; if it is unavailable (older
+    /// iOS, non-Apple-Intelligence device, missing locale asset) or produces
+    /// no text, falls back to legacy SFSpeechRecognizer (see LegacyTranscriber
+    /// below) so a recorded journal never lands as "no transcript" just
+    /// because the device lacks Apple Intelligence.
     ///
     /// Thread-safe: blocking recognition runs on the calling thread; callers
     /// await it off the main actor (e.g. inside a Task.detached).
@@ -46,6 +50,14 @@ enum Transcriber {
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
 
+        let modern = await transcribeWithAnalyzer(url: url)
+        if !modern.isEmpty { return modern }
+        return await LegacyTranscriber.transcribe(url: url)
+    }
+
+    /// The SpeechAnalyzer file path, isolated so the fallback wrapper above
+    /// can try it first and discard an empty result cleanly.
+    private static func transcribeWithAnalyzer(url: URL) async -> String {
         guard let audioFile = try? AVAudioFile(forReading: url) else { return "" }
         return await transcribe(file: audioFile)
     }
@@ -277,5 +289,190 @@ private final class FinalCollector: @unchecked Sendable {
     func text() -> String {
         lock.lock(); defer { lock.unlock() }
         return parts.joined(separator: " ")
+    }
+}
+
+// MARK: - Legacy fallback (SFSpeechRecognizer)
+
+/// Legacy on-device transcription via the pre-SpeechAnalyzer Speech framework
+/// (`SFSpeechRecognizer`). Used as the automatic fallback when SpeechAnalyzer
+/// is unavailable — e.g. iOS versions / devices without Apple Intelligence, or
+/// a locale whose SpeechAnalyzer asset hasn't been downloaded. Without this
+/// fallback, such devices produced "🎙 ... (no transcript)" placeholders.
+///
+/// Whole-audio correctness (the classic chunk-overwrite pitfall):
+///   - When the recognizer supports on-device recognition, ONE request covers
+///     the WHOLE file — on-device requests have no per-request duration limit,
+///     so no segmentation is needed and nothing can be dropped or reordered.
+///   - Only when on-device is unsupported (server-based recognition, which iOS
+///     caps at ~1 minute per request) does the file get split — into ~50s
+///     segments, written as temp files, and transcribed STRICTLY SEQUENTIALLY,
+///     each segment's result APPENDED in order to the previous one. There is
+///     exactly one in-flight request at a time and each result lands exactly
+///     once, so no segment can overwrite another's transcript.
+enum LegacyTranscriber {
+
+    /// Entry point: authorize, pick a recognizer for the current locale, and
+    /// route to whole-file or segmented transcription. Returns "" on failure —
+    /// callers already handle the empty case with a placeholder.
+    static func transcribe(url: URL) async -> String {
+        // SpeechAnalyzer still gates on SFSpeechRecognizer authorization, and
+        // so does this legacy path.
+        let status = await withCheckedContinuation { cont in
+            SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0) }
+        }
+        guard status == .authorized else { return "" }
+
+        let recognizer = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer()
+        guard let recognizer, recognizer.isAvailable else { return "" }
+
+        if recognizer.supportsOnDeviceRecognition {
+            // On-device: one request for the whole file (no 1-minute cap).
+            let text = await transcribeFile(url: url, recognizer: recognizer, forceOnDevice: true)
+            if !text.isEmpty { return text }
+            // Fall through: supportsOnDeviceRecognition can report true while
+            // the on-device asset is actually missing or failed mid-request —
+            // the server-segmented path is the remaining option.
+        }
+        // Server-based recognition is ~1 min/request → segment + append.
+        return await transcribeSegmented(url: url, recognizer: recognizer)
+    }
+
+    /// One SFSpeechURLRecognitionRequest over the whole file. Awaits the final
+    /// result (no partials), with a generous timeout so a wedged request can't
+    /// hang the import queue forever.
+    private static func transcribeFile(url: URL, recognizer: SFSpeechRecognizer, forceOnDevice: Bool) async -> String {
+        let request = SFSpeechURLRecognitionRequest(url: url)
+        request.shouldReportPartialResults = false
+        if forceOnDevice { request.requiresOnDeviceRecognition = true }
+
+        // Shared between the recognition child task and the timeout child
+        // task: whichever finishes first wins, the continuation resumes
+        // exactly once, and the recognition task is cancelled ONLY on a real
+        // timeout. (The previous design used an unstructured watcher Task
+        // polling Task.isCancelled — but nothing ever cancelled it, leaking a
+        // 200ms poll loop per transcription. This structure has no watcher.)
+        let box = RecognitionOutcome()
+        return await withTaskGroup(of: String?.self) { group in
+            group.addTask {
+                await withCheckedContinuation { cont in
+                    box.setContinuation(cont)
+                    let task = recognizer.recognitionTask(with: request) { result, error in
+                        if let result, result.isFinal {
+                            box.resume(returning: result.bestTranscription.formattedString)
+                        } else if error != nil {
+                            box.resume(returning: nil)
+                        }
+                        // Non-final results with no error: keep waiting.
+                    }
+                    box.setTask(task)
+                }
+            }
+            group.addTask {
+                // Safety valve: whole-file on-device gets 15 min (long journals
+                // are fine); server-based segment/short-file gets 90s per
+                // request. On expiry, resume with nil (no-op if already done)
+                // and cancel the recognition task.
+                let budget: UInt64 = forceOnDevice ? 15 * 60 : 90
+                try? await Task.sleep(nanoseconds: budget * 1_000_000_000)
+                // Cancelled because the recognition finished first — no-op.
+                guard !Task.isCancelled else { return nil }
+                box.timedOut()
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first ?? ""
+        }
+    }
+
+    /// Server-based path (~1 min cap per request): split the audio into ~50s
+    /// temp segments and transcribe them STRICTLY IN ORDER, appending each
+    /// result to the accumulated transcript. One request in flight at a time;
+    /// each segment appends exactly once — no overwrites, no reordering.
+    private static func transcribeSegmented(url: URL, recognizer: SFSpeechRecognizer) async -> String {
+        guard let segments = try? splitIntoSegments(url: url, segmentSeconds: 50),
+              !segments.isEmpty else {
+            // Splitting failed — try one whole-file request anyway; short files
+            // (under a minute) fit in a single server request.
+            return await transcribeFile(url: url, recognizer: recognizer, forceOnDevice: false)
+        }
+        defer { segments.forEach { try? FileManager.default.removeItem(at: $0) } }
+        var parts: [String] = []
+        for segment in segments {
+            let text = await transcribeFile(url: segment, recognizer: recognizer, forceOnDevice: false)
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { parts.append(trimmed) }
+        }
+        return parts.joined(separator: " ")
+    }
+
+    /// Split an audio file into ~`segmentSeconds` temp .caf files on frame
+    /// boundaries (no re-encoding — the source format is written as-is). The
+    /// temp files live in the system temp dir; the caller removes them.
+    private static func splitIntoSegments(url: URL, segmentSeconds: Double) throws -> [URL] {
+        let file = try AVAudioFile(forReading: url)
+        let format = file.processingFormat
+        let totalFrames = Int(file.length)
+        guard totalFrames > 0 else { return [] }
+        let framesPerSegment = Int(format.sampleRate * segmentSeconds)
+        guard framesPerSegment > 0 else { return [] }
+
+        var segments: [URL] = []
+        var frameOffset = 0
+        while frameOffset < totalFrames {
+            let toRead = AVAudioFrameCount(min(framesPerSegment, totalFrames - frameOffset))
+            let segURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("slowclaw-stt-\(UUID().uuidString).caf")
+            let out = try AVAudioFile(forWriting: segURL, settings: format.settings)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: toRead) else { break }
+            try file.read(into: buffer, frameCount: toRead)
+            try out.write(from: buffer)
+            segments.append(segURL)
+            frameOffset += Int(toRead)
+        }
+        return segments
+    }
+}
+
+/// Single-resume outcome box shared by the recognition callback and the
+/// timeout task: the checked continuation resumes exactly once (a recognition
+/// error can arrive after a final result), and the SFSpeechRecognitionTask is
+/// cancelled only when a real timeout fires (cancelling a finished task would
+/// be a harmless no-op, but the guard keeps the intent explicit). All state is
+/// behind one lock; safe to touch from the callback queue and both tasks.
+private final class RecognitionOutcome: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cont: CheckedContinuation<String?, Never>?
+    private var task: SFSpeechRecognitionTask?
+
+    func setContinuation(_ cont: CheckedContinuation<String?, Never>) {
+        lock.lock(); defer { lock.unlock() }
+        self.cont = cont
+    }
+
+    func setTask(_ task: SFSpeechRecognitionTask) {
+        lock.lock(); defer { lock.unlock() }
+        self.task = task
+    }
+
+    func resume(returning value: String?) {
+        lock.lock()
+        let target = cont
+        cont = nil
+        lock.unlock()
+        target?.resume(returning: value)
+    }
+
+    /// Timeout fired: resume with nil if not already resumed, and stop the
+    /// recognition task so its engine work doesn't continue headless.
+    func timedOut() {
+        lock.lock()
+        let target = cont
+        cont = nil
+        let task = self.task
+        lock.unlock()
+        target?.resume(returning: nil)
+        task?.cancel()
     }
 }

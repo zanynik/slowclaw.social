@@ -511,6 +511,15 @@ fn buildLlamaCpp(
             c_flags.append(b.allocator, "-D_DARWIN_C_SOURCE") catch @panic("oom");
             cxx_flags.append(b.allocator, "-D_DARWIN_C_SOURCE") catch @panic("oom");
         },
+        // Linux: ggml-cpu.c uses CPU_ALLOC/CPU_SET_S/pthread_setaffinity_np,
+        // which glibc gates behind _GNU_SOURCE (upstream ggml's CMake defines
+        // it on Linux). Without this the Linux local-dev build fails with
+        // "call to undeclared function 'CPU_ALLOC'". CI is unaffected (macOS
+        // host uses _DARWIN_C_SOURCE; iOS device uses Apple clang).
+        .linux => {
+            c_flags.append(b.allocator, "-D_GNU_SOURCE") catch @panic("oom");
+            cxx_flags.append(b.allocator, "-D_GNU_SOURCE") catch @panic("oom");
+        },
         else => {},
     }
 

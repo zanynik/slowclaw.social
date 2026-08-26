@@ -343,7 +343,7 @@ flowchart TB
 
 **Why your journal matters here:** the `topics` JSON passed into `parse_and_rank` is built from your interest profile. A strong topic match (~+1.2) is tuned to beat a near-max recency signal (≤1.0), so an evergreen relevant piece can outrank a fresh generic one. With no topics extracted, scoring degrades gracefully to recency + quality (cold start).
 
-**Nostr details:** the app fetches long-form articles (`kind 30023`) from three relays, filters out spam/non-English/capped at 2 per author, scores by recency + topic boost, and builds `habla.news/a/{naddr}` links via a from-scratch bech32 encoder (`Nip19.swift`).
+**Nostr details:** the app fetches long-form articles (`kind 30023`) from three relays, filters out spam/non-English/capped at 2 per author, scores by recency + topic boost, and builds `highlighter.com/a/{naddr}` links via a from-scratch bech32 encoder (`Nip19.swift`). (habla.news went offline — the domain serves a Vercel DEPLOYMENT_NOT_FOUND — so article links moved to Highlighter, a living long-form Nostr reader that resolves the same naddr URLs server-side.)
 
 ---
 

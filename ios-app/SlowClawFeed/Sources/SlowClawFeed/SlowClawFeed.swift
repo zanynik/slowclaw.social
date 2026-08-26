@@ -328,9 +328,13 @@ private struct RankedFeedItemDTO: Decodable {
     let sourceLabel: String
     let score: Double
     let readMinutes: Int
+    /// Cover image URL extracted by the Zig core (media:thumbnail /
+    /// media:content / image enclosure / first <img>). "" when none —
+    /// older core builds omit the key entirely, hence decodeIfPresent.
+    let thumbnail: String?
 
     enum CodingKeys: String, CodingKey {
-        case title, link, description, sourceLabel, score, readMinutes
+        case title, link, description, sourceLabel, score, readMinutes, thumbnail
     }
 
     /// Build a crash-safe `RankedFeedItem`. Prefers `link` for identity; falls
@@ -356,7 +360,8 @@ private struct RankedFeedItemDTO: Decodable {
         // YouTube detection (re-tag rss -> youtube, synthesize thumbnail).
         let ytID = SlowClawFeedSource.youTubeID(from: trimmedLink)
         let platform = (ytID != nil) ? "youtube" : "rss"
-        let thumb = ytID.map { "https://i.ytimg.com/vi/\($0)/hqdefault.jpg" }
+        let ytThumb = ytID.map { "https://i.ytimg.com/vi/\($0)/hqdefault.jpg" }
+        let rssThumb = thumbnail?.trimmingCharacters(in: .whitespacesAndNewlines)
         return RankedFeedItem(
             id: safeId,
             title: title,
@@ -366,7 +371,7 @@ private struct RankedFeedItemDTO: Decodable {
             score: score,
             readMinutes: readMinutes,
             sourcePlatform: platform,
-            thumbnailURL: thumb
+            thumbnailURL: ytThumb ?? (rssThumb?.isEmpty == false ? rssThumb : nil)
         )
     }
 }
@@ -609,11 +614,14 @@ public struct LocalModelPreset: Identifiable, Equatable {
     public let mmprojFileName: String?
     public let mmprojDownloadURL: URL?
     public let mmprojSizeLabel: String?
+    /// Approximate mmproj download size in bytes (drives combined download
+    /// progress + the delegate's fallback size). nil when unknown.
+    public let mmprojSizeBytes: Int64?
 
     public init(id: String, title: String, detail: String, fileName: String,
                 downloadURL: URL, sizeBytes: Int64, sizeLabel: String,
                 mmprojFileName: String? = nil, mmprojDownloadURL: URL? = nil,
-                mmprojSizeLabel: String? = nil) {
+                mmprojSizeLabel: String? = nil, mmprojSizeBytes: Int64? = nil) {
         self.id = id
         self.title = title
         self.detail = detail
@@ -624,6 +632,7 @@ public struct LocalModelPreset: Identifiable, Equatable {
         self.mmprojFileName = mmprojFileName
         self.mmprojDownloadURL = mmprojDownloadURL
         self.mmprojSizeLabel = mmprojSizeLabel
+        self.mmprojSizeBytes = mmprojSizeBytes
     }
 
     /// True when this preset carries an audio mmproj (mtmd-capable).
@@ -644,25 +653,26 @@ public struct LocalModelPreset: Identifiable, Equatable {
               downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf")!,
               sizeBytes: 2_620_000_000,
               sizeLabel: "2.5 GB"),
-        // 🔬 Experimental audio model: Gemma 3n E4B (multimodal: text + audio).
-        // The text GGUF is from unsloth. The mmproj (audio encoder + projector)
-        // must be generated from the checkpoint via convert_hf_to_gguf.py
-        // --mmproj and hosted — it is NOT in the unsloth GGUF repo. Until a
-        // hosted mmproj URL exists, the audio engine can't be used end-to-end;
-        // the placeholder below is marked so it's obvious what to fill in.
-        // The code path (download + load + transcribe) is fully wired regardless.
-        .init(id: "unsloth/gemma-3n-E4B-it-audio",
-              title: "Gemma 3n E4B Audio (experimental)",
-              detail: "Multimodal: text + audio. Enables on-device transcription via mtmd. Needs the mmproj (see preset).",
-              fileName: "gemma-3n-E4B-it-UD-Q4_K_XL.gguf",
-              downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-3n-E4B-it-GGUF/resolve/main/gemma-3n-E4B-it-UD-Q4_K_XL.gguf")!,
-              sizeBytes: 5_390_000_000,
-              sizeLabel: "5.4 GB",
-              // TODO: replace with a hosted mmproj URL once generated.
-              // Generate via: python convert_hf_to_gguf.py <gemma-3n-E4B-it> --mmproj
-              mmprojFileName: "gemma-3n-E4B-it-mmproj-f16.gguf",
-              mmprojDownloadURL: nil, // set once the mmproj is hosted
-              mmprojSizeLabel: "~500 MB"),
+        // 🔬 Experimental audio model: Gemma 4 E2B (multimodal: text + audio).
+        // Pairs the SAME text GGUF as the proven presets above with unsloth's
+        // official mmproj from the same repo (clip.has_audio_encoder=true,
+        // clip.audio.projector_type=gemma4a — the audio type the vendored mtmd
+        // version actually supports; gemma-3n's "gemma3na" is NOT supported by
+        // init_audio() there, so a Gemma 3n mmproj can never load).
+        // The mmproj URL is revision-pinned so a later upstream change can't
+        // break the download; bump the pin deliberately when re-vendoring.
+        .init(id: "unsloth/gemma-4-E2B-it-qat-audio",
+              title: "Gemma 4 E2B Audio (experimental)",
+              detail: "Multimodal: text + audio. On-device transcription via mtmd. Also downloads the ~1.0 GB audio mmproj (mmproj-F16).",
+              fileName: "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+              downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf")!,
+              sizeBytes: 2_620_000_000,
+              sizeLabel: "2.5 GB",
+              // Revision-pinned: repo sha 66a399f68ddd113b06dff02fca9523e55465d11d
+              mmprojFileName: "gemma-4-E2B-it-mmproj-F16.gguf",
+              mmprojDownloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/66a399f68ddd113b06dff02fca9523e55465d11d/mmproj-F16.gguf")!,
+              mmprojSizeLabel: "1.0 GB",
+              mmprojSizeBytes: 985_654_080),
     ]
 }
 
@@ -751,7 +761,7 @@ public enum LocalModelStore {
         try? FileManager.default.removeItem(at: tmp)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
-        let delegate = ModelDownloadDelegate(tmpURL: tmp, fallbackSize: 500_000_000, progress: progress)
+        let delegate = ModelDownloadDelegate(tmpURL: tmp, fallbackSize: preset.mmprojSizeBytes ?? 500_000_000, progress: progress)
         let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         try await delegate.run(in: session, url: srcURL)

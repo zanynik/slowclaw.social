@@ -820,7 +820,7 @@ pub export fn slowclaw_feed_parse_and_rank(
     // Convert to FeedItems for ranking. Allocated with c_allocator so the
     // defer below frees with the matching allocator (a mismatch here —
     // page_allocator alloc + c_allocator free — was the iOS Reads SIGABRT).
-    const feed_items = rss_parser.toFeedItems(c_allocator, items, src_slice) catch {
+    const feed_items = rss_parser.toFeedItems(c_allocator, items, src_slice, now_epoch) catch {
         out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_OUT_OF_MEMORY };
         return SLOWCLAW_ERR_OUT_OF_MEMORY;
     };
@@ -1217,6 +1217,15 @@ fn serializeRankedFeed(allocator: std.mem.Allocator, ranked: []const feeds_ranki
         const rm_str = try std.fmt.allocPrint(allocator, ",\"readMinutes\":{d}", .{r.read_minutes});
         defer allocator.free(rm_str);
         try buf.appendSlice(allocator, rm_str);
+        // Cover image for the Reads cards (media:thumbnail / media:content /
+        // image enclosure / first <img>). Empty string when none — the Swift
+        // DTO maps empty → nil.
+        try buf.appendSlice(allocator, ",\"thumbnail\":");
+        if (r.item.image_url) |iu| {
+            try writeJsonString(allocator, &buf, iu);
+        } else {
+            try buf.appendSlice(allocator, "\"\"");
+        }
         try buf.append(allocator, '}');
     }
     try buf.append(allocator, ']');
@@ -1651,6 +1660,77 @@ test "ffi: parse_and_rank with topics incl. escaped label does not corrupt the h
         try testing.expect(result.items_json.len > 0);
         slowclaw_feed_rank_result_free(&result);
     }
+}
+
+test "ffi: parse_and_rank emits thumbnail + real timestamps in ranked JSON" {
+    // Cover-image pipeline: media:thumbnail → FeedItem.image_url → the
+    // ranked JSON's "thumbnail" field; items without media get "".
+    // Also asserts dates parse to real epochs (regression: they used to be
+    // the constant 1e9 ≈ 2001, which zeroed the recency ranking term).
+    const xml =
+        \\<rss version="2.0"><channel>
+        \\<item><title>With cover</title><link>https://example.com/a</link>
+        \\<description>A post with an image</description><guid>a</guid>
+        \\<pubDate>Mon, 15 Jan 2024 10:30:00 GMT</pubDate>
+        \\<media:thumbnail url="https://img.example.com/a.jpg"/></item>
+        \\<item><title>Without cover</title><link>https://example.com/b</link>
+        \\<description>Another post</description><guid>b</guid>
+        \\<pubDate>2024-01-15T10:30:00Z</pubDate></item>
+        \\</channel></rss>
+    ;
+    const src = "Test";
+    const now: f64 = 1_705_400_000.0; // just after 2024-01-16, so recency ∈ (0,1)
+
+    var result: SlowclawRankResult = .{ .items_json = SlowclawString.empty(), .status = 0 };
+    const status = slowclaw_feed_parse_and_rank(
+        xml.ptr, xml.len, src.ptr, src.len, null, 0, now, &result,
+    );
+    try testing.expectEqual(SLOWCLAW_OK, status);
+    defer slowclaw_feed_rank_result_free(&result);
+    const json_bytes = result.items_json.bytes orelse return error.NullJson;
+    const json = json_bytes[0..result.items_json.len];
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"thumbnail\":\"https://img.example.com/a.jpg\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"thumbnail\":\"\"") != null);
+
+    // Round-trip through the JSON parser to verify shape (both fields parse).
+    const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return error.JsonInvalid;
+    defer parsed.deinit();
+    try testing.expectEqual(std.meta.Tag(std.json.Value).array, std.meta.activeTag(parsed.value));
+    for (parsed.value.array.items) |v| {
+        try testing.expect(v.object.contains("thumbnail"));
+        try testing.expect(v.object.contains("score"));
+        try testing.expect(v.object.contains("readMinutes"));
+    }
+}
+
+test "ffi: parse_and_rank ranks a dated item above an undated one on recency" {
+    // With real date parsing, the fresh item (1h old) must outscore the stale
+    // one (published 2024) purely on the recency term.
+    const xml =
+        \\<rss version="2.0"><channel>
+        \\<item><title>Stale</title><link>https://example.com/old</link>
+        \\<description>old</description><guid>old</guid>
+        \\<pubDate>Mon, 15 Jan 2024 10:30:00 GMT</pubDate></item>
+        \\<item><title>Fresh</title><link>https://example.com/new</link>
+        \\<description>new</description><guid>new</guid>
+        \\<pubDate></pubDate></item>
+        \\</channel></rss>
+    ;
+    const src = "Test";
+    const now: f64 = 1_705_314_600.0 + 3600.0; // 1h after the 2024-01-15 10:30Z item
+    var result: SlowclawRankResult = .{ .items_json = SlowclawString.empty(), .status = 0 };
+    const status = slowclaw_feed_parse_and_rank(
+        xml.ptr, xml.len, src.ptr, src.len, null, 0, now, &result,
+    );
+    try testing.expectEqual(SLOWCLAW_OK, status);
+    defer slowclaw_feed_rank_result_free(&result);
+    const json_bytes = result.items_json.bytes orelse return error.NullJson;
+    const json = json_bytes[0..result.items_json.len];
+    // JSON is score-desc; "Fresh" (recency=0.5^(1/36)≈0.981) must come first.
+    const fresh_at = std.mem.indexOf(u8, json, "Fresh").?;
+    const stale_at = std.mem.indexOf(u8, json, "Stale").?;
+    try testing.expect(fresh_at < stale_at);
 }
 
 test "ffi: local_audio_status returns valid JSON via the C ABI" {
