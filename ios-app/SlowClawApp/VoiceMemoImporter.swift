@@ -40,6 +40,16 @@ final class VoiceMemoImporter: ObservableObject {
     private var queue: [PendingVoiceMemo] = []
     private var worker: Task<Void, Never>? = nil
 
+    /// Source URLs handed to enqueue recently (absolute string → time). Guards
+    /// double delivery of ONE share: on a cold launch the same URL can arrive
+    /// via launchOptions[.url] AND SwiftUI's .onOpenURL (and potentially the
+    /// app delegate), and iOS reuses the same copied-file path for every
+    /// delivery. Without this, one share imported twice (each enqueue makes a
+    /// new timestamped copy → two journal entries).
+    private var recentlyEnqueuedSources: [String: Date] = [:]
+    /// How long a source URL counts as "already handed to us".
+    private static let enqueueDedupWindow: TimeInterval = 15
+
     private var inboxURL: URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
@@ -54,6 +64,16 @@ final class VoiceMemoImporter: ObservableObject {
     /// each call appends one item and ensures the single serial worker runs.
     @discardableResult
     func enqueue(_ sourceURL: URL) -> URL? {
+        // Prune expired entries, then ignore a re-delivery of a share we
+        // accepted moments ago. Silently return nil WITHOUT touching `status`
+        // — the first delivery is already importing; this is not an error.
+        let sourceKey = sourceURL.absoluteString
+        let now = Date()
+        recentlyEnqueuedSources = recentlyEnqueuedSources.filter {
+            now.timeIntervalSince($0.value) < Self.enqueueDedupWindow
+        }
+        if recentlyEnqueuedSources[sourceKey] != nil { return nil }
+
         guard let dest = copyAudio(sourceURL) else {
             // Surface the rejection so the user isn't left wondering why
             // "Preparing" finished with no result (the share sheet shows
@@ -66,6 +86,9 @@ final class VoiceMemoImporter: ObservableObject {
         if !queue.contains(where: { $0.url.path == dest.path }) {
             queue.append(PendingVoiceMemo(url: dest, queuedAt: Date()))
         }
+        // Only record the source as handled once the copy actually landed —
+        // a failed import stays retryable within the window.
+        recentlyEnqueuedSources[sourceKey] = now
         // Immediate feedback the moment the file lands — don't wait for the
         // worker to start transcribing before telling the user it worked.
         status = "Importing\(queue.count > 1 ? " \(queue.count) voice memos" : " voice memo")…"

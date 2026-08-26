@@ -328,7 +328,11 @@ enum LegacyTranscriber {
 
         if recognizer.supportsOnDeviceRecognition {
             // On-device: one request for the whole file (no 1-minute cap).
-            return await transcribeFile(url: url, recognizer: recognizer, forceOnDevice: true)
+            let text = await transcribeFile(url: url, recognizer: recognizer, forceOnDevice: true)
+            if !text.isEmpty { return text }
+            // Fall through: supportsOnDeviceRecognition can report true while
+            // the on-device asset is actually missing or failed mid-request —
+            // the server-segmented path is the remaining option.
         }
         // Server-based recognition is ~1 min/request → segment + append.
         return await transcribeSegmented(url: url, recognizer: recognizer)
@@ -342,10 +346,17 @@ enum LegacyTranscriber {
         request.shouldReportPartialResults = false
         if forceOnDevice { request.requiresOnDeviceRecognition = true }
 
+        // Shared between the recognition child task and the timeout child
+        // task: whichever finishes first wins, the continuation resumes
+        // exactly once, and the recognition task is cancelled ONLY on a real
+        // timeout. (The previous design used an unstructured watcher Task
+        // polling Task.isCancelled — but nothing ever cancelled it, leaking a
+        // 200ms poll loop per transcription. This structure has no watcher.)
+        let box = RecognitionOutcome()
         return await withTaskGroup(of: String?.self) { group in
             group.addTask {
                 await withCheckedContinuation { cont in
-                    let box = ResumeGuard(cont)
+                    box.setContinuation(cont)
                     let task = recognizer.recognitionTask(with: request) { result, error in
                         if let result, result.isFinal {
                             box.resume(returning: result.bestTranscription.formattedString)
@@ -354,23 +365,19 @@ enum LegacyTranscriber {
                         }
                         // Non-final results with no error: keep waiting.
                     }
-                    // If the timeout child task wins the race, cancel the
-                    // recognition task (its callback then resumes with nil).
-                    Task { [weak task] in
-                        while !Task.isCancelled {
-                            try? await Task.sleep(nanoseconds: 200_000_000)
-                        }
-                        task?.cancel()
-                    }
+                    box.setTask(task)
                 }
             }
             group.addTask {
                 // Safety valve: whole-file on-device gets 15 min (long journals
                 // are fine); server-based segment/short-file gets 90s per
-                // request. After that, cancel and let the caller's placeholder
-                // logic handle it.
+                // request. On expiry, resume with nil (no-op if already done)
+                // and cancel the recognition task.
                 let budget: UInt64 = forceOnDevice ? 15 * 60 : 90
                 try? await Task.sleep(nanoseconds: budget * 1_000_000_000)
+                // Cancelled because the recognition finished first — no-op.
+                guard !Task.isCancelled else { return nil }
+                box.timedOut()
                 return nil
             }
             let first = await group.next() ?? nil
@@ -428,14 +435,25 @@ enum LegacyTranscriber {
     }
 }
 
-/// Ensures a checked continuation resumes exactly once (the recognition
-/// callback can fire an error AFTER a final result in edge cases).
-private final class ResumeGuard: @unchecked Sendable {
+/// Single-resume outcome box shared by the recognition callback and the
+/// timeout task: the checked continuation resumes exactly once (a recognition
+/// error can arrive after a final result), and the SFSpeechRecognitionTask is
+/// cancelled only when a real timeout fires (cancelling a finished task would
+/// be a harmless no-op, but the guard keeps the intent explicit). All state is
+/// behind one lock; safe to touch from the callback queue and both tasks.
+private final class RecognitionOutcome: @unchecked Sendable {
     private let lock = NSLock()
     private var cont: CheckedContinuation<String?, Never>?
+    private var task: SFSpeechRecognitionTask?
 
-    init(_ cont: CheckedContinuation<String?, Never>) {
+    func setContinuation(_ cont: CheckedContinuation<String?, Never>) {
+        lock.lock(); defer { lock.unlock() }
         self.cont = cont
+    }
+
+    func setTask(_ task: SFSpeechRecognitionTask) {
+        lock.lock(); defer { lock.unlock() }
+        self.task = task
     }
 
     func resume(returning value: String?) {
@@ -444,5 +462,17 @@ private final class ResumeGuard: @unchecked Sendable {
         cont = nil
         lock.unlock()
         target?.resume(returning: value)
+    }
+
+    /// Timeout fired: resume with nil if not already resumed, and stop the
+    /// recognition task so its engine work doesn't continue headless.
+    func timedOut() {
+        lock.lock()
+        let target = cont
+        cont = nil
+        let task = self.task
+        lock.unlock()
+        target?.resume(returning: nil)
+        task?.cancel()
     }
 }
