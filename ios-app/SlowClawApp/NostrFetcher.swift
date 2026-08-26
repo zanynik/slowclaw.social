@@ -1,10 +1,13 @@
 // NostrFetcher.swift — client-side Nostr long-form articles (NIP-23) for Reads.
 //
-// The reference app fetches kind 30023 (NIP-23) articles from the default
-// relays and renders them in Reads via habla.news links (web/src/lib/nostr.ts
-// fetchLongFormArticles + socialFeed.ts toUnifiedFromNostrArticle). The iOS
-// app doesn't embed the Rust gateway, so this does the same fetch client-side
-// via URLSessionWebSocketTask.
+// The reference app fetched kind 30023 (NIP-23) articles from the default
+// relays and rendered them in Reads via habla.news links (web/src/lib/nostr.ts
+// fetchLongFormArticles + socialFeed.ts toUnifiedFromNostrArticle). habla.news
+// has since gone offline (the domain now serves a Vercel DEPLOYMENT_NOT_FOUND
+// — every /a/<naddr> link 404s), so article URLs point at highlighter.com —
+// a living long-form Nostr reader that resolves naddr links server-side.
+// The iOS app doesn't embed a gateway, so this does the same fetch
+// client-side via URLSessionWebSocketTask.
 //
 // Output is [RankedFeedItem] with sourcePlatform = "nostr", so the existing
 // ranker/FeedCard handle them uniformly. Articles get a neutral recency score
@@ -97,8 +100,8 @@ enum NostrFetcher {
                       let kind = arr[0] as? String else { continue }
                 if kind == "EOSE" { break }
                 if kind == "EVENT", let ev = arr[2] as? [String: Any] {
-                    // Type-1 NIP-19 relay hints give Habla a concrete location
-                    // for an article it has not indexed yet.
+                    // Type-1 NIP-19 relay hints give the reader a concrete
+                    // location for an article it has not indexed yet.
                     var annotated = ev
                     annotated["slowclaw_relay"] = urlString
                     collected.append(annotated)
@@ -174,7 +177,7 @@ enum NostrFetcher {
 
     /// A parsed NIP-23 article event.
     private struct Article {
-        let identifier: String      // event id (hex) — used for the habla fallback link
+        let identifier: String      // event id (hex) — used for the viewer fallback link
         let pubkey: String          // event author pubkey (hex) — used for the naddr link
         let dTag: String            // NIP-33 "d" identifier — used for the naddr link
         let title: String?
@@ -191,7 +194,7 @@ enum NostrFetcher {
             identifier = id
             // The author pubkey is a top-level field on every Nostr event.
             // The naddr's author TLV (type 2) MUST be this 32-byte pubkey,
-            // NOT the event id — otherwise habla.news decodes a valid bech32
+            // NOT the event id — otherwise readers decode a valid bech32
             // string that points at a nonexistent (pubkey, kind, d) → 404.
             pubkey = (event["pubkey"] as? String) ?? ""
             body = (event["content"] as? String) ?? ""
@@ -266,15 +269,18 @@ enum NostrFetcher {
                 lowered.hasPrefix("lightning address")
         }
 
-        /// habla.news link, preferring a naddr-encoded address (mirrors
+        /// Article URL, preferring a naddr-encoded address (mirrors
         /// encodeNaddr in web/src/lib/nostr.ts, which encodes the author
-        /// PUBKEY — not the event id). An article without a valid NIP-33
-        /// coordinate cannot resolve at Habla; use a generic Nostr viewer for
-        /// that malformed case rather than creating a known 404.
+        /// PUBKEY — not the event id). highlighter.com is a long-form Nostr
+        /// reader that resolves naddr links server-side (verified against live
+        /// relay events; habla.news is offline — 404 for the whole domain).
+        /// An article without a valid NIP-33 coordinate cannot resolve there;
+        /// use a generic Nostr viewer for that malformed case rather than
+        /// creating a known 404.
         var articleURL: String {
             if !dTag.isEmpty, !pubkey.isEmpty,
                let naddr = Nip19.encodeNaddr(identifier: dTag, pubkey: pubkey, kind: 30023, relay: relay) {
-                return "https://habla.news/a/\(naddr)"
+                return "https://highlighter.com/a/\(naddr)"
             }
             return "https://njump.me/\(identifier)"
         }

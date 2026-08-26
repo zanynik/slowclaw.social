@@ -1,8 +1,9 @@
 // Nip19.swift — minimal NIP-19 naddr encoder for Nostr article links.
 //
-// Mirrors encodeNaddr in web/src/lib/nostr.ts so the iOS app produces the same
-// habla.news URLs the reference app does. habla.news decodes with nostr-tools,
-// which uses plain bech32 (constant 1), NOT bech32m — so we must too.
+// Mirrors encodeNaddr in web/src/lib/nostr.ts so the iOS app produces the
+// same naddr bech32 strings the reference app does. Long-form readers
+// (highlighter.com — habla.news is offline) decode with nostr-tools, which
+// uses plain bech32 (constant 1), NOT bech32m — so we must too.
 //
 // naddr TLV layout (NIP-19):
 //   type 0 = identifier (the NIP-33 "d" tag)   — UTF-8 bytes
