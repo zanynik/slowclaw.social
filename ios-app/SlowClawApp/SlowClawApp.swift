@@ -169,6 +169,16 @@ final class ShareURLDelegate: NSObject, UIApplicationDelegate {
             }
             Self.handleBackgroundTranscription(task: task, appState: self?.appState)
         }
+        // Cold-launch delivery: when iOS launches the app straight from a
+        // share ("Copy to SlowClaw" while the app is not running), the URL
+        // arrives in launchOptions — under the SwiftUI lifecycle the delegate's
+        // application(_:open:options:) is NOT reliably called afterwards, so
+        // without this capture the URL (and the import) is silently dropped.
+        if let launchURL = launchOptions?[.url] as? URL {
+            pendingLock.lock()
+            pending.append(launchURL)
+            pendingLock.unlock()
+        }
         return true
     }
 
