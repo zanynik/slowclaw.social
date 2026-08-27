@@ -198,6 +198,22 @@ final class ShareURLDelegate: NSObject, UIApplicationDelegate {
         return true
     }
 
+    // On-Device AI model downloads live in a background URLSession
+    // ("com.slowclaw.app.model-download") so the multi-GB transfer keeps
+    // running while the app is backgrounded/suspended or the phone is locked.
+    // When iOS relaunches the app to deliver those session events, this
+    // callback reconnects the download coordinator's delegate. Sessions we
+    // don't own complete immediately so the system isn't left waiting.
+    func application(_ application: UIApplication,
+                     handleEventsForBackgroundURLSession identifier: String,
+                     completionHandler: @escaping () -> Void) {
+        guard slowClawHandleBackgroundModelSession(identifier: identifier,
+                                                   completionHandler: completionHandler) else {
+            completionHandler()
+            return
+        }
+    }
+
     func application(_ app: UIApplication, open url: URL,
                      options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
         // Warm delivery: hand it straight to the importer if wired; otherwise
@@ -398,6 +414,15 @@ final class AppState: ObservableObject {
         setupLLM()
         refreshLocalLLMStatus()
         refreshLocalAudioStatus()
+        // A model file can land via the background download coordinator with
+        // no in-app awaiter (app relaunched mid-download; the transfer kept
+        // running while suspended). Re-read status so the model row re-renders
+        // as Downloaded/Activate instead of a stale Download button.
+        NotificationCenter.default.addObserver(
+            forName: .slowClawModelFileLanded, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshLocalLLMStatus() }
+        }
         Task { await refreshJournals() }
     }
 
@@ -1963,6 +1988,20 @@ struct JournalDetailView: View {
                 DispatchQueue.main.async { editedBody = polished }
             }
         }
+    }
+
+    /// Re-run on-device transcription of this entry's audio file and replace
+    /// the transcript body in place (title preserved). The manual retry path
+    /// for truncated/incomplete transcripts — lets each new build's engine be
+    /// re-checked against the same audio. The editor + store both get the
+    /// fresh content.
+    private func retranscribe() async {
+        guard hasAudioFile, !isRetranscribing else { return }
+        isRetranscribing = true
+        defer { isRetranscribing = false }
+        let newContent = await state.retranscribeJournal(entry)
+        guard !newContent.isEmpty else { return }
+        editedBody = newContent
     }
 }
 

@@ -700,23 +700,24 @@ public enum LocalModelStore {
         return size > 1_000_000
     }
 
-    /// Download the preset to Documents/Models/ with progress (0...1). Uses a
-    /// URLSession download task (background-thread friendly, resume-capable
-    /// transport) and moves through a `.partial` file so a killed download
-    /// never masquerades as a valid model (the GGUF magic check in the Zig
-    /// core is the second line of defense).
+    /// Download the preset to Documents/Models/ with progress (0...1). Runs
+    /// in a BACKGROUND URLSession so the multi-GB transfer KEEPS GOING while
+    /// the app is backgrounded or the phone is locked (iOS's nsurlsessiond
+    /// owns the transfer, not the app process — no manual pause/resume
+    /// bookkeeping; only a user force-quit cancels it, and the download
+    /// restarts cleanly on the next request). The completed file is moved
+    /// into place by the download delegate only after a full HTTP 200
+    /// transfer — a partial file never masquerades as a valid model (the
+    /// GGUF magic check in the Zig core is the second line of defense).
     public static func download(_ preset: LocalModelPreset,
                                 progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
         let dest = try fileURL(for: preset)
-        let tmp = dest.appendingPathExtension("partial")
-        try? FileManager.default.removeItem(at: tmp)
-        defer { try? FileManager.default.removeItem(at: tmp) }
-
-        let delegate = ModelDownloadDelegate(tmpURL: tmp, fallbackSize: preset.sizeBytes, progress: progress)
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
-        try await delegate.run(in: session, url: preset.downloadURL)
-        try FileManager.default.moveItem(at: tmp, to: dest)
+        if isDownloaded(preset) {
+            progress(1.0)
+            return dest
+        }
+        try await ModelDownloadCoordinator.shared.run(url: preset.downloadURL, destination: dest,
+                                                      fallbackSize: preset.sizeBytes, progress: progress)
         progress(1.0)
         return dest
     }
@@ -746,9 +747,10 @@ public enum LocalModelStore {
         return size > 100_000
     }
 
-    /// Download the mmproj for a preset. Same partial-file + URLSession path
-    /// as the text model download. Throws if the preset has no mmproj or no
-    /// hosted mmproj URL (the Gemma 3n mmproj must be generated + hosted first).
+    /// Download the mmproj for a preset. Same background-URLSession path as
+    /// the text model download (continues while backgrounded/locked).
+    /// Throws if the preset has no mmproj or no hosted mmproj URL (the Gemma
+    /// 3n mmproj must be generated + hosted first).
     public static func downloadMmproj(_ preset: LocalModelPreset,
                                        progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
         guard let name = preset.mmprojFileName,
@@ -757,15 +759,13 @@ public enum LocalModelStore {
                           userInfo: [NSLocalizedDescriptionKey: "This model's mmproj has no hosted download URL yet."])
         }
         let dest = try modelsDirectory().appendingPathComponent(name)
-        let tmp = dest.appendingPathExtension("partial")
-        try? FileManager.default.removeItem(at: tmp)
-        defer { try? FileManager.default.removeItem(at: tmp) }
-
-        let delegate = ModelDownloadDelegate(tmpURL: tmp, fallbackSize: preset.mmprojSizeBytes ?? 500_000_000, progress: progress)
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
-        try await delegate.run(in: session, url: srcURL)
-        try FileManager.default.moveItem(at: tmp, to: dest)
+        if isMmprojDownloaded(preset) {
+            progress(1.0)
+            return dest
+        }
+        try await ModelDownloadCoordinator.shared.run(url: srcURL, destination: dest,
+                                                      fallbackSize: preset.mmprojSizeBytes ?? 500_000_000,
+                                                      progress: progress)
         progress(1.0)
         return dest
     }
@@ -1173,60 +1173,204 @@ private let slowClawHttpPostTrampoline: SlowclawHttpPostFn = { ctx, urlPtr, urlL
     return SlowclawString(bytes: buf.assumingMemoryBound(to: UInt8.self), len: len)
 }
 
-/// URLSession download delegate backing `LocalModelStore.download`. Moves the
-/// completed file inside `didFinishDownloadingTo` (the temp URL is invalidated
-/// when that method returns) and reports byte progress.
-private final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
-    private let tmpURL: URL
-    private let fallbackSize: Int64
-    private let progress: @Sendable (Double) -> Void
-    private var continuation: CheckedContinuation<Void, Error>?
-    private var expected: Int64
+public extension Notification.Name {
+    /// Posted when a model file lands on disk via the background download
+    /// coordinator (object: the file's lastPathComponent). Covers the orphan
+    /// path — a download that finished after the app was relaunched with no
+    /// `download()` call awaiting it — so the app can re-render the model
+    /// rows (a landed file counts as downloaded).
+    static let slowClawModelFileLanded = Notification.Name("slowclaw.model.file-landed")
+}
 
-    init(tmpURL: URL, fallbackSize: Int64, progress: @escaping @Sendable (Double) -> Void) {
-        self.tmpURL = tmpURL
-        self.fallbackSize = fallbackSize
-        self.expected = fallbackSize
-        self.progress = progress
+/// Long-lived coordinator for the on-device model downloads, backed by ONE
+/// background URLSession (identifier-pinned) so multi-GB GGUF transfers keep
+/// running while the app is backgrounded, suspended, or the phone is locked:
+/// iOS's nsurlsessiond owns the transfer, not the app process. That makes the
+/// "background download" answer YES on iOS via background session configs —
+/// no manual pause-when-backgrounded/resume-when-open logic is needed. The OS
+/// also resumes automatically after transient network loss. (iOS cancels the
+/// transfer only when the user force-quits the app; it restarts on the next
+/// download request.)
+///
+/// The coordinator survives app relaunches: when the system relaunches the
+/// app for session events, `handleEventsForBackgroundURLSession` reconnects
+/// this delegate (see slowClawHandleBackgroundModelSession). In-flight tasks
+/// carry their destination path in `taskDescription`, so an orphaned download
+/// (relaunched app, nobody awaiting) still lands its file on disk — and the
+/// next `download()` for the same file ATTACHES to the in-flight task instead
+/// of duplicating it.
+private final class ModelDownloadCoordinator: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    static let shared = ModelDownloadCoordinator()
+    static let sessionIdentifier = "com.slowclaw.app.model-download"
+
+    private struct DownloadRecord {
+        var destination: URL
+        var fallbackSize: Int64
+        var progress: (@Sendable (Double) -> Void)?
+        var continuation: CheckedContinuation<Void, Error>?
+        /// Set when moving the finished temp file failed — surfaced as the
+        /// task's completion error (a successful transfer that couldn't be
+        /// persisted must not resume the awaiter with success).
+        var moveError: Error?
     }
 
-    func run(in session: URLSession, url: URL) async throws {
+    private let lock = NSLock()
+    private var records: [Int: DownloadRecord] = [:]
+    private var backgroundCompletionHandler: (() -> Void)?
+
+    /// The background session — a static let so initialization is thread-safe
+    /// (downloads start from the main actor but complete on session queues).
+    /// Creating it with the pinned identifier re-associates this delegate with
+    /// any tasks still in flight from before a relaunch/suspension.
+    static let session: URLSession = {
+        let config = URLSessionConfiguration.background(withIdentifier: ModelDownloadCoordinator.sessionIdentifier)
+        // Deliver (and relaunch for) session events after the app goes away.
+        config.sessionSendsLaunchEvents = true
+        // A 2.5 GB transfer should wait for connectivity rather than fail fast.
+        config.waitsForConnectivity = true
+        config.isDiscretionary = false
+        return URLSession(configuration: config, delegate: shared, delegateQueue: nil)
+    }()
+
+    private override init() {
+        super.init()
+    }
+
+    /// Download `url` to `destination`, reporting progress (0...1). Attaches
+    /// to an already in-flight task for the same URL (the relaunch case)
+    /// rather than starting a duplicate transfer — progress is byte-based, so
+    /// mid-flight attachment just works.
+    func run(url: URL, destination: URL, fallbackSize: Int64,
+             progress: (@Sendable (Double) -> Void)?) async throws {
+        let inFlight = await Self.session.allTasks
+            .compactMap { $0 as? URLSessionDownloadTask }
+            .filter { ($0.currentRequest?.url ?? $0.originalURL) == url }
+        if let existing = inFlight.first, existing.state == .running || existing.state == .suspended {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                lock.lock()
+                // The task may have completed between discovery and attach;
+                // then the file is already on disk and nobody would resume
+                // us — succeed immediately instead of hanging.
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    lock.unlock()
+                    cont.resume()
+                    return
+                }
+                records[existing.taskIdentifier] = DownloadRecord(destination: destination,
+                                                                  fallbackSize: fallbackSize,
+                                                                  progress: progress,
+                                                                  continuation: cont)
+                lock.unlock()
+            }
+            progress?(1.0)
+            return
+        }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            self.continuation = cont
-            session.downloadTask(with: url).resume()
+            let task = Self.session.downloadTask(with: url)
+            // Destination travels with the task so an orphaned completion
+            // (app relaunched, nobody awaiting) still lands the file.
+            task.taskDescription = destination.path
+            lock.lock()
+            records[task.taskIdentifier] = DownloadRecord(destination: destination,
+                                                          fallbackSize: fallbackSize,
+                                                          progress: progress,
+                                                          continuation: cont)
+            lock.unlock()
+            task.resume()
         }
     }
+
+    /// Store the system's background-relaunch completion handler and
+    /// reconnect this coordinator to the session's events (touching
+    /// `session` is what re-associates the delegate).
+    func acceptBackgroundEvents(completionHandler: @escaping () -> Void) {
+        lock.lock()
+        backgroundCompletionHandler = completionHandler
+        lock.unlock()
+        _ = Self.session
+    }
+
+    // MARK: - URLSessionDownloadDelegate
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                     totalBytesExpectedToWrite: Int64) {
-        if totalBytesExpectedToWrite > 0 { expected = totalBytesExpectedToWrite }
+        lock.lock()
+        let record = records[downloadTask.taskIdentifier]
+        lock.unlock()
+        // No record → orphaned progress (relaunched app, nobody attached yet):
+        // nothing to report; the file still lands on completion.
+        guard let record else { return }
+        var expected = totalBytesExpectedToWrite
+        if expected <= 0 { expected = record.fallbackSize }
         guard expected > 0 else { return }
-        progress(min(1.0, Double(totalBytesWritten) / Double(expected)))
+        record.progress?(min(1.0, Double(totalBytesWritten) / Double(expected)))
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didFinishDownloadingTo location: URL) {
+        // Destination: the registered record's, else the path the task was
+        // created with (orphaned completion after relaunch).
+        lock.lock()
+        let record = records[downloadTask.taskIdentifier]
+        let dest = record?.destination
+            ?? downloadTask.taskDescription.map { URL(fileURLWithPath: $0) }
+        lock.unlock()
+        guard let dest else { return }
+        // Replace any stale/partial file from an interrupted attempt, then
+        // move the completed transfer into place. The temp URL is invalidated
+        // the moment this method returns, so the move must be synchronous.
+        try? FileManager.default.removeItem(at: dest)
         do {
-            try FileManager.default.moveItem(at: location, to: tmpURL)
+            try FileManager.default.moveItem(at: location, to: dest)
+            // Tell the app a model file landed (the orphan path has no
+            // awaiter to surface it) so status UI can re-render.
+            NotificationCenter.default.post(name: .slowClawModelFileLanded,
+                                            object: dest.lastPathComponent)
         } catch {
-            continuation?.resume(throwing: error)
-            continuation = nil
+            lock.lock()
+            records[downloadTask.taskIdentifier]?.moveError = error
+            lock.unlock()
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        let record = records.removeValue(forKey: task.taskIdentifier)
+        lock.unlock()
+        guard let record else { return }
         if let error {
-            continuation?.resume(throwing: error)
-            continuation = nil
-            return
+            record.continuation?.resume(throwing: error)
+        } else if let http = task.response as? HTTPURLResponse, http.statusCode != 200 {
+            record.continuation?.resume(throwing: SlowClawFeedError.internalError(
+                "Model download failed (HTTP \(http.statusCode))."))
+        } else if let moveError = record.moveError {
+            record.continuation?.resume(throwing: moveError)
+        } else {
+            record.continuation?.resume()
         }
-        if let http = task.response as? HTTPURLResponse, http.statusCode != 200 {
-            continuation?.resume(throwing: SlowClawFeedError.internalError("Model download failed (HTTP \(http.statusCode))"))
-            continuation = nil
-            return
-        }
-        continuation?.resume()
-        continuation = nil
     }
+
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        // All tasks done → release the launch completion handler the system
+        // handed us (required for the app to snapshot back down cleanly).
+        lock.lock()
+        let handler = backgroundCompletionHandler
+        backgroundCompletionHandler = nil
+        lock.unlock()
+        DispatchQueue.main.async { handler?() }
+    }
+}
+
+/// Forward the system's background-URLSession relaunch callback
+/// (`application(_:handleEventsForBackgroundURLSession:completionHandler:)`)
+/// to the model-download coordinator. Returns true when the identifier
+/// belongs to the model session (the handler is stored and invoked when the
+/// session goes idle); false for any other session, in which case the caller
+/// should invoke the handler itself.
+public func slowClawHandleBackgroundModelSession(identifier: String,
+                                                 completionHandler: @escaping () -> Void) -> Bool {
+    guard identifier == ModelDownloadCoordinator.sessionIdentifier else { return false }
+    ModelDownloadCoordinator.shared.acceptBackgroundEvents(completionHandler: completionHandler)
+    return true
 }
