@@ -3290,7 +3290,7 @@ struct FeedCard: View {
 
                     Spacer()
 
-                    if let url = URL(string: item.link), !item.link.isEmpty {
+                    if !item.link.isEmpty, URL(string: item.link) != nil {
                         // In-app reader affordance (SFSafariViewController).
                         Image(systemName: "safari")
                             .font(.system(size: 14))
@@ -3388,7 +3388,8 @@ extension String {
                 } else {
                     value = UInt32(String(entity.dropFirst()))
                 }
-                if let value, value > 0, let scalar = Unicode.Scalar(value), scalar.properties.isPrintable {
+                if let value, value > 0, !(0xD800...0xDFFF).contains(value),
+                   let scalar = Unicode.Scalar(value) {
                     return Character(scalar)
                 }
             }
