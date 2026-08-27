@@ -1100,8 +1100,8 @@ final class AppState: ObservableObject {
     /// stored RFC3339 timestamp, fall back to the epoch digits embedded in
     /// the key (journal_<epoch>[_vm]). Older → smaller key.
     private static func pendingAgeKey(_ entry: PendingTranscription, memory: SlowClawSqliteMemory) -> Double {
-        if let existing = try? memory.get(key: entry.key), let ts = existing.timestamp,
-           let date = ISO8601DateFormatter().date(from: ts) {
+        if let existing = try? memory.get(key: entry.key),
+           let date = ISO8601DateFormatter().date(from: existing.timestamp) {
             return date.timeIntervalSince1970
         }
         let digits = entry.key.filter { $0.isNumber }
