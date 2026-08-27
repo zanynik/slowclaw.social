@@ -126,10 +126,13 @@ final class VoiceMemoImporter: ObservableObject {
     }
 
     /// Lazily start the single serial worker if it isn't already running.
-    /// The worker drains `queue` newest-first, one file at a time, transcribing
-    /// each on-device (via SpeechTranscriber, which segments long audio to dodge
-    /// SFSpeech's ~1-min limit) and auto-storing the result as a journal —
-    /// matching the reference app (no review gate).
+    /// The worker drains `queue` newest-first, one file at a time. For each
+    /// file it stores the journal IMMEDIATELY (placeholder body + linked
+    /// audio) and hands transcription to AppState's DURABLE pending queue —
+    /// the same path recordings use. The previous design transcribed inside
+    /// this in-memory worker and only stored the entry afterward, so an app
+    /// suspension mid-transcription (long memo, locked phone) lost the import
+    /// entirely: nothing appeared in the journal and nothing re-queued it.
     private func ensureWorker() {
         guard worker == nil else { return }
         worker = Task { @MainActor in
@@ -143,7 +146,7 @@ final class VoiceMemoImporter: ObservableObject {
 
                 isImporting = true
                 let remaining = queue.count
-                status = remaining == 0 ? "Transcribing…" : "Transcribing, \(remaining) more queued"
+                status = remaining == 0 ? "Importing…" : "Importing, \(remaining) more queued"
 
                 // Guard: if AppState isn't wired yet (cold launch from share
                 // sheet), surface it instead of silently no-op-ing the store.
@@ -155,44 +158,42 @@ final class VoiceMemoImporter: ObservableObject {
                     continue
                 }
 
-                // Transcribe off the main actor (SpeechAnalyzer recognition is
-                // blocking). SpeechTranscriber returns "" if on-device speech
-                // is unavailable for the locale. Wrap in a background-task
-                // assertion so iOS grants CPU time to finish if the app
-                // backgrounds mid-import (~30s).
-                let url = next.url
-                let bgID = UIApplication.shared.beginBackgroundTask(withName: "slowclaw.voiceMemo.import")
-                let transcript = await Task.detached(priority: .userInitiated) {
-                    // Route through the shared STT router: experimental
-                    // Gemma-audio when eligible, else SpeechAnalyzer.
-                    await AudioSTT.transcribe(url: url, useGemmaAudio: state.gemmaAudioEligible)
-                }.value
-                if bgID != .invalid {
-                    UIApplication.shared.endBackgroundTask(bgID)
-                }
-
-                // Auto-store: the file is on disk and must become a journal
-                // entry regardless of whether speech produced text. The user
-                // edits from the Journals list afterward (like the reference).
-                let transcriptText = transcript.text
-                let content = transcriptText.isEmpty ? "🎙 Imported audio (no transcript)" : transcriptText
+                // Store the journal entry NOW (durable), with the transcribing
+                // placeholder — the user sees the memo in the Journal list
+                // immediately, and the audio is linked even if transcription
+                // is slow or interrupted.
                 let mediaURL = Self.documentsRelativePath(for: next.url)
+                let f = DateFormatter()
+                f.locale = Locale.current
+                f.dateFormat = "MMM d, h:mm a"
+                let title = "Imported · \(f.string(from: Date()))"
                 let key = "journal_\(Int(Date().timeIntervalSince1970))_vm"
                 do {
-                    try state.memory.store(key: key, content: content, category: "daily",
-                                           sessionID: nil, source: "audio_imported", mediaURL: mediaURL)
+                    try state.memory.store(key: key,
+                                           content: "\(title)\n\n\(AppState.transcribingPlaceholder)",
+                                           category: "daily", sessionID: nil,
+                                           source: "audio_imported", mediaURL: mediaURL)
                     importedCount += 1
                     await state.refreshJournals()
                 } catch {
                     skippedCount += 1
                     status = "Couldn't save an import: \(error.localizedDescription)"
+                    continue
+                }
+
+                // Durable transcription: the pending queue survives app kills
+                // (pending_transcriptions.json), drains newest-first, and is
+                // reconciled at launch/foreground. The importer's own status
+                // tracks only the file copy + store, not transcription.
+                if let mediaPath = mediaURL {
+                    await state.enqueuePendingTranscription(key: key, mediaPath: mediaPath,
+                                                            generateTitleAfter: false)
                 }
             }
-            // Final summary so the user sees the import landed (the "Preparing
-            // then nothing" symptom was the absence of this acknowledgment).
+            // Final summary so the user sees the import landed.
             if importedCount > 0 {
                 let noun = importedCount == 1 ? "voice memo" : "voice memos"
-                status = "Imported \(importedCount) \(noun)\(skippedCount > 0 ? " (\(skippedCount) skipped)" : "")"
+                status = "Imported \(importedCount) \(noun)\(skippedCount > 0 ? " (\(skippedCount) skipped)" : "") — transcribing"
             } else if skippedCount > 0 {
                 status = "Import failed (\(skippedCount) file\(skippedCount == 1 ? "" : "s"))"
             } else {

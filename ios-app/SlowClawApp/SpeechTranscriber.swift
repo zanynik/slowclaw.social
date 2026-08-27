@@ -114,16 +114,17 @@ enum Transcriber {
         _ = await feeder.value
         do {
             try await analyzerTask.value
-            // Flush any late finals, then await the collector so they're captured.
+            // Flush any late finals, then let the collector drain them.
             try await analyzer.finalizeAndFinishThroughEndOfInput()
         } catch {
             // On-device unavailable / threw — fall through with whatever we have.
         }
-        // Give the result collector a beat to drain finals emitted by finalize.
-        // Cancelling immediately could drop a straggler; a short yield lets the
-        // for-try-await loop iteration complete.
-        recognizerTask.cancel()
-        _ = await recognizerTask.result
+        // The results sequence ENDS on its own after finalize (returning nil
+        // ends the for-await loop). Await its natural completion with a
+        // bounded timeout — cancelling IMMEDIATELY after finalize dropped
+        // finals still queued in the sequence, which is how long files ended
+        // up with only their last line / no transcript at all.
+        await Self.awaitCollectorCompletion(recognizerTask)
         return collected.text()
     }
 
@@ -193,7 +194,12 @@ enum Transcriber {
         func stop() async {
             inputBuilder.finish()
             try? await analyzer.finalizeAndFinishThroughEndOfInput()
-            recognizerTask?.cancel()
+            // Let the finals collector drain to NATURAL completion (bounded)
+            // before tearing down — see transcribe(file:) for why an immediate
+            // cancel lost late finals.
+            if let recognizerTask {
+                await Transcriber.awaitCollectorCompletion(recognizerTask)
+            }
             recognizerTask = nil
             analyzerTask?.cancel()
             analyzerTask = nil
@@ -225,6 +231,26 @@ enum Transcriber {
     }
 
     // MARK: - File feeding
+
+    /// Await a finals-collector task's natural completion, bounded by a
+    /// timeout. After `finalizeAndFinishThroughEndOfInput()` the transcriber's
+    /// results sequence should finish on its own; if an OS build keeps it
+    /// alive, cancel after the bound so the caller can't hang.
+    private static func awaitCollectorCompletion(_ task: Task<Void, Error>) async {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                _ = try? await task.value
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 10_000_000_000) // 10s bound
+                task.cancel()
+                return false
+            }
+            _ = await group.next()
+            group.cancelAll()
+        }
+    }
 
     /// Read an AVAudioFile's PCM in chunks, convert each to `format`, and yield
     /// to the builder. Conversion uses the standard AVAudioConverter path. The

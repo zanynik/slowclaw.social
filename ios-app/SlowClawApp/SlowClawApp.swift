@@ -132,6 +132,12 @@ struct SlowClawApp: App {
                 .onAppear {
                     voiceMemoImporter.appState = appState
                     urlDelegate.appState = appState
+                    // Warm-delivery path for shared files routed through the
+                    // app delegate (see ShareURLDelegate.openURLHandler).
+                    urlDelegate.openURLHandler = { [weak voiceMemoImporter] url in
+                        voiceMemoImporter?.appState = appState
+                        voiceMemoImporter?.enqueue(url)
+                    }
                     // Flush any URL the delegate captured during cold launch.
                     for pending in urlDelegate.flushPending() {
                         voiceMemoImporter.enqueue(pending)
@@ -140,8 +146,12 @@ struct SlowClawApp: App {
                     // the app is open (local-first path).
                     Task { await appState.ensureLocalModelActivated() }
                     // Resume any pending transcriptions left from a killed-app
-                    // session, and schedule a background drain as backup.
-                    Task { await appState.resumePendingTranscriptionsOnLaunch() }
+                    // session, and reconcile audio journals whose transcript
+                    // never landed (queues them newest-first).
+                    Task {
+                        await appState.resumePendingTranscriptionsOnLaunch()
+                        await appState.reconcileMissingTranscripts()
+                    }
                 }
         }
     }
@@ -152,6 +162,12 @@ struct SlowClawApp: App {
 final class ShareURLDelegate: NSObject, UIApplicationDelegate {
     private let pendingLock = NSLock()
     private var pending: [URL] = []
+    /// Warm-delivery handler. When the system routes an opened file through
+    /// application(_:open:options:) AFTER launch (foreground share), the URL
+    /// is dispatched here IMMEDIATELY — the old capture-and-flush design only
+    /// flushed on the App's first onAppear, so a warm share was captured and
+    /// never imported (the "Preparing… then nothing" symptom).
+    var openURLHandler: (@MainActor (URL) -> Void)?
     /// Weak ref to AppState so the BGTask handler can drain pending
     /// transcriptions. Set by the App when appState is wired up.
     weak var appState: AppState?
@@ -184,6 +200,12 @@ final class ShareURLDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ app: UIApplication, open url: URL,
                      options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+        // Warm delivery: hand it straight to the importer if wired; otherwise
+        // capture for the cold-launch flush.
+        if let openURLHandler {
+            MainActor.assumeIsolated { openURLHandler(url) }
+            return true
+        }
         pendingLock.lock()
         pending.append(url)
         pendingLock.unlock()
@@ -279,11 +301,20 @@ final class AppState: ObservableObject {
 
     /// Open a web link inside the app (SFSafariViewController sheet).
     /// Non-http(s) schemes are rejected — the app only ever links articles.
+    /// Dead-viewer migration: any cached habla.news/a/* link (the viewer went
+    /// offline; every URL 404s) is rewritten to highlighter.com/a/*, which
+    /// resolves the same naddr server-side.
     func openWebLink(_ url: URL) {
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+        guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = comps.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              let host = comps.host?.lowercased() else {
             return
         }
-        activeWebLink = WebLink(url: url)
+        if host == "habla.news" {
+            comps.host = "highlighter.com"
+        }
+        guard let final = comps.url else { return }
+        activeWebLink = WebLink(url: final)
     }
 
     // Reads feed cache. Lives on AppState (not ReadsView @State) so switching
@@ -301,7 +332,11 @@ final class AppState: ObservableObject {
     @Published var dislikedReadIDs: Set<String> = []
     private var readsLoadedOnce: Bool = false
     fileprivate static var cachedCatalog: [SlowClawFeedSource]?
-    private static let readsCacheVersion = 1
+    // v2: links moved habla.news → highlighter.com (habla went offline).
+    // The version bump discards v1 caches wholesale — otherwise hydrated
+    // items kept their dead habla.news URLs forever (the persistent-404 bug:
+    // the merge path preserves existing items, so old links never aged out).
+    private static let readsCacheVersion = 2
     private static let readsCacheMaxAge: TimeInterval = 30 * 60
     private static let rssSourceLimit = 24
 
@@ -739,6 +774,12 @@ final class AppState: ObservableObject {
 
         var combined = rss + nostr
         combined.sort { $0.score > $1.score }
+        // Adult-content gate on the merged batch (RSS + Nostr): the catalog
+        // is broad and relays are global; without this, explicit items that
+        // carry no content-warning land in the feed.
+        combined = combined.filter {
+            ReadsContentFilter.isAllowed($0.title, $0.description)
+        }
         // Apply the post-merge production filter the iOS app was missing:
         // quality gate (drop spam/empty), URL dedup (collapse cross-feed
         // reposts), and a per-source cap + round-robin so one feed can't
@@ -837,7 +878,7 @@ final class AppState: ObservableObject {
         guard let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
             return nil
         }
-        return directory.appendingPathComponent("reads-feed-v1.json")
+        return directory.appendingPathComponent("reads-feed-v2.json")
     }
 
     private static func loadReadsCache() -> ReadsCache? {
@@ -967,8 +1008,11 @@ final class AppState: ObservableObject {
     }
 
     /// Add a journal to the pending-transcription queue (persisted to disk).
-    /// Called by auto-save when the transcript wasn't ready at stop. The queue
-    /// is drained by drainPendingTranscriptions() (BGTask / launch).
+    /// Called by auto-save for EVERY recording (the on-disk file is the source
+    /// of truth for its transcript — the live preview can be partial) and by
+    /// the voice-memo importer after its durable store. The queue is drained
+    /// by drainPendingTranscriptions() (launch / foreground / BGTask),
+    /// newest-first.
     func enqueuePendingTranscription(key: String, mediaPath: String,
                                       generateTitleAfter: Bool = false) async {
         guard let url = Self.pendingTranscriptionsURL else { return }
@@ -983,23 +1027,37 @@ final class AppState: ObservableObject {
         await drainPendingTranscriptions()
     }
 
-    /// Transcribe every queued journal and update its content, removing each
-    /// from the queue as it completes. Safe to call from any context; no-ops
-    /// when the queue is empty. Runs each transcription off the main actor.
-    /// Preserves the entry's title (first line); only the body is replaced.
+    /// Transcribe queued journals one at a time, updating each entry's content
+    /// and removing it from the queue as it completes. Newest first (explicit
+    /// product requirement). Single-flight — concurrent callers (launch,
+    /// foreground, importer) no-op while a drain is already running. The loop
+    /// RE-LOADS the queue file every iteration, so items enqueued while a
+    /// drain is in progress are picked up instead of waiting for the next one.
     func drainPendingTranscriptions() async {
         guard let url = Self.pendingTranscriptionsURL else { return }
-        let items = Self.loadPendingTranscriptions(at: url)
-        guard !items.isEmpty else { return }
+        guard !transcriptionDrainInFlight else { return }
+        transcriptionDrainInFlight = true
+        defer { transcriptionDrainInFlight = false }
+        // Keys already processed in this drain (loop-break guard, above).
+        var handledKeys = Set<String>()
 
-        var completedKeys: Set<String> = []
-        for entry in items {
-            guard let absURL = AudioRecorder.absoluteURL(forMediaRelativePath: entry.mediaPath),
+        while !Task.isCancelled {
+            let snapshot = Self.loadPendingTranscriptions(at: url)
+                .filter { !handledKeys.contains($0.key) }
+            guard let newest = snapshot.max(by: { Self.pendingAgeKey($0, memory: memory) < Self.pendingAgeKey($1, memory: memory) })
+            else { break }
+            // Track handled keys locally: if a queue-file write ever fails
+            // silently (try?), the item can't loop back into THIS drain and
+            // re-transcribe forever; the next launch's drain retries it.
+
+            guard let absURL = AudioRecorder.absoluteURL(forMediaRelativePath: newest.mediaPath),
                   FileManager.default.fileExists(atPath: absURL.path) else {
                 // File gone — drop the pending entry so it doesn't wedge.
-                completedKeys.insert(entry.key)
+                handledKeys.insert(newest.key)
+                Self.removeFromPendingQueue(key: newest.key, at: url)
                 continue
             }
+
             let transcript: AudioSTTResult
             if self.lockedPhoneExperiment {
                 // 🔬 Experiment path: hold the AVAudioSession active past Stop
@@ -1020,21 +1078,94 @@ final class AppState: ObservableObject {
                 ? "🎙 Audio journal (no transcript)"
                 : transcript.text
             // Preserve the existing title (first line); replace the body.
-            let existing = try? memory.get(key: entry.key)
+            let existing = try? memory.get(key: newest.key)
             let titleLine = existing.flatMap { e in
                 e.content.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init)
             } ?? "New Recording"
             let newContent = "\(titleLine)\n\n\(transcriptBody)"
-            await storeJournalUpdate(key: entry.key, content: newContent)
-            completedKeys.insert(entry.key)
+            await storeJournalUpdate(key: newest.key, content: newContent)
+            handledKeys.insert(newest.key)
+            Self.removeFromPendingQueue(key: newest.key, at: url)
             // If requested and a real transcript landed, generate an AI title.
-            if entry.generateTitle, !transcript.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                await generateTitleForJournal(key: entry.key, transcript: transcript.text)
+            if newest.generateTitle, !transcript.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                await generateTitleForJournal(key: newest.key, transcript: transcript.text)
             }
         }
-        // Remove completed entries; keep any added concurrently during the drain.
-        let remaining = Self.loadPendingTranscriptions(at: url).filter { !completedKeys.contains($0.key) }
-        Self.savePendingTranscriptions(remaining, at: url)
+    }
+
+    /// True while a transcription drain is running (single-flight guard).
+    private var transcriptionDrainInFlight = false
+
+    /// Sort key placing NEWEST pending items first: prefer the journal's
+    /// stored RFC3339 timestamp, fall back to the epoch digits embedded in
+    /// the key (journal_<epoch>[_vm]). Older → smaller key.
+    private static func pendingAgeKey(_ entry: PendingTranscription, memory: SlowClawSqliteMemory) -> Double {
+        if let existing = try? memory.get(key: entry.key), let ts = existing.timestamp,
+           let date = ISO8601DateFormatter().date(from: ts) {
+            return date.timeIntervalSince1970
+        }
+        let digits = entry.key.filter { $0.isNumber }
+        return Double(UInt64(digits) ?? 0)
+    }
+
+    /// Remove one key from the on-disk pending queue (keeps items added
+    /// concurrently by other writers).
+    private static func removeFromPendingQueue(key: String, at url: URL) {
+        let remaining = loadPendingTranscriptions(at: url).filter { $0.key != key }
+        savePendingTranscriptions(remaining, at: url)
+    }
+
+    // MARK: - Missing-transcript reconciliation
+
+    /// Scan journals for audio entries whose transcript never landed —
+    /// placeholder body, explicit "(no transcript)" body, or a title-only
+    /// body — and (re-)queue them for transcription. This is the guarantee
+    /// that every audio the app owns eventually gets a transcript: anything
+    /// that fell out of the in-memory queue (import interrupted by
+    /// suspension, a crashed drain) is rediscovered here and retried.
+    /// Throttled to at most once per minute per app session.
+    func reconcileMissingTranscripts() async {
+        let now = Date()
+        if let last = lastTranscriptReconcileAt,
+           now.timeIntervalSince(last) < 60 { return }
+        lastTranscriptReconcileAt = now
+
+        let candidates = journals.filter { entry in
+            guard let media = entry.mediaURL, !media.isEmpty,
+                  let abs = AudioRecorder.absoluteURL(forMediaRelativePath: media),
+                  FileManager.default.fileExists(atPath: abs.path) else { return false }
+            return Self.needsTranscript(entry.content)
+        }
+        guard !candidates.isEmpty, let url = Self.pendingTranscriptionsURL else { return }
+
+        var items = Self.loadPendingTranscriptions(at: url)
+        let known = Set(items.map(\.key))
+        var added = false
+        for c in candidates where !known.contains(c.key) {
+            items.append(PendingTranscription(key: c.key, mediaPath: c.mediaURL ?? "", generateTitle: false))
+            added = true
+        }
+        guard added else { return }
+        Self.savePendingTranscriptions(items, at: url)
+        await drainPendingTranscriptions()
+    }
+
+    private var lastTranscriptReconcileAt: Date? = nil
+
+    /// True when a journal's body is missing its transcript (placeholder,
+    /// explicit no-transcript marker, or no body at all under the title).
+    nonisolated static func needsTranscript(_ content: String?) -> Bool {
+        guard let content else { return false }
+        let lines = content
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        guard lines.count > 1 else { return true } // title-only (or empty)
+        let body = lines.dropFirst().joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return body.isEmpty
+            || body == transcribingPlaceholder
+            || body == "🎙 Audio journal (no transcript)"
+            || body == "🎙 Imported audio (no transcript)"
     }
 
     /// Load the pending-transcription queue from disk (empty on any error).
@@ -1243,6 +1374,13 @@ struct AppShell: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 Task { await state.ensureLocalModelActivated() }
+                // Foreground is the retry point for audio that lost its
+                // transcript (suspension, crash, failed engine) — reconcile
+                // throttled to once a minute.
+                Task {
+                    await state.reconcileMissingTranscripts()
+                    await state.scheduleNextBackgroundTranscription()
+                }
             }
         }
     }
@@ -1930,15 +2068,16 @@ struct JournalView: View {
                                                   source: "audio_recorded",
                                                   mediaURL: mediaURL)
             let shouldGenTitle = (userTitle.isEmpty && state.anyLLMAvailable)
-            // If the transcript wasn't ready at stop, enqueue the audio for
-            // background transcription so the placeholder resolves later. Only
-            // enqueue when there's a media path to transcribe from.
-            if !hasTranscript, recordedURL != nil, let mediaPath = mediaURL {
+            // ALWAYS enqueue the audio for authoritative file-based
+            // transcription — the on-disk m4a is the source of truth; the live
+            // session's transcript is only a preview and can be partial (the
+            // "long recording → only the last line" bug: a partial live
+            // transcript used to satisfy hasTranscript and the file was never
+            // re-transcribed). The drain preserves the title and replaces the
+            // body, so a complete live transcript is simply re-confirmed.
+            if let mediaPath = mediaURL, recordedURL != nil {
                 await state.enqueuePendingTranscription(key: key, mediaPath: mediaPath,
                                                         generateTitleAfter: shouldGenTitle)
-            } else if shouldGenTitle {
-                // Transcript was ready at stop — generate the title now.
-                await state.generateTitleForJournal(key: key, transcript: transcript)
             }
             // Reset recorder state for the next recording.
             await MainActor.run {

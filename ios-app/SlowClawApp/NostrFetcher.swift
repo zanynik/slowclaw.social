@@ -148,6 +148,8 @@ enum NostrFetcher {
                   article.title != nil,
                   article.body.count > 200,
                   article.isLanguageAllowed,
+                  article.isTitleLatinOrEmpty,
+                  ReadsContentFilter.isAllowed(article.title ?? "", article.summary, article.body),
                   !article.isSpam else { continue }
 
             let count = (perAuthor[article.pubkey] ?? 0) + 1
@@ -234,10 +236,15 @@ enum NostrFetcher {
         /// intentionally lightweight, dependency-free language signal.
         var isLanguageAllowed: Bool {
             if let declaredLanguage, !declaredLanguage.hasPrefix("en") { return false }
-            let sample = (title ?? "") + " " + String(body.prefix(400))
+            // Strip URLs and hashtags BEFORE the script ratio: spam bodies
+            // carry Latin-character URLs that flipped the ratio and let
+            // CJK/Cyrillic spam (incl. adult content) through the gate.
+            let cleaned = (title ?? "") + " " + String(body.prefix(600))
+                .replacingOccurrences(of: "https?://\\S+", with: "", options: .regularExpression)
+                .replacingOccurrences(of: "#[A-Za-z0-9_]+", with: "", options: .regularExpression)
             var latin = 0
             var nonLatin = 0
-            for scalar in sample.unicodeScalars {
+            for scalar in cleaned.unicodeScalars {
                 switch scalar.value {
                 case 65...90, 97...122, 0x00c0...0x024f:
                     latin += 1
@@ -250,6 +257,28 @@ enum NostrFetcher {
                 }
             }
             return nonLatin == 0 || latin >= nonLatin
+        }
+
+        /// A title with letters but ZERO Latin ones (e.g. CJK-only spam
+        /// titles like "脚 交") is not content this feed wants even when the
+        /// body's URL soup passed the ratio check above.
+        var isTitleLatinOrEmpty: Bool {
+            guard let title else { return true }
+            var latin = 0
+            var nonLatin = 0
+            for scalar in title.unicodeScalars {
+                switch scalar.value {
+                case 65...90, 97...122, 0x00c0...0x024f:
+                    latin += 1
+                case 0x0400...0x052f, 0x0590...0x05ff, 0x0600...0x06ff,
+                     0x0900...0x097f, 0x0e00...0x0e7f, 0x3040...0x30ff,
+                     0x3400...0x9fff, 0xac00...0xd7af:
+                    nonLatin += 1
+                default:
+                    continue
+                }
+            }
+            return nonLatin == 0 || latin > 0
         }
 
         var isSpam: Bool {
