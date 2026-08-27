@@ -68,6 +68,29 @@ which shipped GGUF inference without a memory entitlement. (The
 `increased-memory-limit` entitlement only survives signing with
 Xcode-managed profiles, which this CI pipeline doesn't use.)
 
+### Model downloads keep running in the background
+
+On-device model downloads run in a **background URLSession**
+(`com.slowclaw.app.model-download`, see `ModelDownloadCoordinator` in
+`SlowClawFeed.swift`). Background downloading IS possible on iOS via this
+mechanism: `nsurlsessiond` owns the transfer, so a multi-GB GGUF download
+**keeps running while the app is backgrounded/suspended or the phone is
+locked**, pauses automatically on network loss and resumes, and — if the app
+was relaunched mid-transfer — reattaches to the in-flight task instead of
+restarting (the system relaunch callback is wired through
+`ShareURLDelegate.application(_:handleEventsForBackgroundURLSession:)`).
+No manual pause/resume bookkeeping is needed. The one iOS rule: a user
+force-quit cancels the transfer (it restarts on the next download request).
+
+### Re-transcribing an audio journal
+
+The journal detail view's transcript card has a **Re-transcribe** button
+(shown for entries with a linked audio file). It re-runs on-device
+transcription of the original audio from scratch — via the shared STT router
+(experimental Gemma-audio when enabled + loaded, else SpeechAnalyzer) — and
+replaces the transcript body in place, preserving the entry's title. This is
+the manual retry path for truncated transcripts across new builds.
+
 ## TestFlight (CI)
 
 The `pub-testflight-zig.yml` workflow at `.github/workflows/` builds + signs +

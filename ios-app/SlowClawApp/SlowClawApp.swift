@@ -198,6 +198,22 @@ final class ShareURLDelegate: NSObject, UIApplicationDelegate {
         return true
     }
 
+    // On-Device AI model downloads live in a background URLSession
+    // ("com.slowclaw.app.model-download") so the multi-GB transfer keeps
+    // running while the app is backgrounded/suspended or the phone is locked.
+    // When iOS relaunches the app to deliver those session events, this
+    // callback reconnects the download coordinator's delegate. Sessions we
+    // don't own complete immediately so the system isn't left waiting.
+    func application(_ application: UIApplication,
+                     handleEventsForBackgroundURLSession identifier: String,
+                     completionHandler: @escaping () -> Void) {
+        guard slowClawHandleBackgroundModelSession(identifier: identifier,
+                                                   completionHandler: completionHandler) else {
+            completionHandler()
+            return
+        }
+    }
+
     func application(_ app: UIApplication, open url: URL,
                      options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
         // Warm delivery: hand it straight to the importer if wired; otherwise
@@ -398,6 +414,15 @@ final class AppState: ObservableObject {
         setupLLM()
         refreshLocalLLMStatus()
         refreshLocalAudioStatus()
+        // A model file can land via the background download coordinator with
+        // no in-app awaiter (app relaunched mid-download; the transfer kept
+        // running while suspended). Re-read status so the model row re-renders
+        // as Downloaded/Activate instead of a stale Download button.
+        NotificationCenter.default.addObserver(
+            forName: .slowClawModelFileLanded, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshLocalLLMStatus() }
+        }
         Task { await refreshJournals() }
     }
 
@@ -1115,6 +1140,34 @@ final class AppState: ObservableObject {
         savePendingTranscriptions(remaining, at: url)
     }
 
+    /// Manually re-transcribe an audio journal from its file, replacing the
+    /// entry's body (title line preserved). This is the retry path for
+    /// truncated or missing transcripts — the JournalDetailView exposes a
+    /// Re-transcribe button that calls this, so a new build's engine can be
+    /// re-checked against audio that previously transcribed badly. Uses the
+    /// shared STT router (experimental Gemma-audio when eligible, else
+    /// SpeechAnalyzer) exactly like the drain path. Returns the entry's full
+    /// new content, or "" when the entry has no audio file to transcribe.
+    func retranscribeJournal(_ entry: SlowClawMemoryEntry) async -> String {
+        guard let rel = entry.mediaURL, !rel.isEmpty,
+              let url = AudioRecorder.absoluteURL(forMediaRelativePath: rel),
+              FileManager.default.fileExists(atPath: url.path) else { return "" }
+        let eligible = gemmaAudioEligible
+        let transcript = await Task.detached(priority: .userInitiated) {
+            await AudioSTT.transcribe(url: url, useGemmaAudio: eligible)
+        }.value
+        let trimmed = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = trimmed.isEmpty ? "🎙 Audio journal (no transcript)" : trimmed
+        // Preserve the existing title (first line); replace the body — the
+        // same shape the drain path writes.
+        let titleLine = entry.content
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .first.map(String.init) ?? journalTitleOf(entry)
+        let newContent = "\(titleLine)\n\n\(body)"
+        await storeJournalUpdate(key: entry.key, content: newContent)
+        return newContent
+    }
+
     // MARK: - Missing-transcript reconciliation
 
     /// Scan journals for audio entries whose transcript never landed —
@@ -1581,6 +1634,7 @@ struct JournalDetailView: View {
     @State private var isEditingTitle = false
     @State private var titleDraft: String
     @State private var isPolishing = false
+    @State private var isRetranscribing = false
     @State private var showShareSheet = false
 
     /// Absolute URL of the recording, if this entry has a linked audio file.
@@ -1591,6 +1645,13 @@ struct JournalDetailView: View {
     private var audioURL: URL? {
         guard let rel = entry.mediaURL, !rel.isEmpty else { return nil }
         return AudioRecorder.absoluteURL(forMediaRelativePath: rel)
+    }
+
+    /// True when this entry has a linked audio file on disk — gates the
+    /// Re-transcribe button (the manual retry for truncated transcripts).
+    private var hasAudioFile: Bool {
+        guard let url = audioURL else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
     }
 
     init(entry: SlowClawMemoryEntry) {
@@ -1643,6 +1704,26 @@ struct JournalDetailView: View {
                                     .foregroundStyle(DS.muted(scheme))
                                     .textCase(.uppercase)
                                 Spacer()
+                                if hasAudioFile {
+                                    Button {
+                                        Task { await retranscribe() }
+                                    } label: {
+                                        if isRetranscribing {
+                                            HStack(spacing: 5) {
+                                                ProgressView()
+                                                    .controlSize(.small)
+                                                Text("Transcribing…")
+                                            }
+                                            .font(DS.captionFont.weight(.semibold))
+                                        } else {
+                                            Label("Re-transcribe", systemImage: "arrow.clockwise")
+                                                .font(DS.captionFont.weight(.semibold))
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                    .tint(DS.accentColor)
+                                    .disabled(isRetranscribing)
+                                }
                                 if state.llm != nil {
                                     Button {
                                         Task { await polish() }
@@ -1907,6 +1988,20 @@ struct JournalDetailView: View {
                 DispatchQueue.main.async { editedBody = polished }
             }
         }
+    }
+
+    /// Re-run on-device transcription of this entry's audio file and replace
+    /// the transcript body in place (title preserved). The manual retry path
+    /// for truncated/incomplete transcripts — lets each new build's engine be
+    /// re-checked against the same audio. The editor + store both get the
+    /// fresh content.
+    private func retranscribe() async {
+        guard hasAudioFile, !isRetranscribing else { return }
+        isRetranscribing = true
+        defer { isRetranscribing = false }
+        let newContent = await state.retranscribeJournal(entry)
+        guard !newContent.isEmpty else { return }
+        editedBody = newContent
     }
 }
 
