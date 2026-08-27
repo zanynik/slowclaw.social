@@ -1244,7 +1244,7 @@ private final class ModelDownloadCoordinator: NSObject, URLSessionDownloadDelega
              progress: (@Sendable (Double) -> Void)?) async throws {
         let inFlight = await Self.session.allTasks
             .compactMap { $0 as? URLSessionDownloadTask }
-            .filter { ($0.currentRequest?.url ?? $0.originalURL) == url }
+            .filter { ($0.currentRequest?.url ?? $0.originalRequest?.url) == url }
         if let existing = inFlight.first, existing.state == .running || existing.state == .suspended {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 lock.lock()
