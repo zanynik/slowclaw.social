@@ -64,15 +64,25 @@
     <array>
         <string>com.slowclaw.app.transcription</string>
     </array>
+    <!-- ATS is on by default (no NSAllowsArbitraryLoads). The only legacy
+         plain-HTTP feed in the catalog is www.aaronsw.com (Paul Graham essays
+         RSS), so it gets the sole insecure-load exception. -->
     <key>NSAppTransportSecurity</key>
     <dict>
-        <key>NSAllowsArbitraryLoads</key>
-        <true/>
+        <key>NSExceptionDomains</key>
+        <dict>
+            <key>www.aaronsw.com</key>
+            <dict>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+            </dict>
+        </dict>
     </dict>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
-    <key>UIFileSharingEnabled</key>
-    <true/>
+    <!-- UIFileSharingEnabled is intentionally absent (defaults to NO):
+         Documents contains private journals, audio, and local models, and
+         export already happens explicitly through ShareLink. -->
     <!-- SlowClaw COPIES shared audio into its own Documents/Inbox (see
          VoiceMemoImporter.copyAudio); it never edits the source file in place.
          Declaring in-place support here made iOS take the open-in-place route
@@ -100,7 +110,8 @@
                 <string>public.mpeg4-audio</string>
                 <string>public.mp3</string>
                 <string>com.apple.m4a-audio</string>
-                <string>com.apple.protected-mpeg-4-audio</string>
+                <!-- com.apple.protected-mpeg-4-audio intentionally omitted: the
+                     runtime importer does not support DRM-protected audio. -->
             </array>
         </dict>
     </array>

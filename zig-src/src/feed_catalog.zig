@@ -24,7 +24,7 @@ pub const DEFAULT_FEED_SOURCES: []const FeedSource = &[_]FeedSource{
     .{ .title = "krebsonsecurity.com", .domain = "krebsonsecurity.com", .html_url = "https://krebsonsecurity.com", .xml_url = "https://krebsonsecurity.com/feed/" },
     .{ .title = "daringfireball.net", .domain = "daringfireball.net", .html_url = "https://daringfireball.net", .xml_url = "https://daringfireball.net/feeds/main" },
     .{ .title = "ericmigi.com", .domain = "ericmigi.com", .html_url = "https://ericmigi.com", .xml_url = "https://ericmigi.com/rss.xml" },
-    .{ .title = "antirez.com", .domain = "antirez.com", .html_url = "http://antirez.com", .xml_url = "http://antirez.com/rss" },
+    .{ .title = "antirez.com", .domain = "antirez.com", .html_url = "https://antirez.com", .xml_url = "https://antirez.com/rss" },
     .{ .title = "idiallo.com", .domain = "idiallo.com", .html_url = "https://idiallo.com", .xml_url = "https://idiallo.com/feed.rss" },
     .{ .title = "maurycyz.com", .domain = "maurycyz.com", .html_url = "https://maurycyz.com", .xml_url = "https://maurycyz.com/index.xml" },
     .{ .title = "pluralistic.net", .domain = "pluralistic.net", .html_url = "https://pluralistic.net", .xml_url = "https://pluralistic.net/feed/" },

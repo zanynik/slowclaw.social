@@ -82,14 +82,36 @@ restarting (the system relaunch callback is wired through
 No manual pause/resume bookkeeping is needed. The one iOS rule: a user
 force-quit cancels the transfer (it restarts on the next download request).
 
+Nothing is installed into `Documents/Models/` until the transfer is proven
+good: the delegate rejects any non-2xx HTTP response (error pages never
+become — or overwrite — a model), then validates the downloaded body as a
+plausible GGUF (magic bytes + a size floor derived from the expected
+download size) before it touches the destination. The install is an atomic
+swap (`replaceItemAt`) with no pre-delete, so an existing valid model
+survives a failed or bogus download. By default transfers also stay off
+metered/scarce networks — cellular, expensive links (hotspots), and Low Data
+Mode are all disabled, and combined with `waitsForConnectivity` a multi-GB
+GGUF waits for non-expensive Wi-Fi instead of failing fast or silently
+consuming a data plan.
+
 ### Re-transcribing an audio journal
 
 The journal detail view's transcript card has a **Re-transcribe** button
 (shown for entries with a linked audio file). It re-runs on-device
-transcription of the original audio from scratch — via the shared STT router
-(experimental Gemma-audio when enabled + loaded, else SpeechAnalyzer) — and
-replaces the transcript body in place, preserving the entry's title. This is
-the manual retry path for truncated transcripts across new builds.
+transcription of the original audio from scratch and replaces the transcript
+body in place, preserving the entry's title. This is the manual retry path
+for truncated transcripts across new builds.
+
+Routing goes through the shared on-device STT router (`AudioSTT`): the
+experimental Gemma-audio engine (the Zig core's mtmd layer) when eligible —
+the experimental toggle is on AND an audio mmproj is loaded — otherwise
+SpeechAnalyzer, which itself falls back to the legacy `SFSpeechRecognizer`
+path (on-device only, `requiresOnDeviceRecognition = true`) when Apple
+Intelligence speech is unavailable. Audio never leaves the device on any
+path. If no complete transcript is produced (empty/failed recognition, no
+audio file, or a failed store write), the old transcript is left unchanged
+and a "Re-transcription failed" alert is shown — a partial result never
+overwrites the stored entry.
 
 ## TestFlight (CI)
 

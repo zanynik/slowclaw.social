@@ -91,20 +91,23 @@ enum NostrFetcher {
 
         var collected: [[String: Any]] = []
         let deadline = Date().addingTimeInterval(8)
-        while Date() < deadline {
+        recvLoop: while Date() < deadline {
             // Drain with a short per-message timeout via Task racing.
             guard let msg = await nextMessage(task, by: deadline) else { break }
             switch msg {
             case .string(let text):
-                guard let arr = parseJSONArray(text), arr.count >= 2,
-                      let kind = arr[0] as? String else { continue }
-                if kind == "EOSE" { break }
-                if kind == "EVENT", let ev = arr[2] as? [String: Any] {
+                switch admitFrame(text, subID: subID, kinds: kinds) {
+                case .eose:
+                    // `break` alone would only exit this switch — label the
+                    // loop so EOSE ends the receive immediately.
+                    break recvLoop
+                case .event(var ev):
                     // Type-1 NIP-19 relay hints give the reader a concrete
                     // location for an article it has not indexed yet.
-                    var annotated = ev
-                    annotated["slowclaw_relay"] = urlString
-                    collected.append(annotated)
+                    ev["slowclaw_relay"] = urlString
+                    collected.append(ev)
+                case .ignore:
+                    break
                 }
             case .data:
                 continue
@@ -116,7 +119,37 @@ enum NostrFetcher {
         return collected
     }
 
+    /// Outcome of admitting one relay text frame.
+    private enum RelayFrame {
+        case eose                    // our subscription is done
+        case event([String: Any])    // admitted EVENT payload for our sub
+        case ignore                  // foreign sub / malformed / other kind
+    }
+
+    /// Parse one relay text frame against our subscription id. Enforces the
+    /// frame shape (element count checked BEFORE indexing — a 2-element
+    /// `["EVENT", <subid>]` frame must not crash us), the subscription id
+    /// (relays multiplex and may emit frames for other clients' REQs), and
+    /// EVENT admission via `isAdmissibleEvent`, all before any Article is
+    /// constructed. Pure and unit-testable; loop control stays in queryRelay.
+    private static func admitFrame(_ text: String, subID: String, kinds: [Int]) -> RelayFrame {
+        guard let arr = parseJSONArray(text), arr.count >= 2,
+              let kind = arr[0] as? String,
+              let frameSubID = arr[1] as? String,
+              frameSubID == subID else { return .ignore }
+        if kind == "EOSE" { return .eose }
+        if kind == "EVENT", arr.count >= 3,
+           let ev = arr[2] as? [String: Any],
+           isAdmissibleEvent(ev, kinds: kinds) {
+            return .event(ev)
+        }
+        return .ignore
+    }
+
     /// Race one WebSocket receive against a deadline so we never hang.
+    /// When the deadline wins, cancel the underlying URLSessionWebSocketTask:
+    /// task cancellation alone cannot interrupt a pending receive(), so a
+    /// silent relay would otherwise leave this group suspended past 8s.
     private static func nextMessage(_ task: URLSessionWebSocketTask, by deadline: Date) async -> URLSessionWebSocketTask.Message? {
         await withTaskGroup(of: URLSessionWebSocketTask.Message?.self, returning: URLSessionWebSocketTask.Message?.self) { group in
             group.addTask { try? await task.receive() }
@@ -126,9 +159,38 @@ enum NostrFetcher {
                 return nil
             }
             let first = await group.next() ?? nil
+            if first == nil {
+                // Fails the pending receive() with an error, unblocking the
+                // child task so the group (and queryRelay) can actually end.
+                task.cancel(with: .goingAway, reason: nil)
+            }
             group.cancelAll()
             return first
         }
+    }
+
+    /// Admission check for a received EVENT payload before any Article is
+    /// constructed: it must be a kind we asked for, and id/pubkey must be a
+    /// Nostr-style 32-byte (64-char hex) value. Malformed frames are ignored.
+    private static func isAdmissibleEvent(_ ev: [String: Any], kinds: [Int]) -> Bool {
+        guard let kind = ev["kind"] as? Int, kinds.contains(kind),
+              let id = ev["id"] as? String, isHex64(id),
+              let pubkey = ev["pubkey"] as? String, isHex64(pubkey) else { return false }
+        return true
+    }
+
+    /// Strict ASCII hex, exactly 64 chars (a Nostr 32-byte id/pubkey).
+    private static func isHex64(_ s: String) -> Bool {
+        guard s.count == 64 else { return false }
+        for scalar in s.unicodeScalars {
+            switch scalar.value {
+            case 0x30...0x39, 0x41...0x46, 0x61...0x66:
+                continue
+            default:
+                return false
+            }
+        }
+        return true
     }
 
     private static func parseJSONArray(_ s: String) -> [Any]? {
