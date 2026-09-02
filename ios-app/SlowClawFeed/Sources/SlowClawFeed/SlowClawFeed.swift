@@ -690,14 +690,13 @@ public enum LocalModelStore {
         try modelsDirectory().appendingPathComponent(preset.fileName)
     }
 
-    /// A file counts as downloaded when it exists and clears the Zig core's
-    /// own 1 KiB sanity floor by a wide margin (partial downloads are moved
-    /// into place only after completing, so existence ≈ complete).
+    /// A file counts as downloaded when it exists, clears the Zig core's own
+    /// 1 KiB sanity floor by a wide margin, AND starts with the GGUF magic
+    /// bytes — a corrupt or error-page file left by an older build must not
+    /// count as downloaded (that would bypass download validation).
     public static func isDownloaded(_ preset: LocalModelPreset) -> Bool {
-        guard let url = try? fileURL(for: preset),
-              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attrs[.size] as? Int64 else { return false }
-        return size > 1_000_000
+        guard let url = try? fileURL(for: preset) else { return false }
+        return isPlausibleGGUF(at: url, minimumBytes: 1_000_000)
     }
 
     /// Download the preset to Documents/Models/ with progress (0...1). Runs
@@ -706,8 +705,10 @@ public enum LocalModelStore {
     /// owns the transfer, not the app process — no manual pause/resume
     /// bookkeeping; only a user force-quit cancels it, and the download
     /// restarts cleanly on the next request). The completed file is moved
-    /// into place by the download delegate only after a full HTTP 200
-    /// transfer — a partial file never masquerades as a valid model (the
+    /// into place by the download delegate only after a 2xx transfer that
+    /// validates as a real GGUF (magic bytes + expected-size floor) — a
+    /// partial file or error page never masquerades as a valid model, and a
+    /// valid model on disk is replaced only by a validated download (the
     /// GGUF magic check in the Zig core is the second line of defense).
     public static func download(_ preset: LocalModelPreset,
                                 progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
@@ -741,10 +742,22 @@ public enum LocalModelStore {
     /// True when the mmproj is downloaded (for presets that have one).
     public static func isMmprojDownloaded(_ preset: LocalModelPreset) -> Bool {
         guard preset.hasAudioMmproj,
-              let url = try? mmprojFileURL(for: preset),
-              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attrs[.size] as? Int64 else { return false }
-        return size > 100_000
+              let url = try? mmprojFileURL(for: preset) else { return false }
+        return isPlausibleGGUF(at: url, minimumBytes: 100_000)
+    }
+
+    /// Shared download-state check: the file must exist, clear `minimumBytes`,
+    /// AND start with the GGUF magic bytes. Mirrors the coordinator's stricter
+    /// post-download validation (validateGGUF) so a corrupt or error-page file
+    /// already on disk is never mistaken for a downloaded model/projector —
+    /// pre-existing garbage re-triggers a download instead of bypassing it.
+    private static func isPlausibleGGUF(at url: URL, minimumBytes: Int64) -> Bool {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attrs[.size] as? NSNumber)?.int64Value,
+              size > minimumBytes,
+              let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        return handle.readData(ofLength: 4) == Data("GGUF".utf8)
     }
 
     /// Download the mmproj for a preset. Same background-URLSession path as
@@ -1198,24 +1211,67 @@ public extension Notification.Name {
 /// carry their destination path in `taskDescription`, so an orphaned download
 /// (relaunched app, nobody awaiting) still lands its file on disk — and the
 /// next `download()` for the same file ATTACHES to the in-flight task instead
-/// of duplicating it.
+/// of duplicating it. Attach matching is destination-first (stable across
+/// redirects and relaunches), then the ORIGINAL request URL; `currentRequest`
+/// alone never matches a redirected transfer (Hugging Face resolve URLs
+/// redirect to a CDN).
+///
+/// Nothing is installed into the destination until the transfer is proven
+/// good: a 2xx HTTP status, GGUF magic bytes, and a size floor derived from
+/// the expected download size. A validated replacement is swapped in without
+/// ever pre-deleting the destination, so an existing valid model survives a
+/// failed or bogus download. Completion surfaces every failure — transport,
+/// HTTP status, validation, and move — to ALL awaiters, and orphan
+/// completions stash the combined outcome; a second caller joins
+/// an already-awaited task instead of overwriting it (overwriting would leak
+/// the first caller's continuation, leaving it suspended forever).
 private final class ModelDownloadCoordinator: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     static let shared = ModelDownloadCoordinator()
     static let sessionIdentifier = "com.slowclaw.app.model-download"
 
+    /// GGUF files begin with the ASCII magic "GGUF".
+    private static let ggufMagic = Data("GGUF".utf8)
+    /// Hard floor for accepted files even when no expected size is known
+    /// (orphaned completions carry no fallbackSize). Far above any error-page
+    /// body, far below any real model or projector.
+    private static let minimumFileBytes: Int64 = 1_000_000
+
     private struct DownloadRecord {
         var destination: URL
         var fallbackSize: Int64
-        var progress: (@Sendable (Double) -> Void)?
-        var continuation: CheckedContinuation<Void, Error>?
-        /// Set when moving the finished temp file failed — surfaced as the
-        /// task's completion error (a successful transfer that couldn't be
-        /// persisted must not resume the awaiter with success).
-        var moveError: Error?
+        /// All progress sinks attached to the task (first caller + joiners).
+        var progressHandlers: [@Sendable (Double) -> Void]
+        /// Every caller awaiting this task, each resumed exactly once at
+        /// completion. Callers JOIN (append) — replacing the record would
+        /// orphan the previous continuation and hang that caller forever.
+        var waiters: [CheckedContinuation<Void, Error>]
     }
 
     private let lock = NSLock()
     private var records: [Int: DownloadRecord] = [:]
+    /// Post-transfer failures recorded by the download delegate for tasks
+    /// whose bytes arrived but could not be persisted as a valid model:
+    /// rejected HTTP status, failed validation, failed install/move. Stored
+    /// independently of `records` (keyed by task id) so ORPHANED completions
+    /// — no record, nobody awaiting — still carry the failure into their
+    /// stashed outcome instead of reporting transport success. Consumed and
+    /// cleared in didCompleteWithError.
+    private var delegateErrors: [Int: Error] = [:]
+    /// Task ids whose delegate DID install a validated file at the
+    /// destination (set after a successful install in didFinishDownloadingTo).
+    /// Success is only ever reported for tasks present here — a transfer that
+    /// completes without the delegate installing anything (didFinish absent /
+    /// non-HTTP response edge) must not resume awaiters with success.
+    /// Consumed in didCompleteWithError.
+    private var installedTaskIDs: Set<Int> = []
+    /// Final outcomes for tasks that completed with nobody awaiting (orphan
+    /// completions): the transport/HTTP outcome COMBINED with any delegate-
+    /// recorded validation/install failure. A caller that discovers an
+    /// in-flight task and registers its waiter AFTER the task finished would
+    /// otherwise hang forever — the stashed outcome lets `run()` fail/succeed
+    /// immediately instead. Entries are consumed (removed) on read; growth is
+    /// bounded by the handful of completed model downloads per session.
+    private var finishedTaskResults: [Int: Result<Void, Error>] = [:]
     private var backgroundCompletionHandler: (() -> Void)?
 
     /// The background session — a static let so initialization is thread-safe
@@ -1229,6 +1285,13 @@ private final class ModelDownloadCoordinator: NSObject, URLSessionDownloadDelega
         // A 2.5 GB transfer should wait for connectivity rather than fail fast.
         config.waitsForConnectivity = true
         config.isDiscretionary = false
+        // Multi-GB GGUFs stay off metered/scarce networks by default: no
+        // cellular, no expensive links (hotspots, pay-per-byte), no Low Data
+        // Mode. Combined with waitsForConnectivity, the transfer waits for
+        // Wi-Fi instead of failing fast or silently consuming a data plan.
+        config.allowsCellularAccess = false
+        config.allowsExpensiveNetworkAccess = false
+        config.allowsConstrainedNetworkAccess = false
         return URLSession(configuration: config, delegate: shared, delegateQueue: nil)
     }()
 
@@ -1237,47 +1300,103 @@ private final class ModelDownloadCoordinator: NSObject, URLSessionDownloadDelega
     }
 
     /// Download `url` to `destination`, reporting progress (0...1). Attaches
-    /// to an already in-flight task for the same URL (the relaunch case)
-    /// rather than starting a duplicate transfer — progress is byte-based, so
-    /// mid-flight attachment just works.
+    /// to an already in-flight task for the same destination/URL (the
+    /// relaunch case) rather than starting a duplicate transfer; a second
+    /// caller for an already-awaited task JOINS it (all joined continuations
+    /// are resumed exactly once) instead of overwriting the record.
     func run(url: URL, destination: URL, fallbackSize: Int64,
              progress: (@Sendable (Double) -> Void)?) async throws {
-        let inFlight = await Self.session.allTasks
+        let existing = await Self.session.allTasks
             .compactMap { $0 as? URLSessionDownloadTask }
-            .filter { ($0.currentRequest?.url ?? $0.originalRequest?.url) == url }
-        if let existing = inFlight.first, existing.state == .running || existing.state == .suspended {
+            .first { Self.isAttachable($0, url: url, destination: destination) }
+        if let task = existing {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 lock.lock()
-                // The task may have completed between discovery and attach;
-                // then the file is already on disk and nobody would resume
-                // us — succeed immediately instead of hanging.
-                if FileManager.default.fileExists(atPath: destination.path) {
+                // The transfer completed between discovery and registration:
+                // honor the stashed outcome instead of registering a waiter
+                // that no future completion event would ever resume. The
+                // entry is consumed (removed) on read.
+                if let outcome = finishedTaskResults.removeValue(forKey: task.taskIdentifier) {
                     lock.unlock()
-                    cont.resume()
+                    cont.resume(with: outcome)
                     return
                 }
-                records[existing.taskIdentifier] = DownloadRecord(destination: destination,
-                                                                  fallbackSize: fallbackSize,
-                                                                  progress: progress,
-                                                                  continuation: cont)
+                // NOTE: no "destination file exists → succeed" shortcut here.
+                // A leftover corrupt/error-page file can sit at the
+                // destination while a valid replacement is still downloading;
+                // only the task's own combined outcome — which requires a
+                // proven validated install — may resolve this awaiter. The
+                // stash above already covers the completion race, so waiting
+                // cannot hang.
+                if var record = records[task.taskIdentifier] {
+                    // Second caller joining an awaited task: append the
+                    // waiter; never overwrite the record (that would leak the
+                    // first caller's continuation).
+                    if let progress { record.progressHandlers.append(progress) }
+                    record.waiters.append(cont)
+                    records[task.taskIdentifier] = record
+                } else {
+                    // Orphaned in-flight task (app relaunched, nobody
+                    // awaiting): adopt it so completion reaches this caller.
+                    records[task.taskIdentifier] = DownloadRecord(
+                        destination: destination,
+                        fallbackSize: fallbackSize,
+                        progressHandlers: progress.map { [$0] } ?? [],
+                        waiters: [cont])
+                }
                 lock.unlock()
             }
-            progress?(1.0)
             return
         }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            // A same-destination task may have been created concurrently
+            // (double tap / two callers racing the task scan): join it
+            // instead of duplicating the transfer for one destination.
+            if let existingID = records.first(where: { $0.value.destination == destination })?.key {
+                // Join fully: append the progress handler too, so the second
+                // caller both awaits completion and receives progress updates.
+                if let progress { records[existingID]?.progressHandlers.append(progress) }
+                records[existingID]?.waiters.append(cont)
+                lock.unlock()
+                return
+            }
             let task = Self.session.downloadTask(with: url)
             // Destination travels with the task so an orphaned completion
-            // (app relaunched, nobody awaiting) still lands the file.
+            // (app relaunched, nobody awaiting) still lands the file — and so
+            // reattachment matches by destination first (stable across
+            // redirects, unlike the request URL).
             task.taskDescription = destination.path
-            lock.lock()
-            records[task.taskIdentifier] = DownloadRecord(destination: destination,
-                                                          fallbackSize: fallbackSize,
-                                                          progress: progress,
-                                                          continuation: cont)
+            records[task.taskIdentifier] = DownloadRecord(
+                destination: destination,
+                fallbackSize: fallbackSize,
+                progressHandlers: progress.map { [$0] } ?? [],
+                waiters: [cont])
             lock.unlock()
             task.resume()
         }
+    }
+
+    /// Whether an in-flight download task should be attached to instead of
+    /// starting a duplicate transfer. Matched most-stable-first: the
+    /// destination path tag (survives redirects and relaunches), then the
+    /// ORIGINAL request URL (the pre-redirect URL, stable across the CDN
+    /// hop), and only as a last resort the current (possibly redirected)
+    /// request URL. A task tagged with a DIFFERENT destination is never
+    /// adopted, even when its URL matches (two destinations may share one
+    /// source URL — e.g. the audio preset reuses the Q4 text GGUF).
+    private static func isAttachable(_ task: URLSessionDownloadTask,
+                                     url: URL, destination: URL) -> Bool {
+        guard task.state == .running || task.state == .suspended else { return false }
+        if task.taskDescription == destination.path { return true }
+        // URL-based matching only applies when the task carries no
+        // conflicting destination tag.
+        guard task.taskDescription == nil || task.taskDescription == destination.path else {
+            return false
+        }
+        if task.originalRequest?.url == url { return true }
+        if task.currentRequest?.url == url { return true }
+        return false
     }
 
     /// Store the system's background-relaunch completion handler and
@@ -1304,51 +1423,165 @@ private final class ModelDownloadCoordinator: NSObject, URLSessionDownloadDelega
         var expected = totalBytesExpectedToWrite
         if expected <= 0 { expected = record.fallbackSize }
         guard expected > 0 else { return }
-        record.progress?(min(1.0, Double(totalBytesWritten) / Double(expected)))
+        let fraction = min(1.0, Double(totalBytesWritten) / Double(expected))
+        for handler in record.progressHandlers { handler(fraction) }
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didFinishDownloadingTo location: URL) {
         // Destination: the registered record's, else the path the task was
-        // created with (orphaned completion after relaunch).
+        // created with (orphaned completion after relaunch). Orphans carry no
+        // expected size; they still get the magic check + the hard floor.
         lock.lock()
         let record = records[downloadTask.taskIdentifier]
         let dest = record?.destination
             ?? downloadTask.taskDescription.map { URL(fileURLWithPath: $0) }
+        let fallbackSize = record?.fallbackSize ?? 0
         lock.unlock()
         guard let dest else { return }
-        // Replace any stale/partial file from an interrupted attempt, then
-        // move the completed transfer into place. The temp URL is invalidated
-        // the moment this method returns, so the move must be synchronous.
-        try? FileManager.default.removeItem(at: dest)
+
+        // (1) Only 2xx bodies may be installed. Error pages (404/5xx) arrive
+        // here as nominally "successful" transfers — they must never become
+        // (or overwrite) a model. The temp file is discarded when this method
+        // returns; the destination is left untouched.
+        if let http = downloadTask.response as? HTTPURLResponse,
+           !(200...299).contains(http.statusCode) {
+            recordCompletionError(downloadTask.taskIdentifier, SlowClawFeedError.internalError(
+                "Model download failed (HTTP \(http.statusCode))."))
+            return
+        }
+
+        // (2) Validate content BEFORE anything touches the destination: GGUF
+        // magic + a size floor derived from the expected download size. The
+        // install only proceeds once the temp file is proven good, so an
+        // existing valid model can never be clobbered by a bad body.
+        let minimumBytes = fallbackSize > 0
+            ? max(Self.minimumFileBytes, fallbackSize / 2)
+            : Self.minimumFileBytes
+        if let validationError = Self.validateGGUF(at: location, minimumBytes: minimumBytes) {
+            recordCompletionError(downloadTask.taskIdentifier, SlowClawFeedError.internalError(
+                "Downloaded model failed validation: \(validationError.localizedDescription)"))
+            return
+        }
+
+        // (3) Persist: ensure the directory exists, then move the validated
+        // file into place WITHOUT pre-deleting the destination — an existing
+        // file is swapped atomically, so a valid model is only replaced once
+        // a valid replacement is ready. The temp URL is invalidated the
+        // moment this method returns, so the move must be synchronous.
         do {
-            try FileManager.default.moveItem(at: location, to: dest)
+            try Self.install(validatedAt: location, to: dest)
+            lock.lock()
+            installedTaskIDs.insert(downloadTask.taskIdentifier)
+            lock.unlock()
             // Tell the app a model file landed (the orphan path has no
             // awaiter to surface it) so status UI can re-render.
             NotificationCenter.default.post(name: .slowClawModelFileLanded,
                                             object: dest.lastPathComponent)
         } catch {
-            lock.lock()
-            records[downloadTask.taskIdentifier]?.moveError = error
-            lock.unlock()
+            recordCompletionError(downloadTask.taskIdentifier, error)
+        }
+    }
+
+    /// Record a post-transfer failure for the task so completion reports it
+    /// to every waiter — and to the orphan-outcome stash — instead of a false
+    /// success. Stored independently of any DownloadRecord so it also covers
+    /// orphaned completions (no record, nobody awaiting).
+    private func recordCompletionError(_ taskIdentifier: Int, _ error: Error) {
+        lock.lock()
+        delegateErrors[taskIdentifier] = error
+        lock.unlock()
+    }
+
+    /// Validate a downloaded file is plausibly a GGUF model: it must start
+    /// with the GGUF magic bytes and clear a minimum-size floor. Returns nil
+    /// when valid, else an error describing the rejection.
+    private static func validateGGUF(at url: URL, minimumBytes: Int64) -> Error? {
+        let attrs: [FileAttributeKey: Any]
+        do {
+            attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        } catch {
+            return error
+        }
+        let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        guard size >= minimumBytes else {
+            return SlowClawFeedError.internalError(
+                "File is \(size) bytes, below the expected minimum (\(minimumBytes)).")
+        }
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return SlowClawFeedError.internalError("Downloaded file is unreadable.")
+        }
+        defer { try? handle.close() }
+        let magic = handle.readData(ofLength: ggufMagic.count)
+        guard magic == ggufMagic else {
+            return SlowClawFeedError.internalError("File is not a GGUF model (bad magic bytes).")
+        }
+        return nil
+    }
+
+    /// Move a validated download into its final destination. The destination
+    /// is never deleted first: an existing file is replaced via
+    /// `replaceItemAt` (atomic swap — the old file survives until the new one
+    /// is in place), a fresh destination gets a plain move. Ensures the
+    /// destination directory exists either way.
+    private static func install(validatedAt location: URL, to destination: URL) throws {
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            _ = try FileManager.default.replaceItemAt(destination, withItemAt: location)
+        } else {
+            try FileManager.default.moveItem(at: location, to: destination)
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        lock.lock()
-        let record = records.removeValue(forKey: task.taskIdentifier)
-        lock.unlock()
-        guard let record else { return }
+        // Outcome from the transfer itself (transport error / HTTP status).
+        let transferOutcome: Result<Void, Error>
         if let error {
-            record.continuation?.resume(throwing: error)
-        } else if let http = task.response as? HTTPURLResponse, http.statusCode != 200 {
-            record.continuation?.resume(throwing: SlowClawFeedError.internalError(
+            transferOutcome = .failure(error)
+        } else if let http = task.response as? HTTPURLResponse,
+                  !(200...299).contains(http.statusCode) {
+            transferOutcome = .failure(SlowClawFeedError.internalError(
                 "Model download failed (HTTP \(http.statusCode))."))
-        } else if let moveError = record.moveError {
-            record.continuation?.resume(throwing: moveError)
         } else {
-            record.continuation?.resume()
+            transferOutcome = .success(())
         }
+
+        let waiters: [CheckedContinuation<Void, Error>]
+        lock.lock()
+        // Combine the transfer outcome with the delegate's ground truth: any
+        // recorded validation/install failure, and whether a validated file
+        // was actually installed. All state entries are consumed (cleaned
+        // up) here.
+        let outcome: Result<Void, Error>
+        if let delegateError = delegateErrors.removeValue(forKey: task.taskIdentifier) {
+            outcome = .failure(delegateError)
+        } else if case .failure = transferOutcome {
+            outcome = transferOutcome
+        } else if installedTaskIDs.remove(task.taskIdentifier) == nil {
+            // Transfer reported success but the delegate never installed a
+            // validated file (didFinish absent / non-HTTP response edge):
+            // never report success without a file at the destination.
+            outcome = .failure(SlowClawFeedError.internalError(
+                "Download finished without producing a model file."))
+        } else {
+            outcome = transferOutcome
+        }
+        if let record = records.removeValue(forKey: task.taskIdentifier) {
+            waiters = record.waiters
+        } else {
+            // Nobody awaited this task (orphan completion): stash the COMBINED
+            // outcome so a caller attaching in the discovery→register race
+            // window fails/succeeds fast instead of waiting forever — and so
+            // it never sees transport success for a file that failed
+            // validation or could not be installed.
+            finishedTaskResults[task.taskIdentifier] = outcome
+            waiters = []
+        }
+        lock.unlock()
+        // Resume outside the lock; each waiter is resumed exactly once.
+        for waiter in waiters { waiter.resume(with: outcome) }
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
