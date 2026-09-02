@@ -128,7 +128,6 @@ struct SlowClawApp: App {
                     voiceMemoImporter.appState = appState
                     voiceMemoImporter.enqueue(url)
                 }
-                .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { _ in }
                 .onAppear {
                     voiceMemoImporter.appState = appState
                     urlDelegate.appState = appState
@@ -154,6 +153,25 @@ struct SlowClawApp: App {
                     }
                 }
         }
+    }
+}
+
+/// A lock-protected once-only flag for sharing completion state between two
+/// concurrently-executing (@Sendable) closures — e.g. a BGTask's work task and
+/// its expiration handler — where a captured local `var` is not compiler-safe.
+/// `claim()` returns true for exactly one caller, guaranteeing the guarded
+/// completion (setTaskCompleted / endBackgroundTask) runs exactly once.
+private final class OnceBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    /// True for the first caller, false for every caller afterwards.
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
     }
 }
 
@@ -248,18 +266,42 @@ final class ShareURLDelegate: NSObject, UIApplicationDelegate {
         }
         // Keep the app alive for the duration of the drain.
         let bgID = UIApplication.shared.beginBackgroundTask(withName: "slowclaw.transcribe.drain")
+        // Exactly-once completion, whichever of the work task or the
+        // expiration handler gets there first (a double setTaskCompleted
+        // raises an exception). OnceBox is a lock-protected reference type
+        // because local captured mutable state isn't safe to share across
+        // @Sendable closures; each closure below captures only lets.
+        let completion = OnceBox()
         let work = Task { @MainActor in
             await appState.drainPendingTranscriptions()
-            task.setTaskCompleted(success: true)
-            if bgID != .invalid {
-                UIApplication.shared.endBackgroundTask(bgID)
+            if completion.claim() {
+                task.setTaskCompleted(success: !Task.isCancelled)
+                if bgID != .invalid {
+                    UIApplication.shared.endBackgroundTask(bgID)
+                }
             }
             // If the queue still has items (e.g. a failed segment), reschedule.
-            await appState.scheduleNextBackgroundTranscription()
+            if !Task.isCancelled {
+                await appState.scheduleNextBackgroundTranscription()
+            }
         }
-        // If iOS reclaims the task before we finish, cancel the drain.
+        // If iOS reclaims the task before the drain finishes: submit the
+        // replacement schedule FIRST (once setTaskCompleted runs, the
+        // scheduler may treat the app as done and a later submit can be
+        // lost), then report the task as failed and release the background
+        // assertion. claim() keeps completion exactly-once even if the work
+        // task finishes in between.
         task.expirationHandler = {
-            work.cancel()
+            Task { @MainActor in
+                work.cancel()
+                await appState.scheduleNextBackgroundTranscription()
+                if completion.claim() {
+                    task.setTaskCompleted(success: false)
+                    if bgID != .invalid {
+                        UIApplication.shared.endBackgroundTask(bgID)
+                    }
+                }
+            }
         }
     }
 }
@@ -326,7 +368,11 @@ final class AppState: ObservableObject {
               let host = comps.host?.lowercased() else {
             return
         }
-        if host == "habla.news" {
+        // Only the dead viewer's ARTICLE paths (habla.news/a/*) resolve on
+        // highlighter.com via the same naddr. Other habla.news paths are not
+        // article links — rewriting them would send unrelated URLs to the
+        // wrong host, so they pass through unchanged.
+        if host == "habla.news", comps.path.hasPrefix("/a/") {
             comps.host = "highlighter.com"
         }
         guard let final = comps.url else { return }
@@ -964,12 +1010,20 @@ final class AppState: ObservableObject {
 
     /// Upsert an existing journal entry's content, preserving its provenance
     /// (source / media_url / category / sessionID). Used to fill in a transcript
-    /// after the entry was auto-saved with a placeholder.
-    func storeJournalUpdate(key: String, content: String) async {
-        guard let existing = try? memory.get(key: key) else { return }
-        try? memory.store(key: key, content: content, category: existing.category,
-                          sessionID: existing.sessionID, source: existing.source, mediaURL: existing.mediaURL)
+    /// after the entry was auto-saved with a placeholder. Returns true when the
+    /// row was persisted — callers (drain / re-transcribe) only treat the work
+    /// as done, e.g. removing the pending queue item, after a successful store.
+    @discardableResult
+    func storeJournalUpdate(key: String, content: String) async -> Bool {
+        guard let existing = try? memory.get(key: key) else { return false }
+        do {
+            try memory.store(key: key, content: content, category: existing.category,
+                             sessionID: existing.sessionID, source: existing.source, mediaURL: existing.mediaURL)
+        } catch {
+            return false
+        }
         await refreshJournals()
+        return true
     }
 
     /// Generate an AI title for a journal and replace its first line (the
@@ -1047,6 +1101,10 @@ final class AppState: ObservableObject {
         items.removeAll { $0.key == key }
         items.append(entry)
         Self.savePendingTranscriptions(items, at: url)
+        // Schedule the BG safety net FIRST: if the foreground drain below is
+        // interrupted (suspension, crash, task expiration), iOS already has a
+        // request to finish the remaining items later.
+        await scheduleNextBackgroundTranscription()
         // Try to drain immediately (foreground) — usually the asset is warm and
         // the transcript lands within a couple seconds.
         await drainPendingTranscriptions()
@@ -1054,10 +1112,14 @@ final class AppState: ObservableObject {
 
     /// Transcribe queued journals one at a time, updating each entry's content
     /// and removing it from the queue as it completes. Newest first (explicit
-    /// product requirement). Single-flight — concurrent callers (launch,
-    /// foreground, importer) no-op while a drain is already running. The loop
-    /// RE-LOADS the queue file every iteration, so items enqueued while a
-    /// drain is in progress are picked up instead of waiting for the next one.
+    /// product requirement). A transcription that returns empty is terminal:
+    /// meaningful stored content is kept as-is (queue item dropped), and a
+    /// placeholder/title-only row gets the explicit no-transcript marker
+    /// instead of being retried forever — the manual Re-transcribe button is
+    /// the retry path. Single-flight — concurrent callers (launch, foreground,
+    /// importer) no-op while a drain is already running. The loop RE-LOADS the
+    /// queue file every iteration, so items enqueued while a drain is in
+    /// progress are picked up instead of waiting for the next one.
     func drainPendingTranscriptions() async {
         guard let url = Self.pendingTranscriptionsURL else { return }
         guard !transcriptionDrainInFlight else { return }
@@ -1099,22 +1161,55 @@ final class AppState: ObservableObject {
                     await AudioSTT.transcribe(url: absURL, useGemmaAudio: self.gemmaAudioEligible)
                 }.value
             }
-            let transcriptBody = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? "🎙 Audio journal (no transcript)"
-                : transcript.text
-            // Preserve the existing title (first line); replace the body.
+            let trimmedTranscript = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedTranscript.isEmpty {
+                // Empty recognition: never clobber the stored entry, and never
+                // retry it automatically forever. If the row already carries a
+                // meaningful body, keep it untouched and just drop the pending
+                // item. If it is still a placeholder/title-only row, write the
+                // title plus the explicit no-transcript marker — removing the
+                // pending item ONLY after that store succeeds. The manual
+                // Re-transcribe button remains the retry path for these rows;
+                // reconcile does not re-queue marker rows automatically.
+                handledKeys.insert(newest.key)
+                let existing = try? memory.get(key: newest.key)
+                let titleLine = existing.flatMap { e in
+                    e.content.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init)
+                } ?? "New Recording"
+                let storedBody = existing.map { journalBodyOf($0.content) } ?? ""
+                if AppState.hasMeaningfulBody(storedBody) {
+                    // Real content already persisted — drop the pending item
+                    // without writing anything.
+                    Self.removeFromPendingQueue(key: newest.key, at: url)
+                } else {
+                    let marker = existing?.source == "audio_imported"
+                        ? "🎙 Imported audio (no transcript)"
+                        : "🎙 Audio journal (no transcript)"
+                    if await storeJournalUpdate(key: newest.key, content: "\(titleLine)\n\n\(marker)") {
+                        Self.removeFromPendingQueue(key: newest.key, at: url)
+                    }
+                }
+                continue
+            }
+            // A real transcript landed: preserve the existing title (first
+            // line); replace the body.
             let existing = try? memory.get(key: newest.key)
             let titleLine = existing.flatMap { e in
                 e.content.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init)
             } ?? "New Recording"
-            let newContent = "\(titleLine)\n\n\(transcriptBody)"
-            await storeJournalUpdate(key: newest.key, content: newContent)
-            handledKeys.insert(newest.key)
-            Self.removeFromPendingQueue(key: newest.key, at: url)
-            // If requested and a real transcript landed, generate an AI title.
-            if newest.generateTitle, !transcript.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                await generateTitleForJournal(key: newest.key, transcript: transcript.text)
+            let newContent = "\(titleLine)\n\n\(trimmedTranscript)"
+            // Everything after the store depends on it succeeding: the queue
+            // item is removed only on success (it stays queued for a retry on
+            // failure), and the follow-up AI title never runs on un-persisted
+            // content.
+            let stored = await storeJournalUpdate(key: newest.key, content: newContent)
+            if stored {
+                Self.removeFromPendingQueue(key: newest.key, at: url)
+                if newest.generateTitle {
+                    await generateTitleForJournal(key: newest.key, transcript: trimmedTranscript)
+                }
             }
+            handledKeys.insert(newest.key)
         }
     }
 
@@ -1122,15 +1217,21 @@ final class AppState: ObservableObject {
     private var transcriptionDrainInFlight = false
 
     /// Sort key placing NEWEST pending items first: prefer the journal's
-    /// stored RFC3339 timestamp, fall back to the epoch digits embedded in
-    /// the key (journal_<epoch>[_vm]). Older → smaller key.
+    /// stored RFC3339 timestamp, fall back to the epoch embedded in the key.
+    /// Keys are `journal_<epoch>` (optionally `journal_<epoch>_vm`), so ONLY
+    /// the numeric component right after `journal_` is parsed — concatenating
+    /// every digit in the key would mash a `_vm` suffix (or any UUID-ish
+    /// remainder) into the epoch and corrupt the ordering. Unknown key shapes
+    /// sort oldest.
     private static func pendingAgeKey(_ entry: PendingTranscription, memory: SlowClawSqliteMemory) -> Double {
         if let existing = try? memory.get(key: entry.key),
            let date = ISO8601DateFormatter().date(from: existing.timestamp) {
             return date.timeIntervalSince1970
         }
-        let digits = entry.key.filter { $0.isNumber }
-        return Double(UInt64(digits) ?? 0)
+        guard entry.key.hasPrefix("journal_") else { return 0 }
+        let afterPrefix = entry.key.dropFirst("journal_".count)
+        let epochDigits = afterPrefix.prefix { $0.isNumber }
+        return Double(UInt64(String(epochDigits)) ?? 0)
     }
 
     /// Remove one key from the on-disk pending queue (keeps items added
@@ -1144,10 +1245,15 @@ final class AppState: ObservableObject {
     /// entry's body (title line preserved). This is the retry path for
     /// truncated or missing transcripts — the JournalDetailView exposes a
     /// Re-transcribe button that calls this, so a new build's engine can be
-    /// re-checked against audio that previously transcribed badly. Uses the
-    /// shared STT router (experimental Gemma-audio when eligible, else
-    /// SpeechAnalyzer) exactly like the drain path. Returns the entry's full
-    /// new content, or "" when the entry has no audio file to transcribe.
+    /// re-checked against audio that previously transcribed badly. It is also
+    /// the retry path for rows the drain gave up on automatically (the
+    /// explicit no-transcript markers, which reconcile never re-queues).
+    /// Uses the shared STT router (experimental Gemma-audio when eligible,
+    /// else SpeechAnalyzer) exactly like the drain path. Returns the entry's
+    /// full new content, or "" when there is no audio file, recognition came
+    /// back empty, the entry row is gone, or the store failed — in every
+    /// failure case the existing content is left untouched (never
+    /// overwritten).
     func retranscribeJournal(_ entry: SlowClawMemoryEntry) async -> String {
         guard let rel = entry.mediaURL, !rel.isEmpty,
               let url = AudioRecorder.absoluteURL(forMediaRelativePath: rel),
@@ -1156,27 +1262,38 @@ final class AppState: ObservableObject {
         let transcript = await Task.detached(priority: .userInitiated) {
             await AudioSTT.transcribe(url: url, useGemmaAudio: eligible)
         }.value
+        // Data safety: an empty/failed recognition must never overwrite the
+        // existing transcript. Bail out so the caller can surface the failure.
         let trimmed = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let body = trimmed.isEmpty ? "🎙 Audio journal (no transcript)" : trimmed
-        // Preserve the existing title (first line); replace the body — the
-        // same shape the drain path writes.
-        let titleLine = entry.content
+        guard !trimmed.isEmpty else { return "" }
+        // Reload the latest row by key: the in-memory snapshot can be stale
+        // (the user may have renamed or edited since the view was opened), so
+        // the preserved title and the body being replaced must come from the
+        // current store, not the snapshot.
+        guard let latest = try? memory.get(key: entry.key) else { return "" }
+        let titleLine = latest.content
             .split(separator: "\n", omittingEmptySubsequences: true)
             .first.map(String.init) ?? journalTitleOf(entry)
-        let newContent = "\(titleLine)\n\n\(body)"
-        await storeJournalUpdate(key: entry.key, content: newContent)
+        let newContent = "\(titleLine)\n\n\(trimmed)"
+        // Same shape the drain path writes. Only report success after the
+        // store actually persisted.
+        guard await storeJournalUpdate(key: entry.key, content: newContent) else { return "" }
         return newContent
     }
 
     // MARK: - Missing-transcript reconciliation
 
-    /// Scan journals for audio entries whose transcript never landed —
-    /// placeholder body, explicit "(no transcript)" body, or a title-only
-    /// body — and (re-)queue them for transcription. This is the guarantee
-    /// that every audio the app owns eventually gets a transcript: anything
-    /// that fell out of the in-memory queue (import interrupted by
-    /// suspension, a crashed drain) is rediscovered here and retried.
-    /// Throttled to at most once per minute per app session.
+    /// Scan journals for audio entries whose transcript never landed — an
+    /// empty body, the transcribing placeholder, or a title-only body — and
+    /// (re-)queue them for transcription. This is the guarantee that every
+    /// audio the app owns eventually gets a transcript: anything that fell
+    /// out of the in-memory queue (import interrupted by suspension, a
+    /// crashed drain) is rediscovered here and retried. Rows already carrying
+    /// an explicit no-transcript marker are deliberately NOT re-queued —
+    /// transcription already ran and produced nothing, so retrying them
+    /// automatically would loop forever; their retry is the manual
+    /// Re-transcribe button. Throttled to at most once per minute per app
+    /// session.
     func reconcileMissingTranscripts() async {
         let now = Date()
         if let last = lastTranscriptReconcileAt,
@@ -1205,8 +1322,11 @@ final class AppState: ObservableObject {
 
     private var lastTranscriptReconcileAt: Date? = nil
 
-    /// True when a journal's body is missing its transcript (placeholder,
-    /// explicit no-transcript marker, or no body at all under the title).
+    /// True when a journal's body still awaits its transcript: an empty body
+    /// or the transcribing placeholder. Explicit no-transcript markers are
+    /// deliberately NOT automatic candidates — they mean transcription already
+    /// ran and produced nothing, and auto-retrying would loop forever; the
+    /// manual Re-transcribe button is their retry path.
     nonisolated static func needsTranscript(_ content: String?) -> Bool {
         guard let content else { return false }
         let lines = content
@@ -1215,10 +1335,20 @@ final class AppState: ObservableObject {
         guard lines.count > 1 else { return true } // title-only (or empty)
         let body = lines.dropFirst().joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return body.isEmpty
-            || body == transcribingPlaceholder
-            || body == "🎙 Audio journal (no transcript)"
-            || body == "🎙 Imported audio (no transcript)"
+        return body.isEmpty || body == transcribingPlaceholder
+    }
+
+    /// True when a stored body is meaningful content — non-empty and not one
+    /// of the placeholder / no-transcript markers. The pending drain uses it
+    /// to decide whether an empty recognition result can safely leave the row
+    /// untouched (content already exists) or should record the no-transcript
+    /// marker instead.
+    nonisolated static func hasMeaningfulBody(_ body: String) -> Bool {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return trimmed != transcribingPlaceholder
+            && trimmed != "🎙 Audio journal (no transcript)"
+            && trimmed != "🎙 Imported audio (no transcript)"
     }
 
     /// Load the pending-transcription queue from disk (empty on any error).
@@ -1563,6 +1693,21 @@ func journalPreviewOf(_ entry: SlowClawMemoryEntry) -> String {
     return String(trimmed.prefix(60))
 }
 
+/// Body text under a stored entry's title line. Consumes the title line and
+/// the blank separator line(s) immediately after it — without leaving a
+/// synthetic leading blank line for normal "title\n\nbody" content — while
+/// preserving body paragraphs verbatim. Shared by the journal editor and the
+/// pending-transcription drain.
+func journalBodyOf(_ content: String) -> String {
+    var lines = content.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+    guard !lines.isEmpty else { return "" }
+    lines.removeFirst() // the title line
+    while let first = lines.first, first.trimmingCharacters(in: .whitespaces).isEmpty {
+        lines.removeFirst()
+    }
+    return lines.joined(separator: "\n")
+}
+
 /// Resolve a journal entry's creation Date. Tries, in order: the `timestamp`
 /// field as ISO8601/RFC3339 (lenient — with and without fractional seconds),
 /// then the epoch embedded in the `key` (e.g. `journal_<epoch>`). Returns nil
@@ -1636,6 +1781,14 @@ struct JournalDetailView: View {
     @State private var isPolishing = false
     @State private var isRetranscribing = false
     @State private var showShareSheet = false
+    @State private var showRetranscribeFailedAlert = false
+    @State private var showSaveErrorAlert = false
+    /// Last successfully persisted title/body — the baseline the combined
+    /// save compares against and updates after each successful store, so a
+    /// no-change open→back (or a repeated back) can never overwrite content
+    /// a background transcription persisted after this view was opened.
+    @State private var savedTitle: String
+    @State private var savedBody: String
 
     /// Absolute URL of the recording, if this entry has a linked audio file.
     /// Treat any entry with a non-empty mediaURL as playable (don't require a
@@ -1656,8 +1809,31 @@ struct JournalDetailView: View {
 
     init(entry: SlowClawMemoryEntry) {
         self.entry = entry
-        _editedBody = State(initialValue: entry.content)
+        // Title and body are SEPARATE state: `titleDraft` owns the title,
+        // `editedBody` owns only the body text under it. The stored row keeps
+        // the "title\nbody" shape; every save merges the two at field
+        // granularity (persistCombined), so a title edit can never stomp body
+        // edits and vice versa. savedTitle/savedBody start at what the row
+        // actually contains.
+        _editedBody = State(initialValue: journalBodyOf(entry.content))
         _titleDraft = State(initialValue: journalTitleOf(entry))
+        _savedTitle = State(initialValue: journalTitleOf(entry))
+        _savedBody = State(initialValue: journalBodyOf(entry.content)
+            .trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// First line (the title) of a stored "title\nbody" row.
+    private static func titleLine(of content: String) -> String {
+        content.split(separator: "\n", omittingEmptySubsequences: false)
+            .first.map(String.init) ?? content
+    }
+
+    /// The working title for display. `titleDraft` is the single title state —
+    /// journalTitleOf(entry) would show the stale entry snapshot after a
+    /// rename or a concurrent title change.
+    private var displayTitle: String {
+        let trimmed = titleDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Untitled" : trimmed
     }
 
     var body: some View {
@@ -1671,14 +1847,16 @@ struct JournalDetailView: View {
                             .textFieldStyle(.plain)
                             .foregroundStyle(DS.ink(scheme))
                             .padding(.horizontal, 16)
+                            .disabled(isRetranscribing)
                             .onSubmit { commitTitle() }
                     } else {
                         Button {
                             isEditingTitle = true
-                            titleDraft = journalTitleOf(entry)
+                            // titleDraft is the single title state — don't
+                            // re-seed it from the stale `entry` snapshot.
                         } label: {
                             HStack {
-                                Text(journalTitleOf(entry))
+                                Text(displayTitle)
                                     .font(DS.titleFont)
                                     .foregroundStyle(DS.ink(scheme))
                                     .multilineTextAlignment(.leading)
@@ -1687,6 +1865,7 @@ struct JournalDetailView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .disabled(isRetranscribing)
                         .padding(.horizontal, 16)
                     }
 
@@ -1733,7 +1912,7 @@ struct JournalDetailView: View {
                                     }
                                     .buttonStyle(.plain)
                                     .tint(DS.accentColor)
-                                    .disabled(isPolishing)
+                                    .disabled(isPolishing || isRetranscribing)
                                 }
                             }
                             TextEditor(text: $editedBody)
@@ -1741,6 +1920,11 @@ struct JournalDetailView: View {
                                 .scrollContentBackground(.hidden)
                                 .font(DS.bodyFont)
                                 .foregroundStyle(DS.ink(scheme))
+                                // Editing is locked while a re-transcription is
+                                // in flight so it can't replace user edits
+                                // mid-write (the fresh transcript syncs the
+                                // editor on success instead).
+                                .disabled(isRetranscribing)
                                 .onChange(of: editedBody) { scheduleBodyAutosave() }
                         }
                     }
@@ -1757,9 +1941,15 @@ struct JournalDetailView: View {
                     Button {
                         player?.stop()
                         pollTimer?.invalidate()
-                        commitTitle()
-                        commitBody()
-                        dismiss()
+                        // Cancel the debounced autosave so the final save
+                        // happens exactly once, combining the latest title +
+                        // body (no stale title/body double-commit race).
+                        bodyAutosaveTask?.cancel()
+                        // Dismiss only after the save persisted; on failure the
+                        // save-error alert keeps the view open with edits intact.
+                        if persistCombined() {
+                            dismiss()
+                        }
                     } label: {
                         Image(systemName: "chevron.left")
                             .font(.system(size: 16, weight: .semibold))
@@ -1788,6 +1978,16 @@ struct JournalDetailView: View {
             if let url = audioURL {
                 ShareLink(item: url)
             }
+        }
+        .alert("Re-transcription failed", isPresented: $showRetranscribeFailedAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("No speech was recognized. Your transcript was left unchanged.")
+        }
+        .alert("Couldn't save", isPresented: $showSaveErrorAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Your changes could not be saved. The entry stays open — try again.")
         }
     }
 
@@ -1950,31 +2150,81 @@ struct JournalDetailView: View {
         bodyAutosaveTask = Task {
             try? await Task.sleep(nanoseconds: 700_000_000)
             if Task.isCancelled { return }
-            await MainActor.run { commitBody() }
+            await MainActor.run { _ = persistCombined() }
         }
     }
 
-    private func commitBody() {
-        let trimmed = editedBody.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        // Preserve source/mediaURL on edit (upsert by key).
-        try? state.memory.store(key: entry.key, content: editedBody, category: entry.category,
-                                sessionID: entry.sessionID, source: entry.source, mediaURL: entry.mediaURL)
+    /// The SINGLE save path for the editor. Reloads the LATEST stored row and
+    /// merges at field granularity: a field the user changed locally (working
+    /// value ≠ saved baseline) overwrites the row; an untouched field keeps
+    /// whatever is currently stored — so a title-only edit can never clobber
+    /// a background transcript that landed after this view opened, and vice
+    /// versa. Upserts with the latest row's provenance. After a successful
+    /// store, working state and saved baselines sync to the merged persisted
+    /// content. Returns true when the row persisted (or there was nothing to
+    /// change); on a store failure it surfaces the save-error alert and
+    /// returns false — errors are never swallowed.
+    @discardableResult
+    private func persistCombined() -> Bool {
+        let title = titleDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = editedBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Working values still match the last successful save → no-op. The
+        // comparison is against the SAVED baseline (never the entry snapshot),
+        // so open→back and repeated backs are safe and never touch the row.
+        guard title != savedTitle || body != savedBody else { return true }
+        // Nothing at all to store → no-op, never wipe the row to empty.
+        guard !title.isEmpty || !body.isEmpty else { return true }
+
+        // Latest stored row: locally-untouched fields merge from here, and
+        // its provenance is preserved on the upsert. Falls back to the entry
+        // snapshot when the row can't be read.
+        let latest = try? state.memory.get(key: entry.key)
+        let storedTitle = latest.map {
+            Self.titleLine(of: $0.content).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let storedBody = latest.map {
+            journalBodyOf($0.content).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // Field-granular merge: only fields the user actually changed locally
+        // take the working value; untouched fields keep the stored value.
+        let mergedTitle = title != savedTitle ? title : (storedTitle ?? title)
+        let mergedBody = body != savedBody ? body : (storedBody ?? body)
+        let mergedContent: String
+        if mergedTitle.isEmpty {
+            mergedContent = mergedBody
+        } else if mergedBody.isEmpty {
+            mergedContent = mergedTitle
+        } else {
+            mergedContent = "\(mergedTitle)\n\(mergedBody)"
+        }
+        do {
+            try state.memory.store(key: entry.key, content: mergedContent,
+                                   category: latest?.category ?? entry.category,
+                                   sessionID: latest?.sessionID ?? entry.sessionID,
+                                   source: latest?.source ?? entry.source,
+                                   mediaURL: latest?.mediaURL ?? entry.mediaURL)
+        } catch {
+            showSaveErrorAlert = true
+            return false
+        }
+        // Working state + baselines sync to exactly what was persisted. (The
+        // editor change triggers an autosave pass that no-ops: values now
+        // equal the baselines.)
+        titleDraft = mergedTitle
+        editedBody = mergedBody
+        savedTitle = mergedTitle
+        savedBody = mergedBody
         Task { await state.refreshJournals() }
+        return true
     }
 
+    /// Commit the title field (onSubmit). The save itself is the shared
+    /// combined path — it stores titleDraft + current body in one write.
     private func commitTitle() {
         guard isEditingTitle else { return }
         isEditingTitle = false
-        let newTitle = titleDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !newTitle.isEmpty, newTitle != journalTitleOf(entry) else { return }
-        // Rewrite: title becomes the first line, body preserved.
-        let lines = entry.content.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-        let body = lines.dropFirst().joined(separator: "\n")
-        let newContent = body.isEmpty ? newTitle : "\(newTitle)\n\(body)"
-        try? state.memory.store(key: entry.key, content: newContent, category: entry.category,
-                                sessionID: entry.sessionID, source: entry.source, mediaURL: entry.mediaURL)
-        Task { await state.refreshJournals() }
+        persistCombined()
     }
 
     private func polish() async {
@@ -1993,15 +2243,44 @@ struct JournalDetailView: View {
     /// Re-run on-device transcription of this entry's audio file and replace
     /// the transcript body in place (title preserved). The manual retry path
     /// for truncated/incomplete transcripts — lets each new build's engine be
-    /// re-checked against the same audio. The editor + store both get the
-    /// fresh content.
+    /// re-checked against the same audio. Editing (body/title/polish) is
+    /// locked while it runs so user edits can't be silently replaced; on an
+    /// empty/failed recognition the stored content is untouched and a concise
+    /// alert is shown; on success the editor syncs to the fresh transcript.
     private func retranscribe() async {
         guard hasAudioFile, !isRetranscribing else { return }
+        // Flush any pending body autosave first so the latest stored row —
+        // which retranscribeJournal reloads by key — includes the user's
+        // edits before the transcript body is replaced. If the flush cannot
+        // persist, ABORT before transcribing: running it would silently
+        // replace unsaved edits. (persistCombined already showed the
+        // save-error alert and kept the view editable.)
+        bodyAutosaveTask?.cancel()
+        guard persistCombined() else { return }
         isRetranscribing = true
         defer { isRetranscribing = false }
         let newContent = await state.retranscribeJournal(entry)
-        guard !newContent.isEmpty else { return }
-        editedBody = newContent
+        guard !newContent.isEmpty else {
+            showRetranscribeFailedAlert = true
+            return
+        }
+        // Sync the editor AND the saved baselines to exactly what is now
+        // persisted. retranscribeJournal preserves the row's current title
+        // (it may have changed while this view was open), so the title state
+        // tracks the persisted value rather than the stale snapshot.
+        let body = journalBodyOf(newContent)
+        editedBody = body
+        savedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let persistedTitle = Self.titleLine(of: newContent)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !persistedTitle.isEmpty {
+            // Match journalTitleOf's display semantics: a still-pending
+            // placeholder title line shows as the default title, not raw text.
+            let display = AppState.isTranscribingPlaceholder(persistedTitle)
+                ? "New Recording" : persistedTitle
+            titleDraft = display
+            savedTitle = display
+        }
     }
 }
 
@@ -2848,7 +3127,12 @@ struct OnDeviceAICard: View {
 
     @ViewBuilder
     private func modelRow(_ model: LocalModelPreset) -> some View {
+        // An audio preset is fully downloaded only when BOTH the text GGUF
+        // and its mmproj are on disk. Otherwise the row stays on the Download
+        // path (which skips the GGUF already present and fetches just the
+        // missing projector) and Activate is never offered prematurely.
         let downloaded = LocalModelStore.isDownloaded(model)
+            && (!model.hasAudioMmproj || LocalModelStore.isMmprojDownloaded(model))
         let progress = state.localModelProgress[model.id]
         let isLoaded = state.localLLM.loaded
 
