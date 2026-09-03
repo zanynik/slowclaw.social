@@ -177,8 +177,11 @@ final class AudioRecorder: NSObject, ObservableObject {
                     // whole journal.
                 }
                 // Feed the analyzer the same buffer (converted to its format).
-                if let sessionRef, let converter = pipe.converter {
-                    sessionRef.process(Self.convert(buffer, with: converter))
+                // A failed conversion drops the buffer (momentary gap) — the
+                // original wrong-format buffer is never fed downstream.
+                if let sessionRef, let converter = pipe.converter,
+                   let converted = Self.convert(buffer, with: converter) {
+                    sessionRef.process(converted)
                 }
                 // Level meter: compute RMS (pure) and throttle the main-actor
                 // publish to ~10 Hz via the shared holder's timestamp.
@@ -244,8 +247,9 @@ final class AudioRecorder: NSObject, ObservableObject {
                 do {
                     try pipe.audioFile?.write(from: buffer)
                 } catch {}
-                if let sessionRef, let converter = pipe.converter {
-                    sessionRef.process(Self.convert(buffer, with: converter))
+                if let sessionRef, let converter = pipe.converter,
+                   let converted = Self.convert(buffer, with: converter) {
+                    sessionRef.process(converted)
                 }
                 let now = DispatchTime.now().uptimeNanoseconds
                 if now &- pipe.lastLevelTs > 100_000_000 {
@@ -341,18 +345,26 @@ final class AudioRecorder: NSObject, ObservableObject {
         session.start()
     }
 
-    /// Convert a PCM buffer from the mic format to the analyzer format. Returns
-    /// a new buffer in the analyzer's format. Pure — safe from the audio thread.
-    private static func convert(_ buffer: AVAudioPCMBuffer, with converter: AVAudioConverter) -> AVAudioPCMBuffer {
+    /// Convert a PCM buffer from the mic format to the analyzer format.
+    /// Returns the converted buffer, or nil when the buffer must be DROPPED
+    /// (allocation failure, conversion error, or no output produced) — the
+    /// original wrong-format buffer is never returned or passed downstream.
+    /// Pure — safe from the audio thread.
+    private static func convert(_ buffer: AVAudioPCMBuffer, with converter: AVAudioConverter) -> AVAudioPCMBuffer? {
+        guard buffer.frameLength > 0 else { return nil }
         let outCap = AVAudioFrameCount(Double(buffer.frameLength) *
             (converter.outputFormat.sampleRate / converter.inputFormat.sampleRate)) + 32
-        guard let out = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: outCap) else {
-            return buffer
+        guard outCap > 0, let out = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: outCap) else {
+            return nil // allocation failure: drop this buffer
         }
         var consumed = false
         let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
             if consumed {
-                outStatus.pointee = .endOfStream
+                // More mic buffers are coming after this one — this is NOT
+                // the end of the stream. (Reporting .endOfStream per buffer
+                // would tell the reused converter the stream is over and
+                // poison every subsequent conversion.)
+                outStatus.pointee = .noDataNow
                 return nil
             }
             consumed = true
@@ -361,8 +373,12 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
         var error: NSError?
         let status = converter.convert(to: out, error: &error, withInputFrom: inputBlock)
-        // Return the converted buffer only when conversion produced data.
-        return (status == .haveData || out.frameLength > 0) ? out : buffer
+        // Yield the converted buffer only when conversion succeeded AND
+        // produced data; anything else drops the buffer (a dropped mic
+        // buffer is a momentary gap, a wrong-format buffer is a broken
+        // transcript).
+        guard status != .error, error == nil, out.frameLength > 0 else { return nil }
+        return out
     }
 
     // MARK: - Wall-clock timer

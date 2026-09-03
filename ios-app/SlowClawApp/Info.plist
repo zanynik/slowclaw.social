@@ -84,7 +84,8 @@
          Documents contains private journals, audio, and local models, and
          export already happens explicitly through ShareLink. -->
     <!-- SlowClaw COPIES shared audio into its own Documents/Inbox (see
-         VoiceMemoImporter.copyAudio); it never edits the source file in place.
+         VoiceMemoImporter.copyAndValidateAudio); it never edits the source
+         file in place.
          Declaring in-place support here made iOS take the open-in-place route
          for Voice Memos shares, which stalls at the share sheet's "Preparing"
          spinner and then silently dismisses without launching the app.
@@ -107,11 +108,12 @@
             <key>LSItemContentTypes</key>
             <array>
                 <string>public.audio</string>
-                <string>public.mpeg4-audio</string>
+                <string>public.mpeg-4-audio</string>
                 <string>public.mp3</string>
                 <string>com.apple.m4a-audio</string>
                 <!-- com.apple.protected-mpeg-4-audio intentionally omitted: the
-                     runtime importer does not support DRM-protected audio. -->
+                     runtime importer rejects DRM-protected audio at the decode
+                     validation step. -->
             </array>
         </dict>
     </array>
