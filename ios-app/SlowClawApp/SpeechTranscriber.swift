@@ -39,11 +39,14 @@ enum Transcriber {
     /// feeds them to a SpeechAnalyzer session, accumulating final results.
     ///
     /// Fallback chain: modern SpeechAnalyzer first; if it is unavailable (older
-    /// iOS, non-Apple-Intelligence device, missing locale asset) or produces
-    /// no text, falls back to legacy SFSpeechRecognizer (see LegacyTranscriber
-    /// below) so a recorded journal never lands as "no transcript" just
-    /// because the device lacks Apple Intelligence. The legacy fallback is
-    /// on-device ONLY — audio never leaves the device on either path.
+    /// iOS, non-Apple-Intelligence device, missing locale asset), produces
+    /// no text, OR its results collection fails (sequence threw, or never
+    /// ended within the completion timeout — a 2-line partial must never pass
+    /// as a transcript), falls back to legacy SFSpeechRecognizer (see
+    /// LegacyTranscriber below) so a recorded journal never lands as "no
+    /// transcript" just because the device lacks Apple Intelligence. The
+    /// legacy fallback is FORCED on-device (requiresOnDeviceRecognition) —
+    /// audio never leaves the device on either path.
     ///
     /// Thread-safe: blocking recognition runs on the calling thread; callers
     /// await it off the main actor (e.g. inside a Task.detached).
@@ -66,10 +69,12 @@ enum Transcriber {
     /// Shared file→string transcription used by transcribe(url:) and the
     /// background drain. Takes an already-opened AVAudioFile.
     ///
-    /// All-or-nothing: feeding, analysis, and finalization must ALL succeed —
-    /// any failure discards everything collected and returns "", letting the
-    /// caller's on-device legacy fallback handle the file. Partial finals are
-    /// never returned after an error.
+    /// All-or-nothing: feeding, analysis, finalization, AND result collection
+    /// must ALL succeed — any failure (including the results sequence throwing
+    /// or failing to end within the collector timeout) discards everything
+    /// collected and returns "", letting the caller's on-device legacy
+    /// fallback handle the file. Partial finals are never returned after an
+    /// error or timeout.
     ///
     /// Ordering matters here: analyzer.start(inputSequence:) suspends until the
     /// input stream finishes, so the feeder must run concurrently AND be the one
@@ -138,7 +143,7 @@ enum Transcriber {
             // and return empty so the caller's ON-DEVICE legacy fallback can
             // take the file instead.
             recognizerTask.cancel()
-            await Self.awaitCollectorCompletion(recognizerTask)
+            _ = await Self.awaitCollectorCompletion(recognizerTask)
             return ""
         }
         // The results sequence ENDS on its own after finalize (returning nil
@@ -146,7 +151,13 @@ enum Transcriber {
         // bounded timeout — cancelling IMMEDIATELY after finalize dropped
         // finals still queued in the sequence, which is how long files ended
         // up with only their last line / no transcript at all.
-        await Self.awaitCollectorCompletion(recognizerTask)
+        //
+        // The completion must SUCCEED: if the sequence threw, or never ended
+        // within the timeout, the collected text is a partial (e.g. a lone
+        // 2-line chunk) — discard it and return "" so the caller's
+        // forced-on-device legacy fallback re-transcribes the file honestly.
+        let collectorDrained = await Self.awaitCollectorCompletion(recognizerTask)
+        guard collectorDrained else { return "" }
         return collected.text()
     }
 
@@ -218,9 +229,12 @@ enum Transcriber {
             try? await analyzer.finalizeAndFinishThroughEndOfInput()
             // Let the finals collector drain to NATURAL completion (bounded)
             // before tearing down — see transcribe(file:) for why an immediate
-            // cancel lost late finals.
+            // cancel lost late finals. The live path has no aggregate to
+            // withhold (finals were already streamed via onFinal) and the
+            // recorded file is re-transcribed by the background drain, so the
+            // success/failure outcome is only used to bound the teardown.
             if let recognizerTask {
-                await Transcriber.awaitCollectorCompletion(recognizerTask)
+                _ = await Transcriber.awaitCollectorCompletion(recognizerTask)
             }
             recognizerTask = nil
             analyzerTask?.cancel()
@@ -258,20 +272,34 @@ enum Transcriber {
     /// timeout. After `finalizeAndFinishThroughEndOfInput()` the transcriber's
     /// results sequence should finish on its own; if an OS build keeps it
     /// alive, cancel after the bound so the caller can't hang.
-    private static func awaitCollectorCompletion(_ task: Task<Void, Error>) async {
-        await withTaskGroup(of: Bool.self) { group in
+    ///
+    /// Returns true IFF the results sequence ENDED on its own without throwing
+    /// (the collector drained to natural completion). Returns false when the
+    /// sequence THREW or was still alive after the 10s bound — in both cases
+    /// the text collected so far is a partial at best, and the caller must
+    /// DISCARD it (and take the on-device legacy fallback) rather than return
+    /// it. A collector that never ended cannot vouch for its text.
+    private static func awaitCollectorCompletion(_ task: Task<Void, Error>) async -> Bool {
+        let outcome = await withTaskGroup(of: Bool.self) { group -> Bool? in
             group.addTask {
-                _ = try? await task.value
-                return true
+                do {
+                    // Rethrows the results sequence's error, if it threw.
+                    try await task.value
+                    return true
+                } catch {
+                    return false // sequence threw: collected text is incomplete
+                }
             }
             group.addTask {
                 try? await Task.sleep(nanoseconds: 10_000_000_000) // 10s bound
                 task.cancel()
-                return false
+                return false // never ended in time: collected text is incomplete
             }
-            _ = await group.next()
+            let first = await group.next()
             group.cancelAll()
+            return first
         }
+        return outcome ?? false
     }
 
     /// Read an AVAudioFile's PCM in chunks, convert each to the analyzer
@@ -323,7 +351,10 @@ enum Transcriber {
 
         while !streamEnded {
             if !inputEnded {
-                if framesRemaining > 0 {
+                // Never overwrite readBuffer while the converter still owns
+                // the previous chunk (it may emit buffered output before its
+                // next input-block pull).
+                if !pendingChunk && framesRemaining > 0 {
                     let toRead = min(chunkFrames, framesRemaining)
                     readBuffer.frameLength = 0
                     do {
@@ -398,21 +429,25 @@ private final class FinalCollector: @unchecked Sendable {
 /// and the caller keeps its placeholder. Audio never leaves the device.
 ///
 /// Long-audio robustness + all-or-nothing aggregation:
-///   - Short files (≤ 60s) go through as ONE whole-file on-device request.
-///   - Longer files are split into ~50s temp segments (frame boundaries, no
+///   - Short files (≤ 45s) go through as ONE whole-file on-device request.
+///   - Longer files are split into ~40s temp segments (frame boundaries, no
 ///     re-encoding) transcribed STRICTLY SEQUENTIALLY, each result appended in
 ///     order — exactly one in-flight request at a time, each result lands
 ///     exactly once, so no segment can overwrite or reorder another's text.
+///     The threshold sits safely BELOW the recognizer's ~1min flakiness point,
+///     and segments are ~40s, so a one-minute journal is always TWO sequential
+///     requests — never one request at the unreliable duration.
 ///   - If any segment fails (or the split itself fails) the partial aggregate
 ///     is discarded and transcribe returns "" — a half-transcribed journal is
 ///     worse than an honest placeholder.
 enum LegacyTranscriber {
 
-    // On-device request sizing: long files are segmented for robustness;
-    // short files ride through in a single whole-file request.
-    private static let segmentThresholdSeconds: Double = 60
-    private static let segmentSeconds: Double = 50
-    /// Per-segment budget: a ~50s segment should finish well inside 90s.
+    // On-device request sizing: the on-device recognizer degrades on
+    // whole-file requests approaching the ~1min mark, so anything longer
+    // than 45s is segmented into ~40s sequential requests.
+    private static let segmentThresholdSeconds: Double = 45
+    private static let segmentSeconds: Double = 40
+    /// Per-segment budget: a ~40s segment should finish well inside 90s.
     private static let segmentTimeoutSeconds: UInt64 = 90
     /// Whole-file budget: on-device requests have no duration cap, but a
     /// wedged request still must not hang the import queue forever.
@@ -421,6 +456,7 @@ enum LegacyTranscriber {
     /// Local failure reasons for segmentation (trigger temp-file cleanup).
     private enum SplitFailure: Error {
         case segmentBufferAllocationFailed
+        case unexpectedEndOfFile
     }
 
     /// Entry point: authorize, pick a recognizer for the current locale, and
@@ -519,7 +555,7 @@ enum LegacyTranscriber {
         }
     }
 
-    /// On-device path for LONG files: split into ~50s temp segments and
+    /// On-device path for LONG files: split into ~40s temp segments and
     /// transcribe them STRICTLY IN ORDER, appending each result to the
     /// accumulated transcript. One request in flight at a time; each segment
     /// appends exactly once — no overwrites, no reordering.
@@ -573,6 +609,8 @@ enum LegacyTranscriber {
                 // Read BEFORE creating the segment file so a read error can't
                 // leave an empty .caf behind.
                 try file.read(into: buffer, frameCount: toRead)
+                let framesRead = Int(buffer.frameLength)
+                guard framesRead > 0 else { throw SplitFailure.unexpectedEndOfFile }
                 let segURL = FileManager.default.temporaryDirectory
                     .appendingPathComponent("slowclaw-stt-\(UUID().uuidString).caf")
                 // Track immediately so the catch below can remove it even if
@@ -580,7 +618,7 @@ enum LegacyTranscriber {
                 segments.append(segURL)
                 let out = try AVAudioFile(forWriting: segURL, settings: format.settings)
                 try out.write(from: buffer)
-                frameOffset += Int(toRead)
+                frameOffset += framesRead
             }
         } catch {
             segments.forEach { try? FileManager.default.removeItem(at: $0) }

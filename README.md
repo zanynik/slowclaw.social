@@ -371,7 +371,7 @@ flowchart TB
 ```
 
 **The local model lifecycle** (managed in Profile → On-Device AI card):
-1. **Download** a Gemma GGUF from HuggingFace (`LocalModelStore`, ~2.1–2.5 GB) into `Documents/Models/`.
+1. **Download** a Gemma GGUF from HuggingFace (`LocalModelStore`, ~2.1–2.5 GB) into `Documents/Models/`. The row shows determinate progress immediately; iOS owns the background transfer, and SlowClaw persists the selected preset so a relaunch automatically reattaches the bar or safely retries a force-quit transfer.
 2. **Activate** → `slowclaw_feed_local_llm_load(path)` — Zig loads it into llama.cpp. Context is capped at 1536 tokens to stay inside the default per-app memory budget.
 3. **Use** — every `aiChat` / `aiSynthesize` / `aiExtractInterests` / `aiDraftPost` in `AppState` checks `localLLM.loaded` first.
 4. **Unload** → `slowclaw_feed_local_llm_unload()` frees the RAM.

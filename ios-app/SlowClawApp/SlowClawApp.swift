@@ -141,8 +141,12 @@ struct SlowClawApp: App {
                     for pending in urlDelegate.flushPending() {
                         voiceMemoImporter.enqueue(pending)
                     }
+                    // Reattach any user-started background model transfer so
+                    // its progress bar resumes after a process relaunch.
+                    appState.resumePendingLocalModelDownloads()
                     // Auto-activate the on-device model so AI is ready whenever
-                    // the app is open (local-first path).
+                    // the app is open (local-first path). This defers while a
+                    // restored download is active.
                     Task { await appState.ensureLocalModelActivated() }
                     // Resume any pending transcriptions left from a killed-app
                     // session, and reconcile audio journals whose transcript
@@ -317,9 +321,23 @@ final class AppState: ObservableObject {
     // memory and every AI surface (synthesis, interests, drafts, TweetClaw)
     // runs on-device — the local-first path. Download progress is per-preset.
     @Published var localLLM: LocalLLMStatus = LocalLLMStatus(available: false)
+    /// True only while a model ACTIVATION (load into llama.cpp) is in flight.
+    /// Downloads no longer set this — per-preset download state lives in
+    /// `activeDownloadIDs`, so a multi-GB download never disables unrelated
+    /// Download buttons or other AI surfaces.
     @Published var localModelBusy: Bool = false
     @Published var localModelError: String? = nil
     @Published var localModelProgress: [String: Double] = [:]
+    /// Preset IDs with an in-flight download. Per-preset on purpose: the row
+    /// actually downloading shows its own determinate bar, and every other
+    /// preset's Download button stays enabled. Persisted so a relaunched app
+    /// automatically reattaches to the background URLSession task and restores
+    /// progress instead of showing a misleading fresh Download button.
+    @Published var activeDownloadIDs: Set<String> = []
+    private static let activeDownloadDefaultsKey = "slowclaw.model-downloads.active"
+    /// Operations attached in this process. Separate from activeDownloadIDs,
+    /// which is restored from disk before this process has reattached.
+    private var localDownloadOperations: Set<String> = []
 
     // On-device audio transcription (mtmd / Gemma-audio). Experimental and
     // OFF by default — SpeechAnalyzer remains the stable default. When ON
@@ -457,6 +475,16 @@ final class AppState: ObservableObject {
             self.readsLoadedOnce = true
         }
 
+        // Restore user-started model downloads before the first screen paints.
+        // The URLSession transfer itself is owned by iOS; these IDs let this
+        // process reattach its progress handlers after a relaunch. Unknown IDs
+        // from an older catalog are discarded rather than retried forever.
+        let knownModelIDs = Set(LocalModelPreset.presets.map(\.id))
+        activeDownloadIDs = Set(UserDefaults.standard.stringArray(
+            forKey: Self.activeDownloadDefaultsKey) ?? []).intersection(knownModelIDs)
+        for id in activeDownloadIDs { localModelProgress[id] = 0 }
+        persistActiveDownloadIDs()
+
         setupLLM()
         refreshLocalLLMStatus()
         refreshLocalAudioStatus()
@@ -495,15 +523,34 @@ final class AppState: ObservableObject {
     var anyLLMAvailable: Bool { llm != nil || localLLM.loaded }
 
     func downloadLocalModel(_ preset: LocalModelPreset) async {
-        localModelBusy = true
+        // One waiter/progress pipeline per preset in this process. This also
+        // makes repeated onAppear calls harmless while a restored transfer is
+        // still running.
+        guard localDownloadOperations.insert(preset.id).inserted else { return }
+        activeDownloadIDs.insert(preset.id)
+        persistActiveDownloadIDs()
+        defer {
+            localDownloadOperations.remove(preset.id)
+            activeDownloadIDs.remove(preset.id)
+            persistActiveDownloadIDs()
+        }
+
         localModelError = nil
-        defer { localModelBusy = false }
         // Audio presets carry two files (text GGUF + mmproj). Report progress
         // across BOTH: each file's share is weighted by its expected size so
         // the bar reflects total bytes, not per-file jumps.
         let mmprojSize = preset.mmprojSizeBytes ?? 0
         let totalBytes = preset.sizeBytes + mmprojSize
         let textWeight = totalBytes > 0 ? Double(preset.sizeBytes) / Double(totalBytes) : 1.0
+        // Seed the bar BEFORE the first await so the row renders a determinate
+        // bar immediately — at 0% (the background session waits for unmetered
+        // Wi-Fi before the first byte moves), or at textWeight when the shared
+        // text GGUF is already on disk and only the mmproj remains.
+        localModelProgress[preset.id] = LocalModelStore.isDownloaded(preset) ? textWeight : 0
+        // Track ONLY this preset as downloading. Downloads must not flip the
+        // global busy flag — that used to disable every other preset's
+        // Download button for the whole multi-GB transfer. The defer above
+        // clears both the live and persisted state on every exit path.
         do {
             // Skip the text GGUF when it's already on disk — the audio preset
             // shares its GGUF with the text-only presets, so switching to the
@@ -527,6 +574,24 @@ final class AppState: ObservableObject {
             localModelError = "Download failed: \(error.localizedDescription)"
             localModelProgress[preset.id] = nil
         }
+    }
+
+    /// Reattach progress handlers for downloads the user started before this
+    /// process launched. LocalModelStore joins matching background-session
+    /// tasks by destination; if a file already landed, it completes instantly
+    /// and advances to the optional mmproj. Stale/cancelled transfers retry on
+    /// the same unmetered-network policy rather than remaining stuck forever.
+    func resumePendingLocalModelDownloads() {
+        let presetsByID = Dictionary(uniqueKeysWithValues: LocalModelPreset.presets.map { ($0.id, $0) })
+        for id in activeDownloadIDs {
+            guard let preset = presetsByID[id] else { continue }
+            Task { await self.downloadLocalModel(preset) }
+        }
+    }
+
+    private func persistActiveDownloadIDs() {
+        UserDefaults.standard.set(activeDownloadIDs.sorted(),
+                                  forKey: Self.activeDownloadDefaultsKey)
     }
 
     /// Load a downloaded model into the on-device engine. Runs off-actor:
@@ -586,7 +651,12 @@ final class AppState: ObservableObject {
     func ensureLocalModelActivated() async {
         // Re-read status in case it changed (e.g. the OS reclaimed the model).
         refreshLocalLLMStatus()
-        guard localLLM.available, !localLLM.loaded, !localModelBusy else { return }
+        // Also defer while a download is in flight: loading a multi-GB GGUF
+        // while another streams to disk is the same RAM/disk conflict the
+        // model rows guard against in the UI. Downloads never set
+        // localModelBusy, so this check is explicit.
+        guard localLLM.available, !localLLM.loaded, !localModelBusy,
+              activeDownloadIDs.isEmpty else { return }
         // Prefer an audio-capable preset when the experimental engine is ON
         // (so the mmproj loads and Gemma-audio transcription is eligible),
         // else the first downloaded preset. Never auto-download.
@@ -1092,15 +1162,20 @@ final class AppState: ObservableObject {
     /// the voice-memo importer after its durable store. The queue is drained
     /// by drainPendingTranscriptions() (launch / foreground / BGTask),
     /// newest-first.
+    /// Returns true ONLY when the queue file was atomically rewritten — the
+    /// durable-handoff contract for callers that promise crash-safe intent.
+    /// Drain behavior is unchanged: the BG safety net is scheduled first,
+    /// then a foreground drain is attempted either way.
+    @discardableResult
     func enqueuePendingTranscription(key: String, mediaPath: String,
-                                      generateTitleAfter: Bool = false) async {
-        guard let url = Self.pendingTranscriptionsURL else { return }
+                                      generateTitleAfter: Bool = false) async -> Bool {
+        guard let url = Self.pendingTranscriptionsURL else { return false }
         var items = Self.loadPendingTranscriptions(at: url)
         let entry = PendingTranscription(key: key, mediaPath: mediaPath, generateTitle: generateTitleAfter)
         // Replace any existing entry for the same key so the flag stays fresh.
         items.removeAll { $0.key == key }
         items.append(entry)
-        Self.savePendingTranscriptions(items, at: url)
+        let persisted = Self.savePendingTranscriptions(items, at: url)
         // Schedule the BG safety net FIRST: if the foreground drain below is
         // interrupted (suspension, crash, task expiration), iOS already has a
         // request to finish the remaining items later.
@@ -1108,6 +1183,7 @@ final class AppState: ObservableObject {
         // Try to drain immediately (foreground) — usually the asset is warm and
         // the transcript lands within a couple seconds.
         await drainPendingTranscriptions()
+        return persisted
     }
 
     /// Transcribe queued journals one at a time, updating each entry's content
@@ -1360,10 +1436,20 @@ final class AppState: ObservableObject {
         return items
     }
 
-    /// Persist the pending-transcription queue to disk (atomic).
-    static func savePendingTranscriptions(_ items: [PendingTranscription], at url: URL) {
-        guard let data = try? JSONEncoder().encode(items) else { return }
-        try? data.write(to: url, options: .atomic)
+    /// Persist the pending-transcription queue to disk (atomic). Returns true
+    /// ONLY when the write succeeded — the on-disk file is the crash-safety
+    /// source of truth, so callers handing off durable intent (importer,
+    /// auto-save) can prove the entry survived. A false return means the
+    /// on-disk queue is stale until the next successful save.
+    @discardableResult
+    static func savePendingTranscriptions(_ items: [PendingTranscription], at url: URL) -> Bool {
+        guard let data = try? JSONEncoder().encode(items) else { return false }
+        do {
+            try data.write(to: url, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
     }
 
     /// Background-processing task identifier (must match
@@ -1681,18 +1767,6 @@ func journalTitleOf(_ entry: SlowClawMemoryEntry) -> String {
     return title.isEmpty ? "Untitled" : title
 }
 
-/// A short single-line preview after the title. A transcribing entry shows
-/// "Transcribing…" instead of the raw placeholder text.
-func journalPreviewOf(_ entry: SlowClawMemoryEntry) -> String {
-    let lines = entry.content.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-    let body = lines.dropFirst().joined(separator: " ")
-    let trimmed = body.trimmingCharacters(in: .whitespaces)
-    if AppState.isTranscribingPlaceholder(trimmed) {
-        return "Transcribing…"
-    }
-    return String(trimmed.prefix(60))
-}
-
 /// Body text under a stored entry's title line. Consumes the title line and
 /// the blank separator line(s) immediately after it — without leaving a
 /// synthetic leading blank line for normal "title\n\nbody" content — while
@@ -1731,22 +1805,6 @@ func journalDate(_ entry: SlowClawMemoryEntry) -> Date? {
         return Date(timeIntervalSince1970: secs)
     }
     return nil
-}
-
-/// Coarse relative-time string (now / Nm / Nh / Nd / Nw / Nmo, else MMM d).
-func journalRelativeTime(_ entry: SlowClawMemoryEntry) -> String {
-    let date = journalDate(entry) ?? Date(timeIntervalSince1970: 0)
-    let secs = max(0, Date().timeIntervalSince(date))
-    if secs < 60 { return "now" }
-    if secs < 3600 { return "\(Int(secs / 60))m" }
-    if secs < 86_400 { return "\(Int(secs / 3600))h" }
-    if secs < 604_800 { return "\(Int(secs / 86_400))d" }
-    if secs < 2_592_000 { return "\(Int(secs / 604_800))w" }
-    if secs < 31_536_000 { return "\(Int(secs / 2_592_000))mo" }
-    let f = DateFormatter()
-    f.locale = Locale.current
-    f.dateFormat = "MMM d"
-    return f.string(from: date)
 }
 
 /// mm:ss for an audio player position/duration.
@@ -2364,8 +2422,21 @@ struct JournalView: View {
     @StateObject private var recorder = AudioRecorder()
 
     @State private var search = ""
+    /// Selected list order. `newestFirst` is the Voice-Memos default.
+    @State private var sortOrder: JournalSort = .newestFirst
     @State private var selectedDetail: SlowClawMemoryEntry?
     @State private var showCompose = false
+    /// Best-effort audio durations by journal key, filled asynchronously from
+    /// AVAudioFile header metadata (frame count ÷ sample rate — no PCM
+    /// decode), so `body` never blocks on file I/O. A key is reserved with 0
+    /// while its one-shot lookup runs; 0 renders as "no duration" and marks
+    /// failures done (one read attempt per key per session).
+    @State private var audioDurations: [String: TimeInterval] = [:]
+
+    /// Deterministic sort orders for the journal list.
+    enum JournalSort: Hashable {
+        case newestFirst, oldestFirst, title
+    }
 
     /// First-entry rotating prompts (one per day-of-month). Shown in the empty
     /// state hero.
@@ -2381,10 +2452,72 @@ struct JournalView: View {
         return firstEntryPrompts[day % firstEntryPrompts.count]
     }
 
-    private var filtered: [SlowClawMemoryEntry] {
+    /// The journals actually shown: search filter composed with the selected
+    /// deterministic sort. Every branch ends in a `key` tiebreak so equal
+    /// timestamps/titles can't jitter between renders.
+    private var visibleJournals: [SlowClawMemoryEntry] {
         let q = search.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !q.isEmpty else { return state.journals }
-        return state.journals.filter { $0.content.lowercased().contains(q) }
+        let base = q.isEmpty
+            ? state.journals
+            : state.journals.filter { $0.content.lowercased().contains(q) }
+        switch sortOrder {
+        case .newestFirst, .oldestFirst:
+            // journalDate parses a formatter-backed timestamp; compute once
+            // per entry instead of per comparison.
+            let dated = base.map { ($0, journalDate($0) ?? .distantPast) }
+            let newestFirst = sortOrder == .newestFirst
+            return dated.sorted { lhs, rhs in
+                if lhs.1 != rhs.1 { return newestFirst ? lhs.1 > rhs.1 : lhs.1 < rhs.1 }
+                return newestFirst ? lhs.0.key > rhs.0.key : lhs.0.key < rhs.0.key
+            }
+            .map { $0.0 }
+        case .title:
+            return base.sorted { lhs, rhs in
+                let cmp = journalTitleOf(lhs).localizedCaseInsensitiveCompare(journalTitleOf(rhs))
+                if cmp != .orderedSame { return cmp == .orderedAscending }
+                return lhs.key < rhs.key
+            }
+        }
+    }
+
+    /// Kick off the one-shot async duration read for an audio row. Cached
+    /// (or already-reserved) keys no-op, so calling this on row appear is
+    /// cheap. MainActor for the state read/reserve; the metadata read itself
+    /// runs in a detached utility task and lands back via MainActor.run.
+    @MainActor
+    private func loadAudioDurationIfNeeded(_ entry: SlowClawMemoryEntry) {
+        guard audioDurations[entry.key] == nil else { return }
+        guard entry.source?.hasPrefix("audio") == true,
+              let rel = entry.mediaURL, !rel.isEmpty,
+              let url = AudioRecorder.absoluteURL(forMediaRelativePath: rel) else { return }
+        audioDurations[entry.key] = 0 // reserve: one read per key per session
+        Task.detached(priority: .utility) {
+            let seconds = Self.audioDuration(fromFileAt: url) ?? 0
+            await MainActor.run { audioDurations[entry.key] = seconds }
+        }
+    }
+
+    /// Duration from AVAudioFile HEADER metadata only (frame count ÷ sample
+    /// rate). The m4a frame count comes from the container atom, so this
+    /// never decodes audio.
+    private static func audioDuration(fromFileAt url: URL) -> TimeInterval? {
+        guard let file = try? AVAudioFile(forReading: url),
+              file.length > 0, file.processingFormat.sampleRate > 0 else { return nil }
+        return Double(file.length) / file.processingFormat.sampleRate
+    }
+
+    /// Cached localized date/time formatter for row metadata (DateFormatter
+    /// allocation is expensive; rows re-render often).
+    private static let rowDateTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale.current
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
+    private static func localizedDateTime(_ date: Date) -> String {
+        rowDateTimeFormatter.string(from: date)
     }
 
     var body: some View {
@@ -2417,9 +2550,9 @@ struct JournalView: View {
     /// Auto-save a finished recording as a journal immediately (Voice Memos).
     /// The transcript-so-far is used if present; otherwise a placeholder is
     /// stored and the entry is enqueued for background transcription, so the
-    /// row shows a spinner and fills in when the transcript lands. A date-time
-    /// default title is set; if AI is available an AI title is generated from
-    /// the transcript (once it has landed) and replaces the default.
+    /// row shows a spinner and fills in when the transcript lands. The
+    /// "New Recording" default title is set; if AI is available an AI title is
+    /// generated from the transcript (once it has landed) and replaces it.
     private func autoSaveRecording(fileURL: URL) {
         let mediaURL = AudioRecorder.documentsRelativePath(for: fileURL)
         let userTitle = recorder.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2462,21 +2595,30 @@ struct JournalView: View {
         }
     }
 
-    /// Voice-Memos-style default recording title: "New Recording" + localized
-    /// date/time. Used when the user didn't type a title mid-recording.
+    /// Voice-Memos-style default recording title. Plain on purpose: the list
+    /// row already shows the localized date/time next to the title, and the
+    /// user renames from the detail view.
     private static func defaultRecordingTitle() -> String {
-        let f = DateFormatter()
-        f.locale = Locale.current
-        f.dateFormat = "MMM d, h:mm a"
-        return "New Recording · \(f.string(from: Date()))"
+        "New Recording"
     }
 
     // MARK: - List
 
     private var journalList: some View {
         VStack(spacing: 0) {
-            // Search + import status (migrated from the sidebar).
             VStack(spacing: 8) {
+                // Header: "Journals" + compact sort menu.
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Journals")
+                        .font(DS.titleFont)
+                        .foregroundStyle(DS.ink(scheme))
+                        .kerning(-0.4)
+                    Spacer()
+                    sortMenu
+                }
+                .padding(.horizontal, 16)
+
+                // Search + import status (migrated from the sidebar).
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 13))
@@ -2486,6 +2628,17 @@ struct JournalView: View {
                         .textFieldStyle(.plain)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
+                    if !search.isEmpty {
+                        Button {
+                            search = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 14))
+                                .foregroundStyle(DS.muted(scheme))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Clear search")
+                    }
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
@@ -2504,39 +2657,44 @@ struct JournalView: View {
                     }
                     .padding(.horizontal, 22)
                 }
-
-                HStack(spacing: 6) {
-                    Image(systemName: "waveform").font(.system(size: 11))
-                    Text("Import voice memos via the share sheet → SlowClaw.")
-                        .font(DS.microFont)
-                    Spacer()
-                }
-                .foregroundStyle(DS.muted(scheme))
-                .padding(.horizontal, 22)
             }
             .padding(.top, 10)
 
             // The list.
-            if filtered.isEmpty && search.isEmpty {
+            if visibleJournals.isEmpty && search.isEmpty {
                 emptyState
             } else {
                 ScrollView {
                     LazyVStack(spacing: 2) {
-                        if filtered.isEmpty {
-                            Text("No journals match your search.")
-                                .font(DS.captionFont)
-                                .foregroundStyle(DS.muted(scheme))
-                                .padding(.top, 40)
+                        if visibleJournals.isEmpty {
+                            VStack(spacing: 8) {
+                                Text("No journals match your search.")
+                                    .font(DS.captionFont)
+                                    .foregroundStyle(DS.muted(scheme))
+                                Button("Clear Search") {
+                                    search = ""
+                                }
+                                .font(DS.captionFont.weight(.semibold))
+                                .tint(DS.accentColor)
+                            }
+                            .padding(.top, 40)
                         } else {
-                            ForEach(filtered, id: \.key) { entry in
-                                journalRow(entry)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture { selectedDetail = entry }
-                                    .contextMenu {
-                                        Button(role: .destructive) {
-                                            state.softDelete(key: entry.key)
-                                        } label: { Label("Delete", systemImage: "trash") }
-                                    }
+                            ForEach(visibleJournals, id: \.key) { entry in
+                                // Semantic button: the whole row opens the
+                                // detail (player + transcript + edit).
+                                Button {
+                                    selectedDetail = entry
+                                } label: {
+                                    journalRow(entry)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel(journalRowAccessibilityLabel(entry))
+                                .contextMenu {
+                                    Button(role: .destructive) {
+                                        state.softDelete(key: entry.key)
+                                    } label: { Label("Delete", systemImage: "trash") }
+                                }
+                                .task { loadAudioDurationIfNeeded(entry) }
                             }
                         }
                     }
@@ -2552,25 +2710,46 @@ struct JournalView: View {
         }
     }
 
-    /// One list row: waveform glyph (audio) + title + time + preview. When the
-    /// entry is still being transcribed (placeholder body), shows a circular
-    /// loader + "Transcribing…" so the user sees the transcript is pending.
+    /// Compact sort menu: newest-first (default), oldest-first, title.
+    private var sortMenu: some View {
+        Menu {
+            Picker("Sort journals", selection: $sortOrder) {
+                Label("Newest First", systemImage: "arrow.down")
+                    .tag(JournalSort.newestFirst)
+                Label("Oldest First", systemImage: "arrow.up")
+                    .tag(JournalSort.oldestFirst)
+                Label("Title", systemImage: "textformat.abc")
+                    .tag(JournalSort.title)
+            }
+        } label: {
+            Image(systemName: "arrow.up.arrow.down")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(DS.muted(scheme))
+                .frame(width: 32, height: 32)
+                .background(DS.surface2(scheme), in: Circle())
+        }
+        .accessibilityLabel("Sort journals")
+    }
+
+    /// One list row (Voice Memos style): leading glyph — spinner while
+    /// transcribing, waveform for audio, text glyph otherwise — then the
+    /// title over a metadata line (localized date/time + audio duration, or
+    /// the transcribing status), and a trailing chevron. The transcript
+    /// preview is gone: the detail view owns the transcript.
     private func journalRow(_ entry: SlowClawMemoryEntry) -> some View {
         let isAudio = entry.source?.hasPrefix("audio") == true
         let transcribing = AppState.isTranscribingPlaceholder(entry.content)
-        return HStack(alignment: .top, spacing: 12) {
-            // Audio glyph / waveform mini — or a spinner while transcribing.
+        return HStack(alignment: .center, spacing: 12) {
+            // Leading glyph / spinner.
             if transcribing {
                 ProgressView()
                     .scaleEffect(0.7)
                     .frame(width: 24, height: 24)
-                    .padding(.top, 2)
             } else {
                 Image(systemName: isAudio ? "waveform" : "text.alignleft")
                     .font(.system(size: 16))
                     .foregroundStyle(isAudio ? DS.accent2Color : DS.muted(scheme))
                     .frame(width: 24, height: 24)
-                    .padding(.top, 2)
             }
 
             VStack(alignment: .leading, spacing: 3) {
@@ -2585,22 +2764,48 @@ struct JournalView: View {
                             .scaleEffect(0.5)
                             .frame(width: 12, height: 12)
                     }
-                    Spacer(minLength: 4)
-                    Text(journalRelativeTime(entry))
-                        .font(DS.microFont)
-                        .foregroundStyle(DS.muted(scheme))
                 }
-                let preview = journalPreviewOf(entry)
-                if !preview.isEmpty {
-                    Text(preview)
-                        .font(DS.captionFont)
-                        .foregroundStyle(DS.muted(scheme))
-                        .lineLimit(1)
+
+                HStack(spacing: 6) {
+                    if transcribing {
+                        Text("Transcribing…")
+                            .foregroundStyle(DS.accent2Color)
+                    } else if let date = journalDate(entry) {
+                        Text(Self.localizedDateTime(date))
+                    }
+                    // Audio duration (best-effort; hidden until it lands).
+                    if isAudio, let duration = audioDurations[entry.key], duration > 0 {
+                        Text(audioClock(duration))
+                    }
                 }
+                .font(DS.microFont)
+                .foregroundStyle(DS.muted(scheme))
             }
+
+            Spacer(minLength: 4)
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(DS.muted(scheme).opacity(0.6))
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+        .contentShape(Rectangle())
+    }
+
+    /// VoiceOver label for a row: title, then either the transcribing status
+    /// or the localized date/time, plus the duration when known.
+    private func journalRowAccessibilityLabel(_ entry: SlowClawMemoryEntry) -> String {
+        var parts = [journalTitleOf(entry)]
+        if AppState.isTranscribingPlaceholder(entry.content) {
+            parts.append("Transcribing")
+        } else if let date = journalDate(entry) {
+            parts.append(Self.localizedDateTime(date))
+        }
+        if let duration = audioDurations[entry.key], duration > 0 {
+            parts.append(audioClock(duration))
+        }
+        return parts.joined(separator: ", ")
     }
 
     private var emptyState: some View {
@@ -2617,6 +2822,11 @@ struct JournalView: View {
             Text("Tap the red button to record, or the pen to write.")
                 .font(DS.microFont)
                 .foregroundStyle(DS.muted(scheme))
+            // The import hint lives ONLY here (empty state) — never as a
+            // persistent instruction above a populated list.
+            Text("Import voice memos via the share sheet → SlowClaw.")
+                .font(DS.microFont)
+                .foregroundStyle(DS.muted(scheme))
             Spacer()
         }
         .frame(maxWidth: .infinity)
@@ -2627,8 +2837,8 @@ struct JournalView: View {
     private var baseBar: some View {
         VStack(spacing: 0) {
             Divider().opacity(0.4)
-            HStack(spacing: 28) {
-                // Pen → text compose.
+            HStack(spacing: 0) {
+                // Leading: text compose (the secondary action).
                 Button {
                     showCompose = true
                 } label: {
@@ -2643,7 +2853,7 @@ struct JournalView: View {
 
                 Spacer()
 
-                // Big red record button.
+                // Center: the big red record button.
                 Button {
                     Task {
                         recorder.title = ""
@@ -2663,6 +2873,13 @@ struct JournalView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Record an audio journal")
+
+                Spacer()
+
+                // Trailing balance — same 56pt footprint as the leading pen
+                // button so the record button sits exactly centered.
+                Color.clear
+                    .frame(width: 56, height: 56)
             }
             .padding(.horizontal, 36)
             .padding(.top, 12)
@@ -2716,6 +2933,7 @@ struct JournalView: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(recorder.isPaused ? "Resume recording" : "Pause recording")
 
                     Button {
                         recorder.finishRecording()
@@ -2731,6 +2949,7 @@ struct JournalView: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Stop recording")
                 }
 
                 if let err = recorder.errorMessage {
@@ -3135,6 +3354,18 @@ struct OnDeviceAICard: View {
             && (!model.hasAudioMmproj || LocalModelStore.isMmprojDownloaded(model))
         let progress = state.localModelProgress[model.id]
         let isLoaded = state.localLLM.loaded
+        // Per-preset download tracking: only the row actually downloading is
+        // gated. `localModelBusy` means ACTIVATION now, so other presets'
+        // Download buttons stay enabled during a transfer.
+        let isDownloading = state.activeDownloadIDs.contains(model.id)
+        let anyDownloadActive = !state.activeDownloadIDs.isEmpty
+        // Activation-conflicting controls: loading a model while a multi-GB
+        // download streams (or vice versa) fights for RAM/disk, and deleting
+        // files mid-transfer/activation corrupts state — block those, and
+        // ONLY those, while work is in flight.
+        let conflictControlsDisabled = state.localModelBusy || anyDownloadActive
+        // Audio presets download text GGUF + mmproj; show the combined size.
+        let sizeLabel = model.mmprojSizeLabel.map { "\(model.sizeLabel) + \($0)" } ?? model.sizeLabel
 
         VStack(alignment: .leading, spacing: 6) {
             Text(model.title)
@@ -3144,25 +3375,29 @@ struct OnDeviceAICard: View {
                 .font(DS.captionFont)
                 .foregroundStyle(DS.muted(scheme))
 
-            if let progress, progress < 1, !downloaded {
-                // Download in progress.
-                ProgressView(value: progress)
+            if isDownloading, let progress {
+                // Determinate bar from the first tick — including 0%, while
+                // the background session still waits for unmetered Wi-Fi
+                // before the first byte moves.
+                ProgressView(value: min(max(progress, 0), 1))
                     .tint(DS.accentColor)
-                Text("\(Int(progress * 100))% of \(model.sizeLabel)")
+                Text(progress <= 0
+                     ? "Preparing / waiting for Wi-Fi"
+                     : "\(Int(progress * 100))% of \(sizeLabel)")
                     .font(DS.microFont)
                     .foregroundStyle(DS.muted(scheme))
             } else if !downloaded {
                 Button {
                     Task { await state.downloadLocalModel(model) }
                 } label: {
-                    Label("Download (\(model.sizeLabel))", systemImage: "arrow.down.circle")
+                    Label("Download (\(sizeLabel))", systemImage: "arrow.down.circle")
                         .font(DS.captionFont.weight(.medium))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6)
                 }
                 .buttonStyle(.bordered)
                 .tint(DS.accentColor)
-                .disabled(state.localModelBusy)
+                .disabled(isDownloading || state.localModelBusy)
             } else if !isLoaded {
                 HStack(spacing: 8) {
                     Button {
@@ -3175,7 +3410,7 @@ struct OnDeviceAICard: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(DS.accentColor)
-                    .disabled(state.localModelBusy)
+                    .disabled(conflictControlsDisabled)
 
                     Button(role: .destructive) {
                         state.deleteLocalModel(model)
@@ -3186,7 +3421,7 @@ struct OnDeviceAICard: View {
                     }
                     .buttonStyle(.bordered)
                     .tint(DS.accent2Color)
-                    .disabled(state.localModelBusy)
+                    .disabled(conflictControlsDisabled)
                 }
             } else {
                 HStack(spacing: 8) {
@@ -3200,6 +3435,7 @@ struct OnDeviceAICard: View {
                     }
                     .buttonStyle(.bordered)
                     .tint(DS.accentColor)
+                    .disabled(conflictControlsDisabled)
 
                     Button(role: .destructive) {
                         state.deleteLocalModel(model)
@@ -3210,6 +3446,7 @@ struct OnDeviceAICard: View {
                     }
                     .buttonStyle(.bordered)
                     .tint(DS.accent2Color)
+                    .disabled(conflictControlsDisabled)
                 }
             }
         }

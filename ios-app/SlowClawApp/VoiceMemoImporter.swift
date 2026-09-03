@@ -6,7 +6,8 @@
 //
 // Flow:
 //   1. enqueue(_:) copies the shared file into Documents/Inbox under a
-//      UUID-based name (collision-proof even for same-second imports) and
+//      UUID-based name (collision-proof even for same-second imports),
+//      validates the copy decodes as audio, and
 //      IMMEDIATELY records the import in a durable queue file
 //      (Documents/pending_voice_imports.json, atomic write) — before any
 //      store attempt. Each record carries a stable journalKey, assigned at
@@ -14,12 +15,12 @@
 //      leaves an app-visible intent that the next launch retries.
 //   2. When AppState is wired, the placeholder journal is stored right away
 //      under the record's journalKey (durable SQLite row linked via
-//      source="audio_imported" + media_url) and the queued record is dropped;
-//      transcription is handed to AppState's persisted pending queue (the
-//      same path recordings use). The queued record is removed ONLY after
-//      that store succeeds — and because retries reuse the same journalKey
-//      (memory.store is an upsert by key), even a crash between store and
-//      removal re-stores the SAME row on relaunch instead of duplicating it.
+//      source="audio_imported" + media_url), then transcription is handed to
+//      AppState's persisted pending queue (the same path recordings use). The
+//      import record is removed ONLY after both the store and durable handoff
+//      succeed. Because retries reuse the same journalKey (memory.store is an
+//      upsert by key), a crash between those steps recovers the SAME row on
+//      relaunch without duplicating or overwriting a completed transcript.
 //   3. The queue is mirrored into memory for the serial worker, which
 //      retries failed stores with backoff (attempts are persisted; they
 //      reset on the next launch). When AppState attaches (its weak property
@@ -37,8 +38,10 @@
 // spawning a Task per incoming URL). @MainActor isolation keeps enqueue/worker
 // coordination thread-safe.
 
+import AVFoundation
 import Foundation
 import UIKit
+import UniformTypeIdentifiers
 
 /// One pending import. `url` is the copied-into-Inbox destination (already on
 /// disk). The queue is mirrored to Documents/pending_voice_imports.json after
@@ -58,6 +61,20 @@ struct PendingVoiceMemo: Codable, Equatable {
     var storeAttempts: Int = 0
 }
 
+/// Typed reasons a voice-memo import can fail before the item is queued. Kept small on
+/// purpose: `enqueue` maps each case to a distinct user-facing status so
+/// copy/access problems are never mislabeled as "unsupported audio" (they
+/// have different fixes — retry/re-share vs. protected or non-audio source).
+enum VoiceMemoImportError: Error {
+    /// The delivered URL isn't a file URL — nothing to copy.
+    case notAFileURL
+    /// The security-scoped read or the sandbox copy itself failed.
+    case copyFailed(String)
+    /// The copy landed but AVFoundation cannot decode it as audio (or it
+    /// contains zero audio frames) — e.g. DRM-protected or non-audio data.
+    case undecodable
+}
+
 @MainActor
 final class VoiceMemoImporter: ObservableObject {
     @Published var isImporting = false
@@ -69,9 +86,9 @@ final class VoiceMemoImporter: ObservableObject {
     private var queue: [PendingVoiceMemo] = []
     private var worker: Task<Void, Never>? = nil
 
-    /// How many times the worker retries a failed journal store before ending
-    /// its drain pass. The item stays queued (and persisted); attempts reset
-    /// on the next launch.
+    /// How many times the worker retries a failed journal store or durable
+    /// transcription-queue handoff before ending its drain pass. The item
+    /// stays queued (and persisted); attempts reset on the next launch.
     private static let maxStoreAttempts = 3
 
     /// Source URLs handed to enqueue recently (absolute string → time). Guards
@@ -113,11 +130,12 @@ final class VoiceMemoImporter: ObservableObject {
         return inbox
     }
 
-    /// Copy a shared audio file URL into the workspace Inbox, durably queue
-    /// it, and store it as a journal. Returns the destination URL, or nil if
-    /// the source isn't an audio file / copy fails. Safe to call repeatedly;
-    /// each accepted call imports exactly one item (same-share re-delivery is
-    /// deduped within a short window).
+    /// Copy a shared audio file URL into the workspace Inbox (validated as
+    /// decodable audio), durably queue it, and store it as a journal. Returns
+    /// the destination URL, or nil if the import fails — `status` then
+    /// discloses the specific typed reason (file/copy/access vs. not-audio).
+    /// Safe to call repeatedly; each accepted call imports exactly one item
+    /// (same-share re-delivery is deduped within a short window).
     @discardableResult
     func enqueue(_ sourceURL: URL) -> URL? {
         // Prune expired entries, then ignore a re-delivery of a share we
@@ -130,11 +148,17 @@ final class VoiceMemoImporter: ObservableObject {
         }
         if recentlyEnqueuedSources[sourceKey] != nil { return nil }
 
-        guard let dest = copyAudio(sourceURL) else {
-            // Surface the rejection so the user isn't left wondering why
-            // "Preparing" finished with no result (the share sheet shows
+        let dest: URL
+        do {
+            dest = try copyAndValidateAudio(sourceURL)
+        } catch let error as VoiceMemoImportError {
+            // Surface the accurate reason so the user isn't left wondering
+            // why "Preparing" finished with no result (the share sheet shows
             // "Preparing" while iOS copies, then nothing visible happened).
-            status = "Couldn't import that file (unsupported audio type)."
+            status = Self.statusMessage(for: error)
+            return nil
+        } catch {
+            status = "Import failed: \(error.localizedDescription)"
             return nil
         }
         // Only record the source as handled once the copy actually landed —
@@ -156,12 +180,21 @@ final class VoiceMemoImporter: ObservableObject {
         if let state = appState {
             let mediaURL = Self.documentsRelativePath(for: dest)
             if let key = storePlaceholderJournal(item, mediaURL: mediaURL) {
-                removeQueuedItem(urlPath: dest.path)
                 status = "Imported — transcribing"
-                Task { await self.followUpAfterStore(state, key: key, mediaURL: mediaURL) }
-                // Drain any backlog (cold launch / failed stores). A no-op
-                // drain leaves `status` untouched, so this message survives.
-                ensureWorker()
+                // Keep the durable import record until the transcription queue
+                // has accepted the handoff. Removing it before this async step
+                // left a kill window where the audio had a placeholder row but
+                // no retry intent anywhere.
+                Task {
+                    let handedOff = await self.followUpAfterStore(
+                        state, key: key, mediaURL: mediaURL)
+                    if handedOff {
+                        self.removeQueuedItem(urlPath: dest.path)
+                    } else {
+                        self.status = "Imported, but transcription retry could not be saved. Keep SlowClaw open."
+                        self.ensureWorker()
+                    }
+                }
                 return dest
             }
             // Store failed: the item is already persisted; the worker
@@ -181,12 +214,21 @@ final class VoiceMemoImporter: ObservableObject {
         return dest
     }
 
-    private func copyAudio(_ sourceURL: URL) -> URL? {
-        guard isAudioFile(sourceURL) else {
-            status = "Import skipped: '\(sourceURL.pathExtension)' isn't an audio file."
-            return nil
-        }
+    /// Copy a shared audio file URL into the workspace Inbox and validate
+    /// that the copy decodes as audio. Throws `VoiceMemoImportError` on failure; the
+    /// source is only ever COPIED — never moved or deleted.
+    ///
+    /// Type metadata is advisory: a URL whose UTType conforms to `.audio` is
+    /// accepted, and generic/missing metadata (common for extensionless
+    /// provider exports) is NOT rejected up front — the AVFoundation decode
+    /// of the sandbox copy is the real gate. The read is coordinated via
+    /// NSFileCoordinator while security-scoped access is active, so
+    /// provider-staged files are pulled in consistently.
+    private func copyAndValidateAudio(_ sourceURL: URL) throws -> URL {
+        guard sourceURL.isFileURL else { throw VoiceMemoImportError.notAFileURL }
+
         // Re-resolve security-scoped URLs (share-sheet imports are scoped).
+        // The coordinated read below must happen while access is active.
         let didStart = sourceURL.startAccessingSecurityScopedResource()
         defer { if didStart { sourceURL.stopAccessingSecurityScopedResource() } }
 
@@ -194,24 +236,85 @@ final class VoiceMemoImporter: ObservableObject {
         // the name collision-proof (same-second imports, identical titles).
         let ts = Int(Date().timeIntervalSince1970)
         let base = sourceURL.deletingPathExtension().lastPathComponent
-        let ext = sourceURL.pathExtension.isEmpty ? "m4a" : sourceURL.pathExtension
+        let ext = destinationExtension(for: sourceURL)
         let dest = inboxURL.appendingPathComponent("\(ts)-\(sanitize(base))-\(UUID().uuidString).\(ext)")
+
+        // Copy ONLY. The source is an external file iOS/the provider owns and
+        // must never be moved or deleted by an import; a cross-volume move
+        // would do exactly that, so it is intentionally not a fallback here.
+        // NSFileCoordinator serializes the read against the providing app
+        // (e.g. iCloud/Drive downloads) while the security scope is held.
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        var coordinationError: NSError?
+        var copyError: Error?
+        coordinator.coordinate(readingItemAt: sourceURL, options: [], error: &coordinationError) { url in
+            do {
+                try FileManager.default.copyItem(at: url, to: dest)
+            } catch {
+                copyError = error
+            }
+        }
+        if let copyError {
+            try? FileManager.default.removeItem(at: dest) // partial-copy cleanup; source untouched
+            throw VoiceMemoImportError.copyFailed(copyError.localizedDescription)
+        }
+        if let coordinationError {
+            try? FileManager.default.removeItem(at: dest)
+            throw VoiceMemoImportError.copyFailed(coordinationError.localizedDescription)
+        }
+
+        // Validate the sandbox copy with the same decoder transcription uses:
+        // it must open as audio AND contain at least one frame. DRM-protected
+        // and non-audio files fail here. Only the newly-created destination is
+        // ever removed — the source is never touched.
         do {
-            // Copy ONLY. The source is an external file iOS owns (often a
-            // temp file outside our sandbox) and must never be moved or
-            // deleted by an import; a cross-volume move would do exactly
-            // that, so it is intentionally not a fallback here.
-            try FileManager.default.copyItem(at: sourceURL, to: dest)
-            return dest
+            let audio = try AVAudioFile(forReading: dest)
+            if audio.length <= 0 {
+                try? FileManager.default.removeItem(at: dest)
+                throw VoiceMemoImportError.undecodable
+            }
+        } catch let error as VoiceMemoImportError {
+            throw error
         } catch {
-            status = "Import failed: \(error.localizedDescription)"
-            return nil
+            try? FileManager.default.removeItem(at: dest)
+            throw VoiceMemoImportError.undecodable
+        }
+        return dest
+    }
+
+    /// Destination extension: keep the source's when present (Voice Memos
+    /// always sends one); otherwise use the declared content type's preferred
+    /// extension when it is audio; else default to m4a. Metadata is advisory —
+    /// a missing/generic type falls through to the default and acceptance is
+    /// decided by the decode check, not the name.
+    private func destinationExtension(for sourceURL: URL) -> String {
+        let sourceExt = sourceURL.pathExtension
+        if !sourceExt.isEmpty { return sourceExt }
+        if let type = try? sourceURL.resourceValues(forKeys: [.contentTypeKey]).contentType,
+           type.conforms(to: .audio),
+           let preferred = type.preferredFilenameExtension {
+            return preferred
+        }
+        return "m4a"
+    }
+
+    /// User-facing message per typed import failure.
+    private static func statusMessage(for error: VoiceMemoImportError) -> String {
+        switch error {
+        case .notAFileURL:
+            return "Import skipped: that item isn't a file."
+        case .copyFailed(let detail):
+            return "Import failed: \(detail)"
+        case .undecodable:
+            return "Import skipped: that file isn't readable audio (it may be protected or not audio)."
         }
     }
 
     /// Store the placeholder journal row for a copied memo (title + linked
     /// audio, content = AppState.transcribingPlaceholder) under the record's
-    /// STABLE journalKey. Returns the key on success; nil on failure (status
+    /// STABLE journalKey. If that key already exists during crash recovery,
+    /// preserve it verbatim because it may hold a completed transcript.
+    /// Returns the key on success; nil on failure (status
     /// is set; the copied file stays on disk and retryable). Because the key
     /// never changes per record and memory.store upserts by key, every retry
     /// is an idempotent upsert: a crash after a successful store but before
@@ -233,6 +336,10 @@ final class VoiceMemoImporter: ObservableObject {
         f.dateFormat = "MMM d, h:mm a"
         let title = "Imported · \(f.string(from: Date()))"
         do {
+            // A previous run may have stored this stable key and then died
+            // before removing the import record. Never overwrite that row on
+            // recovery: it may already contain the completed transcript.
+            if try state.memory.get(key: key) != nil { return key }
             try state.memory.store(key: key,
                                    content: "\(title)\n\n\(AppState.transcribingPlaceholder)",
                                    category: "daily", sessionID: nil,
@@ -247,14 +354,15 @@ final class VoiceMemoImporter: ObservableObject {
     /// Post-store follow-up: refresh the journal list and hand the audio to
     /// AppState's persisted pending-transcription queue (pending_
     /// transcriptions.json — survives app kills, drained newest-first at
-    /// launch/foreground). Takes the state explicitly so a strong reference
+    /// launch/foreground). Returns true only when that durable handoff was
+    /// written, so the caller knows when it may remove the import record.
+    /// Takes the state explicitly so a strong reference
     /// lives for the whole follow-up even if `appState` weaks out mid-flow.
-    private func followUpAfterStore(_ state: AppState, key: String, mediaURL: String?) async {
+    private func followUpAfterStore(_ state: AppState, key: String, mediaURL: String?) async -> Bool {
         await state.refreshJournals()
-        if let mediaPath = mediaURL {
-            await state.enqueuePendingTranscription(key: key, mediaPath: mediaPath,
-                                                    generateTitleAfter: false)
-        }
+        guard let mediaPath = mediaURL else { return false }
+        return await state.enqueuePendingTranscription(key: key, mediaPath: mediaPath,
+                                                       generateTitleAfter: false)
     }
 
     /// Lazily start the single serial worker if it isn't already running. The
@@ -298,19 +406,27 @@ final class VoiceMemoImporter: ObservableObject {
                 var item = next
                 let mediaURL = Self.documentsRelativePath(for: item.url)
                 if let key = storePlaceholderJournal(item, mediaURL: mediaURL) {
-                    importedCount += 1
-                    // Durable removal — only after the store landed. If the
-                    // queue write fails here it's benign: a relaunch reloads
-                    // the record and re-stores the SAME journalKey (upsert).
-                    removeQueuedItem(urlPath: item.url.path)
-                    await followUpAfterStore(state, key: key, mediaURL: mediaURL)
-                    continue
+                    // The import record remains authoritative until the
+                    // persisted transcription queue accepts the handoff. This
+                    // closes the store→enqueue crash window and, on recovery,
+                    // storePlaceholderJournal preserves any existing body.
+                    if await followUpAfterStore(state, key: key, mediaURL: mediaURL) {
+                        importedCount += 1
+                        removeQueuedItem(urlPath: item.url.path)
+                        continue
+                    }
+                    status = "Couldn't save transcription retry info; the import remains queued."
                 }
 
-                // Store failed: bump and persist the attempt (never delete
-                // the file), back off, and after too many consecutive
-                // failures end this pass — the item stays queued and
-                // persisted for the next drain or the next launch.
+                // Store or durable handoff failed: bump and persist the
+                // attempt (never delete the file), back off, and after too
+                // many consecutive failures end this pass — the item stays
+                // queued for the next drain or launch. Reload first because
+                // storePlaceholderJournal may have assigned a legacy record's
+                // missing stable key in the durable queue.
+                if let latest = queue.first(where: { $0.url.path == item.url.path }) {
+                    item = latest
+                }
                 item.storeAttempts += 1
                 updateQueuedItem(item)
                 if item.storeAttempts < Self.maxStoreAttempts {
@@ -425,15 +541,6 @@ final class VoiceMemoImporter: ObservableObject {
             loadPersistedQueueOnce()
             ensureWorker()
         }
-    }
-
-    private func isAudioFile(_ url: URL) -> Bool {
-        // Keep in sync with Info.plist LSItemContentTypes. mp4 audio (e.g.
-        // .m4a is the common case) is covered; .mov/.mp4 containers are video
-        // and intentionally excluded here even though the share sheet accepts
-        // public.mpeg4-audio — accept only audio-only extensions at runtime.
-        let exts: Set<String> = ["m4a", "mp3", "aac", "wav", "flac", "caf", "aiff"]
-        return exts.contains(url.pathExtension.lowercased())
     }
 
     private func sanitize(_ s: String) -> String {
