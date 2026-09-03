@@ -12,6 +12,7 @@ on:
     push:
         branches:
             - main
+            - fix/local-audio-transcription-observability # temporary pre-merge validation
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
             - "zig-src/**"
