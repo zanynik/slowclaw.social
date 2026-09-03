@@ -321,6 +321,10 @@ final class AppState: ObservableObject {
     // memory and every AI surface (synthesis, interests, drafts, TweetClaw)
     // runs on-device — the local-first path. Download progress is per-preset.
     @Published var localLLM: LocalLLMStatus = LocalLLMStatus(available: false)
+    /// Preset activated in this process. The Zig model metadata does not carry
+    /// the quant/file identity, so UI rows must not treat every preset as the
+    /// active one merely because some model is loaded.
+    @Published var loadedLocalModelPresetID: String? = nil
     /// True only while a model ACTIVATION (load into llama.cpp) is in flight.
     /// Downloads no longer set this — per-preset download state lives in
     /// `activeDownloadIDs`, so a multi-GB download never disables unrelated
@@ -339,12 +343,17 @@ final class AppState: ObservableObject {
     /// which is restored from disk before this process has reattached.
     private var localDownloadOperations: Set<String> = []
 
-    // On-device audio transcription (mtmd / Gemma-audio). Experimental and
-    // OFF by default — SpeechAnalyzer remains the stable default. When ON
-    // AND an audio mmproj is loaded, file transcription routes through the
-    // Zig core's mtmd layer (with SpeechAnalyzer as the automatic fallback).
+    // On-device audio transcription (mtmd / Gemma audio). OFF by default.
+    // When enabled, every file/re-transcription attempts mtmd first and logs
+    // the actual route; Apple on-device Speech is fallback-only.
     @AppStorage("experimentalAudioEngine") var experimentalAudioEngine: Bool = false
     @Published var localAudio: LocalAudioStatus = LocalAudioStatus()
+    /// Prevent model unload/replacement while mtmd owns pointers into it.
+    @Published var audioTranscriptionInFlight: Bool = false
+    @Published var audioTranscriptionProgress: String? = nil
+    private var audioTranscriptionCount = 0
+    /// Last manual transcription route/result, shown beside Re-transcribe.
+    @Published var lastTranscriptionStatus: String? = nil
 
     // 🔬 Locked-phone CPU experiment. When ON, finishRecording keeps the
     // AVAudioSession active past Stop and runs transcription inside that
@@ -504,18 +513,12 @@ final class AppState: ObservableObject {
 
     func refreshLocalLLMStatus() {
         localLLM = slowClawLocalLLMStatus()
+        if !localLLM.loaded { loadedLocalModelPresetID = nil }
     }
 
     /// Refresh on-device audio engine status (mtmd/mmproj).
     func refreshLocalAudioStatus() {
         localAudio = slowClawLocalAudioStatus()
-    }
-
-    /// True when the experimental Gemma-audio engine should be used for file
-    /// transcription: the toggle is ON, the mtmd backend is linked, and an
-    /// audio-capable mmproj is loaded. SpeechAnalyzer is the default otherwise.
-    var gemmaAudioEligible: Bool {
-        experimentalAudioEngine && localAudio.available && localAudio.supported
     }
 
     /// True when any LLM is usable: a configured remote provider OR a loaded
@@ -603,10 +606,20 @@ final class AppState: ObservableObject {
         localModelBusy = true
         localModelError = nil
         defer { localModelBusy = false }
+        // An mtmd projector holds a pointer to the current text model. Detach
+        // it before local inference replaces/reloads that model, including
+        // when upgrading the shared Q4 row to its audio add-on.
+        slowClawLocalAudioUnload()
+        refreshLocalAudioStatus()
         let err = await Task.detached(priority: .userInitiated) {
             slowClawLocalLLMLoad(path: url.path)
         }.value
-        if let err { localModelError = err }
+        if let err {
+            localModelError = err
+            loadedLocalModelPresetID = nil
+        } else {
+            loadedLocalModelPresetID = preset.id
+        }
         refreshLocalLLMStatus()
 
         // If this preset has an audio mmproj and it's downloaded, load it so
@@ -618,7 +631,15 @@ final class AppState: ObservableObject {
             let mmprojErr = await Task.detached(priority: .userInitiated) {
                 slowClawLocalAudioLoadMMProj(path: mmprojURL.path)
             }.value
-            if let mmprojErr { localModelError = mmprojErr }
+            if let mmprojErr {
+                localModelError = mmprojErr
+                // The shared text model did load, but the audio bundle did
+                // not. Mark the matching text-only row active rather than
+                // falsely presenting mtmd as ready.
+                loadedLocalModelPresetID = LocalModelPreset.presets.first {
+                    !$0.hasAudioMmproj && $0.fileName == preset.fileName
+                }?.id
+            }
         }
         refreshLocalAudioStatus()
     }
@@ -628,6 +649,7 @@ final class AppState: ObservableObject {
         // the text model, then refresh both statuses.
         slowClawLocalAudioUnload()
         slowClawLocalLLMUnload()
+        loadedLocalModelPresetID = nil
         refreshLocalLLMStatus()
         refreshLocalAudioStatus()
     }
@@ -635,7 +657,14 @@ final class AppState: ObservableObject {
     func deleteLocalModel(_ preset: LocalModelPreset) {
         // Unload first if any model is active (frees RAM), then remove the
         // files (text GGUF + mmproj if present).
-        if localLLM.loaded { unloadLocalModel() }
+        // Only unload when deleting the active preset or another row that
+        // points at the same shared text GGUF (Q4 and its audio add-on).
+        if localLLM.loaded,
+           let activeID = loadedLocalModelPresetID,
+           let active = LocalModelPreset.presets.first(where: { $0.id == activeID }),
+           active.fileName == preset.fileName {
+            unloadLocalModel()
+        }
         try? LocalModelStore.delete(preset)
         try? LocalModelStore.deleteMmproj(preset)
         localModelProgress[preset.id] = nil
@@ -1221,22 +1250,9 @@ final class AppState: ObservableObject {
                 continue
             }
 
-            let transcript: AudioSTTResult
-            if self.lockedPhoneExperiment {
-                // 🔬 Experiment path: hold the AVAudioSession active past Stop
-                // and run transcription inside that window, logging timings +
-                // lock state to experiment_log.jsonl. Mic is off (recording
-                // stopped); we only keep the audio-mode lifeline for inference.
-                transcript = await Task.detached(priority: .userInitiated) {
-                    await LockedPhoneExperiment.run(url: absURL, useGemmaAudio: self.gemmaAudioEligible)
-                }.value
-            } else {
-                transcript = await Task.detached(priority: .userInitiated) {
-                    // Route through the shared STT router: experimental Gemma-audio
-                    // (mtmd) when eligible, else SpeechAnalyzer (the proven default).
-                    await AudioSTT.transcribe(url: absURL, useGemmaAudio: self.gemmaAudioEligible)
-                }.value
-            }
+            let transcript = await performAudioTranscription(
+                url: absURL, context: .automatic,
+                keepAliveWhileLocked: lockedPhoneExperiment)
             let trimmedTranscript = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmedTranscript.isEmpty {
                 // Empty recognition: never clobber the stored entry, and never
@@ -1324,8 +1340,8 @@ final class AppState: ObservableObject {
     /// re-checked against audio that previously transcribed badly. It is also
     /// the retry path for rows the drain gave up on automatically (the
     /// explicit no-transcript markers, which reconcile never re-queues).
-    /// Uses the shared STT router (experimental Gemma-audio when eligible,
-    /// else SpeechAnalyzer) exactly like the drain path. Returns the entry's
+    /// Uses the shared STT router: Gemma/mtmd first when the preference is on,
+    /// otherwise segmented Apple Speech. Returns the entry's
     /// full new content, or "" when there is no audio file, recognition came
     /// back empty, the entry row is gone, or the store failed — in every
     /// failure case the existing content is left untouched (never
@@ -1333,11 +1349,17 @@ final class AppState: ObservableObject {
     func retranscribeJournal(_ entry: SlowClawMemoryEntry) async -> String {
         guard let rel = entry.mediaURL, !rel.isEmpty,
               let url = AudioRecorder.absoluteURL(forMediaRelativePath: rel),
-              FileManager.default.fileExists(atPath: url.path) else { return "" }
-        let eligible = gemmaAudioEligible
-        let transcript = await Task.detached(priority: .userInitiated) {
-            await AudioSTT.transcribe(url: url, useGemmaAudio: eligible)
-        }.value
+              FileManager.default.fileExists(atPath: url.path) else {
+            lastTranscriptionStatus = "Audio file is missing."
+            return ""
+        }
+        let useGemma = experimentalAudioEngine
+        lastTranscriptionStatus = useGemma
+            ? "Starting Gemma 4 Audio (mtmd)…"
+            : "Starting Apple's segmented on-device transcription…"
+        let transcript = await performAudioTranscription(
+            url: url, context: .retranscribe, keepAliveWhileLocked: false)
+        lastTranscriptionStatus = "\(transcript.engine.rawValue): \(transcript.diagnostic ?? "finished")"
         // Data safety: an empty/failed recognition must never overwrite the
         // existing transcript. Bail out so the caller can surface the failure.
         let trimmed = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1355,6 +1377,40 @@ final class AppState: ObservableObject {
         // store actually persisted.
         guard await storeJournalUpdate(key: entry.key, content: newContent) else { return "" }
         return newContent
+    }
+
+    /// Single AppState funnel for file STT. The count keeps model lifecycle
+    /// controls disabled until all overlapping callers finish; mtmd also
+    /// serializes internally, but UI-driven unload must never race its model
+    /// pointers.
+    private func performAudioTranscription(
+        url: URL,
+        context: AudioSTTContext,
+        keepAliveWhileLocked: Bool
+    ) async -> AudioSTTResult {
+        audioTranscriptionCount += 1
+        audioTranscriptionInFlight = true
+        defer {
+            audioTranscriptionCount -= 1
+            audioTranscriptionInFlight = audioTranscriptionCount > 0
+            if audioTranscriptionCount == 0 { audioTranscriptionProgress = nil }
+        }
+        let useGemma = experimentalAudioEngine
+        let report: @Sendable (String) -> Void = { [weak self] message in
+            Task { @MainActor [weak self] in
+                self?.audioTranscriptionProgress = message
+            }
+        }
+        if keepAliveWhileLocked {
+            return await Task.detached(priority: .userInitiated) {
+                await LockedPhoneExperiment.run(url: url, useGemmaAudio: useGemma,
+                                                 progress: report)
+            }.value
+        }
+        return await Task.detached(priority: .userInitiated) {
+            await AudioSTT.transcribe(url: url, useGemmaAudio: useGemma,
+                                      context: context, progress: report)
+        }.value
     }
 
     // MARK: - Missing-transcript reconciliation
@@ -1984,6 +2040,14 @@ struct JournalDetailView: View {
                                 // editor on success instead).
                                 .disabled(isRetranscribing)
                                 .onChange(of: editedBody) { scheduleBodyAutosave() }
+                            if let status = state.lastTranscriptionStatus {
+                                Text(status)
+                                    .font(DS.microFont)
+                                    .foregroundStyle(status.contains("failed")
+                                                     || status.contains("no transcript")
+                                                     ? DS.accent2Color
+                                                     : DS.muted(scheme))
+                            }
                         }
                     }
                     .padding(.horizontal, 16)
@@ -2040,7 +2104,8 @@ struct JournalDetailView: View {
         .alert("Re-transcription failed", isPresented: $showRetranscribeFailedAlert) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text("No speech was recognized. Your transcript was left unchanged.")
+            Text(state.lastTranscriptionStatus
+                 ?? "No speech was recognized. Your transcript was left unchanged.")
         }
         .alert("Couldn't save", isPresented: $showSaveErrorAlert) {
             Button("OK", role: .cancel) {}
@@ -3301,7 +3366,10 @@ struct OnDeviceAICard: View {
 
                 // Status line.
                 if state.localLLM.loaded {
-                    Text("Ready — \(state.localLLM.modelId ?? "model") is running on-device")
+                    let activeTitle = LocalModelPreset.presets.first {
+                        $0.id == state.loadedLocalModelPresetID
+                    }?.title ?? state.localLLM.modelId ?? "model"
+                    Text("Ready — \(activeTitle) is running on-device")
                         .font(DS.microFont)
                         .foregroundStyle(DS.accent(scheme))
                 } else if !state.localLLM.available {
@@ -3354,6 +3422,7 @@ struct OnDeviceAICard: View {
             && (!model.hasAudioMmproj || LocalModelStore.isMmprojDownloaded(model))
         let progress = state.localModelProgress[model.id]
         let isLoaded = state.localLLM.loaded
+            && state.loadedLocalModelPresetID == model.id
         // Per-preset download tracking: only the row actually downloading is
         // gated. `localModelBusy` means ACTIVATION now, so other presets'
         // Download buttons stay enabled during a transfer.
@@ -3364,8 +3433,14 @@ struct OnDeviceAICard: View {
         // files mid-transfer/activation corrupts state — block those, and
         // ONLY those, while work is in flight.
         let conflictControlsDisabled = state.localModelBusy || anyDownloadActive
-        // Audio presets download text GGUF + mmproj; show the combined size.
-        let sizeLabel = model.mmprojSizeLabel.map { "\(model.sizeLabel) + \($0)" } ?? model.sizeLabel
+            || state.audioTranscriptionInFlight
+        // The audio row shares Q4's text GGUF. If Q4 is already present,
+        // disclose that Download fetches only the projector add-on.
+        let textModelDownloaded = LocalModelStore.isDownloaded(model)
+        let isAudioAddOnOnly = model.hasAudioMmproj && textModelDownloaded
+        let sizeLabel = isAudioAddOnOnly
+            ? (model.mmprojSizeLabel ?? model.sizeLabel)
+            : (model.mmprojSizeLabel.map { "\(model.sizeLabel) + \($0)" } ?? model.sizeLabel)
 
         VStack(alignment: .leading, spacing: 6) {
             Text(model.title)
@@ -3390,7 +3465,10 @@ struct OnDeviceAICard: View {
                 Button {
                     Task { await state.downloadLocalModel(model) }
                 } label: {
-                    Label("Download (\(sizeLabel))", systemImage: "arrow.down.circle")
+                    Label(isAudioAddOnOnly
+                          ? "Download Audio Add-on (\(sizeLabel))"
+                          : "Download (\(sizeLabel))",
+                          systemImage: "arrow.down.circle")
                         .font(DS.captionFont.weight(.medium))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6)
@@ -3460,36 +3538,33 @@ struct OnDeviceAICard: View {
     }
 }
 
-/// 🔬 Experiment card: the on-device audio engine toggle + the locked-phone
-/// CPU experiment toggle + the experiment log viewer. Surfaced in ProfileView
-/// under the On-Device AI card so you can flip toggles and read results
-/// on-device. All default OFF — zero behavior change unless you opt in.
+/// Engine selection, readiness, and a live audit of every file transcription.
+/// No transcript text is logged—only routing, lengths, errors, and timings.
 struct ExperimentCard: View {
     let scheme: ColorScheme
     @EnvironmentObject var state: AppState
-    @State private var runs: [ExperimentRun] = []
+    @State private var runs: [TranscriptionRun] = []
 
     var body: some View {
         DS.card(scheme) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 6) {
-                    Image(systemName: "flask")
+                    Image(systemName: "waveform.badge.magnifyingglass")
                         .font(.system(size: 14))
-                    Text("Experiments")
+                    Text("Audio Transcription")
                         .font(DS.cardTitleFont)
                         .foregroundStyle(DS.ink(scheme))
                 }
 
-                Text("On-device audio + locked-phone CPU timing. TestFlight-only.")
+                Text("Choose the primary on-device engine and verify what actually ran.")
                     .font(DS.captionFont)
                     .foregroundStyle(DS.muted(scheme))
 
-                // Experimental Gemma-audio engine toggle.
                 Toggle(isOn: $state.experimentalAudioEngine) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Gemma-audio engine (mtmd)")
+                        Text("Prefer Gemma 4 Audio (mtmd)")
                             .font(DS.bodyFont.weight(.medium))
-                        Text("Use the Zig core's mtmd layer for transcription (needs an audio mmproj loaded). Falls back to SpeechAnalyzer.")
+                        Text("Gemma runs first in sequential 45-second segments. Apple Speech is fallback-only if Gemma cannot complete.")
                             .font(DS.microFont)
                             .foregroundStyle(DS.muted(scheme))
                     }
@@ -3499,83 +3574,108 @@ struct ExperimentCard: View {
                     state.refreshLocalAudioStatus()
                 }
 
-                // Audio engine status line.
                 if state.localAudio.available {
                     Text(state.localAudio.supported
-                         ? "Audio mmproj loaded — sample rate \(state.localAudio.sampleRate) Hz."
-                         : (state.localAudio.reason ?? "No audio mmproj loaded."))
+                         ? "Gemma audio is ready at \(state.localAudio.sampleRate) Hz."
+                         : (state.localAudio.reason ?? "The audio projector is not loaded."))
                         .font(DS.microFont)
-                        .foregroundStyle(state.localAudio.supported ? DS.accent(scheme) : DS.muted(scheme))
+                        .foregroundStyle(state.localAudio.supported
+                                         ? DS.accent(scheme) : DS.accent2Color)
                 } else {
-                    Text("mtmd backend not linked in this build.")
+                    Text("mtmd is not linked in this build.")
                         .font(DS.microFont)
-                        .foregroundStyle(DS.muted(scheme))
+                        .foregroundStyle(DS.accent2Color)
                 }
 
-                Divider().overlay(DS.line(scheme))
-
-                // Locked-phone experiment toggle.
                 Toggle(isOn: $state.lockedPhoneExperiment) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Locked-phone CPU experiment")
+                        Text("Keep transcription alive while locked")
                             .font(DS.bodyFont.weight(.medium))
-                        Text("Holds the audio session active past Stop and logs whether inference gets CPU time while locked. See experiment_log.jsonl.")
+                        Text("Keeps the audio session active after recording while file transcription finishes.")
                             .font(DS.microFont)
                             .foregroundStyle(DS.muted(scheme))
                     }
                 }
                 .tint(DS.accentColor)
 
-                // Experiment log viewer.
-                if !runs.isEmpty {
-                    Text("Recent runs (newest last)")
-                        .font(DS.captionFont.weight(.semibold))
-                        .foregroundStyle(DS.ink(scheme))
-                    ForEach(Array(runs.enumerated()), id: \.offset) { _, run in
-                        experimentRow(run)
+                Divider().overlay(DS.line(scheme))
+
+                if state.audioTranscriptionInFlight {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(state.audioTranscriptionProgress ?? "Transcribing on-device…")
+                            .font(DS.microFont)
+                            .foregroundStyle(DS.accent(scheme))
                     }
+                }
+
+                Text("Recent runs (newest last)")
+                    .font(DS.captionFont.weight(.semibold))
+                    .foregroundStyle(DS.ink(scheme))
+                if runs.isEmpty {
+                    Text("No runs yet. Record or re-transcribe an audio journal.")
+                        .font(DS.microFont)
+                        .foregroundStyle(DS.muted(scheme))
+                } else {
+                    ForEach(runs) { run in transcriptionRow(run) }
                     Button(role: .destructive) {
-                        ExperimentLogger.clear()
+                        TranscriptionLogger.clear()
                         runs = []
                     } label: {
-                        Label("Clear log", systemImage: "trash")
+                        Label("Clear runs", systemImage: "trash")
                             .font(DS.microFont)
                     }
                     .buttonStyle(.bordered)
                     .tint(DS.accent2Color)
-                } else {
-                    Text("No experiment runs yet. Record a journal with the toggle ON to log a run.")
-                        .font(DS.microFont)
-                        .foregroundStyle(DS.muted(scheme))
                 }
             }
         }
-        .onAppear { runs = ExperimentLogger.loadRecent() }
+        .onAppear {
+            state.refreshLocalAudioStatus()
+            runs = TranscriptionLogger.loadRecent()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: .slowClawTranscriptionRunAdded)) { _ in
+                runs = TranscriptionLogger.loadRecent()
+            }
     }
 
     @ViewBuilder
-    private func experimentRow(_ run: ExperimentRun) -> some View {
+    private func transcriptionRow(_ run: TranscriptionRun) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
-                Image(systemName: run.completed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                Image(systemName: run.succeeded
+                      ? "checkmark.circle.fill" : "xmark.circle.fill")
                     .font(.system(size: 10))
-                    .foregroundStyle(run.completed ? DS.accent(scheme) : DS.accent2Color)
+                    .foregroundStyle(run.succeeded
+                                     ? DS.accent(scheme) : DS.accent2Color)
                 Text(run.engine)
                     .font(DS.microFont.weight(.medium))
                 Spacer()
-                if run.phoneLockedApprox {
-                    Text("🔒 locked")
-                        .font(.system(size: 9))
-                        .foregroundStyle(DS.accent2Color)
-                }
+                Text(run.context.rawValue)
+                    .font(.system(size: 9))
+                    .foregroundStyle(DS.muted(scheme))
             }
-            Text("total \(run.totalMs)ms · \(run.transcriptLen) chars · \(run.appState)")
+            if run.requestedEngine != run.engine {
+                Text("Requested: \(run.requestedEngine)")
+                    .font(.system(size: 9))
+                    .foregroundStyle(DS.accent2Color)
+            }
+            Text("\(audioClock(run.audioSeconds)) audio · \(run.segmentCount) segment\(run.segmentCount == 1 ? "" : "s") · \(run.transcriptLen) chars · \(run.totalMs)ms")
                 .font(.system(size: 9))
                 .foregroundStyle(DS.muted(scheme))
+            if !run.detail.isEmpty {
+                Text(run.detail)
+                    .font(.system(size: 9))
+                    .foregroundStyle(run.succeeded
+                                     ? DS.muted(scheme) : DS.accent2Color)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(8)
-        .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rSm, style: .continuous))
+        .background(DS.surface2(scheme),
+                    in: RoundedRectangle(cornerRadius: DS.rSm,
+                                         style: .continuous))
     }
 }
 

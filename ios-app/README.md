@@ -104,16 +104,21 @@ transcription of the original audio from scratch and replaces the transcript
 body in place, preserving the entry's title. This is the manual retry path
 for truncated transcripts across new builds.
 
-Routing goes through the shared on-device STT router (`AudioSTT`): the complete
-Apple Speech path runs first (SpeechAnalyzer, then the segmented legacy
-`SFSpeechRecognizer` fallback with `requiresOnDeviceRecognition = true`). The
-experimental Gemma-audio engine (the Zig core's mtmd layer) is tried only when
-that proven path produces no text and the experimental toggle plus audio
-mmproj are active. Audio never leaves the device on any path. If no complete
+Routing goes through the shared on-device STT router (`AudioSTT`). When **Prefer
+Gemma 4 Audio** is enabled, the Zig core's mtmd layer runs first in sequential
+45-second segments; Apple Speech is fallback-only and the actual route appears
+immediately under Profile → Audio Transcription → Recent Runs. With Gemma off,
+Apple uses sequential 40-second forced-on-device `SFSpeechRecognizer` requests
+first because SpeechAnalyzer can return a non-empty but truncated long-file
+result. Audio never leaves the device on any path. If no complete
 transcript is produced (empty/failed recognition, no
 audio file, or a failed store write), the old transcript is left unchanged
 and a "Re-transcription failed" alert is shown — a partial result never
 overwrites the stored entry.
+
+The Profile model rows distinguish the Q4 text model from its audio add-on.
+The add-on reuses the exact same Q4 GGUF and downloads only the separate ~1 GB
+mmproj when Q4 is already present; it is not a second text model.
 
 ## TestFlight (CI)
 

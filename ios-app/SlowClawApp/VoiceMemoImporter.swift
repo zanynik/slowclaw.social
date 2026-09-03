@@ -5,7 +5,7 @@
 // SlowClaw"), it arrives as a file URL via .onOpenURL on the App.
 //
 // Flow:
-//   1. enqueue(_:) copies the shared file into Documents/Inbox under a
+//   1. enqueue(_:) copies the shared file into Documents/ImportedAudio under a
 //      UUID-based name (collision-proof even for same-second imports),
 //      validates the copy decodes as audio, and
 //      IMMEDIATELY records the import in a durable queue file
@@ -40,10 +40,9 @@
 
 import AVFoundation
 import Foundation
-import UIKit
 import UniformTypeIdentifiers
 
-/// One pending import. `url` is the copied-into-Inbox destination (already on
+/// One pending import. `url` is the app-owned ImportedAudio destination (already on
 /// disk). The queue is mirrored to Documents/pending_voice_imports.json after
 /// every change, so an entry — and its retry budget — survive process death;
 /// attempts reset on the next launch.
@@ -122,15 +121,22 @@ final class VoiceMemoImporter: ObservableObject {
         "journal_\(Int(Date().timeIntervalSince1970))_vm_\(UUID().uuidString)"
     }
 
-    private var inboxURL: URL {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let inbox = docs.appendingPathComponent("Inbox", isDirectory: true)
-        try? FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)
-        return inbox
+    /// Writable app-owned destination. Do not use Documents/Inbox: iOS places
+    /// copy-style document imports there and deliberately makes that directory
+    /// read-only to the receiving app (files may be read/deleted, but the app
+    /// cannot create another file beside them).
+    private func importsDirectory() throws -> URL {
+        let docs = try FileManager.default.url(for: .documentDirectory,
+                                               in: .userDomainMask,
+                                               appropriateFor: nil,
+                                               create: true)
+        let imports = docs.appendingPathComponent("ImportedAudio", isDirectory: true)
+        try FileManager.default.createDirectory(at: imports,
+                                                withIntermediateDirectories: true)
+        return imports
     }
 
-    /// Copy a shared audio file URL into the workspace Inbox (validated as
+    /// Copy a shared audio file URL into the writable ImportedAudio directory (validated as
     /// decodable audio), durably queue it, and store it as a journal. Returns
     /// the destination URL, or nil if the import fails — `status` then
     /// discloses the specific typed reason (file/copy/access vs. not-audio).
@@ -214,7 +220,7 @@ final class VoiceMemoImporter: ObservableObject {
         return dest
     }
 
-    /// Copy a shared audio file URL into the workspace Inbox and validate
+    /// Copy a shared audio file URL into ImportedAudio and validate
     /// that the copy decodes as audio. Throws `VoiceMemoImportError` on failure; the
     /// source is only ever COPIED — never moved or deleted.
     ///
@@ -232,12 +238,18 @@ final class VoiceMemoImporter: ObservableObject {
         let didStart = sourceURL.startAccessingSecurityScopedResource()
         defer { if didStart { sourceURL.stopAccessingSecurityScopedResource() } }
 
-        // Timestamp keeps Inbox listings roughly chronological; the UUID makes
+        // Timestamp keeps imported files roughly chronological; the UUID makes
         // the name collision-proof (same-second imports, identical titles).
         let ts = Int(Date().timeIntervalSince1970)
         let base = sourceURL.deletingPathExtension().lastPathComponent
         let ext = destinationExtension(for: sourceURL)
-        let dest = inboxURL.appendingPathComponent("\(ts)-\(sanitize(base))-\(UUID().uuidString).\(ext)")
+        let dest: URL
+        do {
+            dest = try importsDirectory().appendingPathComponent(
+                "\(ts)-\(sanitize(base))-\(UUID().uuidString).\(ext)")
+        } catch {
+            throw VoiceMemoImportError.copyFailed(error.localizedDescription)
+        }
 
         // Copy ONLY. The source is an external file iOS/the provider owns and
         // must never be moved or deleted by an import; a cross-volume move
@@ -370,7 +382,7 @@ final class VoiceMemoImporter: ObservableObject {
     /// queued (in memory AND on disk) until their journal store succeeds, so
     /// an interruption mid-store never loses the import — and every retry
     /// upserts the SAME journal row via the record's stable journalKey.
-    /// Retries use backoff; the Inbox file is never deleted, so a failing
+    /// Retries use backoff; the imported file is never deleted, so a failing
     /// import stays recoverable.
     private func ensureWorker() {
         guard worker == nil else { return }
@@ -434,7 +446,7 @@ final class VoiceMemoImporter: ObservableObject {
                     continue
                 }
                 skippedCount += 1
-                status = "Couldn't save an import — its audio file stays in the Inbox."
+                status = "Couldn't save an import — its audio file stays in Imported Audio."
                 break
             }
             // Final summary so the user sees the import landed. A drain that
@@ -508,7 +520,7 @@ final class VoiceMemoImporter: ObservableObject {
     /// AppState attached) win the dedup. Legacy records without a journalKey
     /// get one assigned and persisted here, before any store. Corrupt or
     /// unreadable files start fresh — worst case is losing recovery of
-    /// pre-kill imports, never losing audio (Inbox files are never deleted).
+    /// pre-kill imports, never losing audio (imported files are never deleted).
     /// A failed normalize write is benign: keys would simply be re-assigned
     /// on the next load, before any store used them.
     private func loadPersistedQueueOnce() {
@@ -553,7 +565,7 @@ final class VoiceMemoImporter: ObservableObject {
     }
 
     /// Documents-relative path for an imported file, suitable for the journal
-    /// media_url column (e.g. "Inbox/1725000000-memo-<UUID>.m4a").
+    /// media_url column (e.g. "ImportedAudio/1725000000-memo-<UUID>.m4a").
     static func documentsRelativePath(for url: URL) -> String? {
         guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
             return nil

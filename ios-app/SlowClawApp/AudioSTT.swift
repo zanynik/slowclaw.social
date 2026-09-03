@@ -1,158 +1,229 @@
 // AudioSTT.swift — shared on-device speech-to-text router.
 //
-// Routes an audio FILE to the right transcription engine, in a FIXED order of
-// authority:
-//   - Default (proven): iOS SpeechAnalyzer via Transcriber.transcribe(url:)
-//     runs FIRST and to COMPLETION — including its legacy forced-on-device
-//     SFSpeechRecognizer fallback. A proven Apple Speech result is never
-//     preempted by the experimental engine.
-//   - Experimental (opt-in): on-device Gemma-audio via the Zig core's mtmd
-//     layer (slowClawLocalAudioTranscribe) is consulted ONLY when the complete
-//     Apple path produced no text. An experimental, possibly incomplete Gemma
-//     result can therefore never replace a proven Apple result.
-//
-// The experimental engine is gated by `experimentalAudioEngine` (default
-// OFF) AND requires an audio mmproj to be loaded (checked via the status
-// JSON). When the toggle is off OR no mmproj is loaded, this is a thin
-// pass-through to Transcriber — zero behavior change.
-//
-// PCM extraction reuses the AVAudioConverter pattern from SpeechTranscriber
-// to produce mono F32 at the sample rate the projector expects (typically
-// 16000). The audio file is the source of truth; we never persist raw PCM.
+// File transcription is local-first when the user enables Gemma audio:
+//   1. Gemma 4 + its audio projector (mtmd) runs first.
+//   2. Apple's on-device Speech framework is used only if mtmd is unavailable
+//      or fails to produce a complete result.
+// With Gemma audio disabled, Apple Speech remains the only path. Every run is
+// persisted by TranscriptionLogger so Profile → Audio Transcription shows the
+// requested engine, actual engine, result, segment count, and timings.
 
 import Foundation
 import AVFoundation
 
-/// Shared result type for file transcription across both engines.
-struct AudioSTTResult {
-    /// The transcribed text ("" if nothing was recognized).
-    let text: String
-    /// Engine that produced this result (for diagnostics / experiment log).
-    let engine: AudioSTTEngine
-    /// Timings from the mtmd path (nil for SpeechAnalyzer).
-    let timings: AudioTimings?
+/// Why a file transcription was started. Persisted in Recent Runs.
+enum AudioSTTContext: String, Codable {
+    case automatic = "Automatic journal"
+    case retranscribe = "Re-transcribe"
+    case lockedPhone = "Locked-phone test"
 }
 
-/// Which engine produced a transcription.
+/// Shared result type for file transcription across both engines.
+struct AudioSTTResult {
+    let text: String
+    let engine: AudioSTTEngine
+    let timings: AudioTimings?
+    /// User-facing explanation of routing/success/failure.
+    let diagnostic: String?
+    /// Number of sequential audio segments submitted to the producing engine.
+    let segmentCount: Int
+}
+
+/// Which engine produced the returned transcription.
 enum AudioSTTEngine: String {
-    case speechAnalyzer = "SpeechAnalyzer"
-    case gemmaAudio = "GemmaAudio (mtmd)"
-    case gemmaAudioFallback = "GemmaAudio→fallback"
+    case appleSpeech = "Apple Speech (on-device)"
+    case gemmaAudio = "Gemma 4 Audio (mtmd)"
+    case appleAfterGemmaFailure = "Apple fallback (mtmd failed)"
 }
 
 enum AudioSTT {
+    /// Keep each mtmd request comfortably within its 4096-token iOS context.
+    /// Gemma audio consumes roughly 25 embedding tokens/second, so 45 seconds
+    /// leaves room for the prompt and up to 512 generated transcript tokens.
+    private static let gemmaSegmentSeconds = 45
+    private static let gemmaMaxTokensPerSegment: UInt32 = 512
 
-    /// Transcribe an audio file at `url`. The proven Apple path
-    /// (SpeechAnalyzer + its forced-on-device legacy fallback) ALWAYS runs
-    /// first and to completion; the experimental Gemma-audio engine is tried
-    /// only when `useGemmaAudio` is set AND Apple produced no text — an
-    /// incomplete experimental result must never preempt a proven one.
-    /// Never throws — returns "" with the engine that produced the (possibly
-    /// empty) outcome so callers can store a placeholder.
-    ///
-    /// `gemmaAudioEligible` is read from the caller (AppState) to avoid a tight
-    /// coupling to @AppStorage here; the caller decides policy (toggle + status).
-    static func transcribe(url: URL, useGemmaAudio: Bool) async -> AudioSTTResult {
-        // Proven path first: run the COMPLETE Apple pipeline to completion.
-        let appleText = await Transcriber.transcribe(url: url)
-        if !appleText.isEmpty {
-            return AudioSTTResult(text: appleText, engine: .speechAnalyzer, timings: nil)
+    /// Transcribe a file and record an observable run. When `useGemmaAudio` is
+    /// true, mtmd is authoritative and Apple is fallback-only. This makes the
+    /// toggle meaningful and keeps re-transcription device-independent.
+    static func transcribe(
+        url: URL,
+        useGemmaAudio: Bool,
+        context: AudioSTTContext = .automatic,
+        progress: (@Sendable (String) -> Void)? = nil
+    ) async -> AudioSTTResult {
+        let started = DispatchTime.now().uptimeNanoseconds
+        let audioSeconds = audioDurationSeconds(url: url)
+        let result: AudioSTTResult
+
+        if useGemmaAudio {
+            progress?("Preparing Gemma 4 Audio…")
+            let gemma = await transcribeWithGemma(url: url, progress: progress)
+            if !gemma.text.isEmpty {
+                result = gemma
+            } else {
+                progress?("Gemma could not complete; trying Apple Speech…")
+                let appleText = await Transcriber.transcribe(url: url)
+                let detail = [gemma.diagnostic, appleText.isEmpty
+                    ? "Apple fallback also produced no transcript."
+                    : "Apple fallback completed after mtmd failed."]
+                    .compactMap { $0 }.joined(separator: " ")
+                result = AudioSTTResult(
+                    text: appleText,
+                    engine: .appleAfterGemmaFailure,
+                    timings: gemma.timings,
+                    diagnostic: detail,
+                    segmentCount: gemma.segmentCount)
+            }
+        } else {
+            progress?("Running Apple's segmented on-device transcription…")
+            let appleText = await Transcriber.transcribe(url: url)
+            result = AudioSTTResult(
+                text: appleText,
+                engine: .appleSpeech,
+                timings: nil,
+                diagnostic: appleText.isEmpty
+                    ? "Apple's on-device recognizer produced no transcript."
+                    : "Apple's segmented on-device recognizer completed.",
+                segmentCount: max(1, Int(ceil((audioSeconds ?? 0) / 40))))
         }
-        // Apple produced no text (or no engine was available). Only now is
-        // the experimental engine allowed to fill the gap.
-        guard useGemmaAudio else {
-            return AudioSTTResult(text: "", engine: .speechAnalyzer, timings: nil)
-        }
-        if let gemma = await transcribeWithGemma(url: url), !gemma.text.isEmpty {
-            return gemma
-        }
-        // Nothing recognized anywhere; report that the fallback path ran.
-        return AudioSTTResult(text: "", engine: .gemmaAudioFallback, timings: nil)
+
+        let elapsedMs = Int64((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
+        progress?(result.text.isEmpty
+                  ? "Transcription failed."
+                  : "Completed with \(result.engine.rawValue).")
+        TranscriptionLogger.append(TranscriptionRun(
+            context: context,
+            requestedEngine: useGemmaAudio ? "Gemma 4 Audio (mtmd)" : "Apple Speech",
+            engine: result.engine.rawValue,
+            succeeded: !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            detail: result.diagnostic ?? "",
+            audioSeconds: audioSeconds ?? 0,
+            segmentCount: result.segmentCount,
+            loadMs: result.timings?.loadMs ?? 0,
+            encodeMs: result.timings?.encodeMs ?? 0,
+            decodeMs: result.timings?.decodeMs ?? 0,
+            totalMs: result.timings?.totalMs ?? elapsedMs,
+            transcriptLen: result.text.count))
+        return result
     }
 
-    // MARK: - Gemma-audio (experimental) via the Zig core's mtmd layer
+    // MARK: - Gemma audio (mtmd)
 
-    /// Transcribe via the on-device Gemma-audio model. Only invoked AFTER the
-    /// complete Apple path produced no text. Returns nil on any failure
-    /// (caller then keeps the honest empty result). Decodes the audio file
-    /// to mono PCM F32 at the projector's expected sample rate, then hands
-    /// the PCM to the Zig core.
-    private static func transcribeWithGemma(url: URL) async -> AudioSTTResult? {
+    /// Decode once, split into bounded requests, and transcribe sequentially.
+    /// All-or-nothing: one failed/empty segment invalidates the Gemma result so
+    /// the router can use Apple over the original complete file. This avoids
+    /// the Zig engine's context ceiling silently dropping trailing audio.
+    private static func transcribeWithGemma(
+        url: URL,
+        progress: (@Sendable (String) -> Void)?
+    ) async -> AudioSTTResult {
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
 
-        // Read the projector's expected sample rate (0 = no mmproj loaded).
         let status = slowClawLocalAudioStatus()
-        guard status.available, status.supported, status.sampleRate > 0 else {
-            return nil
+        guard status.available else {
+            return gemmaFailure(status.reason ?? "The mtmd backend is not linked.")
+        }
+        guard status.supported, status.sampleRate > 0 else {
+            return gemmaFailure(status.reason ?? "The Gemma audio projector is not loaded.")
         }
         let targetRate = Double(status.sampleRate)
-
-        // Decode + resample to mono F32 at the target rate.
         let pcmOpt = await Task.detached(priority: .userInitiated) {
             decodeToMonoF32(url: url, sampleRate: targetRate)
         }.value
         guard let pcm = pcmOpt, !pcm.isEmpty else {
-            return nil
+            return gemmaFailure("mtmd could not decode the audio file.")
         }
 
-        // Hand the PCM to the Zig core. This runs the full mtmd pipeline
-        // (audio encoder → projector → LLM decode → transcript generation).
-        do {
-            let result = try await Task.detached(priority: .userInitiated) {
-                try slowClawLocalAudioTranscribe(pcm: pcm, maxTokens: 256, temperature: 0.0)
-            }.value
-            return AudioSTTResult(text: result.text, engine: .gemmaAudio, timings: result.timings)
-        } catch {
-            // Inference failed (RAM, crash, unsupported). Caller falls back.
-            return nil
+        let samplesPerSegment = max(1, Int(targetRate) * gemmaSegmentSeconds)
+        let segmentCount = Int(ceil(Double(pcm.count) / Double(samplesPerSegment)))
+        var parts: [String] = []
+        parts.reserveCapacity(segmentCount)
+        var loadMs: Int64 = 0
+        var encodeMs: Int64 = 0
+        var decodeMs: Int64 = 0
+        var totalMs: Int64 = 0
+
+        for index in 0..<segmentCount {
+            progress?("Gemma segment \(index + 1) of \(segmentCount)…")
+            if Task.isCancelled {
+                return gemmaFailure("Gemma transcription was cancelled.", segmentCount: index)
+            }
+            let start = index * samplesPerSegment
+            let end = min(start + samplesPerSegment, pcm.count)
+            let segment = Array(pcm[start..<end])
+            do {
+                let item = try await Task.detached(priority: .userInitiated) {
+                    try slowClawLocalAudioTranscribe(
+                        pcm: segment,
+                        maxTokens: gemmaMaxTokensPerSegment,
+                        temperature: 0.0)
+                }.value
+                let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else {
+                    return gemmaFailure(
+                        "Gemma returned no text for segment \(index + 1) of \(segmentCount).",
+                        timings: AudioTimings(loadMs: loadMs, encodeMs: encodeMs,
+                                              decodeMs: decodeMs, totalMs: totalMs),
+                        segmentCount: index + 1)
+                }
+                parts.append(text)
+                loadMs += item.timings.loadMs
+                encodeMs += item.timings.encodeMs
+                decodeMs += item.timings.decodeMs
+                totalMs += item.timings.totalMs
+            } catch {
+                return gemmaFailure(
+                    "Gemma failed on segment \(index + 1) of \(segmentCount): \(error.localizedDescription)",
+                    timings: AudioTimings(loadMs: loadMs, encodeMs: encodeMs,
+                                          decodeMs: decodeMs, totalMs: totalMs),
+                    segmentCount: index + 1)
+            }
         }
+
+        return AudioSTTResult(
+            text: parts.joined(separator: " "),
+            engine: .gemmaAudio,
+            timings: AudioTimings(loadMs: loadMs, encodeMs: encodeMs,
+                                  decodeMs: decodeMs, totalMs: totalMs),
+            diagnostic: "Gemma completed \(segmentCount) local segment\(segmentCount == 1 ? "" : "s").",
+            segmentCount: segmentCount)
+    }
+
+    private static func gemmaFailure(_ message: String,
+                                     timings: AudioTimings? = nil,
+                                     segmentCount: Int = 0) -> AudioSTTResult {
+        AudioSTTResult(text: "", engine: .gemmaAudio, timings: timings,
+                       diagnostic: message, segmentCount: segmentCount)
+    }
+
+    private static func audioDurationSeconds(url: URL) -> Double? {
+        guard let file = try? AVAudioFile(forReading: url),
+              file.processingFormat.sampleRate > 0 else { return nil }
+        return Double(file.length) / file.processingFormat.sampleRate
     }
 
     // MARK: - PCM extraction (AVAudioFile → mono F32 at target rate)
 
-    /// Decode an audio file to a flat array of mono F32 samples at `sampleRate`.
-    /// Reuses the AVAudioConverter pattern from SpeechTranscriber.feed. Returns
-    /// nil on any decode failure. The result is owned by the caller (passed into
-    /// the Zig core, which copies it into the mtmd bitmap).
-    ///
-    /// Nonisolated so it can run in a detached Task off the main actor.
     nonisolated static func decodeToMonoF32(url: URL, sampleRate: Double) -> [Float]? {
         guard let file = try? AVAudioFile(forReading: url) else { return nil }
         return decodeToMonoF32(file: file, sampleRate: sampleRate)
     }
 
-    /// Shared decoder: AVAudioFile → mono F32 [n_samples] at `sampleRate`.
-    /// Converts the file's native format to the target rate + mono, then
-    /// flattens the interleaved channel data to a single channel.
-    ///
-    /// All-or-nothing: any read, conversion, or allocation failure returns nil
-    /// — never a partial PCM array that would be handed to the model as if it
-    /// were the whole recording.
-    ///
-    /// AVAudioConverter streaming protocol (contract, not a nicety): one
-    /// converter instance spans the whole file, and each convert() call pulls
-    /// from the input block as many times as it needs. The block supplies ONE
-    /// freshly-read chunk with .haveData; if asked again within that call it
-    /// reports .noDataNow ("more is coming") — reporting .endOfStream between
-    /// chunks would PERMANENTLY end the stream for this converter instance and
-    /// silently drop every chunk after the first. .endOfStream is reported
-    /// only once, after the source data is actually drained, so the converter
-    /// can flush internally-buffered samples and confirm end-of-output.
+    /// All-or-nothing streaming conversion. A converter instance spans the
+    /// whole file; endOfStream is sent only after the source is truly drained.
     nonisolated static func decodeToMonoF32(file: AVAudioFile, sampleRate: Double) -> [Float]? {
         let srcFormat = file.processingFormat
-        guard let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+        guard sampleRate > 0,
+              let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                                sampleRate: sampleRate,
-                                               channels: 1, interleaved: false) else {
-            return nil
-        }
-        guard let converter = AVAudioConverter(from: srcFormat, to: targetFormat) else {
-            return nil
-        }
+                                               channels: 1, interleaved: false),
+              let converter = AVAudioConverter(from: srcFormat, to: targetFormat)
+        else { return nil }
 
         let totalFrames = AVAudioFrameCount(file.length)
         guard totalFrames > 0 else { return [] }
-
         let chunkFrames: AVAudioFrameCount = min(8192, totalFrames)
         guard let readBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: chunkFrames) else {
             return nil
@@ -160,11 +231,10 @@ enum AudioSTT {
 
         var output: [Float] = []
         output.reserveCapacity(Int(Double(totalFrames) * (sampleRate / srcFormat.sampleRate)) + 1024)
-
         var framesRemaining = totalFrames
-        var pendingChunk = false // readBuffer holds a chunk not yet supplied
-        var inputEnded = false   // source drained: next pull gets .endOfStream
-        var streamEnded = false  // converter confirmed output fully drained
+        var pendingChunk = false
+        var inputEnded = false
+        var streamEnded = false
 
         let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
             if inputEnded {
@@ -176,62 +246,45 @@ enum AudioSTT {
                 outStatus.pointee = .haveData
                 return readBuffer
             }
-            // Nothing to supply right now (the loop reads the next chunk) —
-            // explicitly NOT the end of the stream.
             outStatus.pointee = .noDataNow
             return nil
         }
 
         while !streamEnded {
             if !inputEnded {
-                // Never overwrite readBuffer while the converter still owns
-                // the previous chunk (it may emit buffered output before its
-                // next input-block pull).
                 if !pendingChunk && framesRemaining > 0 {
                     let toRead = min(chunkFrames, framesRemaining)
                     readBuffer.frameLength = 0
                     do {
                         try file.read(into: readBuffer, frameCount: toRead)
                     } catch {
-                        return nil // read failure: no partial PCM
+                        return nil
                     }
                     if readBuffer.frameLength == 0 {
-                        framesRemaining = 0 // file ended early; drain what's buffered
+                        framesRemaining = 0
                     } else {
                         framesRemaining -= readBuffer.frameLength
                         pendingChunk = true
                     }
                 }
-                if framesRemaining == 0 && !pendingChunk {
-                    inputEnded = true // actual final drain: let the converter flush
-                }
+                if framesRemaining == 0 && !pendingChunk { inputEnded = true }
             }
 
             let ratio = sampleRate / srcFormat.sampleRate
             let outCap = max(AVAudioFrameCount(Double(readBuffer.frameLength) * ratio) + 32, 1)
-            guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCap) else {
-                return nil // allocation failure: no partial PCM
-            }
+            guard let outBuffer = AVAudioPCMBuffer(
+                pcmFormat: targetFormat, frameCapacity: outCap) else { return nil }
             var conversionError: NSError?
-            let status = converter.convert(to: outBuffer, error: &conversionError, withInputFrom: inputBlock)
-            if status == .error || conversionError != nil {
-                return nil // conversion failure: no partial PCM
-            }
+            let conversion = converter.convert(
+                to: outBuffer, error: &conversionError, withInputFrom: inputBlock)
+            if conversion == .error || conversionError != nil { return nil }
             if outBuffer.frameLength > 0 {
-                // Mono channel 0 is the full output (channels=1, non-interleaved).
-                let ch = outBuffer.floatChannelData![0]
-                let n = Int(outBuffer.frameLength)
-                output.append(contentsOf: UnsafeBufferPointer(start: ch, count: n))
+                guard let channels = outBuffer.floatChannelData else { return nil }
+                output.append(contentsOf: UnsafeBufferPointer(
+                    start: channels[0], count: Int(outBuffer.frameLength)))
             }
-            // .haveData / .inputRanDry: loop for the next chunk (or another
-            // flush pass); .endOfStream terminates the loop.
-            if status == .endOfStream {
-                streamEnded = true
-            }
+            if conversion == .endOfStream { streamEnded = true }
         }
-
-        // All-or-nothing: a non-empty source that decoded to zero samples is
-        // a failure, not an empty success.
         return output.isEmpty ? nil : output
     }
 }
