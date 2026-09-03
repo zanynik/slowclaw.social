@@ -79,8 +79,10 @@ locked**, pauses automatically on network loss and resumes, and — if the app
 was relaunched mid-transfer — reattaches to the in-flight task instead of
 restarting (the system relaunch callback is wired through
 `ShareURLDelegate.application(_:handleEventsForBackgroundURLSession:)`).
-No manual pause/resume bookkeeping is needed. The one iOS rule: a user
-force-quit cancels the transfer (it restarts on the next download request).
+No manual pause/resume bookkeeping is needed. SlowClaw persists the selected
+preset while a transfer is active, so after an app relaunch it automatically
+reattaches the progress bar to the system-owned task (or safely retries if a
+force-quit cancelled it) instead of appearing stuck.
 
 Nothing is installed into `Documents/Models/` until the transfer is proven
 good: the delegate rejects any non-2xx HTTP response (error pages never
@@ -102,13 +104,13 @@ transcription of the original audio from scratch and replaces the transcript
 body in place, preserving the entry's title. This is the manual retry path
 for truncated transcripts across new builds.
 
-Routing goes through the shared on-device STT router (`AudioSTT`): the
-experimental Gemma-audio engine (the Zig core's mtmd layer) when eligible —
-the experimental toggle is on AND an audio mmproj is loaded — otherwise
-SpeechAnalyzer, which itself falls back to the legacy `SFSpeechRecognizer`
-path (on-device only, `requiresOnDeviceRecognition = true`) when Apple
-Intelligence speech is unavailable. Audio never leaves the device on any
-path. If no complete transcript is produced (empty/failed recognition, no
+Routing goes through the shared on-device STT router (`AudioSTT`): the complete
+Apple Speech path runs first (SpeechAnalyzer, then the segmented legacy
+`SFSpeechRecognizer` fallback with `requiresOnDeviceRecognition = true`). The
+experimental Gemma-audio engine (the Zig core's mtmd layer) is tried only when
+that proven path produces no text and the experimental toggle plus audio
+mmproj are active. Audio never leaves the device on any path. If no complete
+transcript is produced (empty/failed recognition, no
 audio file, or a failed store write), the old transcript is left unchanged
 and a "Re-transcription failed" alert is shown — a partial result never
 overwrites the stored entry.
