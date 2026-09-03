@@ -242,6 +242,28 @@ pub fn build(b: *std.Build) void {
         const run_llm_tests = b.addRunArtifact(llm_tests);
         const llm_test_step = b.step("test-local-llm", "Run the on-device LLM smoke test (set SLOWCLAW_TEST_GGUF)");
         llm_test_step.dependOn(&run_llm_tests.step);
+
+        // Real mtmd smoke: caller supplies the matching text GGUF, audio
+        // projector, and mono F32 PCM at the projector's sample rate.
+        const audio_test_mod = b.addModule("slowclaw_feed_audio_test", .{
+            .root_source_file = b.path("src/audio_transcribe.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        audio_test_mod.link_libc = true;
+        audio_test_mod.link_libcpp = true;
+        audio_test_mod.addImport("build_options", llama_opts_mod);
+        audio_test_mod.addIncludePath(b.path("vendor/llama.cpp/include"));
+        audio_test_mod.addIncludePath(b.path("vendor/llama.cpp/ggml/include"));
+        audio_test_mod.addIncludePath(b.path("vendor/llama.cpp/tools/mtmd"));
+        audio_test_mod.linkLibrary(ll);
+        const audio_tests = b.addTest(.{ .root_module = audio_test_mod });
+        const run_audio_tests = b.addRunArtifact(audio_tests);
+        const audio_test_step = b.step(
+            "test-local-audio",
+            "Run mtmd audio smoke (set SLOWCLAW_TEST_AUDIO_GGUF, SLOWCLAW_TEST_MMPROJ, SLOWCLAW_TEST_PCM_F32)",
+        );
+        audio_test_step.dependOn(&run_audio_tests.step);
     }
 
     // ── Workaround: Apple `ld` rejects Zig's staticlib archive ───────────

@@ -8,7 +8,7 @@
 import Foundation
 
 /// Errors thrown by the SlowClawFeed wrapper.
-public enum SlowClawFeedError: Error, Equatable {
+public enum SlowClawFeedError: Error, Equatable, LocalizedError {
     case openFailed(String)
     case storeFailed(String)
     case getFailed(String)
@@ -18,6 +18,20 @@ public enum SlowClawFeedError: Error, Equatable {
     case outOfMemory
     case internalError(String)
     case unexpectedStatus(Int32)
+
+    public var errorDescription: String? {
+        switch self {
+        case .openFailed(let message), .storeFailed(let message),
+             .getFailed(let message), .recallFailed(let message),
+             .forgetFailed(let message), .invalidArgument(let message),
+             .internalError(let message):
+            return message
+        case .outOfMemory:
+            return "Not enough memory."
+        case .unexpectedStatus(let status):
+            return "Unexpected SlowClaw status \(status)."
+        }
+    }
 }
 
 /// A stored memory entry.
@@ -647,14 +661,14 @@ public struct LocalModelPreset: Identifiable, Equatable {
               sizeBytes: 2_190_000_000,
               sizeLabel: "2.1 GB"),
         .init(id: "unsloth/gemma-4-E2B-it-qat-UD-Q4_K_XL",
-              title: "Gemma 4 E2B (Q4_K_XL)",
-              detail: "Higher quality. ~2.5 GB. Best for iPhone 15 Pro+.",
+              title: "Gemma 4 E2B (Q4_K_XL, text)",
+              detail: "Higher-quality text model for journals and drafts. Add the audio projector below for transcription.",
               fileName: "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
               downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf")!,
               sizeBytes: 2_620_000_000,
               sizeLabel: "2.5 GB"),
-        // 🔬 Experimental audio model: Gemma 4 E2B (multimodal: text + audio).
-        // Pairs the SAME text GGUF as the proven presets above with unsloth's
+        // Audio add-on bundle: this is NOT a second text model. It pairs the
+        // SAME Q4 text GGUF above with unsloth's
         // official mmproj from the same repo (clip.has_audio_encoder=true,
         // clip.audio.projector_type=gemma4a — the audio type the vendored mtmd
         // version actually supports; gemma-3n's "gemma3na" is NOT supported by
@@ -662,8 +676,8 @@ public struct LocalModelPreset: Identifiable, Equatable {
         // The mmproj URL is revision-pinned so a later upstream change can't
         // break the download; bump the pin deliberately when re-vendoring.
         .init(id: "unsloth/gemma-4-E2B-it-qat-audio",
-              title: "Gemma 4 E2B Audio (experimental)",
-              detail: "Multimodal: text + audio. On-device transcription via mtmd. Also downloads the ~1.0 GB audio mmproj (mmproj-F16).",
+              title: "Audio add-on for Gemma 4 E2B (Q4)",
+              detail: "Uses the same Q4 text model above plus a 1.0 GB audio projector. If Q4 is present, only the projector downloads.",
               fileName: "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
               downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf")!,
               sizeBytes: 2_620_000_000,

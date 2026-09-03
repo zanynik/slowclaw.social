@@ -83,7 +83,8 @@
     <!-- UIFileSharingEnabled is intentionally absent (defaults to NO):
          Documents contains private journals, audio, and local models, and
          export already happens explicitly through ShareLink. -->
-    <!-- SlowClaw COPIES shared audio into its own Documents/Inbox (see
+    <!-- iOS may deliver copy-style imports through its read-only Documents/Inbox.
+         SlowClaw copies shared audio into writable Documents/ImportedAudio (see
          VoiceMemoImporter.copyAndValidateAudio); it never edits the source
          file in place.
          Declaring in-place support here made iOS take the open-in-place route

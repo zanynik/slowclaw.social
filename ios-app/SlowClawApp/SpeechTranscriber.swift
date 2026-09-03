@@ -6,11 +6,10 @@
 // `SpeechTranscriber` type, and naming ours the same would shadow it and break
 // every reference to the real API below.
 //
-// Replaces the legacy SFSpeech* request-per-file approach. SpeechAnalyzer
-// streams results as buffers are fed in, with no per-task ~60s ceiling and no
-// file segmentation — so long audio journals transcribe in full instead of
-// being silently truncated at segment boundaries. This is the on-device path
-// (Apple Intelligence); audio never leaves the device.
+// Live capture uses SpeechAnalyzer. Completed files use sequential 40-second
+// SFSpeechRecognizer requests first because SpeechAnalyzer has been observed
+// returning non-empty but truncated long-file results; it remains the fallback.
+// Both paths require on-device recognition, so audio never leaves the device.
 //
 // Two entry points:
 //   - Transcriber.transcribe(url:)     — transcribe an existing audio FILE to
@@ -38,15 +37,12 @@ enum Transcriber {
     /// Returns "" if nothing was recognized. Reads the file's PCM buffers and
     /// feeds them to a SpeechAnalyzer session, accumulating final results.
     ///
-    /// Fallback chain: modern SpeechAnalyzer first; if it is unavailable (older
-    /// iOS, non-Apple-Intelligence device, missing locale asset), produces
-    /// no text, OR its results collection fails (sequence threw, or never
-    /// ended within the completion timeout — a 2-line partial must never pass
-    /// as a transcript), falls back to legacy SFSpeechRecognizer (see
-    /// LegacyTranscriber below) so a recorded journal never lands as "no
-    /// transcript" just because the device lacks Apple Intelligence. The
-    /// legacy fallback is FORCED on-device (requiresOnDeviceRecognition) —
-    /// audio never leaves the device on either path.
+    /// File path: the segmented legacy SFSpeechRecognizer runs first because
+    /// SpeechAnalyzer can return a non-empty but truncated result for longer
+    /// files, which cannot be detected reliably from its API. The legacy path
+    /// uses sequential 40-second, forced-on-device requests. SpeechAnalyzer is
+    /// retained only as a fallback when legacy recognition produces no text.
+    /// Audio never leaves the device on either path.
     ///
     /// Thread-safe: blocking recognition runs on the calling thread; callers
     /// await it off the main actor (e.g. inside a Task.detached).
@@ -54,13 +50,13 @@ enum Transcriber {
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
 
-        let modern = await transcribeWithAnalyzer(url: url)
-        if !modern.isEmpty { return modern }
-        return await LegacyTranscriber.transcribe(url: url)
+        let segmented = await LegacyTranscriber.transcribe(url: url)
+        if !segmented.isEmpty { return segmented }
+        return await transcribeWithAnalyzer(url: url)
     }
 
-    /// The SpeechAnalyzer file path, isolated so the fallback wrapper above
-    /// can try it first and discard an empty result cleanly.
+    /// The SpeechAnalyzer file fallback, isolated so the wrapper above can
+    /// discard an empty result cleanly.
     private static func transcribeWithAnalyzer(url: URL) async -> String {
         guard let audioFile = try? AVAudioFile(forReading: url) else { return "" }
         return await transcribe(file: audioFile)

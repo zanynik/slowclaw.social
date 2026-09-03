@@ -41,6 +41,9 @@ const c_stdlib = @cImport({
     @cInclude("stdlib.h");
     @cInclude("time.h");
 });
+const c_stdio = @cImport({
+    @cInclude("stdio.h");
+});
 const c_getenv = c_stdlib.getenv;
 
 pub const AudioError = error{
@@ -222,15 +225,14 @@ pub fn transcribe(
     defer mtmd.mtmd_bitmap_free(bitmap);
 
     // The prompt MUST contain the projector's media marker exactly once per
-    // bitmap — without <__media__>, mtmd_tokenize fails with "number of
-    // bitmaps does not match number of markers" (this was the empty-result
-    // root cause). The instruction is wrapped in Gemma's turn markers so the
-    // model answers as if asked in chat (parse_special turns them into real
-    // special tokens; harmless literal text for other families).
+    // bitmap. This projector is specifically Gemma 4, whose chat markers are
+    // <|turn>...<turn|> (not Gemma 2/3's <start_of_turn>). Using the older
+    // markers leaves literal control text in the prompt and degrades/fails
+    // transcription even though mtmd tokenization itself succeeds.
     const marker_z = std.mem.span(@as([*:0]const u8, @ptrCast(mtmd.mtmd_get_marker(mctx))));
     const prompt = std.fmt.allocPrint(
         allocator,
-        "<start_of_turn>user\n{s}\nTranscribe this audio faithfully. Output only the spoken text.<end_of_turn>\n<start_of_turn>model\n",
+        "<|turn>user\n{s}\nTranscribe this audio faithfully. Output only the spoken text.<turn|>\n<|turn>model\n",
         .{marker_z},
     ) catch return error.OutOfMemory;
     defer allocator.free(prompt);
@@ -268,28 +270,16 @@ pub fn transcribe(
     if (total_tokens == 0) return error.InferenceFailed;
 
     // Context sizing. Audio eats tokens fast (~25/s), so the audio path uses
-    // a larger iOS ceiling than local_inference's text-only 2048. If the
-    // recording still doesn't fit, trailing audio chunks are skipped (the
-    // leading speech transcribes; SpeechAnalyzer handles marathon journals).
+    // a larger iOS ceiling than local_inference's text-only 2048. Never skip
+    // trailing media: callers segment long recordings, and an oversized direct
+    // request must fail explicitly rather than return a truncated transcript.
     const max_ctx: u32 = if (builtin.os.tag == .ios) 4096 else 8192;
     const gen_headroom: u32 = @min(max_tokens, max_ctx / 2);
     const n_batch: u32 = if (builtin.os.tag == .ios) 128 else 512;
     const prompt_budget: usize = max_ctx - gen_headroom - 8;
 
-    // First pass: decide which chunks fit. Text chunks always fit (tiny);
-    // audio chunks are added while budget allows.
-    var planned: usize = 0;
-    var audio_fits = try allocator.alloc(bool, n_chunks);
-    defer allocator.free(audio_fits);
-    ci = 0;
-    while (ci < n_chunks) : (ci += 1) {
-        const chunk = mtmd.mtmd_input_chunks_get(chunks, ci);
-        const n_tok = mtmd.mtmd_input_chunk_get_n_tokens(chunk);
-        const is_media = mtmd.mtmd_input_chunk_get_type(chunk) != mtmd.MTMD_INPUT_CHUNK_TYPE_TEXT;
-        audio_fits[ci] = !is_media or (planned + n_tok <= prompt_budget);
-        if (audio_fits[ci]) planned += n_tok;
-    }
-    if (max_media_tokens > 0 and planned == 0) return error.InferenceFailed;
+    const planned = total_tokens;
+    if (planned > prompt_budget) return error.ContextCreateFailed;
 
     timings.load_ms = nowMs() - load_start;
     const encode_start = nowMs();
@@ -337,8 +327,6 @@ pub fn transcribe(
         const chunk = mtmd.mtmd_input_chunks_get(chunks, ci);
         const chunk_type = mtmd.mtmd_input_chunk_get_type(chunk);
         const is_last_chunk = (ci + 1 == n_chunks);
-        if (!audio_fits[ci]) continue; // over budget — skip this media chunk
-
         if (chunk_type == mtmd.MTMD_INPUT_CHUNK_TYPE_TEXT) {
             var n_tok: usize = 0;
             const toks = mtmd.mtmd_input_chunk_get_tokens_text(chunk, &n_tok);
@@ -547,4 +535,52 @@ test "audio_transcribe: transcribe fails when no projector loaded" {
         const pcm = [_]f32{ 0.0, 0.1, 0.2 };
         try testing.expectError(error.InferenceFailed, transcribe(testing.allocator, &pcm, 64, 0.0, &timings));
     }
+}
+
+test "local audio: model plus projector transcribes real PCM" {
+    if (!have_mtmd) return error.SkipZigTest;
+    const model_env = c_getenv("SLOWCLAW_TEST_AUDIO_GGUF") orelse return error.SkipZigTest;
+    const mmproj_env = c_getenv("SLOWCLAW_TEST_MMPROJ") orelse return error.SkipZigTest;
+    const pcm_env = c_getenv("SLOWCLAW_TEST_PCM_F32") orelse return error.SkipZigTest;
+    const model_path = std.mem.span(model_env);
+    const mmproj_path = std.mem.span(mmproj_env);
+    const pcm_path = std.mem.span(pcm_env);
+
+    local_inference.loadModel(model_path) catch |err| {
+        std.debug.print("audio smoke model load failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer local_inference.unloadModel();
+    loadMmproj(mmproj_path) catch |err| {
+        std.debug.print("audio smoke mmproj load failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer unloadMmproj();
+
+    const path_z = try testing.allocator.dupeZ(u8, pcm_path);
+    defer testing.allocator.free(path_z);
+    const fp = c_stdio.fopen(path_z.ptr, "rb") orelse return error.SkipZigTest;
+    defer _ = c_stdio.fclose(fp);
+    if (c_stdio.fseek(fp, 0, c_stdio.SEEK_END) != 0) return error.SkipZigTest;
+    const byte_len_c = c_stdio.ftell(fp);
+    if (byte_len_c <= 0 or @rem(byte_len_c, @sizeOf(f32)) != 0) return error.SkipZigTest;
+    if (c_stdio.fseek(fp, 0, c_stdio.SEEK_SET) != 0) return error.SkipZigTest;
+    const sample_count: usize = @intCast(@divTrunc(byte_len_c, @sizeOf(f32)));
+    const pcm = try testing.allocator.alloc(f32, sample_count);
+    defer testing.allocator.free(pcm);
+    if (c_stdio.fread(pcm.ptr, @sizeOf(f32), sample_count, fp) != sample_count) {
+        return error.SkipZigTest;
+    }
+
+    var timings = AudioTimings{};
+    const transcript = transcribe(testing.allocator, pcm, 512, 0.0, &timings) catch |err| {
+        std.debug.print("audio smoke transcription failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer testing.allocator.free(transcript);
+    std.debug.print("local audio transcript: {s}\n", .{transcript});
+    std.debug.print("local audio timings: encode={d}ms decode={d}ms total={d}ms\n", .{
+        timings.encode_ms, timings.decode_ms, timings.total_ms,
+    });
+    try testing.expect(transcript.len > 0);
 }
