@@ -53,7 +53,7 @@ enum Transcriber {
     /// Returns "" if nothing was recognized. Reads the file's PCM buffers and
     /// feeds them to a SpeechAnalyzer session, accumulating final results.
     ///
-    /// File path: SpeechAnalyzer's `.offlineTranscription` preset processes the
+    /// File path: SpeechAnalyzer's `.transcription` preset processes the
     /// whole recording as one time-coded stream. This is Apple's long-form
     /// path and avoids application-level slicing. The forced-on-device legacy
     /// recognizer is only a fallback if the modern model cannot run.
@@ -253,14 +253,14 @@ enum Transcriber {
 
     private static func preparedOfflineTranscriber() async throws -> SpeechTranscriber {
         let locale = try await supportedCurrentLocale()
-        let transcriber = SpeechTranscriber(locale: locale, preset: .offlineTranscription)
+        let transcriber = SpeechTranscriber(locale: locale, preset: .transcription)
         try await installModel(for: transcriber)
         return transcriber
     }
 
     private static func preparedLiveTranscriber() async throws -> SpeechTranscriber {
         let locale = try await supportedCurrentLocale()
-        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveLiveTranscription)
+        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
         try await installModel(for: transcriber)
         return transcriber
     }

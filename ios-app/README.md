@@ -108,7 +108,7 @@ Routing goes through the shared on-device STT router (`AudioSTT`). When **Prefer
 Gemma 4 Audio** is enabled, the Zig core's mtmd layer runs first in sequential
 45-second segments; Apple Speech is fallback-only and the actual route appears
 immediately under Profile → Audio Transcription → Recent Runs. With Gemma off,
-Apple uses SpeechAnalyzer's `.offlineTranscription` preset over the whole file,
+Apple uses SpeechAnalyzer's `.transcription` preset over the whole file,
 after installing the required locale model through `AssetInventory`; segmented
 forced-on-device `SFSpeechRecognizer` is compatibility fallback only. Audio
 never leaves the device on any path. If no complete
@@ -119,7 +119,7 @@ overwrites the stored entry.
 
 New recordings follow the system Voice Memos/Notes pattern: the microphone
 buffer is written to the m4a and streamed into SpeechAnalyzer's
-`.progressiveLiveTranscription` preset at the same time. Volatile text is
+`.progressiveTranscription` preset at the same time. Volatile text is
 replaced as recognition improves, finals accumulate once, and Stop waits for
 the analyzer to flush before the journal is saved. A completed live transcript
 is not re-sliced afterward. If the live model is unavailable, the audio is
