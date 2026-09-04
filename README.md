@@ -275,7 +275,6 @@ sequenceDiagram
     participant JV as JournalView (Swift)
     participant AR as AudioRecorder (Swift)
     participant ST as SpeechTranscriber (Swift)
-    participant RR as RecordingReview (Swift)
     participant AS as AppState (Swift)
     participant MEM as sqlite store (Zig)
     participant LLM as on-device LLM (Zig)
@@ -285,22 +284,23 @@ sequenceDiagram
     AR->>AR: AVAudioEngine tap → AAC .m4a<br/>(Documents/Recordings/)
     U->>JV: tap stop
     JV->>AR: finishRecording()
-    par transcription (background)
-        AR->>ST: transcribe(url)
-        ST->>ST: SFSpeechRecognizer (on-device)<br/>segments files >40s (60s/task cap)
+    par live transcription
+        AR->>ST: stream microphone buffers
+        ST->>ST: SpeechAnalyzer<br/>progressiveTranscription
         ST-->>JV: transcript streams in
     end
-    JV->>RR: open review screen
-    U->>RR: edit transcript / Save
-    RR->>AS: storeJournal(text, source:"audio_recorded", mediaURL)
+    JV->>AS: auto-store transcript or placeholder<br/>source:"audio_recorded", mediaURL
     AS->>MEM: slowclaw_feed_sqlite_store(...)
     MEM-->>AS: OK
     par interest mining (background)
-        AS->>LLM: slowclaw_feed_local_llm_extract_interests(text)
+        AS->>LLM: extract interests from stored body
         LLM-->>AS: keyword list
-        AS->>AS: append to state.interests
+        AS->>AS: checkpoint weighted interest lens
     end
-    AS-->>JV: journal saved
+    opt live transcript unavailable
+        AS->>ST: queued whole-file transcription<br/>BGProcessing + retry backoff
+        ST-->>AS: replace placeholder when complete
+    end
 ```
 
 **Two parallel import paths** (no review gate — auto-stored):
@@ -317,12 +317,12 @@ How the Reads tab decides what to show. The key idea: **your journals steer both
 
 ```mermaid
 flowchart TB
-    J["Your journals + drafts<br/>(SQLite store)"] --> IP["Interest profile<br/>keywords + AI-extracted interests<br/>+ liked / disliked topics"]
+    J["Your journal text + transcripts<br/>(SQLite store)"] --> IP["Durable interest lens<br/>AI topics weighted by<br/>recency + recurrence"]
     IP --> S1{"Stage 1 — discovery"}
 
     subgraph FETCH["Parallel fetch  (Swift, off main actor)"]
         direction TB
-        RSS["RSS / Atom<br/>from 114-source catalog<br/>(topic-matched, ~24 fetched)"]
+        RSS["RSS / Atom<br/>from 114-source catalog<br/>(weighted topic match, ~32 fetched)"]
         NOS["Nostr articles<br/>kind 30023 via WebSocket<br/>(damus / nos.lol / nostr.band)"]
     end
     S1 -->|"topic-match catalog"| RSS
@@ -335,13 +335,13 @@ flowchart TB
     RANKED1 --> MERGE["Merge + sort by score"]
     RANKED2 --> MERGE
     MERGE --> DIV["filterAndDiversify<br/>(quality gate · dedup · per-source cap)"]
-    DIV --> CACHE[("Caches/reads-feed-v1.json<br/>30-min TTL")]
+    DIV --> CACHE[("Caches/reads-feed-v3.json<br/>30-min TTL")]
     CACHE --> FEED["📖 Reads feed (LazyVStack of FeedCards)"]
 
-    IP -.->|"liked/disliked keywords<br/>shape ranking"| PARSE
+    IP -.->|"weighted topic matches<br/>shape ranking"| PARSE
 ```
 
-**Why your journal matters here:** the `topics` JSON passed into `parse_and_rank` is built from your interest profile. A strong topic match (~+1.2) is tuned to beat a near-max recency signal (≤1.0), so an evergreen relevant piece can outrank a fresh generic one. With no topics extracted, scoring degrades gracefully to recency + quality (cold start).
+**Why your journal matters here:** every successfully analyzed entry is checkpointed, then recurring and recent topics receive more weight. The `topics` JSON passed into `parse_and_rank` carries those weights; phrase and meaningful-term matching lets related wording rank without broad single-word noise. A strong topic match (~+1.2) can beat a near-max recency signal (≤1.0), so an evergreen relevant piece can outrank a fresh generic one. With no topics extracted, scoring degrades gracefully to recency + quality (cold start).
 
 **Nostr details:** the app fetches long-form articles (`kind 30023`) from three relays, filters out spam/non-English/capped at 2 per author, scores by recency + topic boost, and builds `highlighter.com/a/{naddr}` links via a from-scratch bech32 encoder (`Nip19.swift`). (habla.news went offline — the domain serves a Vercel DEPLOYMENT_NOT_FOUND — so article links moved to Highlighter, a living long-form Nostr reader that resolves the same naddr URLs server-side.)
 

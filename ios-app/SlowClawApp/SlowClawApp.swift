@@ -380,6 +380,21 @@ final class AppState: ObservableObject {
     @Published var journals: [SlowClawMemoryEntry] = []
     @Published var drafts: [SlowClawMemoryEntry] = []
     @Published var interests: [String] = []
+    @Published var isIndexingInterests = false
+    @Published var interestIndexProgress: String? = nil
+    private var interestWeights: [String: Double] = [:]
+    private var journalInterestRecords: [String: JournalInterestRecord] = [:]
+    private var mutedInterests: Set<String> = []
+    private var interestIndexTask: Task<Void, Never>?
+    private var interestIndexNeedsAnotherPass = false
+    private static let interestIndexDefaultsKey = "slowclaw.interests.index-v1"
+    private static let mutedInterestsDefaultsKey = "slowclaw.interests.muted-v1"
+
+    private struct JournalInterestRecord: Codable {
+        let fingerprint: String
+        let topics: [String]
+        let journalDate: Date
+    }
     // Reads is the default tab (matches the reference app: the unified "for me"
     // stream is the home surface).
     @Published var selectedTab: AppTab = .reads
@@ -432,13 +447,14 @@ final class AppState: ObservableObject {
     @Published var dislikedReadIDs: Set<String> = []
     private var readsLoadedOnce: Bool = false
     fileprivate static var cachedCatalog: [SlowClawFeedSource]?
-    // v2: links moved habla.news → highlighter.com (habla went offline).
-    // The version bump discards v1 caches wholesale — otherwise hydrated
+    // v3: ranking now uses the durable, weighted journal lens.
+    // The version bump discards older caches wholesale — otherwise hydrated
     // items kept their dead habla.news URLs forever (the persistent-404 bug:
     // the merge path preserves existing items, so old links never aged out).
-    private static let readsCacheVersion = 2
+    private static let readsCacheVersion = 3
     private static let readsCacheMaxAge: TimeInterval = 30 * 60
-    private static let rssSourceLimit = 24
+    private static let rssSourceLimit = 32
+    private var readsRefreshInFlight = false
 
     private struct ReadsCache: Codable {
         let version: Int
@@ -463,7 +479,11 @@ final class AppState: ObservableObject {
     }
 
     @Published var apiKey: String {
-        didSet { UserDefaults.standard.set(apiKey, forKey: "slowclaw.api_key"); setupLLM() }
+        didSet {
+            UserDefaults.standard.set(apiKey, forKey: "slowclaw.api_key")
+            setupLLM()
+            scheduleInterestIndexing()
+        }
     }
     @Published var model: String {
         didSet { UserDefaults.standard.set(model, forKey: "slowclaw.model") }
@@ -489,6 +509,13 @@ final class AppState: ObservableObject {
         } catch {
             fatalError("Database error: \(error)")
         }
+
+        // The journal lens is durable. It paints immediately on relaunch and
+        // is incrementally refreshed when the local model becomes available.
+        journalInterestRecords = Self.loadJournalInterestRecords()
+        mutedInterests = Set(UserDefaults.standard.stringArray(
+            forKey: Self.mutedInterestsDefaultsKey) ?? [])
+        rebuildInterestLens()
 
         // Hydrate synchronously so relaunches paint the last good Reads list
         // before any network work begins.
@@ -560,9 +587,7 @@ final class AppState: ObservableObject {
         // Download button for the whole multi-GB transfer. The defer above
         // clears both the live and persisted state on every exit path.
         do {
-            // Skip the text GGUF when it's already on disk — the audio preset
-            // shares its GGUF with the text-only presets, so switching to the
-            // audio engine shouldn't re-download 2.5 GB.
+            // Skip the text GGUF when it is already on disk.
             if !LocalModelStore.isDownloaded(preset) {
                 _ = try await LocalModelStore.download(preset) { [weak self] p in
                     Task { @MainActor in self?.localModelProgress[preset.id] = p }
@@ -577,7 +602,7 @@ final class AppState: ObservableObject {
 
     /// Reattach progress handlers for downloads the user started before this
     /// process launched. LocalModelStore joins matching background-session
-    /// tasks by destination; if a file already landed, it completes instantly
+    /// tasks by destination; if a file already landed, it completes instantly.
     /// Stale/cancelled transfers retry on the same unmetered-network policy
     /// rather than remaining stuck forever.
     func resumePendingLocalModelDownloads() {
@@ -610,6 +635,7 @@ final class AppState: ObservableObject {
             loadedLocalModelPresetID = preset.id
         }
         refreshLocalLLMStatus()
+        if localLLM.loaded { scheduleInterestIndexing() }
     }
 
     func unloadLocalModel() {
@@ -756,6 +782,161 @@ final class AppState: ObservableObject {
             journals = []
             drafts = []
         }
+        scheduleInterestIndexing()
+    }
+
+    // MARK: - Durable journal interest lens
+
+    /// Start a single background indexing pass. Every successfully analyzed
+    /// journal is checkpointed, so suspension or relaunch resumes with only
+    /// new/edited entries. Audio placeholders are skipped until their real
+    /// transcript is stored.
+    func scheduleInterestIndexing() {
+        guard anyLLMAvailable else { return }
+        guard interestIndexTask == nil else {
+            interestIndexNeedsAnotherPass = true
+            return
+        }
+        interestIndexTask = Task { [weak self] in
+            guard let self else { return }
+            await self.indexJournalInterests()
+            self.interestIndexTask = nil
+            if self.interestIndexNeedsAnotherPass {
+                self.interestIndexNeedsAnotherPass = false
+                self.scheduleInterestIndexing()
+            }
+        }
+    }
+
+    private func indexJournalInterests() async {
+        guard anyLLMAvailable else { return }
+        let candidates = journals.compactMap { entry -> (SlowClawMemoryEntry, String, String)? in
+            let body = journalBodyOf(entry.content)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let analysisText = Self.hasMeaningfulBody(body)
+                ? body
+                : entry.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard analysisText.count >= 20,
+                  !Self.needsTranscript(entry.content),
+                  Self.hasMeaningfulBody(analysisText) else { return nil }
+            return (entry, analysisText, Self.interestFingerprint(analysisText))
+        }
+        .sorted { (journalDate($0.0) ?? .distantPast) > (journalDate($1.0) ?? .distantPast) }
+
+        let pending = candidates.filter {
+            journalInterestRecords[$0.0.key]?.fingerprint != $0.2
+        }
+        guard !pending.isEmpty else {
+            rebuildInterestLens()
+            return
+        }
+
+        isIndexingInterests = true
+        defer {
+            isIndexingInterests = false
+            interestIndexProgress = nil
+        }
+        var changed = false
+        for (offset, item) in pending.enumerated() {
+            if Task.isCancelled { break }
+            if Self.softDeletedKeys()[item.0.key] != nil { continue }
+            // A user-requested post should win after the current extraction.
+            while isGeneratingPosts && !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            interestIndexProgress = "Learning from journal \(offset + 1) of \(pending.count)…"
+            guard let raw = try? await aiExtractInterests(from: item.1) else {
+                await Task.yield()
+                continue
+            }
+            let topics = Self.sanitizeInterests(raw)
+            guard !topics.isEmpty else { continue }
+            journalInterestRecords[item.0.key] = JournalInterestRecord(
+                fingerprint: item.2,
+                topics: topics,
+                journalDate: journalDate(item.0) ?? Date())
+            Self.saveJournalInterestRecords(journalInterestRecords)
+            rebuildInterestLens()
+            changed = true
+            await Task.yield()
+        }
+
+        if changed {
+            // The old cache was ranked with another lens. Replace it in a
+            // background refresh; the rest of the app stays interactive.
+            readsRefreshedAt = nil
+            await loadReads(force: true)
+        }
+    }
+
+    /// Persist a user's removal as a mute, then immediately rebuild and
+    /// re-rank. A later journal mentioning the same topic will not silently
+    /// re-add it.
+    func removeInterest(_ interest: String) {
+        mutedInterests.insert(interest.lowercased())
+        UserDefaults.standard.set(mutedInterests.sorted(),
+                                  forKey: Self.mutedInterestsDefaultsKey)
+        rebuildInterestLens()
+        readsRefreshedAt = nil
+        Task { await loadReads(force: true) }
+    }
+
+    private func rebuildInterestLens() {
+        let now = Date()
+        var scores: [String: Double] = [:]
+        for record in journalInterestRecords.values {
+            let ageDays = max(0, now.timeIntervalSince(record.journalDate) / 86_400)
+            // Recent thoughts lead, but older recurring interests retain a
+            // meaningful floor instead of disappearing abruptly.
+            let recency = max(0.35, pow(0.5, ageDays / 90))
+            for topic in record.topics where !mutedInterests.contains(topic) {
+                scores[topic, default: 0] += recency
+            }
+        }
+        let ordered = scores.sorted {
+            if $0.value == $1.value { return $0.key < $1.key }
+            return $0.value > $1.value
+        }
+        let strongest = ordered.first?.value ?? 1
+        interests = ordered.prefix(24).map(\.key)
+        interestWeights = Dictionary(uniqueKeysWithValues: ordered.prefix(24).map {
+            // 0.75...1.75: frequency/recency influences rank without letting
+            // one long-running theme permanently swamp freshness/diversity.
+            ($0.key, 0.75 + min(1, $0.value / strongest))
+        })
+    }
+
+    private static func sanitizeInterests(_ raw: [String]) -> [String] {
+        var seen = Set<String>()
+        return raw.compactMap { value in
+            let topic = value.lowercased()
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'`.-"))
+            guard topic.count >= 2, topic.count <= 48,
+                  seen.insert(topic).inserted else { return nil }
+            return topic
+        }.prefix(8).map { $0 }
+    }
+
+    nonisolated private static func interestFingerprint(_ text: String) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in text.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(hash, radix: 16)
+    }
+
+    private static func loadJournalInterestRecords() -> [String: JournalInterestRecord] {
+        guard let data = UserDefaults.standard.data(forKey: interestIndexDefaultsKey),
+              let records = try? JSONDecoder().decode(
+                [String: JournalInterestRecord].self, from: data) else { return [:] }
+        return records
+    }
+
+    private static func saveJournalInterestRecords(_ records: [String: JournalInterestRecord]) {
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        UserDefaults.standard.set(data, forKey: interestIndexDefaultsKey)
     }
 
     // MARK: - Recently Deleted (30-day soft-delete safety net)
@@ -812,6 +993,10 @@ final class AppState: ObservableObject {
         live[key] = Date().timeIntervalSince1970
         UserDefaults.standard.set(live, forKey: Self.softDeleteKey)
         if selectedJournalKey == key { selectedJournalKey = nil }
+        journalInterestRecords.removeValue(forKey: key)
+        Self.saveJournalInterestRecords(journalInterestRecords)
+        rebuildInterestLens()
+        readsRefreshedAt = nil
         Task { await refreshJournals() }
     }
 
@@ -839,11 +1024,15 @@ final class AppState: ObservableObject {
             }
             try? memory.forget(key: key)
             pending.removeAll { $0.key == key }
+            journalInterestRecords.removeValue(forKey: key)
         }
         if let queueURL = Self.pendingTranscriptionsURL {
             Self.savePendingTranscriptions(pending, at: queueURL)
         }
         UserDefaults.standard.removeObject(forKey: Self.softDeleteKey)
+        Self.saveJournalInterestRecords(journalInterestRecords)
+        rebuildInterestLens()
+        readsRefreshedAt = nil
         Task { await refreshJournals() }
     }
 
@@ -875,7 +1064,7 @@ final class AppState: ObservableObject {
 
     /// On-disk cache of the last ranked Reads feed, so the list survives app
     /// restarts and shows instantly instead of re-fetching 100+ feeds every
-    /// launch. Lives in Caches/reads-feed-v1.json (see readsCacheURL above).
+    /// launch. Lives in Caches/reads-feed-v3.json (see readsCacheURL above).
 
     /// The Reads feed catalog (114 sources), cached on first access.
     fileprivate var catalog: [SlowClawFeedSource] {
@@ -903,6 +1092,9 @@ final class AppState: ObservableObject {
            Date().timeIntervalSince(refreshedAt) < Self.readsCacheMaxAge {
             return
         }
+        guard !readsRefreshInFlight else { return }
+        readsRefreshInFlight = true
+        defer { readsRefreshInFlight = false }
 
         let isFirst = !readsLoadedOnce || readsItems.isEmpty
         if force || isFirst {
@@ -911,7 +1103,9 @@ final class AppState: ObservableObject {
         }
         readsLoadedOnce = true
 
-        let topics = interests.map { SlowClawTopic(label: $0, weight: 1.0) }
+        let topics = interests.map {
+            SlowClawTopic(label: $0, weight: interestWeights[$0] ?? 1.0)
+        }
         let sources = catalog
 
         // Snapshot fetch happens off the main actor.
@@ -1011,27 +1205,38 @@ final class AppState: ObservableObject {
         _ sources: [SlowClawFeedSource],
         topics: [SlowClawTopic]
     ) -> [SlowClawFeedSource] {
-        let labels = topics.map { $0.label.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { $0.count >= 3 }
-        guard !labels.isEmpty else { return Array(sources.prefix(rssSourceLimit)) }
+        let stopWords: Set<String> = [
+            "about", "after", "from", "into", "journal", "notes", "that",
+            "their", "there", "these", "this", "with", "your"
+        ]
+        let weightedTerms: [(String, Double)] = topics.flatMap { topic in
+            topic.label.lowercased().split { !$0.isLetter && !$0.isNumber }.compactMap { part in
+                let term = String(part)
+                guard term.count >= 3, !stopWords.contains(term) else { return nil }
+                return (term, topic.weight)
+            }
+        }
+        guard !weightedTerms.isEmpty else { return Array(sources.prefix(rssSourceLimit)) }
 
-        let matching = sources.filter { source in
+        let scored = sources.enumerated().map { index, source in
             let metadata = "\(source.title) \(source.domain)".lowercased()
-            return labels.contains { metadata.contains($0) }
+            let score = weightedTerms.reduce(0.0) { total, term in
+                total + (metadata.contains(term.0) ? term.1 : 0)
+            }
+            return (source: source, score: score, index: index)
         }
-        guard matching.count < rssSourceLimit else {
-            return Array(matching.prefix(rssSourceLimit))
+        .sorted {
+            if $0.score == $1.score { return $0.index < $1.index }
+            return $0.score > $1.score
         }
-        let selectedDomains = Set(matching.map(\.domain))
-        let fallback = sources.filter { !selectedDomains.contains($0.domain) }
-        return Array((matching + fallback).prefix(rssSourceLimit))
+        return Array(scored.prefix(rssSourceLimit).map(\.source))
     }
 
     private static var readsCacheURL: URL? {
         guard let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
             return nil
         }
-        return directory.appendingPathComponent("reads-feed-v2.json")
+        return directory.appendingPathComponent("reads-feed-v3.json")
     }
 
     private static func loadReadsCache() -> ReadsCache? {
@@ -1079,14 +1284,6 @@ final class AppState: ObservableObject {
         try? memory.store(key: key, content: text,
                           category: "daily", sessionID: nil, source: source, mediaURL: mediaURL)
         await refreshJournals()
-        guard anyLLMAvailable else { return key }
-        Task.detached(priority: .utility) {
-            if let keywords = try? await self.aiExtractInterests(from: text) {
-                await MainActor.run {
-                    self.interests.append(contentsOf: keywords.filter { !self.interests.contains($0) })
-                }
-            }
-        }
         return key
     }
 
@@ -1158,6 +1355,10 @@ final class AppState: ObservableObject {
         /// If true, generate an AI title from the transcript after it lands
         /// and replace the entry's title line.
         var generateTitle: Bool = false
+        /// Optional for backward-compatible decoding of queues written by
+        /// earlier builds. Failures retry forever with a capped backoff.
+        var attemptCount: Int? = nil
+        var nextAttemptAt: Date? = nil
     }
 
     /// File URL of the on-disk pending-transcription queue (Documents).
@@ -1183,7 +1384,9 @@ final class AppState: ObservableObject {
                                       generateTitleAfter: Bool = false) async -> Bool {
         guard let url = Self.pendingTranscriptionsURL else { return false }
         var items = Self.loadPendingTranscriptions(at: url)
-        let entry = PendingTranscription(key: key, mediaPath: mediaPath, generateTitle: generateTitleAfter)
+        let entry = PendingTranscription(key: key, mediaPath: mediaPath,
+                                         generateTitle: generateTitleAfter,
+                                         attemptCount: 0, nextAttemptAt: nil)
         // Replace any existing entry for the same key so the flag stays fresh.
         items.removeAll { $0.key == key }
         items.append(entry)
@@ -1199,12 +1402,11 @@ final class AppState: ObservableObject {
     }
 
     /// Transcribe queued journals one at a time, updating each entry's content
-    /// and removing it from the queue as it completes. Newest first (explicit
-    /// product requirement). A transcription that returns empty is terminal:
-    /// meaningful stored content is kept as-is (queue item dropped), and a
-    /// placeholder/title-only row gets the explicit no-transcript marker
-    /// instead of being retried forever — the manual Re-transcribe button is
-    /// the retry path. Single-flight — concurrent callers (launch, foreground,
+    /// and removing it from the queue as it completes. Newest eligible item
+    /// first. Empty/failed recognition stays queued with capped exponential
+    /// backoff, so old and imported audio heals without a manual tap. A manual
+    /// Re-transcribe remains available for immediate retries. Single-flight —
+    /// concurrent callers (launch, foreground,
     /// importer) no-op while a drain is already running. The loop RE-LOADS the
     /// queue file every iteration, so items enqueued while a drain is in
     /// progress are picked up instead of waiting for the next one.
@@ -1217,8 +1419,12 @@ final class AppState: ObservableObject {
         var handledKeys = Set<String>()
 
         while !Task.isCancelled {
+            let now = Date()
             let snapshot = Self.loadPendingTranscriptions(at: url)
-                .filter { !handledKeys.contains($0.key) }
+                .filter {
+                    !handledKeys.contains($0.key) &&
+                    ($0.nextAttemptAt.map { $0 <= now } ?? true)
+                }
             guard let newest = snapshot.max(by: { Self.pendingAgeKey($0, memory: memory) < Self.pendingAgeKey($1, memory: memory) })
             else { break }
             // Track handled keys locally: if a queue-file write ever fails
@@ -1238,14 +1444,9 @@ final class AppState: ObservableObject {
                 keepAliveWhileLocked: lockedPhoneExperiment)
             let trimmedTranscript = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmedTranscript.isEmpty {
-                // Empty recognition: never clobber the stored entry, and never
-                // retry it automatically forever. If the row already carries a
-                // meaningful body, keep it untouched and just drop the pending
-                // item. If it is still a placeholder/title-only row, write the
-                // title plus the explicit no-transcript marker — removing the
-                // pending item ONLY after that store succeeds. The manual
-                // Re-transcribe button remains the retry path for these rows;
-                // reconcile does not re-queue marker rows automatically.
+                // Never clobber meaningful stored content. Placeholder/marker
+                // rows stay queued and retry automatically with a capped
+                // backoff; keep the visible body in the transcribing state.
                 handledKeys.insert(newest.key)
                 let existing = try? memory.get(key: newest.key)
                 let titleLine = existing.flatMap { e in
@@ -1253,16 +1454,14 @@ final class AppState: ObservableObject {
                 } ?? "New Recording"
                 let storedBody = existing.map { journalBodyOf($0.content) } ?? ""
                 if AppState.hasMeaningfulBody(storedBody) {
-                    // Real content already persisted — drop the pending item
-                    // without writing anything.
+                    // Real content already persisted, so this queued copy is
+                    // obsolete and can be removed safely.
                     Self.removeFromPendingQueue(key: newest.key, at: url)
                 } else {
-                    let marker = existing?.source == "audio_imported"
-                        ? "🎙 Imported audio (no transcript)"
-                        : "🎙 Audio journal (no transcript)"
-                    if await storeJournalUpdate(key: newest.key, content: "\(titleLine)\n\n\(marker)") {
-                        Self.removeFromPendingQueue(key: newest.key, at: url)
-                    }
+                    _ = await storeJournalUpdate(
+                        key: newest.key,
+                        content: "\(titleLine)\n\n\(Self.transcribingPlaceholder)")
+                    Self.deferPendingTranscriptionRetry(newest, at: url)
                 }
                 continue
             }
@@ -1286,6 +1485,7 @@ final class AppState: ObservableObject {
             }
             handledKeys.insert(newest.key)
         }
+        await scheduleNextBackgroundTranscription()
     }
 
     /// True while a transcription drain is running (single-flight guard).
@@ -1316,13 +1516,27 @@ final class AppState: ObservableObject {
         savePendingTranscriptions(remaining, at: url)
     }
 
+    /// Checkpoint an automatic retry without losing items appended by another
+    /// writer. Delays: 1m, 5m, 30m, 2h, 12h, then daily until success.
+    private static func deferPendingTranscriptionRetry(
+        _ entry: PendingTranscription,
+        at url: URL
+    ) {
+        var items = loadPendingTranscriptions(at: url)
+        guard let index = items.firstIndex(where: { $0.key == entry.key }) else { return }
+        let attempt = min((entry.attemptCount ?? 0) + 1, 100_000)
+        let delays: [TimeInterval] = [60, 300, 1_800, 7_200, 43_200, 86_400]
+        items[index].attemptCount = attempt
+        items[index].nextAttemptAt = Date(timeIntervalSinceNow: delays[min(attempt - 1, delays.count - 1)])
+        savePendingTranscriptions(items, at: url)
+    }
+
     /// Manually re-transcribe an audio journal from its file, replacing the
     /// entry's body (title line preserved). This is the retry path for
     /// truncated or missing transcripts — the JournalDetailView exposes a
     /// Re-transcribe button that calls this, so a new build's engine can be
     /// re-checked against audio that previously transcribed badly. It is also
-    /// the retry path for rows the drain gave up on automatically (the
-    /// explicit no-transcript markers, which reconcile never re-queues).
+    /// also lets the user bypass the automatic retry backoff immediately.
     /// Uses Apple's whole-file, on-device SpeechAnalyzer path. Returns the entry's
     /// full new content, or "" when there is no audio file, recognition came
     /// back empty, the entry row is gone, or the store failed — in every
@@ -1355,6 +1569,9 @@ final class AppState: ObservableObject {
         // Same shape the drain path writes. Only report success after the
         // store actually persisted.
         guard await storeJournalUpdate(key: entry.key, content: newContent) else { return "" }
+        if let queueURL = Self.pendingTranscriptionsURL {
+            Self.removeFromPendingQueue(key: entry.key, at: queueURL)
+        }
         return newContent
     }
 
@@ -1393,12 +1610,8 @@ final class AppState: ObservableObject {
     /// (re-)queue them for transcription. This is the guarantee that every
     /// audio the app owns eventually gets a transcript: anything that fell
     /// out of the in-memory queue (import interrupted by suspension, a
-    /// crashed drain) is rediscovered here and retried. Rows already carrying
-    /// an explicit no-transcript marker are deliberately NOT re-queued —
-    /// transcription already ran and produced nothing, so retrying them
-    /// automatically would loop forever; their retry is the manual
-    /// Re-transcribe button. Throttled to at most once per minute per app
-    /// session.
+    /// crashed drain, or an older build's no-transcript marker) is rediscovered
+    /// here and retried. Throttled to at most once per minute per app session.
     func reconcileMissingTranscripts() async {
         let now = Date()
         if let last = lastTranscriptReconcileAt,
@@ -1420,18 +1633,15 @@ final class AppState: ObservableObject {
             items.append(PendingTranscription(key: c.key, mediaPath: c.mediaURL ?? "", generateTitle: false))
             added = true
         }
-        guard added else { return }
-        Self.savePendingTranscriptions(items, at: url)
+        if added { Self.savePendingTranscriptions(items, at: url) }
         await drainPendingTranscriptions()
     }
 
     private var lastTranscriptReconcileAt: Date? = nil
 
     /// True when a journal's body still awaits its transcript: an empty body
-    /// or the transcribing placeholder. Explicit no-transcript markers are
-    /// deliberately NOT automatic candidates — they mean transcription already
-    /// ran and produced nothing, and auto-retrying would loop forever; the
-    /// manual Re-transcribe button is their retry path.
+    /// or the transcribing placeholder. Legacy no-transcript markers are also
+    /// candidates so installing this build automatically heals older audio.
     nonisolated static func needsTranscript(_ content: String?) -> Bool {
         guard let content else { return false }
         let lines = content
@@ -1441,6 +1651,8 @@ final class AppState: ObservableObject {
         let body = lines.dropFirst().joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return body.isEmpty || body == transcribingPlaceholder
+            || body == "🎙 Audio journal (no transcript)"
+            || body == "🎙 Imported audio (no transcript)"
     }
 
     /// True when a stored body is meaningful content — non-empty and not one
@@ -1496,7 +1708,9 @@ final class AppState: ObservableObject {
         let request = BGProcessingTaskRequest(identifier: Self.backgroundTranscriptionTaskID)
         request.requiresNetworkConnectivity = false
         request.requiresExternalPower = false
-        request.earliestBeginDate = Date(timeIntervalSinceNow: 60) // at least 1 min out
+        let earliestRetry = remaining.map { $0.nextAttemptAt ?? Date() }.min() ?? Date()
+        request.earliestBeginDate = Date(
+            timeIntervalSinceNow: max(60, earliestRetry.timeIntervalSinceNow))
         try? BGTaskScheduler.shared.submit(request)
     }
 
@@ -3758,7 +3972,18 @@ struct ProfileView: View {
                                 .font(DS.captionFont)
                                 .foregroundStyle(DS.muted(scheme))
                         } else {
-                            FlowChips(interests: $state.interests, scheme: scheme)
+                            FlowChips(interests: state.interests, scheme: scheme) {
+                                state.removeInterest($0)
+                            }
+                        }
+                        if state.isIndexingInterests {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text(state.interestIndexProgress ?? "Learning from journals…")
+                                    .font(DS.captionFont)
+                                    .foregroundStyle(DS.muted(scheme))
+                            }
                         }
                     }
                 }
@@ -3966,14 +4191,15 @@ struct InterestChipsRow: View {
 
 /// Wrapping interest chips with delete-on-tap, used on the Profile tab.
 struct FlowChips: View {
-    @Binding var interests: [String]
+    let interests: [String]
     let scheme: ColorScheme
+    let onRemove: (String) -> Void
 
     var body: some View {
         FlowLayout(spacing: 6, lineSpacing: 6) {
             ForEach(interests, id: \.self) { tag in
                 Button {
-                    interests.removeAll { $0 == tag }
+                    onRemove(tag)
                 } label: {
                     HStack(spacing: 4) {
                         Text(tag)

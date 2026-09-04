@@ -702,7 +702,7 @@ public enum LocalModelStore {
     /// Shared download-state check: the file must exist, clear `minimumBytes`,
     /// AND start with the GGUF magic bytes. Mirrors the coordinator's stricter
     /// post-download validation (validateGGUF) so a corrupt or error-page file
-    /// already on disk is never mistaken for a downloaded model/projector —
+    /// already on disk is never mistaken for a downloaded model —
     /// pre-existing garbage re-triggers a download instead of bypassing it.
     private static func isPlausibleGGUF(at url: URL, minimumBytes: Int64) -> Bool {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
@@ -1202,7 +1202,7 @@ private final class ModelDownloadCoordinator: NSObject, URLSessionDownloadDelega
     /// hop), and only as a last resort the current (possibly redirected)
     /// request URL. A task tagged with a DIFFERENT destination is never
     /// adopted, even when its URL matches (two destinations may share one
-    /// source URL — e.g. the audio preset reuses the Q4 text GGUF).
+    /// source URL, so callers can safely join a restored background transfer).
     private static func isAttachable(_ task: URLSessionDownloadTask,
                                      url: URL, destination: URL) -> Bool {
         guard task.state == .running || task.state == .suspended else { return false }

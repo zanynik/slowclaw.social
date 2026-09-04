@@ -86,19 +86,43 @@ pub fn estimateReadMinutes(text: []const u8) u32 {
 
 // ── Topic matching ────────────────────────────────────────────────────────
 
-/// Check if `item` matches `topic_label`. Case-insensitive substring match on
-/// title + body. Mirrors the TS `matchesTopic`.
+/// Check if `item` matches `topic_label`. Exact phrases match first; extracted
+/// multi-word interests also match when at least two meaningful terms occur.
+/// This lets a journal topic such as "local artificial intelligence" match an
+/// article titled "Private AI on your phone" without letting generic words
+/// such as "local" match on their own.
 fn matchesTopic(item: FeedItem, topic_label: []const u8) bool {
-    // Lowercase the label and check against title + body (case-insensitive).
     var lower_buf: [256]u8 = undefined;
     const label_lower = lowerSlice(&lower_buf, topic_label);
+    if (itemContains(item, label_lower)) return true;
 
-    // Check title
-    if (containsCaseInsensitive(item.title, label_lower)) return true;
-    // Check body
-    if (containsCaseInsensitive(item.body, label_lower)) return true;
-    // Check author handle
-    if (containsCaseInsensitive(item.author_handle, label_lower)) return true;
+    var terms = std.mem.tokenizeAny(u8, topic_label, " \t\r\n-_/.,:;()[]{}");
+    var significant: usize = 0;
+    var matched: usize = 0;
+    while (terms.next()) |term| {
+        var term_buf: [96]u8 = undefined;
+        const term_lower = lowerSlice(&term_buf, term);
+        if (term_lower.len < 3 or isTopicStopword(term_lower)) continue;
+        significant += 1;
+        if (itemContains(item, term_lower)) matched += 1;
+    }
+    return if (significant == 1) matched == 1 else significant > 1 and matched >= 2;
+}
+
+fn itemContains(item: FeedItem, needle_lower: []const u8) bool {
+    return containsCaseInsensitive(item.title, needle_lower) or
+        containsCaseInsensitive(item.body, needle_lower) or
+        containsCaseInsensitive(item.author_handle, needle_lower);
+}
+
+fn isTopicStopword(term_lower: []const u8) bool {
+    const words = [_][]const u8{
+        "about", "after", "from", "into", "journal", "notes", "that",
+        "their", "there", "these", "this", "with", "your",
+    };
+    for (words) |word| {
+        if (std.mem.eql(u8, term_lower, word)) return true;
+    }
     return false;
 }
 
@@ -137,7 +161,9 @@ fn journalTopicBoost(item: FeedItem, topics: []const Topic) f64 {
     var first = true;
     for (topics) |t| {
         if (matchesTopic(item, t.label)) {
-            boost += if (first) TOPIC_MATCH_TOP else TOPIC_MATCH_EACH;
+            const base = if (first) TOPIC_MATCH_TOP else TOPIC_MATCH_EACH;
+            const weight = @min(@max(t.weight, 0.25), 2.0);
+            boost += base * weight;
             first = false;
             if (boost >= TOPIC_MATCH_CAP) return TOPIC_MATCH_CAP;
         }
@@ -527,6 +553,22 @@ test "scoreRead: topic match boosts score" {
     try testing.expect(result_with.score > result_without.score + 0.5); // significant boost
 }
 
+test "scoreRead: journal topic weight affects relevance" {
+    const now: f64 = 1_000_000;
+    const item = FeedItem{
+        .id = "1",
+        .title = "On-device AI advances",
+        .body = "Private models on a phone",
+        .author_handle = "author",
+        .source_platform = "rss",
+        .timestamp = now,
+    };
+    const low = [_]Topic{.{ .label = "on-device AI", .weight = 0.5 }};
+    const high = [_]Topic{.{ .label = "on-device AI", .weight = 1.5 }};
+    try testing.expect(scoreRead(item, &high, &.{}, now).score >
+        scoreRead(item, &low, &.{}, now).score + 0.5);
+}
+
 test "scoreRead: negative topic penalizes" {
     const now: f64 = 1_000_000;
     const item = FeedItem{
@@ -617,6 +659,19 @@ test "matchesTopic: matches title, body, author" {
     try testing.expect(matchesTopic(item, "systems"));
     try testing.expect(matchesTopic(item, "rustacean"));
     try testing.expect(!matchesTopic(item, "python"));
+}
+
+test "matchesTopic: meaningful terms bridge extracted phrase wording" {
+    const item = FeedItem{
+        .id = "1",
+        .title = "Private artificial intelligence on phones",
+        .body = "A fast inference engine for mobile devices",
+        .author_handle = "author",
+        .source_platform = "rss",
+        .timestamp = 0,
+    };
+    try testing.expect(matchesTopic(item, "mobile artificial intelligence"));
+    try testing.expect(!matchesTopic(item, "local gardening projects"));
 }
 
 // ── Cold-start diversity (TDD) ─────────────────────────────────────────────

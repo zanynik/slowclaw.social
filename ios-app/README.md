@@ -106,13 +106,15 @@ for truncated transcripts across new builds.
 
 Routing goes through the shared on-device STT router (`AudioSTT`). Apple uses
 SpeechAnalyzer's `.transcription` preset over the whole file,
-after installing the required locale model through `AssetInventory`; segmented
-forced-on-device `SFSpeechRecognizer` is compatibility fallback only. Audio
+after installing the required locale model through `AssetInventory`. Audio
 never leaves the device. If no complete
 transcript is produced (empty/failed recognition, no
 audio file, or a failed store write), the old transcript is left unchanged
 and a "Re-transcription failed" alert is shown — a partial result never
-overwrites the stored entry.
+overwrites the stored entry. Automatic jobs remain in the durable queue and
+retry after 1 minute, 5 minutes, 30 minutes, 2 hours, 12 hours, then daily
+until a transcript lands. Legacy no-transcript rows are discovered and queued
+on upgrade, so imported and recorded audio do not require one manual tap each.
 
 New recordings follow the system Voice Memos/Notes pattern: the microphone
 buffer is written to the m4a and streamed into SpeechAnalyzer's
@@ -123,6 +125,11 @@ is not re-sliced afterward. If the live model is unavailable, the audio is
 still saved immediately and the durable pending queue runs whole-file offline
 transcription in the background. Imported audio enters that same persisted
 queue, so its placeholder is usable/playable while transcription continues.
+
+Interest extraction is also resumable background work. It skips placeholders,
+checkpoints topics per journal only after real text/transcription exists, and
+rebuilds a recency/recurrence-weighted lens that drives both RSS source choice
+and Zig item ranking. Tweet generation takes priority between extractions.
 
 Audio detail screens expose a visible Delete action. Deletion moves the journal,
 audio and transcript to Recently Deleted for 30 days; Empty Trash removes both
