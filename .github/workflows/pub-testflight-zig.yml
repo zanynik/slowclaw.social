@@ -12,6 +12,7 @@ on:
     push:
         branches:
             - main
+            - feat/background-ai-personalized-reads
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
             - "zig-src/**"
