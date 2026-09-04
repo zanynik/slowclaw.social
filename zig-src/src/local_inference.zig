@@ -27,8 +27,7 @@ const provider = @import("provider.zig");
 pub const have_llama = build_options.with_llama;
 
 // Only analyzed when have_llama is true (comptime-lazy), so the stub build
-// never references llama symbols or headers. Public so audio_transcribe.zig
-// can share the same declarations (DRY — both modules bind llama.h).
+// never references llama symbols or headers.
 pub const llama = if (have_llama) @cImport({
     @cInclude("llama.h");
 }) else struct {};
@@ -90,14 +89,6 @@ fn loadedModel() ?*llama.llama_model {
     if (!have_llama) return null;
     const m = g_model orelse return null;
     return @ptrCast(@alignCast(m));
-}
-
-/// Public accessor for the currently-loaded text model pointer, so
-/// audio_transcribe.zig can attach an mtmd projector to it. Returns null
-/// when no model is loaded (or the backend is compiled out). Borrowed —
-/// the caller must not free it; lifetime is owned by this module.
-pub fn loadedModelPtr() ?*llama.llama_model {
-    return loadedModel();
 }
 
 /// On-device LLM inference engine. Wraps llama.cpp's C API.
@@ -367,8 +358,7 @@ pub const LocalInference = struct {
 
 /// Readable, >1 KiB, "GGUF" magic — the three pre-checks from
 /// inference.rs load_model. `path_z` must be null-terminated.
-/// Public so audio_transcribe.zig can validate an mmproj GGUF the same way.
-pub fn checkGgufFile(path_z: [:0]const u8) InferenceError!void {
+fn checkGgufFile(path_z: [:0]const u8) InferenceError!void {
     const fp = c_stdio.fopen(path_z.ptr, "rb") orelse return error.ModelLoadFailed;
     defer _ = c_stdio.fclose(fp);
     if (c_stdio.fseek(fp, 0, c_stdio.SEEK_END) != 0) return error.ModelLoadFailed;

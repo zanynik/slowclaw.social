@@ -77,11 +77,6 @@ zig build test-response-cache # LLM response cache tests (libc + sqlite)
 SLOWCLAW_TEST_GGUF=/path/to/model.gguf zig build test-local-llm
                            # on-device LLM smoke test: loads a real GGUF and
                            # runs a short chat completion on-device
-SLOWCLAW_TEST_AUDIO_GGUF=/path/to/model.gguf \
-SLOWCLAW_TEST_MMPROJ=/path/to/mmproj.gguf \
-SLOWCLAW_TEST_PCM_F32=/path/to/mono-16k-f32.raw zig build test-local-audio
-                           # real mtmd smoke: text model + audio projector +
-                           # raw mono PCM (skips when env vars are unset)
 ```
 
 `-Dwith-llama=false` compiles the staticlib without llama.cpp (the FFI then

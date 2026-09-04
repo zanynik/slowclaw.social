@@ -343,12 +343,8 @@ final class AppState: ObservableObject {
     /// which is restored from disk before this process has reattached.
     private var localDownloadOperations: Set<String> = []
 
-    // On-device audio transcription (mtmd / Gemma audio). OFF by default.
-    // When enabled, every file/re-transcription attempts mtmd first and logs
-    // the actual route; Apple on-device Speech is fallback-only.
-    @AppStorage("experimentalAudioEngine") var experimentalAudioEngine: Bool = false
-    @Published var localAudio: LocalAudioStatus = LocalAudioStatus()
-    /// Prevent model unload/replacement while mtmd owns pointers into it.
+    // Apple Speech file transcription status. This is independent of the local
+    // text model, so model lifecycle controls never race audio work.
     @Published var audioTranscriptionInFlight: Bool = false
     @Published var audioTranscriptionProgress: String? = nil
     private var audioTranscriptionCount = 0
@@ -484,6 +480,11 @@ final class AppState: ObservableObject {
             self.readsLoadedOnce = true
         }
 
+        // Retire the old low-quality quant and the removed MTMD projector
+        // before restoring downloads or activating the single supported model.
+        LocalModelStore.removeRetiredArtifacts()
+        UserDefaults.standard.removeObject(forKey: "experimentalAudioEngine")
+
         // Restore user-started model downloads before the first screen paints.
         // The URLSession transfer itself is owned by iOS; these IDs let this
         // process reattach its progress handlers after a relaunch. Unknown IDs
@@ -496,7 +497,6 @@ final class AppState: ObservableObject {
 
         setupLLM()
         refreshLocalLLMStatus()
-        refreshLocalAudioStatus()
         // A model file can land via the background download coordinator with
         // no in-app awaiter (app relaunched mid-download; the transfer kept
         // running while suspended). Re-read status so the model row re-renders
@@ -514,11 +514,6 @@ final class AppState: ObservableObject {
     func refreshLocalLLMStatus() {
         localLLM = slowClawLocalLLMStatus()
         if !localLLM.loaded { loadedLocalModelPresetID = nil }
-    }
-
-    /// Refresh on-device audio engine status (mtmd/mmproj).
-    func refreshLocalAudioStatus() {
-        localAudio = slowClawLocalAudioStatus()
     }
 
     /// True when any LLM is usable: a configured remote provider OR a loaded
@@ -539,17 +534,9 @@ final class AppState: ObservableObject {
         }
 
         localModelError = nil
-        // Audio presets carry two files (text GGUF + mmproj). Report progress
-        // across BOTH: each file's share is weighted by its expected size so
-        // the bar reflects total bytes, not per-file jumps.
-        let mmprojSize = preset.mmprojSizeBytes ?? 0
-        let totalBytes = preset.sizeBytes + mmprojSize
-        let textWeight = totalBytes > 0 ? Double(preset.sizeBytes) / Double(totalBytes) : 1.0
-        // Seed the bar BEFORE the first await so the row renders a determinate
-        // bar immediately — at 0% (the background session waits for unmetered
-        // Wi-Fi before the first byte moves), or at textWeight when the shared
-        // text GGUF is already on disk and only the mmproj remains.
-        localModelProgress[preset.id] = LocalModelStore.isDownloaded(preset) ? textWeight : 0
+        // Seed the bar before the first await so the row renders immediately,
+        // including 0% while the background session waits for Wi-Fi.
+        localModelProgress[preset.id] = LocalModelStore.isDownloaded(preset) ? 1 : 0
         // Track ONLY this preset as downloading. Downloads must not flip the
         // global busy flag — that used to disable every other preset's
         // Download button for the whole multi-GB transfer. The defer above
@@ -560,16 +547,7 @@ final class AppState: ObservableObject {
             // audio engine shouldn't re-download 2.5 GB.
             if !LocalModelStore.isDownloaded(preset) {
                 _ = try await LocalModelStore.download(preset) { [weak self] p in
-                    Task { @MainActor in self?.localModelProgress[preset.id] = p * textWeight }
-                }
-            }
-            // Fetch the mmproj too (audio presets only). Store it next to the
-            // text GGUF; activation loads it via slowClawLocalAudioLoadMMProj.
-            if preset.hasAudioMmproj, !LocalModelStore.isMmprojDownloaded(preset) {
-                _ = try await LocalModelStore.downloadMmproj(preset) { [weak self] p in
-                    Task { @MainActor in
-                        self?.localModelProgress[preset.id] = textWeight + p * (1.0 - textWeight)
-                    }
+                    Task { @MainActor in self?.localModelProgress[preset.id] = p }
                 }
             }
             localModelProgress[preset.id] = 1
@@ -582,8 +560,8 @@ final class AppState: ObservableObject {
     /// Reattach progress handlers for downloads the user started before this
     /// process launched. LocalModelStore joins matching background-session
     /// tasks by destination; if a file already landed, it completes instantly
-    /// and advances to the optional mmproj. Stale/cancelled transfers retry on
-    /// the same unmetered-network policy rather than remaining stuck forever.
+    /// Stale/cancelled transfers retry on the same unmetered-network policy
+    /// rather than remaining stuck forever.
     func resumePendingLocalModelDownloads() {
         let presetsByID = Dictionary(uniqueKeysWithValues: LocalModelPreset.presets.map { ($0.id, $0) })
         for id in activeDownloadIDs {
@@ -598,19 +576,12 @@ final class AppState: ObservableObject {
     }
 
     /// Load a downloaded model into the on-device engine. Runs off-actor:
-    /// mmap-ing a multi-GB GGUF takes seconds and must not block the UI. When
-    /// the preset has an audio mmproj that's already downloaded, also loads
-    /// the projector so the mtmd audio engine becomes available.
+    /// mmap-ing a multi-GB GGUF takes seconds and must not block the UI.
     func activateLocalModel(_ preset: LocalModelPreset) async {
         guard let url = try? LocalModelStore.fileURL(for: preset) else { return }
         localModelBusy = true
         localModelError = nil
         defer { localModelBusy = false }
-        // An mtmd projector holds a pointer to the current text model. Detach
-        // it before local inference replaces/reloads that model, including
-        // when upgrading the shared Q4 row to its audio add-on.
-        slowClawLocalAudioUnload()
-        refreshLocalAudioStatus()
         let err = await Task.detached(priority: .userInitiated) {
             slowClawLocalLLMLoad(path: url.path)
         }.value
@@ -621,44 +592,17 @@ final class AppState: ObservableObject {
             loadedLocalModelPresetID = preset.id
         }
         refreshLocalLLMStatus()
-
-        // If this preset has an audio mmproj and it's downloaded, load it so
-        // the mtmd audio engine is ready. Best-effort — a missing/bad mmproj
-        // doesn't block the text model; the audio toggle just stays inactive.
-        if localLLM.loaded, preset.hasAudioMmproj,
-           let mmprojURL = try? LocalModelStore.mmprojFileURL(for: preset),
-           LocalModelStore.isMmprojDownloaded(preset) {
-            let mmprojErr = await Task.detached(priority: .userInitiated) {
-                slowClawLocalAudioLoadMMProj(path: mmprojURL.path)
-            }.value
-            if let mmprojErr {
-                localModelError = mmprojErr
-                // The shared text model did load, but the audio bundle did
-                // not. Mark the matching text-only row active rather than
-                // falsely presenting mtmd as ready.
-                loadedLocalModelPresetID = LocalModelPreset.presets.first {
-                    !$0.hasAudioMmproj && $0.fileName == preset.fileName
-                }?.id
-            }
-        }
-        refreshLocalAudioStatus()
     }
 
     func unloadLocalModel() {
-        // Unload the audio mmproj first (it attaches to the text model), then
-        // the text model, then refresh both statuses.
-        slowClawLocalAudioUnload()
         slowClawLocalLLMUnload()
         loadedLocalModelPresetID = nil
         refreshLocalLLMStatus()
-        refreshLocalAudioStatus()
     }
 
     func deleteLocalModel(_ preset: LocalModelPreset) {
         // Unload first if any model is active (frees RAM), then remove the
-        // files (text GGUF + mmproj if present).
-        // Only unload when deleting the active preset or another row that
-        // points at the same shared text GGUF (Q4 and its audio add-on).
+        // model file. Unload first if the active model owns it.
         if localLLM.loaded,
            let activeID = loadedLocalModelPresetID,
            let active = LocalModelPreset.presets.first(where: { $0.id == activeID }),
@@ -666,10 +610,8 @@ final class AppState: ObservableObject {
             unloadLocalModel()
         }
         try? LocalModelStore.delete(preset)
-        try? LocalModelStore.deleteMmproj(preset)
         localModelProgress[preset.id] = nil
         refreshLocalLLMStatus()
-        refreshLocalAudioStatus()
     }
 
     /// Auto-activate the on-device model when the app is open or AI is needed.
@@ -686,13 +628,9 @@ final class AppState: ObservableObject {
         // localModelBusy, so this check is explicit.
         guard localLLM.available, !localLLM.loaded, !localModelBusy,
               activeDownloadIDs.isEmpty else { return }
-        // Prefer an audio-capable preset when the experimental engine is ON
-        // (so the mmproj loads and Gemma-audio transcription is eligible),
-        // else the first downloaded preset. Never auto-download.
+        // There is one curated text model. Never auto-download without consent.
         let downloaded = LocalModelPreset.presets.filter { LocalModelStore.isDownloaded($0) }
-        let preset = (experimentalAudioEngine
-            ? downloaded.first(where: { $0.hasAudioMmproj && LocalModelStore.isMmprojDownloaded($0) })
-            : nil) ?? downloaded.first
+        let preset = downloaded.first
         guard let preset else { return }
         await activateLocalModel(preset)
     }
@@ -1367,8 +1305,7 @@ final class AppState: ObservableObject {
     /// re-checked against audio that previously transcribed badly. It is also
     /// the retry path for rows the drain gave up on automatically (the
     /// explicit no-transcript markers, which reconcile never re-queues).
-    /// Uses the shared STT router: Gemma/mtmd first when the preference is on,
-    /// otherwise segmented Apple Speech. Returns the entry's
+    /// Uses Apple's whole-file, on-device SpeechAnalyzer path. Returns the entry's
     /// full new content, or "" when there is no audio file, recognition came
     /// back empty, the entry row is gone, or the store failed — in every
     /// failure case the existing content is left untouched (never
@@ -1380,10 +1317,7 @@ final class AppState: ObservableObject {
             lastTranscriptionStatus = "Audio file is missing."
             return ""
         }
-        let useGemma = experimentalAudioEngine
-        lastTranscriptionStatus = useGemma
-            ? "Starting Gemma 4 Audio (mtmd)…"
-            : "Starting Apple's long-form on-device transcription…"
+        lastTranscriptionStatus = "Starting Apple's long-form on-device transcription…"
         let transcript = await performAudioTranscription(
             url: url, context: .retranscribe, keepAliveWhileLocked: false)
         lastTranscriptionStatus = "\(transcript.engine.rawValue): \(transcript.diagnostic ?? "finished")"
@@ -1406,10 +1340,7 @@ final class AppState: ObservableObject {
         return newContent
     }
 
-    /// Single AppState funnel for file STT. The count keeps model lifecycle
-    /// controls disabled until all overlapping callers finish; mtmd also
-    /// serializes internally, but UI-driven unload must never race its model
-    /// pointers.
+    /// Single AppState funnel for whole-file Apple Speech transcription.
     private func performAudioTranscription(
         url: URL,
         context: AudioSTTContext,
@@ -1422,7 +1353,6 @@ final class AppState: ObservableObject {
             audioTranscriptionInFlight = audioTranscriptionCount > 0
             if audioTranscriptionCount == 0 { audioTranscriptionProgress = nil }
         }
-        let useGemma = experimentalAudioEngine
         let report: @Sendable (String) -> Void = { [weak self] message in
             Task { @MainActor [weak self] in
                 self?.audioTranscriptionProgress = message
@@ -1430,13 +1360,11 @@ final class AppState: ObservableObject {
         }
         if keepAliveWhileLocked {
             return await Task.detached(priority: .userInitiated) {
-                await LockedPhoneExperiment.run(url: url, useGemmaAudio: useGemma,
-                                                 progress: report)
+                await LockedPhoneExperiment.run(url: url, progress: report)
             }.value
         }
         return await Task.detached(priority: .userInitiated) {
-            await AudioSTT.transcribe(url: url, useGemmaAudio: useGemma,
-                                      context: context, progress: report)
+            await AudioSTT.transcribe(url: url, context: context, progress: report)
         }.value
     }
 
@@ -3482,12 +3410,7 @@ struct OnDeviceAICard: View {
 
     @ViewBuilder
     private func modelRow(_ model: LocalModelPreset) -> some View {
-        // An audio preset is fully downloaded only when BOTH the text GGUF
-        // and its mmproj are on disk. Otherwise the row stays on the Download
-        // path (which skips the GGUF already present and fetches just the
-        // missing projector) and Activate is never offered prematurely.
         let downloaded = LocalModelStore.isDownloaded(model)
-            && (!model.hasAudioMmproj || LocalModelStore.isMmprojDownloaded(model))
         let progress = state.localModelProgress[model.id]
         let isLoaded = state.localLLM.loaded
             && state.loadedLocalModelPresetID == model.id
@@ -3501,14 +3424,6 @@ struct OnDeviceAICard: View {
         // files mid-transfer/activation corrupts state — block those, and
         // ONLY those, while work is in flight.
         let conflictControlsDisabled = state.localModelBusy || anyDownloadActive
-            || state.audioTranscriptionInFlight
-        // The audio row shares Q4's text GGUF. If Q4 is already present,
-        // disclose that Download fetches only the projector add-on.
-        let textModelDownloaded = LocalModelStore.isDownloaded(model)
-        let isAudioAddOnOnly = model.hasAudioMmproj && textModelDownloaded
-        let sizeLabel = isAudioAddOnOnly
-            ? (model.mmprojSizeLabel ?? model.sizeLabel)
-            : (model.mmprojSizeLabel.map { "\(model.sizeLabel) + \($0)" } ?? model.sizeLabel)
 
         VStack(alignment: .leading, spacing: 6) {
             Text(model.title)
@@ -3526,16 +3441,14 @@ struct OnDeviceAICard: View {
                     .tint(DS.accentColor)
                 Text(progress <= 0
                      ? "Preparing / waiting for Wi-Fi"
-                     : "\(Int(progress * 100))% of \(sizeLabel)")
+                     : "\(Int(progress * 100))% of \(model.sizeLabel)")
                     .font(DS.microFont)
                     .foregroundStyle(DS.muted(scheme))
             } else if !downloaded {
                 Button {
                     Task { await state.downloadLocalModel(model) }
                 } label: {
-                    Label(isAudioAddOnOnly
-                          ? "Download Audio Add-on (\(sizeLabel))"
-                          : "Download (\(sizeLabel))",
+                    Label("Download (\(model.sizeLabel))",
                           systemImage: "arrow.down.circle")
                         .font(DS.captionFont.weight(.medium))
                         .frame(maxWidth: .infinity)
@@ -3606,7 +3519,7 @@ struct OnDeviceAICard: View {
     }
 }
 
-/// Engine selection, readiness, and a live audit of every file transcription.
+/// Apple Speech readiness and a live audit of every file transcription.
 /// No transcript text is logged—only routing, lengths, errors, and timings.
 struct ExperimentCard: View {
     let scheme: ColorScheme
@@ -3624,36 +3537,9 @@ struct ExperimentCard: View {
                         .foregroundStyle(DS.ink(scheme))
                 }
 
-                Text("Choose the primary on-device engine and verify what actually ran.")
+                Text("Apple Speech transcribes recordings and imports automatically on-device.")
                     .font(DS.captionFont)
                     .foregroundStyle(DS.muted(scheme))
-
-                Toggle(isOn: $state.experimentalAudioEngine) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Prefer Gemma 4 Audio (mtmd)")
-                            .font(DS.bodyFont.weight(.medium))
-                        Text("Gemma runs first in sequential 45-second segments. Apple Speech is fallback-only if Gemma cannot complete.")
-                            .font(DS.microFont)
-                            .foregroundStyle(DS.muted(scheme))
-                    }
-                }
-                .tint(DS.accentColor)
-                .onChange(of: state.experimentalAudioEngine) { _, _ in
-                    state.refreshLocalAudioStatus()
-                }
-
-                if state.localAudio.available {
-                    Text(state.localAudio.supported
-                         ? "Gemma audio is ready at \(state.localAudio.sampleRate) Hz."
-                         : (state.localAudio.reason ?? "The audio projector is not loaded."))
-                        .font(DS.microFont)
-                        .foregroundStyle(state.localAudio.supported
-                                         ? DS.accent(scheme) : DS.accent2Color)
-                } else {
-                    Text("mtmd is not linked in this build.")
-                        .font(DS.microFont)
-                        .foregroundStyle(DS.accent2Color)
-                }
 
                 Toggle(isOn: $state.lockedPhoneExperiment) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -3699,7 +3585,6 @@ struct ExperimentCard: View {
             }
         }
         .onAppear {
-            state.refreshLocalAudioStatus()
             runs = TranscriptionLogger.loadRecent()
         }
         .onReceive(NotificationCenter.default.publisher(
@@ -3762,7 +3647,7 @@ struct ProfileView: View {
                 // core: not available until the llama.cpp backend is linked.
                 OnDeviceAICard(scheme: scheme)
 
-                // 🔬 Experiments: on-device audio engine + locked-phone CPU.
+                // Apple Speech diagnostics + optional locked-phone test.
                 ExperimentCard(scheme: scheme)
 
                 DS.card(scheme) {

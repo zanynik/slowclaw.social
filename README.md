@@ -371,7 +371,7 @@ flowchart TB
 ```
 
 **The local model lifecycle** (managed in Profile → On-Device AI card):
-1. **Download** a Gemma GGUF from HuggingFace (`LocalModelStore`, ~2.1–2.5 GB) into `Documents/Models/`. The Q4 audio option is the same Q4 text GGUF plus a separate ~1 GB audio projector—not a second text model. The row shows determinate progress immediately; iOS owns the background transfer, and SlowClaw persists the selected preset so a relaunch automatically reattaches the bar or safely retries a force-quit transfer.
+1. **Download** the curated Gemma 4 E2B Q4 GGUF from HuggingFace (`LocalModelStore`, ~2.5 GB) into `Documents/Models/`. The row shows determinate progress immediately; iOS owns the background transfer, and SlowClaw persists the selected preset so a relaunch automatically reattaches the bar or safely retries a force-quit transfer. Audio transcription is handled separately by Apple Speech and requires no LLM model.
 2. **Activate** → `slowclaw_feed_local_llm_load(path)` — Zig loads it into llama.cpp. Context is capped at 1536 tokens to stay inside the default per-app memory budget.
 3. **Use** — every `aiChat` / `aiSynthesize` / `aiExtractInterests` / `aiDraftPost` in `AppState` checks `localLLM.loaded` first.
 4. **Unload** → `slowclaw_feed_local_llm_unload()` frees the RAM.
@@ -521,7 +521,6 @@ zig build test-sqlite      # SQLite memory backend tests
 zig build test-markdown    # Markdown memory backend tests
 zig build test-response-cache
 SLOWCLAW_TEST_GGUF=/path/to/model.gguf zig build test-local-llm   # on-device LLM smoke
-SLOWCLAW_TEST_AUDIO_GGUF=/path/to/model.gguf SLOWCLAW_TEST_MMPROJ=/path/to/mmproj.gguf SLOWCLAW_TEST_PCM_F32=/path/to/mono-16k-f32.raw zig build test-local-audio
 ```
 
 For the full module map, the C ABI surface, the build graph, and the known iOS-specific link workarounds, see [`zig-src/README.md`](zig-src/README.md).

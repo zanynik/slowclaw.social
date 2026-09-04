@@ -303,48 +303,6 @@ int32_t slowclaw_feed_local_llm_generate_title(
     SlowclawChatResult *out_result
 );
 
-// ── On-device audio transcription (mtmd / multimodal) ──────────────────────
-// Backed by the vendored mtmd layer (libllama.a). Requires a text model
-// loaded via slowclaw_feed_local_llm_load AND an audio mmproj loaded via
-// slowclaw_feed_local_audio_load_mmproj. When mtmd is compiled out
-// (-Dwith-llama=false), status reports available:false.
-
-/// Per-transcription timing in milliseconds. Read by the locked-phone
-/// experiment to determine whether the process got CPU time while locked.
-typedef struct {
-    int64_t load_ms;
-    int64_t encode_ms;
-    int64_t decode_ms;
-    int64_t total_ms;
-} SlowclawAudioTimings;
-
-/// On-device audio engine status as JSON:
-/// {"available","supported","sampleRate","reason"}. Bytes freed via
-/// slowclaw_feed_free.
-int32_t slowclaw_feed_local_audio_status(SlowclawString *out_str);
-
-/// Load the multimodal projector (mmproj GGUF) against the currently-loaded
-/// text model (load that first via slowclaw_feed_local_llm_load). Returns
-/// 0 on success, negative on error.
-int32_t slowclaw_feed_local_audio_load_mmproj(
-    const uint8_t *mmproj_path, size_t mmproj_path_len
-);
-
-/// Unload the audio mmproj (frees RAM). No-op when nothing is loaded.
-void slowclaw_feed_local_audio_unload(void);
-
-/// Transcribe mono PCM F32 samples into text. `pcm` is raw 32-bit float
-/// samples at the rate from slowclaw_feed_local_audio_status (sampleRate,
-/// typically 16000). The transcript is returned via out_result (free via
-/// slowclaw_feed_chat_result_free); timings via out_timings.
-int32_t slowclaw_feed_local_audio_transcribe(
-    const float *pcm, size_t pcm_len,
-    uint32_t max_tokens,
-    double temperature,
-    SlowclawChatResult *out_result,
-    SlowclawAudioTimings *out_timings
-);
-
 #ifdef __cplusplus
 } // extern "C"
 #endif
