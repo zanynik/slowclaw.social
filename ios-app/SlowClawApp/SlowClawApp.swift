@@ -179,6 +179,21 @@ private final class OnceBox: @unchecked Sendable {
     }
 }
 
+/// Serializes llama.cpp work and keeps it at utility priority. The Zig engine
+/// already protects its model with a mutex; queueing here prevents multiple
+/// Swift tasks from occupying cooperative threads while they wait for that
+/// mutex. The actual synchronous FFI call runs in a detached task, so the main
+/// actor remains free to handle tab changes, scrolling, and taps.
+private actor OnDeviceAIExecutor {
+    static let shared = OnDeviceAIExecutor()
+
+    func run<T: Sendable>(
+        _ operation: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await Task.detached(priority: .utility, operation: operation).value
+    }
+}
+
 /// Captures share-sheet / file-open URLs delivered during cold launch (before
 /// SwiftUI's .onOpenURL is wired). The App flushes them on first appear.
 final class ShareURLDelegate: NSObject, UIApplicationDelegate {
@@ -438,6 +453,9 @@ final class AppState: ObservableObject {
     }
     @Published var isGeneratingPosts = false
     @Published var generateStatus: String? = nil
+    /// Owned by AppState rather than DraftsView, so switching tabs cannot
+    /// cancel or orphan an in-progress generation.
+    private var postGenerationTask: Task<Void, Never>?
 
     private var processedJournalKeys: Set<String> {
         get { Set(UserDefaults.standard.stringArray(forKey: "slowclaw.tweetclaw.processed") ?? []) }
@@ -643,9 +661,9 @@ final class AppState: ObservableObject {
     /// generations never block the main actor.
     func aiExtractInterests(from text: String) async throws -> [String] {
         if localLLM.loaded {
-            return try await Task.detached(priority: .utility) {
+            return try await OnDeviceAIExecutor.shared.run {
                 try slowClawLocalExtractInterests(journalText: text)
-            }.value
+            }
         }
         guard let llm else { throw SlowClawFeedError.internalError("no LLM configured") }
         return try llm.extractInterests(journalText: text, model: model)
@@ -653,9 +671,9 @@ final class AppState: ObservableObject {
 
     func aiDraftPost(from text: String, maxChars: Int = 300) async throws -> String {
         if localLLM.loaded {
-            return try await Task.detached(priority: .userInitiated) {
+            return try await OnDeviceAIExecutor.shared.run {
                 try slowClawLocalDraftPost(journalText: text, maxChars: maxChars)
-            }.value
+            }
         }
         guard let llm else { throw SlowClawFeedError.internalError("no LLM configured") }
         return try llm.draftPost(journalText: text, model: model, maxChars: maxChars)
@@ -663,9 +681,9 @@ final class AppState: ObservableObject {
 
     func aiSynthesize(transcript: String) async throws -> String {
         if localLLM.loaded {
-            return try await Task.detached(priority: .userInitiated) {
+            return try await OnDeviceAIExecutor.shared.run {
                 try slowClawLocalSynthesizeJournal(transcript: transcript)
-            }.value
+            }
         }
         guard let llm else { throw SlowClawFeedError.internalError("no LLM configured") }
         return try llm.synthesizeJournal(transcript: transcript, model: model)
@@ -676,9 +694,9 @@ final class AppState: ObservableObject {
     /// trimmed title or throws if no LLM is available.
     func aiTitle(transcript: String) async throws -> String {
         if localLLM.loaded {
-            return try await Task.detached(priority: .userInitiated) {
+            return try await OnDeviceAIExecutor.shared.run {
                 try slowClawLocalGenerateTitle(transcript: transcript)
-            }.value
+            }
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         guard let llm else { throw SlowClawFeedError.internalError("no LLM configured") }
@@ -692,9 +710,9 @@ final class AppState: ObservableObject {
 
     func aiChat(system: String, message: String, temperature: Double) async throws -> String {
         if localLLM.loaded {
-            return try await Task.detached(priority: .userInitiated) {
+            return try await OnDeviceAIExecutor.shared.run {
                 try slowClawLocalLLMChat(systemPrompt: system, message: message, maxTokens: 512, temperature: temperature)
-            }.value
+            }
         }
         guard let llm else { throw SlowClawFeedError.internalError("no LLM configured") }
         return try llm.chat(systemPrompt: system, message: message, model: model, temperature: temperature)
@@ -1504,6 +1522,18 @@ final class AppState: ObservableObject {
 
     // MARK: - TweetClaw (pull-to-generate)
 
+    /// Start generation independently of the currently visible tab. Repeated
+    /// taps join the existing single flight instead of starting another model
+    /// request.
+    func startTweetClawGeneration() {
+        guard postGenerationTask == nil else { return }
+        postGenerationTask = Task { [weak self] in
+            guard let self else { return }
+            await self.tweetClawGenerateNext()
+            self.postGenerationTask = nil
+        }
+    }
+
     /// Pull-to-generate: pick the most-recently-modified unprocessed text journal
     /// (or a random one if all are processed) and turn it into one or more posts.
     /// Long entries are chunked at ~3200 chars; each chunk produces its own post.
@@ -1535,31 +1565,23 @@ final class AppState: ObservableObject {
         // Snapshot the 10 most-recent existing draft texts to discourage repeats.
         let recentDrafts = drafts.prefix(10).map { $0.content }
 
-        await withTaskGroup(of: Void.self) { group in
-            for chunk in chunkForPosts(journal.content, limit: 3200) {
-                group.addTask { [weak self] in
-                    guard let self else { return }
-                    var message = chunk
-                    if !recentDrafts.isEmpty {
-                        let dedupe = recentDrafts.prefix(10).joined(separator: "\n---\n")
-                        message += "\n\n(Avoid repeating these posts you already wrote:)\n\(dedupe)"
-                    }
-                    // chat() honors the editable TweetClaw prompt as the system prompt.
-                    if let post = try? await self.aiChat(system: prompt, message: message, temperature: 0.8) {
-                        let cleaned = post.trimmingCharacters(in: .whitespacesAndNewlines)
-                            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'`"))
-                        // Acceptance gate: 11–399 chars (matches the reference).
-                        guard cleaned.count > 10, cleaned.count < 400 else { return }
-                        let key = "draft_\(Date().timeIntervalSince1970)_\(UInt.random(in: 0..<1_000_000))"
-                        let excerpt = String(chunk.prefix(80))
-                        // Store with an excerpt marker so the card can show the source.
-                        try? self.memory.store(key: key, content: cleaned, category: "core", sessionID: "drafts")
-                        // Stash the source excerpt alongside (encoded in the key's
-                        // metadata isn't supported; keep it simple — the draft body
-                        // is the post itself, matching the reference).
-                        _ = excerpt
-                    }
-                }
+        // llama.cpp is single-model/single-context. Generate chunks in order
+        // instead of spawning several tasks that only wait on the same model
+        // mutex and compete with SwiftUI for CPU time.
+        for chunk in chunkForPosts(journal.content, limit: 3200) {
+            var message = chunk
+            if !recentDrafts.isEmpty {
+                let dedupe = recentDrafts.prefix(10).joined(separator: "\n---\n")
+                message += "\n\n(Avoid repeating these posts you already wrote:)\n\(dedupe)"
+            }
+            // chat() honors the editable TweetClaw prompt as the system prompt.
+            if let post = try? await aiChat(system: prompt, message: message, temperature: 0.8) {
+                let cleaned = post.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'`"))
+                // Acceptance gate: 11–399 chars (matches the reference).
+                guard cleaned.count > 10, cleaned.count < 400 else { continue }
+                let key = "draft_\(Date().timeIntervalSince1970)_\(UInt.random(in: 0..<1_000_000))"
+                try? memory.store(key: key, content: cleaned, category: "core", sessionID: "drafts")
             }
         }
 
@@ -3145,7 +3167,7 @@ struct DraftsView: View {
                     }
                     Spacer()
                     Button {
-                        Task { await state.tweetClawGenerateNext() }
+                        state.startTweetClawGeneration()
                     } label: {
                         Image(systemName: state.isGeneratingPosts ? "" : "arrow.clockwise")
                             .font(.system(size: 18, weight: .medium))
@@ -3201,7 +3223,7 @@ struct DraftsView: View {
         }
         .background(DS.bg(scheme))
         .refreshable {
-            await state.tweetClawGenerateNext()
+            state.startTweetClawGeneration()
         }
     }
 }

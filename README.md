@@ -376,6 +376,10 @@ flowchart TB
 3. **Use** — every `aiChat` / `aiSynthesize` / `aiExtractInterests` / `aiDraftPost` in `AppState` checks `localLLM.loaded` first.
 4. **Unload** → `slowclaw_feed_local_llm_unload()` frees the RAM.
 
+On iOS, local calls are serialized on a utility-priority executor and llama.cpp
+uses two worker threads. This deliberately leaves foreground CPU capacity for
+tab navigation and scrolling while a draft or interest extraction continues.
+
 > **TweetClaw** (the Drafts tab) is the reference AI feature: pick an unprocessed journal → chunk it → `aiChat(system: tweetClawPrompt, message: chunk)` → acceptance gate (11–399 chars) → store as a draft. Copy this pattern for any new AI feature.
 
 ---

@@ -270,6 +270,14 @@ pub const LocalInference = struct {
         cparams.n_batch = n_batch;
         const ctx = llama.llama_init_from_model(model, cparams) orelse return error.ContextCreateFailed;
         defer llama.llama_free(ctx);
+        // Leave CPU headroom for UIKit/SwiftUI. llama.cpp's platform default
+        // can occupy every performance core even when called from a detached
+        // task, making taps and tab transitions appear frozen. Two worker
+        // threads are sufficient for the curated E2B model while preserving a
+        // responsive foreground app during generation.
+        if (builtin.os.tag == .ios) {
+            llama.llama_set_n_threads(ctx, 2, 2);
+        }
 
         // ── Decode the prompt in chunks no larger than n_batch ──────────
         // (Decoding the whole prompt in one oversized batch can abort

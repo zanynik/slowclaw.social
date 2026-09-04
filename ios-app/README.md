@@ -131,6 +131,9 @@ the database row and the app-owned audio file.
 Profile offers one curated local model: Gemma 4 E2B Q4 for journal titles,
 interest extraction, polishing, and post drafts. Transcription is independent
 of the LLM, so there is no audio projector or engine-selection setting.
+Local inference is serialized on a utility-priority executor and limited to
+two llama.cpp worker threads on iOS. TweetClaw work belongs to `AppState`, so
+generation continues when the user switches tabs without monopolizing SwiftUI.
 
 ## TestFlight (CI)
 
