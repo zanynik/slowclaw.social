@@ -111,9 +111,9 @@ enum TranscriptionLogger {
 enum LockedPhoneExperiment {
     static let maxDurationSeconds: TimeInterval = 10 * 60
 
-    /// Hold the audio session while mtmd/Apple processes the just-recorded
+    /// Hold the audio session while Apple Speech processes the just-recorded
     /// file. AudioSTT writes the same observable run as every other path.
-    static func run(url: URL, useGemmaAudio: Bool,
+    static func run(url: URL,
                     progress: (@Sendable (String) -> Void)? = nil) async -> AudioSTTResult {
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playAndRecord, mode: .default,
@@ -124,8 +124,8 @@ enum LockedPhoneExperiment {
 
         let result = await withTaskGroup(of: AudioSTTResult?.self) { group -> AudioSTTResult in
             group.addTask {
-                await AudioSTT.transcribe(url: url, useGemmaAudio: useGemmaAudio,
-                                          context: .lockedPhone, progress: progress)
+                await AudioSTT.transcribe(url: url, context: .lockedPhone,
+                                          progress: progress)
             }
             group.addTask {
                 try? await Task.sleep(
@@ -135,7 +135,7 @@ enum LockedPhoneExperiment {
             let first = await group.next() ?? nil
             group.cancelAll()
             return first ?? AudioSTTResult(
-                text: "", engine: .gemmaAudio, timings: nil,
+                text: "", engine: .appleSpeech,
                 diagnostic: "Locked-phone transcription exceeded the time limit.",
                 segmentCount: 0)
         }

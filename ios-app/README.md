@@ -104,18 +104,17 @@ transcription of the original audio from scratch and replaces the transcript
 body in place, preserving the entry's title. This is the manual retry path
 for truncated transcripts across new builds.
 
-Routing goes through the shared on-device STT router (`AudioSTT`). When **Prefer
-Gemma 4 Audio** is enabled, the Zig core's mtmd layer runs first in sequential
-45-second segments; Apple Speech is fallback-only and the actual route appears
-immediately under Profile → Audio Transcription → Recent Runs. With Gemma off,
-Apple uses SpeechAnalyzer's `.transcription` preset over the whole file,
-after installing the required locale model through `AssetInventory`; segmented
-forced-on-device `SFSpeechRecognizer` is compatibility fallback only. Audio
-never leaves the device on any path. If no complete
+Routing goes through the shared on-device STT router (`AudioSTT`). Apple uses
+SpeechAnalyzer's `.transcription` preset over the whole file,
+after installing the required locale model through `AssetInventory`. Audio
+never leaves the device. If no complete
 transcript is produced (empty/failed recognition, no
 audio file, or a failed store write), the old transcript is left unchanged
 and a "Re-transcription failed" alert is shown — a partial result never
-overwrites the stored entry.
+overwrites the stored entry. Automatic jobs remain in the durable queue and
+retry after 1 minute, 5 minutes, 30 minutes, 2 hours, 12 hours, then daily
+until a transcript lands. Legacy no-transcript rows are discovered and queued
+on upgrade, so imported and recorded audio do not require one manual tap each.
 
 New recordings follow the system Voice Memos/Notes pattern: the microphone
 buffer is written to the m4a and streamed into SpeechAnalyzer's
@@ -127,13 +126,21 @@ still saved immediately and the durable pending queue runs whole-file offline
 transcription in the background. Imported audio enters that same persisted
 queue, so its placeholder is usable/playable while transcription continues.
 
+Interest extraction is also resumable background work. It skips placeholders,
+checkpoints topics per journal only after real text/transcription exists, and
+rebuilds a recency/recurrence-weighted lens that drives both RSS source choice
+and Zig item ranking. Tweet generation takes priority between extractions.
+
 Audio detail screens expose a visible Delete action. Deletion moves the journal,
 audio and transcript to Recently Deleted for 30 days; Empty Trash removes both
 the database row and the app-owned audio file.
 
-The Profile model rows distinguish the Q4 text model from its audio add-on.
-The add-on reuses the exact same Q4 GGUF and downloads only the separate ~1 GB
-mmproj when Q4 is already present; it is not a second text model.
+Profile offers one curated local model: Gemma 4 E2B Q4 for journal titles,
+interest extraction, polishing, and post drafts. Transcription is independent
+of the LLM, so there is no audio projector or engine-selection setting.
+Local inference is serialized on a utility-priority executor and limited to
+two llama.cpp worker threads on iOS. TweetClaw work belongs to `AppState`, so
+generation continues when the user switches tabs without monopolizing SwiftUI.
 
 ## TestFlight (CI)
 

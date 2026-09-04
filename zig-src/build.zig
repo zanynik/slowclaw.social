@@ -211,9 +211,6 @@ pub fn build(b: *std.Build) void {
         // the symbols resolve at the Xcode link step via -lllama).
         lib_mod.addIncludePath(b.path("vendor/llama.cpp/include"));
         lib_mod.addIncludePath(b.path("vendor/llama.cpp/ggml/include"));
-        // mtmd.h (multimodal: audio + vision) for audio_transcribe.zig's
-        // @cImport. mtmd.h includes llama.h + ggml.h (roots above).
-        lib_mod.addIncludePath(b.path("vendor/llama.cpp/tools/mtmd"));
     }
 
     const lib = b.addLibrary(.{
@@ -243,27 +240,6 @@ pub fn build(b: *std.Build) void {
         const llm_test_step = b.step("test-local-llm", "Run the on-device LLM smoke test (set SLOWCLAW_TEST_GGUF)");
         llm_test_step.dependOn(&run_llm_tests.step);
 
-        // Real mtmd smoke: caller supplies the matching text GGUF, audio
-        // projector, and mono F32 PCM at the projector's sample rate.
-        const audio_test_mod = b.addModule("slowclaw_feed_audio_test", .{
-            .root_source_file = b.path("src/audio_transcribe.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        audio_test_mod.link_libc = true;
-        audio_test_mod.link_libcpp = true;
-        audio_test_mod.addImport("build_options", llama_opts_mod);
-        audio_test_mod.addIncludePath(b.path("vendor/llama.cpp/include"));
-        audio_test_mod.addIncludePath(b.path("vendor/llama.cpp/ggml/include"));
-        audio_test_mod.addIncludePath(b.path("vendor/llama.cpp/tools/mtmd"));
-        audio_test_mod.linkLibrary(ll);
-        const audio_tests = b.addTest(.{ .root_module = audio_test_mod });
-        const run_audio_tests = b.addRunArtifact(audio_tests);
-        const audio_test_step = b.step(
-            "test-local-audio",
-            "Run mtmd audio smoke (set SLOWCLAW_TEST_AUDIO_GGUF, SLOWCLAW_TEST_MMPROJ, SLOWCLAW_TEST_PCM_F32)",
-        );
-        audio_test_step.dependOn(&run_audio_tests.step);
     }
 
     // ── Workaround: Apple `ld` rejects Zig's staticlib archive ───────────
@@ -366,34 +342,7 @@ fn collectLlamaSources(b: *std.Build, target: std.Build.ResolvedTarget) LlamaSou
     }
     appendVendoredCpp(b, &cxx, "vendor/llama.cpp/src");
     appendVendoredCpp(b, &cxx, "vendor/llama.cpp/src/models");
-    // Multimodal layer (mtmd): audio + vision input support from the vendored
-    // tools/mtmd/ tree. Added explicitly (not globbed) so the CLI/helper files
-    // that pull stb_image are excluded — only the library sources compile.
-    appendMtmdSources(b, &cxx);
     return .{ .c = c.items, .cxx = cxx.items };
-}
-
-/// Append the mtmd (multimodal) C++ source files to `sources`, as paths
-/// relative to vendor/llama.cpp/ (the prefix `buildLlamaCpp` /
-/// `buildLlamaCppIOS` re-prepend). Mirrors the lean subset vendored from
-/// b10201's tools/mtmd/: top-level library sources + the whole models/ dir.
-/// Excludes mtmd-cli.cpp / mtmd-helper.{cpp,h} (CLI image loading →
-/// stb_image) and debug/mtmd-debug.cpp (pulls common/arg.h + common.h +
-/// log.h, and is an internal debugging API not needed for transcription).
-fn appendMtmdSources(b: *std.Build, sources: *std.ArrayList([]const u8)) void {
-    const top_level = &[_][]const u8{
-        "tools/mtmd/mtmd.cpp",
-        "tools/mtmd/mtmd-audio.cpp",
-        "tools/mtmd/mtmd-image.cpp",
-        "tools/mtmd/clip.cpp",
-        "tools/mtmd/deprecation-warning.cpp",
-    };
-    for (top_level) |name| {
-        sources.append(b.allocator, name) catch @panic("oom");
-    }
-    // models/ is interdependent via models.h and every arch encoder lives here;
-    // glob the whole dir (it's source-only, no stb_image dependency).
-    appendVendoredCpp(b, sources, "vendor/llama.cpp/tools/mtmd/models");
 }
 
 /// Build libllama.a for iOS with Apple's toolchain (xcrun clang/clang++). This
@@ -436,10 +385,10 @@ fn buildLlamaCppIOS(
         \\    full="vendor/llama.cpp/$src"
         \\    case "$src" in
         \\      *.cpp)
-        \\        xcrun clang++ -target "$TRIPLE" -isysroot "$SDK" -std=c++17 "$OPT" -fno-sanitize=undefined -w -DGGML_USE_CPU -DGGML_USE_LLAMAFILE -D_DARWIN_C_SOURCE -D_XOPEN_SOURCE=600 '-DGGML_VERSION="b10201"' '-DGGML_COMMIT="b10201"' -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include -Ivendor/llama.cpp/ggml/src -Ivendor/llama.cpp/ggml/src/ggml-cpu -Ivendor/llama.cpp/src -Ivendor/llama.cpp/tools/mtmd -c "$full" -o "$obj"
+        \\        xcrun clang++ -target "$TRIPLE" -isysroot "$SDK" -std=c++17 "$OPT" -fno-sanitize=undefined -w -DGGML_USE_CPU -DGGML_USE_LLAMAFILE -D_DARWIN_C_SOURCE -D_XOPEN_SOURCE=600 '-DGGML_VERSION="b10201"' '-DGGML_COMMIT="b10201"' -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include -Ivendor/llama.cpp/ggml/src -Ivendor/llama.cpp/ggml/src/ggml-cpu -Ivendor/llama.cpp/src -c "$full" -o "$obj"
         \\        ;;
         \\      *.c)
-        \\        xcrun clang -target "$TRIPLE" -isysroot "$SDK" -std=c11 "$OPT" -fno-sanitize=undefined -w -DGGML_USE_CPU -DGGML_USE_LLAMAFILE -D_DARWIN_C_SOURCE -D_XOPEN_SOURCE=600 '-DGGML_VERSION="b10201"' '-DGGML_COMMIT="b10201"' -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include -Ivendor/llama.cpp/ggml/src -Ivendor/llama.cpp/ggml/src/ggml-cpu -Ivendor/llama.cpp/src -Ivendor/llama.cpp/tools/mtmd -c "$full" -o "$obj"
+        \\        xcrun clang -target "$TRIPLE" -isysroot "$SDK" -std=c11 "$OPT" -fno-sanitize=undefined -w -DGGML_USE_CPU -DGGML_USE_LLAMAFILE -D_DARWIN_C_SOURCE -D_XOPEN_SOURCE=600 '-DGGML_VERSION="b10201"' '-DGGML_COMMIT="b10201"' -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include -Ivendor/llama.cpp/ggml/src -Ivendor/llama.cpp/ggml/src/ggml-cpu -Ivendor/llama.cpp/src -c "$full" -o "$obj"
         \\        ;;
         \\    esac
         \\    OBJS="$OBJS $obj"
@@ -490,7 +439,6 @@ fn buildLlamaCpp(
         "vendor/llama.cpp/ggml/src",
         "vendor/llama.cpp/ggml/src/ggml-cpu",
         "vendor/llama.cpp/src",
-        "vendor/llama.cpp/tools/mtmd",
     };
     for (includes) |inc| mod.addIncludePath(b.path(inc));
     if (ios_sysroot) |sdk| {
