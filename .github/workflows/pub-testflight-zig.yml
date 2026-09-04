@@ -12,9 +12,6 @@ on:
     push:
         branches:
             - main
-            # Temporary pre-merge validation branch. Removed after the
-            # TestFlight archive/upload succeeds.
-            - fix/voice-memos-transcription-delete
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
             - "zig-src/**"
