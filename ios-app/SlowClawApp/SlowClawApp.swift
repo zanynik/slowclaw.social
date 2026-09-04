@@ -871,9 +871,36 @@ final class AppState: ObservableObject {
     /// removes the underlying rows.
     func emptyTrash() {
         let keys = Array(Self.softDeletedKeys().keys)
-        for key in keys { try? memory.forget(key: key) }
+        var pending = Self.pendingTranscriptionsURL.map {
+            Self.loadPendingTranscriptions(at: $0)
+        } ?? []
+        for key in keys {
+            if let entry = try? memory.get(key: key),
+               let rel = entry.mediaURL,
+               let mediaURL = AudioRecorder.absoluteURL(forMediaRelativePath: rel),
+               Self.isOwnedDocumentURL(mediaURL) {
+                try? FileManager.default.removeItem(at: mediaURL)
+            }
+            try? memory.forget(key: key)
+            pending.removeAll { $0.key == key }
+        }
+        if let queueURL = Self.pendingTranscriptionsURL {
+            Self.savePendingTranscriptions(pending, at: queueURL)
+        }
         UserDefaults.standard.removeObject(forKey: Self.softDeleteKey)
         Task { await refreshJournals() }
+    }
+
+    /// Destructive media cleanup is limited to the app's Documents directory;
+    /// a malformed/stale media_url can never make Empty Trash remove an
+    /// arbitrary filesystem location.
+    private static func isOwnedDocumentURL(_ url: URL) -> Bool {
+        guard let docs = FileManager.default.urls(for: .documentDirectory,
+                                                  in: .userDomainMask).first else {
+            return false
+        }
+        let root = docs.standardizedFileURL.path + "/"
+        return url.standardizedFileURL.path.hasPrefix(root)
     }
 
     /// Clear the journal selection so the editor shows a fresh, empty entry.
@@ -1356,7 +1383,7 @@ final class AppState: ObservableObject {
         let useGemma = experimentalAudioEngine
         lastTranscriptionStatus = useGemma
             ? "Starting Gemma 4 Audio (mtmd)…"
-            : "Starting Apple's segmented on-device transcription…"
+            : "Starting Apple's long-form on-device transcription…"
         let transcript = await performAudioTranscription(
             url: url, context: .retranscribe, keepAliveWhileLocked: false)
         lastTranscriptionStatus = "\(transcript.engine.rawValue): \(transcript.diagnostic ?? "finished")"
@@ -1897,6 +1924,7 @@ struct JournalDetailView: View {
     @State private var showShareSheet = false
     @State private var showRetranscribeFailedAlert = false
     @State private var showSaveErrorAlert = false
+    @State private var showDeleteConfirmation = false
     /// Last successfully persisted title/body — the baseline the combined
     /// save compares against and updates after each successful store, so a
     /// no-change open→back (or a repeated back) can never overwrite content
@@ -2077,14 +2105,20 @@ struct JournalDetailView: View {
                             .font(.system(size: 16, weight: .semibold))
                     }
                 }
-                if audioURL != nil {
-                    ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if audioURL != nil {
                         Button {
                             showShareSheet = true
                         } label: {
                             Image(systemName: "square.and.arrow.up")
                         }
                     }
+                    Button(role: .destructive) {
+                        showDeleteConfirmation = true
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .accessibilityLabel("Delete journal")
                 }
             }
         }
@@ -2111,6 +2145,20 @@ struct JournalDetailView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text("Your changes could not be saved. The entry stays open — try again.")
+        }
+        .alert("Move to Recently Deleted?", isPresented: $showDeleteConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                bodyAutosaveTask?.cancel()
+                pollTimer?.invalidate()
+                player?.stop()
+                state.softDelete(key: entry.key)
+                dismiss()
+            }
+        } message: {
+            Text(audioURL == nil
+                 ? "This journal can be restored for 30 days."
+                 : "The audio and transcript can be restored for 30 days.")
         }
     }
 
@@ -2640,16 +2688,16 @@ struct JournalView: View {
                                                   source: "audio_recorded",
                                                   mediaURL: mediaURL)
             let shouldGenTitle = (userTitle.isEmpty && state.anyLLMAvailable)
-            // ALWAYS enqueue the audio for authoritative file-based
-            // transcription — the on-disk m4a is the source of truth; the live
-            // session's transcript is only a preview and can be partial (the
-            // "long recording → only the last line" bug: a partial live
-            // transcript used to satisfy hasTranscript and the file was never
-            // re-transcribed). The drain preserves the title and replaces the
-            // body, so a complete live transcript is simply re-confirmed.
-            if let mediaPath = mediaURL, recordedURL != nil {
+            // A successfully finalized live SpeechAnalyzer session is the
+            // Voice Memos-style source of truth: it already consumed the whole
+            // recording as one continuous stream, so do not slice and
+            // re-transcribe the saved file. Only failed/unavailable live
+            // sessions enqueue the durable offline fallback.
+            if !hasTranscript, let mediaPath = mediaURL, recordedURL != nil {
                 await state.enqueuePendingTranscription(key: key, mediaPath: mediaPath,
                                                         generateTitleAfter: shouldGenTitle)
+            } else if hasTranscript && shouldGenTitle {
+                await state.generateTitleForJournal(key: key, transcript: transcript)
             }
             // Reset recorder state for the next recording.
             await MainActor.run {
@@ -2931,12 +2979,18 @@ struct JournalView: View {
                             .fill(DS.accent2Color)
                             .frame(width: 70, height: 70)
                             .shadow(color: DS.accent2Color.opacity(0.35), radius: 8, y: 3)
-                        Image(systemName: "mic.fill")
-                            .font(.system(size: 26))
-                            .foregroundStyle(.white)
+                        if recorder.isTranscribing {
+                            ProgressView()
+                                .tint(.white)
+                        } else {
+                            Image(systemName: "mic.fill")
+                                .font(.system(size: 26))
+                                .foregroundStyle(.white)
+                        }
                     }
                 }
                 .buttonStyle(.plain)
+                .disabled(recorder.isTranscribing || recorder.isFinalizing)
                 .accessibilityLabel("Record an audio journal")
 
                 Spacer()
@@ -2976,9 +3030,21 @@ struct JournalView: View {
                     .frame(height: 72)
                     .padding(.horizontal, 16)
 
-                Text(recorder.isPaused ? "Paused" : "Recording…")
+                Text(recorder.isFinalizing
+                     ? "Finishing transcript…"
+                     : (recorder.isPaused ? "Paused" : "Recording…"))
                     .font(DS.bodyFont)
                     .foregroundStyle(DS.ink(scheme))
+
+                if !recorder.transcript.isEmpty {
+                    Text(recorder.transcript)
+                        .font(DS.captionFont)
+                        .foregroundStyle(DS.muted(scheme))
+                        .lineLimit(4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 24)
+                        .accessibilityLabel("Live transcript: \(recorder.transcript)")
+                }
 
                 HStack(spacing: 28) {
                     Button {
@@ -2998,10 +3064,11 @@ struct JournalView: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    .disabled(recorder.isFinalizing)
                     .accessibilityLabel(recorder.isPaused ? "Resume recording" : "Pause recording")
 
                     Button {
-                        recorder.finishRecording()
+                        Task { await recorder.finishRecording() }
                     } label: {
                         ZStack {
                             Circle()
@@ -3014,6 +3081,7 @@ struct JournalView: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    .disabled(recorder.isFinalizing)
                     .accessibilityLabel("Stop recording")
                 }
 

@@ -6,9 +6,11 @@
 // `SpeechTranscriber` type, and naming ours the same would shadow it and break
 // every reference to the real API below.
 //
-// Live capture uses SpeechAnalyzer. Completed files use sequential 40-second
-// SFSpeechRecognizer requests first because SpeechAnalyzer has been observed
-// returning non-empty but truncated long-file results; it remains the fallback.
+// Live capture and completed files use SpeechAnalyzer's purpose-built live and
+// offline presets. Before either session starts, the app asks AssetInventory to
+// install the current locale's on-device model — the same required setup used
+// by Apple's Notes and Voice Memos transcription flow. Legacy
+// SFSpeechRecognizer is retained only as a compatibility fallback.
 // Both paths require on-device recognition, so audio never leaves the device.
 //
 // Two entry points:
@@ -17,8 +19,8 @@
 //                                        background drain).
 //   - Transcriber.makeLiveSession()    — a streaming session the AudioRecorder
 //                                        feeds from its AVAudioEngine tap
-//                                        during capture; finals arrive via
-//                                        onFinal.
+//                                        during capture; revised snapshots
+//                                        arrive via onTranscript.
 //
 // Permission: SpeechAnalyzer still requires SFSpeechRecognizer authorization,
 // so callers request it before starting a session.
@@ -31,17 +33,30 @@ import Speech
 /// `Transcriber` to avoid colliding with Apple's `Speech.SpeechTranscriber`.
 enum Transcriber {
 
+    private enum SetupError: LocalizedError {
+        case unsupportedLocale
+        case unavailableAudioFormat
+
+        var errorDescription: String? {
+            switch self {
+            case .unsupportedLocale:
+                return "Speech transcription is not available for the current language."
+            case .unavailableAudioFormat:
+                return "Speech transcription could not prepare an audio format."
+            }
+        }
+    }
+
     // MARK: - File transcription (VoiceMemoImporter + background-drain path)
 
     /// Transcribe an existing audio file at `url` to a single string on-device.
     /// Returns "" if nothing was recognized. Reads the file's PCM buffers and
     /// feeds them to a SpeechAnalyzer session, accumulating final results.
     ///
-    /// File path: the segmented legacy SFSpeechRecognizer runs first because
-    /// SpeechAnalyzer can return a non-empty but truncated result for longer
-    /// files, which cannot be detected reliably from its API. The legacy path
-    /// uses sequential 40-second, forced-on-device requests. SpeechAnalyzer is
-    /// retained only as a fallback when legacy recognition produces no text.
+    /// File path: SpeechAnalyzer's `.transcription` preset processes the
+    /// whole recording as one time-coded stream. This is Apple's long-form
+    /// path and avoids application-level slicing. The forced-on-device legacy
+    /// recognizer is only a fallback if the modern model cannot run.
     /// Audio never leaves the device on either path.
     ///
     /// Thread-safe: blocking recognition runs on the calling thread; callers
@@ -50,9 +65,9 @@ enum Transcriber {
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
 
-        let segmented = await LegacyTranscriber.transcribe(url: url)
-        if !segmented.isEmpty { return segmented }
-        return await transcribeWithAnalyzer(url: url)
+        let modern = await transcribeWithAnalyzer(url: url)
+        if !modern.isEmpty { return modern }
+        return await LegacyTranscriber.transcribe(url: url)
     }
 
     /// The SpeechAnalyzer file fallback, isolated so the wrapper above can
@@ -72,31 +87,16 @@ enum Transcriber {
     /// fallback handle the file. Partial finals are never returned after an
     /// error or timeout.
     ///
-    /// Ordering matters here: analyzer.start(inputSequence:) suspends until the
-    /// input stream finishes, so the feeder must run concurrently AND be the one
-    /// to call finish() on the stream when the file is fully fed. Only after
-    /// start returns do we finalize (flushing any late finals) and let the
-    /// result-collection task drain to completion. Cancelling the collector
-    /// before finalize would drop late finals — the previous empty-transcript bug.
+    /// Uses SpeechAnalyzer.analyzeSequence(from:) rather than a hand-written
+    /// AVAudioConverter loop. The framework owns file reading, timecodes and
+    /// end-of-input, which prevents a converter status mistake from silently
+    /// dropping the middle or tail of a long recording.
     static func transcribe(file: AVAudioFile) async -> String {
-        let transcriber = SpeechTranscriber(
-            locale: Locale.current,
-            transcriptionOptions: [],
-            reportingOptions: [],
-            attributeOptions: []
-        )
+        guard let transcriber = try? await preparedOfflineTranscriber() else {
+            return ""
+        }
         let analyzer = SpeechAnalyzer(modules: [transcriber])
-        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
-            return ""
-        }
-        guard let converter = AVAudioConverter(from: file.processingFormat, to: analyzerFormat) else {
-            return ""
-        }
 
-        let (inputStream, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
-
-        // Accumulate finals as they stream in (off the main actor). The results
-        // sequence throws, so this Task's failure type is Error.
         let collected = FinalCollector()
         let recognizerTask = Task<Void, Error> {
             for try await result in transcriber.results {
@@ -105,39 +105,15 @@ enum Transcriber {
                 }
             }
         }
-
-        // Feeder: convert + yield the file's PCM, then finish() the stream so
-        // analyzer.start can return. Runs concurrently with the analyzer.
-        // Reports whether the WHOLE file was fed — a mid-file read/conversion
-        // failure must not come back below as a partial transcript.
-        let feeder = Task<Bool, Never> {
-            let fed = Self.feed(file: file, converter: converter, into: inputBuilder)
-            inputBuilder.finish()
-            return fed
-        }
-        // Analyzer: consumes the stream; returns once the stream is finished.
-        // Drive it on its own task so feeder + collector run concurrently.
-        let analyzerTask = Task<Void, Error> {
-            try await analyzer.start(inputSequence: inputStream)
-        }
-        // Wait for feeding first. If it failed, the analyzer only ever saw
-        // part of the audio — tear down and return empty rather than
-        // transcribe a truncated file.
-        guard await feeder.value else {
-            analyzerTask.cancel()
-            recognizerTask.cancel()
-            return ""
-        }
         do {
-            try await analyzerTask.value
-            // Flush any late finals, then let the collector drain them.
-            try await analyzer.finalizeAndFinishThroughEndOfInput()
+            guard let lastSample = try await analyzer.analyzeSequence(from: file) else {
+                await analyzer.cancelAndFinishNow()
+                recognizerTask.cancel()
+                return ""
+            }
+            try await analyzer.finalizeAndFinish(through: lastSample)
         } catch {
-            // Analyzer start/finalize failed (unavailable, locale asset
-            // missing, engine error). Whatever was collected so far is a
-            // partial at best — all-or-nothing: cancel + drain the collector
-            // and return empty so the caller's ON-DEVICE legacy fallback can
-            // take the file instead.
+            await analyzer.cancelAndFinishNow()
             recognizerTask.cancel()
             _ = await Self.awaitCollectorCompletion(recognizerTask)
             return ""
@@ -161,7 +137,7 @@ enum Transcriber {
 
     /// A streaming on-device transcription session. The recorder yields
     /// converted mic buffers via `process(_:)`; finalized transcript chunks are
-    /// delivered on the main actor through `onFinal`. Call `start()` once, feed
+    /// delivered on the main actor through `onTranscript`. Call `start()` once, feed
     /// buffers, then `stop()` to flush. `analyzerFormat` is the AVAudioFormat
     /// the recorder must convert its tap buffers to before yielding.
     final class LiveSession {
@@ -172,20 +148,21 @@ enum Transcriber {
         private var recognizerTask: Task<Void, Error>?
         private var analyzerTask: Task<Void, Never>?
         let analyzerFormat: AVAudioFormat
-        let onFinal: @MainActor (String) -> Void
+        let onTranscript: @MainActor (String) -> Void
+        private let accumulator = LiveTranscriptAccumulator()
 
         init(transcriber: SpeechTranscriber,
              analyzer: SpeechAnalyzer,
              analyzerFormat: AVAudioFormat,
              inputStream: AsyncStream<AnalyzerInput>,
              inputBuilder: AsyncStream<AnalyzerInput>.Continuation,
-             onFinal: @escaping @MainActor (String) -> Void) {
+             onTranscript: @escaping @MainActor (String) -> Void) {
             self.transcriber = transcriber
             self.analyzer = analyzer
             self.analyzerFormat = analyzerFormat
             self.inputStream = inputStream
             self.inputBuilder = inputBuilder
-            self.onFinal = onFinal
+            self.onTranscript = onTranscript
         }
 
         /// Start the analyzer + the result-collection task. Must be called once
@@ -198,10 +175,9 @@ enum Transcriber {
             // so this Task's failure type is Error.
             recognizerTask = Task<Void, Error> { [transcriber] in
                 for try await result in transcriber.results {
-                    if result.isFinal {
-                        let text = String(result.text.characters)
-                        await MainActor.run { self.onFinal(text) }
-                    }
+                    let snapshot = self.accumulator.apply(
+                        String(result.text.characters), isFinal: result.isFinal)
+                    await MainActor.run { self.onTranscript(snapshot) }
                 }
             }
             // Drive the analyzer for the lifetime of inputStream. It suspends
@@ -220,21 +196,22 @@ enum Transcriber {
 
         /// Stop the session: finish the stream and finalize so any in-flight
         /// finals flush. Safe to call multiple times.
-        func stop() async {
+        func stop() async -> String {
             inputBuilder.finish()
             try? await analyzer.finalizeAndFinishThroughEndOfInput()
             // Let the finals collector drain to NATURAL completion (bounded)
             // before tearing down — see transcribe(file:) for why an immediate
             // cancel lost late finals. The live path has no aggregate to
-            // withhold (finals were already streamed via onFinal) and the
-            // recorded file is re-transcribed by the background drain, so the
-            // success/failure outcome is only used to bound the teardown.
-            if let recognizerTask {
-                _ = await Transcriber.awaitCollectorCompletion(recognizerTask)
-            }
+            // withhold (snapshots were already streamed via onTranscript).
+            // The completion outcome determines whether the accumulated
+            // finals are trustworthy enough to save as the journal body.
+            let completed = if let recognizerTask {
+                await Transcriber.awaitCollectorCompletion(recognizerTask)
+            } else { false }
             recognizerTask = nil
             analyzerTask?.cancel()
             analyzerTask = nil
+            return completed ? accumulator.finalizedText() : ""
         }
     }
 
@@ -242,16 +219,11 @@ enum Transcriber {
     /// analyzer/format can't be constructed. The caller starts it once recording
     /// begins. If on-device speech is unavailable, finals simply never arrive
     /// and the caller stores a placeholder.
-    static func makeLiveSession(onFinal: @escaping @MainActor (String) -> Void) async -> LiveSession? {
-        let transcriber = SpeechTranscriber(
-            locale: Locale.current,
-            transcriptionOptions: [],
-            reportingOptions: [],
-            attributeOptions: []
-        )
+    static func makeLiveSession(onTranscript: @escaping @MainActor (String) -> Void) async throws -> LiveSession {
+        let transcriber = try await preparedLiveTranscriber()
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
-            return nil
+            throw SetupError.unavailableAudioFormat
         }
         let (inputStream, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
         return LiveSession(transcriber: transcriber,
@@ -259,7 +231,46 @@ enum Transcriber {
                            analyzerFormat: analyzerFormat,
                            inputStream: inputStream,
                            inputBuilder: inputBuilder,
-                           onFinal: onFinal)
+                           onTranscript: onTranscript)
+    }
+
+    /// Resolve a SpeechTranscriber locale equivalent to the user's current
+    /// locale and ensure its system-managed model is installed. AssetInventory
+    /// keeps the model outside the app bundle and updates it independently.
+    private static func supportedCurrentLocale() async throws -> Locale {
+        let requested = Locale.current
+        let requestedID = requested.identifier(.bcp47)
+        let requestedLanguage = requested.language.languageCode?.identifier
+        let supported = await SpeechTranscriber.supportedLocales
+        guard let locale = supported.first(where: { $0.identifier(.bcp47) == requestedID })
+            ?? supported.first(where: {
+                $0.language.languageCode?.identifier == requestedLanguage
+            }) else {
+            throw SetupError.unsupportedLocale
+        }
+        return locale
+    }
+
+    private static func preparedOfflineTranscriber() async throws -> SpeechTranscriber {
+        let locale = try await supportedCurrentLocale()
+        let transcriber = SpeechTranscriber(locale: locale, preset: .transcription)
+        try await installModel(for: transcriber)
+        return transcriber
+    }
+
+    private static func preparedLiveTranscriber() async throws -> SpeechTranscriber {
+        let locale = try await supportedCurrentLocale()
+        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
+        try await installModel(for: transcriber)
+        return transcriber
+    }
+
+    private static func installModel(for transcriber: SpeechTranscriber) async throws {
+        if let installation = try await AssetInventory.assetInstallationRequest(
+            supporting: [transcriber]
+        ) {
+            try await installation.downloadAndInstall()
+        }
     }
 
     // MARK: - File feeding
@@ -408,6 +419,35 @@ private final class FinalCollector: @unchecked Sendable {
     func text() -> String {
         lock.lock(); defer { lock.unlock() }
         return parts.joined(separator: " ")
+    }
+}
+
+/// Lock-protected live transcript state. SpeechTranscriber may revise the
+/// current volatile phrase several times; finalized phrases append exactly
+/// once and the volatile phrase is replaced rather than duplicated.
+private final class LiveTranscriptAccumulator: @unchecked Sendable {
+    private var finalParts: [String] = []
+    private var volatilePart = ""
+    private let lock = NSLock()
+
+    func apply(_ text: String, isFinal: Bool) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isFinal {
+            if !trimmed.isEmpty { finalParts.append(trimmed) }
+            volatilePart = ""
+        } else {
+            volatilePart = trimmed
+        }
+        return (finalParts + (volatilePart.isEmpty ? [] : [volatilePart]))
+            .joined(separator: " ")
+    }
+
+    func finalizedText() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return finalParts.joined(separator: " ")
     }
 }
 
