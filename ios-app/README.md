@@ -108,13 +108,28 @@ Routing goes through the shared on-device STT router (`AudioSTT`). When **Prefer
 Gemma 4 Audio** is enabled, the Zig core's mtmd layer runs first in sequential
 45-second segments; Apple Speech is fallback-only and the actual route appears
 immediately under Profile → Audio Transcription → Recent Runs. With Gemma off,
-Apple uses sequential 40-second forced-on-device `SFSpeechRecognizer` requests
-first because SpeechAnalyzer can return a non-empty but truncated long-file
-result. Audio never leaves the device on any path. If no complete
+Apple uses SpeechAnalyzer's `.offlineTranscription` preset over the whole file,
+after installing the required locale model through `AssetInventory`; segmented
+forced-on-device `SFSpeechRecognizer` is compatibility fallback only. Audio
+never leaves the device on any path. If no complete
 transcript is produced (empty/failed recognition, no
 audio file, or a failed store write), the old transcript is left unchanged
 and a "Re-transcription failed" alert is shown — a partial result never
 overwrites the stored entry.
+
+New recordings follow the system Voice Memos/Notes pattern: the microphone
+buffer is written to the m4a and streamed into SpeechAnalyzer's
+`.progressiveLiveTranscription` preset at the same time. Volatile text is
+replaced as recognition improves, finals accumulate once, and Stop waits for
+the analyzer to flush before the journal is saved. A completed live transcript
+is not re-sliced afterward. If the live model is unavailable, the audio is
+still saved immediately and the durable pending queue runs whole-file offline
+transcription in the background. Imported audio enters that same persisted
+queue, so its placeholder is usable/playable while transcription continues.
+
+Audio detail screens expose a visible Delete action. Deletion moves the journal,
+audio and transcript to Recently Deleted for 30 days; Empty Trash removes both
+the database row and the app-owned audio file.
 
 The Profile model rows distinguish the Q4 text model from its audio add-on.
 The add-on reuses the exact same Q4 GGUF and downloads only the separate ~1 GB

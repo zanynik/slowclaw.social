@@ -76,7 +76,7 @@ enum AudioSTT {
                     segmentCount: gemma.segmentCount)
             }
         } else {
-            progress?("Running Apple's segmented on-device transcription…")
+            progress?("Running Apple's long-form on-device transcription…")
             let appleText = await Transcriber.transcribe(url: url)
             result = AudioSTTResult(
                 text: appleText,
@@ -84,8 +84,8 @@ enum AudioSTT {
                 timings: nil,
                 diagnostic: appleText.isEmpty
                     ? "Apple's on-device recognizer produced no transcript."
-                    : "Apple's segmented on-device recognizer completed.",
-                segmentCount: max(1, Int(ceil((audioSeconds ?? 0) / 40))))
+                    : "Apple's long-form on-device recognizer completed.",
+                segmentCount: 1)
         }
 
         let elapsedMs = Int64((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)

@@ -34,6 +34,10 @@ final class AudioRecorder: NSObject, ObservableObject {
     /// appends to the same continuous m4a).
     @Published var isPaused = false
     @Published var isTranscribing = false
+    /// True while Stop is flushing the analyzer's final results. The journal
+    /// is not auto-saved until this becomes false and `isRecording` flips,
+    /// which prevents losing the last spoken phrase.
+    @Published var isFinalizing = false
     @Published var transcript = ""
     @Published var audioLevel: Float = 0
     @Published var errorMessage: String?
@@ -110,6 +114,7 @@ final class AudioRecorder: NSObject, ObservableObject {
     }
 
     func startRecording() async {
+        guard !isRecording, !isTranscribing, !isFinalizing else { return }
         guard await requestPermissions() else {
             errorMessage = "Microphone and speech recognition permissions are required."
             return
@@ -208,7 +213,7 @@ final class AudioRecorder: NSObject, ObservableObject {
             startDisplayTimer()
         } catch {
             errorMessage = "Failed to start recording: \(error.localizedDescription)"
-            stopRecording()
+            await cleanupFailedStart()
         }
     }
 
@@ -273,7 +278,7 @@ final class AudioRecorder: NSObject, ObservableObject {
         } catch {
             errorMessage = "Could not resume: \(error.localizedDescription)"
             // Fall back to finishing so the partial file is still saved.
-            finishRecording()
+            await finishRecording()
         }
     }
 
@@ -281,8 +286,9 @@ final class AudioRecorder: NSObject, ObservableObject {
     /// session. Sets `transcript` (accumulated from the live session) and
     /// `recordedFileURL`; the caller auto-saves the journal immediately. This
     /// is the "Stop" action — no review gate, full Voice Memos flow.
-    func finishRecording() {
-        guard isRecording else { return }
+    func finishRecording() async {
+        guard isRecording, !isFinalizing else { return }
+        isFinalizing = true
         endSegment()
         stopDisplayTimer()
 
@@ -297,29 +303,36 @@ final class AudioRecorder: NSObject, ObservableObject {
         // closes the m4a.
         shared.audioFile = nil
 
-        isRecording = false
-        isPaused = false
         audioLevel = 0
         samples = []
 
+        // Flush the live transcription session BEFORE isRecording becomes
+        // false. JournalView observes that transition to auto-save, so this
+        // ordering guarantees the saved body contains the complete finalized
+        // stream rather than a pre-flush preview.
+        let session = liveSession
+        liveSession = nil
+        shared.converter = nil
+        if let completed = await session?.stop(), !completed.isEmpty {
+            transcript = completed
+        } else if session != nil {
+            // A failed/undrained live session cannot vouch for a partial
+            // preview. Save a placeholder and let the durable file queue use
+            // the offline long-form path.
+            transcript = ""
+        }
+
+        isFinalizing = false
+        isRecording = false
+        isPaused = false
         Self.haptic(.success)
         try? AVAudioSession.sharedInstance().setActive(
             false, options: .notifyOthersOnDeactivation
         )
-
-        // Flush the live transcription session so any in-flight finals land
-        // before the caller saves. Best-effort: the saved journal already
-        // carries whatever transcript has streamed in so far; if finals arrive
-        // a moment later the background-drain (or the caller's short tail)
-        // updates the entry.
-        let session = liveSession
-        liveSession = nil
-        shared.converter = nil
-        Task { await session?.stop() }
     }
 
     /// Legacy alias kept for call sites that mean "end and finalize."
-    @inlinable func stopRecording() { finishRecording() }
+    @inlinable func stopRecording() async { await finishRecording() }
 
     // MARK: - Live transcription session
 
@@ -327,15 +340,19 @@ final class AudioRecorder: NSObject, ObservableObject {
     /// up the format converter from the mic format. On final results, appends
     /// to `transcript`. No-op (graceful) if the locale asset is unavailable.
     private func beginLiveSession(micFormat: AVAudioFormat) async {
-        let session = await Transcriber.makeLiveSession { [weak self] chunk in
-            // Append finalized chunk to the running transcript.
-            guard let self else { return }
-            let combined = self.transcript.isEmpty ? chunk : "\(self.transcript) \(chunk)"
-            self.transcript = combined
-        }
-        guard let session else {
-            // Locale asset unavailable — recording proceeds without live
-            // transcription; the caller stores a placeholder on save.
+        isTranscribing = true
+        defer { isTranscribing = false }
+        let session: Transcriber.LiveSession
+        do {
+            session = try await Transcriber.makeLiveSession { [weak self] snapshot in
+                // Snapshot already combines immutable finals with the latest
+                // replaceable volatile phrase, so revisions never duplicate.
+                self?.transcript = snapshot
+            }
+        } catch {
+            // Recording remains available even if model installation fails.
+            // Stop will enqueue the durable file for offline/fallback STT.
+            errorMessage = "Live transcription is unavailable; audio will be transcribed after saving."
             return
         }
         // Store the mic→analyzer converter on the shared (non-isolated) holder
@@ -343,6 +360,29 @@ final class AudioRecorder: NSObject, ObservableObject {
         shared.converter = AVAudioConverter(from: micFormat, to: session.analyzerFormat)
         liveSession = session
         session.start()
+    }
+
+    /// Tear down resources allocated before `isRecording` became true. A
+    /// start failure used to call finishRecording(), whose guard then skipped
+    /// cleanup and left the audio session/file open.
+    private func cleanupFailedStart() async {
+        audioEngine.stop()
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        shared.audioFile = nil
+        shared.converter = nil
+        let session = liveSession
+        liveSession = nil
+        _ = await session?.stop()
+        isRecording = false
+        isPaused = false
+        isFinalizing = false
+        isTranscribing = false
+        try? AVAudioSession.sharedInstance().setActive(
+            false, options: .notifyOthersOnDeactivation
+        )
     }
 
     /// Convert a PCM buffer from the mic format to the analyzer format.
@@ -442,8 +482,10 @@ final class AudioRecorder: NSObject, ObservableObject {
     }
 
     @objc private func handleMediaServicesReset(_ note: Notification) {
-        if isRecording { finishRecording() }
-        errorMessage = "Audio system reset. Please start the recording again."
+        Task { @MainActor in
+            if isRecording { await finishRecording() }
+            errorMessage = "Audio system reset. Please start the recording again."
+        }
     }
 
     // MARK: - Paths + helpers
