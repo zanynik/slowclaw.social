@@ -147,7 +147,8 @@ struct SlowClawApp: App {
                     // Auto-activate the on-device model so AI is ready whenever
                     // the app is open (local-first path). This defers while a
                     // restored download is active.
-                    Task { await appState.ensureLocalModelActivated() }
+                    // Load AI only when requested: capture and reading must
+                    // remain available even after an inference-related crash.
                     // Resume any pending transcriptions left from a killed-app
                     // session, and reconcile audio journals whose transcript
                     // never landed (queues them newest-first).
@@ -184,13 +185,18 @@ private final class OnceBox: @unchecked Sendable {
 /// Swift tasks from occupying cooperative threads while they wait for that
 /// mutex. The actual synchronous FFI call runs in a detached task, so the main
 /// actor remains free to handle tab changes, scrolling, and taps.
-private actor OnDeviceAIExecutor {
+private final class OnDeviceAIExecutor: @unchecked Sendable {
     static let shared = OnDeviceAIExecutor()
+    private let queue = DispatchQueue(label: "com.slowclaw.inference", qos: .utility)
 
     func run<T: Sendable>(
         _ operation: @escaping @Sendable () throws -> T
     ) async throws -> T {
-        try await Task.detached(priority: .utility, operation: operation).value
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                continuation.resume(with: Result { try operation() })
+            }
+        }
     }
 }
 
@@ -557,8 +563,13 @@ final class AppState: ObservableObject {
     // MARK: - On-device LLM management
 
     func refreshLocalLLMStatus() {
-        localLLM = slowClawLocalLLMStatus()
-        if !localLLM.loaded { loadedLocalModelPresetID = nil }
+        Task {
+            let snapshot = try? await OnDeviceAIExecutor.shared.run { slowClawLocalLLMStatus() }
+            if let snapshot {
+                localLLM = snapshot
+                if !snapshot.loaded { loadedLocalModelPresetID = nil }
+            }
+        }
     }
 
     /// True when any LLM is usable: a configured remote provider OR a loaded
@@ -625,37 +636,45 @@ final class AppState: ObservableObject {
         localModelBusy = true
         localModelError = nil
         defer { localModelBusy = false }
-        let err = await Task.detached(priority: .userInitiated) {
+        let err = try? await OnDeviceAIExecutor.shared.run {
             slowClawLocalLLMLoad(path: url.path)
-        }.value
+        }
         if let err {
             localModelError = err
             loadedLocalModelPresetID = nil
         } else {
             loadedLocalModelPresetID = preset.id
         }
-        refreshLocalLLMStatus()
+        if let snapshot = try? await OnDeviceAIExecutor.shared.run({ slowClawLocalLLMStatus() }) {
+            localLLM = snapshot
+        }
         if localLLM.loaded { scheduleInterestIndexing() }
     }
 
     func unloadLocalModel() {
-        slowClawLocalLLMUnload()
-        loadedLocalModelPresetID = nil
-        refreshLocalLLMStatus()
+        guard !localModelBusy else { return }
+        localModelBusy = true
+        Task {
+            _ = try? await OnDeviceAIExecutor.shared.run { slowClawLocalLLMUnload() }
+            loadedLocalModelPresetID = nil
+            localModelBusy = false
+            refreshLocalLLMStatus()
+        }
     }
 
     func deleteLocalModel(_ preset: LocalModelPreset) {
-        // Unload first if any model is active (frees RAM), then remove the
-        // model file. Unload first if the active model owns it.
-        if localLLM.loaded,
-           let activeID = loadedLocalModelPresetID,
-           let active = LocalModelPreset.presets.first(where: { $0.id == activeID }),
-           active.fileName == preset.fileName {
-            unloadLocalModel()
+        guard !localModelBusy else { return }
+        localModelBusy = true
+        Task {
+            defer { localModelBusy = false }
+            _ = try? await OnDeviceAIExecutor.shared.run {
+                slowClawLocalLLMUnload()
+                try LocalModelStore.delete(preset)
+            }
+            loadedLocalModelPresetID = nil
+            localModelProgress[preset.id] = nil
+            refreshLocalLLMStatus()
         }
-        try? LocalModelStore.delete(preset)
-        localModelProgress[preset.id] = nil
-        refreshLocalLLMStatus()
     }
 
     /// Auto-activate the on-device model when the app is open or AI is needed.
@@ -817,7 +836,7 @@ final class AppState: ObservableObject {
                 ? body
                 : entry.content.trimmingCharacters(in: .whitespacesAndNewlines)
             guard analysisText.count >= 20,
-                  !Self.needsTranscript(entry.content),
+                  !(entry.mediaURL != nil && Self.needsTranscript(entry.content)),
                   Self.hasMeaningfulBody(analysisText) else { return nil }
             return (entry, analysisText, Self.interestFingerprint(analysisText))
         }
@@ -841,7 +860,7 @@ final class AppState: ObservableObject {
             if Task.isCancelled { break }
             if Self.softDeletedKeys()[item.0.key] != nil { continue }
             // A user-requested post should win after the current extraction.
-            while isGeneratingPosts && !Task.isCancelled {
+            while (isGeneratingPosts || audioTranscriptionInFlight) && !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(300))
             }
             interestIndexProgress = "Learning from journal \(offset + 1) of \(pending.count)…"
@@ -1753,6 +1772,10 @@ final class AppState: ObservableObject {
     /// Long entries are chunked at ~3200 chars; each chunk produces its own post.
     /// Mirrors the reference app's handleFeedPullRefresh / generatePostFromJournal.
     func tweetClawGenerateNext() async {
+        isGeneratingPosts = true
+        generateStatus = "Preparing your writing space…"
+        defer { isGeneratingPosts = false }
+        await ensureLocalModelActivated()
         guard anyLLMAvailable else {
             generateStatus = "Add an LLM API key in Profile, or activate an on-device model, to generate posts."
             return
@@ -1761,13 +1784,13 @@ final class AppState: ObservableObject {
             generateStatus = "Write a journal entry first."
             return
         }
-        isGeneratingPosts = true
         generateStatus = "Generating…"
-        defer { isGeneratingPosts = false }
 
         // Pick the next journal to process.
         var processed = processedJournalKeys
-        let candidates = journals.filter { $0.content.trimmingCharacters(in: .whitespacesAndNewlines).count > 10 }
+        let candidates = journals.filter {
+            $0.content.count > 20 && !($0.mediaURL != nil && Self.needsTranscript($0.content))
+        }
         let unprocessed = candidates.filter { !processed.contains($0.key) }
         let journal = (unprocessed.first ?? candidates.randomElement())
         guard let journal = journal else {
@@ -1782,10 +1805,10 @@ final class AppState: ObservableObject {
         // llama.cpp is single-model/single-context. Generate chunks in order
         // instead of spawning several tasks that only wait on the same model
         // mutex and compete with SwiftUI for CPU time.
-        for chunk in chunkForPosts(journal.content, limit: 3200) {
+        for chunk in chunkForPosts(journal.content, limit: 1800).prefix(3) {
             var message = chunk
             if !recentDrafts.isEmpty {
-                let dedupe = recentDrafts.prefix(10).joined(separator: "\n---\n")
+                let dedupe = String(recentDrafts.prefix(2).joined(separator: "\n---\n").prefix(500))
                 message += "\n\n(Avoid repeating these posts you already wrote:)\n\(dedupe)"
             }
             // chat() honors the editable TweetClaw prompt as the system prompt.
@@ -1889,7 +1912,7 @@ struct AppShell: View {
         // OS may have reclaimed it), so AI is ready whenever the app is open.
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
-                Task { await state.ensureLocalModelActivated() }
+                // Foregrounding must never wait for the inference mutex.
                 // Foreground is the retry point for audio that lost its
                 // transcript (suspension, crash, failed engine) — reconcile
                 // throttled to once a minute.
