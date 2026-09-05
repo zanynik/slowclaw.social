@@ -121,6 +121,17 @@ jobs:
                   set -euo pipefail
                   xcodegen generate
 
+            - name: Validate iOS app without signing
+              working-directory: ios-app
+              run: |
+                  set -euo pipefail
+                  xcodebuild build \
+                    -project SlowClaw.xcodeproj \
+                    -scheme SlowClaw \
+                    -configuration Release \
+                    -destination "generic/platform=iOS" \
+                    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
             - name: Prepare App Store Connect API key
               env:
                   APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}

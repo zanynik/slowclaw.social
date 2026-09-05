@@ -119,7 +119,9 @@ async function request(token, method, path, body) {
   const certRecord = cert.data;
   fs.writeFileSync(process.env.CERT_OUT_PATH, Buffer.from(certRecord.attributes.certificateContent, "base64"));
 
-  const profile = await request(token, "POST", "/v1/profiles", {
+  let profile;
+  try {
+    profile = await request(token, "POST", "/v1/profiles", {
     data: {
       type: "profiles",
       attributes: {
@@ -132,6 +134,16 @@ async function request(token, method, path, body) {
       }
     }
   });
+  } catch (error) {
+    // Only this attempt's newly issued certificate is ours to revoke. Never
+    // delete arbitrary team certificates to make room under Apple's quota.
+    try {
+      await request(token, "DELETE", `/v1/certificates/${certRecord.id}`);
+    } catch {
+      console.error("Could not clean up this run's newly issued certificate; review Apple Developer Certificates before retrying.");
+    }
+    throw error;
+  }
   const profileRecord = profile.data;
   fs.writeFileSync(process.env.PROFILE_OUT_PATH, Buffer.from(profileRecord.attributes.profileContent, "base64"));
   fs.writeFileSync(process.env.PROFILE_NAME_OUT_PATH, profileRecord.attributes.name);
