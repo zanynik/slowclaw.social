@@ -71,7 +71,9 @@ async function request(token, method, path, body) {
   }
   if (response.status < 200 || response.status >= 300) {
     const detail = parsed?.errors?.[0]?.detail || parsed?.errors?.[0]?.title || `HTTP ${response.status}`;
-    throw new Error(detail);
+    // Include the operation, never tokens, request bodies, or resource IDs.
+    const resource = path.split("?")[0].replace(/\/([A-Z0-9]{8,})(?=\/|$)/g, "/<id>");
+    throw new Error(`${method} ${resource} (HTTP ${response.status}): ${detail}`);
   }
   return parsed;
 }
@@ -93,12 +95,14 @@ async function request(token, method, path, body) {
       continue;
     }
     const relatedCerts = await request(token, "GET", `/v1/profiles/${staleProfile.id}/certificates?fields[certificates]=certificateType&limit=20`);
-    await request(token, "DELETE", `/v1/profiles/${staleProfile.id}`);
     for (const relatedCert of relatedCerts.data || []) {
       if (relatedCert.attributes?.certificateType === "IOS_DISTRIBUTION") {
         await request(token, "DELETE", `/v1/certificates/${relatedCert.id}`);
       }
     }
+    // Keep the ownership link until certificate cleanup succeeds. Otherwise
+    // a transient delete failure leaves a certificate we cannot find next run.
+    await request(token, "DELETE", `/v1/profiles/${staleProfile.id}`);
   }
 
   const csrContent = fs.readFileSync(process.env.CERT_CSR_PATH, "utf8");
@@ -114,7 +118,20 @@ async function request(token, method, path, body) {
       }
     });
   } catch (error) {
-    throw new Error(`Could not create Apple Distribution certificate. If the certificate limit is full, revoke an unused Distribution certificate in Apple Developer Certificates, Identifiers & Profiles, then rerun. Apple said: ${error.message}`);
+    try {
+      const certificates = await request(token, "GET", "/v1/certificates?filter[certificateType]=IOS_DISTRIBUTION&limit=200");
+      let ciSubjectCount = 0;
+      for (const record of certificates.data || []) {
+        try {
+          const x509 = new crypto.X509Certificate(Buffer.from(record.attributes.certificateContent, "base64"));
+          if (x509.subject.split("\n").includes("CN=SlowClaw CI")) ciSubjectCount++;
+        } catch { /* Diagnostic only; never delete based on a subject match. */ }
+      }
+      console.error(`Signing diagnostic: ${(certificates.data || []).length} iOS distribution certificate(s); ${ciSubjectCount} with the SlowClaw CI subject. No certificates were deleted by this diagnostic.`);
+    } catch (diagnosticError) {
+      console.error(`Certificate inventory unavailable: ${diagnosticError.message}`);
+    }
+    throw new Error(`Certificate issuance failed. Existing team certificates were left unchanged by recovery. Apple said: ${error.message}`);
   }
   const certRecord = cert.data;
   fs.writeFileSync(process.env.CERT_OUT_PATH, Buffer.from(certRecord.attributes.certificateContent, "base64"));
