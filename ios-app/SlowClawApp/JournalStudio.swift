@@ -8,7 +8,7 @@ final class BlogClaw: ObservableObject {
     private var task: Task<Void, Never>?
 
     func start(entries: [SlowClawMemoryEntry], state: AppState) {
-        guard !running, !entries.isEmpty else { return }
+        guard !running, !state.isGeneratingPosts, !entries.isEmpty else { return }
         running = true
         progress = "Preparing BlogClaw…"
         task = Task {

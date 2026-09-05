@@ -144,9 +144,6 @@ struct SlowClawApp: App {
                     // Reattach any user-started background model transfer so
                     // its progress bar resumes after a process relaunch.
                     appState.resumePendingLocalModelDownloads()
-                    // Auto-activate the on-device model so AI is ready whenever
-                    // the app is open (local-first path). This defers while a
-                    // restored download is active.
                     // Load AI only when requested: capture and reading must
                     // remain available even after an inference-related crash.
                     // Resume any pending transcriptions left from a killed-app
@@ -669,7 +666,9 @@ final class AppState: ObservableObject {
     /// model is already loaded. Safe to call repeatedly.
     func ensureLocalModelActivated() async {
         // Re-read status in case it changed (e.g. the OS reclaimed the model).
-        refreshLocalLLMStatus()
+        if let snapshot = try? await OnDeviceAIExecutor.shared.run({ slowClawLocalLLMStatus() }) {
+            localLLM = snapshot
+        }
         // Also defer while a download is in flight: loading a multi-GB GGUF
         // while another streams to disk is the same RAM/disk conflict the
         // model rows guard against in the UI. Downloads never set
@@ -1790,7 +1789,8 @@ final class AppState: ObservableObject {
         // llama.cpp is single-model/single-context. Generate chunks in order
         // instead of spawning several tasks that only wait on the same model
         // mutex and compete with SwiftUI for CPU time.
-        for chunk in chunkForPosts(journal.content, limit: 1800).prefix(3) {
+        var savedCount = 0
+        for chunk in DraftBudget.chunks(journal.content, limit: 1800).prefix(3) {
             var message = chunk
             if !recentDrafts.isEmpty {
                 let dedupe = String(recentDrafts.prefix(2).joined(separator: "\n---\n").prefix(500))
@@ -1803,33 +1803,25 @@ final class AppState: ObservableObject {
                 // Acceptance gate: 11–399 chars (matches the reference).
                 guard cleaned.count > 10, cleaned.count < 400 else { continue }
                 let key = "draft_\(Date().timeIntervalSince1970)_\(UInt.random(in: 0..<1_000_000))"
-                try? memory.store(key: key, content: cleaned, category: "core", sessionID: "drafts")
+                do {
+                    try memory.store(key: key, content: cleaned, category: "core", sessionID: "drafts")
+                    savedCount += 1
+                } catch { generateStatus = "Could not save the draft. Please try again." }
             }
         }
 
-        processed.insert(journal.key)
-        processedJournalKeys = processed
+        if savedCount > 0 {
+            processed.insert(journal.key)
+            processedJournalKeys = processed
+        }
         await refreshJournals()
-        generateStatus = nil
+        generateStatus = savedCount > 0 ? "\(savedCount) draft\(savedCount == 1 ? "" : "s") saved for review." : "The model did not produce a usable short post. Try a shorter journal or adjust the prompt in Profile."
     }
 
     /// Split long text into chunks for per-chunk post generation. Mirrors the
     /// reference's CHUNK_CHAR_LIMIT + splitIntoChunks (paragraph boundaries).
     private func chunkForPosts(_ text: String, limit: Int) -> [String] {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count > limit else { return [trimmed].filter { !$0.isEmpty } }
-        var chunks: [String] = []
-        var current = ""
-        for para in trimmed.components(separatedBy: "\n\n") {
-            if current.count + para.count > limit, !current.isEmpty {
-                chunks.append(current)
-                current = para
-            } else {
-                current += (current.isEmpty ? "" : "\n\n") + para
-            }
-        }
-        if !current.isEmpty { chunks.append(current) }
-        return chunks
+        DraftBudget.chunks(text, limit: limit)
     }
 }
 

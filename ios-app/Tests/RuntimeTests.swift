@@ -2,6 +2,13 @@ import XCTest
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
+    func testUnbrokenTranscriptStaysWithinBudget() {
+        let text = String(repeating: "journal 🐾 ", count: 1500)
+        let parts = DraftBudget.chunks(text, limit: 1800)
+        XCTAssertTrue(parts.allSatisfy { $0.count <= 1800 })
+        XCTAssertEqual(parts.joined(), text.trimmingCharacters(in: .whitespacesAndNewlines))
+        XCTAssertTrue(DraftBudget.chunks("   ", limit: 1800).isEmpty)
+    }
     func testBIP340VectorZero() throws {
         // Published BIP-340 test key, never used as an app identity.
         let key = Array(repeating: UInt8(0), count: 31) + [3]
