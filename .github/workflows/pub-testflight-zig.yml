@@ -12,6 +12,7 @@ on:
     push:
         branches:
             - main
+            - feat/journal-studio-stability
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
             - "zig-src/**"
