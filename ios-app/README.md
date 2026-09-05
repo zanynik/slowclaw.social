@@ -144,6 +144,35 @@ generation continues when the user switches tabs without monopolizing SwiftUI.
 
 ## TestFlight (CI)
 
+### Journal studio and launch recovery
+
+The app opens on Journals without loading Gemma. The previous launch freeze
+could occur when a main-thread status query waited on the native inference
+mutex. All model lifecycle/status/generation calls now use one serial Dispatch
+queue, avoiding both main-thread waits and actor reentrancy. AI loads when a
+user requests it; Profile's interest refresh explicitly activates indexing.
+
+Drafts is a writing studio: TweetClaw creates short posts; BlogClaw takes one
+to three selected journals, extracts bounded notes, and writes three sections.
+Each source is limited to the first 7,200 characters, disclosed in the picker.
+Intermediate sections are saved, edits persist, and drafts can be exported.
+
+Review & publish sends only the reviewed draft to Nostr (kind 1 or NIP-23
+kind 30023). Identity secrets stay in device-only Keychain and can be imported
+or revealed as portable nsec recovery keys. The pinned swift-secp256k1 0.23.2
+C product supplies BIP-340 signing; no AI/runtime replacement is introduced.
+Relay URLs are editable. Signed events persist before transmission, retries
+reuse their IDs, and success requires a matching positive relay OK. No relay
+receipt means uncertainty, not a claim that a public event does not exist.
+
+Proven: retain Apple audio and local drafting. Better: responsive lifecycle,
+named navigation, persisted editing and acknowledged publishing. New: bounded
+multi-journal BlogClaw. Rollback is reverting the studio commit; keys and
+journals remain in their existing stores. Physical-device launch, recording,
+and model-memory behavior still require iPhone verification; a signed archive
+alone cannot establish crash freedom. CI runs the scheduling and signing
+regression tests before the device build (`bash ios-app/Tests/run.sh` on macOS).
+
 The `pub-testflight-zig.yml` workflow at `.github/workflows/` builds + signs +
 uploads to TestFlight on every push to `main` (when `zig-src/`, `ios-app/`,
 or the workflow file change). It uses these repo-wide App Store Connect +

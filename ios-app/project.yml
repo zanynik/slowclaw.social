@@ -18,6 +18,10 @@
 #   4. Copy slowclaw_feed.h as a bridging header
 
 name: SlowClaw
+packages:
+  NostrCrypto:
+    url: https://github.com/21-DOT-DEV/swift-secp256k1
+    exactVersion: 0.23.2
 options:
   bundleIdPrefix: com.slowclaw
   deploymentTarget:
@@ -47,6 +51,9 @@ settings:
 targets:
   SlowClaw:
     type: application
+    dependencies:
+      - package: NostrCrypto
+        product: libsecp256k1
     platform: iOS
     deploymentTarget: "26.0"
     sources:

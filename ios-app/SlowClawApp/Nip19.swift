@@ -15,6 +15,27 @@
 import Foundation
 
 enum Nip19 {
+    static func encodeKey(_ bytes: [UInt8], prefix: String) -> String {
+        let data = convertBits(bytes, fromBits: 8, toBits: 5, pad: true)
+        return prefix + "1" + String((data + bech32CreateChecksum(hrp: prefix, data: data, constant: 1)).map { charset[Int($0)] })
+    }
+
+    static func decodeSecret(_ input: String) -> [UInt8]? {
+        let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.count == 64 { return hexBytes(value) }
+        guard value == value.lowercased() || value == value.uppercased() else { return nil }
+        let normalized = value.lowercased()
+        guard normalized.hasPrefix("nsec1"), normalized.count == 63 else { return nil }
+        let chars = normalized.dropFirst(5)
+        let words = chars.compactMap { charset.firstIndex(of: $0).map(UInt8.init) }
+        guard words.count == chars.count,
+              bech32Polymod(bech32HrpExpand("nsec") + words) == 1 else { return nil }
+        let payload = Array(words.dropLast(6))
+        guard payload.last.map({ $0 & 15 == 0 }) == true else { return nil }
+        let bytes = convertBits(payload, fromBits: 5, toBits: 8, pad: false)
+        return bytes.count == 32 ? bytes : nil
+    }
+
     private static let charset: [Character] = Array("qpzry9x8gf2tvdw0s3jn54khce6mua7l")
 
     /// Encode an naddr. Returns nil if the pubkey isn't a valid 32-byte hex.

@@ -68,6 +68,9 @@ jobs:
                   fi
                   xcodegen --version
 
+            - name: Test inference scheduling and Nostr signing
+              run: bash ios-app/Tests/run.sh
+
             - name: Build Zig staticlib (iOS device)
               working-directory: zig-src
               run: |

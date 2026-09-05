@@ -185,21 +185,6 @@ private final class OnceBox: @unchecked Sendable {
 /// Swift tasks from occupying cooperative threads while they wait for that
 /// mutex. The actual synchronous FFI call runs in a detached task, so the main
 /// actor remains free to handle tab changes, scrolling, and taps.
-private final class OnDeviceAIExecutor: @unchecked Sendable {
-    static let shared = OnDeviceAIExecutor()
-    private let queue = DispatchQueue(label: "com.slowclaw.inference", qos: .utility)
-
-    func run<T: Sendable>(
-        _ operation: @escaping @Sendable () throws -> T
-    ) async throws -> T {
-        try await withCheckedThrowingContinuation { continuation in
-            queue.async {
-                continuation.resume(with: Result { try operation() })
-            }
-        }
-    }
-}
-
 /// Captures share-sheet / file-open URLs delivered during cold launch (before
 /// SwiftUI's .onOpenURL is wired). The App flushes them on first appear.
 final class ShareURLDelegate: NSObject, UIApplicationDelegate {
@@ -403,7 +388,7 @@ final class AppState: ObservableObject {
     }
     // Reads is the default tab (matches the reference app: the unified "for me"
     // stream is the home surface).
-    @Published var selectedTab: AppTab = .reads
+    @Published var selectedTab: AppTab = .journal
 
     // Journal sidebar (matches the reference app's hamburger drawer). The
     // selected journal's content loads into the editor; nil = fresh new entry.
@@ -1334,7 +1319,7 @@ final class AppState: ObservableObject {
             return
         }
         // Ensure the on-device model is active before asking it for a title.
-        await ensureLocalModelActivated()
+        guard anyLLMAvailable else { return }
         pendingTitleKeys.insert(key)
         defer { pendingTitleKeys.remove(key) }
         guard let title = try? await aiTitle(transcript: trimmed),
@@ -1759,7 +1744,7 @@ final class AppState: ObservableObject {
     /// taps join the existing single flight instead of starting another model
     /// request.
     func startTweetClawGeneration() {
-        guard postGenerationTask == nil else { return }
+        guard postGenerationTask == nil, !BlogClaw.shared.running else { return }
         postGenerationTask = Task { [weak self] in
             guard let self else { return }
             await self.tweetClawGenerateNext()
@@ -1990,9 +1975,12 @@ struct BottomNav: View {
                         selection = tab
                     }
                 } label: {
+                    VStack(spacing: 4) {
                     Image(systemName: tab.icon)
                         .font(.system(size: 22, weight: .regular))
                         .scaleEffect(active ? 1.1 : 1.0)
+                    Text(tab.label).font(.system(size: 10, weight: active ? .semibold : .regular))
+                    }
                         .foregroundStyle(active ? DS.accent(scheme) : DS.muted(scheme))
                         .frame(maxWidth: .infinity)
                         .frame(height: 44)
@@ -3386,6 +3374,8 @@ struct ReadsView: View {
 struct DraftsView: View {
     @Environment(\.colorScheme) var scheme
     @EnvironmentObject var state: AppState
+    @StateObject private var blog = BlogClaw.shared
+    @State private var showBlogPicker = false
 
     var body: some View {
         ScrollView {
@@ -3395,10 +3385,10 @@ struct DraftsView: View {
                     Text("🐾")
                         .font(.system(size: 28))
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("TweetClaw")
+                        Text("Your writing studio")
                             .font(DS.cardTitleFont)
                             .foregroundStyle(DS.ink(scheme))
-                        Text("Turns your journals into posts")
+                        Text("Private thoughts. Something worth sharing.")
                             .font(DS.captionFont)
                             .foregroundStyle(DS.muted(scheme))
                     }
@@ -3423,6 +3413,28 @@ struct DraftsView: View {
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 8)
+
+                HStack(spacing: 12) {
+                    Button { state.startTweetClawGeneration() } label: {
+                        Label("Short post", systemImage: "quote.bubble")
+                            .frame(maxWidth: .infinity).padding(.vertical, 10)
+                    }
+                    Button { showBlogPicker = true } label: {
+                        Label("BlogClaw", systemImage: "doc.richtext")
+                            .frame(maxWidth: .infinity).padding(.vertical, 10)
+                    }
+                }
+                .buttonStyle(.bordered).tint(DS.accent(scheme))
+                .disabled(state.isGeneratingPosts || blog.running || state.localModelBusy)
+
+                if let progress = blog.progress {
+                    HStack {
+                        if blog.running { ProgressView().controlSize(.small) }
+                        Text(progress).font(DS.captionFont)
+                        Spacer()
+                        if blog.running { Button("Stop") { blog.stop() } }
+                    }.padding(12).background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: 12))
+                }
 
                 if let status = state.generateStatus {
                     Text(status)
@@ -3459,6 +3471,7 @@ struct DraftsView: View {
             .padding(.bottom, 24)
         }
         .background(DS.bg(scheme))
+        .sheet(isPresented: $showBlogPicker) { BlogClawPicker().environmentObject(state) }
         .refreshable {
             state.startTweetClawGeneration()
         }
@@ -3477,8 +3490,11 @@ struct DraftCard: View {
     @State private var isEditing = false
     @State private var isRegenerating = false
     @State private var showCopyAlert = false
+    @State private var showPublish = false
+    @State private var saveError: String?
 
-    private let maxChars = 300
+    private var isArticle: Bool { draft.source == "blogclaw" }
+    private var maxChars: Int { isArticle ? 60_000 : 300 }
 
     var charCount: Int { editedText.count }
     var charCountColor: Color {
@@ -3495,10 +3511,10 @@ struct DraftCard: View {
                     Text("🐾")
                         .font(.system(size: 20))
                     VStack(alignment: .leading, spacing: 0) {
-                        Text("TweetClaw")
+                        Text(isArticle ? "BlogClaw" : "TweetClaw")
                             .font(DS.captionFont.weight(.semibold))
                             .foregroundStyle(DS.ink(scheme))
-                        Text("@tweetclaw")
+                        Text(isArticle ? "Article draft · private until published" : "Short post · private until published")
                             .font(DS.microFont)
                             .foregroundStyle(DS.muted(scheme))
                     }
@@ -3522,7 +3538,7 @@ struct DraftCard: View {
                 // Toolbar
                 HStack(spacing: 8) {
                     // Character count
-                    Text("\(charCount)/\(maxChars)")
+                    Text(isArticle ? "\(editedText.split { $0.isWhitespace }.count) words" : "\(charCount) characters")
                         .font(DS.microFont.monospacedDigit())
                         .foregroundStyle(charCountColor)
 
@@ -3530,7 +3546,10 @@ struct DraftCard: View {
 
                     // Edit / Done toggle
                     Button {
-                        if isEditing { editedText = editedText.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        if isEditing {
+                            editedText = editedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard saveDraft() else { return }
+                        }
                         isEditing.toggle()
                     } label: {
                         Image(systemName: isEditing ? "checkmark.circle.fill" : "pencil")
@@ -3570,7 +3589,23 @@ struct DraftCard: View {
                             .foregroundStyle(DS.accent2Color)
                     }
                 }
+                if let saveError { Text(saveError).font(.caption).foregroundStyle(.red) }
+                HStack {
+                    Button {
+                        guard saveDraft() else { return }
+                        isEditing = false
+                        showPublish = true
+                    } label: {
+                        Label("Review & publish", systemImage: "paperplane")
+                            .frame(maxWidth: .infinity)
+                    }.buttonStyle(.borderedProminent).tint(DS.accent(scheme))
+                    ShareLink(item: editedText) { Image(systemName: "square.and.arrow.up") }
+                        .accessibilityLabel("Export draft")
+                }
             }
+        }
+        .sheet(isPresented: $showPublish) {
+            PublishDraftSheet(draftKey: draft.key, content: editedText, article: isArticle)
         }
         .alert("Copied", isPresented: $showCopyAlert) {
             Button("OK", role: .cancel) {}
@@ -3587,6 +3622,20 @@ struct DraftCard: View {
         if let newDraft = try? await state.aiDraftPost(from: source) {
             editedText = newDraft
         }
+    }
+
+    private func saveDraft() -> Bool {
+        guard !editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            saveError = "Write something before saving or publishing."
+            return false
+        }
+        do {
+            try state.memory.store(key: draft.key, content: editedText,
+                category: draft.category, sessionID: "drafts", source: draft.source, mediaURL: draft.mediaURL)
+            saveError = nil
+            Task { await state.refreshJournals() }
+            return true
+        } catch { saveError = "Could not save your edits. Please try again."; return false }
     }
 }
 
@@ -3999,6 +4048,14 @@ struct ProfileView: View {
                                 state.removeInterest($0)
                             }
                         }
+                        Button {
+                            Task {
+                                await state.ensureLocalModelActivated()
+                                state.scheduleInterestIndexing()
+                            }
+                        } label: {
+                            Label("Refresh from my journals", systemImage: "sparkles")
+                        }.disabled(state.isIndexingInterests || state.localModelBusy)
                         if state.isIndexingInterests {
                             HStack(spacing: 8) {
                                 ProgressView()
