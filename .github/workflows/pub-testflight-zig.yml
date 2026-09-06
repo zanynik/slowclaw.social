@@ -12,6 +12,7 @@ on:
     push:
         branches:
             - main
+            - fix/restore-pr24-transcription
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
             - ".github/workflows/scripts/asc-issue-cert-profile.js"

@@ -29,7 +29,6 @@ import Speech
 /// transcription via SpeechAnalyzer. Wall-clock timer survives backgrounding.
 @MainActor
 final class AudioRecorder: NSObject, ObservableObject {
-    private var hasSpeechLease = false
     @Published var isRecording = false
     /// True when recording is paused (engine stopped, file kept open so resume
     /// appends to the same continuous m4a).
@@ -117,13 +116,11 @@ final class AudioRecorder: NSObject, ObservableObject {
     func startRecording() async {
         guard !isRecording, !isTranscribing, !isFinalizing else { return }
         guard await requestPermissions() else {
-            CaptureActivity.isCapturing = false
             errorMessage = "Microphone and speech recognition permissions are required."
             return
         }
 
         // Reset state from any prior session.
-        CaptureActivity.isCapturing = true
         transcript = ""
         errorMessage = nil
         recordedFileURL = nil
@@ -326,8 +323,6 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
 
         isFinalizing = false
-        if hasSpeechLease { await SpeechSessionGate.shared.release(); hasSpeechLease = false }
-        CaptureActivity.isCapturing = false
         isRecording = false
         isPaused = false
         Self.haptic(.success)
@@ -345,11 +340,6 @@ final class AudioRecorder: NSObject, ObservableObject {
     /// up the format converter from the mic format. On final results, appends
     /// to `transcript`. No-op (graceful) if the locale asset is unavailable.
     private func beginLiveSession(micFormat: AVAudioFormat) async {
-        guard await SpeechSessionGate.shared.tryAcquire() else {
-            errorMessage = "Another recording is being transcribed. This audio will be transcribed after saving."
-            return
-        }
-        hasSpeechLease = true
         isTranscribing = true
         defer { isTranscribing = false }
         let session: Transcriber.LiveSession
@@ -362,8 +352,6 @@ final class AudioRecorder: NSObject, ObservableObject {
         } catch {
             // Recording remains available even if model installation fails.
             // Stop will enqueue the durable file for offline/fallback STT.
-            await SpeechSessionGate.shared.release()
-            hasSpeechLease = false
             errorMessage = "Live transcription: \(error.localizedDescription). Audio will be transcribed after saving."
             return
         }
@@ -388,8 +376,6 @@ final class AudioRecorder: NSObject, ObservableObject {
         let session = liveSession
         liveSession = nil
         _ = await session?.stop()
-        if hasSpeechLease { await SpeechSessionGate.shared.release(); hasSpeechLease = false }
-        CaptureActivity.isCapturing = false
         isRecording = false
         isPaused = false
         isFinalizing = false

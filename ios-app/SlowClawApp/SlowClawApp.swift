@@ -412,7 +412,7 @@ final class AppState: ObservableObject {
             try? await Task.sleep(for: .seconds(8))
             guard let self, self.readingCandidate?.id == item.id,
                   UIApplication.shared.applicationState == .active,
-                  !CaptureActivity.isCapturing, !self.audioTranscriptionInFlight,
+                  !self.audioTranscriptionInFlight,
                   !ProcessInfo.processInfo.isLowPowerModeEnabled,
                   ProcessInfo.processInfo.thermalState == .nominal else { return }
             await self.ensureLocalModelActivated()
@@ -717,7 +717,7 @@ final class AppState: ObservableObject {
     /// downloaded (won't auto-download a 2GB model without consent) or when a
     /// model is already loaded. Safe to call repeatedly.
     func ensureLocalModelActivated() async {
-        guard !CaptureActivity.isCapturing, !audioTranscriptionInFlight else { return }
+        guard !audioTranscriptionInFlight else { return }
         // Re-read status in case it changed (e.g. the OS reclaimed the model).
         if let snapshot = try? await OnDeviceAIExecutor.shared.run({ slowClawLocalLLMStatus() }) {
             localLLM = snapshot
@@ -848,26 +848,10 @@ final class AppState: ObservableObject {
 
     // MARK: - Durable journal interest lens
     private func waitForSpeechPriority() async throws {
-        while CaptureActivity.isCapturing || audioTranscriptionInFlight {
+        while audioTranscriptionInFlight {
             try await Task.sleep(for: .milliseconds(250))
         }
         try Task.checkCancellation()
-    }
-
-    func prepareAudioCapture() async -> Bool {
-        guard !CaptureActivity.isCapturing else { return false }
-        CaptureActivity.isCapturing = true
-        await releaseModelForSpeech()
-        return true
-    }
-
-    private func releaseModelForSpeech() async {
-        // Wait for the current request off-main, then free its multi-GB model
-        // before Apple Speech installs/loads its own assets.
-        if let snapshot = try? await OnDeviceAIExecutor.shared.run({
-            slowClawLocalLLMUnload()
-            return slowClawLocalLLMStatus()
-        }) { localLLM = snapshot; loadedLocalModelPresetID = nil }
     }
 
     /// Start a single background indexing pass. Every successfully analyzed
@@ -924,7 +908,7 @@ final class AppState: ObservableObject {
             if Task.isCancelled { break }
             if Self.softDeletedKeys()[item.0.key] != nil { continue }
             // A user-requested post should win after the current extraction.
-            while (isGeneratingPosts || audioTranscriptionInFlight || CaptureActivity.isCapturing
+            while (isGeneratingPosts || audioTranscriptionInFlight
                    || UIApplication.shared.applicationState != .active
                    || ProcessInfo.processInfo.isLowPowerModeEnabled
                    || ProcessInfo.processInfo.thermalState == .serious
@@ -1517,7 +1501,6 @@ final class AppState: ObservableObject {
         var handledKeys = Set<String>()
 
         while !Task.isCancelled {
-            if CaptureActivity.isCapturing { break }
             let now = Date()
             let snapshot = Self.loadPendingTranscriptions(at: url)
                 .filter {
@@ -1687,7 +1670,6 @@ final class AppState: ObservableObject {
             audioTranscriptionInFlight = audioTranscriptionCount > 0
             if audioTranscriptionCount == 0 { audioTranscriptionProgress = nil }
         }
-        await releaseModelForSpeech()
         let report: @Sendable (String) -> Void = { [weak self] message in
             Task { @MainActor [weak self] in
                 self?.audioTranscriptionProgress = message
@@ -1984,7 +1966,7 @@ struct AppShell: View {
             // nextAttemptAt preserves backoff instead of waiting for relaunch.
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(15)) } catch { break }
-                if scenePhase == .active && !CaptureActivity.isCapturing {
+                if scenePhase == .active {
                     await state.drainPendingTranscriptions()
                 }
             }
@@ -2196,7 +2178,6 @@ struct JournalDetailView: View {
     @State private var titleDraft: String
     @State private var isPolishing = false
     @State private var isRetranscribing = false
-    @State private var showShareSheet = false
     @State private var showRetranscribeFailedAlert = false
     @State private var showSaveErrorAlert = false
     @State private var showDeleteConfirmation = false
@@ -2381,12 +2362,11 @@ struct JournalDetailView: View {
                     }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    if audioURL != nil {
-                        Button {
-                            showShareSheet = true
-                        } label: {
+                    if let url = audioURL {
+                        ShareLink(item: url) {
                             Image(systemName: "square.and.arrow.up")
                         }
+                        .accessibilityLabel("Share recording")
                     }
                     Button(role: .destructive) {
                         showDeleteConfirmation = true
@@ -2404,11 +2384,6 @@ struct JournalDetailView: View {
         .onDisappear {
             pollTimer?.invalidate()
             player?.stop()
-        }
-        .sheet(isPresented: $showShareSheet) {
-            if let url = audioURL {
-                ShareLink(item: url)
-            }
         }
         .alert("Re-transcription failed", isPresented: $showRetranscribeFailedAlert) {
             Button("OK", role: .cancel) {}
@@ -2814,6 +2789,8 @@ struct JournalView: View {
     @State private var sortOrder: JournalSort = .newestFirst
     @State private var selectedDetail: SlowClawMemoryEntry?
     @State private var showCompose = false
+    @State private var isSelectingAudio = false
+    @State private var selectedAudioKeys = Set<String>()
     /// Best-effort audio durations by journal key, filled asynchronously from
     /// AVAudioFile header metadata (frame count ÷ sample rate — no PCM
     /// decode), so `body` never blocks on file I/O. A key is reserved with 0
@@ -2865,6 +2842,24 @@ struct JournalView: View {
                 if cmp != .orderedSame { return cmp == .orderedAscending }
                 return lhs.key < rhs.key
             }
+        }
+    }
+
+    private func audioURL(for entry: SlowClawMemoryEntry) -> URL? {
+        guard entry.source?.hasPrefix("audio") == true,
+              let relativePath = entry.mediaURL, !relativePath.isEmpty,
+              let url = AudioRecorder.absoluteURL(forMediaRelativePath: relativePath),
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url
+    }
+
+    private var selectableAudioKeys: Set<String> {
+        Set(visibleJournals.compactMap { audioURL(for: $0) == nil ? nil : $0.key })
+    }
+
+    private var selectedAudioURLs: [URL] {
+        visibleJournals.compactMap { entry in
+            selectedAudioKeys.contains(entry.key) ? audioURL(for: entry) : nil
         }
     }
 
@@ -3002,7 +2997,16 @@ struct JournalView: View {
                         .foregroundStyle(DS.ink(scheme))
                         .kerning(-0.4)
                     Spacer()
-                    sortMenu
+                    if !isSelectingAudio { sortMenu }
+                    Button(isSelectingAudio ? "Done" : "Select") {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            isSelectingAudio.toggle()
+                            if !isSelectingAudio { selectedAudioKeys.removeAll() }
+                        }
+                    }
+                    .font(DS.captionFont.weight(.semibold))
+                    .foregroundStyle(DS.accentColor)
+                    .disabled(!isSelectingAudio && selectableAudioKeys.isEmpty)
                 }
                 .padding(.horizontal, 16)
 
@@ -3071,11 +3075,21 @@ struct JournalView: View {
                                 // Semantic button: the whole row opens the
                                 // detail (player + transcript + edit).
                                 Button {
-                                    selectedDetail = entry
+                                    if isSelectingAudio {
+                                        guard audioURL(for: entry) != nil else { return }
+                                        if selectedAudioKeys.contains(entry.key) {
+                                            selectedAudioKeys.remove(entry.key)
+                                        } else {
+                                            selectedAudioKeys.insert(entry.key)
+                                        }
+                                    } else {
+                                        selectedDetail = entry
+                                    }
                                 } label: {
                                     journalRow(entry)
                                 }
                                 .buttonStyle(.plain)
+                                .disabled(isSelectingAudio && audioURL(for: entry) == nil)
                                 .accessibilityLabel(journalRowAccessibilityLabel(entry))
                                 .contextMenu {
                                     Button(role: .destructive) {
@@ -3090,7 +3104,9 @@ struct JournalView: View {
                 }
             }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) { baseBar }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            isSelectingAudio ? AnyView(selectionBar) : AnyView(baseBar)
+        }
         // Fullscreen detail.
         .fullScreenCover(item: $selectedDetail) { entry in
             JournalDetailView(entry: entry)
@@ -3127,9 +3143,15 @@ struct JournalView: View {
     private func journalRow(_ entry: SlowClawMemoryEntry) -> some View {
         let isAudio = entry.source?.hasPrefix("audio") == true
         let transcribing = AppState.isTranscribingPlaceholder(entry.content)
+        let canSelect = audioURL(for: entry) != nil
         return HStack(alignment: .center, spacing: 12) {
             // Leading glyph / spinner.
-            if transcribing {
+            if isSelectingAudio {
+                Image(systemName: selectedAudioKeys.contains(entry.key) ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 21, weight: .medium))
+                    .foregroundStyle(selectedAudioKeys.contains(entry.key) ? DS.accentColor : DS.muted(scheme))
+                    .frame(width: 24, height: 24)
+            } else if transcribing {
                 ProgressView()
                     .scaleEffect(0.7)
                     .frame(width: 24, height: 24)
@@ -3172,13 +3194,16 @@ struct JournalView: View {
 
             Spacer(minLength: 4)
 
-            Image(systemName: "chevron.right")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(DS.muted(scheme).opacity(0.6))
+            if !isSelectingAudio {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(DS.muted(scheme).opacity(0.6))
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .contentShape(Rectangle())
+        .opacity(isSelectingAudio && !canSelect ? 0.4 : 1)
     }
 
     /// VoiceOver label for a row: title, then either the transcribing status
@@ -3222,6 +3247,40 @@ struct JournalView: View {
 
     // MARK: - Base bar (record + pen, or recording controls)
 
+    private var selectionBar: some View {
+        VStack(spacing: 0) {
+            Divider().opacity(0.4)
+            HStack {
+                Button(selectedAudioKeys == selectableAudioKeys ? "Deselect All" : "Select All") {
+                    if selectedAudioKeys == selectableAudioKeys {
+                        selectedAudioKeys.removeAll()
+                    } else {
+                        selectedAudioKeys = selectableAudioKeys
+                    }
+                }
+                .font(DS.captionFont.weight(.semibold))
+                .foregroundStyle(DS.accentColor)
+
+                Spacer()
+
+                Text("\(selectedAudioKeys.count) selected")
+                    .font(DS.captionFont)
+                    .foregroundStyle(DS.muted(scheme))
+
+                Spacer()
+
+                ShareLink(items: selectedAudioURLs) {
+                    Label("Export", systemImage: "square.and.arrow.up")
+                        .font(DS.captionFont.weight(.semibold))
+                }
+                .disabled(selectedAudioURLs.isEmpty)
+            }
+            .padding(.horizontal, 18)
+            .frame(height: 64)
+            .background(.ultraThinMaterial)
+        }
+    }
+
     private var baseBar: some View {
         VStack(spacing: 0) {
             Divider().opacity(0.4)
@@ -3246,7 +3305,6 @@ struct JournalView: View {
                     Task {
                         recorder.title = ""
                         recorder.transcript = ""
-                        guard await state.prepareAudioCapture() else { return }
                         await recorder.startRecording()
                     }
                 } label: {
