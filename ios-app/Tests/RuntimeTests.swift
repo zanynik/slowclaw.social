@@ -2,22 +2,6 @@ import XCTest
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
-    func testSpeechLeaseRejectsOverlapAndCancellation() async {
-        let gate = SpeechSessionGate()
-        let first = await gate.tryAcquire()
-        XCTAssertTrue(first)
-        let second = await gate.tryAcquire()
-        XCTAssertFalse(second)
-        let waiting = Task { await gate.acquire() }
-        waiting.cancel()
-        let acquired = await waiting.value
-        XCTAssertFalse(acquired)
-        await gate.release()
-        let next = await gate.tryAcquire()
-        XCTAssertTrue(next)
-        await gate.release()
-    }
-
     func testReadingTopicsAreBoundedAndDeduplicated() {
         let topics = ReadingHistory.topics(title: "Gardens and gardens", summary: "Soil, vegetables, forests and agriculture support communities.")
         XCTAssertLessThanOrEqual(topics.count, 8)

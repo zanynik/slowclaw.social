@@ -62,13 +62,6 @@ enum Transcriber {
     /// Thread-safe: blocking recognition runs on the calling thread; callers
     /// await it off the main actor (e.g. inside a Task.detached).
     static func transcribe(url: URL, diagnostic: (@Sendable (String) -> Void)? = nil) async -> String {
-        guard await SpeechSessionGate.shared.acquire() else { return "" }
-        let result = await transcribeExclusively(url: url, diagnostic: diagnostic)
-        await SpeechSessionGate.shared.release()
-        return result
-    }
-
-    private static func transcribeExclusively(url: URL, diagnostic: (@Sendable (String) -> Void)?) async -> String {
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
 
