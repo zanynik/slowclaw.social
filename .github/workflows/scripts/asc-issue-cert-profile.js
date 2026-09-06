@@ -80,6 +80,16 @@ async function request(token, method, path, body) {
 
 (async () => {
   const token = jwt();
+  const statePath = process.env.SIGNING_STATE_PATH;
+  if (process.env.SIGNING_CLEANUP === "1") {
+    if (!statePath || !fs.existsSync(statePath)) return;
+    const owned = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    if (owned.certificate) await request(token, "DELETE", `/v1/certificates/${owned.certificate}`);
+    if (owned.profile) await request(token, "DELETE", `/v1/profiles/${owned.profile}`);
+    fs.unlinkSync(statePath);
+    console.log("Released this run's temporary signing certificate and profile.");
+    return;
+  }
   const bundleId = process.env.APP_BUNDLE_ID;
   // Apple Distribution is the current certificate for App Store/TestFlight.
   const certificateType = "DISTRIBUTION";
@@ -87,6 +97,22 @@ async function request(token, method, path, body) {
   const bundleRecord = bundle.data?.[0];
   if (!bundleRecord?.id) {
     throw new Error(`Bundle ID ${bundleId} was not found in App Store Connect.`);
+  }
+
+  // Recover prior SlowClaw CI assets. The user authorized ongoing signing
+  // maintenance; constrain ownership by both the CI name and bundle relation.
+  const old = await request(token, "GET", "/v1/profiles?filter[profileType]=IOS_APP_STORE&limit=200");
+  for (const profile of old.data || []) {
+    if (!/^SlowClaw CI App Store \d+-\d+$/.test(profile.attributes?.name || "")) continue;
+    const owner = await request(token, "GET", `/v1/profiles/${profile.id}/bundleId`);
+    if (owner.data?.id !== bundleRecord.id) continue;
+    const certs = await request(token, "GET", `/v1/profiles/${profile.id}/certificates?limit=20`);
+    for (const certificate of certs.data || []) {
+      if (["DISTRIBUTION", "IOS_DISTRIBUTION"].includes(certificate.attributes?.certificateType)) {
+        await request(token, "DELETE", `/v1/certificates/${certificate.id}`);
+      }
+    }
+    await request(token, "DELETE", `/v1/profiles/${profile.id}`);
   }
 
   const csrContent = fs.readFileSync(process.env.CERT_CSR_PATH, "utf8");
@@ -118,6 +144,7 @@ async function request(token, method, path, body) {
     throw new Error(`Certificate issuance failed. Existing team certificates were left unchanged by recovery. Apple said: ${error.message}`);
   }
   const certRecord = cert.data;
+  if (statePath) fs.writeFileSync(statePath, JSON.stringify({certificate: certRecord.id}), {mode: 0o600});
   fs.writeFileSync(process.env.CERT_OUT_PATH, Buffer.from(certRecord.attributes.certificateContent, "base64"));
 
   let profile;
@@ -149,6 +176,7 @@ async function request(token, method, path, body) {
   }
   }
   const profileRecord = profile.data;
+  if (statePath) fs.writeFileSync(statePath, JSON.stringify({certificate: certRecord.id, profile: profileRecord.id}), {mode: 0o600});
   fs.writeFileSync(process.env.PROFILE_OUT_PATH, Buffer.from(profileRecord.attributes.profileContent, "base64"));
   fs.writeFileSync(process.env.PROFILE_NAME_OUT_PATH, profileRecord.attributes.name);
   fs.writeFileSync(process.env.PROFILE_ID_OUT_PATH, profileRecord.attributes.uuid);

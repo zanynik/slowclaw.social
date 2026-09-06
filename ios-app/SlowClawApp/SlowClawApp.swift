@@ -397,6 +397,58 @@ final class AppState: ObservableObject {
     // so every link (Reads cards, article viewers) opens inside the app
     // instead of bouncing out to Safari.
     @Published var activeWebLink: WebLink? = nil
+    @Published var readingSignals = ReadingHistory.load()
+    private var readingCandidate: RankedFeedItem?
+    private var readingStarted: Date?
+    private var readingSeconds: TimeInterval = 0
+
+    func openArticle(_ item: RankedFeedItem) {
+        guard let url = URL(string: item.link) else { return }
+        readingCandidate = item
+        readingSeconds = 0
+        readingStarted = Date()
+        openWebLink(url)
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            guard let self, self.readingCandidate?.id == item.id,
+                  UIApplication.shared.applicationState == .active,
+                  !CaptureActivity.isCapturing, !self.audioTranscriptionInFlight,
+                  !ProcessInfo.processInfo.isLowPowerModeEnabled,
+                  ProcessInfo.processInfo.thermalState == .nominal else { return }
+            await self.ensureLocalModelActivated()
+            self.scheduleInterestIndexing()
+        }
+    }
+
+    func readingActivityChanged(active: Bool) {
+        if let started = readingStarted { readingSeconds += Date().timeIntervalSince(started) }
+        readingStarted = active && readingCandidate != nil ? Date() : nil
+    }
+
+    func finishReading() {
+        readingActivityChanged(active: false)
+        if let item = readingCandidate, readingSeconds >= 20, readingSignals[item.id] == nil {
+            rememberArticle(item, preference: 0)
+        }
+        readingCandidate = nil
+    }
+
+    func rememberArticle(_ item: RankedFeedItem, preference: Int) {
+        readingSignals[item.id] = ReadingSignal(
+            topics: ReadingHistory.topics(title: item.title, summary: item.description.strippingHTML()),
+            date: Date(), preference: preference)
+        readingSignals = Dictionary(uniqueKeysWithValues: readingSignals.sorted { $0.value.date > $1.value.date }.prefix(200).map { ($0.key, $0.value) })
+        ReadingHistory.save(readingSignals)
+        rebuildInterestLens()
+        readsRefreshedAt = nil
+    }
+
+    func clearReadingHistory() {
+        readingSignals = [:]
+        ReadingHistory.save(readingSignals)
+        rebuildInterestLens()
+        readsRefreshedAt = nil
+    }
 
     /// Open a web link inside the app (SFSafariViewController sheet).
     /// Non-http(s) schemes are rejected — the app only ever links articles.
@@ -665,6 +717,7 @@ final class AppState: ObservableObject {
     /// downloaded (won't auto-download a 2GB model without consent) or when a
     /// model is already loaded. Safe to call repeatedly.
     func ensureLocalModelActivated() async {
+        guard !CaptureActivity.isCapturing, !audioTranscriptionInFlight else { return }
         // Re-read status in case it changed (e.g. the OS reclaimed the model).
         if let snapshot = try? await OnDeviceAIExecutor.shared.run({ slowClawLocalLLMStatus() }) {
             localLLM = snapshot
@@ -689,6 +742,7 @@ final class AppState: ObservableObject {
     /// provider. Local inference runs in a detached task so multi-second
     /// generations never block the main actor.
     func aiExtractInterests(from text: String) async throws -> [String] {
+        try await waitForSpeechPriority()
         if localLLM.loaded {
             return try await OnDeviceAIExecutor.shared.run {
                 try slowClawLocalExtractInterests(journalText: text)
@@ -699,6 +753,7 @@ final class AppState: ObservableObject {
     }
 
     func aiDraftPost(from text: String, maxChars: Int = 300) async throws -> String {
+        try await waitForSpeechPriority()
         if localLLM.loaded {
             return try await OnDeviceAIExecutor.shared.run {
                 try slowClawLocalDraftPost(journalText: text, maxChars: maxChars)
@@ -709,6 +764,7 @@ final class AppState: ObservableObject {
     }
 
     func aiSynthesize(transcript: String) async throws -> String {
+        try await waitForSpeechPriority()
         if localLLM.loaded {
             return try await OnDeviceAIExecutor.shared.run {
                 try slowClawLocalSynthesizeJournal(transcript: transcript)
@@ -722,6 +778,7 @@ final class AppState: ObservableObject {
     /// Local-first (on-device llama.cpp) with a remote fallback. Returns the
     /// trimmed title or throws if no LLM is available.
     func aiTitle(transcript: String) async throws -> String {
+        try await waitForSpeechPriority()
         if localLLM.loaded {
             return try await OnDeviceAIExecutor.shared.run {
                 try slowClawLocalGenerateTitle(transcript: transcript)
@@ -738,6 +795,7 @@ final class AppState: ObservableObject {
     }
 
     func aiChat(system: String, message: String, temperature: Double) async throws -> String {
+        try await waitForSpeechPriority()
         if localLLM.loaded {
             return try await OnDeviceAIExecutor.shared.run {
                 try slowClawLocalLLMChat(systemPrompt: system, message: message, maxTokens: 512, temperature: temperature)
@@ -789,6 +847,28 @@ final class AppState: ObservableObject {
     }
 
     // MARK: - Durable journal interest lens
+    private func waitForSpeechPriority() async throws {
+        while CaptureActivity.isCapturing || audioTranscriptionInFlight {
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        try Task.checkCancellation()
+    }
+
+    func prepareAudioCapture() async -> Bool {
+        guard !CaptureActivity.isCapturing else { return false }
+        CaptureActivity.isCapturing = true
+        await releaseModelForSpeech()
+        return true
+    }
+
+    private func releaseModelForSpeech() async {
+        // Wait for the current request off-main, then free its multi-GB model
+        // before Apple Speech installs/loads its own assets.
+        if let snapshot = try? await OnDeviceAIExecutor.shared.run({
+            slowClawLocalLLMUnload()
+            return slowClawLocalLLMStatus()
+        }) { localLLM = snapshot; loadedLocalModelPresetID = nil }
+    }
 
     /// Start a single background indexing pass. Every successfully analyzed
     /// journal is checkpointed, so suspension or relaunch resumes with only
@@ -844,9 +924,14 @@ final class AppState: ObservableObject {
             if Task.isCancelled { break }
             if Self.softDeletedKeys()[item.0.key] != nil { continue }
             // A user-requested post should win after the current extraction.
-            while (isGeneratingPosts || audioTranscriptionInFlight) && !Task.isCancelled {
+            while (isGeneratingPosts || audioTranscriptionInFlight || CaptureActivity.isCapturing
+                   || UIApplication.shared.applicationState != .active
+                   || ProcessInfo.processInfo.isLowPowerModeEnabled
+                   || ProcessInfo.processInfo.thermalState == .serious
+                   || ProcessInfo.processInfo.thermalState == .critical) && !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(300))
             }
+            if Task.isCancelled { break }
             interestIndexProgress = "Learning from journal \(offset + 1) of \(pending.count)…"
             guard let raw = try? await aiExtractInterests(from: item.1) else {
                 await Task.yield()
@@ -896,6 +981,16 @@ final class AppState: ObservableObject {
                 scores[topic, default: 0] += recency
             }
         }
+        var readingScores: [String: Double] = [:]
+        for signal in readingSignals.values {
+            let age = max(0, now.timeIntervalSince(signal.date) / 86_400)
+            let weight = (signal.preference < 0 ? -0.5 : signal.preference > 0 ? 0.45 : 0.15) * pow(0.5, age / 14)
+            for topic in signal.topics where !mutedInterests.contains(topic) {
+                readingScores[topic, default: 0] += weight
+            }
+        }
+        for (topic, weight) in readingScores { scores[topic, default: 0] += min(0.75, max(-0.75, weight)) }
+        scores = scores.filter { $0.value > 0 }
         let ordered = scores.sorted {
             if $0.value == $1.value { return $0.key < $1.key }
             return $0.value > $1.value
@@ -1122,7 +1217,7 @@ final class AppState: ObservableObject {
         let reachedAny = fetched.0.1
         let nostr = fetched.1
 
-        var combined = rss + nostr
+        var combined = (rss + nostr).filter { readingSignals[$0.id]?.preference != -1 }
         combined.sort { $0.score > $1.score }
         // Adult-content gate on the merged batch (RSS + Nostr): the catalog
         // is broad and relays are global; without this, explicit items that
@@ -1422,6 +1517,7 @@ final class AppState: ObservableObject {
         var handledKeys = Set<String>()
 
         while !Task.isCancelled {
+            if CaptureActivity.isCapturing { break }
             let now = Date()
             let snapshot = Self.loadPendingTranscriptions(at: url)
                 .filter {
@@ -1591,6 +1687,7 @@ final class AppState: ObservableObject {
             audioTranscriptionInFlight = audioTranscriptionCount > 0
             if audioTranscriptionCount == 0 { audioTranscriptionProgress = nil }
         }
+        await releaseModelForSpeech()
         let report: @Sendable (String) -> Void = { [weak self] message in
             Task { @MainActor [weak self] in
                 self?.audioTranscriptionProgress = message
@@ -1879,8 +1976,18 @@ struct AppShell: View {
         .background(DS.bg(scheme).ignoresSafeArea())
         // In-app browser for ALL web links (Reads cards, article viewers) —
         // presented above every tab, never an external Safari jump.
-        .sheet(item: $state.activeWebLink) { _ in
+        .sheet(item: $state.activeWebLink, onDismiss: { state.finishReading() }) { _ in
             InAppBrowserSheet()
+        }
+        .task {
+            // Retry durable pending audio while the user keeps using the app;
+            // nextAttemptAt preserves backoff instead of waiting for relaunch.
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(15)) } catch { break }
+                if scenePhase == .active && !CaptureActivity.isCapturing {
+                    await state.drainPendingTranscriptions()
+                }
+            }
         }
         // Voice-memo imports auto-store (transcribe on-device → journal entry),
         // matching the reference app — no review gate. The sidebar shows
@@ -1888,6 +1995,7 @@ struct AppShell: View {
         // Re-activate the on-device model when returning to the foreground (the
         // OS may have reclaimed it), so AI is ready whenever the app is open.
         .onChange(of: scenePhase) { _, phase in
+            state.readingActivityChanged(active: phase == .active)
             if phase == .active {
                 // Foregrounding must never wait for the inference mutex.
                 // Foreground is the retry point for audio that lost its
@@ -3138,6 +3246,7 @@ struct JournalView: View {
                     Task {
                         recorder.title = ""
                         recorder.transcript = ""
+                        guard await state.prepareAudioCapture() else { return }
                         await recorder.startRecording()
                     }
                 } label: {
@@ -4040,6 +4149,11 @@ struct ProfileView: View {
                                 state.removeInterest($0)
                             }
                         }
+                        Text("Reads learns from article titles and summaries after 20 seconds in the reader. Likes count more. History stays on this iPhone; journals remain the strongest signal.")
+                            .font(DS.captionFont)
+                            .foregroundStyle(DS.muted(scheme))
+                        Button("Reset reading history", role: .destructive) { state.clearReadingHistory() }
+                            .disabled(state.readingSignals.isEmpty)
                         Button {
                             Task {
                                 await state.ensureLocalModelActivated()
@@ -4300,8 +4414,8 @@ struct FeedCard: View {
 
     // Backed by AppState sets (session-stable) instead of @State, which the
     // LazyVStack recycles on scroll — likes used to reset silently.
-    private var liked: Bool { state.likedReadIDs.contains(item.id) }
-    private var disliked: Bool { state.dislikedReadIDs.contains(item.id) }
+    private var liked: Bool { state.readingSignals[item.id]?.preference == 1 }
+    private var disliked: Bool { state.readingSignals[item.id]?.preference == -1 }
 
     private var host: String {
         guard let url = URL(string: item.link), let h = url.host else {
@@ -4387,12 +4501,7 @@ struct FeedCard: View {
                 // Like / dislike actions.
                 HStack(spacing: 18) {
                     Button {
-                        if liked {
-                            state.likedReadIDs.remove(item.id)
-                        } else {
-                            state.likedReadIDs.insert(item.id)
-                            state.dislikedReadIDs.remove(item.id)
-                        }
+                        state.rememberArticle(item, preference: liked ? 0 : 1)
                         UISelectionFeedbackGenerator().selectionChanged()
                     } label: {
                         Image(systemName: liked ? "hand.thumbsup.fill" : "hand.thumbsup")
@@ -4400,14 +4509,10 @@ struct FeedCard: View {
                             .foregroundStyle(liked ? DS.likeColor : DS.muted(scheme))
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("More like this")
 
                     Button {
-                        if disliked {
-                            state.dislikedReadIDs.remove(item.id)
-                        } else {
-                            state.dislikedReadIDs.insert(item.id)
-                            state.likedReadIDs.remove(item.id)
-                        }
+                        state.rememberArticle(item, preference: disliked ? 0 : -1)
                         UISelectionFeedbackGenerator().selectionChanged()
                     } label: {
                         Image(systemName: disliked ? "hand.thumbsdown.fill" : "hand.thumbsdown")
@@ -4415,6 +4520,7 @@ struct FeedCard: View {
                             .foregroundStyle(disliked ? DS.accent2Color : DS.muted(scheme))
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Less like this")
 
                     Spacer()
 
@@ -4439,10 +4545,10 @@ struct FeedCard: View {
         .clipShape(RoundedRectangle(cornerRadius: DS.rSm, style: .continuous))
         .contentShape(Rectangle())
         .onTapGesture {
-            guard let url = URL(string: item.link), !item.link.isEmpty else { return }
+            guard URL(string: item.link) != nil, !item.link.isEmpty else { return }
             // All web links open inside the app (SFSafariViewController),
             // never an external Safari window.
-            state.openWebLink(url)
+            state.openArticle(item)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(host), \(item.title), \(item.readMinutes) minute read")

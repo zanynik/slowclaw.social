@@ -34,7 +34,7 @@ struct InAppBrowserView: UIViewControllerRepresentable {
         let config = SFSafariViewController.Configuration()
         // Reader-mode button when the page provides a reader-friendly form —
         // long-form Nostr/RSS articles benefit from it.
-        config.entersReaderIfAvailable = false
+        config.entersReaderIfAvailable = true
         let vc = SFSafariViewController(url: url, configuration: config)
         vc.delegate = context.coordinator
         // #16a37f (DS._accent) — the app's accent green.

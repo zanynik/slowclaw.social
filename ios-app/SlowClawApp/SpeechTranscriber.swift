@@ -61,20 +61,39 @@ enum Transcriber {
     ///
     /// Thread-safe: blocking recognition runs on the calling thread; callers
     /// await it off the main actor (e.g. inside a Task.detached).
-    static func transcribe(url: URL) async -> String {
+    static func transcribe(url: URL, diagnostic: (@Sendable (String) -> Void)? = nil) async -> String {
+        guard await SpeechSessionGate.shared.acquire() else { return "" }
+        let result = await transcribeExclusively(url: url, diagnostic: diagnostic)
+        await SpeechSessionGate.shared.release()
+        return result
+    }
+
+    private static func transcribeExclusively(url: URL, diagnostic: (@Sendable (String) -> Void)?) async -> String {
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
 
-        let modern = await transcribeWithAnalyzer(url: url)
+        let authorization = await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0 == .authorized) }
+        }
+        guard authorization else {
+            diagnostic?("Speech permission is disabled. Enable Speech Recognition for SlowClaw in Settings.")
+            return ""
+        }
+        let modern = await transcribeWithAnalyzer(url: url, diagnostic: diagnostic)
         if !modern.isEmpty { return modern }
         return await LegacyTranscriber.transcribe(url: url)
     }
 
     /// The SpeechAnalyzer file fallback, isolated so the wrapper above can
     /// discard an empty result cleanly.
-    private static func transcribeWithAnalyzer(url: URL) async -> String {
-        guard let audioFile = try? AVAudioFile(forReading: url) else { return "" }
-        return await transcribe(file: audioFile)
+    private static func transcribeWithAnalyzer(url: URL, diagnostic: (@Sendable (String) -> Void)?) async -> String {
+        do {
+            let audioFile = try AVAudioFile(forReading: url)
+            return await transcribe(file: audioFile, diagnostic: diagnostic)
+        } catch {
+            diagnostic?("Cannot open the saved audio (\((error as NSError).domain), \((error as NSError).code)).")
+            return ""
+        }
     }
 
     /// Shared file→string transcription used by transcribe(url:) and the
@@ -91,8 +110,11 @@ enum Transcriber {
     /// AVAudioConverter loop. The framework owns file reading, timecodes and
     /// end-of-input, which prevents a converter status mistake from silently
     /// dropping the middle or tail of a long recording.
-    static func transcribe(file: AVAudioFile) async -> String {
-        guard let transcriber = try? await preparedOfflineTranscriber() else {
+    static func transcribe(file: AVAudioFile, diagnostic: (@Sendable (String) -> Void)? = nil) async -> String {
+        let transcriber: SpeechTranscriber
+        do { transcriber = try await preparedOfflineTranscriber() }
+        catch {
+            diagnostic?("Speech model preparation failed: \(error.localizedDescription)")
             return ""
         }
         let analyzer = SpeechAnalyzer(modules: [transcriber])
@@ -113,6 +135,7 @@ enum Transcriber {
             }
             try await analyzer.finalizeAndFinish(through: lastSample)
         } catch {
+            diagnostic?("Speech analysis failed (\((error as NSError).domain), \((error as NSError).code)).")
             await analyzer.cancelAndFinishNow()
             recognizerTask.cancel()
             _ = await Self.awaitCollectorCompletion(recognizerTask)
@@ -129,7 +152,10 @@ enum Transcriber {
         // 2-line chunk) — discard it and return "" so the caller's
         // forced-on-device legacy fallback re-transcribes the file honestly.
         let collectorDrained = await Self.awaitCollectorCompletion(recognizerTask)
-        guard collectorDrained else { return "" }
+        guard collectorDrained else {
+            diagnostic?("Speech results did not finish. Retrying with the compatibility recognizer.")
+            return ""
+        }
         return collected.text()
     }
 
