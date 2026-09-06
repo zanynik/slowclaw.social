@@ -245,8 +245,6 @@ jobs:
                     CODE_SIGN_IDENTITY="Apple Distribution" \
                     CODE_SIGNING_REQUIRED=YES \
                     CODE_SIGNING_ALLOWED=YES \
-                    PROVISIONING_PROFILE_SPECIFIER="" \
-                    PROVISIONING_PROFILE="${APP_PROFILE_UUID}" \
                     CURRENT_PROJECT_VERSION="${{ steps.build_number.outputs.number }}"
 
             - name: Export IPA

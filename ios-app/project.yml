@@ -67,6 +67,9 @@ targets:
         PRODUCT_NAME: SlowClaw
         MARKETING_VERSION: "0.2.0"
         CURRENT_PROJECT_VERSION: "1"
+        # Scope the app-store profile to the application target. Passing this
+        # on the xcodebuild command line also applies it to Swift packages.
+        PROVISIONING_PROFILE_SPECIFIER: "$(APP_PROFILE_NAME)"
         INFOPLIST_FILE: SlowClawApp/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # Link the Zig + vendored staticlibs (target-level override of the
