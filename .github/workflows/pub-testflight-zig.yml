@@ -7,6 +7,7 @@ name: Publish iOS TestFlight (Zig)
 # and via manual workflow_dispatch. The push trigger was temporarily
 # commented out for the one-time consolidation push; it is active again.
 # The App Store Connect + signing secrets are repo-wide secrets, not per-workflow.
+# Recovery release: clean up only the two explicitly approved failed trial runs.
 
 on:
     push:
