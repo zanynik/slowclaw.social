@@ -81,28 +81,13 @@ async function request(token, method, path, body) {
 (async () => {
   const token = jwt();
   const bundleId = process.env.APP_BUNDLE_ID;
+  // Apple Distribution is the current certificate for App Store/TestFlight
+  // uploads. Keep legacy iOS Distribution support only for CI cleanup.
+  const certificateType = "DISTRIBUTION";
   const bundle = await request(token, "GET", `/v1/bundleIds?filter[identifier]=${encodeURIComponent(bundleId)}`);
   const bundleRecord = bundle.data?.[0];
   if (!bundleRecord?.id) {
     throw new Error(`Bundle ID ${bundleId} was not found in App Store Connect.`);
-  }
-
-  // Revoke stale SlowClaw CI profiles + their associated distribution certs
-  // before issuing fresh ones (Apple limits both).
-  const staleProfiles = await request(token, "GET", "/v1/profiles?filter[profileType]=IOS_APP_STORE&limit=200");
-  for (const staleProfile of staleProfiles.data || []) {
-    if (!String(staleProfile.attributes?.name || "").startsWith("SlowClaw CI App Store ")) {
-      continue;
-    }
-    const relatedCerts = await request(token, "GET", `/v1/profiles/${staleProfile.id}/certificates?fields[certificates]=certificateType&limit=20`);
-    for (const relatedCert of relatedCerts.data || []) {
-      if (relatedCert.attributes?.certificateType === "IOS_DISTRIBUTION") {
-        await request(token, "DELETE", `/v1/certificates/${relatedCert.id}`);
-      }
-    }
-    // Keep the ownership link until certificate cleanup succeeds. Otherwise
-    // a transient delete failure leaves a certificate we cannot find next run.
-    await request(token, "DELETE", `/v1/profiles/${staleProfile.id}`);
   }
 
   const csrContent = fs.readFileSync(process.env.CERT_CSR_PATH, "utf8");
@@ -112,14 +97,14 @@ async function request(token, method, path, body) {
       data: {
         type: "certificates",
         attributes: {
-          certificateType: "IOS_DISTRIBUTION",
+          certificateType,
           csrContent
         }
       }
     });
   } catch (error) {
     try {
-      const certificates = await request(token, "GET", "/v1/certificates?filter[certificateType]=IOS_DISTRIBUTION&limit=200");
+      const certificates = await request(token, "GET", `/v1/certificates?filter[certificateType]=${certificateType}&limit=200`);
       let ciSubjectCount = 0;
       for (const record of certificates.data || []) {
         try {
@@ -127,7 +112,7 @@ async function request(token, method, path, body) {
           if (x509.subject.split("\n").includes("CN=SlowClaw CI")) ciSubjectCount++;
         } catch { /* Diagnostic only; never delete based on a subject match. */ }
       }
-      console.error(`Signing diagnostic: ${(certificates.data || []).length} iOS distribution certificate(s); ${ciSubjectCount} with the SlowClaw CI subject. No certificates were deleted by this diagnostic.`);
+      console.error(`Signing diagnostic: ${(certificates.data || []).length} ${certificateType} certificate(s); ${ciSubjectCount} with the SlowClaw CI subject. No certificates were deleted by this diagnostic.`);
     } catch (diagnosticError) {
       console.error(`Certificate inventory unavailable: ${diagnosticError.message}`);
     }
@@ -152,13 +137,8 @@ async function request(token, method, path, body) {
     }
   });
   } catch (error) {
-    // Only this attempt's newly issued certificate is ours to revoke. Never
-    // delete arbitrary team certificates to make room under Apple's quota.
-    try {
-      await request(token, "DELETE", `/v1/certificates/${certRecord.id}`);
-    } catch {
-      console.error("Could not clean up this run's newly issued certificate; review Apple Developer Certificates before retrying.");
-    }
+    // This recovery trial is intentionally non-destructive. Report the
+    // profile error without revoking any team signing asset.
     throw error;
   }
   const profileRecord = profile.data;
