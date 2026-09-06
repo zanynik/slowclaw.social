@@ -242,7 +242,6 @@ jobs:
                     -destination "generic/platform=iOS" \
                     -archivePath "${RUNNER_TEMP}/SlowClaw.xcarchive" \
                     DEVELOPMENT_TEAM="${APPLE_DEVELOPMENT_TEAM}" \
-                    CODE_SIGN_IDENTITY="Apple Distribution" \
                     CODE_SIGNING_REQUIRED=YES \
                     CODE_SIGNING_ALLOWED=YES \
                     CURRENT_PROJECT_VERSION="${{ steps.build_number.outputs.number }}"
