@@ -12,7 +12,6 @@ on:
     push:
         branches:
             - main
-            - fix/capture-and-reading-feedback
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
             - ".github/workflows/scripts/asc-issue-cert-profile.js"
