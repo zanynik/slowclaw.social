@@ -81,32 +81,12 @@ async function request(token, method, path, body) {
 (async () => {
   const token = jwt();
   const bundleId = process.env.APP_BUNDLE_ID;
-  // Apple Distribution is the current certificate for App Store/TestFlight
-  // uploads. Keep legacy iOS Distribution support only for CI cleanup.
+  // Apple Distribution is the current certificate for App Store/TestFlight.
   const certificateType = "DISTRIBUTION";
   const bundle = await request(token, "GET", `/v1/bundleIds?filter[identifier]=${encodeURIComponent(bundleId)}`);
   const bundleRecord = bundle.data?.[0];
   if (!bundleRecord?.id) {
     throw new Error(`Bundle ID ${bundleId} was not found in App Store Connect.`);
-  }
-
-  // One-time recovery for two certificates issued by failed archive attempts
-  // in this PR. Exact profile names make ownership unambiguous; never broaden
-  // this to a prefix or delete unrelated team signing assets.
-  const failedTrialProfiles = new Set([
-    "SlowClaw CI App Store 34016053699-1",
-    "SlowClaw CI App Store 34016468047-1"
-  ]);
-  const profiles = await request(token, "GET", "/v1/profiles?filter[profileType]=IOS_APP_STORE&limit=200");
-  for (const profile of profiles.data || []) {
-    if (!failedTrialProfiles.has(String(profile.attributes?.name || ""))) continue;
-    const related = await request(token, "GET", `/v1/profiles/${profile.id}/certificates?fields[certificates]=certificateType&limit=20`);
-    for (const certificate of related.data || []) {
-      if (certificate.attributes?.certificateType === certificateType) {
-        await request(token, "DELETE", `/v1/certificates/${certificate.id}`);
-      }
-    }
-    await request(token, "DELETE", `/v1/profiles/${profile.id}`);
   }
 
   const csrContent = fs.readFileSync(process.env.CERT_CSR_PATH, "utf8");
