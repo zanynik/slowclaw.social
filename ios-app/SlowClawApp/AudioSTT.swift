@@ -33,12 +33,16 @@ enum AudioSTT {
     ) async -> AudioSTTResult {
         let started = DispatchTime.now().uptimeNanoseconds
         progress?("Running Apple's long-form on-device transcription…")
-        let text = await Transcriber.transcribe(url: url)
+        let failure = SpeechFailureDetail()
+        let text = await Transcriber.transcribe(url: url) { detail in
+            failure.set(detail)
+            progress?(detail)
+        }
         let result = AudioSTTResult(
             text: text,
             engine: .appleSpeech,
             diagnostic: text.isEmpty
-                ? "Apple's on-device recognizer produced no transcript."
+                ? failure.get() ?? "Apple's on-device recognizer produced no transcript."
                 : "Apple's long-form on-device recognizer completed.",
             segmentCount: 1)
 
@@ -65,4 +69,11 @@ enum AudioSTT {
               file.processingFormat.sampleRate > 0 else { return nil }
         return Double(file.length) / file.processingFormat.sampleRate
     }
+}
+
+private final class SpeechFailureDetail: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+    func set(_ text: String) { lock.lock(); defer { lock.unlock() }; value = text }
+    func get() -> String? { lock.lock(); defer { lock.unlock() }; return value }
 }

@@ -29,7 +29,7 @@ on:
                 type: string
 
 concurrency:
-    group: testflight-zig-${{ github.ref }}
+    group: testflight-zig-signing
     cancel-in-progress: false
 
 permissions:
@@ -186,6 +186,9 @@ jobs:
                   # pub-testflight-ios.yml; kept in lockstep on purpose.
                   ASC_KEY_PATH="${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
                   PROFILE_NAME="SlowClaw CI App Store ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+                  SIGNING_STATE_PATH="${RUNNER_TEMP}/slowclaw-issued-signing.json"
+                  printf 'SIGNING_STATE_PATH=%s\n' "${SIGNING_STATE_PATH}" >>"${GITHUB_ENV}"
+                  export SIGNING_STATE_PATH
                   ASC_KEY_PATH="${ASC_KEY_PATH}" \
                   ASC_ISSUER_ID="${APP_STORE_CONNECT_ISSUER_ID}" \
                   ASC_KEY_ID="${APP_STORE_CONNECT_KEY_ID}" \
@@ -303,6 +306,17 @@ jobs:
                     --apiKey "${APP_STORE_CONNECT_KEY_ID}" \
                     --apiIssuer "${APP_STORE_CONNECT_ISSUER_ID}" \
                     --verbose
+
+            - name: Release temporary Apple signing assets
+              if: always()
+              env:
+                  ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+                  ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+              run: |
+                  if [ -n "${ASC_KEY_DIR:-}" ] && [ -f "${SIGNING_STATE_PATH:-/nonexistent}" ]; then
+                    ASC_KEY_PATH="${ASC_KEY_DIR}/AuthKey_${ASC_KEY_ID}.p8" SIGNING_CLEANUP=1 \
+                      node .github/workflows/scripts/asc-issue-cert-profile.js
+                  fi
 
             - name: Cleanup signing keychain
               if: always()
