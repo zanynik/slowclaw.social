@@ -141,6 +141,7 @@ async function request(token, method, path, body) {
   fs.writeFileSync(process.env.CERT_OUT_PATH, Buffer.from(certRecord.attributes.certificateContent, "base64"));
 
   let profile;
+  for (let attempt = 0; attempt < 3; attempt++) {
   try {
     profile = await request(token, "POST", "/v1/profiles", {
     data: {
@@ -155,10 +156,17 @@ async function request(token, method, path, body) {
       }
     }
   });
+    break;
   } catch (error) {
     // This recovery trial is intentionally non-destructive. Report the
     // profile error without revoking any team signing asset.
-    throw error;
+    if (!error.message.includes("HTTP 500") || attempt === 2) throw error;
+    console.error("Apple profile service returned HTTP 500; checking whether creation completed before retrying.");
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    const existing = await request(token, "GET", "/v1/profiles?filter[profileType]=IOS_APP_STORE&limit=200");
+    const found = (existing.data || []).find(item => item.attributes?.name === process.env.PROFILE_NAME);
+    if (found) { profile = { data: found }; break; }
+  }
   }
   const profileRecord = profile.data;
   fs.writeFileSync(process.env.PROFILE_OUT_PATH, Buffer.from(profileRecord.attributes.profileContent, "base64"));

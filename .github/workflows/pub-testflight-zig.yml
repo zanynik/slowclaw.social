@@ -16,6 +16,7 @@ on:
             - feat/journal-studio-stability
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
+            - ".github/workflows/scripts/asc-issue-cert-profile.js"
             - "zig-src/**"
             - "ios-app/**"
     workflow_dispatch:
