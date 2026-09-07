@@ -360,6 +360,15 @@ final class AppState: ObservableObject {
         queuedAudio = Self.pendingTranscriptionsURL.map { Self.loadPendingTranscriptions(at: $0) } ?? []
     }
 
+    func transcriptionLabel(for key: String) -> String {
+        if activeTranscriptionKey == key { return "Transcribing…" }
+        if automaticTranscriptionPaused { return "Queued · paused" }
+        if let item = queuedAudio.first(where: { $0.key == key }), (item.attemptCount ?? 0) > 0 {
+            return "Waiting to retry · audio is safe"
+        }
+        return "Queued for transcription"
+    }
+
     func retryQueuedAudio() async {
         guard let url = Self.pendingTranscriptionsURL else { return }
         var items = Self.loadPendingTranscriptions(at: url)
@@ -768,7 +777,8 @@ final class AppState: ObservableObject {
     /// downloaded (won't auto-download a 2GB model without consent) or when a
     /// model is already loaded. Safe to call repeatedly.
     func ensureLocalModelActivated() async {
-        guard !audioTranscriptionInFlight else { return }
+        guard !audioTranscriptionInFlight, !recorder.isRecording,
+              !recorder.isTranscribing, !recorder.isFinalizing, !optionalAIPaused else { return }
         // Re-read status in case it changed (e.g. the OS reclaimed the model).
         if let snapshot = try? await OnDeviceAIExecutor.shared.run({ slowClawLocalLLMStatus() }) {
             localLLM = snapshot
@@ -2032,6 +2042,7 @@ struct AppShell: View {
     @Environment(\.colorScheme) var scheme
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("slowclaw.theme") private var themeRaw: String = ""
+    @State private var visitedTabs: Set<AppTab> = [.journal]
     var body: some View {
         ZStack {
             // Capture and autosave stay alive even while another tab is
@@ -2040,13 +2051,27 @@ struct AppShell: View {
                 .opacity(state.selectedTab == .journal ? 1 : 0)
                 .allowsHitTesting(state.selectedTab == .journal)
                 .accessibilityHidden(state.selectedTab != .journal)
-            switch state.selectedTab {
-            case .reads: ReadsView()
-            case .journal: EmptyView()
-            case .drafts: DraftsView()
-            case .profile: ProfileView()
+            if visitedTabs.contains(.reads) {
+                ReadsView()
+                    .opacity(state.selectedTab == .reads ? 1 : 0)
+                    .allowsHitTesting(state.selectedTab == .reads)
+                    .accessibilityHidden(state.selectedTab != .reads)
+            }
+            if visitedTabs.contains(.drafts) {
+                DraftsView()
+                    .opacity(state.selectedTab == .drafts ? 1 : 0)
+                    .allowsHitTesting(state.selectedTab == .drafts)
+                    .accessibilityHidden(state.selectedTab != .drafts)
+            }
+            if visitedTabs.contains(.profile) {
+                ProfileView()
+                    .opacity(state.selectedTab == .profile ? 1 : 0)
+                    .allowsHitTesting(state.selectedTab == .profile)
+                    .accessibilityHidden(state.selectedTab != .profile)
             }
         }
+        .onAppear { visitedTabs.insert(state.selectedTab) }
+        .onChange(of: state.selectedTab) { _, tab in visitedTabs.insert(tab) }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.bg(scheme))
         // Pin the top bar above the content's top safe area, extending the
@@ -2056,6 +2081,7 @@ struct AppShell: View {
         }
         // Pin the bottom nav above the home indicator.
         .safeAreaInset(edge: .bottom, spacing: 0) {
+            ActivityBar(recorder: state.recorder)
             BottomNav(selection: $state.selectedTab, scheme: scheme)
         }
         // The Journal tab is now a Voice Memos-style list with the record +
@@ -2069,9 +2095,11 @@ struct AppShell: View {
         .task {
             // Retry durable pending audio while the user keeps using the app;
             // nextAttemptAt preserves backoff instead of waiting for relaunch.
+            state.refreshAudioQueue()
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(15)) } catch { break }
                 if scenePhase == .active {
+                    state.refreshAudioQueue()
                     await state.drainPendingTranscriptions()
                 }
             }
@@ -2861,6 +2889,9 @@ struct TextComposeSheet: View {
             .padding(16)
             .background(DS.bg(scheme))
             .navigationTitle("New Entry")
+            .alert("Couldn't save your journal", isPresented: $saveFailed) {
+                Button("OK", role: .cancel) {}
+            } message: { Text("Your text is still here. Please try Save again.") }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -3297,8 +3328,8 @@ struct JournalView: View {
                     .foregroundStyle(selectedAudioKeys.contains(entry.key) ? DS.accentColor : DS.muted(scheme))
                     .frame(width: 24, height: 24)
             } else if transcribing {
-                ProgressView()
-                    .scaleEffect(0.7)
+                Image(systemName: state.activeTranscriptionKey == entry.key ? "waveform" : "clock")
+                    .foregroundStyle(DS.muted(scheme))
                     .frame(width: 24, height: 24)
             } else {
                 Image(systemName: isAudio ? "waveform" : "text.alignleft")
@@ -3323,7 +3354,7 @@ struct JournalView: View {
 
                 HStack(spacing: 6) {
                     if transcribing {
-                        Text("Transcribing…")
+                        Text(state.transcriptionLabel(for: entry.key))
                             .foregroundStyle(DS.accent2Color)
                     } else if let date = journalDate(entry) {
                         Text(Self.localizedDateTime(date))
