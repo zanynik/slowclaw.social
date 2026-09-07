@@ -2,6 +2,13 @@ import XCTest
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
+    func testTranscriptReplacementPreservesEditsAndRejectsShorterResults() {
+        XCTAssertFalse(TranscriptSafety.canReplace(original: "original", current: "edited", candidate: "longer result"))
+        XCTAssertFalse(TranscriptSafety.canReplace(original: "complete transcript", current: "complete transcript", candidate: "partial"))
+        XCTAssertFalse(TranscriptSafety.canReplace(original: "", current: "", candidate: "  "))
+        XCTAssertTrue(TranscriptSafety.canReplace(original: "", current: "", candidate: "Recovered speech"))
+        XCTAssertTrue(TranscriptSafety.canReplace(original: "first", current: "first", candidate: "first and last"))
+    }
     func testReadingTopicsAreBoundedAndDeduplicated() {
         let topics = ReadingHistory.topics(title: "Gardens and gardens", summary: "Soil, vegetables, forests and agriculture support communities.")
         XCTAssertLessThanOrEqual(topics.count, 8)

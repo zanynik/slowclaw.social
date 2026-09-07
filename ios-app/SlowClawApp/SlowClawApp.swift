@@ -349,6 +349,26 @@ final class AppState: ObservableObject {
     // Apple Speech file transcription status. This is independent of the local
     // text model, so model lifecycle controls never race audio work.
     @Published var audioTranscriptionInFlight: Bool = false
+    let recorder = AudioRecorder()
+    @Published var queuedAudio: [PendingTranscription] = []
+    @Published var activeTranscriptionKey: String?
+    @Published var automaticTranscriptionPaused = false
+    @Published var optionalAIPaused = false
+    @Published var lastDeletedJournalKey: String?
+
+    func refreshAudioQueue() {
+        queuedAudio = Self.pendingTranscriptionsURL.map { Self.loadPendingTranscriptions(at: $0) } ?? []
+    }
+
+    func retryQueuedAudio() async {
+        guard let url = Self.pendingTranscriptionsURL else { return }
+        var items = Self.loadPendingTranscriptions(at: url)
+        for index in items.indices { items[index].nextAttemptAt = nil }
+        guard Self.savePendingTranscriptions(items, at: url) else { return }
+        automaticTranscriptionPaused = false
+        refreshAudioQueue()
+        await drainPendingTranscriptions()
+    }
     @Published var audioTranscriptionProgress: String? = nil
     private var audioTranscriptionCount = 0
     /// Last manual transcription route/result, shown beside Re-transcribe.
@@ -848,7 +868,10 @@ final class AppState: ObservableObject {
 
     // MARK: - Durable journal interest lens
     private func waitForSpeechPriority() async throws {
-        while audioTranscriptionInFlight {
+        while audioTranscriptionInFlight || recorder.isRecording || recorder.isTranscribing
+            || recorder.isFinalizing || optionalAIPaused
+            || ProcessInfo.processInfo.thermalState == .serious
+            || ProcessInfo.processInfo.thermalState == .critical {
             try await Task.sleep(for: .milliseconds(250))
         }
         try Task.checkCancellation()
@@ -908,7 +931,8 @@ final class AppState: ObservableObject {
             if Task.isCancelled { break }
             if Self.softDeletedKeys()[item.0.key] != nil { continue }
             // A user-requested post should win after the current extraction.
-            while (isGeneratingPosts || audioTranscriptionInFlight
+            while (isGeneratingPosts || audioTranscriptionInFlight || optionalAIPaused
+                   || recorder.isRecording || recorder.isTranscribing || recorder.isFinalizing
                    || UIApplication.shared.applicationState != .active
                    || ProcessInfo.processInfo.isLowPowerModeEnabled
                    || ProcessInfo.processInfo.thermalState == .serious
@@ -1071,6 +1095,7 @@ final class AppState: ObservableObject {
     /// Soft-delete a journal entry (moves it to Recently Deleted; the row stays
     /// in the store). Idempotent.
     func softDelete(key: String) {
+        lastDeletedJournalKey = key
         var live = Self.softDeletedKeys()
         live[key] = Date().timeIntervalSince1970
         UserDefaults.standard.set(live, forKey: Self.softDeleteKey)
@@ -1084,6 +1109,7 @@ final class AppState: ObservableObject {
 
     /// Restore a soft-deleted entry (removes it from Recently Deleted).
     func restore(key: String) {
+        if lastDeletedJournalKey == key { lastDeletedJournalKey = nil }
         var live = Self.softDeletedKeys()
         live.removeValue(forKey: key)
         UserDefaults.standard.set(live, forKey: Self.softDeleteKey)
@@ -1473,6 +1499,7 @@ final class AppState: ObservableObject {
         items.removeAll { $0.key == key }
         items.append(entry)
         let persisted = Self.savePendingTranscriptions(items, at: url)
+        refreshAudioQueue()
         // Schedule the BG safety net FIRST: if the foreground drain below is
         // interrupted (suspension, crash, task expiration), iOS already has a
         // request to finish the remaining items later.
@@ -1496,11 +1523,14 @@ final class AppState: ObservableObject {
         guard let url = Self.pendingTranscriptionsURL else { return }
         guard !transcriptionDrainInFlight else { return }
         transcriptionDrainInFlight = true
-        defer { transcriptionDrainInFlight = false }
+        defer { transcriptionDrainInFlight = false; refreshAudioQueue() }
         // Keys already processed in this drain (loop-break guard, above).
         var handledKeys = Set<String>()
 
         while !Task.isCancelled {
+            // Yield BETWEEN files. Never make live Speech wait on a lock or
+            // unload its model; leave PR #24's capture lifecycle untouched.
+            if automaticTranscriptionPaused || recorder.isRecording || recorder.isTranscribing || recorder.isFinalizing { break }
             let now = Date()
             let snapshot = Self.loadPendingTranscriptions(at: url)
                 .filter {
@@ -1509,6 +1539,13 @@ final class AppState: ObservableObject {
                 }
             guard let newest = snapshot.max(by: { Self.pendingAgeKey($0, memory: memory) < Self.pendingAgeKey($1, memory: memory) })
             else { break }
+            guard Self.softDeletedKeys()[newest.key] == nil,
+                  let before = try? memory.get(key: newest.key),
+                  Self.needsTranscript(before.content) else {
+                handledKeys.insert(newest.key)
+                Self.removeFromPendingQueue(key: newest.key, at: url)
+                continue
+            }
             // Track handled keys locally: if a queue-file write ever fails
             // silently (try?), the item can't loop back into THIS drain and
             // re-transcribe forever; the next launch's drain retries it.
@@ -1521,9 +1558,21 @@ final class AppState: ObservableObject {
                 continue
             }
 
+            activeTranscriptionKey = newest.key
             let transcript = await performAudioTranscription(
                 url: absURL, context: .automatic,
                 keepAliveWhileLocked: lockedPhoneExperiment)
+            activeTranscriptionKey = nil
+            guard !Task.isCancelled else { break }
+            // Another screen may have edited, re-transcribed or deleted this
+            // row while Speech was running. Keep the user's newer content.
+            guard Self.softDeletedKeys()[newest.key] == nil,
+                  let current = try? memory.get(key: newest.key),
+                  Self.needsTranscript(current.content) else {
+                handledKeys.insert(newest.key)
+                Self.removeFromPendingQueue(key: newest.key, at: url)
+                continue
+            }
             let trimmedTranscript = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmedTranscript.isEmpty {
                 // Never clobber meaningful stored content. Placeholder/marker
@@ -1562,7 +1611,7 @@ final class AppState: ObservableObject {
             if stored {
                 Self.removeFromPendingQueue(key: newest.key, at: url)
                 if newest.generateTitle {
-                    await generateTitleForJournal(key: newest.key, transcript: trimmedTranscript)
+                    Task { await generateTitleForJournal(key: newest.key, transcript: trimmedTranscript) }
                 }
             }
             handledKeys.insert(newest.key)
@@ -1625,6 +1674,11 @@ final class AppState: ObservableObject {
     /// failure case the existing content is left untouched (never
     /// overwritten).
     func retranscribeJournal(_ entry: SlowClawMemoryEntry) async -> String {
+        guard !audioTranscriptionInFlight, !recorder.isRecording,
+              let original = try? memory.get(key: entry.key) else {
+            lastTranscriptionStatus = "Speech is busy. Please retry after the current recording or transcription."
+            return ""
+        }
         guard let rel = entry.mediaURL, !rel.isEmpty,
               let url = AudioRecorder.absoluteURL(forMediaRelativePath: rel),
               FileManager.default.fileExists(atPath: url.path) else {
@@ -1644,6 +1698,16 @@ final class AppState: ObservableObject {
         // the preserved title and the body being replaced must come from the
         // current store, not the snapshot.
         guard let latest = try? memory.get(key: entry.key) else { return "" }
+        guard Self.softDeletedKeys()[entry.key] == nil,
+              latest.content == original.content else {
+            lastTranscriptionStatus = "The journal changed during transcription. Your changes were kept."
+            return ""
+        }
+        let oldBody = Self.needsTranscript(latest.content) ? "" : journalBodyOf(latest.content)
+        guard TranscriptSafety.canReplace(original: oldBody, current: oldBody, candidate: trimmed) else {
+            lastTranscriptionStatus = "The new transcript was shorter. Your existing transcript was kept."
+            return ""
+        }
         let titleLine = latest.content
             .split(separator: "\n", omittingEmptySubsequences: true)
             .first.map(String.init) ?? journalTitleOf(entry)
@@ -1934,10 +1998,16 @@ struct AppShell: View {
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("slowclaw.theme") private var themeRaw: String = ""
     var body: some View {
-        Group {
+        ZStack {
+            // Capture and autosave stay alive even while another tab is
+            // visible. Do not recreate the recorder on every tab switch.
+            JournalView(recorder: state.recorder)
+                .opacity(state.selectedTab == .journal ? 1 : 0)
+                .allowsHitTesting(state.selectedTab == .journal)
+                .accessibilityHidden(state.selectedTab != .journal)
             switch state.selectedTab {
             case .reads: ReadsView()
-            case .journal: JournalView()
+            case .journal: EmptyView()
             case .drafts: DraftsView()
             case .profile: ProfileView()
             }
@@ -2782,7 +2852,7 @@ struct JournalView: View {
 
     // The recorder is owned here so the base record button + the recording
     // screen + the post-stop auto-save all share one state machine.
-    @StateObject private var recorder = AudioRecorder()
+    @ObservedObject var recorder: AudioRecorder
 
     @State private var search = ""
     /// Selected list order. `newestFirst` is the Voice-Memos default.
