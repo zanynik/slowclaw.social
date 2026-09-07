@@ -1032,8 +1032,7 @@ final class AppState: ObservableObject {
         }
         var readingScores: [String: Double] = [:]
         for signal in readingSignals.values {
-            let age = max(0, now.timeIntervalSince(signal.date) / 86_400)
-            let weight = (signal.preference < 0 ? -0.5 : signal.preference > 0 ? 0.45 : 0.15) * pow(0.5, age / 14)
+            let weight = signal.weight(at: now)
             for topic in signal.topics where !mutedInterests.contains(topic) {
                 readingScores[topic, default: 0] += weight
             }
@@ -1566,7 +1565,7 @@ final class AppState: ObservableObject {
     /// progress are picked up instead of waiting for the next one.
     func drainPendingTranscriptions() async {
         guard let url = Self.pendingTranscriptionsURL else { return }
-        guard !transcriptionDrainInFlight else { return }
+        guard !transcriptionDrainInFlight, !audioTranscriptionInFlight else { return }
         transcriptionDrainInFlight = true
         defer { transcriptionDrainInFlight = false; refreshAudioQueue() }
         // Keys already processed in this drain (loop-break guard, above).
@@ -2081,8 +2080,10 @@ struct AppShell: View {
         }
         // Pin the bottom nav above the home indicator.
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            ActivityBar(recorder: state.recorder)
-            BottomNav(selection: $state.selectedTab, scheme: scheme)
+            VStack(spacing: 0) {
+                ActivityBar(recorder: state.recorder)
+                BottomNav(selection: $state.selectedTab, scheme: scheme)
+            }
         }
         // The Journal tab is now a Voice Memos-style list with the record +
         // pen buttons at its base; the sidebar drawer is removed.

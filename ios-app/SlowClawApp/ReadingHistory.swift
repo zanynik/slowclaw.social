@@ -5,6 +5,13 @@ struct ReadingSignal: Codable {
     let topics: [String]
     let date: Date
     var preference: Int // -1 less, 0 read, +1 more, 2 just curious (no topics)
+
+    func weight(at now: Date) -> Double {
+        guard preference != 2 else { return 0 }
+        let days = max(0, now.timeIntervalSince(date) / 86_400)
+        let base = preference < 0 ? -0.5 : preference > 0 ? 0.45 : 0.15
+        return base * pow(0.5, days / 14)
+    }
 }
 
 /// A small local history of feed metadata, never browser contents or URLs.
