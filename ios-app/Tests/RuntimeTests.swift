@@ -2,6 +2,30 @@ import XCTest
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
+    func testCasualReadingDecaysAndCuriosityDoesNotTrain() {
+        let now = Date(timeIntervalSince1970: 1000000)
+        let casual = ReadingSignal(topics: ["gardens"], date: now, preference: 0)
+        let explicit = ReadingSignal(topics: ["gardens"], date: now, preference: 1)
+        let curious = ReadingSignal(topics: ["gardens"], date: now, preference: 2)
+        XCTAssertEqual(curious.weight(at: now), 0)
+        XCTAssertLessThan(casual.weight(at: now), explicit.weight(at: now))
+        XCTAssertEqual(casual.weight(at: now.addingTimeInterval(14 * 86400)), casual.weight(at: now) / 2, accuracy: 0.0001)
+        XCTAssertLessThan(ReadingSignal(topics: [], date: now, preference: -1).weight(at: now), 0)
+    }
+
+    func testArticleSourceRoundTripKeepsLinkSeparateFromTranscript() throws {
+        let source = ArticleReflection(title: "SlowClaw reading", url: URL(string: "https://example.com/article")!)
+        let data = try JSONEncoder().encode(["journal_test": source])
+        let decoded = try JSONDecoder().decode([String: ArticleReflection].self, from: data)
+        XCTAssertEqual(decoded["journal_test"], source)
+    }
+    func testTranscriptReplacementPreservesEditsAndRejectsShorterResults() {
+        XCTAssertFalse(TranscriptSafety.canReplace(original: "original", current: "edited", candidate: "longer result"))
+        XCTAssertFalse(TranscriptSafety.canReplace(original: "complete transcript", current: "complete transcript", candidate: "partial"))
+        XCTAssertFalse(TranscriptSafety.canReplace(original: "", current: "", candidate: "  "))
+        XCTAssertTrue(TranscriptSafety.canReplace(original: "", current: "", candidate: "Recovered speech"))
+        XCTAssertTrue(TranscriptSafety.canReplace(original: "first", current: "first", candidate: "first and last"))
+    }
     func testReadingTopicsAreBoundedAndDeduplicated() {
         let topics = ReadingHistory.topics(title: "Gardens and gardens", summary: "Soil, vegetables, forests and agriculture support communities.")
         XCTAssertLessThanOrEqual(topics.count, 8)

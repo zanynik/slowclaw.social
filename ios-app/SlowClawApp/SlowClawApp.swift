@@ -349,6 +349,35 @@ final class AppState: ObservableObject {
     // Apple Speech file transcription status. This is independent of the local
     // text model, so model lifecycle controls never race audio work.
     @Published var audioTranscriptionInFlight: Bool = false
+    let recorder = AudioRecorder()
+    @Published var queuedAudio: [PendingTranscription] = []
+    @Published var activeTranscriptionKey: String?
+    @Published var automaticTranscriptionPaused = false
+    @Published var optionalAIPaused = false
+    @Published var lastDeletedJournalKey: String?
+
+    func refreshAudioQueue() {
+        queuedAudio = Self.pendingTranscriptionsURL.map { Self.loadPendingTranscriptions(at: $0) } ?? []
+    }
+
+    func transcriptionLabel(for key: String) -> String {
+        if activeTranscriptionKey == key { return "Transcribing…" }
+        if automaticTranscriptionPaused { return "Queued · paused" }
+        if let item = queuedAudio.first(where: { $0.key == key }), (item.attemptCount ?? 0) > 0 {
+            return "Waiting to retry · audio is safe"
+        }
+        return "Queued for transcription"
+    }
+
+    func retryQueuedAudio() async {
+        guard let url = Self.pendingTranscriptionsURL else { return }
+        var items = Self.loadPendingTranscriptions(at: url)
+        for index in items.indices { items[index].nextAttemptAt = nil }
+        guard Self.savePendingTranscriptions(items, at: url) else { return }
+        automaticTranscriptionPaused = false
+        refreshAudioQueue()
+        await drainPendingTranscriptions()
+    }
     @Published var audioTranscriptionProgress: String? = nil
     private var audioTranscriptionCount = 0
     /// Last manual transcription route/result, shown beside Re-transcribe.
@@ -397,6 +426,37 @@ final class AppState: ObservableObject {
     // so every link (Reads cards, article viewers) opens inside the app
     // instead of bouncing out to Safari.
     @Published var activeWebLink: WebLink? = nil
+    @Published var reflectionSource: ArticleReflection?
+    @Published var reflectionSources = ArticleReflection.load()
+
+    func beginArticleReflection() {
+        guard let link = activeWebLink, !recorder.isRecording,
+              !recorder.isTranscribing, recorder.recordedFileURL == nil else { return }
+        reflectionSource = ArticleReflection(title: readingCandidate?.title ?? link.url.host ?? "Article", url: link.url)
+        finishReading()
+        activeWebLink = nil
+        selectedTab = .journal
+    }
+
+    func attachReflection(_ source: ArticleReflection?, to key: String) {
+        guard let source, !key.isEmpty else { return }
+        reflectionSources[key] = source
+        ArticleReflection.save(reflectionSources)
+        if reflectionSource == source { reflectionSource = nil }
+    }
+
+    func recommendationReason(for item: RankedFeedItem) -> String {
+        let text = (item.title + " " + item.description.strippingHTML()).lowercased()
+        guard let topic = interests.first(where: { text.contains($0.lowercased()) }) else {
+            return interests.isEmpty ? "From the source catalog — your journal interests are still growing."
+                : "Discovery from the source catalog, alongside your journal interests."
+        }
+        let fromJournal = journalInterestRecords.contains { key, record in
+            Self.softDeletedKeys()[key] == nil && record.topics.contains(topic)
+        }
+        return fromJournal ? "Matches a theme from your journals: \(topic)."
+            : "Matches your reading interests: \(topic)."
+    }
     @Published var readingSignals = ReadingHistory.load()
     private var readingCandidate: RankedFeedItem?
     private var readingStarted: Date?
@@ -435,7 +495,7 @@ final class AppState: ObservableObject {
 
     func rememberArticle(_ item: RankedFeedItem, preference: Int) {
         readingSignals[item.id] = ReadingSignal(
-            topics: ReadingHistory.topics(title: item.title, summary: item.description.strippingHTML()),
+            topics: preference == 2 ? [] : ReadingHistory.topics(title: item.title, summary: item.description.strippingHTML()),
             date: Date(), preference: preference)
         readingSignals = Dictionary(uniqueKeysWithValues: readingSignals.sorted { $0.value.date > $1.value.date }.prefix(200).map { ($0.key, $0.value) })
         ReadingHistory.save(readingSignals)
@@ -717,7 +777,8 @@ final class AppState: ObservableObject {
     /// downloaded (won't auto-download a 2GB model without consent) or when a
     /// model is already loaded. Safe to call repeatedly.
     func ensureLocalModelActivated() async {
-        guard !audioTranscriptionInFlight else { return }
+        guard !audioTranscriptionInFlight, !recorder.isRecording,
+              !recorder.isTranscribing, !recorder.isFinalizing, !optionalAIPaused else { return }
         // Re-read status in case it changed (e.g. the OS reclaimed the model).
         if let snapshot = try? await OnDeviceAIExecutor.shared.run({ slowClawLocalLLMStatus() }) {
             localLLM = snapshot
@@ -848,7 +909,10 @@ final class AppState: ObservableObject {
 
     // MARK: - Durable journal interest lens
     private func waitForSpeechPriority() async throws {
-        while audioTranscriptionInFlight {
+        while audioTranscriptionInFlight || recorder.isRecording || recorder.isTranscribing
+            || recorder.isFinalizing || optionalAIPaused
+            || ProcessInfo.processInfo.thermalState == .serious
+            || ProcessInfo.processInfo.thermalState == .critical {
             try await Task.sleep(for: .milliseconds(250))
         }
         try Task.checkCancellation()
@@ -908,7 +972,8 @@ final class AppState: ObservableObject {
             if Task.isCancelled { break }
             if Self.softDeletedKeys()[item.0.key] != nil { continue }
             // A user-requested post should win after the current extraction.
-            while (isGeneratingPosts || audioTranscriptionInFlight
+            while (isGeneratingPosts || audioTranscriptionInFlight || optionalAIPaused
+                   || recorder.isRecording || recorder.isTranscribing || recorder.isFinalizing
                    || UIApplication.shared.applicationState != .active
                    || ProcessInfo.processInfo.isLowPowerModeEnabled
                    || ProcessInfo.processInfo.thermalState == .serious
@@ -967,8 +1032,7 @@ final class AppState: ObservableObject {
         }
         var readingScores: [String: Double] = [:]
         for signal in readingSignals.values {
-            let age = max(0, now.timeIntervalSince(signal.date) / 86_400)
-            let weight = (signal.preference < 0 ? -0.5 : signal.preference > 0 ? 0.45 : 0.15) * pow(0.5, age / 14)
+            let weight = signal.weight(at: now)
             for topic in signal.topics where !mutedInterests.contains(topic) {
                 readingScores[topic, default: 0] += weight
             }
@@ -1071,6 +1135,7 @@ final class AppState: ObservableObject {
     /// Soft-delete a journal entry (moves it to Recently Deleted; the row stays
     /// in the store). Idempotent.
     func softDelete(key: String) {
+        lastDeletedJournalKey = key
         var live = Self.softDeletedKeys()
         live[key] = Date().timeIntervalSince1970
         UserDefaults.standard.set(live, forKey: Self.softDeleteKey)
@@ -1084,6 +1149,7 @@ final class AppState: ObservableObject {
 
     /// Restore a soft-deleted entry (removes it from Recently Deleted).
     func restore(key: String) {
+        if lastDeletedJournalKey == key { lastDeletedJournalKey = nil }
         var live = Self.softDeletedKeys()
         live.removeValue(forKey: key)
         UserDefaults.standard.set(live, forKey: Self.softDeleteKey)
@@ -1098,6 +1164,7 @@ final class AppState: ObservableObject {
             Self.loadPendingTranscriptions(at: $0)
         } ?? []
         for key in keys {
+            reflectionSources.removeValue(forKey: key)
             if let entry = try? memory.get(key: key),
                let rel = entry.mediaURL,
                let mediaURL = AudioRecorder.absoluteURL(forMediaRelativePath: rel),
@@ -1112,6 +1179,7 @@ final class AppState: ObservableObject {
             Self.savePendingTranscriptions(pending, at: queueURL)
         }
         UserDefaults.standard.removeObject(forKey: Self.softDeleteKey)
+        ArticleReflection.save(reflectionSources)
         Self.saveJournalInterestRecords(journalInterestRecords)
         rebuildInterestLens()
         readsRefreshedAt = nil
@@ -1363,8 +1431,10 @@ final class AppState: ObservableObject {
     @discardableResult
     func storeJournalNow(text: String, source: String?, mediaURL: String?) async -> String {
         let key = "journal_\(Date().timeIntervalSince1970)"
-        try? memory.store(key: key, content: text,
-                          category: "daily", sessionID: nil, source: source, mediaURL: mediaURL)
+        do {
+            try memory.store(key: key, content: text,
+                             category: "daily", sessionID: nil, source: source, mediaURL: mediaURL)
+        } catch { return "" }
         await refreshJournals()
         return key
     }
@@ -1473,6 +1543,7 @@ final class AppState: ObservableObject {
         items.removeAll { $0.key == key }
         items.append(entry)
         let persisted = Self.savePendingTranscriptions(items, at: url)
+        refreshAudioQueue()
         // Schedule the BG safety net FIRST: if the foreground drain below is
         // interrupted (suspension, crash, task expiration), iOS already has a
         // request to finish the remaining items later.
@@ -1494,13 +1565,16 @@ final class AppState: ObservableObject {
     /// progress are picked up instead of waiting for the next one.
     func drainPendingTranscriptions() async {
         guard let url = Self.pendingTranscriptionsURL else { return }
-        guard !transcriptionDrainInFlight else { return }
+        guard !transcriptionDrainInFlight, !audioTranscriptionInFlight else { return }
         transcriptionDrainInFlight = true
-        defer { transcriptionDrainInFlight = false }
+        defer { transcriptionDrainInFlight = false; refreshAudioQueue() }
         // Keys already processed in this drain (loop-break guard, above).
         var handledKeys = Set<String>()
 
         while !Task.isCancelled {
+            // Yield BETWEEN files. Never make live Speech wait on a lock or
+            // unload its model; leave PR #24's capture lifecycle untouched.
+            if automaticTranscriptionPaused || recorder.isRecording || recorder.isTranscribing || recorder.isFinalizing { break }
             let now = Date()
             let snapshot = Self.loadPendingTranscriptions(at: url)
                 .filter {
@@ -1509,6 +1583,13 @@ final class AppState: ObservableObject {
                 }
             guard let newest = snapshot.max(by: { Self.pendingAgeKey($0, memory: memory) < Self.pendingAgeKey($1, memory: memory) })
             else { break }
+            guard Self.softDeletedKeys()[newest.key] == nil,
+                  let before = try? memory.get(key: newest.key),
+                  Self.needsTranscript(before.content) else {
+                handledKeys.insert(newest.key)
+                Self.removeFromPendingQueue(key: newest.key, at: url)
+                continue
+            }
             // Track handled keys locally: if a queue-file write ever fails
             // silently (try?), the item can't loop back into THIS drain and
             // re-transcribe forever; the next launch's drain retries it.
@@ -1521,9 +1602,21 @@ final class AppState: ObservableObject {
                 continue
             }
 
+            activeTranscriptionKey = newest.key
             let transcript = await performAudioTranscription(
                 url: absURL, context: .automatic,
                 keepAliveWhileLocked: lockedPhoneExperiment)
+            activeTranscriptionKey = nil
+            guard !Task.isCancelled else { break }
+            // Another screen may have edited, re-transcribed or deleted this
+            // row while Speech was running. Keep the user's newer content.
+            guard Self.softDeletedKeys()[newest.key] == nil,
+                  let current = try? memory.get(key: newest.key),
+                  Self.needsTranscript(current.content) else {
+                handledKeys.insert(newest.key)
+                Self.removeFromPendingQueue(key: newest.key, at: url)
+                continue
+            }
             let trimmedTranscript = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmedTranscript.isEmpty {
                 // Never clobber meaningful stored content. Placeholder/marker
@@ -1562,7 +1655,7 @@ final class AppState: ObservableObject {
             if stored {
                 Self.removeFromPendingQueue(key: newest.key, at: url)
                 if newest.generateTitle {
-                    await generateTitleForJournal(key: newest.key, transcript: trimmedTranscript)
+                    Task { await generateTitleForJournal(key: newest.key, transcript: trimmedTranscript) }
                 }
             }
             handledKeys.insert(newest.key)
@@ -1625,6 +1718,11 @@ final class AppState: ObservableObject {
     /// failure case the existing content is left untouched (never
     /// overwritten).
     func retranscribeJournal(_ entry: SlowClawMemoryEntry) async -> String {
+        guard !audioTranscriptionInFlight, !recorder.isRecording,
+              let original = try? memory.get(key: entry.key) else {
+            lastTranscriptionStatus = "Speech is busy. Please retry after the current recording or transcription."
+            return ""
+        }
         guard let rel = entry.mediaURL, !rel.isEmpty,
               let url = AudioRecorder.absoluteURL(forMediaRelativePath: rel),
               FileManager.default.fileExists(atPath: url.path) else {
@@ -1644,6 +1742,16 @@ final class AppState: ObservableObject {
         // the preserved title and the body being replaced must come from the
         // current store, not the snapshot.
         guard let latest = try? memory.get(key: entry.key) else { return "" }
+        guard Self.softDeletedKeys()[entry.key] == nil,
+              latest.content == original.content else {
+            lastTranscriptionStatus = "The journal changed during transcription. Your changes were kept."
+            return ""
+        }
+        let oldBody = Self.needsTranscript(latest.content) ? "" : journalBodyOf(latest.content)
+        guard TranscriptSafety.canReplace(original: oldBody, current: oldBody, candidate: trimmed) else {
+            lastTranscriptionStatus = "The new transcript was shorter. Your existing transcript was kept."
+            return ""
+        }
         let titleLine = latest.content
             .split(separator: "\n", omittingEmptySubsequences: true)
             .first.map(String.init) ?? journalTitleOf(entry)
@@ -1933,15 +2041,36 @@ struct AppShell: View {
     @Environment(\.colorScheme) var scheme
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("slowclaw.theme") private var themeRaw: String = ""
+    @State private var visitedTabs: Set<AppTab> = [.journal]
     var body: some View {
-        Group {
-            switch state.selectedTab {
-            case .reads: ReadsView()
-            case .journal: JournalView()
-            case .drafts: DraftsView()
-            case .profile: ProfileView()
+        ZStack {
+            // Capture and autosave stay alive even while another tab is
+            // visible. Do not recreate the recorder on every tab switch.
+            JournalView(recorder: state.recorder)
+                .opacity(state.selectedTab == .journal ? 1 : 0)
+                .allowsHitTesting(state.selectedTab == .journal)
+                .accessibilityHidden(state.selectedTab != .journal)
+            if visitedTabs.contains(.reads) {
+                ReadsView()
+                    .opacity(state.selectedTab == .reads ? 1 : 0)
+                    .allowsHitTesting(state.selectedTab == .reads)
+                    .accessibilityHidden(state.selectedTab != .reads)
+            }
+            if visitedTabs.contains(.drafts) {
+                DraftsView()
+                    .opacity(state.selectedTab == .drafts ? 1 : 0)
+                    .allowsHitTesting(state.selectedTab == .drafts)
+                    .accessibilityHidden(state.selectedTab != .drafts)
+            }
+            if visitedTabs.contains(.profile) {
+                ProfileView()
+                    .opacity(state.selectedTab == .profile ? 1 : 0)
+                    .allowsHitTesting(state.selectedTab == .profile)
+                    .accessibilityHidden(state.selectedTab != .profile)
             }
         }
+        .onAppear { visitedTabs.insert(state.selectedTab) }
+        .onChange(of: state.selectedTab) { _, tab in visitedTabs.insert(tab) }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.bg(scheme))
         // Pin the top bar above the content's top safe area, extending the
@@ -1951,7 +2080,10 @@ struct AppShell: View {
         }
         // Pin the bottom nav above the home indicator.
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            BottomNav(selection: $state.selectedTab, scheme: scheme)
+            VStack(spacing: 0) {
+                ActivityBar(recorder: state.recorder)
+                BottomNav(selection: $state.selectedTab, scheme: scheme)
+            }
         }
         // The Journal tab is now a Voice Memos-style list with the record +
         // pen buttons at its base; the sidebar drawer is removed.
@@ -1964,9 +2096,11 @@ struct AppShell: View {
         .task {
             // Retry durable pending audio while the user keeps using the app;
             // nextAttemptAt preserves backoff instead of waiting for relaunch.
+            state.refreshAudioQueue()
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(15)) } catch { break }
                 if scenePhase == .active {
+                    state.refreshAudioQueue()
                     await state.drainPendingTranscriptions()
                 }
             }
@@ -2268,6 +2402,13 @@ struct JournalDetailView: View {
                     }
 
                     // ── Audio player (only for audio entries with a file) ──
+                    if let source = state.reflectionSources[entry.key] {
+                        Link(destination: source.url) {
+                            Label("Reflection on: \(source.title)", systemImage: "link")
+                                .font(DS.captionFont)
+                        }
+                        .padding(.horizontal, 16)
+                    }
                     if let url = audioURL, FileManager.default.fileExists(atPath: url.path) {
                         playerSection(url: url)
                     }
@@ -2717,6 +2858,7 @@ struct TextComposeSheet: View {
 
     @State private var title = ""
     @State private var bodyText = ""
+    @State private var saveFailed = false
 
     var body: some View {
         NavigationStack {
@@ -2748,6 +2890,9 @@ struct TextComposeSheet: View {
             .padding(16)
             .background(DS.bg(scheme))
             .navigationTitle("New Entry")
+            .alert("Couldn't save your journal", isPresented: $saveFailed) {
+                Button("OK", role: .cancel) {}
+            } message: { Text("Your text is still here. Please try Save again.") }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -2768,7 +2913,10 @@ struct TextComposeSheet: View {
         let b = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !b.isEmpty else { return }
         let content = t.isEmpty ? b : "\(t)\n\n\(b)"
-        await state.storeJournal(text: content, source: "text", mediaURL: nil)
+        let reflection = state.reflectionSource
+        let key = await state.storeJournalNow(text: content, source: "text", mediaURL: nil)
+        guard !key.isEmpty else { saveFailed = true; return }
+        state.attachReflection(reflection, to: key)
         dismiss()
     }
 }
@@ -2780,15 +2928,17 @@ struct JournalView: View {
     @EnvironmentObject var state: AppState
     @EnvironmentObject var voiceMemoImporter: VoiceMemoImporter
 
-    // The recorder is owned here so the base record button + the recording
-    // screen + the post-stop auto-save all share one state machine.
-    @StateObject private var recorder = AudioRecorder()
+    // AppState owns the recorder; this retained view observes capture and
+    // auto-saves even when the user visits another tab.
+    @ObservedObject var recorder: AudioRecorder
 
     @State private var search = ""
     /// Selected list order. `newestFirst` is the Voice-Memos default.
     @State private var sortOrder: JournalSort = .newestFirst
     @State private var selectedDetail: SlowClawMemoryEntry?
     @State private var showCompose = false
+    @State private var isSavingRecording = false
+    @State private var recordingSaveFailed = false
     @State private var isSelectingAudio = false
     @State private var selectedAudioKeys = Set<String>()
     /// Best-effort audio durations by journal key, filled asynchronously from
@@ -2937,6 +3087,9 @@ struct JournalView: View {
     /// "New Recording" default title is set; if AI is available an AI title is
     /// generated from the transcript (once it has landed) and replaces it.
     private func autoSaveRecording(fileURL: URL) {
+        guard !isSavingRecording else { return }
+        isSavingRecording = true
+        let reflection = state.reflectionSource
         let mediaURL = AudioRecorder.documentsRelativePath(for: fileURL)
         let userTitle = recorder.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let transcript = recorder.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2957,6 +3110,17 @@ struct JournalView: View {
             let key = await state.storeJournalNow(text: body,
                                                   source: "audio_recorded",
                                                   mediaURL: mediaURL)
+            guard !key.isEmpty else {
+                recordingSaveFailed = true
+                isSavingRecording = false
+                return // Keep the durable audio and transcript for Retry Save.
+            }
+            recordingSaveFailed = false
+            state.attachReflection(reflection, to: key)
+            recorder.recordedFileURL = nil
+            recorder.transcript = ""
+            recorder.title = ""
+            isSavingRecording = false
             let shouldGenTitle = (userTitle.isEmpty && state.anyLLMAvailable)
             // A successfully finalized live SpeechAnalyzer session is the
             // Voice Memos-style source of truth: it already consumed the whole
@@ -2968,12 +3132,6 @@ struct JournalView: View {
                                                         generateTitleAfter: shouldGenTitle)
             } else if hasTranscript && shouldGenTitle {
                 await state.generateTitleForJournal(key: key, transcript: transcript)
-            }
-            // Reset recorder state for the next recording.
-            await MainActor.run {
-                recorder.recordedFileURL = nil
-                recorder.transcript = ""
-                recorder.title = ""
             }
         }
     }
@@ -2989,6 +3147,25 @@ struct JournalView: View {
 
     private var journalList: some View {
         VStack(spacing: 0) {
+            if recordingSaveFailed, let url = recorder.recordedFileURL {
+                HStack {
+                    Text("Audio kept on this phone. Journal save failed.")
+                    Button("Retry Save") { autoSaveRecording(fileURL: url) }
+                        .disabled(isSavingRecording)
+                }
+                .font(DS.captionFont).padding()
+            }
+            if let source = state.reflectionSource {
+                HStack {
+                    Label("Reflect on: \(source.title)", systemImage: "quote.bubble")
+                        .lineLimit(2)
+                    Spacer()
+                    Button("Cancel") { state.reflectionSource = nil }
+                }
+                .font(DS.captionFont).padding()
+                Text("Tap Record to add your private voice reflection.")
+                    .font(DS.microFont).padding(.bottom, 8)
+            }
             VStack(spacing: 8) {
                 // Header: "Journals" + compact sort menu.
                 HStack(alignment: .firstTextBaseline) {
@@ -3142,7 +3319,7 @@ struct JournalView: View {
     /// preview is gone: the detail view owns the transcript.
     private func journalRow(_ entry: SlowClawMemoryEntry) -> some View {
         let isAudio = entry.source?.hasPrefix("audio") == true
-        let transcribing = AppState.isTranscribingPlaceholder(entry.content)
+        let transcribing = entry.mediaURL != nil && AppState.needsTranscript(entry.content)
         let canSelect = audioURL(for: entry) != nil
         return HStack(alignment: .center, spacing: 12) {
             // Leading glyph / spinner.
@@ -3152,8 +3329,8 @@ struct JournalView: View {
                     .foregroundStyle(selectedAudioKeys.contains(entry.key) ? DS.accentColor : DS.muted(scheme))
                     .frame(width: 24, height: 24)
             } else if transcribing {
-                ProgressView()
-                    .scaleEffect(0.7)
+                Image(systemName: state.activeTranscriptionKey == entry.key ? "waveform" : "clock")
+                    .foregroundStyle(DS.muted(scheme))
                     .frame(width: 24, height: 24)
             } else {
                 Image(systemName: isAudio ? "waveform" : "text.alignleft")
@@ -3178,7 +3355,7 @@ struct JournalView: View {
 
                 HStack(spacing: 6) {
                     if transcribing {
-                        Text("Transcribing…")
+                        Text(state.transcriptionLabel(for: entry.key))
                             .foregroundStyle(DS.accent2Color)
                     } else if let date = journalDate(entry) {
                         Text(Self.localizedDateTime(date))
@@ -3210,8 +3387,8 @@ struct JournalView: View {
     /// or the localized date/time, plus the duration when known.
     private func journalRowAccessibilityLabel(_ entry: SlowClawMemoryEntry) -> String {
         var parts = [journalTitleOf(entry)]
-        if AppState.isTranscribingPlaceholder(entry.content) {
-            parts.append("Transcribing")
+        if entry.mediaURL != nil && AppState.needsTranscript(entry.content) {
+            parts.append(state.transcriptionLabel(for: entry.key))
         } else if let date = journalDate(entry) {
             parts.append(Self.localizedDateTime(date))
         }
@@ -3324,7 +3501,7 @@ struct JournalView: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .disabled(recorder.isTranscribing || recorder.isFinalizing)
+                .disabled(recorder.isTranscribing || recorder.isFinalizing || isSavingRecording || recordingSaveFailed)
                 .accessibilityLabel("Record an audio journal")
 
                 Spacer()
@@ -4547,14 +4724,10 @@ struct FeedCard: View {
                 }
 
                 // Rationale chip ("✨ {topic}").
-                if let topic = rationaleTopic {
-                    Text("✨ \(topic)")
-                        .font(DS.microFont.weight(.semibold))
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                        .background(DS.accentDim(scheme), in: Capsule())
-                        .foregroundStyle(DS.accent(scheme))
-                        .padding(.top, 6)
-                }
+                Text(state.recommendationReason(for: item))
+                    .font(DS.microFont)
+                    .foregroundStyle(DS.accent(scheme))
+                    .padding(.top, 6)
 
                 // Like / dislike actions.
                 HStack(spacing: 18) {
@@ -4579,6 +4752,15 @@ struct FeedCard: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Less like this")
+
+                    Button {
+                        state.rememberArticle(item, preference: 2)
+                    } label: {
+                        Text(state.readingSignals[item.id]?.preference == 2 ? "Not learning from this" : "Just curious")
+                            .font(DS.microFont)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Exclude this article from your reading interests")
 
                     Spacer()
 
