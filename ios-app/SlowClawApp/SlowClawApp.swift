@@ -2928,8 +2928,8 @@ struct JournalView: View {
     @EnvironmentObject var state: AppState
     @EnvironmentObject var voiceMemoImporter: VoiceMemoImporter
 
-    // The recorder is owned here so the base record button + the recording
-    // screen + the post-stop auto-save all share one state machine.
+    // AppState owns the recorder; this retained view observes capture and
+    // auto-saves even when the user visits another tab.
     @ObservedObject var recorder: AudioRecorder
 
     @State private var search = ""
@@ -3319,7 +3319,7 @@ struct JournalView: View {
     /// preview is gone: the detail view owns the transcript.
     private func journalRow(_ entry: SlowClawMemoryEntry) -> some View {
         let isAudio = entry.source?.hasPrefix("audio") == true
-        let transcribing = AppState.isTranscribingPlaceholder(entry.content)
+        let transcribing = entry.mediaURL != nil && AppState.needsTranscript(entry.content)
         let canSelect = audioURL(for: entry) != nil
         return HStack(alignment: .center, spacing: 12) {
             // Leading glyph / spinner.
@@ -3387,8 +3387,8 @@ struct JournalView: View {
     /// or the localized date/time, plus the duration when known.
     private func journalRowAccessibilityLabel(_ entry: SlowClawMemoryEntry) -> String {
         var parts = [journalTitleOf(entry)]
-        if AppState.isTranscribingPlaceholder(entry.content) {
-            parts.append("Transcribing")
+        if entry.mediaURL != nil && AppState.needsTranscript(entry.content) {
+            parts.append(state.transcriptionLabel(for: entry.key))
         } else if let date = journalDate(entry) {
             parts.append(Self.localizedDateTime(date))
         }
@@ -3501,7 +3501,7 @@ struct JournalView: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .disabled(recorder.isTranscribing || recorder.isFinalizing || isSavingRecording || recorder.recordedFileURL != nil)
+                .disabled(recorder.isTranscribing || recorder.isFinalizing || isSavingRecording || recordingSaveFailed)
                 .accessibilityLabel("Record an audio journal")
 
                 Spacer()
