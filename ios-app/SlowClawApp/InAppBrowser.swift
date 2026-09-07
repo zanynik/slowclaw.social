@@ -69,8 +69,15 @@ struct InAppBrowserSheet: View {
 
     var body: some View {
         if let link = state.activeWebLink {
-            InAppBrowserView(url: link.url, onDismiss: dismiss)
-                .ignoresSafeArea()
+            VStack(spacing: 0) {
+                InAppBrowserView(url: link.url, onDismiss: dismiss)
+                Button { state.beginArticleReflection() } label: {
+                    Label("My thoughts · voice reflection", systemImage: "mic.badge.plus")
+                        .font(.callout.weight(.semibold))
+                        .frame(maxWidth: .infinity).padding()
+                }
+                .disabled(state.recorder.isRecording || state.recorder.isTranscribing || state.recorder.recordedFileURL != nil)
+            }
         }
     }
 }

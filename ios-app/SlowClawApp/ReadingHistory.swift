@@ -4,7 +4,7 @@ import NaturalLanguage
 struct ReadingSignal: Codable {
     let topics: [String]
     let date: Date
-    var preference: Int // -1 less, 0 read, +1 more
+    var preference: Int // -1 less, 0 read, +1 more, 2 just curious (no topics)
 }
 
 /// A small local history of feed metadata, never browser contents or URLs.

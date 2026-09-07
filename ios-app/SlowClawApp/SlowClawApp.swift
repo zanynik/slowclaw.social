@@ -417,6 +417,37 @@ final class AppState: ObservableObject {
     // so every link (Reads cards, article viewers) opens inside the app
     // instead of bouncing out to Safari.
     @Published var activeWebLink: WebLink? = nil
+    @Published var reflectionSource: ArticleReflection?
+    @Published var reflectionSources = ArticleReflection.load()
+
+    func beginArticleReflection() {
+        guard let link = activeWebLink, !recorder.isRecording,
+              !recorder.isTranscribing, recorder.recordedFileURL == nil else { return }
+        reflectionSource = ArticleReflection(title: readingCandidate?.title ?? link.url.host ?? "Article", url: link.url)
+        finishReading()
+        activeWebLink = nil
+        selectedTab = .journal
+    }
+
+    func attachReflection(_ source: ArticleReflection?, to key: String) {
+        guard let source, !key.isEmpty else { return }
+        reflectionSources[key] = source
+        ArticleReflection.save(reflectionSources)
+        if reflectionSource == source { reflectionSource = nil }
+    }
+
+    func recommendationReason(for item: RankedFeedItem) -> String {
+        let text = (item.title + " " + item.description.strippingHTML()).lowercased()
+        guard let topic = interests.first(where: { text.contains($0.lowercased()) }) else {
+            return interests.isEmpty ? "From the source catalog — your journal interests are still growing."
+                : "Discovery from the source catalog, alongside your journal interests."
+        }
+        let fromJournal = journalInterestRecords.contains { key, record in
+            Self.softDeletedKeys()[key] == nil && record.topics.contains(topic)
+        }
+        return fromJournal ? "Matches a theme from your journals: \(topic)."
+            : "Matches your reading interests: \(topic)."
+    }
     @Published var readingSignals = ReadingHistory.load()
     private var readingCandidate: RankedFeedItem?
     private var readingStarted: Date?
@@ -455,7 +486,7 @@ final class AppState: ObservableObject {
 
     func rememberArticle(_ item: RankedFeedItem, preference: Int) {
         readingSignals[item.id] = ReadingSignal(
-            topics: ReadingHistory.topics(title: item.title, summary: item.description.strippingHTML()),
+            topics: preference == 2 ? [] : ReadingHistory.topics(title: item.title, summary: item.description.strippingHTML()),
             date: Date(), preference: preference)
         readingSignals = Dictionary(uniqueKeysWithValues: readingSignals.sorted { $0.value.date > $1.value.date }.prefix(200).map { ($0.key, $0.value) })
         ReadingHistory.save(readingSignals)
@@ -1124,6 +1155,7 @@ final class AppState: ObservableObject {
             Self.loadPendingTranscriptions(at: $0)
         } ?? []
         for key in keys {
+            reflectionSources.removeValue(forKey: key)
             if let entry = try? memory.get(key: key),
                let rel = entry.mediaURL,
                let mediaURL = AudioRecorder.absoluteURL(forMediaRelativePath: rel),
@@ -1138,6 +1170,7 @@ final class AppState: ObservableObject {
             Self.savePendingTranscriptions(pending, at: queueURL)
         }
         UserDefaults.standard.removeObject(forKey: Self.softDeleteKey)
+        ArticleReflection.save(reflectionSources)
         Self.saveJournalInterestRecords(journalInterestRecords)
         rebuildInterestLens()
         readsRefreshedAt = nil
@@ -1389,8 +1422,10 @@ final class AppState: ObservableObject {
     @discardableResult
     func storeJournalNow(text: String, source: String?, mediaURL: String?) async -> String {
         let key = "journal_\(Date().timeIntervalSince1970)"
-        try? memory.store(key: key, content: text,
-                          category: "daily", sessionID: nil, source: source, mediaURL: mediaURL)
+        do {
+            try memory.store(key: key, content: text,
+                             category: "daily", sessionID: nil, source: source, mediaURL: mediaURL)
+        } catch { return "" }
         await refreshJournals()
         return key
     }
@@ -2338,6 +2373,13 @@ struct JournalDetailView: View {
                     }
 
                     // ── Audio player (only for audio entries with a file) ──
+                    if let source = state.reflectionSources[entry.key] {
+                        Link(destination: source.url) {
+                            Label("Reflection on: \(source.title)", systemImage: "link")
+                                .font(DS.captionFont)
+                        }
+                        .padding(.horizontal, 16)
+                    }
                     if let url = audioURL, FileManager.default.fileExists(atPath: url.path) {
                         playerSection(url: url)
                     }
@@ -2787,6 +2829,7 @@ struct TextComposeSheet: View {
 
     @State private var title = ""
     @State private var bodyText = ""
+    @State private var saveFailed = false
 
     var body: some View {
         NavigationStack {
@@ -2838,7 +2881,10 @@ struct TextComposeSheet: View {
         let b = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !b.isEmpty else { return }
         let content = t.isEmpty ? b : "\(t)\n\n\(b)"
-        await state.storeJournal(text: content, source: "text", mediaURL: nil)
+        let reflection = state.reflectionSource
+        let key = await state.storeJournalNow(text: content, source: "text", mediaURL: nil)
+        guard !key.isEmpty else { saveFailed = true; return }
+        state.attachReflection(reflection, to: key)
         dismiss()
     }
 }
@@ -2859,6 +2905,8 @@ struct JournalView: View {
     @State private var sortOrder: JournalSort = .newestFirst
     @State private var selectedDetail: SlowClawMemoryEntry?
     @State private var showCompose = false
+    @State private var isSavingRecording = false
+    @State private var recordingSaveFailed = false
     @State private var isSelectingAudio = false
     @State private var selectedAudioKeys = Set<String>()
     /// Best-effort audio durations by journal key, filled asynchronously from
@@ -3007,6 +3055,9 @@ struct JournalView: View {
     /// "New Recording" default title is set; if AI is available an AI title is
     /// generated from the transcript (once it has landed) and replaces it.
     private func autoSaveRecording(fileURL: URL) {
+        guard !isSavingRecording else { return }
+        isSavingRecording = true
+        let reflection = state.reflectionSource
         let mediaURL = AudioRecorder.documentsRelativePath(for: fileURL)
         let userTitle = recorder.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let transcript = recorder.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3027,6 +3078,17 @@ struct JournalView: View {
             let key = await state.storeJournalNow(text: body,
                                                   source: "audio_recorded",
                                                   mediaURL: mediaURL)
+            guard !key.isEmpty else {
+                recordingSaveFailed = true
+                isSavingRecording = false
+                return // Keep the durable audio and transcript for Retry Save.
+            }
+            recordingSaveFailed = false
+            state.attachReflection(reflection, to: key)
+            recorder.recordedFileURL = nil
+            recorder.transcript = ""
+            recorder.title = ""
+            isSavingRecording = false
             let shouldGenTitle = (userTitle.isEmpty && state.anyLLMAvailable)
             // A successfully finalized live SpeechAnalyzer session is the
             // Voice Memos-style source of truth: it already consumed the whole
@@ -3038,12 +3100,6 @@ struct JournalView: View {
                                                         generateTitleAfter: shouldGenTitle)
             } else if hasTranscript && shouldGenTitle {
                 await state.generateTitleForJournal(key: key, transcript: transcript)
-            }
-            // Reset recorder state for the next recording.
-            await MainActor.run {
-                recorder.recordedFileURL = nil
-                recorder.transcript = ""
-                recorder.title = ""
             }
         }
     }
@@ -3059,6 +3115,25 @@ struct JournalView: View {
 
     private var journalList: some View {
         VStack(spacing: 0) {
+            if recordingSaveFailed, let url = recorder.recordedFileURL {
+                HStack {
+                    Text("Audio kept on this phone. Journal save failed.")
+                    Button("Retry Save") { autoSaveRecording(fileURL: url) }
+                        .disabled(isSavingRecording)
+                }
+                .font(DS.captionFont).padding()
+            }
+            if let source = state.reflectionSource {
+                HStack {
+                    Label("Reflect on: \(source.title)", systemImage: "quote.bubble")
+                        .lineLimit(2)
+                    Spacer()
+                    Button("Cancel") { state.reflectionSource = nil }
+                }
+                .font(DS.captionFont).padding()
+                Text("Tap Record to add your private voice reflection.")
+                    .font(DS.microFont).padding(.bottom, 8)
+            }
             VStack(spacing: 8) {
                 // Header: "Journals" + compact sort menu.
                 HStack(alignment: .firstTextBaseline) {
@@ -3394,7 +3469,7 @@ struct JournalView: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .disabled(recorder.isTranscribing || recorder.isFinalizing)
+                .disabled(recorder.isTranscribing || recorder.isFinalizing || isSavingRecording || recorder.recordedFileURL != nil)
                 .accessibilityLabel("Record an audio journal")
 
                 Spacer()
@@ -4617,14 +4692,10 @@ struct FeedCard: View {
                 }
 
                 // Rationale chip ("✨ {topic}").
-                if let topic = rationaleTopic {
-                    Text("✨ \(topic)")
-                        .font(DS.microFont.weight(.semibold))
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                        .background(DS.accentDim(scheme), in: Capsule())
-                        .foregroundStyle(DS.accent(scheme))
-                        .padding(.top, 6)
-                }
+                Text(state.recommendationReason(for: item))
+                    .font(DS.microFont)
+                    .foregroundStyle(DS.accent(scheme))
+                    .padding(.top, 6)
 
                 // Like / dislike actions.
                 HStack(spacing: 18) {
@@ -4649,6 +4720,15 @@ struct FeedCard: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Less like this")
+
+                    Button {
+                        state.rememberArticle(item, preference: 2)
+                    } label: {
+                        Text(state.readingSignals[item.id]?.preference == 2 ? "Not learning from this" : "Just curious")
+                            .font(DS.microFont)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Exclude this article from your reading interests")
 
                     Spacer()
 
