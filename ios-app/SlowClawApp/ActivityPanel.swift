@@ -7,6 +7,14 @@ struct ActivityBar: View {
     @ObservedObject var recorder: AudioRecorder
     @State private var showActivity = false
 
+    private var hasActivity: Bool {
+        recorder.isRecording || recorder.isTranscribing || recorder.isFinalizing
+            || state.audioTranscriptionInFlight || !state.queuedAudio.isEmpty
+            || state.isGeneratingPosts || state.isIndexingInterests
+            || !state.pendingTitleKeys.isEmpty || state.optionalAIPaused
+            || state.automaticTranscriptionPaused
+    }
+
     private var summary: String {
         if recorder.isFinalizing { return "Finishing your transcript…" }
         if recorder.isRecording { return "Recording · tap to return" }
@@ -29,6 +37,7 @@ struct ActivityBar: View {
                 }
                 .font(.caption).padding(.horizontal).padding(.vertical, 8)
             }
+            if hasActivity {
             Button {
                 if recorder.isRecording || recorder.isFinalizing { state.selectedTab = .journal }
                 else { state.refreshAudioQueue(); showActivity = true }
@@ -42,6 +51,7 @@ struct ActivityBar: View {
                 .font(.caption).padding(.horizontal).padding(.vertical, 8)
             }
             .buttonStyle(.plain)
+            }
         }
         .background(.thinMaterial)
         .sheet(isPresented: $showActivity) {

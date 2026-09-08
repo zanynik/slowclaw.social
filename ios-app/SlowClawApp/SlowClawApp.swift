@@ -468,16 +468,6 @@ final class AppState: ObservableObject {
         readingSeconds = 0
         readingStarted = Date()
         openWebLink(url)
-        Task { [weak self] in
-            try? await Task.sleep(for: .seconds(8))
-            guard let self, self.readingCandidate?.id == item.id,
-                  UIApplication.shared.applicationState == .active,
-                  !self.audioTranscriptionInFlight,
-                  !ProcessInfo.processInfo.isLowPowerModeEnabled,
-                  ProcessInfo.processInfo.thermalState == .nominal else { return }
-            await self.ensureLocalModelActivated()
-            self.scheduleInterestIndexing()
-        }
     }
 
     func readingActivityChanged(active: Bool) {
@@ -1654,9 +1644,6 @@ final class AppState: ObservableObject {
             let stored = await storeJournalUpdate(key: newest.key, content: newContent)
             if stored {
                 Self.removeFromPendingQueue(key: newest.key, at: url)
-                if newest.generateTitle {
-                    Task { await generateTitleForJournal(key: newest.key, transcript: trimmedTranscript) }
-                }
             }
             handledKeys.insert(newest.key)
         }
@@ -2017,7 +2004,7 @@ final class AppState: ObservableObject {
 enum AppTab: String, CaseIterable {
     case reads, journal, drafts, profile
 
-    var label: String { rawValue.capitalized }
+    var label: String { self == .drafts ? "Create" : self == .profile ? "Settings" : rawValue.capitalized }
     /// Line-style SF Symbol matching the reference SVG icons in BottomNav.tsx.
     var icon: String {
         switch self {
@@ -2310,7 +2297,6 @@ struct JournalDetailView: View {
     @State private var editedBody: String
     @State private var isEditingTitle = false
     @State private var titleDraft: String
-    @State private var isPolishing = false
     @State private var isRetranscribing = false
     @State private var showRetranscribeFailedAlert = false
     @State private var showSaveErrorAlert = false
@@ -2441,17 +2427,6 @@ struct JournalDetailView: View {
                                     .buttonStyle(.plain)
                                     .tint(DS.accentColor)
                                     .disabled(isRetranscribing)
-                                }
-                                if state.llm != nil {
-                                    Button {
-                                        Task { await polish() }
-                                    } label: {
-                                        Label("Polish", systemImage: "sparkles")
-                                            .font(DS.captionFont.weight(.semibold))
-                                    }
-                                    .buttonStyle(.plain)
-                                    .tint(DS.accentColor)
-                                    .disabled(isPolishing || isRetranscribing)
                                 }
                             }
                             TextEditor(text: $editedBody)
@@ -2789,19 +2764,6 @@ struct JournalDetailView: View {
         persistCombined()
     }
 
-    private func polish() async {
-        guard let llm = state.llm else { return }
-        isPolishing = true
-        defer { isPolishing = false }
-        let raw = editedBody
-        let model = state.model
-        DispatchQueue.global(qos: .userInitiated).async {
-            if let polished = try? llm.synthesizeJournal(transcript: raw, model: model) {
-                DispatchQueue.main.async { editedBody = polished }
-            }
-        }
-    }
-
     /// Re-run on-device transcription of this entry's audio file and replace
     /// the transcript body in place (title preserved). The manual retry path
     /// for truncated/incomplete transcripts — lets each new build's engine be
@@ -3121,17 +3083,13 @@ struct JournalView: View {
             recorder.transcript = ""
             recorder.title = ""
             isSavingRecording = false
-            let shouldGenTitle = (userTitle.isEmpty && state.anyLLMAvailable)
             // A successfully finalized live SpeechAnalyzer session is the
             // Voice Memos-style source of truth: it already consumed the whole
             // recording as one continuous stream, so do not slice and
             // re-transcribe the saved file. Only failed/unavailable live
             // sessions enqueue the durable offline fallback.
             if !hasTranscript, let mediaPath = mediaURL, recordedURL != nil {
-                await state.enqueuePendingTranscription(key: key, mediaPath: mediaPath,
-                                                        generateTitleAfter: shouldGenTitle)
-            } else if hasTranscript && shouldGenTitle {
-                await state.generateTitleForJournal(key: key, transcript: transcript)
+                await state.enqueuePendingTranscription(key: key, mediaPath: mediaPath)
             }
         }
     }
@@ -3140,7 +3098,7 @@ struct JournalView: View {
     /// row already shows the localized date/time next to the title, and the
     /// user renames from the detail view.
     private static func defaultRecordingTitle() -> String {
-        "New Recording"
+        "Recording · " + localizedDateTime(Date())
     }
 
     // MARK: - List
