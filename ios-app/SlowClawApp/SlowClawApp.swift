@@ -815,9 +815,6 @@ final class AppState: ObservableObject {
         return try llm.synthesizeJournal(transcript: transcript, model: model)
     }
 
-    /// Generate a concise title for a journal entry from its transcript/text.
-    /// Local-first (on-device llama.cpp) with a remote fallback. Returns the
-    /// trimmed title or throws if no LLM is available.
     func aiTitle(transcript: String) async throws -> String {
         try await waitForSpeechPriority()
         if localLLM.loaded {
@@ -1435,31 +1432,6 @@ final class AppState: ObservableObject {
         }
         await refreshJournals()
         return true
-    }
-
-    /// Generate an AI title for a journal and replace its first line (the
-    /// title). Best-effort: on failure the existing title is left untouched.
-    /// Marks `key` in pendingTitleKeys while running so the row shows a spinner.
-    func generateTitleForJournal(key: String, transcript: String) async {
-        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            pendingTitleKeys.remove(key)
-            return
-        }
-        // Ensure the on-device model is active before asking it for a title.
-        guard anyLLMAvailable else { return }
-        pendingTitleKeys.insert(key)
-        defer { pendingTitleKeys.remove(key) }
-        guard let title = try? await aiTitle(transcript: trimmed),
-              !title.isEmpty else { return }
-        // Replace the first line (title) of the entry, keep the rest (body).
-        guard let existing = try? memory.get(key: key) else { return }
-        let lines = existing.content.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        let body = lines.dropFirst().joined(separator: "\n")
-        let newContent = body.isEmpty ? title : "\(title)\n\(body)"
-        try? memory.store(key: key, content: newContent, category: existing.category,
-                          sessionID: existing.sessionID, source: existing.source, mediaURL: existing.mediaURL)
-        await refreshJournals()
     }
 
     /// Shared placeholder body stored when an audio journal is saved before its
@@ -4493,35 +4465,8 @@ struct FeedCard: View {
         return h.replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression)
     }
 
-    /// First journal topic the item matches — surfaces as the "why it's here" chip.
-    private var rationaleTopic: String? {
-        let title = item.title.lowercased()
-        let desc = item.description.lowercased()
-        return interests.first { title.contains($0) || desc.contains($0) }
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Optional cover image (RSS media cover / YouTube thumbnail /
-            // Nostr article image). Failed loads render NOTHING — a dead
-            // image URL must not leave a reserved gray block on the card.
-            if let thumb = item.thumbnailURL, let url = URL(string: thumb) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .empty:
-                        Rectangle().fill(DS.surface2(scheme))
-                            .frame(height: 160)
-                    case .success(let image):
-                        image.resizable().scaledToFill().frame(height: 160).clipped()
-                    case .failure:
-                        EmptyView()
-                    @unknown default:
-                        EmptyView()
-                    }
-                }
-                .frame(maxWidth: .infinity)
-            }
-
             VStack(alignment: .leading, spacing: 6) {
                 // Source row: accent-green uppercase host + read time / video badge.
                 HStack(spacing: 8) {
