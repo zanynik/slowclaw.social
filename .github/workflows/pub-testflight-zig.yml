@@ -12,6 +12,7 @@ on:
     push:
         branches:
             - main
+            - feat/personal-memory
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
             - ".github/workflows/scripts/asc-issue-cert-profile.js"
@@ -71,6 +72,10 @@ jobs:
 
             - name: Test inference scheduling and Nostr signing
               run: bash ios-app/Tests/run.sh
+
+            - name: Test semantic ranking and C ABI
+              working-directory: zig-src
+              run: '"${ZIG_BIN}" build test test-ffi'
 
             - name: Build Zig staticlib (iOS device)
               working-directory: zig-src
