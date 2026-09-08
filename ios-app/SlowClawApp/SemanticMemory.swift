@@ -1,7 +1,7 @@
 import Foundation
 import NaturalLanguage
 
-struct SemanticMatch: Sendable {
+struct SemanticMatch: Codable, Sendable {
     let journalKey: String
     let similarity: Double
     let ageDays: Double

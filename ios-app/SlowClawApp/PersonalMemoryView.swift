@@ -21,7 +21,7 @@ struct PersonalMemoryView: View {
                     Text("At most one per day, from recent journals. Always private until you review and publish.")
                         .font(.caption).foregroundStyle(.secondary)
                     if let status = state.memoryStatus { Text(status).font(.caption) }
-                    if !state.localLLM.loaded { Text("Activate your downloaded local model in Settings to learn from new journals.").font(.caption) }
+                    if !state.localLLM.loaded { Text("A downloaded local model resumes this work when the app is idle enough. Model downloads are managed in Settings.").font(.caption) }
                 }
                 Section("From your journals") {
                     if state.personalMemories.isEmpty {

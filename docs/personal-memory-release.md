@@ -42,6 +42,10 @@ post candidates from recent journals, without manual journal selection.
   executor. Recording/transcription, manual writing, low power, heat and suspension
   defer new requests. A native inference request already running completes first.
   Embedding passes check priority between vectors and discard interrupted results.
+  An already-downloaded model can activate after a five-second settling delay
+  only when there is pending memory work and priority checks permit it. Explicit
+  Unload prevents automatic reactivation for that session. Cached Reads retains
+  its source-match metadata across relaunch; unchanged indexing doesn't erase it.
 
 ## Validation and rollback
 

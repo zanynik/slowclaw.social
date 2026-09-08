@@ -407,6 +407,7 @@ final class AppState: ObservableObject {
     @Published var memoryStatus: String?
     @Published var semanticMatches: [String: SemanticMatch] = [:]
     private var memoryRevision = 0
+    private var automaticModelActivationAllowed = true
     private var mutedInterests: Set<String> = []
     private var interestIndexTask: Task<Void, Never>?
     private var interestIndexNeedsAnotherPass = false
@@ -551,7 +552,7 @@ final class AppState: ObservableObject {
     // The version bump discards older caches wholesale — otherwise hydrated
     // items kept their dead habla.news URLs forever (the persistent-404 bug:
     // the merge path preserves existing items, so old links never aged out).
-    private static let readsCacheVersion = 3
+    private static let readsCacheVersion = 4
     private static let readsCacheMaxAge: TimeInterval = 30 * 60
     private static let rssSourceLimit = 32
     private var readsRefreshInFlight = false
@@ -560,6 +561,7 @@ final class AppState: ObservableObject {
         let version: Int
         let refreshedAt: Date
         let items: [RankedFeedItem]
+        var semanticMatches: [String: SemanticMatch]?
     }
 
     // TweetClaw (post generation). The prompt is editable + persisted; processed
@@ -614,6 +616,10 @@ final class AppState: ObservableObject {
             self.readsItems = cache.items
             self.readsRefreshedAt = cache.refreshedAt
             self.readsLoadedOnce = true
+            self.semanticMatches = (cache.semanticMatches ?? [:]).filter {
+                journalInterestRecords[$0.value.journalKey]?.insight != nil && !excludedMemoryKeys.contains($0.value.journalKey)
+                    && Self.softDeletedKeys()[$0.value.journalKey] == nil
+            }
         }
 
         // Retire the old low-quality quant and the removed MTMD projector
@@ -738,6 +744,7 @@ final class AppState: ObservableObject {
 
     func unloadLocalModel() {
         guard !localModelBusy else { return }
+        automaticModelActivationAllowed = false
         localModelBusy = true
         Task {
             _ = try? await OnDeviceAIExecutor.shared.run { slowClawLocalLLMUnload() }
@@ -924,7 +931,7 @@ final class AppState: ObservableObject {
     /// new/edited entries. Audio placeholders are skipped until their real
     /// transcript is stored.
     func scheduleInterestIndexing() {
-        guard localLLM.loaded else { return }
+        guard localLLM.loaded || (automaticModelActivationAllowed && LocalModelPreset.presets.contains(where: { LocalModelStore.isDownloaded($0) })) else { return }
         guard interestIndexTask == nil else {
             interestIndexNeedsAnotherPass = true
             return
@@ -941,7 +948,6 @@ final class AppState: ObservableObject {
     }
 
     private func indexJournalInterests() async {
-        guard localLLM.loaded else { return }
         let candidates = journals.compactMap { entry -> (SlowClawMemoryEntry, String, String)? in
             let body = journalBodyOf(entry.content)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -959,7 +965,6 @@ final class AppState: ObservableObject {
             journalInterestRecords[$0.0.key]?.fingerprint != $0.2 || journalInterestRecords[$0.0.key]?.insight == nil
         }
         guard !pending.isEmpty else {
-            rebuildInterestLens()
             return
         }
 
@@ -968,20 +973,22 @@ final class AppState: ObservableObject {
             isIndexingInterests = false
             interestIndexProgress = nil
         }
+        if !localLLM.loaded {
+            interestIndexProgress = "Waiting to prepare personal memory…"
+            do {
+                try await Task.sleep(for: .seconds(5))
+                try await waitForMemoryPriority()
+            } catch { return }
+            guard automaticModelActivationAllowed else { return }
+            await ensureLocalModelActivated()
+            guard localLLM.loaded else { return }
+        }
         var changed = false
         for (offset, item) in pending.enumerated() {
             if Task.isCancelled { break }
             if Self.softDeletedKeys()[item.0.key] != nil || excludedMemoryKeys.contains(item.0.key) { continue }
             // A user-requested post should win after the current extraction.
-            while (isGeneratingPosts || audioTranscriptionInFlight || optionalAIPaused
-                   || recorder.isRecording || recorder.isTranscribing || recorder.isFinalizing
-                   || UIApplication.shared.applicationState != .active
-                   || ProcessInfo.processInfo.isLowPowerModeEnabled
-                   || ProcessInfo.processInfo.thermalState == .serious
-                   || ProcessInfo.processInfo.thermalState == .critical) && !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(300))
-            }
-            if Task.isCancelled { break }
+            do { try await waitForMemoryPriority() } catch { break }
             interestIndexProgress = "Learning from journal \(offset + 1) of \(pending.count)…"
             let sample = MemoryInsight.sample(item.1)
             let revision = memoryRevision
@@ -1021,6 +1028,17 @@ final class AppState: ObservableObject {
             readsRefreshedAt = nil
             await loadReads(force: true)
         }
+    }
+
+    private func waitForMemoryPriority() async throws {
+        while isGeneratingPosts || localModelBusy || audioTranscriptionInFlight || optionalAIPaused
+            || recorder.isRecording || recorder.isTranscribing || recorder.isFinalizing
+            || UIApplication.shared.applicationState != .active
+            || ProcessInfo.processInfo.isLowPowerModeEnabled
+            || ProcessInfo.processInfo.thermalState == .serious || ProcessInfo.processInfo.thermalState == .critical {
+            try await Task.sleep(for: .milliseconds(300))
+        }
+        try Task.checkCancellation()
     }
 
     /// Persist a user's removal as a mute, then immediately rebuild and
@@ -1422,7 +1440,7 @@ final class AppState: ObservableObject {
             }
         }
         readsRefreshedAt = Date()
-        Self.saveReadsCache(items: readsItems, refreshedAt: readsRefreshedAt!)
+        Self.saveReadsCache(items: readsItems, refreshedAt: readsRefreshedAt!, matches: semanticMatches)
         readsError = nil
         readsLoading = false
     }
@@ -1510,16 +1528,16 @@ final class AppState: ObservableObject {
         return ReadsCache(
             version: cache.version,
             refreshedAt: cache.refreshedAt,
-            items: Array(cache.items.prefix(80))
+            items: Array(cache.items.prefix(80)), semanticMatches: cache.semanticMatches
         )
     }
 
-    private static func saveReadsCache(items: [RankedFeedItem], refreshedAt: Date) {
+    private static func saveReadsCache(items: [RankedFeedItem], refreshedAt: Date, matches: [String: SemanticMatch]) {
         guard let url = readsCacheURL, !items.isEmpty else { return }
         let cache = ReadsCache(
             version: readsCacheVersion,
             refreshedAt: refreshedAt,
-            items: Array(items.prefix(80))
+            items: Array(items.prefix(80)), semanticMatches: matches
         )
         guard let data = try? JSONEncoder().encode(cache) else { return }
         try? data.write(to: url, options: .atomic)
