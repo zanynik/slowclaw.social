@@ -1,5 +1,11 @@
 import SwiftUI
 
+enum DraftFormat: String, CaseIterable, Identifiable {
+    case shortPost = "Short post"
+    case article = "Article"
+    var id: String { rawValue }
+}
+
 @MainActor
 final class BlogClaw: ObservableObject {
     static let shared = BlogClaw()
@@ -7,10 +13,10 @@ final class BlogClaw: ObservableObject {
     @Published var progress: String?
     private var task: Task<Void, Never>?
 
-    func start(entries: [SlowClawMemoryEntry], state: AppState) {
+    func start(entries: [SlowClawMemoryEntry], format: DraftFormat, state: AppState) {
         guard !running, !state.isGeneratingPosts, !entries.isEmpty else { return }
         running = true
-        progress = "Preparing BlogClaw…"
+        progress = "Preparing your draft…"
         task = Task {
             state.isGeneratingPosts = true
             defer { running = false; task = nil; state.isGeneratingPosts = false }
@@ -42,6 +48,23 @@ final class BlogClaw: ObservableObject {
                     notes.append(String(summary.prefix(450)))
                 }
                 let source = notes.joined(separator: "\n\n")
+                if format == .shortPost {
+                    try Task.checkCancellation()
+                    progress = "Writing your short post…"
+                    let post = try await state.aiChat(
+                        system: state.tweetClawPrompt + "\nUse only these source notes. Write a single post under 300 characters; no invented facts or preamble.",
+                        message: source, temperature: 0.5)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    try Task.checkCancellation()
+                    guard post.count > 10, post.count <= 300 else {
+                        throw PublishingError.message("The draft didn't fit a short post. Try one source journal or choose Article.")
+                    }
+                    try state.memory.store(key: "draft_" + UUID().uuidString.lowercased(),
+                        content: post, category: "core", sessionID: "drafts")
+                    await state.refreshJournals()
+                    progress = "Draft saved for your review."
+                    return
+                }
                 let title = try await state.aiTitle(transcript: source)
                 let key = "draft_blog_" + UUID().uuidString.lowercased()
                 var body = ""
@@ -61,7 +84,7 @@ final class BlogClaw: ObservableObject {
                         category: "core", sessionID: "drafts", source: "blogclaw", mediaURL: nil)
                     await state.refreshJournals()
                 }
-                progress = "Blog draft saved. Review and edit it before publishing."
+                progress = "Article saved for your review."
             } catch is CancellationError {
                 progress = "Stopped. Any completed sections are saved in Drafts."
             } catch { progress = error.localizedDescription }
@@ -75,6 +98,7 @@ struct BlogClawPicker: View {
     @EnvironmentObject var state: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var selected: Set<String> = []
+    @State private var format: DraftFormat = .shortPost
     private var eligible: [SlowClawMemoryEntry] {
         state.journals.filter { $0.content.count > 30 && !($0.mediaURL != nil && AppState.needsTranscript($0.content)) }
     }
@@ -82,7 +106,12 @@ struct BlogClawPicker: View {
         NavigationStack {
             List {
                 Section {
-                    Text("Choose up to three journals. BlogClaw extracts notes, then writes a short article in sections. Your journals stay private.")
+                    Picker("Format", selection: $format) {
+                        ForEach(DraftFormat.allCases) { option in
+                            Text(option.rawValue).tag(option)
+                        }
+                    }.pickerStyle(.segmented)
+                    Text("Choose up to three journals. Review the draft before sharing.")
                     Text("For this small model, each source is limited to its first 7,200 characters. Review the result for omissions and personal details.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -104,12 +133,12 @@ struct BlogClawPicker: View {
                     }
                 }
             }
-            .navigationTitle("BlogClaw")
+            .navigationTitle("Create")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Create draft") {
-                        BlogClaw.shared.start(entries: eligible.filter { selected.contains($0.key) }, state: state)
+                        BlogClaw.shared.start(entries: eligible.filter { selected.contains($0.key) }, format: format, state: state)
                         dismiss()
                     }.disabled(selected.isEmpty)
                 }
