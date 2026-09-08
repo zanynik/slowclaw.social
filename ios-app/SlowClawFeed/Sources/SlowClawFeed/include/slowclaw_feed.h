@@ -22,6 +22,9 @@
 extern "C" {
 #endif
 
+/// Bounded semantic ranking evidence. Scalar-only, no memory ownership.
+double slowclaw_feed_semantic_score(double base, double similarity, double age_days);
+
 // ──────────────────────────────────────────────────────────────────────────
 // Common types
 // ──────────────────────────────────────────────────────────────────────────

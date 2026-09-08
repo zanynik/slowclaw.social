@@ -42,6 +42,16 @@ const feeds_ranking = @import("feeds_ranking.zig");
 const feed_catalog = @import("feed_catalog.zig");
 const local_inference = @import("local_inference.zig");
 
+/// Scalar-only ABI: no allocations, retained pointers or ownership transfer.
+export fn slowclaw_feed_semantic_score(base: f64, similarity: f64, age_days: f64) f64 {
+    return feeds_ranking.semanticScore(base, similarity, age_days);
+}
+
+test "ffi: semantic score rejects invalid evidence" {
+    try testing.expectEqual(@as(f64, 1), slowclaw_feed_semantic_score(1, std.math.nan(f64), 0));
+    try testing.expectApproxEqAbs(@as(f64, 1.9), slowclaw_feed_semantic_score(1, 1, 0), 0.0001);
+}
+
 /// C allocator — pairs with `free` on the Swift side. Using this ensures Zig
 /// and Swift agree on the heap.
 const c_allocator = std.heap.c_allocator;

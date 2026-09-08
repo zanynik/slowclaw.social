@@ -24,6 +24,24 @@ const NEG_TOPIC_MATCH_EACH: f64 = 0.25;
 const NEG_TOPIC_CAP: f64 = 0.9;
 const AI_BOOST_WEIGHT: f64 = 0.6;
 
+/// Bounded semantic evidence supplements rather than replaces quality,
+/// freshness and topic scoring. Invalid or weak evidence adds nothing.
+pub fn semanticScore(base: f64, similarity: f64, age_days: f64) f64 {
+    if (!std.math.isFinite(base)) return 0;
+    if (!std.math.isFinite(similarity) or !std.math.isFinite(age_days) or similarity <= 0.45) return base;
+    const relevance = @min(1.0, (similarity - 0.45) / 0.55);
+    const recency = @max(0.25, std.math.pow(f64, 0.5, @max(0, age_days) / 90.0));
+    return base + 0.9 * relevance * recency;
+}
+
+test "semantic evidence preserves base ranking when weak and caps strong matches" {
+    try testing.expectEqual(@as(f64, 2), semanticScore(2, 0.4, 0));
+    try testing.expectEqual(@as(f64, 2), semanticScore(2, std.math.nan(f64), 0));
+    try testing.expectApproxEqAbs(@as(f64, 2.9), semanticScore(2, 1, 0), 0.0001);
+    try testing.expectApproxEqAbs(@as(f64, 2.45), semanticScore(2, 1, 90), 0.0001);
+    try testing.expect(semanticScore(2, 50, 0) <= 2.9);
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 /// A topic (label + weight) from the user's journals. Matches the TS `Topic`.

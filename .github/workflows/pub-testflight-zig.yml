@@ -72,6 +72,10 @@ jobs:
             - name: Test inference scheduling and Nostr signing
               run: bash ios-app/Tests/run.sh
 
+            - name: Test semantic ranking and C ABI
+              working-directory: zig-src
+              run: '"${ZIG_BIN}" build test test-ffi'
+
             - name: Build Zig staticlib (iOS device)
               working-directory: zig-src
               run: |

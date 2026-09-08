@@ -2,6 +2,36 @@ import XCTest
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
+    func testMemoryRejectsInventedSourcePassagesAndUnsupportedKinds() {
+        let source = "SlowClaw journals explore ways to grow a community garden."
+        let valid = #"{"summary":"Exploring a community garden project.","excerpt":"explore ways to grow a community garden","kind":"project","topics":["gardens"],"post":null}"#
+        XCTAssertNotNil(MemoryInsight.parse(valid, source: source))
+        XCTAssertNil(MemoryInsight.parse(valid, source: "A different source entirely."))
+        XCTAssertNil(MemoryInsight.parse(valid.replacingOccurrences(of: "\"project\"", with: "\"personality\""), source: source))
+        XCTAssertNil(MemoryInsight.parse("{broken", source: source))
+    }
+
+    func testMemorySamplesLongJournalsAcrossBeginningMiddleAndEnd() {
+        let source = "Beginning " + String(repeating: "a", count: 2500) + " middle " + String(repeating: "b", count: 2500) + " ending"
+        let sample = MemoryInsight.sample(source)
+        XCTAssertTrue(sample.contains("Beginning"))
+        XCTAssertTrue(sample.contains("middle"))
+        XCTAssertTrue(sample.contains("ending"))
+        XCTAssertLessThan(sample.count, 1850)
+        XCTAssertEqual(MemoryInsight.sample("Short source"), "Short source")
+    }
+
+    func testAutomaticPostRejectsOverlongAndContactBearingCandidates() {
+        XCTAssertNil(MemoryInsight.validPost(String(repeating: "a", count: 301)))
+        XCTAssertNil(MemoryInsight.validPost("Please contact slowclaw_user@example.com to learn more."))
+        XCTAssertNil(MemoryInsight.validPost(nil))
+        XCTAssertNotNil(MemoryInsight.validPost("I wonder how shared gardens could help a community learn together."))
+    }
+
+    func testCorrectedMemoryPreservesOriginalEvidenceAcrossRelaunch() throws {
+        let insight = MemoryInsight(summary: "An open question, not a firm belief.", excerpt: "I wonder whether this would work.", kind: .question, corrected: true)
+        XCTAssertEqual(try JSONDecoder().decode(MemoryInsight.self, from: JSONEncoder().encode(insight)), insight)
+    }
     func testCasualReadingDecaysAndCuriosityDoesNotTrain() {
         let now = Date(timeIntervalSince1970: 1000000)
         let casual = ReadingSignal(topics: ["gardens"], date: now, preference: 0)
