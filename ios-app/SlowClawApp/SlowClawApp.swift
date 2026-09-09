@@ -1199,7 +1199,14 @@ final class AppState: ObservableObject {
         scheduleInterestIndexing()
     }
 
-    var contextRevision: Int { memoryRevision }
+    // Reading history also rebuilds the feed lens. It must not erase the
+    // evidence the user just opened when they return from the reader.
+    var contextRevision: String {
+        Self.interestFingerprint(personalMemories.map { row in
+            row.id + "|" + (journalInterestRecords[row.id]?.fingerprint ?? "")
+                + "|" + row.insight.summary + "|" + row.insight.kind.rawValue
+        }.joined(separator: "\n"))
+    }
 
     var contextWorkPaused: Bool {
         recorder.isRecording || recorder.isTranscribing || recorder.isFinalizing || audioTranscriptionInFlight
