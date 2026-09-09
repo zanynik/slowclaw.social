@@ -49,6 +49,7 @@ pub const InferenceError = error{
     ModelNotLoaded,
     ModelLoadFailed,
     ContextCreateFailed,
+    ContextLimitExceeded,
     TokenizationFailed,
     InferenceFailed,
     OutOfMemory,
@@ -247,11 +248,14 @@ pub const LocalInference = struct {
         // context must fit prompt + generation headroom. Over-long prompts
         // keep the first 80% and last 20% so the model sees both the
         // instruction and the tail of the content.
-        const max_ctx: u32 = if (builtin.os.tag == .ios or isMiniCPM5(g_model_id)) 1536 else 4096;
+        const max_ctx: u32 = contextCeiling(g_model_id, max_tokens, builtin.os.tag == .ios);
         const gen_headroom: u32 = @min(max_tokens, max_ctx / 2);
         const max_prompt_tokens: usize = max_ctx - gen_headroom - 8;
         var truncated: []llama.llama_token = tokens;
         if (n_prompt > max_prompt_tokens) {
+            // Long-form callers supply original passages in one request. Fail
+            // explicitly rather than silently discarding part of their source.
+            if (max_tokens > 512) return error.ContextLimitExceeded;
             const keep_start = max_prompt_tokens * 4 / 5;
             const keep_end = max_prompt_tokens - keep_start;
             const buf = allocator.alloc(llama.llama_token, max_prompt_tokens) catch return error.OutOfMemory;
@@ -434,6 +438,17 @@ fn isMiniCPM5(model_id: []const u8) bool {
     const len = @min(model_id.len, buf.len);
     const lower = std.ascii.lowerString(buf[0..len], model_id[0..len]);
     return std.mem.indexOf(u8, lower, "minicpm5") != null;
+}
+
+fn contextCeiling(model_id: []const u8, max_tokens: u32, ios: bool) u32 {
+    if (isMiniCPM5(model_id)) return if (max_tokens > 512) 4096 else 1536;
+    return if (ios) 1536 else 4096;
+}
+
+test "only MiniCPM5 long-form expands the iPhone context" {
+    try testing.expectEqual(@as(u32, 4096), contextCeiling("MiniCPM5 2.6B", 1024, true));
+    try testing.expectEqual(@as(u32, 1536), contextCeiling("MiniCPM5 2.6B", 384, true));
+    try testing.expectEqual(@as(u32, 1536), contextCeiling("Gemma 4 E2B", 1024, true));
 }
 
 fn buildFallbackPrompt(
@@ -638,6 +653,29 @@ test "local llm: load + chat (requires SLOWCLAW_TEST_GGUF)" {
             const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, answer, .{});
             defer parsed.deinit();
             try testing.expectEqualStrings("gardens", parsed.value.object.get("topic").?.string);
+
+            // One request with enough source tokens + output reserve to exceed
+            // the previous 1536-token context. Use the same ceiling as iPhone.
+            const article_source = "Original journal passages:\n" ++
+                ("I am exploring a shared garden. I enjoyed planting beans, but watering schedules were difficult. I do not yet know whether shared responsibility works better. " ** 30);
+            const article = try chat(testing.allocator,
+                "Write one complete first-person article of 250–350 words from the original passages. Title on the first line, then distinct paragraphs. Develop each idea once; no repeated introduction or conclusion. Preserve uncertainty. Invent no facts. Output only the draft.",
+                article_source, 1024, 0.0);
+            defer testing.allocator.free(article);
+            try testing.expect(article.len > 500);
+            try testing.expect(std.mem.indexOf(u8, article, "<think>") == null);
+            var paragraphs = std.mem.splitSequence(u8, article, "\n\n");
+            var unique = std.StringHashMap(void).init(testing.allocator);
+            defer unique.deinit();
+            while (paragraphs.next()) |paragraph| {
+                const trimmed = std.mem.trim(u8, paragraph, " \n\r\t");
+                if (trimmed.len < 60) continue;
+                try testing.expect(!unique.contains(trimmed));
+                try unique.put(trimmed, {});
+            }
+            std.debug.print("single-pass article: {d} bytes, {d} distinct paragraphs\n", .{ article.len, unique.count() });
+            try testing.expectError(error.ContextLimitExceeded,
+                chat(testing.allocator, "Write an article.", "word " ** 5000, 1024, 0.0));
         }
     }
 }

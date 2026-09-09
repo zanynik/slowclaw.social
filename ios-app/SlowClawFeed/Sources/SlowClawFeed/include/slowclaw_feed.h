@@ -24,6 +24,8 @@ extern "C" {
 
 /// Bounded semantic ranking evidence. Scalar-only, no memory ownership.
 double slowclaw_feed_semantic_score(double base, double similarity, double age_days);
+/* Local retrieval relevance; lexical fallback when semantic vectors are unavailable. */
+double slowclaw_feed_context_score(double lexical, double similarity);
 
 // ──────────────────────────────────────────────────────────────────────────
 // Common types
@@ -48,6 +50,7 @@ typedef struct SlowclawSqlite SlowclawSqlite;
 #define SLOWCLAW_ERR_OUT_OF_MEMORY (-2)
 #define SLOWCLAW_ERR_INTERNAL (-3)
 #define SLOWCLAW_ERR_EMBEDDER_MISMATCH (-4)
+#define SLOWCLAW_ERR_CONTEXT_LIMIT (-5)
 
 // ──────────────────────────────────────────────────────────────────────────
 // Universal deallocator

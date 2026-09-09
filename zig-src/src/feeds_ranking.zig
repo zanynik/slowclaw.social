@@ -34,6 +34,19 @@ pub fn semanticScore(base: f64, similarity: f64, age_days: f64) f64 {
     return base + 0.9 * relevance * recency;
 }
 
+/// Retrieval is relevance, not agreement. Do not decay old experiences away.
+pub fn contextScore(lexical: f64, similarity: f64) f64 {
+    const words = if (std.math.isFinite(lexical)) @max(0, @min(1, lexical)) else 0;
+    return semanticScore(words * 0.6, similarity, 0);
+}
+
+test "context retrieval keeps lexical fallback and rejects invalid geometry" {
+    try testing.expectEqual(@as(f64, 0.6), contextScore(1, std.math.nan(f64)));
+    try testing.expectEqual(@as(f64, 0), contextScore(0, 0.4));
+    try testing.expect(contextScore(0, 0.85) > contextScore(0.2, 0));
+    try testing.expectEqual(@as(f64, 0), contextScore(std.math.nan(f64), std.math.nan(f64)));
+}
+
 test "semantic evidence preserves base ranking when weak and caps strong matches" {
     try testing.expectEqual(@as(f64, 2), semanticScore(2, 0.4, 0));
     try testing.expectEqual(@as(f64, 2), semanticScore(2, std.math.nan(f64), 0));

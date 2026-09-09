@@ -24,6 +24,31 @@ actor SemanticMemory {
     private var models: [NLLanguage: NLEmbedding] = [:]
     private var cache: [String: Vector] = [:]
 
+    /// Hybrid personal-context/evidence retrieval. Exact-word fallback works
+    /// without language assets; old sources retain their relevance.
+    func retrieve(query: String, documents: [ContextDocument], limit: Int = 5,
+                  shouldPause: @MainActor @Sendable () -> Bool) async -> [String] {
+        defer { cache.removeAll(keepingCapacity: false) }
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+        let queryVector = vector(query)
+        var scored: [(String, Double)] = []
+        for document in documents.prefix(128) {
+            if Task.isCancelled { return [] }
+            if await shouldPause() { return [] }
+            var similarity = 0.0
+            if let a = queryVector, let b = vector(document.title + " " + document.text),
+               a.language == b.language, a.values.count == b.values.count {
+                var dot = 0.0, normA = 0.0, normB = 0.0
+                for (x, y) in zip(a.values, b.values) { dot += x * y; normA += x * x; normB += y * y }
+                if normA > 0 && normB > 0 { similarity = dot / sqrt(normA * normB) }
+            }
+            let lexical = ContextTools.lexicalMatch(query: query, text: document.title + " " + document.text)
+            let score = slowclaw_feed_context_score(lexical, similarity)
+            if score >= 0.12 { scored.append((document.id, score)) }
+        }
+        return scored.sorted { $0.1 == $1.1 ? $0.0 < $1.0 : $0.1 > $1.1 }.prefix(max(0, min(limit, 8))).map(\.0)
+    }
+
     private func vector(_ text: String) -> Vector? {
         let bounded = String(text.prefix(900))
         if let existing = cache[bounded] { return existing }

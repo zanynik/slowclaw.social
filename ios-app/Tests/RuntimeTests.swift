@@ -2,6 +2,61 @@ import XCTest
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
+    func testLiveEvidenceProviderReturnsPublicSources() async throws {
+        guard ProcessInfo.processInfo.environment["SLOWCLAW_TEST_EVIDENCE"] == "1" else { throw XCTSkip("Opt-in live provider smoke") }
+        let results = try await EvidenceSearch.search(query: "community gardening")
+        XCTAssertFalse(results.isEmpty)
+        XCTAssertTrue(results.allSatisfy { $0.url.host == "en.wikipedia.org" && !$0.excerpt.isEmpty })
+    }
+    func testGroundedReflectionRejectsFabricatedAndUnrelatedCitations() {
+        let sources = ["J1": "I felt calmer after walking through the garden.", "E1": "Walking can provide an opportunity for physical activity."]
+        let valid = #"{"observation":"Walking appeared to help on this occasion.","question":"What else was different that day?","citations":[{"id":"J1","quote":"felt calmer after walking"}]}"#
+        XCTAssertNotNil(GroundedReflection.parse(valid, sources: sources))
+        XCTAssertNil(GroundedReflection.parse(valid.replacingOccurrences(of: "felt calmer", with: "felt angry"), sources: sources))
+        XCTAssertNil(GroundedReflection.parse(valid.replacingOccurrences(of: "J1", with: "J99"), sources: sources))
+        XCTAssertNil(GroundedReflection.parse(valid, sources: [:]))
+        let externalOnly = #"{"observation":"Walking appeared to help on this occasion.","question":"What else was different that day?","citations":[{"id":"E1","quote":"Walking can provide an opportunity"}]}"#
+        XCTAssertNil(GroundedReflection.parse(externalOnly, sources: sources))
+    }
+
+    func testEvidenceSearchOnlySendsExplicitQueryToFixedPublicEndpoint() throws {
+        let request = try EvidenceSearch.request(query: "gardens & wellbeing")
+        let url = try XCTUnwrap(request.url)
+        XCTAssertEqual(url.host, "en.wikipedia.org")
+        let items = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
+        XCTAssertEqual(items.first { $0.name == "gsrsearch" }?.value, "gardens & wellbeing")
+        XCTAssertThrowsError(try EvidenceSearch.request(query: "slowclaw_user@example.com"))
+        XCTAssertThrowsError(try EvidenceSearch.request(query: "https://example.com/private"))
+        XCTAssertThrowsError(try EvidenceSearch.request(query: String(repeating: "a", count: 81)))
+        let result = try EvidenceSearch.decode(Data(#"{"query":{"pages":[{"pageid":42,"title":"Gardening","extract":"Gardening is cultivating plants.","index":1}]}}"#.utf8))
+        XCTAssertEqual(result.first?.url.absoluteString, "https://en.wikipedia.org/?curid=42")
+        XCTAssertEqual(result.first?.excerpt, "Gardening is cultivating plants.")
+    }
+
+    func testSinglePassSourceSamplesEveryJournalWithinUTF8Budget() {
+        let source = "Beginning " + String(repeating: "園🐾 ", count: 3000) + " Ending"
+        let result = DraftBudget.source([source, "Second source", "Third source"], miniCPM: true)
+        XCTAssertTrue(result.contains("Beginning"))
+        XCTAssertTrue(result.contains("Ending"))
+        XCTAssertTrue(result.contains("Second source"))
+        XCTAssertTrue(result.contains("Third source"))
+        XCTAssertLessThan(result.utf8.count, 6100)
+        XCTAssertLessThan(DraftBudget.source([source], miniCPM: false).utf8.count, 1650)
+        XCTAssertEqual(DraftBudget.source([], miniCPM: true), "")
+    }
+
+    func testRetrievalWordsDoNotConfuseRelevanceWithAgreement() {
+        XCTAssertEqual(ContextTools.lexicalMatch(query: "gardens", text: "Gardens are not useful."), 1)
+        XCTAssertEqual(ContextTools.lexicalMatch(query: "the and", text: "the and"), 0)
+        XCTAssertEqual(ContextTools.lexicalMatch(query: "gardens", text: "Traffic and roads"), 0)
+    }
+
+    func testMemoryKindsRemainEditableWithoutTurningClaimsIntoFacts() throws {
+        for kind in MemoryInsight.Kind.allCases {
+            let memory = MemoryInsight(summary: "An explicitly stated view.", excerpt: "I think this might be helpful.", kind: kind)
+            XCTAssertEqual(try JSONDecoder().decode(MemoryInsight.self, from: JSONEncoder().encode(memory)), memory)
+        }
+    }
     func testMemoryRejectsInventedSourcePassagesAndUnsupportedKinds() {
         let source = "SlowClaw journals explore ways to grow a community garden."
         let valid = #"{"summary":"Exploring a community garden project.","excerpt":"explore ways to grow a community garden","kind":"project","topics":["gardens"],"post":null}"#

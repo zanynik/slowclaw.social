@@ -47,6 +47,15 @@ export fn slowclaw_feed_semantic_score(base: f64, similarity: f64, age_days: f64
     return feeds_ranking.semanticScore(base, similarity, age_days);
 }
 
+export fn slowclaw_feed_context_score(lexical: f64, similarity: f64) f64 {
+    return feeds_ranking.contextScore(lexical, similarity);
+}
+
+test "ffi: context retrieval supports lexical fallback" {
+    try testing.expectEqual(@as(f64, 0.6), slowclaw_feed_context_score(1, 0));
+    try testing.expectEqual(@as(f64, 0), slowclaw_feed_context_score(0, std.math.nan(f64)));
+}
+
 test "ffi: semantic score rejects invalid evidence" {
     try testing.expectEqual(@as(f64, 1), slowclaw_feed_semantic_score(1, std.math.nan(f64), 0));
     try testing.expectApproxEqAbs(@as(f64, 1.9), slowclaw_feed_semantic_score(1, 1, 0), 0.0001);
@@ -83,6 +92,7 @@ pub const SLOWCLAW_ERR_INVALID_ARGUMENT: c_int = -1;
 pub const SLOWCLAW_ERR_OUT_OF_MEMORY: c_int = -2;
 pub const SLOWCLAW_ERR_INTERNAL: c_int = -3;
 pub const SLOWCLAW_ERR_EMBEDDER_MISMATCH: c_int = -4;
+pub const SLOWCLAW_ERR_CONTEXT_LIMIT: c_int = -5;
 
 /// An interest vector for ranking. Strings are caller-owned UTF-8 + length
 /// (Zig does not free them). `embedding` is a pointer to `embedding_len` f32s.
@@ -970,6 +980,7 @@ pub export fn slowclaw_feed_local_llm_chat(
     ) catch |err| {
         const status: c_int = switch (err) {
             error.ModelNotLoaded => SLOWCLAW_ERR_INVALID_ARGUMENT,
+            error.ContextLimitExceeded => SLOWCLAW_ERR_CONTEXT_LIMIT,
             error.OutOfMemory => SLOWCLAW_ERR_OUT_OF_MEMORY,
             else => SLOWCLAW_ERR_INTERNAL,
         };
