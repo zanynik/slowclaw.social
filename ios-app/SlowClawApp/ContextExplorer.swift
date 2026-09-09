@@ -70,6 +70,7 @@ struct ContextExplorer: View {
                     if let reflection {
                         Text(reflection.observation)
                         Text(reflection.question).font(.headline)
+                        FollowQuestionButton(sourceKey: journalKey, suggestion: reflection.question)
                         Text("A tentative AI reflection. Exact quotes are checked; its interpretation can still be wrong.")
                             .font(.caption).foregroundStyle(.secondary)
                         ForEach(reflection.citations, id: \.id) { citation in

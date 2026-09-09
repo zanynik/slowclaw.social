@@ -404,6 +404,9 @@ final class AppState: ObservableObject {
     @Published var automaticDrafts = UserDefaults.standard.object(forKey: "slowclaw.memory.auto-drafts") as? Bool ?? true {
         didSet { UserDefaults.standard.set(automaticDrafts, forKey: "slowclaw.memory.auto-drafts") }
     }
+    @Published var questionThreads: [QuestionThread] = []
+    @Published var questionError: String?
+    @Published var dailySelection: DailySelection?
     @Published var memoryStatus: String?
     @Published var semanticMatches: [String: SemanticMatch] = [:]
     private var memoryRevision = 0
@@ -615,6 +618,14 @@ final class AppState: ObservableObject {
         // The journal lens is durable. It paints immediately on relaunch and
         // is incrementally refreshed when the local model becomes available.
         journalInterestRecords = Self.loadJournalInterestRecords()
+        do {
+            if let record = try memory.get(key: "question_threads_v1") {
+                questionThreads = try JSONDecoder().decode([QuestionThread].self, from: Data(record.content.utf8))
+            }
+        } catch { questionError = "Saved questions could not be loaded. \(error.localizedDescription)" }
+        if let data = UserDefaults.standard.data(forKey: "slowclaw.daily-selection.v1") {
+            dailySelection = try? JSONDecoder().decode(DailySelection.self, from: data)
+        }
         mutedInterests = Set(UserDefaults.standard.stringArray(
             forKey: Self.mutedInterestsDefaultsKey) ?? [])
         rebuildInterestLens()
@@ -1150,6 +1161,77 @@ final class AppState: ObservableObject {
     private static func saveJournalInterestRecords(_ records: [String: JournalInterestRecord]) {
         guard let data = try? JSONEncoder().encode(records) else { return }
         UserDefaults.standard.set(data, forKey: interestIndexDefaultsKey)
+    }
+
+    var visibleQuestionThreads: [QuestionThread] {
+        questionThreads.filter { $0.sourceKeys.contains { contextDocument($0) != nil } }
+            .sorted { $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt }
+    }
+
+    private func saveQuestions(_ threads: [QuestionThread]) throws {
+        let data = try JSONEncoder().encode(threads)
+        try memory.store(key: "question_threads_v1", content: String(decoding: data, as: UTF8.self), category: "question_threads")
+        questionThreads = threads
+    }
+
+    @discardableResult
+    func followQuestion(_ question: String, sourceKey: String) throws -> String {
+        guard contextDocument(sourceKey) != nil else { throw PublishingError.message("This source is no longer available.") }
+        let text = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let existing = questionThreads.first(where: { $0.question.caseInsensitiveCompare(text) == .orderedSame }) {
+            try linkQuestion(existing.id, sourceKey: sourceKey)
+            return existing.id
+        }
+        guard questionThreads.count < 100, let thread = QuestionThread.make(question: text, sourceKey: sourceKey) else {
+            throw PublishingError.message("Use a question of 5–240 characters. You can keep up to 100 questions.")
+        }
+        try saveQuestions(questionThreads + [thread])
+        return thread.id
+    }
+
+    func updateQuestion(_ id: String, question: String, note: String, status: QuestionThread.Status) throws {
+        let text = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (5...240).contains(text.count), note.count <= 2000,
+              let index = questionThreads.firstIndex(where: { $0.id == id }) else {
+            throw PublishingError.message("Keep the question under 240 characters and the observation under 2,000.")
+        }
+        var threads = questionThreads
+        threads[index].question = text; threads[index].note = note
+        threads[index].status = status; threads[index].updatedAt = Date()
+        try saveQuestions(threads)
+    }
+
+    func linkQuestion(_ id: String, sourceKey: String) throws {
+        guard contextDocument(sourceKey) != nil,
+              let index = questionThreads.firstIndex(where: { $0.id == id }) else { return }
+        var threads = questionThreads
+        guard !threads[index].sourceKeys.contains(sourceKey) else { return }
+        guard threads[index].sourceKeys.count < 30 else { throw PublishingError.message("This question already has 30 kept experiences.") }
+        threads[index].sourceKeys.append(sourceKey); threads[index].updatedAt = Date()
+        try saveQuestions(threads)
+    }
+
+    func removeQuestion(_ id: String) throws { try saveQuestions(questionThreads.filter { $0.id != id }) }
+
+    func prepareDailySelection(now: Date = Date()) {
+        let day = DailySelection.dayKey(now)
+        guard dailySelection?.day != day, !readsItems.isEmpty else { return }
+        let candidates = readsItems.filter { readingSignals[$0.id] == nil }
+        let ids = DailySelection.select(candidates.map {
+            (id: $0.id, source: URL(string: $0.link)?.host ?? $0.sourceLabel)
+        })
+        let questions = visibleQuestionThreads.filter { $0.status == .active }.sorted { $0.id < $1.id }
+        let ordinal = Calendar.current.ordinality(of: .day, in: .era, for: now) ?? 0
+        dailySelection = DailySelection(day: day, readIDs: ids,
+            questionID: questions.isEmpty ? nil : questions[ordinal % questions.count].id)
+        saveDailySelection()
+    }
+
+    func dismissDailySelection() { dailySelection?.dismissed = true; saveDailySelection() }
+    private func saveDailySelection() {
+        if let dailySelection, let data = try? JSONEncoder().encode(dailySelection) {
+            UserDefaults.standard.set(data, forKey: "slowclaw.daily-selection.v1")
+        }
     }
 
     var personalMemories: [PersonalMemoryRow] {
@@ -3759,6 +3841,10 @@ struct ReadsView: View {
     @State private var visibleCount = 5
 
 
+    private var remainingReads: [RankedFeedItem] {
+        let ids = state.dailySelection?.dismissed == false ? Set(state.dailySelection?.readIDs ?? []) : []
+        return state.readsItems.filter { !ids.contains($0.id) }
+    }
     var body: some View {
         Group {
             if state.readsLoading && state.readsItems.isEmpty {
@@ -3808,6 +3894,7 @@ struct ReadsView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 10) {
+                        DailySelectionCard()
                         // Subtitle row matching the reference: "{N} stories · ranked by your lens".
                         HStack {
                             Text("Selected for you")
@@ -3828,10 +3915,10 @@ struct ReadsView: View {
                         }
                         .padding(.horizontal, 4)
 
-                        ForEach(Array(state.readsItems.prefix(visibleCount))) { item in
+                        ForEach(Array(remainingReads.prefix(visibleCount))) { item in
                             FeedCard(item: item, interests: state.interests)
                         }
-                        if visibleCount < state.readsItems.count {
+                        if visibleCount < remainingReads.count {
                             Button("Explore five more") { visibleCount += 5 }
                                 .padding(.vertical, 20)
                         } else {
@@ -3844,7 +3931,7 @@ struct ReadsView: View {
                     .padding(.top, 16)
                     .padding(.bottom, 24)
                 }
-                .refreshable { await state.loadReads(force: true) }
+                .refreshable { await state.loadReads(force: true); state.prepareDailySelection() }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -3853,6 +3940,7 @@ struct ReadsView: View {
             // Cached list is shown instantly if present; otherwise load. A
             // background refresh (merge, no wipe) runs when returning to the tab.
             await state.loadReads(force: false)
+            state.prepareDailySelection()
         }
     }
 }

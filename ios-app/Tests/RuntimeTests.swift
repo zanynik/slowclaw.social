@@ -2,6 +2,22 @@ import XCTest
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
+    func testQuestionRoundTripPreservesUserEditsAndLifecycle() throws {
+        var question = try XCTUnwrap(QuestionThread.make(question: "What helps the garden grow?", sourceKey: "journal_test"))
+        question.note = "A small experiment changed my view."
+        question.status = .resolved
+        question.sourceKeys.append("journal_second")
+        XCTAssertEqual(try JSONDecoder().decode(QuestionThread.self, from: JSONEncoder().encode(question)), question)
+        XCTAssertNil(QuestionThread.make(question: "   ", sourceKey: "journal_test"))
+        XCTAssertNil(QuestionThread.make(question: String(repeating: "x", count: 241), sourceKey: "journal_test"))
+    }
+    func testDailySelectionIsBoundedDistinctAndSourceDiverse() throws {
+        let selection = DailySelection.select([("a", "source_a"), ("a", "source_b"), ("b", "source_a"), ("c", "source_b"), ("d", "source_c"), ("e", "source_d")])
+        XCTAssertEqual(selection, ["a", "c", "d"])
+        let daily = DailySelection(day: "2026-1-1", readIDs: selection, questionID: "q", dismissed: true)
+        XCTAssertEqual(try JSONDecoder().decode(DailySelection.self, from: JSONEncoder().encode(daily)), daily)
+    }
+
     func testLiveEvidenceProviderReturnsPublicSources() async throws {
         guard ProcessInfo.processInfo.environment["SLOWCLAW_TEST_EVIDENCE"] == "1" else { throw XCTSkip("Opt-in live provider smoke") }
         let results = try await EvidenceSearch.search(query: "community gardening")

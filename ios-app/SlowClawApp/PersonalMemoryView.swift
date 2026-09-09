@@ -26,6 +26,10 @@ struct PersonalMemoryView: View {
                     if let status = state.memoryStatus { Text(status).font(.caption) }
                     if !state.localLLM.loaded { Text("A downloaded local model resumes this work when the app is idle enough. Model downloads are managed in Settings.").font(.caption) }
                 }
+                Section {
+                    NavigationLink("Questions you’re following") { QuestionThreadsView() }
+                    if let error = state.questionError { Text(error).font(.caption).foregroundStyle(.red) }
+                }
                 Section("From your journals") {
                     if searching { ProgressView("Searching on this device…") }
                     if state.personalMemories.isEmpty {
@@ -91,6 +95,8 @@ private struct MemoryInsightRow: View {
             } else {
                 Text(row.insight.summary)
                 NavigationLink("Explore connections") { ContextExplorer(journalKey: row.id).environmentObject(state) }
+                FollowQuestionButton(sourceKey: row.id,
+                    suggestion: row.insight.kind == .question ? row.insight.summary : "")
                 DisclosureGroup("Source passage") {
                     Text(row.insight.excerpt).font(.callout).foregroundStyle(.secondary)
                     Button("Open journal") { source = state.memorySource(row.id) }
