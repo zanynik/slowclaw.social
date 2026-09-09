@@ -9,6 +9,7 @@ cp "$APP_ROOT/SlowClawApp/DraftBudget.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/ReadingHistory.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/TranscriptSafety.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/ArticleReflection.swift" "$TEST_ROOT/Sources/Runtime/"
+cp "$APP_ROOT/SlowClawApp/ContextTools.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/PersonalMemory.swift" "$TEST_ROOT/Sources/Runtime/"
 swiftc -frontend -parse "$APP_ROOT"/SlowClawApp/*.swift
 cp "$APP_ROOT/Tests/RuntimeTests.swift" "$TEST_ROOT/Tests/RuntimeTests/"

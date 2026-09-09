@@ -780,6 +780,8 @@ private func processLocalChatResult(_ result: SlowclawChatResult) throws -> Stri
     case SLOWCLAW_OK: break
     case SLOWCLAW_ERR_INVALID_ARGUMENT:
         throw SlowClawFeedError.internalError("No on-device model is loaded.")
+    case SLOWCLAW_ERR_CONTEXT_LIMIT:
+        throw SlowClawFeedError.internalError("ContextLimitExceeded: use fewer or shorter journal passages.")
     default:
         throw SlowClawFeedError.internalError("On-device inference failed (status \(result.status))")
     }

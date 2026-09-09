@@ -2,10 +2,12 @@ import Foundation
 
 /// A source-backed observation, never an inferred personality or moral judgement.
 struct MemoryInsight: Codable, Equatable {
-    enum Kind: String, Codable, CaseIterable { case interest, project, question }
+    enum Kind: String, Codable, CaseIterable {
+        case interest, project, question, experience, interpretation, belief, value
+    }
     var summary: String
     let excerpt: String
-    let kind: Kind
+    var kind: Kind
     var corrected: Bool = false
 
     struct Extraction: Decodable {

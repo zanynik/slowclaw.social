@@ -75,7 +75,7 @@ jobs:
                   xcodegen --version
 
             - name: Test inference scheduling and Nostr signing
-              run: bash ios-app/Tests/run.sh
+              run: SLOWCLAW_TEST_EVIDENCE=1 bash ios-app/Tests/run.sh
 
             - name: Test semantic ranking and C ABI
               working-directory: zig-src
