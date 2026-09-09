@@ -12,7 +12,6 @@ on:
     push:
         branches:
             - main
-            - feat/minicpm5-comparison
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
             - ".github/workflows/scripts/asc-issue-cert-profile.js"
@@ -83,7 +82,7 @@ jobs:
               run: '"${ZIG_BIN}" build test test-ffi'
 
             - name: Test MiniCPM5 with the actual GGUF
-              if: github.ref == 'refs/heads/feat/minicpm5-comparison' || inputs.test_minicpm == true
+              if: inputs.test_minicpm == true
               timeout-minutes: 20
               run: bash ios-app/Tests/minicpm-smoke.sh
 
