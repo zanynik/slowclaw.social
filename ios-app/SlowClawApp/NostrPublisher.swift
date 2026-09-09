@@ -96,7 +96,7 @@ enum NostrIdentity {
     static func hex(_ bytes: [UInt8]) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
 }
 
-struct PublishedEvent: Codable {
+struct PublishedEvent: Codable, Sendable {
     let id: String
     let pubkey: String
     let created_at: Int
@@ -170,7 +170,30 @@ final class NostrPublisher: ObservableObject {
         }
         status = "Published · accepted by \(accepted) relay\(accepted == 1 ? "" : "s")"
         UserDefaults.standard.set(event.id, forKey: "slowclaw.nostr.receipt." + draftKey)
+        var archive = Self.confirmedEvents()
+        archive.removeAll { $0.id == event.id }
+        archive.insert(event, at: 0)
+        if let data = try? JSONEncoder().encode(Array(archive.prefix(200))) {
+            UserDefaults.standard.set(data, forKey: "slowclaw.nostr.confirmed.v1")
+        }
         return event.id
+    }
+
+    /// Existing receipts are migrated only when they match the saved signed
+    /// event. A signed attempt alone is never called a publication.
+    static func confirmedEvents(defaults: UserDefaults = .standard) -> [PublishedEvent] {
+        var result: [PublishedEvent] = []
+        if let data = defaults.data(forKey: "slowclaw.nostr.confirmed.v1") {
+            result = (try? JSONDecoder().decode([PublishedEvent].self, from: data)) ?? []
+        }
+        let prefix = "slowclaw.nostr.receipt."
+        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(prefix) {
+            let draft = String(key.dropFirst(prefix.count))
+            if let id = defaults.string(forKey: key), let data = defaults.data(forKey: "slowclaw.nostr.event." + draft),
+               let event = try? JSONDecoder().decode(PublishedEvent.self, from: data), event.id == id,
+               !result.contains(where: { $0.id == id }) { result.append(event) }
+        }
+        return result.sorted { $0.created_at > $1.created_at }
     }
 
     nonisolated private static func send(_ wire: String, id: String, relay: String) async -> Bool {

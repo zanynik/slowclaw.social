@@ -1,7 +1,83 @@
 import XCTest
+import CryptoKit
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
+    private func event(kind: Int = 1, tags: [[String]] = [], content: String = "SlowClaw test observation", date: Int = 1) throws -> PublishedEvent {
+        let secret = Array(repeating: UInt8(0), count: 31) + [UInt8(1)]
+        let key = try NostrIdentity.publicKey(secret)
+        let canonical = try JSONSerialization.data(withJSONObject: [0, key, date, kind, tags, content], options: [.withoutEscapingSlashes])
+        let hash = Array(SHA256.hash(data: canonical))
+        return PublishedEvent(id: NostrIdentity.hex(hash), pubkey: key, created_at: date,
+            kind: kind, tags: tags, content: content, sig: try NostrIdentity.sign(hash: hash, secret: secret))
+    }
+    func testRelayEventVerificationRejectsTamperingAndFutureEvents() throws {
+        let valid = try event(content: "SlowClaw \"quote\" and https://example.com/ 🐾")
+        XCTAssertTrue(NostrEventVerifier.verify(valid))
+        let forged = PublishedEvent(id: valid.id, pubkey: valid.pubkey, created_at: valid.created_at,
+            kind: valid.kind, tags: valid.tags, content: "Changed", sig: valid.sig)
+        XCTAssertFalse(NostrEventVerifier.verify(forged))
+        XCTAssertFalse(NostrEventVerifier.verify(try event(date: Int(Date().timeIntervalSince1970) + 3600)))
+        XCTAssertNil(NostrEventVerifier.bytes("zz", count: 1))
+    }
+    func testConversationRulesSeparateMentionsRepliesAndEmoji() throws {
+        let post = try event()
+        let mention = try event(tags: [["e", post.id, "", "mention"]])
+        let reply = try event(tags: [["e", post.id, "", "root"]])
+        let other = try event(tags: [["e", post.id, "", "mention"], ["e", "other", "", "reply"]])
+        XCTAssertFalse(NostrConversationRules.belongs(mention, to: post))
+        XCTAssertFalse(NostrConversationRules.belongs(other, to: post))
+        XCTAssertEqual(NostrConversationRules.replies([reply, reply, mention], to: post).count, 1)
+        let like = try event(kind: 7, tags: [["e", post.id]], content: "+", date: 2)
+        let emoji = try event(kind: 7, tags: [["e", post.id]], content: "🐾", date: 3)
+        XCTAssertEqual(NostrConversationRules.likes([like, like], to: post), 1)
+        XCTAssertEqual(NostrConversationRules.likes([like, emoji], to: post), 0)
+        let elsewhere = try event(kind: 7, tags: [["e", post.id], ["e", "other"]], content: "+")
+        XCTAssertFalse(NostrConversationRules.belongs(elsewhere, to: post))
+    }
+    func testArticleCommentScopesAndReplaceablePublications() throws {
+        let old = try event(kind: 30023, tags: [["d", "article_test"]])
+        let updated = try event(kind: 30023, tags: old.tags, content: "Updated SlowClaw article", date: 2)
+        let reply = try event(kind: 1111, tags: [["A", old.address!], ["K", "30023"], ["P", old.pubkey], ["k", "30023"], ["p", old.pubkey]])
+        XCTAssertTrue(NostrConversationRules.belongs(reply, to: updated))
+        XCTAssertFalse(NostrConversationRules.belongs(try event(kind: 1111, tags: [["A", old.address!]]), to: old))
+        XCTAssertEqual(NostrConversationRules.mergedPosts([old, updated, updated], author: old.pubkey).map(\.id), [updated.id])
+    }
+    @MainActor
+    func testSignedAttemptIsNotMistakenForConfirmedPublication() throws {
+        let suite = "slowclaw_test_" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let signed = try event()
+        defaults.set(try JSONEncoder().encode(signed), forKey: "slowclaw.nostr.event.draft_test")
+        XCTAssertTrue(NostrPublisher.confirmedEvents(defaults: defaults).isEmpty)
+        defaults.set("wrong_event", forKey: "slowclaw.nostr.receipt.draft_test")
+        XCTAssertTrue(NostrPublisher.confirmedEvents(defaults: defaults).isEmpty)
+        defaults.set(signed.id, forKey: "slowclaw.nostr.receipt.draft_test")
+        XCTAssertEqual(NostrPublisher.confirmedEvents(defaults: defaults).first?.id, signed.id)
+    }
+
+    func testQuestionMetadataAndDraftsNeverEnterJournalCaptureOrIndexing() {
+        XCTAssertFalse(QuestionThread.isJournalRecord(key: "question_threads_v1", category: "question_threads", sessionID: "app_metadata"))
+        XCTAssertFalse(QuestionThread.isJournalRecord(key: "draft_test", category: "core", sessionID: "drafts"))
+        XCTAssertTrue(QuestionThread.isJournalRecord(key: "journal_test", category: "daily", sessionID: nil))
+    }
+    func testQuestionRoundTripPreservesUserEditsAndLifecycle() throws {
+        var question = try XCTUnwrap(QuestionThread.make(question: "What helps the garden grow?", sourceKey: "journal_test"))
+        question.note = "A small experiment changed my view."
+        question.status = .resolved
+        question.sourceKeys.append("journal_second")
+        XCTAssertEqual(try JSONDecoder().decode(QuestionThread.self, from: JSONEncoder().encode(question)), question)
+        XCTAssertNil(QuestionThread.make(question: "   ", sourceKey: "journal_test"))
+        XCTAssertNil(QuestionThread.make(question: String(repeating: "x", count: 241), sourceKey: "journal_test"))
+    }
+    func testDailySelectionIsBoundedDistinctAndSourceDiverse() throws {
+        let selection = DailySelection.select([("a", "source_a"), ("a", "source_b"), ("b", "source_a"), ("c", "source_b"), ("d", "source_c"), ("e", "source_d")])
+        XCTAssertEqual(selection, ["a", "c", "d"])
+        let daily = DailySelection(day: "2026-1-1", readIDs: selection, questionID: "q", dismissed: true)
+        XCTAssertEqual(try JSONDecoder().decode(DailySelection.self, from: JSONEncoder().encode(daily)), daily)
+    }
+
     func testLiveEvidenceProviderReturnsPublicSources() async throws {
         guard ProcessInfo.processInfo.environment["SLOWCLAW_TEST_EVIDENCE"] == "1" else { throw XCTSkip("Opt-in live provider smoke") }
         let results = try await EvidenceSearch.search(query: "community gardening")
