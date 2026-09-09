@@ -105,6 +105,7 @@ struct QuestionThreadView: View {
                 }
             } else { Text("This question's sources are unavailable or excluded.") }
         }
+        .buttonStyle(.borderless)
         .navigationTitle("Following a question")
         .onAppear { if let thread { question = thread.question; note = thread.note; status = thread.status } }
         .task(id: (thread?.question ?? "") + state.contextRevision + String(state.readsItems.count)) {
@@ -165,6 +166,7 @@ private struct FollowQuestionSheet: View {
                 }
                 if let error { Text(error).foregroundStyle(.red) }
             }
+            .buttonStyle(.borderless)
             .navigationTitle("Follow a question")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
             .onAppear { question = suggestion }
@@ -206,7 +208,10 @@ struct DailySelectionCard: View {
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
             .sheet(isPresented: $showingQuestions) {
                 NavigationStack {
-                    if let id = selection.questionID { QuestionThreadView(threadID: id) }
+                    if let id = selection.questionID {
+                        QuestionThreadView(threadID: id)
+                            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showingQuestions = false } } }
+                    }
                 }
             }
         }

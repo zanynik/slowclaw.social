@@ -141,6 +141,7 @@ private struct NostrPostDetail: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
+        .buttonStyle(.borderless)
         .navigationTitle(post.kind == 30023 ? "Your article" : "Your post")
         .task { await inbox.refresh(force: true, post: post); inbox.markRead(post) }
         .refreshable { await inbox.refresh(force: true, post: post); inbox.markRead(post) }

@@ -3840,6 +3840,7 @@ struct JournalView: View {
 
 struct ReadsView: View {
     @Environment(\.colorScheme) var scheme
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject var state: AppState
     @State private var visibleCount = 5
 
@@ -3939,6 +3940,12 @@ struct ReadsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.bg(scheme))
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { state.prepareDailySelection() }
+        }
+        .onChange(of: state.selectedTab) { _, tab in
+            if tab == .reads { state.prepareDailySelection() }
+        }
         .task {
             // Cached list is shown instantly if present; otherwise load. A
             // background refresh (merge, no wipe) runs when returning to the tab.
