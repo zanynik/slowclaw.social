@@ -759,14 +759,24 @@ final class AppState: ObservableObject {
     func deleteLocalModel(_ preset: LocalModelPreset) {
         guard !localModelBusy else { return }
         localModelBusy = true
+        let shouldUnload = loadedLocalModelPresetID == preset.id
+            || (localLLM.loaded && loadedLocalModelPresetID == nil)
         Task {
             defer { localModelBusy = false }
-            _ = try? await OnDeviceAIExecutor.shared.run {
-                slowClawLocalLLMUnload()
-                try LocalModelStore.delete(preset)
+            do {
+                try await OnDeviceAIExecutor.shared.run {
+                    if shouldUnload { slowClawLocalLLMUnload() }
+                    try LocalModelStore.delete(preset)
+                }
+                if UserDefaults.standard.string(forKey: "slowclaw.local-model.preferred") == preset.id {
+                    UserDefaults.standard.removeObject(forKey: "slowclaw.local-model.preferred")
+                }
+                localModelProgress[preset.id] = nil
+                localModelError = nil
+            } catch {
+                localModelError = "Could not delete the model: \(error.localizedDescription)"
             }
-            loadedLocalModelPresetID = nil
-            localModelProgress[preset.id] = nil
+            if shouldUnload { loadedLocalModelPresetID = nil }
             refreshLocalLLMStatus()
         }
     }
