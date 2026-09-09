@@ -247,7 +247,7 @@ pub const LocalInference = struct {
         // context must fit prompt + generation headroom. Over-long prompts
         // keep the first 80% and last 20% so the model sees both the
         // instruction and the tail of the content.
-        const max_ctx: u32 = if (builtin.os.tag == .ios) 1536 else 4096;
+        const max_ctx: u32 = if (builtin.os.tag == .ios or isMiniCPM5(g_model_id)) 1536 else 4096;
         const gen_headroom: u32 = @min(max_tokens, max_ctx / 2);
         const max_prompt_tokens: usize = max_ctx - gen_headroom - 8;
         var truncated: []llama.llama_token = tokens;
@@ -387,6 +387,10 @@ fn buildChatPrompt(
     message: []const u8,
 ) ![]u8 {
     if (have_llama) {
+        // The C template API cannot pass enable_thinking=false to Jinja.
+        // Use the publisher's text-only ChatML form with its closed thinking
+        // prefix, so small journal requests produce final answers directly.
+        if (isMiniCPM5(g_model_id)) return buildFallbackPrompt(allocator, system_prompt, message, g_model_id);
         // Try the model's embedded chat template first (two-pass sizing).
         if (llama.llama_model_chat_template(model, null)) |tmpl| {
             var msgs: [2]llama.llama_chat_message = undefined;
@@ -425,6 +429,13 @@ fn buildChatPrompt(
 /// Manual chat formats keyed by model family, ported verbatim from
 /// build_fallback_prompt in inference.rs. Used when the embedded Jinja
 /// template is missing or fails in llama.cpp's template engine.
+fn isMiniCPM5(model_id: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    const len = @min(model_id.len, buf.len);
+    const lower = std.ascii.lowerString(buf[0..len], model_id[0..len]);
+    return std.mem.indexOf(u8, lower, "minicpm5") != null;
+}
+
 fn buildFallbackPrompt(
     allocator: std.mem.Allocator,
     system_prompt: ?[]const u8,
@@ -437,7 +448,13 @@ fn buildFallbackPrompt(
 
     var prompt = std.ArrayList(u8).empty;
     errdefer prompt.deinit(allocator);
-    if (std.mem.indexOf(u8, id_lower, "gemma-4") != null or std.mem.indexOf(u8, id_lower, "gemma4") != null) {
+    if (isMiniCPM5(model_id)) {
+        if (system_prompt) |sys| {
+            try prompt.print(allocator, "<|im_start|>system\n{s}<|im_end|>\n", .{sys});
+        }
+        // BOS is supplied once by llama_tokenize(add_special=true).
+        try prompt.print(allocator, "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", .{message});
+    } else if (std.mem.indexOf(u8, id_lower, "gemma-4") != null or std.mem.indexOf(u8, id_lower, "gemma4") != null) {
         // Gemma 4: <|turn>role / <turn|> (NOT Gemma 3's <start_of_turn>).
         if (system_prompt) |sys| {
             try prompt.print(allocator, "<|turn>system\n{s}\n<turn|>\n", .{sys});
@@ -529,6 +546,16 @@ pub fn loadedModelId() []const u8 {
 
 const testing = std.testing;
 
+test "MiniCPM5 prompt uses direct-answer template and preserves source" {
+    const prompt = try buildFallbackPrompt(testing.allocator, "Extract a topic.", "A community garden.", "MiniCPM5 2B");
+    defer testing.allocator.free(prompt);
+    try testing.expectEqualStrings("<|im_start|>system\nExtract a topic.<|im_end|>\n<|im_start|>user\nA community garden.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", prompt);
+    const plain = try buildFallbackPrompt(testing.allocator, null, "hello", "MiniCPM5-2B-Q4_K_M.gguf");
+    defer testing.allocator.free(plain);
+    try testing.expect(!std.mem.containsAtLeast(u8, plain, 1, "system"));
+    try testing.expect(!isMiniCPM5("gemma-4-E2B"));
+}
+
 test "LocalInference: init sets model path" {
     const li = LocalInference.init("/path/to/model.gguf");
     try testing.expectEqualStrings("/path/to/model.gguf", li.model_path);
@@ -603,6 +630,15 @@ test "local llm: load + chat (requires SLOWCLAW_TEST_GGUF)" {
         defer testing.allocator.free(reply);
         std.debug.print("local llm reply: {s}\n", .{reply});
         try testing.expect(reply.len > 0);
+        if (isMiniCPM5(loadedModelId())) {
+            try testing.expect(std.mem.indexOf(u8, reply, "hello") != null);
+            try testing.expect(std.mem.indexOf(u8, reply, "<think>") == null);
+            const answer = try chat(testing.allocator, "Return only valid JSON, no markdown or explanation.", "Journal: I want to grow vegetables in a community garden. Return exactly {\"topic\":\"gardens\"}.", 64, 0.0);
+            defer testing.allocator.free(answer);
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, answer, .{});
+            defer parsed.deinit();
+            try testing.expectEqualStrings("gardens", parsed.value.object.get("topic").?.string);
+        }
     }
 }
 

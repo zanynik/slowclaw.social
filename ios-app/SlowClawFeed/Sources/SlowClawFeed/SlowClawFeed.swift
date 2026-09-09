@@ -611,9 +611,7 @@ public struct LocalLLMStatus: Decodable {
     }
 }
 
-/// The single supported on-device model. Keeping one curated preset avoids
-/// confusing quality/storage choices and lets the app tune one known-good
-/// configuration for current iPhones.
+/// Curated on-device models for comparison. Only one runs at a time.
 public struct LocalModelPreset: Identifiable, Equatable {
     public let id: String
     public let title: String
@@ -637,11 +635,18 @@ public struct LocalModelPreset: Identifiable, Equatable {
     public static let presets: [LocalModelPreset] = [
         .init(id: "unsloth/gemma-4-E2B-it-qat-UD-Q4_K_XL",
               title: "Gemma 4 E2B",
-              detail: "Recommended balance of quality, speed, and memory for journals, Reads, and drafts.",
+              detail: "Your existing journal and drafting model. Keep it installed to compare with MiniCPM5.",
               fileName: "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
               downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf")!,
               sizeBytes: 2_620_000_000,
               sizeLabel: "2.5 GB"),
+        .init(id: "openbmb/MiniCPM5-2B-Q4_K_M",
+              title: "MiniCPM5 2B",
+              detail: "OpenBMB's 4-bit text model. Direct answers for journals, Reads, and drafts; compare with Gemma.",
+              fileName: "MiniCPM5-2B-Q4_K_M.gguf",
+              downloadURL: URL(string: "https://huggingface.co/openbmb/MiniCPM5-2B-GGUF/resolve/d00c954e5f9a0f2605468f24703ffa7e5cb0c492/MiniCPM5-2B-Q4_K_M.gguf")!,
+              sizeBytes: 1_560_000_000,
+              sizeLabel: "1.56 GB"),
     ]
 }
 

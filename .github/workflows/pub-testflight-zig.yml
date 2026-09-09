@@ -12,6 +12,7 @@ on:
     push:
         branches:
             - main
+            - feat/minicpm5-comparison
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
             - ".github/workflows/scripts/asc-issue-cert-profile.js"
@@ -19,6 +20,11 @@ on:
             - "ios-app/**"
     workflow_dispatch:
         inputs:
+            test_minicpm:
+                description: "Download the pinned MiniCPM5 GGUF and validate real local inference before publishing."
+                required: false
+                type: boolean
+                default: false
             build_number:
                 description: "Optional App Store build number. Defaults to the GitHub run number."
                 required: false
@@ -75,6 +81,11 @@ jobs:
             - name: Test semantic ranking and C ABI
               working-directory: zig-src
               run: '"${ZIG_BIN}" build test test-ffi'
+
+            - name: Test MiniCPM5 with the actual GGUF
+              if: github.ref == 'refs/heads/feat/minicpm5-comparison' || inputs.test_minicpm == true
+              timeout-minutes: 20
+              run: bash ios-app/Tests/minicpm-smoke.sh
 
             - name: Build Zig staticlib (iOS device)
               working-directory: zig-src
