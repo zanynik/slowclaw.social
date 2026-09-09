@@ -3952,6 +3952,7 @@ struct DraftsView: View {
     @EnvironmentObject var state: AppState
     @StateObject private var writer = BlogClaw.shared
     @State private var showPicker = false
+    @State private var showNostrPosts = false
 
     var body: some View {
         ScrollView {
@@ -3964,8 +3965,10 @@ struct DraftsView: View {
                     }
                     .disabled(writer.running || state.isGeneratingPosts || state.localModelBusy)
                 }
-                Text("Choose your journals. Shape a thought. Share when ready.")
+                Text("Private drafts from your journals. Shape a thought and share when ready.")
                     .font(DS.captionFont).foregroundStyle(DS.muted(scheme))
+
+                Button("My published posts & replies") { showNostrPosts = true }
 
                 if let progress = writer.progress {
                     HStack {
@@ -3989,6 +3992,7 @@ struct DraftsView: View {
             .padding(20)
         }
         .background(DS.bg(scheme))
+        .sheet(isPresented: $showNostrPosts) { NostrPostsView() }
         .sheet(isPresented: $showPicker) { BlogClawPicker().environmentObject(state) }
         .refreshable { await state.refreshJournals() }
     }
@@ -4461,6 +4465,7 @@ struct ProfileView: View {
     @State private var baseURLInput = "https://api.openai.com/v1"
     @State private var showAdvanced = false
     @State private var showPersonalMemory = false
+    @State private var showNostrPosts = false
 
     var body: some View {
         ScrollView {
@@ -4475,6 +4480,7 @@ struct ProfileView: View {
                             .font(DS.captionFont).foregroundStyle(DS.muted(scheme))
                         Button("Manage writing tools") { showAdvanced.toggle() }
                         Button("Personal memory") { showPersonalMemory = true }
+                        Button("My Nostr posts & replies") { showNostrPosts = true }
                     }
                 }
                 DisclosureGroup("Advanced settings", isExpanded: $showAdvanced) {
@@ -4643,6 +4649,7 @@ struct ProfileView: View {
             modelInput = state.model
             baseURLInput = state.baseURL
         }
+        .sheet(isPresented: $showNostrPosts) { NostrPostsView() }
         .sheet(isPresented: $showPersonalMemory) { PersonalMemoryView().environmentObject(state) }
     }
 
