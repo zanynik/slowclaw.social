@@ -27,7 +27,7 @@ final class BlogClaw: ObservableObject {
             }
             do {
                 let miniCPM = state.localLLM.modelId?.lowercased().contains("minicpm5") == true
-                let source = DraftBudget.source(entries.prefix(3).map { journalBodyOf($0.content) }, miniCPM: miniCPM)
+                let source = DraftBudget.source(entries.prefix(3).map { journalBodyOf($0.content) }, miniCPM: miniCPM && format == .article)
                 try Task.checkCancellation()
                 progress = format == .article ? "Writing your article in one pass…" : "Writing your short post…"
                 let instruction = format == .article
