@@ -12,6 +12,10 @@ struct QuestionThread: Codable, Identifiable, Equatable {
     var updatedAt: Date
     var note: String
 
+    static func isJournalRecord(key: String, category: String, sessionID: String?) -> Bool {
+        key != "question_threads_v1" && category != "question_threads" && sessionID != "drafts"
+    }
+
     static func make(question: String, sourceKey: String, now: Date = Date()) -> Self? {
         let text = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (5...240).contains(text.count), !sourceKey.isEmpty else { return nil }

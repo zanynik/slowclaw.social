@@ -926,7 +926,10 @@ final class AppState: ObservableObject {
             // fetch a wider set and drop both client-side. Order newest-first.
             let all = try memory.recall(query: "the a an of to and", limit: 60)
             let deletedKeys = Set(Self.softDeletedKeys().keys)
-            journals = all.filter { ($0.sessionID ?? "") != "drafts" && !deletedKeys.contains($0.key) }
+            journals = all.filter {
+                QuestionThread.isJournalRecord(key: $0.key, category: $0.category, sessionID: $0.sessionID)
+                    && !deletedKeys.contains($0.key)
+            }
             drafts = try memory.recall(query: "draft post", limit: 20, sessionID: "drafts")
             // Invalidate stale observations immediately, before slow inference.
             let invalid = journalInterestRecords.keys.filter { key in
@@ -1170,7 +1173,7 @@ final class AppState: ObservableObject {
 
     private func saveQuestions(_ threads: [QuestionThread]) throws {
         let data = try JSONEncoder().encode(threads)
-        try memory.store(key: "question_threads_v1", content: String(decoding: data, as: UTF8.self), category: "question_threads")
+        try memory.store(key: "question_threads_v1", content: String(decoding: data, as: UTF8.self), category: "question_threads", sessionID: "app_metadata")
         questionThreads = threads
     }
 

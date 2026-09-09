@@ -57,6 +57,11 @@ final class RuntimeTests: XCTestCase {
         XCTAssertEqual(NostrPublisher.confirmedEvents(defaults: defaults).first?.id, signed.id)
     }
 
+    func testQuestionMetadataAndDraftsNeverEnterJournalCaptureOrIndexing() {
+        XCTAssertFalse(QuestionThread.isJournalRecord(key: "question_threads_v1", category: "question_threads", sessionID: "app_metadata"))
+        XCTAssertFalse(QuestionThread.isJournalRecord(key: "draft_test", category: "core", sessionID: "drafts"))
+        XCTAssertTrue(QuestionThread.isJournalRecord(key: "journal_test", category: "daily", sessionID: nil))
+    }
     func testQuestionRoundTripPreservesUserEditsAndLifecycle() throws {
         var question = try XCTUnwrap(QuestionThread.make(question: "What helps the garden grow?", sourceKey: "journal_test"))
         question.note = "A small experiment changed my view."
