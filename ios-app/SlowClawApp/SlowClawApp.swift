@@ -723,6 +723,7 @@ final class AppState: ObservableObject {
     /// Load a downloaded model into the on-device engine. Runs off-actor:
     /// mmap-ing a multi-GB GGUF takes seconds and must not block the UI.
     func activateLocalModel(_ preset: LocalModelPreset) async {
+        guard !localModelBusy else { return }
         guard let url = try? LocalModelStore.fileURL(for: preset) else { return }
         localModelBusy = true
         localModelError = nil
@@ -735,6 +736,7 @@ final class AppState: ObservableObject {
             loadedLocalModelPresetID = nil
         } else {
             loadedLocalModelPresetID = preset.id
+            UserDefaults.standard.set(preset.id, forKey: "slowclaw.local-model.preferred")
         }
         if let snapshot = try? await OnDeviceAIExecutor.shared.run({ slowClawLocalLLMStatus() }) {
             localLLM = snapshot
@@ -757,14 +759,24 @@ final class AppState: ObservableObject {
     func deleteLocalModel(_ preset: LocalModelPreset) {
         guard !localModelBusy else { return }
         localModelBusy = true
+        let shouldUnload = loadedLocalModelPresetID == preset.id
+            || (localLLM.loaded && loadedLocalModelPresetID == nil)
         Task {
             defer { localModelBusy = false }
-            _ = try? await OnDeviceAIExecutor.shared.run {
-                slowClawLocalLLMUnload()
-                try LocalModelStore.delete(preset)
+            do {
+                try await OnDeviceAIExecutor.shared.run {
+                    if shouldUnload { slowClawLocalLLMUnload() }
+                    try LocalModelStore.delete(preset)
+                }
+                if UserDefaults.standard.string(forKey: "slowclaw.local-model.preferred") == preset.id {
+                    UserDefaults.standard.removeObject(forKey: "slowclaw.local-model.preferred")
+                }
+                localModelProgress[preset.id] = nil
+                localModelError = nil
+            } catch {
+                localModelError = "Could not delete the model: \(error.localizedDescription)"
             }
-            loadedLocalModelPresetID = nil
-            localModelProgress[preset.id] = nil
+            if shouldUnload { loadedLocalModelPresetID = nil }
             refreshLocalLLMStatus()
         }
     }
@@ -787,9 +799,10 @@ final class AppState: ObservableObject {
         // localModelBusy, so this check is explicit.
         guard localLLM.available, !localLLM.loaded, !localModelBusy,
               activeDownloadIDs.isEmpty else { return }
-        // There is one curated text model. Never auto-download without consent.
+        // Restore the last successfully selected model; never auto-download.
         let downloaded = LocalModelPreset.presets.filter { LocalModelStore.isDownloaded($0) }
-        let preset = downloaded.first
+        let preferred = UserDefaults.standard.string(forKey: "slowclaw.local-model.preferred")
+        let preset = downloaded.first(where: { $0.id == preferred }) ?? downloaded.first
         guard let preset else { return }
         await activateLocalModel(preset)
     }
@@ -3943,7 +3956,7 @@ struct DraftCard: View {
 
 // MARK: - Profile View
 
-/// On-Device AI card. Lists the Gemma model presets with download → activate
+/// On-Device AI card. Lists model presets with download → activate
 /// → ready lifecycle, driven by real status from the Zig core (llama.cpp CPU
 /// backend). When a model is loaded, every AI surface (Polish, interests,
 /// drafts, TweetClaw) runs on-device — nothing leaves the iPhone.
