@@ -21,6 +21,9 @@ struct NostrReplySheet: View {
                     TextEditor(text: $text).frame(minHeight: 150).disabled(publisher.busy || sent)
                     Text("This reply will be public on Nostr. No journals or recordings are attached.")
                         .font(.caption).foregroundStyle(.secondary)
+                    if text.utf8.count > 8000 {
+                        Text("This reply is too long. Shorten it before publishing.").font(.caption).foregroundStyle(.red)
+                    }
                     Button(sent ? "Published" : publisher.busy ? "Publishing…" : "Publish reply") {
                         Task {
                             do {

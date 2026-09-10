@@ -20,7 +20,7 @@ struct ActivityBar: View {
         if recorder.isRecording { return "Recording · tap to return" }
         if state.audioTranscriptionInFlight { return "Transcribing audio…" }
         if !state.queuedAudio.isEmpty { return "\(state.queuedAudio.count) audio waiting" }
-        if state.isGeneratingPosts { return "Preparing drafts…" }
+        if state.isGeneratingPosts { return "Preparing a draft or reflection…" }
         if state.isIndexingInterests { return state.optionalAIPaused ? "Interest learning paused" : "Learning from journals…" }
         return "Activity · up to date"
     }
