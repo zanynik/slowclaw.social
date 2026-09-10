@@ -164,6 +164,12 @@ int32_t slowclaw_feed_sqlite_count(SlowclawSqlite *handle);
 
 /// Hybrid recall (FTS5 + vector if embedder set). out_result.items_json is a
 /// Zig-owned JSON array of full entries. Free via slowclaw_feed_sqlite_result_free.
+// before=0 starts a bounded archive scan; next=0 means exhausted.
+// Free the JSON result with slowclaw_feed_sqlite_result_free.
+int32_t slowclaw_feed_sqlite_archive_page(
+    SlowclawSqlite *handle, int64_t before, size_t limit,
+    int64_t *next, SlowclawRankResult *out_result);
+
 int32_t slowclaw_feed_sqlite_recall(
     SlowclawSqlite *handle,
     const uint8_t *query, size_t query_len,

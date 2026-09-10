@@ -466,6 +466,32 @@ pub const SqliteMemory = struct {
         return results.toOwnedSlice(allocator);
     }
 
+    /// Keyset traversal for journal archive work. Unlike relevance recall,
+    /// this eventually visits every row without loading the whole archive.
+    pub fn archivePage(self: *SqliteMemory, allocator: std.mem.Allocator, before: i64, limit: usize, next: *i64) ![]MemoryEntry {
+        next.* = 0;
+        var results = std.ArrayList(MemoryEntry).empty;
+        errdefer {
+            for (results.items) |e| freeEntry(allocator, e);
+            results.deinit(allocator);
+        }
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT id, key, content, category, created_at, session_id, source, media_url, rowid FROM memories WHERE rowid < ?1 AND COALESCE(session_id, '') NOT IN ('drafts', 'app_metadata') AND category != 'question_threads' ORDER BY rowid DESC LIMIT ?2";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_int64(stmt.?, 1, if (before <= 0) std.math.maxInt(i64) else before) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt.?, 2, @intCast(@min(@max(limit, 1), 20))) != c.SQLITE_OK) return error.BindFailed;
+        while (true) {
+            const rc = c.sqlite3_step(stmt.?);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+            const entry = try readRow(allocator, stmt.?);
+            results.append(allocator, entry) catch |err| { freeEntry(allocator, entry); return err; };
+            next.* = c.sqlite3_column_int64(stmt.?, 8);
+        }
+        return results.toOwnedSlice(allocator);
+    }
+
     /// Delete a memory by key. Returns true if a row was removed.
     /// Mirrors `forget` in sqlite.rs:751.
     pub fn forget(self: *SqliteMemory, key: []const u8) !bool {

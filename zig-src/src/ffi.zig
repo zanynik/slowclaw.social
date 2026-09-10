@@ -426,6 +426,22 @@ pub export fn slowclaw_feed_sqlite_recall(
     return SLOWCLAW_OK;
 }
 
+/// Bounded keyset page; before=0 starts at the newest row. next=0 denotes
+/// exhaustion. The JSON result uses the same ownership contract as recall.
+pub export fn slowclaw_feed_sqlite_archive_page(handle: *SlowclawSqlite, before: i64, limit: usize, next: *i64, out_result: *SlowclawRankResult) c_int {
+    next.* = 0;
+    out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_INTERNAL };
+    const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
+    const entries = db.archivePage(c_allocator, before, limit, next) catch return SLOWCLAW_ERR_INTERNAL;
+    defer {
+        for (entries) |e| sqlite.freeEntry(c_allocator, e);
+        c_allocator.free(entries);
+    }
+    const json = serializeEntriesFull(c_allocator, entries) catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    out_result.* = .{ .items_json = SlowclawString.fromOwnedSlice(json), .status = SLOWCLAW_OK };
+    return SLOWCLAW_OK;
+}
+
 pub export fn slowclaw_feed_sqlite_result_free(result: *SlowclawRankResult) void {
     if (result.items_json.bytes) |b| {
         const slice = b[0..result.items_json.len];
@@ -1434,6 +1450,37 @@ test "ffi: writeJsonString escapes special chars" {
 }
 
 // ── SQLite FFI round-trip tests ───────────────────────────────────────────
+
+test "ffi: archive pages traverse older journals and exclude app metadata" {
+    const handle = slowclaw_feed_sqlite_open(":memory:", ":memory:".len, null) orelse return error.OOM;
+    defer slowclaw_feed_sqlite_close(handle);
+    for (0..65) |i| {
+        var buf: [64]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "slowclaw_journal_{d}", .{i});
+        try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sqlite_store(handle, key.ptr, key.len, "A garden observation", 20, "daily", 5, null, 0, null, 0, null, 0));
+    }
+    try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sqlite_store(handle, "question_threads_v1", 19, "{}", 2, "question_threads", 16, "app_metadata", 12, null, 0, null, 0));
+    try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sqlite_store(handle, "draft_test", 10, "A draft", 7, "core", 4, "drafts", 6, null, 0, null, 0));
+    var cursor: i64 = 0;
+    var count: usize = 0;
+    for (0..5) |_| {
+        var next: i64 = 0;
+        var result: SlowclawRankResult = undefined;
+        try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sqlite_archive_page(handle, cursor, 20, &next, &result));
+        defer slowclaw_feed_sqlite_result_free(&result);
+        const json = result.items_json.bytes.?[0..result.items_json.len];
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer parsed.deinit();
+        const rows = parsed.value.array.items;
+        try testing.expect(rows.len <= 20);
+        for (rows) |row| try testing.expect(std.mem.startsWith(u8, row.object.get("key").?.string, "slowclaw_journal_"));
+        count += rows.len;
+        if (next == 0) break;
+        if (cursor != 0) try testing.expect(next < cursor);
+        cursor = next;
+    }
+    try testing.expectEqual(@as(usize, 65), count);
+}
 
 test "ffi: sqlite open/store/get/forget round-trip via C ABI" {
     const handle = slowclaw_feed_sqlite_open(":memory:", ":memory:".len, null) orelse return error.OOM;

@@ -32,7 +32,7 @@ actor SemanticMemory {
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         let queryVector = vector(query)
         var scored: [(String, Double)] = []
-        for document in documents.prefix(128) {
+        for document in documents {
             if Task.isCancelled { return [] }
             if await shouldPause() { return [] }
             var similarity = 0.0
