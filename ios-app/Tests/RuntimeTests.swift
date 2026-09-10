@@ -3,6 +3,38 @@ import CryptoKit
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
+    func testReplyEnvelopePreservesRootsParentsAndArticleScopes() throws {
+        let root = try event()
+        let first = try NostrReply.envelope(root: root, parent: root)
+        XCTAssertEqual(first.kind, 1)
+        XCTAssertEqual(first.tags.filter { $0[0] == "e" }.count, 1)
+        let reply = try event(tags: first.tags, content: "A first reply")
+        let second = try NostrReply.envelope(root: root, parent: reply)
+        XCTAssertTrue(second.tags.contains { $0.count > 3 && $0[1] == reply.id && $0[3] == "reply" })
+        let ownReply = try NostrReply.envelope(root: reply, parent: reply)
+        XCTAssertTrue(ownReply.tags.contains { $0.count > 3 && $0[1] == root.id && $0[3] == "root" })
+        let article = try event(kind: 30023, tags: [["d", "slowclaw_article"]])
+        let comment = try NostrReply.envelope(root: article, parent: article)
+        XCTAssertEqual(comment.kind, 1111)
+        XCTAssertTrue(comment.tags.contains(["A", article.address!]))
+        XCTAssertTrue(comment.tags.contains(["a", article.address!]))
+        XCTAssertTrue(comment.tags.contains(["k", "30023"]))
+        let unrelated = try event(content: "An unrelated observation")
+        XCTAssertThrowsError(try NostrReply.envelope(root: root, parent: unrelated))
+    }
+
+    func testWeeklyReflectionAndDraftProvenanceRetainExactSources() throws {
+        let source = ContextDocument(id: "journal_test", title: "A garden observation", text: "The garden grew after several rainy days.", date: .distantPast)
+        let reflection = GroundedReflection(observation: "A possible connection to explore.", question: "What else changed in the garden?", citations: [ContextCitation(id: "J1", quote: "several rainy days")])
+        let weekly = WeeklyReflection(createdAt: Date(), reflection: reflection, sources: [source])
+        let decoded = try JSONDecoder().decode(WeeklyReflection.self, from: JSONEncoder().encode(weekly))
+        XCTAssertEqual(decoded.sources.first?.text, source.text)
+        XCTAssertEqual(decoded.reflection, reflection)
+        let evidence = DraftEvidence(journalKey: source.id, quote: source.text)
+        XCTAssertTrue(evidence.matches(source.text))
+        XCTAssertFalse(evidence.matches("A changed journal"))
+        XCTAssertFalse(evidence.matches(nil))
+    }
     private func event(kind: Int = 1, tags: [[String]] = [], content: String = "SlowClaw test observation", date: Int = 1) throws -> PublishedEvent {
         let secret = Array(repeating: UInt8(0), count: 31) + [UInt8(1)]
         let key = try NostrIdentity.publicKey(secret)

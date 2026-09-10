@@ -1,7 +1,7 @@
 import Foundation
 
 /// Immutable tool results. IDs and passages come from storage, never the LLM.
-struct ContextDocument: Identifiable, Sendable {
+struct ContextDocument: Identifiable, Sendable, Codable {
     let id: String
     let title: String
     let text: String

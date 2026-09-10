@@ -21,6 +21,7 @@ struct PersonalMemoryView: View {
                     Text("Reads compares meaning on this device where Apple's language model is available. Other languages use topic matching. Similarity doesn't mean agreement or truth.")
                         .font(.caption).foregroundStyle(.secondary)
                     Toggle("Prepare occasional short posts", isOn: $state.automaticDrafts)
+                    Toggle("Prepare a weekly reflection", isOn: $state.automaticReflections)
                     Text("At most one per day, from recent journals. Always private until you review and publish.")
                         .font(.caption).foregroundStyle(.secondary)
                     if let status = state.memoryStatus { Text(status).font(.caption) }
@@ -30,6 +31,7 @@ struct PersonalMemoryView: View {
                     NavigationLink("Questions you’re following") { QuestionThreadsView() }
                     if let error = state.questionError { Text(error).font(.caption).foregroundStyle(.red) }
                 }
+                Section { WeeklyReflectionCard() }
                 Section("From your journals") {
                     if searching { ProgressView("Searching on this device…") }
                     if state.personalMemories.isEmpty {
