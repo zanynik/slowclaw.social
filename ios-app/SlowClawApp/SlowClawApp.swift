@@ -939,15 +939,26 @@ final class AppState: ObservableObject {
                     && !deletedKeys.contains($0.key)
             }
             drafts = try memory.recall(query: "draft post", limit: 20, sessionID: "drafts")
-            // Invalidate stale observations immediately, before slow inference.
-            let invalid = journalInterestRecords.keys.filter { key in
-                guard !deletedKeys.contains(key), let entry = try? memory.get(key: key) else { return true }
-                let body = journalBodyOf(entry.content).trimmingCharacters(in: .whitespacesAndNewlines)
-                let text = Self.hasMeaningfulBody(body) ? body : entry.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                return journalInterestRecords[key]?.fingerprint != Self.interestFingerprint(text)
+            // The index can now span years. Yield between small validation
+            // batches so a refresh doesn't monopolize the UI. Read and remove
+            // each record without suspension between them, preserving edits.
+            var invalidated = false
+            var currentDeleted = deletedKeys
+            for (offset, key) in Array(journalInterestRecords.keys).enumerated() {
+                if offset % 8 == 0 {
+                    await Task.yield()
+                    currentDeleted = Set(Self.softDeletedKeys().keys)
+                }
+                guard let record = journalInterestRecords[key] else { continue }
+                var invalid = true
+                if !currentDeleted.contains(key), let entry = try? memory.get(key: key) {
+                    let body = journalBodyOf(entry.content).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let text = Self.hasMeaningfulBody(body) ? body : entry.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    invalid = record.fingerprint != Self.interestFingerprint(text)
+                }
+                if invalid { journalInterestRecords.removeValue(forKey: key); invalidated = true }
             }
-            if !invalid.isEmpty {
-                invalid.forEach { journalInterestRecords.removeValue(forKey: $0) }
+            if invalidated {
                 Self.saveJournalInterestRecords(journalInterestRecords)
                 rebuildInterestLens()
                 readsRefreshedAt = nil
