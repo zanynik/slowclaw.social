@@ -10,3 +10,7 @@ The archive index stores small source-backed observations, not whole transcripts
 Validation: added C ABI coverage traversing 65 records across multiple pages while excluding drafts and question metadata. Swift/Xcode/Zig are unavailable in the local Linux scratch environment; run existing macOS CI, C ABI tests, iOS compile/archive and TestFlight upload before merge. Physical phone performance, recording and lock behavior remain device acceptance checks.
 
 Rollback: revert release commits. The additive page API has no schema migration; existing memory formats remain readable. Extra archive cursor preferences can be ignored by older builds.
+
+## Reviewed replies
+
+The publication detail supports replying to a post or a specific incoming reply. Draft text survives closing the sheet; only an explicit Publish reply sends it to the configured relays. The existing publication path keeps signed retries idempotent and requires a relay acknowledgement. NIP-10 roots/parents and NIP-22 article scopes are built from verified source events; unrelated parents are rejected. There are no automatic replies, journal attachments or AI-written outgoing messages. Public profile metadata, avatars and discovery expansion are deferred.

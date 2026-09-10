@@ -117,7 +117,8 @@ final class NostrPublisher: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "slowclaw.nostr.relays") }
     }
 
-    func publish(draftKey: String, content: String, title: String, article: Bool) async throws -> String {
+    func publish(draftKey: String, content: String, title: String, article: Bool,
+                 replyRoot: PublishedEvent? = nil, replyParent: PublishedEvent? = nil) async throws -> String {
         guard !busy else { throw PublishingError.message("A publication is already in progress.") }
         let text = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.utf8.count <= 60_000 else {
@@ -134,16 +135,18 @@ final class NostrPublisher: ObservableObject {
         let secret = try NostrIdentity.secret()
         let pubkey = try NostrIdentity.publicKey(secret)
         let cacheKey = "slowclaw.nostr.event." + draftKey
-        let kind = article ? 30023 : 1
+        let reply = try replyRoot.map { try NostrReply.envelope(root: $0, parent: replyParent ?? $0) }
+        let kind = reply?.kind ?? (article ? 30023 : 1)
         let event: PublishedEvent
         if let cached = UserDefaults.standard.data(forKey: cacheKey),
            let saved = try? JSONDecoder().decode(PublishedEvent.self, from: cached),
            saved.content == text, saved.pubkey == pubkey, saved.kind == kind,
-           (!article || saved.tags.contains(["title", title])) {
+           (!article || saved.tags.contains(["title", title])),
+           (reply.map { saved.tags == $0.tags } ?? true) {
             event = saved // Retry the same event ID after a timeout or relaunch.
         } else {
             let created = Int(Date().timeIntervalSince1970)
-            let tags = article ? [["d", draftKey], ["title", title], ["published_at", String(created)]] : []
+            let tags = reply?.tags ?? (article ? [["d", draftKey], ["title", title], ["published_at", String(created)]] : [])
             let canonical = try JSONSerialization.data(withJSONObject: [0, pubkey, created, kind, tags, text], options: [.withoutEscapingSlashes])
             let hash = Array(SHA256.hash(data: canonical))
             event = PublishedEvent(id: NostrIdentity.hex(hash), pubkey: pubkey,

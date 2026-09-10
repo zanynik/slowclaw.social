@@ -112,10 +112,12 @@ struct NostrPostsView: View {
 private struct NostrPostDetail: View {
     let post: PublishedEvent
     @StateObject private var inbox = NostrInbox.shared
+    @State private var replyTarget: PublishedEvent?
     var body: some View {
         List {
             Section {
                 Text(post.content).textSelection(.enabled)
+                Button("Reply") { replyTarget = post }
                 if let url = URL(string: "https://njump.me/" + post.id) {
                     Link("Open on the web", destination: url)
                     ShareLink(item: url)
@@ -129,6 +131,7 @@ private struct NostrPostDetail: View {
                         Text(reply.content).textSelection(.enabled)
                         Text(Date(timeIntervalSince1970: Double(reply.created_at)), style: .date).font(.caption).foregroundStyle(.secondary)
                         HStack {
+                            Button("Reply") { replyTarget = reply }
                             if let url = URL(string: "https://njump.me/" + reply.id) { Link("Open conversation", destination: url) }
                             Spacer()
                             Button("Hide author") { inbox.hide(reply.pubkey) }
@@ -137,12 +140,13 @@ private struct NostrPostDetail: View {
                 }
                 if inbox.replies(to: post).isEmpty && !inbox.busy { Text("No replies found on the checked relays.").foregroundStyle(.secondary) }
                 if let status = inbox.status { Text(status).font(.caption).foregroundStyle(.secondary) }
-                Text("Signatures verify authorship, not accuracy. Open a conversation in another Nostr client to reply.")
+                Text("Signatures verify authorship, not accuracy. Replies remain private drafts until you choose Publish reply.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .buttonStyle(.borderless)
         .navigationTitle(post.kind == 30023 ? "Your article" : "Your post")
+        .sheet(item: $replyTarget) { target in NostrReplySheet(root: post, parent: target) }
         .task { await inbox.refresh(force: true, post: post); inbox.markRead(post) }
         .refreshable { await inbox.refresh(force: true, post: post); inbox.markRead(post) }
     }
