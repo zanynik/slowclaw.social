@@ -35,7 +35,7 @@ public enum SlowClawFeedError: Error, Equatable, LocalizedError {
 }
 
 /// A stored memory entry.
-public struct SlowClawMemoryEntry: Identifiable, Equatable {
+public struct SlowClawMemoryEntry: Identifiable, Equatable, Sendable {
     public let id: String
     public let key: String
     public let content: String
@@ -199,6 +199,18 @@ public final class SlowClawSqliteMemory {
         let n = slowclaw_feed_sqlite_count(h)
         if n < 0 { throw SlowClawFeedError.internalError("count returned \(n)") }
         return Int(n)
+    }
+
+    public func archivePage(before: Int64 = 0) throws -> (entries: [SlowClawMemoryEntry], next: Int64) {
+        guard let h = handle else { throw SlowClawFeedError.internalError("closed") }
+        var result = SlowclawRankResult()
+        var next: Int64 = 0
+        defer { slowclaw_feed_sqlite_result_free(&result) }
+        let status = slowclaw_feed_sqlite_archive_page(h, before, 20, &next, &result)
+        guard status == SLOWCLAW_OK else { throw SlowClawFeedError.recallFailed("Archive page could not be read.") }
+        guard let bytes = result.items_json.bytes else { return ([], 0) }
+        let decoded = try JSONDecoder().decode([MemoryEntryDTO].self, from: Data(bytes: bytes, count: result.items_json.len))
+        return (decoded.map { $0.toSwift() }, next)
     }
 
     /// Hybrid recall (FTS5 keyword + vector similarity if embedder is set).
