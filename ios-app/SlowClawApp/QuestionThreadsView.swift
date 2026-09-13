@@ -195,13 +195,13 @@ struct DailySelectionCard: View {
                     }
                 }
                 let items = selection.readIDs.compactMap { id in
-                    state.readsItems.first { $0.id == id && state.readingSignals[id]?.preference != -1 }
+                    state.relevantReads.first { $0.id == id }
                 }
                 ForEach(items) { item in
                     FeedCard(item: item, interests: state.interests)
                 }
-                if items.isEmpty { Text("Nothing new to add today. Your reading is below.").font(.caption).foregroundStyle(.secondary) }
-                Text("A few unread choices from your journal-ranked Reads, with different sources. Explore more below when you want.")
+                if items.isEmpty { Text("No strong journal matches to add right now.").font(.caption).foregroundStyle(.secondary) }
+                Text("A few journal-connected choices, with different sources. Read at your own pace.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .padding(14)

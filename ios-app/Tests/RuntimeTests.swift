@@ -3,6 +3,15 @@ import CryptoKit
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
+    func testPersonalReadsRejectBroadDiscoveryAndRequireJournalEvidence() {
+        XCTAssertFalse(ReadsRelevance.accepts(title: "Latest headlines", summary: "Popular today", similarity: nil, journalTopics: []))
+        XCTAssertFalse(ReadsRelevance.accepts(title: "Garden news", summary: "Latest updates", similarity: 0.3, journalTopics: [["garden", "compost"]]))
+        XCTAssertTrue(ReadsRelevance.accepts(title: "Garden compost", summary: "A practical guide", similarity: nil, journalTopics: [["garden", "compost"]]))
+        XCTAssertFalse(ReadsRelevance.accepts(title: "Garden compost", summary: "", similarity: nil, journalTopics: [["garden"], ["compost"]]))
+        XCTAssertFalse(ReadsRelevance.accepts(title: "Garden", summary: "", similarity: nil, journalTopics: [["garden", "Garden"]]))
+        XCTAssertFalse(ReadsRelevance.accepts(title: "Party articles", summary: "", similarity: .nan, journalTopics: [["art", "part"]]))
+        XCTAssertTrue(ReadsRelevance.accepts(title: "Related ideas", summary: "", similarity: 0.8, journalTopics: []))
+    }
     func testReplyEnvelopePreservesRootsParentsAndArticleScopes() throws {
         let root = try event()
         let first = try NostrReply.envelope(root: root, parent: root)

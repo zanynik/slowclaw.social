@@ -4,6 +4,7 @@ APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 mkdir -p "$TEST_ROOT/Sources/Runtime" "$TEST_ROOT/Tests/RuntimeTests"
+cp "$APP_ROOT/SlowClawApp/ReadsRelevance.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/OnDeviceAIExecutor.swift" "$APP_ROOT/SlowClawApp/Nip19.swift" "$APP_ROOT/SlowClawApp/NostrPublisher.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/DraftBudget.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/ReadingHistory.swift" "$TEST_ROOT/Sources/Runtime/"

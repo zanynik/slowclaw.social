@@ -464,8 +464,29 @@ final class AppState: ObservableObject {
         if reflectionSource == source { reflectionSource = nil }
     }
 
+    /// Discovery candidates stay cached, but the default reading surface must
+    /// have a strong connection to a currently included journal.
+    var relevantReads: [RankedFeedItem] {
+        let deleted = Self.softDeletedKeys()
+        let records = journalInterestRecords.filter {
+            deleted[$0.key] == nil && !excludedMemoryKeys.contains($0.key)
+        }
+        let journalTopics = records.values.map(\.topics)
+        return readsItems.filter { item in
+            guard readingSignals[item.id]?.preference != -1 else { return false }
+            let similarity = semanticMatches[item.id].flatMap { match in
+                records[match.journalKey] == nil ? nil : match.similarity
+            }
+            return ReadsRelevance.accepts(title: item.title,
+                summary: item.description.strippingHTML(), similarity: similarity,
+                journalTopics: journalTopics)
+        }
+    }
+
     func recommendationReason(for item: RankedFeedItem) -> String {
-        if let match = semanticMatches[item.id], let insight = journalInterestRecords[match.journalKey]?.insight {
+        if let match = semanticMatches[item.id], match.similarity >= 0.65,
+           !excludedMemoryKeys.contains(match.journalKey), Self.softDeletedKeys()[match.journalKey] == nil,
+           let insight = journalInterestRecords[match.journalKey]?.insight {
             return "Connected to your journal: \(insight.summary)"
         }
         let text = (item.title + " " + item.description.strippingHTML()).lowercased()
@@ -1272,8 +1293,13 @@ final class AppState: ObservableObject {
 
     func prepareDailySelection(now: Date = Date()) {
         let day = DailySelection.dayKey(now)
-        guard dailySelection?.day != day, !readsItems.isEmpty else { return }
-        let candidates = readsItems.filter { readingSignals[$0.id] == nil }
+        let eligible = relevantReads
+        let eligibleIDs = Set(eligible.map(\.id))
+        if let existing = dailySelection, existing.day == day {
+            guard !existing.dismissed, !existing.readIDs.contains(where: eligibleIDs.contains) else { return }
+        }
+        guard !readsItems.isEmpty else { return }
+        let candidates = eligible.filter { readingSignals[$0.id] == nil }
         let ids = DailySelection.select(candidates.map {
             (id: $0.id, source: URL(string: $0.link)?.host ?? $0.sourceLabel)
         })
@@ -3940,7 +3966,7 @@ struct ReadsView: View {
 
     private var remainingReads: [RankedFeedItem] {
         let ids = state.dailySelection?.dismissed == false ? Set(state.dailySelection?.readIDs ?? []) : []
-        return state.readsItems.filter { !ids.contains($0.id) }
+        return state.relevantReads.filter { !ids.contains($0.id) }
     }
     var body: some View {
         Group {
@@ -3994,13 +4020,13 @@ struct ReadsView: View {
                         DailySelectionCard()
                         // Subtitle row matching the reference: "{N} stories · ranked by your lens".
                         HStack {
-                            Text("Selected for you")
+                            Text("Connected to your journals")
                                 .font(DS.captionFont)
                                 .foregroundStyle(DS.muted(scheme))
                             Text("·")
                                 .font(DS.captionFont)
                                 .foregroundStyle(DS.muted(scheme))
-                            Text("ranked by your lens")
+                            Text("a quieter selection")
                                 .font(DS.captionFont)
                                 .foregroundStyle(DS.muted(scheme))
                             Spacer()
@@ -4019,7 +4045,7 @@ struct ReadsView: View {
                             Button("Explore five more") { visibleCount += 5 }
                                 .padding(.vertical, 20)
                         } else {
-                            Text("You're caught up. Take a thought with you.")
+                            Text(remainingReads.isEmpty ? "No more strong journal matches right now. A shorter list is enough." : "You're caught up. Take a thought with you.")
                                 .font(DS.captionFont).foregroundStyle(DS.muted(scheme))
                                 .padding(.vertical, 20)
                         }
@@ -4111,6 +4137,7 @@ struct DraftCard: View {
 
     @State private var editedText = ""
     @State private var isEditing = false
+    @State private var expanded = false
     @State private var isRegenerating = false
     @State private var showCopyAlert = false
     @State private var showPublish = false
@@ -4132,13 +4159,11 @@ struct DraftCard: View {
             VStack(alignment: .leading, spacing: 10) {
                 // TweetClaw byline (🐾 avatar + handle), like the reference.
                 HStack(spacing: 8) {
-                    Text("🐾")
-                        .font(.system(size: 20))
                     VStack(alignment: .leading, spacing: 0) {
                         Text(isArticle ? "Article" : "Short post")
                             .font(DS.captionFont.weight(.semibold))
                             .foregroundStyle(DS.ink(scheme))
-                        Text(isArticle ? "Article draft · private until published" : "Short post · private until published")
+                        Text("Private draft")
                             .font(DS.microFont)
                             .foregroundStyle(DS.muted(scheme))
                     }
@@ -4158,12 +4183,15 @@ struct DraftCard: View {
                     Text(editedText.isEmpty ? draft.content : editedText)
                         .font(DS.bodyFont)
                         .foregroundStyle(DS.ink(scheme))
+                        .lineLimit(expanded ? nil : 6)
+                    if (editedText.isEmpty ? draft.content : editedText).count > 240 {
+                        Button(expanded ? "Show less" : "Read full draft") { expanded.toggle() }
+                            .font(DS.captionFont)
+                    }
                 }
 
                 // Toolbar
                 if let source = draft.source, source.hasPrefix("automatic:") {
-                    Text("Suggested from your journal. Check the meaning and personal details before sharing.")
-                        .font(DS.captionFont).foregroundStyle(DS.muted(scheme))
                     Button("Source journal") { sourceEntry = state.memorySource(String(source.dropFirst("automatic:".count))) }
                         .font(DS.captionFont)
                 }
@@ -4188,14 +4216,13 @@ struct DraftCard: View {
                             .foregroundStyle(DS.accent(scheme))
                     }
 
+                    Menu {
                     // Regenerate (if we have the source journal)
                     if sourceJournalContent != nil && state.anyLLMAvailable {
                         Button {
                             Task { await regenerate() }
                         } label: {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.system(size: 16))
-                                .foregroundStyle(DS.accent(scheme))
+                            Label("Regenerate", systemImage: "arrow.clockwise")
                         }
                         .disabled(isRegenerating)
                     }
@@ -4205,9 +4232,7 @@ struct DraftCard: View {
                         UIPasteboard.general.string = editedText.isEmpty ? draft.content : editedText
                         showCopyAlert = true
                     } label: {
-                        Image(systemName: "doc.on.doc")
-                            .font(.system(size: 16))
-                            .foregroundStyle(DS.muted(scheme))
+                        Label("Copy text", systemImage: "doc.on.doc")
                     }
 
                     // Delete
@@ -4215,10 +4240,12 @@ struct DraftCard: View {
                         try? state.memory.forget(key: draft.key)
                         Task { await state.refreshJournals() }
                     } label: {
-                        Image(systemName: "trash")
-                            .font(.system(size: 16))
-                            .foregroundStyle(DS.accent2Color)
+                        Label("Delete draft", systemImage: "trash")
                     }
+                    ShareLink(item: editedText) { Label("Export draft", systemImage: "square.and.arrow.up") }
+                    } label: {
+                        Image(systemName: "ellipsis").frame(minWidth: 44, minHeight: 44)
+                    }.accessibilityLabel("More draft actions")
                 }
                 if let saveError { Text(saveError).font(.caption).foregroundStyle(.red) }
                 HStack {
@@ -4230,8 +4257,6 @@ struct DraftCard: View {
                         Label("Review & publish", systemImage: "paperplane")
                             .frame(maxWidth: .infinity)
                     }.buttonStyle(.borderedProminent).tint(DS.accent(scheme))
-                    ShareLink(item: editedText) { Image(systemName: "square.and.arrow.up") }
-                        .accessibilityLabel("Export draft")
                 }
             }
         }
@@ -4582,12 +4607,10 @@ struct ProfileView: View {
                         Text("Private by default").font(DS.cardTitleFont)
                         Text("Recording and transcription work on this iPhone. Writing tools are optional.")
                             .font(DS.captionFont).foregroundStyle(DS.muted(scheme))
-                        Button("Manage writing tools") { showAdvanced.toggle() }
                         Button("Personal memory") { showPersonalMemory = true }
-                        Button("My Nostr posts & replies") { showNostrPosts = true }
                     }
                 }
-                DisclosureGroup("Advanced settings", isExpanded: $showAdvanced) {
+                DisclosureGroup("Writing tools", isExpanded: $showAdvanced) {
                 // LLM Configuration
                 // On-Device AI (llama.cpp). Shows honest status from the Zig
                 // core: not available until the llama.cpp backend is linked.
@@ -4598,6 +4621,7 @@ struct ProfileView: View {
                     ExperimentCard(scheme: scheme)
                 }
 
+                DisclosureGroup("Remote provider (optional)") {
                 DS.card(scheme) {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Optional remote provider")
@@ -4645,7 +4669,9 @@ struct ProfileView: View {
                     }
                 }
 
+                }
                 // TweetClaw prompt (editable; persists to UserDefaults).
+                DisclosureGroup("Custom draft instructions") {
                 DS.card(scheme) {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack(spacing: 8) {
@@ -4668,7 +4694,9 @@ struct ProfileView: View {
                 }
 
                 }
+                }
                 // Interests
+                DisclosureGroup("Reading preferences") {
                 DS.card(scheme) {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
@@ -4714,6 +4742,8 @@ struct ProfileView: View {
                     }
                 }
 
+                }
+                DisclosureGroup("Storage & app information") {
                 // Database
                 DS.card(scheme) {
                     VStack(alignment: .leading, spacing: 10) {
@@ -4742,6 +4772,7 @@ struct ProfileView: View {
                 // Shows entries the user deleted from Journals, with restore +
                 // empty-trash. Auto-expire after 30 days.
                 RecentlyDeletedCard(scheme: scheme)
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 16)
