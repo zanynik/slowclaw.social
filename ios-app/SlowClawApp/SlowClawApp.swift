@@ -471,7 +471,7 @@ final class AppState: ObservableObject {
         let records = journalInterestRecords.filter {
             deleted[$0.key] == nil && !excludedMemoryKeys.contains($0.key)
         }
-        let journalTopics = records.values.map(\.topics)
+        let journalTopics = ReadsRelevance.prepare(records.values.map(\.topics))
         return readsItems.filter { item in
             guard readingSignals[item.id]?.preference != -1 else { return false }
             let similarity = semanticMatches[item.id].flatMap { match in
@@ -479,7 +479,7 @@ final class AppState: ObservableObject {
             }
             return ReadsRelevance.accepts(title: item.title,
                 summary: item.description.strippingHTML(), similarity: similarity,
-                journalTopics: journalTopics)
+                preparedJournalTopics: journalTopics)
         }
     }
 

@@ -194,8 +194,9 @@ struct DailySelectionCard: View {
                         }
                     }
                 }
+                let eligible = state.relevantReads
                 let items = selection.readIDs.compactMap { id in
-                    state.relevantReads.first { $0.id == id }
+                    eligible.first { $0.id == id }
                 }
                 ForEach(items) { item in
                     FeedCard(item: item, interests: state.interests)

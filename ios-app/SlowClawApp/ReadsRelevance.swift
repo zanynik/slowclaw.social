@@ -4,16 +4,26 @@ import Foundation
 /// freshness/popularity scores. Similarity is a heuristic, not a probability.
 enum ReadsRelevance {
     static func accepts(title: String, summary: String, similarity: Double?, journalTopics: [[String]]) -> Bool {
+        accepts(title: title, summary: summary, similarity: similarity, preparedJournalTopics: prepare(journalTopics))
+    }
+
+    static func prepare(_ journalTopics: [[String]]) -> [[String]] {
+        journalTopics.map { Array(Set($0.map(normalized).filter { $0.count >= 3 })) }
+            .filter { $0.count >= 2 }
+    }
+
+    static func accepts(title: String, summary: String, similarity: Double?, preparedJournalTopics: [[String]]) -> Bool {
         if let similarity, similarity.isFinite, similarity >= 0.65 { return true }
         let text = " " + normalized(title + " " + summary) + " "
         // Two distinct topics from the same journal reduce broad one-word
         // coincidences, including when sentence embeddings are unavailable.
-        return journalTopics.contains { topics in
-            Set(topics.map(normalized))
-                .filter { topic in
-                    guard topic.count >= 3 else { return false }
-                    return text.contains(" " + topic + " ")
-                }.count >= 2
+        return preparedJournalTopics.contains { topics in
+            var count = 0
+            for topic in topics where text.contains(" " + topic + " ") {
+                count += 1
+                if count == 2 { return true }
+            }
+            return false
         }
     }
 
