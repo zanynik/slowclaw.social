@@ -54,10 +54,14 @@ struct ReadsModelCard: View {
         let preset = ReadsDecisionModel.preset
         let downloading = state.activeDownloadIDs.contains(preset.id)
         VStack(alignment: .leading, spacing: 8) {
-            if !state.readsModelInstalled {
-                Text("A small model for your Reads").font(.headline)
-                Text("Articles and Nostr posts appear only after an on-device relevance check against your journals.")
+            if showRemove || !state.readsModelInstalled || !state.readsModelEnabled {
+                Text("Qwen3-Reranker 0.6B").font(.headline)
+                Text("Fast local relevance for articles and Nostr posts, using your journals and personal memory.")
                     .font(.caption).foregroundStyle(.secondary)
+                Text("484 MB · Apache 2.0 · Separate from your writing model")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            if !state.readsModelInstalled {
                 if downloading {
                     ProgressView(value: state.localModelProgress[preset.id] ?? 0)
                 } else {
@@ -65,19 +69,33 @@ struct ReadsModelCard: View {
                         .buttonStyle(.bordered)
                 }
                 if let error = state.localModelError { Text(error).font(.caption) }
-            } else if let status = state.readsDecisionStatus {
+            } else if showRemove || !state.readsModelEnabled {
                 HStack {
-                    if state.readsDecisionBusy { ProgressView() }
+                    if state.readsModelEnabled {
+                        Label("Active for Reads", systemImage: "checkmark.circle.fill")
+                            .font(.caption).foregroundStyle(.green)
+                        Spacer()
+                        Button("Deactivate") { state.deactivateReadsModel() }
+                    } else {
+                        Button(state.readsModelActivating ? "Activating…" : "Activate for Reads") {
+                            Task { await state.activateReadsModel() }
+                        }.buttonStyle(.bordered)
+                            .disabled(state.readsModelActivating || state.readsDecisionBusy)
+                    }
+                }
+            }
+            if let status = state.readsDecisionStatus, state.readsModelInstalled {
+                HStack {
+                    if state.readsDecisionBusy || state.readsModelActivating { ProgressView() }
                     Text(status).font(.caption).foregroundStyle(.secondary)
-                    if !state.readsDecisionBusy {
+                    if state.readsModelEnabled && !state.readsDecisionBusy && !state.readsModelActivating {
                         Button("Retry") { Task { await state.refreshReadsDecisions() } }
                     }
                 }
             }
             if showRemove && state.readsModelInstalled {
-                Text(preset.detail).font(.caption).foregroundStyle(.secondary)
                 Button("Remove Reads model", role: .destructive) { Task { await state.removeReadsModel() } }
-                    .disabled(state.readsDecisionBusy || downloading)
+                    .disabled(state.readsDecisionBusy || state.readsModelActivating || downloading)
             }
         }.padding(.horizontal)
     }

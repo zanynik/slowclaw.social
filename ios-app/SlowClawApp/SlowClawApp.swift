@@ -467,9 +467,14 @@ final class AppState: ObservableObject {
     /// Discovery candidates stay cached, but the default reading surface must
     /// have a strong connection to a currently included journal.
     var relevantReads: [RankedFeedItem] {
-        readsItems.filter { item in
+        guard readsModelEnabled else { return [] }
+        return readsItems.filter { item in
             readingSignals[item.id]?.preference != -1 && ReadsRelevance.accepts(
                 readsDecisions[item.id], text: Self.readsDecisionText(item), revision: memoryRevision)
+        }.sorted {
+            let left = readsDecisions[$0.id]?.score ?? 0
+            let right = readsDecisions[$1.id]?.score ?? 0
+            return left == right ? ($0.score == $1.score ? $0.id < $1.id : $0.score > $1.score) : left > right
         }
     }
 
@@ -482,6 +487,37 @@ final class AppState: ObservableObject {
     @Published var readsDecisionStatus: String? = nil
     @Published private var readsDecisions: [String: ReadsRelevance.Decision] = [:]
     @Published var readsDecisionBusy = false
+    @Published private(set) var readsModelEnabled = UserDefaults.standard.bool(forKey: "slowclaw.reads-model.enabled.v1")
+    @Published private(set) var readsModelActivating = false
+
+    func activateReadsModel() async {
+        guard readsModelInstalled, !readsModelActivating, !readsDecisionBusy else { return }
+        guard !contextWorkPaused, !localModelBusy, !isGeneratingPosts else {
+            readsDecisionStatus = "Activate when recording or writing finishes."
+            return
+        }
+        readsModelActivating = true
+        readsDecisionStatus = "Checking the Reads model…"
+        do {
+            let path = try LocalModelStore.fileURL(for: ReadsDecisionModel.preset).path
+            try await OnDeviceAIExecutor.shared.run {
+                let model = try ReadsDecisionModel(path: path)
+                model.close()
+            }
+            readsModelEnabled = true
+            UserDefaults.standard.set(true, forKey: "slowclaw.reads-model.enabled.v1")
+            readsDecisionStatus = nil
+        } catch { readsDecisionStatus = error.localizedDescription }
+        readsModelActivating = false
+        if readsModelEnabled { await refreshReadsDecisions() }
+    }
+
+    func deactivateReadsModel() {
+        readsModelEnabled = false
+        UserDefaults.standard.set(false, forKey: "slowclaw.reads-model.enabled.v1")
+        readsDecisions = [:]
+        readsDecisionStatus = "Activate the relevance model to select your Reads."
+    }
 
     var readsDecisionRevision: Int { memoryRevision }
 
@@ -492,9 +528,10 @@ final class AppState: ObservableObject {
     }
 
     func removeReadsModel() async {
-        guard !readsDecisionBusy, !activeDownloadIDs.contains(ReadsDecisionModel.preset.id) else { return }
+        guard !readsDecisionBusy, !readsModelActivating, !activeDownloadIDs.contains(ReadsDecisionModel.preset.id) else { return }
         do {
             try LocalModelStore.delete(ReadsDecisionModel.preset)
+            deactivateReadsModel()
             readsDecisions = [:]
             localModelProgress[ReadsDecisionModel.preset.id] = nil
             readsDecisionStatus = "Download the relevance model to select your Reads."
@@ -504,10 +541,15 @@ final class AppState: ObservableObject {
     /// The larger generative model and keyword/embedding retrieval never grant
     /// admission. Pauses, missing context, missing models and errors abstain.
     func refreshReadsDecisions() async {
-        guard !readsDecisionBusy else { return }
+        guard !readsDecisionBusy, !readsModelActivating else { return }
         guard readsModelInstalled else {
             readsDecisions = [:]
             readsDecisionStatus = "Download the relevance model to select your Reads."
+            return
+        }
+        guard readsModelEnabled else {
+            readsDecisions = [:]
+            readsDecisionStatus = "Activate the relevance model to select your Reads."
             return
         }
         // Prefer corrected journal context; fall back to original journals so
@@ -532,7 +574,7 @@ final class AppState: ObservableObject {
             readsDecisionStatus = "Add a journal to help select relevant articles and posts."
             return
         }
-        guard !contextWorkPaused && !isGeneratingPosts && !isIndexingInterests && !localModelBusy else {
+        guard !contextWorkPaused && !isGeneratingPosts && !localModelBusy else {
             readsDecisionStatus = "Selection paused while other work finishes. Pull to retry."
             return
         }
@@ -547,7 +589,7 @@ final class AppState: ObservableObject {
         defer {
             readsDecisionBusy = false
             prepareDailySelection()
-            if !Task.isCancelled, revision != memoryRevision {
+            if !Task.isCancelled, readsModelEnabled, revision != memoryRevision {
                 Task { await refreshReadsDecisions() }
             }
         }
@@ -560,20 +602,22 @@ final class AppState: ObservableObject {
             // One bounded evaluation at a time. Recording and writing can take
             // priority between candidates; never queue a whole batch of work.
             for item in pending {
-                if Task.isCancelled || revision != memoryRevision || contextWorkPaused || isGeneratingPosts || isIndexingInterests || localModelBusy {
+                if Task.isCancelled || !readsModelEnabled || revision != memoryRevision || contextWorkPaused || isGeneratingPosts || localModelBusy {
                     paused = true; break
                 }
                 let text = Self.readsDecisionText(item)
                 let document = String(item.title.prefix(200)) + "\n" + String(item.description.strippingHTML().prefix(1200))
                 let score = try? await OnDeviceAIExecutor.shared.run { model.score(query: query, document: document) }
-                guard !Task.isCancelled, revision == memoryRevision else { paused = true; break }
+                guard !Task.isCancelled, readsModelEnabled, revision == memoryRevision else { paused = true; break }
                 if let score {
                     readsDecisions[item.id] = .init(text: text, score: score, revision: revision)
                 } else { failed = true }
             }
             _ = try? await OnDeviceAIExecutor.shared.run { model.close() }
-            readsDecisionStatus = paused ? "Selection paused. Pull to continue."
-                : failed ? "Some items couldn't be checked and remain hidden. Pull to retry." : nil
+            if readsModelEnabled {
+                readsDecisionStatus = paused ? "Selection paused. Pull to continue."
+                    : failed ? "Some items couldn't be checked and remain hidden. Pull to retry." : nil
+            }
         } catch { readsDecisionStatus = error.localizedDescription }
     }
 
@@ -1238,7 +1282,7 @@ final class AppState: ObservableObject {
     }
 
     private func waitForMemoryPriority() async throws {
-        while isGeneratingPosts || localModelBusy || audioTranscriptionInFlight || optionalAIPaused
+        while isGeneratingPosts || localModelBusy || readsDecisionBusy || readsModelActivating || audioTranscriptionInFlight || optionalAIPaused
             || recorder.isRecording || recorder.isTranscribing || recorder.isFinalizing
             || UIApplication.shared.applicationState != .active
             || ProcessInfo.processInfo.isLowPowerModeEnabled
@@ -4157,7 +4201,7 @@ struct ReadsView: View {
         .onChange(of: state.readsDecisionRevision) { _, _ in
             if state.selectedTab == .reads { Task { await state.refreshReadsDecisions() } }
         }
-        .onChange(of: state.contextWorkPaused || state.isGeneratingPosts || state.isIndexingInterests || state.localModelBusy) { _, paused in
+        .onChange(of: state.contextWorkPaused || state.isGeneratingPosts || state.localModelBusy) { _, paused in
             if !paused { Task { await state.refreshReadsDecisions() } }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -4415,14 +4459,14 @@ struct OnDeviceAICard: View {
                         Text("On-Device AI")
                             .font(DS.cardTitleFont)
                             .foregroundStyle(DS.ink(scheme))
-                        Text("Private model on your iPhone. No data leaves your device.")
+                        Text("Separate local models for reading and writing.")
                             .font(DS.captionFont)
                             .foregroundStyle(DS.muted(scheme))
                     }
                     Spacer()
                     // Availability dot: accent when a model is loaded.
                     Circle()
-                        .fill(state.localLLM.loaded ? DS.accent(scheme) : DS.muted(scheme))
+                        .fill(state.localLLM.loaded || state.readsModelEnabled ? DS.accent(scheme) : DS.muted(scheme))
                         .frame(width: 10, height: 10)
                 }
 
@@ -4432,6 +4476,10 @@ struct OnDeviceAICard: View {
                         $0.id == state.loadedLocalModelPresetID
                     }?.title ?? state.localLLM.modelId ?? "model"
                     Text("Ready — \(activeTitle) is running on-device")
+                        .font(DS.microFont)
+                        .foregroundStyle(DS.accent(scheme))
+                } else if state.readsModelEnabled {
+                    Text("Reads relevance is active. A writing model is optional.")
                         .font(DS.microFont)
                         .foregroundStyle(DS.accent(scheme))
                 } else if !state.localLLM.available {

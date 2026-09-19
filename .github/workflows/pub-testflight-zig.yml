@@ -12,6 +12,8 @@ on:
     push:
         branches:
             - main
+            # Explicit release branch: publish and validate before merging.
+            - feat/local-reads-relevance
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
             - ".github/workflows/scripts/asc-issue-cert-profile.js"

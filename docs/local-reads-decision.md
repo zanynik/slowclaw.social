@@ -12,8 +12,11 @@ The initial threshold needs real-device and personal-relevance evaluation.
 
 ## Product behavior
 
-- Download the separate 484 MB Reads model from Reads or Settings. It does not
-  appear among the journal-writing models or replace the active writing model.
+- Download and activate the separate 484 MB Reads model from Reads or Settings.
+  It does not
+  replace the active writing model. Its model-list row includes Download,
+  Activate for Reads, Active for Reads, Deactivate, and Remove controls.
+  Activation is persisted but weights are loaded only while selecting content.
 - Recent journal excerpts provide context when no generated memory exists;
   corrected memory summaries take precedence. Excluded/deleted journals cannot
   contribute. Up to 12 journal samples (180 characters each) are used per pass.
@@ -28,9 +31,12 @@ The initial threshold needs real-device and personal-relevance evaluation.
   to full candidate content/URL and the current journal revision. Edits,
   exclusions, deletion, and changed feed content invalidate prior approvals.
 - Evaluation runs off-main, one candidate at a time. Recording, model activation,
-  journal indexing/writing, backgrounding, low power, and thermal pressure pause
+  journal writing, backgrounding, low power, and thermal pressure pause
   work between candidates. The small model is released after each pass. An
   already executing prompt is bounded to 2,048 tokens and is not preempted.
+- Optional large-model journal indexing yields between entries to active Reads
+  selection. The small model can run from original journals with no writer active.
+- Accepted items sort by the small model's score; prior ranking breaks ties.
 - Daily selections and normal Reads cards both use the same admission gate.
   The instruction allows relevant challenges to beliefs, not just agreement.
 
@@ -77,5 +83,5 @@ Journal generation, transcription, publishing and signing workflows are unchange
 
 Rollback: revert the feature commit. No journal/database schema changes are
 introduced. Cache version 5 contains candidates only and can be discarded;
-the model can be removed in Settings. No TestFlight publishing is triggered by
-pushing the feature branch.
+the model can be removed in Settings. The existing TestFlight workflow explicitly accepts pushes to
+`feat/local-reads-relevance` for pre-merge release validation.
