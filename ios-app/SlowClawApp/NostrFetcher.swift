@@ -63,7 +63,7 @@ enum NostrFetcher {
                 id: "nostr:\(art.identifier)",
                 title: art.title ?? "Untitled",
                 link: art.articleURL,
-                description: art.summary.isEmpty ? String(art.body.prefix(280)) : art.summary,
+                description: art.summary.isEmpty ? String(art.body.prefix(1600)) : String((art.summary + "\n" + art.body).prefix(1600)),
                 sourceLabel: "Nostr",
                 score: score,
                 readMinutes: minutes,
@@ -73,6 +73,56 @@ enum NostrFetcher {
         }
     }
 
+    /// Query kinds separately so a high-volume short-post relay cannot crowd
+    /// long-form articles out of its result limit. No journal text leaves device.
+    static func fetchReads(topics: [String]) async -> [RankedFeedItem] {
+        async let articles = fetchArticles(topics: topics)
+        async let posts = fetchPosts(topics: topics)
+        return await articles + posts
+    }
+
+    private static func fetchPosts(topics: [String]) async -> [RankedFeedItem] {
+        var events: [[String: Any]] = []
+        await withTaskGroup(of: [[String: Any]]?.self) { group in
+            for relay in relays { group.addTask { await queryRelay(relay, kinds: [1], limit: 60) } }
+            for await batch in group { events += batch ?? [] }
+        }
+        return shortPostCandidates(events, topics: topics)
+    }
+
+    /// Only signed, substantive text notes become candidates. They still must
+    /// pass the same local decision model as every article before display.
+    static func shortPostCandidates(_ events: [[String: Any]], topics: [String], now: Date = Date()) -> [RankedFeedItem] {
+        var seen = Set<String>()
+        var perAuthor: [String: Int] = [:]
+        let verified = events.compactMap { raw -> PublishedEvent? in
+            guard JSONSerialization.isValidJSONObject(raw),
+                  let data = try? JSONSerialization.data(withJSONObject: raw),
+                  let event = try? JSONDecoder().decode(PublishedEvent.self, from: data),
+                  event.kind == 1, NostrEventVerifier.verify(event, now: now) else { return nil }
+            return event
+        }.sorted { $0.created_at == $1.created_at ? $0.id < $1.id : $0.created_at > $1.created_at }
+        var result: [RankedFeedItem] = []
+        for event in verified {
+            let body = event.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard seen.insert(event.id).inserted, body.count >= 30,
+                  !event.tags.contains(where: { $0.first == "content-warning" }),
+                  ReadsContentFilter.isAllowed(body),
+                  let quality = Article(event: ["id": event.id, "pubkey": event.pubkey, "content": body]),
+                  !quality.isSpam else { continue }
+            let count = perAuthor[event.pubkey, default: 0]
+            guard count < 2 else { continue }
+            perAuthor[event.pubkey] = count + 1
+            let age = max(0, (now.timeIntervalSince1970 - Double(event.created_at)) / 3600)
+            result.append(RankedFeedItem(id: "nostr:\(event.id)",
+                title: String(body.replacingOccurrences(of: "\n", with: " ").prefix(100)),
+                link: "https://njump.me/\(event.id)", description: String(body.prefix(1600)),
+                sourceLabel: "Nostr posts", score: 1 + 0.5 * pow(0.5, age / 72) + topicBoost(article: quality, topics: topics),
+                readMinutes: max(1, body.count / 900), sourcePlatform: "nostr", thumbnailURL: nil))
+        }
+        return Array(result.sorted { $0.score == $1.score ? $0.id < $1.id : $0.score > $1.score }.prefix(40))
+    }
+
     // MARK: - Relay query
 
     /// Open a WebSocket to one relay, send a REQ for `kinds`/`limit`, collect
@@ -80,6 +130,7 @@ enum NostrFetcher {
     private static func queryRelay(_ urlString: String, kinds: [Int], limit: Int) async -> [[String: Any]]? {
         guard let url = URL(string: urlString) else { return nil }
         let task = URLSession.shared.webSocketTask(with: url)
+        task.maximumMessageSize = 128 * 1024
         task.resume()
         defer { task.cancel(with: .goingAway, reason: nil) }
 
@@ -91,7 +142,7 @@ enum NostrFetcher {
 
         var collected: [[String: Any]] = []
         let deadline = Date().addingTimeInterval(8)
-        recvLoop: while Date() < deadline {
+        recvLoop: while Date() < deadline && collected.count < limit {
             // Drain with a short per-message timeout via Task racing.
             guard let msg = await nextMessage(task, by: deadline) else { break }
             switch msg {

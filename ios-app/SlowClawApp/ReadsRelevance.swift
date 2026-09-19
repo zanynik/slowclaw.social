@@ -1,33 +1,16 @@
 import Foundation
 
-/// Conservative admission to the personal reading surface, independent of
-/// freshness/popularity scores. Similarity is a heuristic, not a probability.
+/// Admission is exclusively a successful local decision for this exact input.
+/// Scores are model outputs, not calibrated probabilities of personal benefit.
 enum ReadsRelevance {
-    static func accepts(title: String, summary: String, similarity: Double?, journalTopics: [[String]]) -> Bool {
-        accepts(title: title, summary: summary, similarity: similarity, preparedJournalTopics: prepare(journalTopics))
+    static let threshold = 0.8
+    struct Decision: Sendable {
+        let text: String
+        let score: Double
+        let revision: Int
     }
-
-    static func prepare(_ journalTopics: [[String]]) -> [[String]] {
-        journalTopics.map { Array(Set($0.map(normalized).filter { $0.count >= 3 })) }
-            .filter { $0.count >= 2 }
-    }
-
-    static func accepts(title: String, summary: String, similarity: Double?, preparedJournalTopics: [[String]]) -> Bool {
-        if let similarity, similarity.isFinite, similarity >= 0.65 { return true }
-        let text = " " + normalized(title + " " + summary) + " "
-        // Two distinct topics from the same journal reduce broad one-word
-        // coincidences, including when sentence embeddings are unavailable.
-        return preparedJournalTopics.contains { topics in
-            var count = 0
-            for topic in topics where text.contains(" " + topic + " ") {
-                count += 1
-                if count == 2 { return true }
-            }
-            return false
-        }
-    }
-
-    private static func normalized(_ text: String) -> String {
-        text.lowercased().split { !$0.isLetter && !$0.isNumber }.joined(separator: " ")
+    static func accepts(_ decision: Decision?, text: String, revision: Int) -> Bool {
+        guard let decision, decision.revision == revision, decision.text == text else { return false }
+        return decision.score.isFinite && decision.score >= threshold && decision.score <= 1
     }
 }

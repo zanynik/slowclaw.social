@@ -40,6 +40,7 @@ const journal_agent = @import("journal_agent.zig");
 const rss_parser = @import("rss_parser.zig");
 const feeds_ranking = @import("feeds_ranking.zig");
 const feed_catalog = @import("feed_catalog.zig");
+const reads_decision = @import("reads_decision.zig");
 const local_inference = @import("local_inference.zig");
 
 /// Scalar-only ABI: no allocations, retained pointers or ownership transfer.
@@ -1701,4 +1702,26 @@ test "ffi: parse_and_rank ranks a dated item above an undated one on recency" {
     const fresh_at = std.mem.indexOf(u8, json, "Fresh").?;
     const stale_at = std.mem.indexOf(u8, json, "Stale").?;
     try testing.expect(fresh_at < stale_at);
+}
+
+// Dedicated Reads model. Input buffers are borrowed for the call. Handles
+// returned by open must be closed exactly once; scores own no memory.
+pub export fn slowclaw_feed_reads_model_open(path: [*]const u8, path_len: usize) ?*anyopaque {
+    return reads_decision.load(path[0..path_len]) catch null;
+}
+pub export fn slowclaw_feed_reads_model_close(handle: ?*anyopaque) void {
+    reads_decision.free(handle);
+}
+pub export fn slowclaw_feed_reads_score(handle: ?*anyopaque, query: [*]const u8, query_len: usize, document: [*]const u8, document_len: usize, out_score: *f64) c_int {
+    out_score.* = -1; // Explicit abstention, including every failure path.
+    out_score.* = reads_decision.score(handle, query[0..query_len], document[0..document_len]) catch return SLOWCLAW_ERR_INTERNAL;
+    return SLOWCLAW_OK;
+}
+test "Reads scoring fails closed without a model" {
+    var score: f64 = 1;
+    try std.testing.expect(slowclaw_feed_reads_score(null, "garden", 6, "compost", 7, &score) != SLOWCLAW_OK);
+    try std.testing.expectEqual(@as(f64, -1), score);
+    slowclaw_feed_reads_model_close(null);
+    try std.testing.expect(slowclaw_feed_reads_model_open("/nonexistent/reads.gguf", "/nonexistent/reads.gguf".len) == null);
+    _ = reads_decision;
 }
