@@ -1,6 +1,12 @@
-# Local decisions for Reads
+# Legacy Reads reranker baseline
 
-Reads now admits articles and Nostr short posts only after the dedicated local
+**Direction update:** Kev-0.5B is the first candidate for the typed local judge.
+Qwen3-Reranker is retained only as the already-released comparison baseline,
+not the primary Jev substitute going forward. See [the real-weight Kev
+evaluation](kev-reads-evaluation.md) for results and the deployment gate.
+This evaluation branch does not change the installed app or its active model.
+
+The released implementation admits articles and Nostr short posts only after the dedicated local
 Qwen3-Reranker 0.6B model scores them at least 0.80. Missing, failed, non-finite,
 stale, or unevaluated scores do not admit content. There is no keyword, embedding,
 or generative-model admission fallback. A short or empty feed is intentional.

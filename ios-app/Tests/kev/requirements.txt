@@ -1,0 +1,6 @@
+# Install torch from https://download.pytorch.org/whl/cpu on Linux.
+torch==2.14.0
+transformers==4.57.6
+peft==0.21.0
+safetensors==0.8.0
+huggingface_hub==0.36.2
