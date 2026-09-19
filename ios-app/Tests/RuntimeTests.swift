@@ -3,14 +3,33 @@ import CryptoKit
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
-    func testPersonalReadsRejectBroadDiscoveryAndRequireJournalEvidence() {
-        XCTAssertFalse(ReadsRelevance.accepts(title: "Latest headlines", summary: "Popular today", similarity: nil, journalTopics: []))
-        XCTAssertFalse(ReadsRelevance.accepts(title: "Garden news", summary: "Latest updates", similarity: 0.3, journalTopics: [["garden", "compost"]]))
-        XCTAssertTrue(ReadsRelevance.accepts(title: "Garden compost", summary: "A practical guide", similarity: nil, journalTopics: [["garden", "compost"]]))
-        XCTAssertFalse(ReadsRelevance.accepts(title: "Garden compost", summary: "", similarity: nil, journalTopics: [["garden"], ["compost"]]))
-        XCTAssertFalse(ReadsRelevance.accepts(title: "Garden", summary: "", similarity: nil, journalTopics: [["garden", "Garden"]]))
-        XCTAssertFalse(ReadsRelevance.accepts(title: "Party articles", summary: "", similarity: .nan, journalTopics: [["art", "part"]]))
-        XCTAssertTrue(ReadsRelevance.accepts(title: "Related ideas", summary: "", similarity: 0.8, journalTopics: []))
+    func testPersonalReadsRequireCurrentSuccessfulDecision() {
+        let text = "https://example.com/garden\nComposting in a small garden"
+        XCTAssertFalse(ReadsRelevance.accepts(nil, text: text, revision: 1))
+        for score in [Double.nan, .infinity, -1, 0, 0.79, 1.01] {
+            XCTAssertFalse(ReadsRelevance.accepts(.init(text: text, score: score, revision: 1), text: text, revision: 1))
+        }
+        let accepted = ReadsRelevance.Decision(text: text, score: 0.9, revision: 1)
+        XCTAssertTrue(ReadsRelevance.accepts(accepted, text: text, revision: 1))
+        XCTAssertFalse(ReadsRelevance.accepts(accepted, text: text, revision: 2))
+        XCTAssertFalse(ReadsRelevance.accepts(accepted, text: text + "changed", revision: 1))
+    }
+
+    func testNostrShortPostsRequireSignatureAndRespectWarningsAndDedup() throws {
+        let note = try event(content: "Composting in the community garden helps reduce food waste.")
+        func raw(_ event: PublishedEvent) throws -> [String: Any] {
+            try JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as! [String: Any]
+        }
+        let warning = try event(tags: [["content-warning"]], content: note.content)
+        let reaction = try event(kind: 7, content: note.content)
+        var tampered = try raw(note); tampered["content"] = "Altered garden content that was not signed."
+        let candidates = NostrFetcher.shortPostCandidates([try raw(note), try raw(note), try raw(warning), try raw(reaction), tampered], topics: ["garden"])
+        XCTAssertEqual(candidates.count, 1)
+        XCTAssertEqual(candidates.first?.id, "nostr:" + note.id)
+        XCTAssertEqual(candidates.first?.link, "https://njump.me/" + note.id)
+        XCTAssertEqual(candidates.first?.sourcePlatform, "nostr")
+        // Becoming a candidate alone must never grant Reads admission.
+        XCTAssertFalse(ReadsRelevance.accepts(nil, text: note.content, revision: 0))
     }
     func testReplyEnvelopePreservesRootsParentsAndArticleScopes() throws {
         let root = try event()

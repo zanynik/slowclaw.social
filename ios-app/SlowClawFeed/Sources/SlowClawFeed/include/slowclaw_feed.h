@@ -315,6 +315,14 @@ int32_t slowclaw_feed_local_llm_generate_title(
     SlowclawChatResult *out_result
 );
 
+/* Dedicated local Reads reranker. Inputs are borrowed; close each non-null
+ * model handle exactly once, after all scoring calls finish. Score is [0,1]
+ * on success, -1 on error. No strings/results require slowclaw_feed_free. */
+void *slowclaw_feed_reads_model_open(const char *path, size_t path_len);
+void slowclaw_feed_reads_model_close(void *handle);
+int slowclaw_feed_reads_score(void *handle, const char *query, size_t query_len,
+    const char *document, size_t document_len, double *out_score);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

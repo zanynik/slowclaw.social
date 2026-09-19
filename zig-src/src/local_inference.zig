@@ -67,17 +67,17 @@ var g_model_id: []u8 = &.{};
 // code paths, which the libc-free test build never emits.
 var g_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
 
-fn lockEngine() void {
+pub fn lockEngine() void {
     if (!have_llama) return;
     _ = std.c.pthread_mutex_lock(&g_mutex);
 }
 
-fn unlockEngine() void {
+pub fn unlockEngine() void {
     if (!have_llama) return;
     _ = std.c.pthread_mutex_unlock(&g_mutex);
 }
 
-fn ensureBackendInit() void {
+pub fn ensureBackendInit() void {
     if (have_llama) {
         if (!g_backend_init) {
             llama.llama_backend_init();
@@ -370,7 +370,7 @@ pub const LocalInference = struct {
 
 /// Readable, >1 KiB, "GGUF" magic — the three pre-checks from
 /// inference.rs load_model. `path_z` must be null-terminated.
-fn checkGgufFile(path_z: [:0]const u8) InferenceError!void {
+pub fn checkGgufFile(path_z: [:0]const u8) InferenceError!void {
     const fp = c_stdio.fopen(path_z.ptr, "rb") orelse return error.ModelLoadFailed;
     defer _ = c_stdio.fclose(fp);
     if (c_stdio.fseek(fp, 0, c_stdio.SEEK_END) != 0) return error.ModelLoadFailed;

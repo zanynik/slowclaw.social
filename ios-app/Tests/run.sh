@@ -4,6 +4,14 @@ APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 mkdir -p "$TEST_ROOT/Sources/Runtime" "$TEST_ROOT/Tests/RuntimeTests"
+cp "$APP_ROOT/SlowClawApp/NostrFetcher.swift" "$APP_ROOT/SlowClawApp/ReadsContentFilter.swift" "$TEST_ROOT/Sources/Runtime/"
+python3 - "$APP_ROOT" "$TEST_ROOT" <<'PYDTO'
+import pathlib, sys
+source = (pathlib.Path(sys.argv[1]) / "SlowClawFeed/Sources/SlowClawFeed/SlowClawFeed.swift").read_text()
+start = source.index("public struct RankedFeedItem:")
+end = source.index("private struct RankedFeedItemDTO:", start)
+(pathlib.Path(sys.argv[2]) / "Sources/Runtime/RankedFeedItem.swift").write_text("import Foundation\n" + source[start:end])
+PYDTO
 cp "$APP_ROOT/SlowClawApp/ReadsRelevance.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/OnDeviceAIExecutor.swift" "$APP_ROOT/SlowClawApp/Nip19.swift" "$APP_ROOT/SlowClawApp/NostrPublisher.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/DraftBudget.swift" "$TEST_ROOT/Sources/Runtime/"

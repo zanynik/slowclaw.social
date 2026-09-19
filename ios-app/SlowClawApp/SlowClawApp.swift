@@ -467,38 +467,162 @@ final class AppState: ObservableObject {
     /// Discovery candidates stay cached, but the default reading surface must
     /// have a strong connection to a currently included journal.
     var relevantReads: [RankedFeedItem] {
-        let deleted = Self.softDeletedKeys()
-        let records = journalInterestRecords.filter {
-            deleted[$0.key] == nil && !excludedMemoryKeys.contains($0.key)
-        }
-        let journalTopics = ReadsRelevance.prepare(records.values.map(\.topics))
+        guard readsModelEnabled else { return [] }
         return readsItems.filter { item in
-            guard readingSignals[item.id]?.preference != -1 else { return false }
-            let similarity = semanticMatches[item.id].flatMap { match in
-                records[match.journalKey] == nil ? nil : match.similarity
-            }
-            return ReadsRelevance.accepts(title: item.title,
-                summary: item.description.strippingHTML(), similarity: similarity,
-                preparedJournalTopics: journalTopics)
+            readingSignals[item.id]?.preference != -1 && ReadsRelevance.accepts(
+                readsDecisions[item.id], text: Self.readsDecisionText(item), revision: memoryRevision)
+        }.sorted {
+            let left = readsDecisions[$0.id]?.score ?? 0
+            let right = readsDecisions[$1.id]?.score ?? 0
+            return left == right ? ($0.score == $1.score ? $0.id < $1.id : $0.score > $1.score) : left > right
         }
     }
 
+    private static func readsDecisionText(_ item: RankedFeedItem) -> String {
+        // Full identity includes URL and untruncated content so recycled IDs
+        // and edited excerpts cannot inherit approval.
+        item.link + "\n" + item.title + "\n" + item.description
+    }
+
+    @Published var readsDecisionStatus: String? = nil
+    @Published private var readsDecisions: [String: ReadsRelevance.Decision] = [:]
+    @Published var readsDecisionBusy = false
+    @Published private(set) var readsModelEnabled = UserDefaults.standard.bool(forKey: "slowclaw.reads-model.enabled.v1")
+    @Published private(set) var readsModelActivating = false
+
+    func activateReadsModel() async {
+        guard readsModelInstalled, !readsModelActivating, !readsDecisionBusy else { return }
+        guard !contextWorkPaused, !localModelBusy, !isGeneratingPosts else {
+            readsDecisionStatus = "Activate when recording or writing finishes."
+            return
+        }
+        readsModelActivating = true
+        readsDecisionStatus = "Checking the Reads model…"
+        do {
+            let path = try LocalModelStore.fileURL(for: ReadsDecisionModel.preset).path
+            try await OnDeviceAIExecutor.shared.run {
+                let model = try ReadsDecisionModel(path: path)
+                model.close()
+            }
+            readsModelEnabled = true
+            UserDefaults.standard.set(true, forKey: "slowclaw.reads-model.enabled.v1")
+            readsDecisionStatus = nil
+        } catch { readsDecisionStatus = error.localizedDescription }
+        readsModelActivating = false
+        if readsModelEnabled { await refreshReadsDecisions() }
+    }
+
+    func deactivateReadsModel() {
+        readsModelEnabled = false
+        UserDefaults.standard.set(false, forKey: "slowclaw.reads-model.enabled.v1")
+        readsDecisions = [:]
+        readsDecisionStatus = "Activate the relevance model to select your Reads."
+    }
+
+    var readsDecisionRevision: Int { memoryRevision }
+
+    var readsModelInstalled: Bool { LocalModelStore.isDownloaded(ReadsDecisionModel.preset) }
+
+    func downloadReadsModel() async {
+        await downloadLocalModel(ReadsDecisionModel.preset)
+    }
+
+    func removeReadsModel() async {
+        guard !readsDecisionBusy, !readsModelActivating, !activeDownloadIDs.contains(ReadsDecisionModel.preset.id) else { return }
+        do {
+            try LocalModelStore.delete(ReadsDecisionModel.preset)
+            deactivateReadsModel()
+            readsDecisions = [:]
+            localModelProgress[ReadsDecisionModel.preset.id] = nil
+            readsDecisionStatus = "Download the relevance model to select your Reads."
+        } catch { readsDecisionStatus = error.localizedDescription }
+    }
+
+    /// The larger generative model and keyword/embedding retrieval never grant
+    /// admission. Pauses, missing context, missing models and errors abstain.
+    func refreshReadsDecisions() async {
+        guard !readsDecisionBusy, !readsModelActivating else { return }
+        guard readsModelInstalled else {
+            readsDecisions = [:]
+            readsDecisionStatus = "Download the relevance model to select your Reads."
+            return
+        }
+        guard readsModelEnabled else {
+            readsDecisions = [:]
+            readsDecisionStatus = "Activate the relevance model to select your Reads."
+            return
+        }
+        // Prefer corrected journal context; fall back to original journals so
+        // selecting Reads does not depend on the generative model being loaded.
+        let sources = journals.filter {
+            !excludedMemoryKeys.contains($0.key) && Self.softDeletedKeys()[$0.key] == nil
+        }.sorted {
+            let left = journalDate($0) ?? .distantPast
+            let right = journalDate($1) ?? .distantPast
+            return left == right ? $0.key < $1.key : left > right
+        }.prefix(12)
+        let query = sources.compactMap { entry -> String? in
+            let text: String
+            if let insight = journalInterestRecords[entry.key]?.insight {
+                text = insight.corrected ? insight.summary : insight.summary + " " + insight.excerpt
+            } else { text = journalBodyOf(entry.content) }
+            let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return clean.isEmpty ? nil : String(clean.prefix(180))
+        }.joined(separator: "\n")
+        guard !query.isEmpty else {
+            readsDecisions = [:]
+            readsDecisionStatus = "Add a journal to help select relevant articles and posts."
+            return
+        }
+        guard !contextWorkPaused && !isGeneratingPosts && !localModelBusy else {
+            readsDecisionStatus = "Selection paused while other work finishes. Pull to retry."
+            return
+        }
+        let revision = memoryRevision
+        let pending = readsItems.filter {
+            let prior = readsDecisions[$0.id]
+            return readingSignals[$0.id]?.preference != -1 &&
+                (prior?.revision != revision || prior?.text != Self.readsDecisionText($0))
+        }
+        guard !pending.isEmpty else { readsDecisionStatus = nil; return }
+        readsDecisionBusy = true
+        defer {
+            readsDecisionBusy = false
+            prepareDailySelection()
+            if !Task.isCancelled, readsModelEnabled, revision != memoryRevision {
+                Task { await refreshReadsDecisions() }
+            }
+        }
+        readsDecisionStatus = "Selecting articles and posts on your device…"
+        do {
+            let path = try LocalModelStore.fileURL(for: ReadsDecisionModel.preset).path
+            let model = try await OnDeviceAIExecutor.shared.run { try ReadsDecisionModel(path: path) }
+            var failed = false
+            var paused = false
+            // One bounded evaluation at a time. Recording and writing can take
+            // priority between candidates; never queue a whole batch of work.
+            for item in pending {
+                if Task.isCancelled || !readsModelEnabled || revision != memoryRevision || contextWorkPaused || isGeneratingPosts || localModelBusy {
+                    paused = true; break
+                }
+                let text = Self.readsDecisionText(item)
+                let document = String(item.title.prefix(200)) + "\n" + String(item.description.strippingHTML().prefix(1200))
+                let score = try? await OnDeviceAIExecutor.shared.run { model.score(query: query, document: document) }
+                guard !Task.isCancelled, readsModelEnabled, revision == memoryRevision else { paused = true; break }
+                if let score {
+                    readsDecisions[item.id] = .init(text: text, score: score, revision: revision)
+                } else { failed = true }
+            }
+            _ = try? await OnDeviceAIExecutor.shared.run { model.close() }
+            if readsModelEnabled {
+                readsDecisionStatus = paused ? "Selection paused. Pull to continue."
+                    : failed ? "Some items couldn't be checked and remain hidden. Pull to retry." : nil
+            }
+        } catch { readsDecisionStatus = error.localizedDescription }
+    }
+
     func recommendationReason(for item: RankedFeedItem) -> String {
-        if let match = semanticMatches[item.id], match.similarity >= 0.65,
-           !excludedMemoryKeys.contains(match.journalKey), Self.softDeletedKeys()[match.journalKey] == nil,
-           let insight = journalInterestRecords[match.journalKey]?.insight {
-            return "Connected to your journal: \(insight.summary)"
-        }
-        let text = (item.title + " " + item.description.strippingHTML()).lowercased()
-        guard let topic = interests.first(where: { text.contains($0.lowercased()) }) else {
-            return interests.isEmpty ? "From the source catalog — your journal interests are still growing."
-                : "Discovery from the source catalog, alongside your journal interests."
-        }
-        let fromJournal = journalInterestRecords.contains { key, record in
-            Self.softDeletedKeys()[key] == nil && record.topics.contains(topic)
-        }
-        return fromJournal ? "Matches a theme from your journals: \(topic)."
-            : "Matches your reading interests: \(topic)."
+        "Selected on your device for its connection to your journals."
     }
     @Published var readingSignals = ReadingHistory.load()
     private var readingCandidate: RankedFeedItem?
@@ -593,7 +717,7 @@ final class AppState: ObservableObject {
     // The version bump discards older caches wholesale — otherwise hydrated
     // items kept their dead habla.news URLs forever (the persistent-404 bug:
     // the merge path preserves existing items, so old links never aged out).
-    private static let readsCacheVersion = 4
+    private static let readsCacheVersion = 5
     private static let readsCacheMaxAge: TimeInterval = 30 * 60
     private static let rssSourceLimit = 32
     private var readsRefreshInFlight = false
@@ -680,7 +804,7 @@ final class AppState: ObservableObject {
         // The URLSession transfer itself is owned by iOS; these IDs let this
         // process reattach its progress handlers after a relaunch. Unknown IDs
         // from an older catalog are discarded rather than retried forever.
-        let knownModelIDs = Set(LocalModelPreset.presets.map(\.id))
+        let knownModelIDs = Set((LocalModelPreset.presets + [ReadsDecisionModel.preset]).map(\.id))
         activeDownloadIDs = Set(UserDefaults.standard.stringArray(
             forKey: Self.activeDownloadDefaultsKey) ?? []).intersection(knownModelIDs)
         for id in activeDownloadIDs { localModelProgress[id] = 0 }
@@ -745,6 +869,7 @@ final class AppState: ObservableObject {
                 }
             }
             localModelProgress[preset.id] = 1
+            if preset.id == ReadsDecisionModel.preset.id { await refreshReadsDecisions() }
         } catch {
             localModelError = "Download failed: \(error.localizedDescription)"
             localModelProgress[preset.id] = nil
@@ -757,7 +882,7 @@ final class AppState: ObservableObject {
     /// Stale/cancelled transfers retry on the same unmetered-network policy
     /// rather than remaining stuck forever.
     func resumePendingLocalModelDownloads() {
-        let presetsByID = Dictionary(uniqueKeysWithValues: LocalModelPreset.presets.map { ($0.id, $0) })
+        let presetsByID = Dictionary(uniqueKeysWithValues: (LocalModelPreset.presets + [ReadsDecisionModel.preset]).map { ($0.id, $0) })
         for id in activeDownloadIDs {
             guard let preset = presetsByID[id] else { continue }
             Task { await self.downloadLocalModel(preset) }
@@ -947,6 +1072,13 @@ final class AppState: ObservableObject {
     }
 
     func refreshJournals() async {
+        let previousReadsSources = journals.map { $0.key + "\n" + $0.content }
+        defer {
+            if previousReadsSources != journals.map({ $0.key + "\n" + $0.content }) {
+                memoryRevision += 1
+                readsDecisions = [:]
+            }
+        }
         do {
             // Journals: all entries EXCEPT drafts (sessionID="drafts") and
             // soft-deleted keys. Drafts (TweetClaw-generated posts) belong in
@@ -1150,7 +1282,7 @@ final class AppState: ObservableObject {
     }
 
     private func waitForMemoryPriority() async throws {
-        while isGeneratingPosts || localModelBusy || audioTranscriptionInFlight || optionalAIPaused
+        while isGeneratingPosts || localModelBusy || readsDecisionBusy || readsModelActivating || audioTranscriptionInFlight || optionalAIPaused
             || recorder.isRecording || recorder.isTranscribing || recorder.isFinalizing
             || UIApplication.shared.applicationState != .active
             || ProcessInfo.processInfo.isLowPowerModeEnabled
@@ -1174,6 +1306,7 @@ final class AppState: ObservableObject {
 
     private func rebuildInterestLens() {
         memoryRevision += 1
+        readsDecisions = [:]
         semanticMatches = [:]
         let now = Date()
         var scores: [String: Double] = [:]
@@ -1672,6 +1805,7 @@ final class AppState: ObservableObject {
            !readsItems.isEmpty,
            let refreshedAt = readsRefreshedAt,
            Date().timeIntervalSince(refreshedAt) < Self.readsCacheMaxAge {
+            await refreshReadsDecisions()
             return
         }
         guard !readsRefreshInFlight else { return }
@@ -1693,7 +1827,7 @@ final class AppState: ObservableObject {
         // Snapshot fetch happens off the main actor.
         let fetched = await Task.detached(priority: .userInitiated) {
             async let rssResult = Self.fetchAllRSS(sources: sources, topics: topics)
-            async let nostrResult = NostrFetcher.fetchArticles(topics: topics.map(\.label))
+            async let nostrResult = NostrFetcher.fetchReads(topics: topics.map(\.label))
             // rssResult is ([RankedFeedItem], Bool); nostrResult is [RankedFeedItem].
             return await (rssResult, nostrResult)
         }.value
@@ -1751,6 +1885,7 @@ final class AppState: ObservableObject {
         if capped.isEmpty {
             readsError = reachedAny ? nil : "Couldn't reach any feeds. Pull to retry."
             readsLoading = false
+            await refreshReadsDecisions()
             return
         }
 
@@ -1775,6 +1910,7 @@ final class AppState: ObservableObject {
         Self.saveReadsCache(items: readsItems, refreshedAt: readsRefreshedAt!, matches: semanticMatches)
         readsError = nil
         readsLoading = false
+        await refreshReadsDecisions()
     }
 
     /// Fetch a bounded catalog slice with a per-source timeout, then parse +
@@ -3969,101 +4105,110 @@ struct ReadsView: View {
         return state.relevantReads.filter { !ids.contains($0.id) }
     }
     var body: some View {
-        Group {
-            if state.readsLoading && state.readsItems.isEmpty {
-                VStack(spacing: 10) {
-                    ProgressView()
-                    Text("Loading…")
-                        .font(DS.captionFont)
-                        .foregroundStyle(DS.muted(scheme))
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if state.readsItems.isEmpty {
-                if let err = state.readsError {
-                    // Surface the failure instead of silently looking empty.
-                    VStack(spacing: 12) {
-                        Image(systemName: "exclamationmark.triangle")
-                            .font(.system(size: 36))
-                            .foregroundStyle(DS.muted(scheme))
-                        Text("Couldn't load reads")
-                            .font(DS.cardTitleFont)
-                            .foregroundStyle(DS.ink(scheme))
-                        Text(err)
+        VStack(spacing: 10) {
+            ReadsModelCard()
+            Group {
+                if state.readsLoading && state.readsItems.isEmpty {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                        Text("Loading…")
                             .font(DS.captionFont)
                             .foregroundStyle(DS.muted(scheme))
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal)
-                        Button("Retry") { Task { await state.loadReads(force: true) } }
-                            .buttonStyle(.bordered)
-                            .tint(DS.accentColor)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if state.readsItems.isEmpty {
+                    if let err = state.readsError {
+                        // Surface the failure instead of silently looking empty.
+                        VStack(spacing: 12) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.system(size: 36))
+                                .foregroundStyle(DS.muted(scheme))
+                            Text("Couldn't load reads")
+                                .font(DS.cardTitleFont)
+                                .foregroundStyle(DS.ink(scheme))
+                            Text(err)
+                                .font(DS.captionFont)
+                                .foregroundStyle(DS.muted(scheme))
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal)
+                            Button("Retry") { Task { await state.loadReads(force: true) } }
+                                .buttonStyle(.bordered)
+                                .tint(DS.accentColor)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        VStack(spacing: 12) {
+                            Image(systemName: "newspaper")
+                                .font(.system(size: 40))
+                                .foregroundStyle(DS.muted(scheme))
+                            Text("No articles yet")
+                                .font(DS.cardTitleFont)
+                                .foregroundStyle(DS.ink(scheme))
+                            Text("Articles and Nostr posts selected for your journals. Pull to refresh to load.")
+                                .font(DS.captionFont)
+                                .foregroundStyle(DS.muted(scheme))
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 32)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 } else {
-                    VStack(spacing: 12) {
-                        Image(systemName: "newspaper")
-                            .font(.system(size: 40))
-                            .foregroundStyle(DS.muted(scheme))
-                        Text("No articles yet")
-                            .font(DS.cardTitleFont)
-                            .foregroundStyle(DS.ink(scheme))
-                        Text("Long-form posts and news — ranked by what you've been writing about. Pull to refresh to load.")
-                            .font(DS.captionFont)
-                            .foregroundStyle(DS.muted(scheme))
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 32)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 10) {
-                        DailySelectionCard()
-                        // Subtitle row matching the reference: "{N} stories · ranked by your lens".
-                        HStack {
-                            Text("Connected to your journals")
-                                .font(DS.captionFont)
-                                .foregroundStyle(DS.muted(scheme))
-                            Text("·")
-                                .font(DS.captionFont)
-                                .foregroundStyle(DS.muted(scheme))
-                            Text("a quieter selection")
-                                .font(DS.captionFont)
-                                .foregroundStyle(DS.muted(scheme))
-                            Spacer()
-                            if state.readsLoading {
-                                // Background refresh in progress — keep the
-                                // cached list visible (no spinner swap).
-                                ProgressView().scaleEffect(0.7).frame(width: 14, height: 14)
+                    ScrollView {
+                        LazyVStack(spacing: 10) {
+                            DailySelectionCard()
+                            // Subtitle row matching the reference: "{N} stories · ranked by your lens".
+                            HStack {
+                                Text("Connected to your journals")
+                                    .font(DS.captionFont)
+                                    .foregroundStyle(DS.muted(scheme))
+                                Text("·")
+                                    .font(DS.captionFont)
+                                    .foregroundStyle(DS.muted(scheme))
+                                Text("a quieter selection")
+                                    .font(DS.captionFont)
+                                    .foregroundStyle(DS.muted(scheme))
+                                Spacer()
+                                if state.readsLoading {
+                                    // Background refresh in progress — keep the
+                                    // cached list visible (no spinner swap).
+                                    ProgressView().scaleEffect(0.7).frame(width: 14, height: 14)
+                                }
+                            }
+                            .padding(.horizontal, 4)
+
+                            ForEach(Array(remainingReads.prefix(visibleCount))) { item in
+                                FeedCard(item: item, interests: state.interests)
+                            }
+                            if visibleCount < remainingReads.count {
+                                Button("Explore five more") { visibleCount += 5 }
+                                    .padding(.vertical, 20)
+                            } else {
+                                Text(remainingReads.isEmpty ? "No more strong journal matches right now. A shorter list is enough." : "You're caught up. Take a thought with you.")
+                                    .font(DS.captionFont).foregroundStyle(DS.muted(scheme))
+                                    .padding(.vertical, 20)
                             }
                         }
-                        .padding(.horizontal, 4)
-
-                        ForEach(Array(remainingReads.prefix(visibleCount))) { item in
-                            FeedCard(item: item, interests: state.interests)
-                        }
-                        if visibleCount < remainingReads.count {
-                            Button("Explore five more") { visibleCount += 5 }
-                                .padding(.vertical, 20)
-                        } else {
-                            Text(remainingReads.isEmpty ? "No more strong journal matches right now. A shorter list is enough." : "You're caught up. Take a thought with you.")
-                                .font(DS.captionFont).foregroundStyle(DS.muted(scheme))
-                                .padding(.vertical, 20)
-                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 16)
+                        .padding(.bottom, 24)
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 16)
-                    .padding(.bottom, 24)
+                    .refreshable { await state.loadReads(force: true); state.prepareDailySelection() }
                 }
-                .refreshable { await state.loadReads(force: true); state.prepareDailySelection() }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.bg(scheme))
+        .onChange(of: state.readsDecisionRevision) { _, _ in
+            if state.selectedTab == .reads { Task { await state.refreshReadsDecisions() } }
+        }
+        .onChange(of: state.contextWorkPaused || state.isGeneratingPosts || state.localModelBusy) { _, paused in
+            if !paused { Task { await state.refreshReadsDecisions() } }
+        }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { state.prepareDailySelection() }
+            if phase == .active { Task { await state.refreshReadsDecisions() } }
         }
         .onChange(of: state.selectedTab) { _, tab in
-            if tab == .reads { state.prepareDailySelection() }
+            if tab == .reads { Task { await state.refreshReadsDecisions() } }
         }
         .task {
             // Cached list is shown instantly if present; otherwise load. A
@@ -4314,14 +4459,14 @@ struct OnDeviceAICard: View {
                         Text("On-Device AI")
                             .font(DS.cardTitleFont)
                             .foregroundStyle(DS.ink(scheme))
-                        Text("Private model on your iPhone. No data leaves your device.")
+                        Text("Separate local models for reading and writing.")
                             .font(DS.captionFont)
                             .foregroundStyle(DS.muted(scheme))
                     }
                     Spacer()
                     // Availability dot: accent when a model is loaded.
                     Circle()
-                        .fill(state.localLLM.loaded ? DS.accent(scheme) : DS.muted(scheme))
+                        .fill(state.localLLM.loaded || state.readsModelEnabled ? DS.accent(scheme) : DS.muted(scheme))
                         .frame(width: 10, height: 10)
                 }
 
@@ -4331,6 +4476,10 @@ struct OnDeviceAICard: View {
                         $0.id == state.loadedLocalModelPresetID
                     }?.title ?? state.localLLM.modelId ?? "model"
                     Text("Ready — \(activeTitle) is running on-device")
+                        .font(DS.microFont)
+                        .foregroundStyle(DS.accent(scheme))
+                } else if state.readsModelEnabled {
+                    Text("Reads relevance is active. A writing model is optional.")
                         .font(DS.microFont)
                         .foregroundStyle(DS.accent(scheme))
                 } else if !state.localLLM.available {
@@ -4354,6 +4503,7 @@ struct OnDeviceAICard: View {
                 }
 
                 // Model presets with lifecycle actions.
+                ReadsModelCard(showRemove: true)
                 ForEach(LocalModelPreset.presets) { model in
                     modelRow(model)
                 }
