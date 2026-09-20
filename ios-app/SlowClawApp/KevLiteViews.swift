@@ -1,5 +1,4 @@
 import SwiftUI
-import SlowClawFeed
 
 struct DraftsView: View {
     @EnvironmentObject var state: AppState

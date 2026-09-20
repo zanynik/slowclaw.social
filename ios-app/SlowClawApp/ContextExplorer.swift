@@ -1,5 +1,4 @@
 import SwiftUI
-import SlowClawFeed
 
 /// Lite revisits exact source passages. It does not invent a reflection.
 struct ContextExplorer: View {
