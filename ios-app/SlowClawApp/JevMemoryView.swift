@@ -21,7 +21,7 @@ struct JevConnectionCard: View {
                 }.font(.caption)
             } else {
                 Text("Find lasting ideas and useful context in your own words. No model download needed.").font(.caption).foregroundStyle(.secondary)
-                Button("Enable Jev") { consent = true }.disabled(state.jevConnecting || state.readsDecisionBusy || state.kevJournalBusy)
+                Button("Enable Jev") { consent = true }.disabled(state.jevConnecting)
             }
             if let status = state.jevStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
             if state.jevEnabled, let status = state.readsDecisionStatus { Text(status).font(.caption).foregroundStyle(.secondary) }

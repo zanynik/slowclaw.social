@@ -616,6 +616,7 @@ final class AppState: ObservableObject {
         defer {
             readsDecisionBusy = false
             prepareDailySelection()
+            if jevEnabled { startJevMemory() }
             if !Task.isCancelled, readsModelEnabled, revision != memoryRevision {
                 Task { await refreshReadsDecisions() }
             }
@@ -5089,6 +5090,7 @@ extension AppState {
             jevEnabled = true
             UserDefaults.standard.set(true, forKey: "slowclaw.jev.enabled.v1")
             deactivateReadsModel()
+            readsDecisionStatus = "Preparing personal memory for Reads…"
             jevStatus = "Connected. Finding useful passages…"
             startJevMemory()
         } catch { jevStatus = error.localizedDescription }
