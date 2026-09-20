@@ -77,7 +77,7 @@ final class AudioRecorder: NSObject, ObservableObject {
     private var tapInstalled = false
 
     /// The live on-device transcription session (nil when not recording).
-    private var liveSession: Transcriber.LiveSession?
+    private var liveSession: (any LiveTranscriptionSession)?
 
     /// Mutable state shared between the main actor (start/stop) and the
     /// audio-thread tap closure (which writes buffers + feeds the analyzer).
@@ -340,6 +340,9 @@ final class AudioRecorder: NSObject, ObservableObject {
     /// up the format converter from the mic format. On final results, appends
     /// to `transcript`. No-op (graceful) if the locale asset is unavailable.
     private func beginLiveSession(micFormat: AVAudioFormat) async {
+        // iOS 18 saves the same durable recording and transcribes it on-device
+        // after capture through the existing SFSpeechRecognizer path.
+        guard #available(iOS 26.0, *) else { return }
         isTranscribing = true
         defer { isTranscribing = false }
         let session: Transcriber.LiveSession

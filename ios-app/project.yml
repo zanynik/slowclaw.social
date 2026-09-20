@@ -25,7 +25,7 @@ packages:
 options:
   bundleIdPrefix: com.slowclaw
   deploymentTarget:
-    iOS: "26.0"
+    iOS: "18.0"
   createIntermediateGroups: true
   generateEmptyDirectories: true
 
@@ -55,7 +55,7 @@ targets:
       - package: NostrCrypto
         product: libsecp256k1
     platform: iOS
-    deploymentTarget: "26.0"
+    deploymentTarget: "18.0"
     sources:
       - path: SlowClawApp
       - path: SlowClawFeed/Sources/SlowClawFeed

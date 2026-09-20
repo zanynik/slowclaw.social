@@ -29,6 +29,14 @@ import Foundation
 import AVFoundation
 import Speech
 
+/// The recorder can store a session without requiring the iOS 26 speech types.
+protocol LiveTranscriptionSession: AnyObject {
+    var analyzerFormat: AVAudioFormat { get }
+    func start()
+    func process(_ buffer: AVAudioPCMBuffer)
+    func stop() async -> String
+}
+
 /// On-device speech transcription backed by SpeechAnalyzer (iOS 26+). Named
 /// `Transcriber` to avoid colliding with Apple's `Speech.SpeechTranscriber`.
 enum Transcriber {
@@ -72,13 +80,16 @@ enum Transcriber {
             diagnostic?("Speech permission is disabled. Enable Speech Recognition for SlowClaw in Settings.")
             return ""
         }
-        let modern = await transcribeWithAnalyzer(url: url, diagnostic: diagnostic)
-        if !modern.isEmpty { return modern }
+        if #available(iOS 26.0, *) {
+            let modern = await transcribeWithAnalyzer(url: url, diagnostic: diagnostic)
+            if !modern.isEmpty { return modern }
+        }
         return await LegacyTranscriber.transcribe(url: url)
     }
 
     /// The SpeechAnalyzer file fallback, isolated so the wrapper above can
     /// discard an empty result cleanly.
+    @available(iOS 26.0, *)
     private static func transcribeWithAnalyzer(url: URL, diagnostic: (@Sendable (String) -> Void)?) async -> String {
         do {
             let audioFile = try AVAudioFile(forReading: url)
@@ -103,6 +114,7 @@ enum Transcriber {
     /// AVAudioConverter loop. The framework owns file reading, timecodes and
     /// end-of-input, which prevents a converter status mistake from silently
     /// dropping the middle or tail of a long recording.
+    @available(iOS 26.0, *)
     static func transcribe(file: AVAudioFile, diagnostic: (@Sendable (String) -> Void)? = nil) async -> String {
         let transcriber: SpeechTranscriber
         do { transcriber = try await preparedOfflineTranscriber() }
@@ -159,7 +171,8 @@ enum Transcriber {
     /// delivered on the main actor through `onTranscript`. Call `start()` once, feed
     /// buffers, then `stop()` to flush. `analyzerFormat` is the AVAudioFormat
     /// the recorder must convert its tap buffers to before yielding.
-    final class LiveSession {
+    @available(iOS 26.0, *)
+    final class LiveSession: LiveTranscriptionSession {
         private let transcriber: SpeechTranscriber
         private let analyzer: SpeechAnalyzer
         private let inputStream: AsyncStream<AnalyzerInput>
@@ -238,6 +251,7 @@ enum Transcriber {
     /// analyzer/format can't be constructed. The caller starts it once recording
     /// begins. If on-device speech is unavailable, finals simply never arrive
     /// and the caller stores a placeholder.
+    @available(iOS 26.0, *)
     static func makeLiveSession(onTranscript: @escaping @MainActor (String) -> Void) async throws -> LiveSession {
         let transcriber = try await preparedLiveTranscriber()
         let analyzer = SpeechAnalyzer(modules: [transcriber])
@@ -256,6 +270,7 @@ enum Transcriber {
     /// Resolve a SpeechTranscriber locale equivalent to the user's current
     /// locale and ensure its system-managed model is installed. AssetInventory
     /// keeps the model outside the app bundle and updates it independently.
+    @available(iOS 26.0, *)
     private static func supportedCurrentLocale() async throws -> Locale {
         let requested = Locale.current
         let requestedID = requested.identifier(.bcp47)
@@ -270,6 +285,7 @@ enum Transcriber {
         return locale
     }
 
+    @available(iOS 26.0, *)
     private static func preparedOfflineTranscriber() async throws -> SpeechTranscriber {
         let locale = try await supportedCurrentLocale()
         let transcriber = SpeechTranscriber(locale: locale, preset: .transcription)
@@ -277,6 +293,7 @@ enum Transcriber {
         return transcriber
     }
 
+    @available(iOS 26.0, *)
     private static func preparedLiveTranscriber() async throws -> SpeechTranscriber {
         let locale = try await supportedCurrentLocale()
         let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
@@ -284,6 +301,7 @@ enum Transcriber {
         return transcriber
     }
 
+    @available(iOS 26.0, *)
     private static func installModel(for transcriber: SpeechTranscriber) async throws {
         if let installation = try await AssetInventory.assetInstallationRequest(
             supporting: [transcriber]
@@ -342,6 +360,7 @@ enum Transcriber {
     /// silently drop every chunk after the first. .endOfStream is reported
     /// only once, after the source data is actually drained, so the converter
     /// can flush internally-buffered samples and confirm end-of-output.
+    @available(iOS 26.0, *)
     private static func feed(file: AVAudioFile,
                              converter: AVAudioConverter,
                              into builder: AsyncStream<AnalyzerInput>.Continuation) -> Bool {
