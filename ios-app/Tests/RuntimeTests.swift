@@ -3,6 +3,27 @@ import CryptoKit
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
+    func testJevChunksPreserveSourceAndBoundUnicodePayloads() {
+        for text in [String(repeating: "A meaningful sentence. Another sentence!\n", count: 250), String(repeating: "🌿 विचार。", count: 900), String(repeating: "x", count: 4000)] {
+            let chunks = JevMemory.chunks(text)
+            XCTAssertEqual(chunks.joined(), text)
+            XCTAssertTrue(chunks.allSatisfy { !$0.isEmpty && $0.utf16.count <= 1200 })
+            XCTAssertEqual(JevMemory.split(text, near: text.count / 2).joined(), text)
+        }
+        XCTAssertTrue(JevMemory.chunks("  \n").isEmpty)
+    }
+    func testJevAdmissionRejectsRoutineInvalidAndStaleClassifications() {
+        XCTAssertTrue(JevMemory.Answer(category: "context", score: 0.7, version: JevMemory.version).useful)
+        for answer in [
+            JevMemory.Answer(category: "routine", score: 0.99, version: JevMemory.version),
+            JevMemory.Answer(category: "insight", score: 0.69, version: JevMemory.version),
+            JevMemory.Answer(category: "insight", score: .nan, version: JevMemory.version),
+            JevMemory.Answer(category: "insight", score: 1.1, version: JevMemory.version),
+            JevMemory.Answer(category: "unknown", score: 0.9, version: JevMemory.version),
+            JevMemory.Answer(category: "insight", score: 0.9, version: "old")
+        ] { XCTAssertFalse(answer.useful) }
+    }
+
     func testPersonalReadsRequireCurrentSuccessfulDecision() {
         let text = "https://example.com/garden\nComposting in a small garden"
         XCTAssertFalse(ReadsRelevance.accepts(nil, text: text, revision: 1))

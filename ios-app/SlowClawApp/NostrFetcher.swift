@@ -63,7 +63,7 @@ enum NostrFetcher {
                 id: "nostr:\(art.identifier)",
                 title: art.title ?? "Untitled",
                 link: art.articleURL,
-                description: art.summary.isEmpty ? String(art.body.prefix(1600)) : String((art.summary + "\n" + art.body).prefix(1600)),
+                description: art.summary.isEmpty ? art.body : art.summary + "\n" + art.body,
                 sourceLabel: "Nostr",
                 score: score,
                 readMinutes: minutes,
@@ -116,7 +116,7 @@ enum NostrFetcher {
             let age = max(0, (now.timeIntervalSince1970 - Double(event.created_at)) / 3600)
             result.append(RankedFeedItem(id: "nostr:\(event.id)",
                 title: String(body.replacingOccurrences(of: "\n", with: " ").prefix(100)),
-                link: "https://njump.me/\(event.id)", description: String(body.prefix(1600)),
+                link: "https://njump.me/\(event.id)", description: body,
                 sourceLabel: "Nostr posts", score: 1 + 0.5 * pow(0.5, age / 72) + topicBoost(article: quality, topics: topics),
                 readMinutes: max(1, body.count / 900), sourcePlatform: "nostr", thumbnailURL: nil))
         }

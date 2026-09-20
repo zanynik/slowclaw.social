@@ -125,6 +125,7 @@ struct SlowClawApp: App {
                 // audio file URL here. enqueue copies it into the Inbox and the
                 // serial worker transcribes on-device + auto-stores as a journal.
                 .onOpenURL { url in
+                    guard url.scheme != "slowclaw" else { return }
                     voiceMemoImporter.appState = appState
                     voiceMemoImporter.enqueue(url)
                 }
@@ -134,6 +135,7 @@ struct SlowClawApp: App {
                     // Warm-delivery path for shared files routed through the
                     // app delegate (see ShareURLDelegate.openURLHandler).
                     urlDelegate.openURLHandler = { [weak voiceMemoImporter] url in
+                        guard url.scheme != "slowclaw" else { return }
                         voiceMemoImporter?.appState = appState
                         voiceMemoImporter?.enqueue(url)
                     }
@@ -241,6 +243,7 @@ final class ShareURLDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ app: UIApplication, open url: URL,
                      options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+        if url.scheme == "slowclaw" { return true }
         // Warm delivery: hand it straight to the importer if wired; otherwise
         // capture for the cold-launch flush.
         if let openURLHandler {
@@ -414,6 +417,14 @@ final class AppState: ObservableObject {
     }
     private var lastWeeklyAttempt = Date.distantPast
     @Published var semanticMatches: [String: SemanticMatch] = [:]
+    @Published private(set) var jevEnabled = UserDefaults.standard.bool(forKey: "slowclaw.jev.enabled.v1")
+    @Published var jevStatus: String?
+    @Published var jevBusy = false
+    @Published var jevConnecting = false
+    @Published private var jevCache = JevMemory.Cache.load()
+    private var jevTask: Task<Void, Never>?
+    private var jevReadingTask: Task<Void, Never>?
+    private var jevReadSources: [String: String] = [:]
     private var memoryRevision = 0
     private var automaticModelActivationAllowed = true
     private var mutedInterests: Set<String> = []
@@ -467,10 +478,10 @@ final class AppState: ObservableObject {
     /// Discovery candidates stay cached, but the default reading surface must
     /// have a strong connection to a currently included journal.
     var relevantReads: [RankedFeedItem] {
-        guard readsModelEnabled else { return [] }
+        guard jevEnabled || readsModelEnabled else { return [] }
         return readsItems.filter { item in
             readingSignals[item.id]?.preference != -1 && ReadsRelevance.accepts(
-                readsDecisions[item.id], text: Self.readsDecisionText(item), revision: memoryRevision, threshold: kevStrongMatchesOnly ? 0.8 : 0)
+                readsDecisions[item.id], text: Self.readsDecisionText(item), revision: memoryRevision, threshold: jevEnabled ? JevMemory.threshold : (kevStrongMatchesOnly ? 0.8 : 0))
         }.sorted {
             let left = readsDecisions[$0.id]?.score ?? 0
             let right = readsDecisions[$1.id]?.score ?? 0
@@ -509,6 +520,7 @@ final class AppState: ObservableObject {
                 let model = try ReadsDecisionModel(path: path)
                 model.close()
             }
+            if jevEnabled { disableJev() }
             readsModelEnabled = true
             UserDefaults.standard.set(true, forKey: "slowclaw.kev.enabled.v1")
             readsDecisionStatus = nil
@@ -548,6 +560,14 @@ final class AppState: ObservableObject {
     /// The larger generative model and keyword/embedding retrieval never grant
     /// admission. Pauses, missing context, missing models and errors abstain.
     func refreshReadsDecisions() async {
+        if jevEnabled {
+            guard jevReadingTask == nil else { return }
+            let task = Task { await rankJevReads() }
+            jevReadingTask = task
+            await task.value
+            jevReadingTask = nil
+            return
+        }
         guard !readsDecisionBusy, !readsModelActivating, !kevJournalBusy else { return }
         guard readsModelInstalled else {
             readsDecisions = [:]
@@ -631,6 +651,11 @@ final class AppState: ObservableObject {
     }
 
     func recommendationReason(for item: RankedFeedItem) -> String {
+        if jevEnabled {
+            guard let decision = readsDecisions[item.id] else { return "Awaiting Jev" }
+            let quote = jevReadSources[item.id] ?? "your saved memory"
+            return "Relevance \(Int(decision.score * 100)) · \(quote)"
+        }
         guard let detail = kevReadDetails[item.id] else { return "Awaiting Kev" }
         return "Relevance \(Int(detail.relevance * 100)) · \(detail.topic) · \(detail.priority) priority"
     }
@@ -1116,6 +1141,7 @@ final class AppState: ObservableObject {
             journals = []
             drafts = []
         }
+        pruneJevMemory()
         scheduleInterestIndexing()
     }
 
@@ -1135,6 +1161,7 @@ final class AppState: ObservableObject {
     /// new/edited entries. Audio placeholders are skipped until their real
     /// transcript is stored.
     func scheduleInterestIndexing() {
+        if jevEnabled { startJevMemory() }
         // Lite uses original journals and on-demand Kev selections. No model
         // wakes automatically to rewrite or classify the journal archive.
     }
@@ -1317,6 +1344,7 @@ final class AppState: ObservableObject {
         UserDefaults.standard.set(excludedMemoryKeys.sorted(), forKey: "slowclaw.memory.excluded")
         journalInterestRecords.removeValue(forKey: key)
         Self.saveJournalInterestRecords(journalInterestRecords)
+        pruneJevMemory()
         rebuildInterestLens()
         readsRefreshedAt = nil
         Task { await loadReads(force: true) }
@@ -3843,7 +3871,8 @@ struct ReadsView: View {
     private var remainingReads: [RankedFeedItem] { state.relevantReads }
     var body: some View {
         VStack(spacing: 10) {
-            ReadsModelCard()
+            JevConnectionCard()
+            if !state.jevEnabled { ReadsModelCard() }
             HStack {
                 Button("Add a link") { showLink = true }
                 Spacer()
@@ -3900,9 +3929,10 @@ struct ReadsView: View {
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 10) {
-                            Toggle("Strong matches only", isOn: $state.kevStrongMatchesOnly)
-                                .font(DS.captionFont)
-                            Text("Kev Lite experiment · Scores are estimates. Every checked item is ranked below.")
+                            if !state.jevEnabled {
+                                Toggle("Strong matches only", isOn: $state.kevStrongMatchesOnly).font(DS.captionFont)
+                            }
+                            Text(state.jevEnabled ? "Jev · Only strong connections to saved memory. Scores are estimates." : "Kev Lite experiment · Scores are estimates. Every checked item is ranked below.")
                                 .font(.caption2).foregroundStyle(.secondary)
                             // Subtitle row matching the reference: "{N} stories · ranked by your lens".
                             HStack {
@@ -5022,5 +5052,164 @@ extension AppState {
             readsError = nil
             await refreshReadsDecisions()
         } catch { readsError = "Couldn't read that link. Try again." }
+    }
+}
+
+// MARK: - Jev cloud memory: exact passages, cached decisions, explicit consent
+extension AppState {
+    private func pruneJevMemory() {
+        var next = jevCache
+        next.records = next.records.filter { key, record in
+            guard let entry = jevSource(key) else { return false }
+            return record.version == JevMemory.version && record.fingerprint == JevCloud.fingerprint(entry.content)
+        }
+        guard next.records.count != jevCache.records.count else { return }
+        jevCache = next
+        memoryRevision += 1; readsDecisions = [:]; jevReadSources = [:]
+        do { try next.save() } catch { jevStatus = "Could not update the memory cache. Please retry." }
+    }
+    private func jevSource(_ key: String) -> SlowClawMemoryEntry? {
+        guard !excludedMemoryKeys.contains(key), let entry = memorySource(key),
+              QuestionThread.isJournalRecord(key: entry.key, category: entry.category, sessionID: entry.sessionID) else { return nil }
+        return entry
+    }
+    var jevPassages: [JevMemory.Passage] {
+        jevCache.records.flatMap { key, record -> [JevMemory.Passage] in
+            guard record.version == JevMemory.version, let entry = jevSource(key),
+                  record.fingerprint == JevCloud.fingerprint(entry.content) else { return [] }
+            return record.passages.filter { !jevCache.dismissed.contains($0.id) && entry.content.contains($0.text) }
+        }.sorted { $0.score == $1.score ? $0.id < $1.id : $0.score > $1.score }
+    }
+    func connectJev() async {
+        guard !jevConnecting else { return }
+        jevConnecting = true
+        defer { jevConnecting = false }
+        do {
+            if !JevCloud.shared.connected { try await JevCloud.shared.connect() }
+            jevEnabled = true
+            UserDefaults.standard.set(true, forKey: "slowclaw.jev.enabled.v1")
+            deactivateReadsModel()
+            jevStatus = "Connected. Finding useful passages…"
+            startJevMemory()
+        } catch { jevStatus = error.localizedDescription }
+    }
+    func stopJevMemory() {
+        jevTask?.cancel()
+        jevStatus = "Paused. Completed journals are saved; continue when ready."
+    }
+    func disableJev() {
+        jevEnabled = false
+        UserDefaults.standard.set(false, forKey: "slowclaw.jev.enabled.v1")
+        jevTask?.cancel(); jevReadingTask?.cancel()
+        memoryRevision += 1; readsDecisions = [:]; jevReadSources = [:]
+        jevStatus = "Cloud memory is off. Saved passages stay on this device."
+        Task { await JevCloud.shared.disconnect() }
+    }
+    func dismissJevPassage(_ id: String) {
+        var next = jevCache; next.dismissed.insert(id)
+        do { try next.save(); jevCache = next; memoryRevision += 1; readsDecisions = [:]; jevReadSources = [:] }
+        catch { jevStatus = "Could not save this change. Please retry." }
+    }
+    func startJevMemory() {
+        guard jevEnabled, jevTask == nil, !readsDecisionBusy, !contextWorkPaused else { return }
+        jevTask = Task { await scanJevMemory(); jevTask = nil }
+    }
+    private func checkJevWork() throws {
+        try Task.checkCancellation()
+        guard jevEnabled, !contextWorkPaused else { throw CancellationError() }
+    }
+    private func selectJevPassage(_ text: String, key: String, depth: Int = 0) async throws -> [JevMemory.Passage] {
+        try checkJevWork()
+        let answer = try await JevCloud.shared.memory(text)
+        try checkJevWork()
+        guard answer.useful else { return [] }
+        if text.count > 550 && depth < 2 {
+            var children: [JevMemory.Passage] = []
+            for part in JevMemory.split(text, near: text.count / 2) where !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                children += try await selectJevPassage(part, key: key, depth: depth + 1)
+            }
+            if !children.isEmpty { return children }
+            // The combined passage may carry meaning that neither half carries alone.
+        }
+        return [.init(id: JevCloud.fingerprint(key + "\n" + text), sourceKey: key, text: text, category: answer.category, score: answer.score)]
+    }
+    private func scanJevMemory() async {
+        jevBusy = true
+        defer {
+            jevBusy = false
+            if jevEnabled && !Task.isCancelled { Task { await refreshReadsDecisions() } }
+        }
+        do {
+            var cursor: Int64 = 0, checked = 0
+            repeat {
+                try checkJevWork()
+                let page = try memory.archivePage(before: cursor)
+                for entry in page.entries {
+                    try checkJevWork()
+                    guard let current = jevSource(entry.key), current.content == entry.content else { continue }
+                    let fingerprint = JevCloud.fingerprint(entry.content)
+                    if let previous = jevCache.records[entry.key], previous.fingerprint == fingerprint, previous.version == JevMemory.version { continue }
+                    let body = journalBodyOf(entry.content)
+                    guard Self.hasMeaningfulBody(body) else { continue }
+                    jevStatus = "Finding useful passages · \(checked) journals checked"
+                    var passages: [JevMemory.Passage] = []
+                    for chunk in JevMemory.chunks(body) {
+                        passages += try await selectJevPassage(chunk, key: entry.key)
+                    }
+                    try checkJevWork()
+                    guard jevSource(entry.key)?.content == entry.content else { continue }
+                    // Deduplicate repeated source text before storing or ranking.
+                    var seen = Set<String>()
+                    passages = passages.filter { seen.insert($0.id).inserted && entry.content.contains($0.text) }
+                    var next = jevCache
+                    next.records[entry.key] = .init(fingerprint: fingerprint, version: JevMemory.version, passages: passages)
+                    try next.save(); jevCache = next
+                    memoryRevision += 1; readsDecisions = [:]; jevReadSources = [:]
+                    checked += 1
+                    await Task.yield()
+                }
+                guard page.next != cursor else { break }
+                cursor = page.next
+            } while cursor != 0
+            jevStatus = "\(jevPassages.count) passages remembered"
+        } catch is CancellationError {
+            jevStatus = "Paused. Completed journals are saved; continue when ready."
+        } catch { jevStatus = error.localizedDescription }
+    }
+    private func rankJevReads() async {
+        guard jevEnabled, !readsDecisionBusy, !jevBusy, !contextWorkPaused else { return }
+        let memories = jevPassages
+        guard !memories.isEmpty else { readsDecisions = [:]; readsDecisionStatus = "Find useful passages in Personal memory first."; return }
+        readsDecisionBusy = true
+        defer { readsDecisionBusy = false; prepareDailySelection() }
+        let revision = memoryRevision
+        do {
+            for item in readsItems where readingSignals[item.id]?.preference != -1 {
+                try checkJevWork()
+                guard revision == memoryRevision else { return }
+                let identity = Self.readsDecisionText(item)
+                if let previous = readsDecisions[item.id], previous.revision == revision, previous.text == identity { continue }
+                readsDecisionStatus = "Comparing incoming stories with your memory…"
+                let text = item.title + "\n" + item.description.strippingHTML()
+                var best: JevCloud.Match?
+                // Long posts are judged in full, in bounded portions, never just the lead.
+                for portion in JevMemory.chunks(text, maximum: 10000) {
+                    for offset in stride(from: 0, to: memories.count, by: 16) {
+                        try checkJevWork()
+                        guard revision == memoryRevision else { return }
+                        let batch = Array(memories[offset..<min(offset + 16, memories.count)])
+                        for match in try await JevCloud.shared.reading(portion, memories: batch) {
+                            if match.score > (best?.score ?? -1) { best = match }
+                        }
+                    }
+                }
+                try checkJevWork()
+                guard revision == memoryRevision, let best else { continue }
+                readsDecisions[item.id] = .init(text: identity, score: best.score, revision: revision)
+                jevReadSources[item.id] = memories.first(where: { $0.id == best.id }).map { String($0.text.prefix(110)).trimmingCharacters(in: .whitespacesAndNewlines) }
+            }
+            readsDecisionStatus = nil
+        } catch is CancellationError { readsDecisionStatus = "Selection paused. Pull to continue." }
+        catch { readsDecisionStatus = error.localizedDescription }
     }
 }

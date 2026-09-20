@@ -68,10 +68,11 @@ struct ProfileView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 Text("Settings").font(DS.titleFont)
-                Text("SlowClaw Lite · Kev experiment").font(.headline)
-                Text("One local judge for reading and finding your words. Recording, transcription and publishing work as before.")
+                Text("SlowClaw Lite · Jev memory").font(.headline)
+                Text("Keep the useful parts of your journals. Let them guide what you read.")
                     .font(.subheadline).foregroundStyle(.secondary)
-                ReadsModelCard(showRemove: true)
+                JevConnectionCard()
+                DisclosureGroup("Optional on-device Kev") { ReadsModelCard(showRemove: true) }
                 Button("Personal memory & followed questions") { showMemory = true }
                 Button("My Nostr posts & replies") { showPosts = true }
                 DisclosureGroup("Storage") {
