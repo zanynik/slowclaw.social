@@ -83,6 +83,7 @@ final class JevCloud: NSObject, ASWebAuthenticationPresentationContextProviding 
               result.matches.allSatisfy({ $0.score.isFinite && (0...1).contains($0.score) }) else { throw Failure(message: "Jev returned an invalid reading decision.") }
         return result.matches
     }
+    private struct ErrorBody: Decodable { let error: String }
     private func request<T: Decodable>(_ path: String, body: [String: Any], authenticated: Bool = true) async throws -> T {
         try Task.checkCancellation()
         var request = URLRequest(url: URL(string: Self.origin + "/api/" + path)!)
@@ -96,7 +97,6 @@ final class JevCloud: NSObject, ASWebAuthenticationPresentationContextProviding 
         let (data, response) = try await session.data(for: request)
         try Task.checkCancellation()
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            struct ErrorBody: Decodable { let error: String }
             let message = (try? JSONDecoder().decode(ErrorBody.self, from: data))?.error ?? "Jev could not complete the request. Please retry."
             throw Failure(message: message)
         }
