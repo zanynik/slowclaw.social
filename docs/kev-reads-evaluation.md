@@ -1,5 +1,10 @@
 # Kev-first Reads judge: initial evaluation
 
+**Later experiment:** the user explicitly requested a Kev Lite TestFlight despite
+these diagnostic failures. See [Kev Lite](kev-lite.md) for the native port, relaxed
+experimental feed ranking and release behavior. The historical results below
+remain unchanged.
+
 The target is a small on-device decision model that uses journals/personal
 memory to judge RSS stories, links and Nostr posts. Qwen3-Reranker is a legacy
 comparison baseline, no longer the primary Jev substitute. Kev-0.5B is the first

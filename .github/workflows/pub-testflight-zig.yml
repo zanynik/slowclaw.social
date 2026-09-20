@@ -14,6 +14,7 @@ on:
             - main
             # Explicit release branch: publish and validate before merging.
             - feat/local-reads-relevance
+            - feat/kev-reads-judge
         paths:
             - ".github/workflows/pub-testflight-zig.yml"
             - ".github/workflows/scripts/asc-issue-cert-profile.js"
@@ -43,7 +44,24 @@ permissions:
     contents: read
 
 jobs:
+    kev-model:
+        name: Package pinned Kev model
+        if: github.ref == 'refs/heads/feat/kev-reads-judge'
+        runs-on: ubuntu-24.04
+        timeout-minutes: 25
+        permissions:
+            contents: write
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+            - name: Package or verify the tested model asset
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: bash ios-app/Tests/kev/package-model.sh
+
     build-and-upload:
+        needs: kev-model
+        if: always() && !cancelled() && (needs.kev-model.result == 'success' || needs.kev-model.result == 'skipped')
         name: Build and Upload iOS App (Zig)
         runs-on: macos-26
         timeout-minutes: 45
@@ -87,6 +105,24 @@ jobs:
               if: inputs.test_minicpm == true
               timeout-minutes: 20
               run: bash ios-app/Tests/minicpm-smoke.sh
+
+            - name: Test actual Kev model and C ABI
+              if: github.ref == 'refs/heads/feat/kev-reads-judge'
+              timeout-minutes: 15
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  gh release download kev-lite-model-v1 --pattern slowclaw-kev-q8.gguf --dir /tmp/kev-model
+                  python3 - <<'PY'
+                  import hashlib, json
+                  manifest = json.load(open('ios-app/Tests/kev/model-manifest.json'))
+                  h = hashlib.sha256()
+                  with open('/tmp/kev-model/slowclaw-kev-q8.gguf', 'rb') as f:
+                      while chunk := f.read(1048576): h.update(chunk)
+                  assert h.hexdigest() == manifest['sha256']
+                  PY
+                  SLOWCLAW_KEV_GGUF=/tmp/kev-model/slowclaw-kev-q8.gguf bash ios-app/Tests/kev/native-smoke.sh
 
             - name: Build Zig staticlib (iOS device)
               working-directory: zig-src

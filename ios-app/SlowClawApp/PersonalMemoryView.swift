@@ -10,67 +10,69 @@ struct PersonalMemoryView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
-    @State private var matches: Set<String> = []
+    @State private var results: [(String, Double)] = []
     @State private var searching = false
+    @State private var source: SlowClawMemoryEntry?
+    @State private var searched = false
     var body: some View {
         NavigationStack {
             List {
                 Section {
-                    Text("Your experiences, questions and stated views, with their original passages. These are tentative notes, not facts about who you are. Correct or forget anything.")
+                    Text("Original journals are Kev's memory. Exclude any journal from its source page. Saved corrections below take precedence for Reads.")
                         .font(.callout).foregroundStyle(.secondary)
-                    Text("Reads compares meaning on this device where Apple's language model is available. Other languages use topic matching. Similarity doesn't mean agreement or truth.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Toggle("Prepare occasional short posts", isOn: $state.automaticDrafts)
-                    Toggle("Prepare a weekly reflection", isOn: $state.automaticReflections)
-                    Text("At most one per day, from recent journals. Always private until you review and publish.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    if let status = state.memoryStatus { Text(status).font(.caption) }
-                    Text("\(state.personalMemories.count) source-linked memories. Older journals are processed in small batches while optional on-device work is available.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    if !state.localLLM.loaded { Text("A downloaded local model resumes this work when the app is idle enough. Model downloads are managed in Settings.").font(.caption) }
-                }
-                Section {
-                    NavigationLink("Questions you’re following") { QuestionThreadsView() }
-                    if let error = state.questionError { Text(error).font(.caption).foregroundStyle(.red) }
-                }
-                Section { WeeklyReflectionCard() }
-                Section("From your journals") {
-                    if searching { ProgressView("Searching on this device…") }
-                    if state.personalMemories.isEmpty {
-                        Text("Source-linked notes will appear after local processing.").foregroundStyle(.secondary)
+                    HStack {
+                        TextField("Find a thought or experience", text: $query)
+                        Button("Find") {
+                            let request = query
+                            searching = true; searched = true; results = []
+                            Task {
+                                let matches = await state.searchKevJournals(request)
+                                if query == request { results = matches }
+                                searching = false
+                            }
+                        }.disabled(query.isEmpty || searching || state.kevJournalBusy || state.readsDecisionBusy || !state.readsModelEnabled)
                     }
-                    if !query.isEmpty && !searching && matches.isEmpty {
-                        Text("No close matches. Try another word or phrase.").foregroundStyle(.secondary)
+                    if searching { ProgressView("Checking journals with Kev…") }
+                    Text("Search checks up to 24 recent journals. Scores are experimental estimates.").font(.caption)
+                }
+                if searched {
+                    Section("Highest relevance first") {
+                        ForEach(results, id: \.0) { result in
+                            if let entry = state.memorySource(result.0), !state.excludedMemoryKeys.contains(result.0) {
+                                Button { source = entry } label: {
+                                    VStack(alignment: .leading) {
+                                        Text(String(entry.content.prefix(160))).lineLimit(3)
+                                        Text("Relevance \(Int(result.1 * 100))").font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                        if results.isEmpty && !searching { Text("No results yet. Activate Kev and try when other work finishes.").font(.caption) }
                     }
-                    ForEach(state.personalMemories.filter { query.isEmpty || matches.contains($0.id) }) { row in
-                        MemoryInsightRow(row: row)
+                }
+                Section { NavigationLink("Questions you’re following") { QuestionThreadsView() } }
+                if !state.personalMemories.isEmpty {
+                    Section("Saved memory notes") { ForEach(state.personalMemories) { row in MemoryInsightRow(row: row) } }
+                }
+                Section("Recent source journals") {
+                    ForEach(Array(state.liteJournals.prefix(24)), id: \.key) { entry in
+                        Button { source = entry } label: { Text(String(entry.content.prefix(100))).lineLimit(2) }
                     }
                 }
                 if !state.excludedMemoryKeys.isEmpty {
                     Section("Excluded journals") {
                         ForEach(state.excludedMemoryKeys.sorted(), id: \.self) { key in
                             if let entry = state.memorySource(key) {
-                                HStack {
-                                    Text(journalTitleOf(entry)).lineLimit(2)
-                                    Spacer()
-                                    Button("Include") { state.includeInMemory(key) }
-                                }
+                                Button("Include: " + String(entry.content.prefix(70))) { state.includeInMemory(key) }
                             }
                         }
                     }
                 }
-            }
-            .navigationTitle("Personal memory")
-            .searchable(text: $query, prompt: "Find a thought or experience")
-            .task(id: query + String(state.contextRevision)) {
-                guard !query.isEmpty else { matches = []; searching = false; return }
-                searching = true
-                do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
-                let results = await state.searchPersonalContext(query)
-                guard !Task.isCancelled else { return }
-                matches = Set(results.map(\.id)); searching = false
-            }
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            }.navigationTitle("Personal memory")
+                .onChange(of: state.readsDecisionRevision) { _, _ in results = []; searched = false }
+                .onChange(of: query) { _, _ in results = []; searched = false }
+                .sheet(item: $source) { JournalDetailView(entry: $0).environmentObject(state) }
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
     }
 }

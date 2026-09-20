@@ -9,7 +9,7 @@ enum ReadsRelevance {
         let score: Double
         let revision: Int
     }
-    static func accepts(_ decision: Decision?, text: String, revision: Int) -> Bool {
+    static func accepts(_ decision: Decision?, text: String, revision: Int, threshold: Double = threshold) -> Bool {
         guard let decision, decision.revision == revision, decision.text == text else { return false }
         return decision.score.isFinite && decision.score >= threshold && decision.score <= 1
     }

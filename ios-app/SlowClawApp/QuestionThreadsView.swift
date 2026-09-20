@@ -58,7 +58,7 @@ struct QuestionThreadView: View {
                         catch { self.error = error.localizedDescription }
                     }.disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).count < 5 || question.count > 240 || note.count > 2000)
                     if let error { Text(error).foregroundStyle(.red).font(.caption) }
-                    Text("Paused and resolved questions stay here, but leave your daily selection.").font(.caption).foregroundStyle(.secondary)
+                    Text("Paused and resolved questions stay here for reference.").font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Kept experiences") {
                     ForEach(thread.sourceKeys.compactMap { state.contextDocument($0) }) { doc in
@@ -81,7 +81,7 @@ struct QuestionThreadView: View {
                             }.font(.caption)
                         }
                     }
-                    if related.isEmpty { Text("No close matches in indexed journals yet.").foregroundStyle(.secondary) }
+                    if related.isEmpty { Text("No checked journal matches yet. Activate Kev and retry when idle.").foregroundStyle(.secondary) }
                 }
                 Section("Reading to explore") {
                     ForEach(evidence) { article in

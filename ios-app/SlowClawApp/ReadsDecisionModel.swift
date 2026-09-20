@@ -1,48 +1,50 @@
 import Foundation
 import CryptoKit
 
-/// Native operations run only on OnDeviceAIExecutor. The handle never escapes
-/// this wrapper and is released on that executor after each curation pass.
+/// A separate Kev handle, used and closed only on OnDeviceAIExecutor.
 final class ReadsDecisionModel: @unchecked Sendable {
     static let preset = LocalModelPreset(
-        id: "reads-qwen3-reranker-0.6b-q4km-v1",
-        title: "Reads relevance model",
-        detail: "Qwen3-Reranker 0.6B · Apache 2.0 · only used on this device",
-        fileName: "Qwen3-Reranker-0.6B.Q4_K_M.gguf",
-        downloadURL: URL(string: "https://huggingface.co/QuantFactory/Qwen3-Reranker-0.6B-GGUF/resolve/9bdee8f1ad01d7896a20823d5affd66c494eee8b/Qwen3-Reranker-0.6B.Q4_K_M.gguf")!,
-        sizeBytes: 484_000_000, sizeLabel: "484 MB")
-
+        id: "kev-0.5b-q8-v1", title: "Kev-0.5B",
+        detail: "Local judge for Reads and journal selections · Apache 2.0",
+        fileName: "slowclaw-kev-q8.gguf",
+        downloadURL: URL(string: "https://github.com/zanynik/slowclaw.social/releases/download/kev-lite-model-v1/slowclaw-kev-q8.gguf")!,
+        sizeBytes: 532904896, sizeLabel: "533 MB")
+    static let digest = "4606b739bd5fae0c77c2dc978a8983a9cc1eccd476d97d02f2e1e154ea537686"
     private var handle: UnsafeMutableRawPointer?
     init(path: String) throws {
-        // Validate the actual trained weights, not the uninformative GGUF name.
-        // Stream the hash off-main; never allocate the 484 MB file as one Data.
         let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
         defer { try? file.close() }
         var hash = SHA256()
         while let chunk = try file.read(upToCount: 1_048_576), !chunk.isEmpty { hash.update(data: chunk) }
-        let digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
-        guard digest == "783d816e7541ba78a5105f949a010217fecf31795c267d69ffa5a96403dff4a7" else {
-            throw PublishingError.message("The Reads model is incomplete or different. Remove it in Settings and download it again.")
+        guard hash.finalize().map({ String(format: "%02x", $0) }).joined() == Self.digest else {
+            throw PublishingError.message("Kev's download is incomplete or different. Remove it and download again.")
         }
-        handle = path.withCString { slowclaw_feed_reads_model_open($0, path.utf8.count) }
-        guard handle != nil else {
-            throw PublishingError.message("Couldn't load the Reads model. Remove it in Settings and download it again.")
+        handle = path.withCString { slowclaw_feed_kev_open($0, path.utf8.count) }
+        guard handle != nil else { throw PublishingError.message("Couldn't load Kev. Try again after closing other model work.") }
+    }
+    func evaluate(state: String, questions: [KevQuestion]) -> [[Double]]? {
+        struct Request: Encodable { let state: String; let questions: [KevQuestion] }
+        guard !state.isEmpty, (1...8).contains(questions.count),
+              questions.allSatisfy({ (2...8).contains($0.options.count) }),
+              let data = try? JSONEncoder().encode(Request(state: state, questions: questions)),
+              let json = String(data: data, encoding: .utf8) else { return nil }
+        var values = [Double](repeating: -1, count: questions.reduce(0) { $0 + $1.options.count })
+        let capacity = values.count
+        let count = json.withCString { slowclaw_feed_kev_evaluate(handle, $0, json.utf8.count, &values, capacity) }
+        guard count == capacity else { return nil }
+        var offset = 0
+        var result: [[Double]] = []
+        for q in questions {
+            let row = Array(values[offset..<(offset + q.options.count)])
+            guard KevLite.validDistribution(row) else { return nil }
+            result.append(row); offset += q.options.count
         }
+        return result
     }
-    func score(query: String, document: String) -> Double? {
-        var result = -1.0
-        let status = query.withCString { queryBytes in
-            document.withCString { documentBytes in
-                slowclaw_feed_reads_score(handle, queryBytes, query.utf8.count,
-                    documentBytes, document.utf8.count, &result)
-            }
-        }
-        return status == 0 && result.isFinite && (0...1).contains(result) ? result : nil
+    func judge(memory: String, document: String) -> KevReadingJudgement? {
+        evaluate(state: document, questions: KevReadingJudgement.questions(memory: memory)).flatMap(KevReadingJudgement.init)
     }
-    func close() {
-        slowclaw_feed_reads_model_close(handle)
-        handle = nil
-    }
+    func close() { slowclaw_feed_kev_close(handle); handle = nil }
 }
 
 import SwiftUI
@@ -55,32 +57,32 @@ struct ReadsModelCard: View {
         let downloading = state.activeDownloadIDs.contains(preset.id)
         VStack(alignment: .leading, spacing: 8) {
             if showRemove || !state.readsModelInstalled || !state.readsModelEnabled {
-                Text("Qwen3-Reranker 0.6B").font(.headline)
-                Text("Fast local relevance for articles and Nostr posts, using your journals and personal memory.")
+                Text("Kev-0.5B · Lite experiment").font(.headline)
+                Text("Ranks reading and selects your own journal sentences, entirely on this device.")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("484 MB · Apache 2.0 · Separate from your writing model")
+                Text("533 MB · Apache 2.0 · Experimental rankings")
                     .font(.caption2).foregroundStyle(.secondary)
             }
             if !state.readsModelInstalled {
                 if downloading {
                     ProgressView(value: state.localModelProgress[preset.id] ?? 0)
                 } else {
-                    Button("Download · 484 MB") { Task { await state.downloadReadsModel() } }
+                    Button("Download · 533 MB") { Task { await state.downloadReadsModel() } }
                         .buttonStyle(.bordered)
                 }
                 if let error = state.localModelError { Text(error).font(.caption) }
             } else if showRemove || !state.readsModelEnabled {
                 HStack {
                     if state.readsModelEnabled {
-                        Label("Active for Reads", systemImage: "checkmark.circle.fill")
+                        Label("Kev active", systemImage: "checkmark.circle.fill")
                             .font(.caption).foregroundStyle(.green)
                         Spacer()
                         Button("Deactivate") { state.deactivateReadsModel() }
                     } else {
-                        Button(state.readsModelActivating ? "Activating…" : "Activate for Reads") {
+                        Button(state.readsModelActivating ? "Activating…" : "Activate Kev") {
                             Task { await state.activateReadsModel() }
                         }.buttonStyle(.bordered)
-                            .disabled(state.readsModelActivating || state.readsDecisionBusy)
+                            .disabled(state.readsModelActivating || state.readsDecisionBusy || state.kevJournalBusy)
                     }
                 }
             }
@@ -94,8 +96,8 @@ struct ReadsModelCard: View {
                 }
             }
             if showRemove && state.readsModelInstalled {
-                Button("Remove Reads model", role: .destructive) { Task { await state.removeReadsModel() } }
-                    .disabled(state.readsDecisionBusy || state.readsModelActivating || downloading)
+                Button("Remove Kev model", role: .destructive) { Task { await state.removeReadsModel() } }
+                    .disabled(state.readsDecisionBusy || state.readsModelActivating || state.kevJournalBusy || downloading)
             }
         }.padding(.horizontal)
     }

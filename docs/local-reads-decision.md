@@ -1,5 +1,8 @@
 # Legacy Reads reranker baseline
 
+**Kev Lite branch:** this file describes the former full-app baseline. The active
+branch implementation is now documented in [Kev Lite](kev-lite.md).
+
 **Direction update:** Kev-0.5B is the first candidate for the typed local judge.
 Qwen3-Reranker is retained only as the already-released comparison baseline,
 not the primary Jev substitute going forward. See [the real-weight Kev

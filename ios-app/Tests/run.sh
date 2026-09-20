@@ -12,6 +12,7 @@ start = source.index("public struct RankedFeedItem:")
 end = source.index("private struct RankedFeedItemDTO:", start)
 (pathlib.Path(sys.argv[2]) / "Sources/Runtime/RankedFeedItem.swift").write_text("import Foundation\n" + source[start:end])
 PYDTO
+cp "$APP_ROOT/SlowClawApp/KevLite.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/ReadsRelevance.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/OnDeviceAIExecutor.swift" "$APP_ROOT/SlowClawApp/Nip19.swift" "$APP_ROOT/SlowClawApp/NostrPublisher.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/DraftBudget.swift" "$TEST_ROOT/Sources/Runtime/"

@@ -301,3 +301,41 @@ final class RuntimeTests: XCTestCase {
         XCTAssertEqual(counter.maximum, 1)
     }
 }
+
+
+final class KevLiteTests: XCTestCase {
+    func testExactSentenceSelectionPreservesUnicodeAndRejectsInventedText() {
+        let source = "SlowClawAgent notes: shared gardens bring people together. A quiet walk helps me notice the changing seasons! What makes a community grocery sustainable?"
+        let sentences = KevLite.sentences(source)
+        XCTAssertEqual(sentences.count, 3)
+        XCTAssertTrue(sentences.allSatisfy(source.contains))
+        XCTAssertNil(KevLite.selected([1, 0, 0, 0], sentences: sentences, source: source))
+        XCTAssertEqual(KevLite.selected([0, 1, 0, 0], sentences: sentences, source: source), sentences[0])
+        XCTAssertNil(KevLite.selected([0, 1], sentences: ["An invented sentence that never appeared."], source: source))
+        let combined = KevLite.compose([sentences[2], sentences[0]], source: source)!
+        XCTAssertEqual(combined, sentences[0] + "\n\n" + sentences[2])
+        XCTAssertLessThanOrEqual(combined.count, 280)
+        XCTAssertNil(KevLite.compose(["made up"], source: source))
+    }
+    func testInvalidDistributionsAndStaleReadsAbstain() {
+        XCTAssertFalse(KevLite.validDistribution([.nan, 0]))
+        XCTAssertFalse(KevLite.validDistribution([0.2, 0.2]))
+        XCTAssertFalse(KevLite.validDistribution([-0.1, 1.1]))
+        XCTAssertEqual(KevLite.winner([0.5, 0.5]), 0)
+        let decision = ReadsRelevance.Decision(text: "item", score: 0.3, revision: 1)
+        XCTAssertTrue(ReadsRelevance.accepts(decision, text: "item", revision: 1, threshold: 0))
+        XCTAssertFalse(ReadsRelevance.accepts(decision, text: "item", revision: 1, threshold: 0.8))
+        XCTAssertFalse(ReadsRelevance.accepts(decision, text: "changed", revision: 1, threshold: 0))
+        XCTAssertFalse(ReadsRelevance.accepts(decision, text: "item", revision: 2, threshold: 0))
+        XCTAssertNil(KevReadingJudgement([[1, 0]]))
+    }
+    func testLongJournalsUseBoundedOptionsAndNeverCutDraftSentences() {
+        let source = (0..<20).map { "SlowClawAgent records a complete observation number \($0)." }.joined(separator: " ")
+        let sentences = KevLite.sentences(source)
+        XCTAssertEqual(sentences.count, 7)
+        XCTAssertEqual(KevLite.journalQuestions(sentences).map(\.options.count), [8, 8, 8])
+        let draft = KevLite.compose(sentences, source: source, limit: 100)!
+        XCTAssertTrue(sentences.contains(draft))
+        XCTAssertLessThanOrEqual(draft.count, 100)
+    }
+}
