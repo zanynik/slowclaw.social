@@ -9,16 +9,16 @@ struct DraftsView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
                 Text("Your words").font(DS.titleFont)
-                Text("Find a thought worth keeping or sharing. Kev selects sentences; your words stay yours.")
+                Text("Find a thought worth keeping or sharing. \(state.jevEnabled ? "Jev" : "Kev") selects sentences; your words stay yours.")
                     .font(.subheadline).foregroundStyle(.secondary)
                 HStack {
                     Button("Find highlights") { Task { await state.scanKevJournals() } }
                         .buttonStyle(.borderedProminent)
-                        .disabled(state.kevJournalBusy || state.readsDecisionBusy || state.readsModelActivating)
+                        .disabled(state.kevJournalBusy || state.readsDecisionBusy || state.readsModelActivating || state.jevBusy || state.jevFeedsBusy)
                     if state.kevJournalBusy { ProgressView() }
                 }
                 if let status = state.kevJournalStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
-                if !state.readsModelEnabled { ReadsModelCard() }
+                if !state.jevEnabled && !state.readsModelEnabled { ReadsModelCard() }
                 ForEach(Array(state.liteJournals.prefix(12)), id: \.key) { entry in
                     VStack(alignment: .leading, spacing: 10) {
                         Button { source = entry } label: {
@@ -35,13 +35,13 @@ struct DraftsView: View {
                                 }.font(.caption)
                             }
                             if let draft = selected.draft {
-                                Text("Words to share").font(.caption).foregroundStyle(.secondary)
+                                Text("Private draft suggestion · review before sharing").font(.caption).foregroundStyle(.secondary)
                                 Text(draft).font(.body)
                                 Button("Save private draft") { state.saveKevDraft(selected) }.buttonStyle(.bordered)
                             } else { Text("No short post selected. You can still write your own.").font(.caption).foregroundStyle(.secondary) }
                         } else {
                             Button("Select from this journal") { Task { await state.selectKevJournal(entry) } }
-                                .disabled(state.kevJournalBusy || state.readsDecisionBusy || state.readsModelActivating)
+                                .disabled(state.kevJournalBusy || state.readsDecisionBusy || state.readsModelActivating || state.jevBusy || state.jevFeedsBusy)
                         }
                     }.padding().frame(maxWidth: .infinity, alignment: .leading)
                         .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: 12))

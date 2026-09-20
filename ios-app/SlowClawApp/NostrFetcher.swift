@@ -132,7 +132,15 @@ enum NostrFetcher {
         let task = URLSession.shared.webSocketTask(with: url)
         task.maximumMessageSize = 128 * 1024
         task.resume()
-        defer { task.cancel(with: .goingAway, reason: nil) }
+        // Bound the handshake and send too, not only receive. A dead relay
+        // must not hold the entire RSS + Nostr refresh open indefinitely.
+        let deadline = Date().addingTimeInterval(8)
+        let watchdog = Task {
+            do { try await Task.sleep(nanoseconds: 8_000_000_000) }
+            catch { return }
+            task.cancel(with: .goingAway, reason: nil)
+        }
+        defer { watchdog.cancel(); task.cancel(with: .goingAway, reason: nil) }
 
         let subID = "sc_\(UInt32.random(in: 0..<1_000_000))"
         let req: [Any] = ["REQ", subID, ["kinds": kinds, "limit": limit]]
@@ -141,13 +149,18 @@ enum NostrFetcher {
         guard (try? await task.send(.string(reqStr))) != nil else { return nil }
 
         var collected: [[String: Any]] = []
-        let deadline = Date().addingTimeInterval(8)
         recvLoop: while Date() < deadline && collected.count < limit {
             // Drain with a short per-message timeout via Task racing.
             guard let msg = await nextMessage(task, by: deadline) else { break }
+            let text: String
             switch msg {
-            case .string(let text):
-                switch admitFrame(text, subID: subID, kinds: kinds) {
+            case .string(let value): text = value
+            case .data(let data):
+                guard let value = String(data: data, encoding: .utf8) else { continue }
+                text = value
+            @unknown default: continue
+            }
+            switch admitFrame(text, subID: subID, kinds: kinds) {
                 case .eose:
                     // `break` alone would only exit this switch — label the
                     // loop so EOSE ends the receive immediately.
@@ -159,11 +172,6 @@ enum NostrFetcher {
                     collected.append(ev)
                 case .ignore:
                     break
-                }
-            case .data:
-                continue
-            @unknown default:
-                continue
             }
             if collected.count >= limit * 2 { break }
         }

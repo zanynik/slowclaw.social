@@ -3,6 +3,31 @@ import CryptoKit
 @testable import Runtime
 
 final class RuntimeTests: XCTestCase {
+    func testFeedSelectionExpiresWeeklyAndDropsRemovedMemory() {
+        let now = Date(timeIntervalSince1970: 1000000)
+        let choice = JevFeeds.Decision(score: 0.8, passageID: "insight", checkedAt: now)
+        XCTAssertTrue(choice.selected(activePassages: ["insight"]))
+        XCTAssertFalse(choice.selected(activePassages: []))
+        XCTAssertFalse(choice.needsRefresh(activePassages: ["insight"], now: now.addingTimeInterval(JevFeeds.interval - 1)))
+        XCTAssertTrue(choice.needsRefresh(activePassages: ["insight"], now: now.addingTimeInterval(JevFeeds.interval)))
+        XCTAssertTrue(choice.needsRefresh(activePassages: [], now: now))
+        XCTAssertFalse(JevFeeds.Decision(score: 0.69, passageID: "insight", checkedAt: now).selected(activePassages: ["insight"]))
+    }
+    func testTransportReservesVideoAndBothNostrKindsBeforeJudging() {
+        func item(_ i: Int, _ platform: String, _ source: String) -> RankedFeedItem {
+            .init(id: "\(platform)-\(i)", title: "A useful story", link: "https://example.com/\(platform)/\(i)", description: "A substantive description.", sourceLabel: source, score: Double(1000 - i), readMinutes: 1, sourcePlatform: platform)
+        }
+        let rss = (0..<200).map { item($0, "rss", "Feed \($0 % 40)") }
+        let videos = (0..<20).map { item($0, "youtube", "Channel \($0 % 4)") }
+        let social = (0..<60).map { item($0, "nostr", $0 < 30 ? "Nostr" : "Nostr posts") }
+        let selected = JevFeeds.candidates(rss + videos + social + [rss[0]])
+        XCTAssertEqual(selected.count, 80)
+        XCTAssertEqual(selected.filter { $0.sourcePlatform == "youtube" }.count, 20)
+        XCTAssertEqual(selected.filter { $0.sourceLabel == "Nostr" }.count, 10)
+        XCTAssertEqual(selected.filter { $0.sourceLabel == "Nostr posts" }.count, 10)
+        XCTAssertEqual(Set(selected.prefix(3).map(\.sourcePlatform)), ["rss", "youtube", "nostr"])
+        XCTAssertEqual(Set(selected.map(\.link)).count, selected.count)
+    }
     func testJevChunksPreserveSourceAndBoundUnicodePayloads() {
         for text in [String(repeating: "A meaningful sentence. Another sentence!\n", count: 250), String(repeating: "🌿 विचार。", count: 900), String(repeating: "x", count: 4000)] {
             let chunks = JevMemory.chunks(text)

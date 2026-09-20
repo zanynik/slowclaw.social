@@ -106,12 +106,27 @@ fn parseAtomEntries(allocator: std.mem.Allocator, xml: []const u8) ![]RssItem {
     return items.toOwnedSlice(allocator);
 }
 
+test "YouTube Atom entries retain the video description for relevance" {
+    const allocator = std.testing.allocator;
+    const xml =
+        \\<feed><entry><title>Community gardens</title>
+        \\<link rel="alternate" href="https://www.youtube.com/watch?v=abcdefghijk"/>
+        \\<media:group><media:description>How compost feeds healthy soil.</media:description></media:group>
+        \\</entry></feed>
+    ;
+    const items = try parseFeed(allocator, xml);
+    defer freeRssItems(allocator, items);
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("How compost feeds healthy soil.", items[0].description);
+    try std.testing.expectEqualStrings("https://www.youtube.com/watch?v=abcdefghijk", items[0].link);
+}
+
 /// Extract a single Atom <entry>'s fields.
 fn extractAtomEntry(allocator: std.mem.Allocator, xml: []const u8) !RssItem {
     return .{
         .title = try extractTag(allocator, xml, "title"),
         .link = try extractAtomLink(allocator, xml),
-        .description = try extractTagAny(allocator, xml, &.{ "summary", "content" }),
+        .description = try extractTagAny(allocator, xml, &.{ "summary", "content", "media:description" }),
         .pub_date = try extractTagAny(allocator, xml, &.{ "published", "updated" }),
         .author = try extractAtomAuthor(allocator, xml),
         .guid = try extractTagAny(allocator, xml, &.{ "id", "guid" }),

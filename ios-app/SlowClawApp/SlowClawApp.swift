@@ -422,6 +422,12 @@ final class AppState: ObservableObject {
     @Published var jevBusy = false
     @Published var jevConnecting = false
     @Published private var jevCache = JevMemory.Cache.load()
+    @Published private var jevFeedCache = JevFeeds.Cache.load()
+    @Published var jevFeedsBusy = false
+    @Published var jevFeedsStatus: String?
+    @Published var readsTransportStatus: String?
+    private var jevFeedsTask: Task<Void, Never>?
+    private var lastFeedAttempt = Date.distantPast
     private var jevTask: Task<Void, Never>?
     private var jevReadingTask: Task<Void, Never>?
     private var jevReadSources: [String: String] = [:]
@@ -1647,6 +1653,7 @@ final class AppState: ObservableObject {
            let refreshedAt = readsRefreshedAt,
            Date().timeIntervalSince(refreshedAt) < Self.readsCacheMaxAge {
             await refreshReadsDecisions()
+            startJevFeedSelection()
             return
         }
         guard !readsRefreshInFlight else { return }
@@ -1661,7 +1668,7 @@ final class AppState: ObservableObject {
         readsLoadedOnce = true
 
         let topics: [SlowClawTopic] = []
-        let sources = catalog
+        let sources = jevEnabled ? selectedJevFeeds : Self.selectRSSSources(catalog, topics: topics)
 
         // Snapshot fetch happens off the main actor.
         let fetched = await Task.detached(priority: .userInitiated) {
@@ -1675,7 +1682,6 @@ final class AppState: ObservableObject {
         let nostr = fetched.1
 
         var combined = (rss + nostr).filter { readingSignals[$0.id]?.preference != -1 }
-        combined.sort { $0.id < $1.id }
         // Transport returns candidates only. Kev is the sole relevance ranker.
         // Adult-content gate on the merged batch (RSS + Nostr): the catalog
         // is broad and relays are global; without this, explicit items that
@@ -1683,19 +1689,18 @@ final class AppState: ObservableObject {
         combined = combined.filter {
             ReadsContentFilter.isAllowed($0.title, $0.description)
         }
-        // Apply the post-merge production filter the iOS app was missing:
-        // quality gate (drop spam/empty), URL dedup (collapse cross-feed
-        // reposts), and a per-source cap + round-robin so one feed can't
-        // dominate. This is the curation the reference does in the Rust
-        // gateway ranker.rs; we do it client-side on the merged batch.
-        let capped = slowClawFilterAndDiversify(combined, maxPerSource: 5, limit: 80)
+        // Deduplicate and reserve candidate space for web, video and social.
+        // Jev alone decides which of those candidates appears in Reads.
+        let capped = JevFeeds.candidates(combined)
+        readsTransportStatus = "Fetched \(rss.filter { $0.sourcePlatform != "youtube" }.count) articles · \(rss.filter { $0.sourcePlatform == "youtube" }.count) videos · \(nostr.count) Nostr posts. Each still needs a strong memory match."
 
         // Never replace a usable snapshot with an empty failed refresh. A stale
         // local feed is more useful than a blank loading/error state.
         if capped.isEmpty {
-            readsError = reachedAny ? nil : "Couldn't reach any feeds. Pull to retry."
+            readsError = reachedAny || !nostr.isEmpty ? nil : "No sources returned items. Check Sources or pull to retry."
             readsLoading = false
             await refreshReadsDecisions()
+            startJevFeedSelection()
             return
         }
 
@@ -1721,13 +1726,14 @@ final class AppState: ObservableObject {
         readsError = nil
         readsLoading = false
         await refreshReadsDecisions()
+        startJevFeedSelection()
     }
 
     /// Fetch a bounded catalog slice with a per-source timeout, then parse +
     /// rank through Zig. The previous implementation walked all 114 sources in
     /// sequential batches, making a cold launch wait for slow or dead feeds.
     private static func fetchAllRSS(sources: [SlowClawFeedSource], topics: [SlowClawTopic]) async -> ([RankedFeedItem], Bool) {
-        let selected = selectRSSSources(sources, topics: topics)
+        let selected = sources
         let results = await withTaskGroup(of: [RankedFeedItem]?.self, returning: [[RankedFeedItem]].self) { group in
             for src in selected {
                 group.addTask {
@@ -1766,7 +1772,8 @@ final class AppState: ObservableObject {
         guard !sources.isEmpty else { return [] }
         let day = Int(Date().timeIntervalSince1970 / 86400)
         let start = (day * rssSourceLimit) % sources.count
-        return (0..<min(rssSourceLimit, sources.count)).map { sources[(start + $0) % sources.count] }
+        let rotated = (0..<min(rssSourceLimit, sources.count)).map { sources[(start + $0) % sources.count] }
+        return rotated + sources.filter { $0.domain.contains("youtube.com") && !rotated.contains($0) }
     }
 
     private static var readsCacheURL: URL? {
@@ -3867,6 +3874,7 @@ struct ReadsView: View {
     @State private var linkText = ""
     @State private var addingLink = false
     @State private var showLink = false
+    @State private var showSources = false
 
 
     private var remainingReads: [RankedFeedItem] { state.relevantReads }
@@ -3876,10 +3884,15 @@ struct ReadsView: View {
             if !state.jevEnabled { ReadsModelCard() }
             HStack {
                 Button("Add a link") { showLink = true }
+                Button("Sources") { showSources = true }
                 Spacer()
                 Button("Refresh") { Task { await state.loadReads(force: true) } }
                     .disabled(state.readsLoading)
             }.font(.caption).padding(.horizontal)
+                .sheet(isPresented: $showSources) { JevSourcesView().environmentObject(state) }
+            if let status = state.jevFeedsStatus, state.jevFeedsBusy {
+                Text(status).font(.caption).foregroundStyle(.secondary).padding(.horizontal)
+            }
             if addingLink { ProgressView("Reading the page…") }
             if let error = state.readsError { Text(error).font(.caption).foregroundStyle(.secondary).padding(.horizontal) }
             Group {
@@ -4929,6 +4942,7 @@ extension AppState {
             .sorted { (journalDate($0) ?? .distantPast) > (journalDate($1) ?? .distantPast) }
     }
     func selectKevJournal(_ entry: SlowClawMemoryEntry) async {
+        if jevEnabled { await selectJevJournal(entry); return }
         guard readsModelEnabled, readsModelInstalled else { kevJournalStatus = "Download and activate Kev in Settings first."; return }
         guard !kevJournalBusy, !readsDecisionBusy, !readsModelActivating, !contextWorkPaused, !localModelBusy, !isGeneratingPosts else {
             kevJournalStatus = "Kev will be available when current work finishes. Tap again to retry."; return
@@ -5056,6 +5070,129 @@ extension AppState {
     }
 }
 
+// MARK: - Jev sources and private draft suggestions
+extension AppState {
+    var jevFeedCatalog: [SlowClawFeedSource] { catalog }
+    var jevSelectedFeedURLs: Set<String> {
+        let active = Set(jevPassages.map(\.id))
+        return Set(jevFeedCache.decisions.filter { $0.value.selected(activePassages: active) }.keys)
+    }
+    func jevFeedScore(_ source: SlowClawFeedSource) -> Double? { jevFeedCache.decisions[source.xmlURL]?.score }
+    private var selectedJevFeeds: [SlowClawFeedSource] {
+        let selectedURLs = jevSelectedFeedURLs
+        let selected = catalog.filter { selectedURLs.contains($0.xmlURL) }.sorted {
+            let left = jevFeedScore($0) ?? 0, right = jevFeedScore($1) ?? 0
+            return left == right ? $0.xmlURL < $1.xmlURL : left > right
+        }
+        // Rotate the selected pool daily so a high scoring large catalog does
+        // not permanently hide the sources below the fetch budget.
+        return Self.selectRSSSources(selected, topics: [])
+    }
+    func startJevFeedSelection(force: Bool = false) {
+        guard jevEnabled, !jevFeedsBusy, !jevBusy, !readsDecisionBusy, !kevJournalBusy, !contextWorkPaused else {
+            if force { jevFeedsStatus = "Finish the current selection, then try again." }
+            return
+        }
+        let memories = jevPassages
+        guard !memories.isEmpty else { jevFeedsStatus = "Find useful passages in Personal memory first."; return }
+        let active = Set(memories.map(\.id))
+        let pending = catalog.filter { force || (jevFeedCache.decisions[$0.xmlURL]?.needsRefresh(activePassages: active) ?? true) }
+        guard !pending.isEmpty, force || Date().timeIntervalSince(lastFeedAttempt) >= 3600 else { return }
+        lastFeedAttempt = Date()
+        jevFeedsBusy = true
+        jevFeedsTask = Task {
+            let changed = await refreshJevFeeds(pending, memories: memories)
+            jevFeedsBusy = false
+            jevFeedsTask = nil
+            if changed && jevEnabled && !Task.isCancelled { await loadReads(force: true) }
+        }
+    }
+    func pauseJevFeedSelection() { jevFeedsTask?.cancel() }
+    private func refreshJevFeeds(_ sources: [SlowClawFeedSource], memories: [JevMemory.Passage]) async -> Bool {
+        let revision = memoryRevision
+        var changed = false, unavailable = 0, checked = 0
+        do {
+            // Small network batches, then one Jev request at a time. Resume
+            // from persisted decisions after cancellation or a failed request.
+            for offset in stride(from: 0, to: sources.count, by: 8) {
+                try checkJevWork()
+                guard revision == memoryRevision else { throw CancellationError() }
+                jevFeedsStatus = "Choosing sources · \(checked)/\(sources.count) checked"
+                let batch = Array(sources[offset..<min(offset + 8, sources.count)])
+                let previews = await withTaskGroup(of: (String, [RankedFeedItem]).self) { group in
+                    for source in batch {
+                        group.addTask {
+                            let result = await Self.fetchAllRSS(sources: [source], topics: [])
+                            return (source.xmlURL, result.0)
+                        }
+                    }
+                    var result: [String: [RankedFeedItem]] = [:]
+                    for await (url, items) in group { result[url] = items }
+                    return result
+                }
+                for source in batch {
+                    try checkJevWork()
+                    guard revision == memoryRevision else { throw CancellationError() }
+                    guard let items = previews[source.xmlURL], !items.isEmpty else { unavailable += 1; checked += 1; continue }
+                    let sample = items.prefix(5).map { String($0.title.prefix(180)) + "\n" + String($0.description.strippingHTML().prefix(400)) }.joined(separator: "\n\n")
+                    let profile = "Source: \(source.title) (\(source.domain))\nRecent stories:\n" + sample
+                    var best: JevCloud.Match?
+                    for start in stride(from: 0, to: memories.count, by: 16) {
+                        try checkJevWork()
+                        guard revision == memoryRevision else { throw CancellationError() }
+                        for match in try await JevCloud.shared.reading(profile, memories: Array(memories[start..<min(start + 16, memories.count)])) {
+                            if match.score > (best?.score ?? -1) { best = match }
+                        }
+                    }
+                    try checkJevWork()
+                    guard revision == memoryRevision, let best else { throw CancellationError() }
+                    var next = jevFeedCache
+                    next.decisions[source.xmlURL] = .init(score: best.score, passageID: best.id, checkedAt: Date())
+                    try next.save(); jevFeedCache = next
+                    changed = true; checked += 1
+                    jevFeedsStatus = "Choosing sources · \(checked)/\(sources.count) checked"
+                }
+            }
+            let selected = jevSelectedFeedURLs.count
+            jevFeedsStatus = "\(selected) selected · rechecked weekly when you use Reads" + (unavailable > 0 ? " · \(unavailable) feeds unavailable; retry later" : "")
+        } catch is CancellationError { jevFeedsStatus = "Source selection paused. Completed choices are saved." }
+        catch { jevFeedsStatus = error.localizedDescription }
+        return changed
+    }
+
+    private func selectJevJournal(_ entry: SlowClawMemoryEntry) async {
+        guard !kevJournalBusy, !jevBusy, !jevFeedsBusy, !readsDecisionBusy, !contextWorkPaused else {
+            kevJournalStatus = "Finish the current Jev selection, then try again."; return
+        }
+        guard jevSource(entry.key)?.content == entry.content else { return }
+        kevJournalBusy = true
+        defer { kevJournalBusy = false }
+        kevJournalStatus = "Jev is selecting your strongest sentences…"
+        let revision = memoryRevision
+        let source = journalBodyOf(entry.content)
+        let passages = jevPassages.filter { $0.sourceKey == entry.key }
+        let candidates = passages.isEmpty ? KevLite.sentences(source) : Array(passages.flatMap { KevLite.sentences($0.text) }.prefix(12))
+        do {
+            var choices: [(text: String, score: Double)] = []
+            var seen = Set<String>()
+            for sentence in candidates where seen.insert(sentence).inserted {
+                try checkJevWork()
+                guard revision == memoryRevision, jevSource(entry.key)?.content == entry.content else { throw CancellationError() }
+                let answer = try await JevCloud.shared.memory(sentence)
+                if answer.useful { choices.append((sentence, answer.score)) }
+            }
+            try checkJevWork()
+            guard revision == memoryRevision, jevSource(entry.key)?.content == entry.content else { throw CancellationError() }
+            choices.sort { $0.score == $1.score ? $0.text < $1.text : $0.score > $1.score }
+            let draft = KevLite.compose(Array(choices.prefix(2).map(\.text)), source: source)
+            kevJournalSelections[entry.key] = .init(id: entry.key, source: entry.content,
+                highlight: choices.first?.text, question: nil, draft: draft)
+            kevJournalStatus = draft == nil ? "No complete short highlight selected. Try another journal." : "Private suggestion ready. Review personal details and edit before sharing."
+        } catch is CancellationError { kevJournalStatus = "Selection paused or source changed. Try again." }
+        catch { kevJournalStatus = error.localizedDescription }
+    }
+}
+
 // MARK: - Jev cloud memory: exact passages, cached decisions, explicit consent
 extension AppState {
     private func pruneJevMemory() {
@@ -5088,6 +5225,7 @@ extension AppState {
         do {
             if !JevCloud.shared.connected { try await JevCloud.shared.connect() }
             jevEnabled = true
+            kevJournalSelections = [:]
             UserDefaults.standard.set(true, forKey: "slowclaw.jev.enabled.v1")
             deactivateReadsModel()
             readsDecisionStatus = "Preparing personal memory for Reads…"
@@ -5102,18 +5240,19 @@ extension AppState {
     func disableJev() {
         jevEnabled = false
         UserDefaults.standard.set(false, forKey: "slowclaw.jev.enabled.v1")
-        jevTask?.cancel(); jevReadingTask?.cancel()
+        jevTask?.cancel(); jevReadingTask?.cancel(); jevFeedsTask?.cancel()
+        kevJournalSelections = [:]
         memoryRevision += 1; readsDecisions = [:]; jevReadSources = [:]
         jevStatus = "Cloud memory is off. Saved passages stay on this device."
         Task { await JevCloud.shared.disconnect() }
     }
     func dismissJevPassage(_ id: String) {
         var next = jevCache; next.dismissed.insert(id)
-        do { try next.save(); jevCache = next; memoryRevision += 1; readsDecisions = [:]; jevReadSources = [:] }
+        do { try next.save(); jevCache = next; memoryRevision += 1; readsDecisions = [:]; jevReadSources = [:]; kevJournalSelections = [:] }
         catch { jevStatus = "Could not save this change. Please retry." }
     }
     func startJevMemory() {
-        guard jevEnabled, jevTask == nil, !readsDecisionBusy, !contextWorkPaused else { return }
+        guard jevEnabled, jevTask == nil, !readsDecisionBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
         jevTask = Task { await scanJevMemory(); jevTask = nil }
     }
     private func checkJevWork() throws {
@@ -5140,7 +5279,9 @@ extension AppState {
         jevBusy = true
         defer {
             jevBusy = false
-            if jevEnabled && !Task.isCancelled { Task { await refreshReadsDecisions() } }
+            if jevEnabled && !Task.isCancelled {
+                Task { await refreshReadsDecisions(); startJevFeedSelection() }
+            }
         }
         do {
             var cursor: Int64 = 0, checked = 0
@@ -5180,7 +5321,7 @@ extension AppState {
         } catch { jevStatus = error.localizedDescription }
     }
     private func rankJevReads() async {
-        guard jevEnabled, !readsDecisionBusy, !jevBusy, !contextWorkPaused else { return }
+        guard jevEnabled, !readsDecisionBusy, !jevBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
         let memories = jevPassages
         guard !memories.isEmpty else { readsDecisions = [:]; readsDecisionStatus = "Find useful passages in Personal memory first."; return }
         readsDecisionBusy = true
