@@ -8,6 +8,28 @@ const D = 896;
 const P = 256;
 const Question = struct { instruction: []const u8, options: []const []const u8 };
 const Request = struct { state: []const u8, questions: []const Question };
+// Typed []u8 JSON parsing also accepts numeric arrays and instantiates f128
+// integer conversion helpers unavailable on iOS. This protocol is strings only.
+fn requestFromValue(value: std.json.Value, allocator: std.mem.Allocator) !Request {
+    if (value != .object or value.object.count() != 2) return error.InvalidRequest;
+    const state = value.object.get("state") orelse return error.InvalidRequest;
+    const questions = value.object.get("questions") orelse return error.InvalidRequest;
+    if (state != .string or questions != .array or questions.array.items.len == 0 or questions.array.items.len > 8) return error.InvalidRequest;
+    const result = try allocator.alloc(Question, questions.array.items.len);
+    for (questions.array.items, result) |question, *out| {
+        if (question != .object or question.object.count() != 2) return error.InvalidRequest;
+        const instruction = question.object.get("instruction") orelse return error.InvalidRequest;
+        const options = question.object.get("options") orelse return error.InvalidRequest;
+        if (instruction != .string or options != .array or options.array.items.len < 2 or options.array.items.len > 8) return error.InvalidRequest;
+        const choices = try allocator.alloc([]const u8, options.array.items.len);
+        for (options.array.items, choices) |option, *choice| {
+            if (option != .string) return error.InvalidRequest;
+            choice.* = option.string;
+        }
+        out.* = .{ .instruction = instruction.string, .options = choices };
+    }
+    return .{ .state = state.string, .questions = result };
+}
 const Token = struct { id: i32, pos: i32, branch: i32, output: bool = false, q: usize = 0, slot: usize = 0 };
 const Handle = struct { model: *c.llama_model, meta: *c.gguf_context, qw: []const f32, qb: []const f32, kw: []const f32, kb: []const f32 };
 
@@ -94,9 +116,9 @@ pub fn evaluate(raw: ?*anyopaque, json: []const u8, out: []f64) E!usize {
     if (!engine.have_llama) return error.ModelNotLoaded;
     const h: *Handle = @ptrCast(@alignCast(raw orelse return error.ModelNotLoaded));
     if (json.len == 0 or json.len > 64000) return error.ContextLimitExceeded;
-    const parsed = std.json.parseFromSlice(Request, A, json, .{}) catch return error.InferenceFailed;
+    const parsed = std.json.parseFromSlice(std.json.Value, A, json, .{}) catch return error.InferenceFailed;
     defer parsed.deinit();
-    const req = parsed.value;
+    const req = requestFromValue(parsed.value, parsed.arena.allocator()) catch return error.InferenceFailed;
     if (req.state.len == 0 or req.state.len > 12000 or req.questions.len == 0 or req.questions.len > 8) return error.ContextLimitExceeded;
     var total: usize = 0;
     for (req.questions) |q| {
@@ -219,4 +241,22 @@ test "Kev softmax is stable and rejects invalid input" {
     try softmax(&.{ 1000, 1000 }, &out);
     try std.testing.expectEqual(@as(f64, 0.5), out[0]);
     try std.testing.expectError(error.InferenceFailed, softmax(&.{ std.math.nan(f64), 0 }, &out));
+}
+
+test "Kev request requires string state and string choices" {
+    const cases = [_][]const u8{
+        "{\"state\":[65],\"questions\":[]}",
+        "{\"state\":\"journal\",\"questions\":[{\"instruction\":\"relevant\",\"options\":[0,1]}]}",
+        "{\"state\":\"journal\",\"questions\":[{\"instruction\":12,\"options\":[\"no\",\"yes\"]}]}",
+    };
+    for (cases) |json| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidRequest, requestFromValue(parsed.value, parsed.arena.allocator()));
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"state\":\"journal\",\"questions\":[{\"instruction\":\"relevant\",\"options\":[\"no\",\"yes\"]}]}", .{});
+    defer parsed.deinit();
+    const request = try requestFromValue(parsed.value, parsed.arena.allocator());
+    try std.testing.expectEqualStrings("journal", request.state);
+    try std.testing.expectEqualStrings("yes", request.questions[0].options[1]);
 }
