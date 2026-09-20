@@ -2,13 +2,44 @@
 
 This branch improves the journal-first reading loop: exact useful journal passages become the authority for admitting incoming content. It is an opt-in cloud experiment. Capture stays on-device.
 
-The owner configures OpenRouter in the separate SlowClaw Jev service. Its owner-only form verifies `jev-1.13` through `/api/v1/systemone` before encrypting the key at rest. No shared API key ships in the app. Each device signs in, exchanges a short-lived, single-use PKCE code, and stores a revocable session token in Keychain. The service does not persist journal or reading text. OpenRouter/provider policies still apply; the app explains this before enabling cloud processing. There are no per-user usage quotas. One request per device runs at a time.
+The owner configures OpenRouter in the separate SlowClaw Jev service. Its owner-only form verifies `jev-1.13` through `/api/v1/systemone` before encrypting the key at rest. No shared API key ships in the app. After first-use consent, each tester device automatically obtains a revocable session token and stores it in Keychain. The service does not persist journal or reading text. OpenRouter/provider policies still apply; the app explains this before enabling cloud processing. There are no per-user usage quotas. One request per device runs at a time.
 
 Memory scans the journal archive, skips excluded/deleted records, and classifies bounded source passages as routine, useful context, or lasting insight. Promising long passages are split at natural boundaries and checked again, to two levels. If splitting loses the meaning, the original coherent passage remains. Exact source words, source key, content fingerprint and classifier version stay on-device. Unchanged journals, including those with no useful passages, are not reclassified. Forgotten passages remain dismissed. Edits invalidate prior memory. Failed requests remain retryable.
 
 Reads compares incoming article content and short/long Nostr posts with every retained memory in batches of up to 16. Long incoming content is divided into bounded portions. A completed relevance score of at least 0.7 admits the item; items appear in descending score order with a matching source excerpt. Scores are model estimates, not a guarantee of usefulness. Incomplete or failed decisions do not admit items. Discovery/fetching still uses the existing feed sources; Jev makes admission decisions rather than fetching URLs itself.
 
 Rollback: turn off Jev in Settings to stop new cloud requests and revoke this device connection, then explicitly activate the optional local Kev model. This experiment is not merged into main. Live latency, quality and provider compatibility need a configured OpenRouter key and on-device evaluation. Publishing continues through the existing TestFlight workflow only.
+
+## Tester-first interface
+
+The first-use screen explains cloud text processing once and offers Start
+journaling or Use offline. The first option automatically obtains a device
+session from the existing service; testers need no account, OpenRouter key,
+or model download. The provider key remains server-side. Anonymous beta
+enrollment is intentionally open while TESTFLIGHT_ACCESS_ENABLED is true;
+it is not a guarantee that a caller installed via TestFlight. The owner can
+disable enrollment and existing beta sessions with that server setting.
+
+Journal saves and completed transcripts resume memory extraction automatically.
+Retained passages supply exact-sentence private draft suggestions and Reads.
+Deleted suggestions are not recreated for an unchanged source. Nothing is
+published automatically. The app retries an interrupted connection and can
+renew expired device sessions. Cloud processing off remains respected.
+
+Journal, Reads, Create, Settings each have one primary purpose. Source controls
+and recommendation explanations sit behind menus/disclosures. Settings has
+Memory, Privacy & connection, Appearance and Advanced; models, storage and
+diagnostics are in Advanced. Create shows drafts rather than journal-by-journal
+classification controls. The backend is isolated behind JevCloud so a future
+local judge need not change these screens.
+
+Validation: Swift syntax parsing; backend TypeScript check and production build;
+five backend tests including real SQLite-backed enrollment, key-admin denial,
+server-side disable and session revocation. The existing TestFlight pipeline
+provides full Swift/iOS compilation. Physical-device layout, recording and
+classification quality remain device acceptance checks. A live synthetic journal
+request verified anonymous enrollment and a valid Jev response; its session was
+revoked afterward. This does not establish latency or real-journal quality.
 
 ## Source and draft follow-up
 

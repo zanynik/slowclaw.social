@@ -13,14 +13,7 @@ struct PersonalMemoryView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section { JevConnectionCard(showsMemoryLink: false) }
                 JevMemoryList()
-                Section { NavigationLink("Questions you’re following") { QuestionThreadsView() } }
-                Section("Recent source journals") {
-                    ForEach(Array(state.liteJournals.prefix(24)), id: \.key) { entry in
-                        Button { source = entry } label: { Text(String(entry.content.prefix(100))).lineLimit(2) }
-                    }
-                }
                 if !state.excludedMemoryKeys.isEmpty {
                     Section("Excluded journals") {
                         ForEach(state.excludedMemoryKeys.sorted(), id: \.self) { key in
@@ -30,7 +23,7 @@ struct PersonalMemoryView: View {
                         }
                     }
                 }
-            }.navigationTitle("Personal memory")
+            }.navigationTitle("Memory")
                 .sheet(item: $source) { JournalDetailView(entry: $0).environmentObject(state) }
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }

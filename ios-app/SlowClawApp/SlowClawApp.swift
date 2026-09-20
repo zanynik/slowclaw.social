@@ -421,6 +421,7 @@ final class AppState: ObservableObject {
     @Published var jevStatus: String?
     @Published var jevBusy = false
     @Published var jevConnecting = false
+    @Published var jevProblem: String?
     @Published private var jevCache = JevMemory.Cache.load()
     @Published private var jevFeedCache = JevFeeds.Cache.load()
     @Published var jevFeedsBusy = false
@@ -431,6 +432,8 @@ final class AppState: ObservableObject {
     private var jevTask: Task<Void, Never>?
     private var jevReadingTask: Task<Void, Never>?
     private var jevReadSources: [String: String] = [:]
+    private var lastJevConnectionAttempt = Date.distantPast
+    private var jevDraftedSources = UserDefaults.standard.dictionary(forKey: "slowclaw.jev.drafted.v1") as? [String: String] ?? [:]
     private var memoryRevision = 0
     private var automaticModelActivationAllowed = true
     private var mutedInterests: Set<String> = []
@@ -2289,7 +2292,7 @@ final class AppState: ObservableObject {
 // MARK: - Tab enum
 
 enum AppTab: String, CaseIterable {
-    case reads, journal, drafts, profile
+    case journal, reads, drafts, profile
 
     var label: String { self == .drafts ? "Create" : self == .profile ? "Settings" : rawValue.capitalized }
     /// Line-style SF Symbol matching the reference SVG icons in BottomNav.tsx.
@@ -2316,6 +2319,7 @@ struct AppShell: View {
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("slowclaw.theme") private var themeRaw: String = ""
     @State private var visitedTabs: Set<AppTab> = [.journal]
+    @AppStorage("slowclaw.welcome.v1") private var welcomed = false
     var body: some View {
         ZStack {
             // Capture and autosave stay alive even while another tab is
@@ -2344,14 +2348,18 @@ struct AppShell: View {
             }
         }
         .onAppear { visitedTabs.insert(state.selectedTab) }
+        .sheet(isPresented: Binding(get: { !welcomed && !state.jevEnabled }, set: { _ in })) {
+            WelcomeView {
+                welcomed = true
+                Task { await state.enableTesterJev() }
+            } offline: { welcomed = true }
+            .interactiveDismissDisabled()
+        }
         .onChange(of: state.selectedTab) { _, tab in visitedTabs.insert(tab) }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.bg(scheme))
         // Pin the top bar above the content's top safe area, extending the
         // translucent material under the status bar (matches the reference).
-        .safeAreaInset(edge: .top, spacing: 0) {
-            TopBar(scheme: scheme, themeRaw: $themeRaw)
-        }
         // Pin the bottom nav above the home indicator.
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 0) {
@@ -2371,11 +2379,13 @@ struct AppShell: View {
             // Retry durable pending audio while the user keeps using the app;
             // nextAttemptAt preserves backoff instead of waiting for relaunch.
             state.refreshAudioQueue()
+            await state.resumeJevWork()
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(15)) } catch { break }
                 if scenePhase == .active {
                     state.refreshAudioQueue()
                     await state.drainPendingTranscriptions()
+                    await state.resumeJevWork()
                 }
             }
         }
@@ -2420,7 +2430,7 @@ struct TopBar: View {
             // Journal tab is now a Voice Memos-style list with its own base
             // record/pen bar; the hamburger drawer and "+" new-entry button are
             // removed. Other tabs keep their wordmark + theme toggle.
-            Text("SlowClaw · Lite")
+            Text("SlowClaw")
                 .font(DS.topbarFont)
                 .foregroundStyle(DS.ink(scheme))
                 .kerning(-0.4)
@@ -3426,20 +3436,17 @@ struct JournalView: View {
                         .foregroundStyle(DS.ink(scheme))
                         .kerning(-0.4)
                     Spacer()
-                    if !isSelectingAudio {
-                        Button { showContext = true } label: { Image(systemName: "brain") }
-                            .accessibilityLabel("Explore personal memory")
-                        sortMenu
+                    if isSelectingAudio {
+                        Button("Done") { isSelectingAudio = false; selectedAudioKeys.removeAll() }
+                    } else {
+                        Menu {
+                            Button("Memory") { showContext = true }
+                            sortMenu
+                            Button("Select recordings") { isSelectingAudio = true }
+                                .disabled(selectableAudioKeys.isEmpty)
+                        } label: { Image(systemName: "ellipsis.circle").font(.title3) }
+                        .accessibilityLabel("Journal options")
                     }
-                    Button(isSelectingAudio ? "Done" : "Select") {
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            isSelectingAudio.toggle()
-                            if !isSelectingAudio { selectedAudioKeys.removeAll() }
-                        }
-                    }
-                    .font(DS.captionFont.weight(.semibold))
-                    .foregroundStyle(DS.accentColor)
-                    .disabled(!isSelectingAudio && selectableAudioKeys.isEmpty)
                 }
                 .padding(.horizontal, 16)
 
@@ -3867,156 +3874,70 @@ struct JournalView: View {
 // MARK: - Reads View (Feed loop) — crash-safe
 
 struct ReadsView: View {
-    @Environment(\.colorScheme) var scheme
-    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject var state: AppState
-    @State private var visibleCount = 5
+    @Environment(\.colorScheme) var scheme
+    @State private var visibleCount = 10
     @State private var linkText = ""
-    @State private var addingLink = false
     @State private var showLink = false
     @State private var showSources = false
-
-
-    private var remainingReads: [RankedFeedItem] { state.relevantReads }
+    @State private var addingLink = false
+    private var items: [RankedFeedItem] { state.relevantReads }
+    private var busy: Bool { state.jevBusy || state.jevFeedsBusy || state.readsDecisionBusy || state.readsLoading || state.jevConnecting }
     var body: some View {
-        VStack(spacing: 10) {
-            JevConnectionCard()
-            if !state.jevEnabled { ReadsModelCard() }
-            HStack {
-                Button("Add a link") { showLink = true }
-                Button("Sources") { showSources = true }
-                Spacer()
-                Button("Refresh") { Task { await state.loadReads(force: true) } }
-                    .disabled(state.readsLoading)
-            }.font(.caption).padding(.horizontal)
-                .sheet(isPresented: $showSources) { JevSourcesView().environmentObject(state) }
-            if let status = state.jevFeedsStatus, state.jevFeedsBusy {
-                Text(status).font(.caption).foregroundStyle(.secondary).padding(.horizontal)
-            }
-            if addingLink { ProgressView("Reading the page…") }
-            if let error = state.readsError { Text(error).font(.caption).foregroundStyle(.secondary).padding(.horizontal) }
-            Group {
-                if state.readsLoading && state.readsItems.isEmpty {
-                    VStack(spacing: 10) {
-                        ProgressView()
-                        Text("Loading…")
-                            .font(DS.captionFont)
-                            .foregroundStyle(DS.muted(scheme))
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 18) {
+                HStack {
+                    Text("Reads").font(DS.titleFont)
+                    Spacer()
+                    Menu {
+                        Button("Sources") { showSources = true }
+                        Button("Add a link") { showLink = true }
+                        Button("Refresh") { Task { await state.loadReads(force: true) } }
+                    } label: { Image(systemName: "ellipsis.circle").font(.title3) }
+                    .accessibilityLabel("Reading options")
+                }
+                if busy || addingLink {
+                    ProgressView(state.jevBusy ? "Finding your ideas…" : state.jevFeedsBusy ? "Choosing your sources…" : "Finding your reads…")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                } else if let problem = state.jevProblem ?? state.readsError {
+                    Button { Task { if state.jevEnabled { await state.enableTesterJev() }; await state.loadReads(force: true) } } label: {
+                        Label(problem, systemImage: "arrow.clockwise").font(.footnote)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if state.readsItems.isEmpty {
-                    if let err = state.readsError {
-                        // Surface the failure instead of silently looking empty.
-                        VStack(spacing: 12) {
-                            Image(systemName: "exclamationmark.triangle")
-                                .font(.system(size: 36))
-                                .foregroundStyle(DS.muted(scheme))
-                            Text("Couldn't load reads")
-                                .font(DS.cardTitleFont)
-                                .foregroundStyle(DS.ink(scheme))
-                            Text(err)
-                                .font(DS.captionFont)
-                                .foregroundStyle(DS.muted(scheme))
-                                .multilineTextAlignment(.center)
-                                .padding(.horizontal)
-                            Button("Retry") { Task { await state.loadReads(force: true) } }
-                                .buttonStyle(.bordered)
-                                .tint(DS.accentColor)
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else {
-                        VStack(spacing: 12) {
-                            Image(systemName: "newspaper")
-                                .font(.system(size: 40))
-                                .foregroundStyle(DS.muted(scheme))
-                            Text("No articles yet")
-                                .font(DS.cardTitleFont)
-                                .foregroundStyle(DS.ink(scheme))
-                            Text("Articles and Nostr posts selected for your journals. Pull to refresh to load.")
-                                .font(DS.captionFont)
-                                .foregroundStyle(DS.muted(scheme))
-                                .multilineTextAlignment(.center)
-                                .padding(.horizontal, 32)
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                if !state.jevEnabled && !state.readsModelEnabled {
+                    ContentUnavailableView("Cloud processing is off", systemImage: "cloud",
+                        description: Text("Turn it on in Settings to find reads from your journals."))
+                    Button("Open Settings") { state.selectedTab = .profile }
+                } else if items.isEmpty && !busy {
+                    ContentUnavailableView(state.liteJournals.isEmpty ? "A feed that starts with you" : "Nothing new for you yet",
+                        systemImage: "book",
+                        description: Text(state.liteJournals.isEmpty ? "Record a journal to find things worth your time." : "Your next good read will appear here."))
+                    if state.liteJournals.isEmpty {
+                        Button("Record a journal") { state.selectedTab = .journal }.buttonStyle(.borderedProminent)
                     }
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 10) {
-                            if !state.jevEnabled {
-                                Toggle("Strong matches only", isOn: $state.kevStrongMatchesOnly).font(DS.captionFont)
-                            }
-                            Text(state.jevEnabled ? "Jev · Only strong connections to saved memory. Scores are estimates." : "Kev Lite experiment · Scores are estimates. Every checked item is ranked below.")
-                                .font(.caption2).foregroundStyle(.secondary)
-                            // Subtitle row matching the reference: "{N} stories · ranked by your lens".
-                            HStack {
-                                Text("Highest relevance first")
-                                    .font(DS.captionFont)
-                                    .foregroundStyle(DS.muted(scheme))
-                                Text("·")
-                                    .font(DS.captionFont)
-                                    .foregroundStyle(DS.muted(scheme))
-                                Text("\(remainingReads.count) items")
-                                    .font(DS.captionFont)
-                                    .foregroundStyle(DS.muted(scheme))
-                                Spacer()
-                                if state.readsLoading {
-                                    // Background refresh in progress — keep the
-                                    // cached list visible (no spinner swap).
-                                    ProgressView().scaleEffect(0.7).frame(width: 14, height: 14)
-                                }
-                            }
-                            .padding(.horizontal, 4)
-
-                            ForEach(Array(remainingReads.prefix(visibleCount))) { item in
-                                FeedCard(item: item, interests: state.interests)
-                            }
-                            if visibleCount < remainingReads.count {
-                                Button("Explore five more") { visibleCount += 5 }
-                                    .padding(.vertical, 20)
-                            } else {
-                                Text(remainingReads.isEmpty ? "No more strong journal matches right now. A shorter list is enough." : "You're caught up. Take a thought with you.")
-                                    .font(DS.captionFont).foregroundStyle(DS.muted(scheme))
-                                    .padding(.vertical, 20)
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.top, 16)
-                        .padding(.bottom, 24)
-                    }
-                    .refreshable { await state.loadReads(force: true); state.prepareDailySelection() }
+                }
+                ForEach(Array(items.prefix(visibleCount))) { item in
+                    FeedCard(item: item, interests: state.interests)
+                }
+                if visibleCount < items.count {
+                    Button("More reads") { visibleCount += 10 }.frame(maxWidth: .infinity).padding(.vertical)
+                }
+            }.padding(20)
+        }.background(DS.bg(scheme))
+            .sheet(isPresented: $showSources) { JevSourcesView().environmentObject(state) }
+            .refreshable { await state.loadReads(force: true) }
+            .alert("Add a link", isPresented: $showLink) {
+                TextField("https://…", text: $linkText).textInputAutocapitalization(.never).autocorrectionDisabled()
+                Button("Cancel", role: .cancel) {}
+                Button("Add") {
+                    let text = linkText; addingLink = true
+                    Task { await state.addKevReadLink(text); addingLink = false }
                 }
             }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(DS.bg(scheme))
-        .alert("Add a web link", isPresented: $showLink) {
-            TextField("https://…", text: $linkText)
-                .textInputAutocapitalization(.never).autocorrectionDisabled()
-            Button("Cancel", role: .cancel) {}
-            Button("Check with Kev") {
-                let link = linkText; addingLink = true
-                Task { await state.addKevReadLink(link); addingLink = false }
+            .onChange(of: state.selectedTab) { _, tab in
+                if tab == .reads { Task { await state.loadReads() } }
             }
-        } message: { Text("Kev checks the page excerpt against your journals on this device.") }
-        .onChange(of: state.readsDecisionRevision) { _, _ in
-            if state.selectedTab == .reads { Task { await state.refreshReadsDecisions() } }
-        }
-        .onChange(of: state.contextWorkPaused || state.isGeneratingPosts || state.localModelBusy || state.kevJournalBusy) { _, paused in
-            if !paused { Task { await state.refreshReadsDecisions() } }
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active { Task { await state.refreshReadsDecisions() } }
-        }
-        .onChange(of: state.selectedTab) { _, tab in
-            if tab == .reads { Task { await state.refreshReadsDecisions() } }
-        }
-        .task {
-            // Cached list is shown instantly if present; otherwise load. A
-            // background refresh (merge, no wipe) runs when returning to the tab.
-            await state.loadReads(force: false)
-            state.prepareDailySelection()
-        }
+            .task { await state.loadReads() }
     }
 }
 
@@ -4724,10 +4645,9 @@ struct FeedCard: View {
                 }
 
                 // Rationale chip ("✨ {topic}").
-                Text(state.recommendationReason(for: item))
-                    .font(DS.microFont)
-                    .foregroundStyle(DS.accent(scheme))
-                    .padding(.top, 6)
+                DisclosureGroup("Why this?") {
+                    Text(state.recommendationReason(for: item)).font(.footnote).foregroundStyle(.secondary)
+                }.font(.caption).padding(.top, 6)
                 if let match = state.semanticMatches[item.id] {
                     Button("View connected journal") { memoryJournal = state.memorySource(match.journalKey) }
                         .font(DS.microFont).buttonStyle(.borderless)
@@ -4988,6 +4908,15 @@ extension AppState {
             await selectKevJournal(entry)
         }
     }
+    func refreshDraftIdeas() async {
+        guard !kevJournalBusy, !jevBusy, !jevFeedsBusy, !readsDecisionBusy else { return }
+        for entry in liteJournals.prefix(6) {
+            if Task.isCancelled || contextWorkPaused { break }
+            if drafts.contains(where: { $0.source == "kev:" + entry.key }) { continue }
+            await generateDraft(from: entry)
+        }
+        await refreshJournals()
+    }
     func saveKevDraft(_ selection: KevJournalSelection) {
         guard let draft = selection.draft, !excludedMemoryKeys.contains(selection.id),
               let entry = memorySource(selection.id), entry.content == selection.source,
@@ -4999,6 +4928,10 @@ extension AppState {
             // Never overwrite a draft the user has already edited.
             if try memory.get(key: key) == nil {
                 try memory.store(key: key, content: draft, category: "core", sessionID: "drafts", source: "kev:" + selection.id)
+            }
+            if jevEnabled {
+                jevDraftedSources[selection.id] = JevCloud.fingerprint(entry.content)
+                UserDefaults.standard.set(jevDraftedSources, forKey: "slowclaw.jev.drafted.v1")
             }
             kevJournalStatus = "Saved as a private draft below."
             Task { await refreshJournals() }
@@ -5195,6 +5128,53 @@ extension AppState {
 
 // MARK: - Jev cloud memory: exact passages, cached decisions, explicit consent
 extension AppState {
+    func enableTesterJev() async {
+        jevEnabled = true
+        UserDefaults.standard.set(true, forKey: "slowclaw.jev.enabled.v1")
+        deactivateReadsModel()
+        lastJevConnectionAttempt = .distantPast
+        await resumeJevWork()
+    }
+    func resumeJevWork() async {
+        guard jevEnabled, !jevConnecting, !contextWorkPaused else { return }
+        if !JevCloud.shared.connected {
+            guard Date().timeIntervalSince(lastJevConnectionAttempt) > 60 else { return }
+            lastJevConnectionAttempt = Date()
+            jevConnecting = true
+            do {
+                try await JevCloud.shared.connectForTesting()
+                jevProblem = nil
+            } catch {
+                if jevEnabled { jevProblem = "Couldn’t connect to Jev. We’ll retry automatically." }
+            }
+            jevConnecting = false
+        }
+        guard jevEnabled, JevCloud.shared.connected, !jevBusy, !readsDecisionBusy, !jevFeedsBusy, !kevJournalBusy else { return }
+        let pending = liteJournals.contains { entry in
+            jevCache.records[entry.key]?.fingerprint != JevCloud.fingerprint(entry.content)
+        }
+        if pending { startJevMemory() }
+        else if !jevPassages.isEmpty {
+            prepareJevDrafts()
+            if readsItems.isEmpty { await loadReads() }
+        }
+    }
+    /// Jev has already selected these passages. Assemble original sentences
+    /// into private suggestions without another model call or rewriting.
+    private func prepareJevDrafts() {
+        guard jevEnabled else { return }
+        let passages = jevPassages
+        for entry in liteJournals.prefix(6) {
+            // Deleting a suggestion is intentional; never recreate it every
+            // time the background worker wakes for an unchanged journal.
+            guard jevDraftedSources[entry.key] != JevCloud.fingerprint(entry.content) else { continue }
+            guard !drafts.contains(where: { $0.source == "kev:" + entry.key }) else { continue }
+            let sentences = passages.filter { $0.sourceKey == entry.key }.flatMap { KevLite.sentences($0.text) }
+            guard let draft = KevLite.compose(Array(sentences.prefix(2)), source: journalBodyOf(entry.content)) else { continue }
+            let selection = KevJournalSelection(id: entry.key, source: entry.content, highlight: nil, question: nil, draft: draft)
+            saveKevDraft(selection)
+        }
+    }
     private func pruneJevMemory() {
         var next = jevCache
         next.records = next.records.filter { key, record in
@@ -5218,27 +5198,13 @@ extension AppState {
             return record.passages.filter { !jevCache.dismissed.contains($0.id) && entry.content.contains($0.text) }
         }.sorted { $0.score == $1.score ? $0.id < $1.id : $0.score > $1.score }
     }
-    func connectJev() async {
-        guard !jevConnecting else { return }
-        jevConnecting = true
-        defer { jevConnecting = false }
-        do {
-            if !JevCloud.shared.connected { try await JevCloud.shared.connect() }
-            jevEnabled = true
-            kevJournalSelections = [:]
-            UserDefaults.standard.set(true, forKey: "slowclaw.jev.enabled.v1")
-            deactivateReadsModel()
-            readsDecisionStatus = "Preparing personal memory for Reads…"
-            jevStatus = "Connected. Finding useful passages…"
-            startJevMemory()
-        } catch { jevStatus = error.localizedDescription }
-    }
     func stopJevMemory() {
         jevTask?.cancel()
         jevStatus = "Paused. Completed journals are saved; continue when ready."
     }
     func disableJev() {
         jevEnabled = false
+        jevProblem = nil
         UserDefaults.standard.set(false, forKey: "slowclaw.jev.enabled.v1")
         jevTask?.cancel(); jevReadingTask?.cancel(); jevFeedsTask?.cancel()
         kevJournalSelections = [:]
@@ -5252,7 +5218,7 @@ extension AppState {
         catch { jevStatus = "Could not save this change. Please retry." }
     }
     func startJevMemory() {
-        guard jevEnabled, jevTask == nil, !readsDecisionBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
+        guard jevEnabled, JevCloud.shared.connected, jevTask == nil, !readsDecisionBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
         jevTask = Task { await scanJevMemory(); jevTask = nil }
     }
     private func checkJevWork() throws {
@@ -5277,10 +5243,15 @@ extension AppState {
     }
     private func scanJevMemory() async {
         jevBusy = true
+        jevProblem = nil
         defer {
             jevBusy = false
             if jevEnabled && !Task.isCancelled {
-                Task { await refreshReadsDecisions(); startJevFeedSelection() }
+                Task {
+                    prepareJevDrafts()
+                    await loadReads()
+                    startJevFeedSelection()
+                }
             }
         }
         do {
@@ -5318,7 +5289,7 @@ extension AppState {
             jevStatus = "\(jevPassages.count) passages remembered"
         } catch is CancellationError {
             jevStatus = "Paused. Completed journals are saved; continue when ready."
-        } catch { jevStatus = error.localizedDescription }
+        } catch { jevStatus = error.localizedDescription; jevProblem = error.localizedDescription }
     }
     private func rankJevReads() async {
         guard jevEnabled, !readsDecisionBusy, !jevBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
@@ -5353,7 +5324,8 @@ extension AppState {
                 jevReadSources[item.id] = memories.first(where: { $0.id == best.id }).map { String($0.text.prefix(110)).trimmingCharacters(in: .whitespacesAndNewlines) }
             }
             readsDecisionStatus = nil
+            jevProblem = nil
         } catch is CancellationError { readsDecisionStatus = "Selection paused. Pull to continue." }
-        catch { readsDecisionStatus = error.localizedDescription }
+        catch { readsDecisionStatus = error.localizedDescription; jevProblem = error.localizedDescription }
     }
 }

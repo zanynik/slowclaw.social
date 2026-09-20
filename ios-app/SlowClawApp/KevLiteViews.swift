@@ -1,99 +1,125 @@
 import SwiftUI
 
+struct WelcomeView: View {
+    let start: () -> Void
+    let offline: () -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            Spacer()
+            Image(systemName: "waveform").font(.system(size: 48, weight: .light)).foregroundStyle(DS.accentColor)
+            Text("Start with a thought.").font(.largeTitle.bold())
+            Text("Record your first journal. SlowClaw finds ideas worth keeping, things worth reading, and words you might share.")
+                .font(.title3).foregroundStyle(.secondary)
+            Spacer()
+            Text("Journal text is processed by Jev through OpenRouter. Audio stays on this iPhone. You can turn cloud processing off in Settings.")
+                .font(.footnote).foregroundStyle(.secondary)
+            Button(action: start) { Text("Start journaling").frame(maxWidth: .infinity).padding(.vertical, 8) }
+                .buttonStyle(.borderedProminent).tint(DS.accentColor)
+            Button("Use offline", action: offline).frame(maxWidth: .infinity)
+        }.padding(28)
+    }
+}
+
 struct DraftsView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.colorScheme) var scheme
     @State private var showPosts = false
-    @State private var source: SlowClawMemoryEntry?
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
-                Text("Your words").font(DS.titleFont)
-                Text("Find a thought worth keeping or sharing. \(state.jevEnabled ? "Jev" : "Kev") selects sentences; your words stay yours.")
-                    .font(.subheadline).foregroundStyle(.secondary)
                 HStack {
-                    Button("Find highlights") { Task { await state.scanKevJournals() } }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(state.kevJournalBusy || state.readsDecisionBusy || state.readsModelActivating || state.jevBusy || state.jevFeedsBusy)
-                    if state.kevJournalBusy { ProgressView() }
+                    Text("Create").font(DS.titleFont)
+                    Spacer()
+                    Button { showPosts = true } label: { Image(systemName: "paperplane") }
+                        .accessibilityLabel("Published posts")
                 }
-                if let status = state.kevJournalStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
-                if !state.jevEnabled && !state.readsModelEnabled { ReadsModelCard() }
-                ForEach(Array(state.liteJournals.prefix(12)), id: \.key) { entry in
-                    VStack(alignment: .leading, spacing: 10) {
-                        Button { source = entry } label: {
-                            Text(String(entry.content.split(separator: "\n").first ?? "Journal").replacingOccurrences(of: "# ", with: ""))
-                                .font(.headline).lineLimit(2)
-                        }
-                        if let selected = state.kevJournalSelections[entry.key], selected.source == entry.content {
-                            if let text = selected.highlight { Text(text).font(.body) }
-                            if let question = selected.question {
-                                Text(question).font(.subheadline).foregroundStyle(.secondary)
-                                Button("Keep this question") {
-                                    do { _ = try state.followQuestion(question, sourceKey: entry.key) }
-                                    catch { state.kevJournalStatus = error.localizedDescription }
-                                }.font(.caption)
-                            }
-                            if let draft = selected.draft {
-                                Text("Private draft suggestion · review before sharing").font(.caption).foregroundStyle(.secondary)
-                                Text(draft).font(.body)
-                                Button("Save private draft") { state.saveKevDraft(selected) }.buttonStyle(.bordered)
-                            } else { Text("No short post selected. You can still write your own.").font(.caption).foregroundStyle(.secondary) }
-                        } else {
-                            Button("Select from this journal") { Task { await state.selectKevJournal(entry) } }
-                                .disabled(state.kevJournalBusy || state.readsDecisionBusy || state.readsModelActivating || state.jevBusy || state.jevFeedsBusy)
-                        }
-                    }.padding().frame(maxWidth: .infinity, alignment: .leading)
-                        .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: 12))
+                if state.drafts.isEmpty {
+                    ContentUnavailableView("Your words, ready to share", systemImage: "text.quote",
+                        description: Text("Ideas from your journals become private drafts here."))
+                    if state.liteJournals.isEmpty {
+                        Button("Record a journal") { state.selectedTab = .journal }.buttonStyle(.borderedProminent)
+                    } else {
+                        Button("Find ideas") { Task { await state.refreshDraftIdeas() } }.buttonStyle(.borderedProminent)
+                            .disabled(state.jevBusy || state.jevFeedsBusy || state.readsDecisionBusy || state.kevJournalBusy)
+                    }
                 }
-                if state.liteJournals.isEmpty { Text("Add a journal to find words worth keeping.").foregroundStyle(.secondary) }
-                Text("Private drafts").font(.title2)
+                if state.kevJournalBusy { ProgressView("Finding ideas…") }
                 ForEach(state.drafts, id: \.id) { draft in DraftCard(draft: draft, sourceJournalContent: nil) }
-                if state.drafts.isEmpty { Text("Nothing is published automatically.").font(.caption).foregroundStyle(.secondary) }
-                Button("My published posts & replies") { showPosts = true }
             }.padding(20)
         }.background(DS.bg(scheme))
-            .sheet(item: $source) { JournalDetailView(entry: $0).environmentObject(state) }
             .sheet(isPresented: $showPosts) { NostrPostsView() }
-            .refreshable { await state.refreshJournals() }
+            .refreshable { await state.refreshDraftIdeas() }
     }
 }
 
 struct ProfileView: View {
     @EnvironmentObject var state: AppState
-    @Environment(\.colorScheme) var scheme
+    @AppStorage("slowclaw.theme") private var theme = ""
     @State private var showMemory = false
-    @State private var showPosts = false
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                Text("Settings").font(DS.titleFont)
-                Text("SlowClaw Lite · Jev memory").font(.headline)
-                Text("Keep the useful parts of your journals. Let them guide what you read.")
-                    .font(.subheadline).foregroundStyle(.secondary)
-                JevConnectionCard()
-                DisclosureGroup("Optional on-device Kev") { ReadsModelCard(showRemove: true) }
-                Button("Personal memory & followed questions") { showMemory = true }
-                Button("My Nostr posts & replies") { showPosts = true }
-                DisclosureGroup("Storage") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("\(state.journals.count) recent journals · \(state.drafts.count) drafts")
-                        Text("Existing writing models are not used by Lite. Your files remain available if you return to the full app.").font(.caption)
-                        ForEach(LocalModelPreset.presets.filter { LocalModelStore.isDownloaded($0) }) { model in
-                            HStack {
-                                Text(model.title).font(.caption)
-                                Spacer()
-                                Button("Remove", role: .destructive) { state.deleteLocalModel(model) }
-                                    .disabled(state.localModelBusy || state.kevJournalBusy || state.readsDecisionBusy)
-                            }
-                        }
-                        RecentlyDeletedCard(scheme: scheme)
-                    }.padding(.top, 10)
+        NavigationStack {
+            Form {
+                Section {
+                    Button { showMemory = true } label: { Label("Memory", systemImage: "brain") }
+                    NavigationLink { JevPrivacyView() } label: { Label("Privacy & connection", systemImage: "lock") }
+                    Picker("Appearance", selection: $theme) {
+                        Text("System").tag("")
+                        Text("Light").tag("light")
+                        Text("Dark").tag("dark")
+                    }
+                    NavigationLink { AdvancedSettingsView() } label: { Label("Advanced", systemImage: "slider.horizontal.3") }
                 }
-                DisclosureGroup("Transcription troubleshooting") { ExperimentCard(scheme: scheme) }
-            }.padding(20)
-        }.background(DS.bg(scheme))
-            .sheet(isPresented: $showMemory) { PersonalMemoryView().environmentObject(state) }
-            .sheet(isPresented: $showPosts) { NostrPostsView() }
+            }.navigationTitle("Settings")
+                .sheet(isPresented: $showMemory) { PersonalMemoryView().environmentObject(state) }
+        }
+    }
+}
+
+struct JevPrivacyView: View {
+    @EnvironmentObject var state: AppState
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Cloud processing", isOn: Binding(get: { state.jevEnabled }, set: { enabled in
+                    if enabled { Task { await state.enableTesterJev() } } else { state.disableJev() }
+                }))
+                Text("Included journal text and reading content are processed by Jev through OpenRouter. Audio and saved memories stay on this iPhone. The SlowClaw service does not save journal text.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Text("Access is included during testing. No account or API key is needed.").font(.footnote).foregroundStyle(.secondary)
+                if state.jevConnecting { ProgressView("Connecting…") }
+                if let problem = state.jevProblem {
+                    Text(problem).font(.footnote)
+                    Button("Retry connection") { Task { await state.enableTesterJev() } }
+                }
+            }
+        }.navigationTitle("Privacy & connection")
+    }
+}
+
+struct AdvancedSettingsView: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.colorScheme) var scheme
+    var body: some View {
+        List {
+            DisclosureGroup("On-device models") {
+                ReadsModelCard(showRemove: true)
+                ForEach(LocalModelPreset.presets.filter { LocalModelStore.isDownloaded($0) }) { model in
+                    HStack {
+                        Text(model.title)
+                        Spacer()
+                        Button("Remove", role: .destructive) { state.deleteLocalModel(model) }
+                            .disabled(state.localModelBusy || state.kevJournalBusy || state.readsDecisionBusy)
+                    }
+                }
+            }
+            DisclosureGroup("Recently deleted") { RecentlyDeletedCard(scheme: scheme) }
+            DisclosureGroup("Transcription") { ExperimentCard(scheme: scheme) }
+            DisclosureGroup("Activity") {
+                if let text = state.jevStatus { Text(text) }
+                if let text = state.readsDecisionStatus { Text(text) }
+                if let text = state.jevFeedsStatus { Text(text) }
+                if let text = state.kevJournalStatus { Text(text) }
+            }
+        }.navigationTitle("Advanced")
     }
 }
