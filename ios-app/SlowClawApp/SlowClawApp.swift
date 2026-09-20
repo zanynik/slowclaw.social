@@ -5118,15 +5118,16 @@ extension AppState {
         try Task.checkCancellation()
         guard jevEnabled, !contextWorkPaused else { throw CancellationError() }
     }
-    private func selectJevPassage(_ text: String, key: String, depth: Int = 0) async throws -> [JevMemory.Passage] {
+    private func selectJevPassage(_ text: String, key: String, fingerprint: String, depth: Int = 0) async throws -> [JevMemory.Passage] {
         try checkJevWork()
+        guard let source = jevSource(key), JevCloud.fingerprint(source.content) == fingerprint else { throw CancellationError() }
         let answer = try await JevCloud.shared.memory(text)
         try checkJevWork()
         guard answer.useful else { return [] }
         if text.count > 550 && depth < 2 {
             var children: [JevMemory.Passage] = []
             for part in JevMemory.split(text, near: text.count / 2) where !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                children += try await selectJevPassage(part, key: key, depth: depth + 1)
+                children += try await selectJevPassage(part, key: key, fingerprint: fingerprint, depth: depth + 1)
             }
             if !children.isEmpty { return children }
             // The combined passage may carry meaning that neither half carries alone.
@@ -5154,7 +5155,7 @@ extension AppState {
                     jevStatus = "Finding useful passages · \(checked) journals checked"
                     var passages: [JevMemory.Passage] = []
                     for chunk in JevMemory.chunks(body) {
-                        passages += try await selectJevPassage(chunk, key: entry.key)
+                        passages += try await selectJevPassage(chunk, key: entry.key, fingerprint: fingerprint)
                     }
                     try checkJevWork()
                     guard jevSource(entry.key)?.content == entry.content else { continue }
