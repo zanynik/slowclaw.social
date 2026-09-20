@@ -1,0 +1,9 @@
+{
+  "file": "slowclaw-kev-q8.gguf",
+  "sha256": "4606b739bd5fae0c77c2dc978a8983a9cc1eccd476d97d02f2e1e154ea537686",
+  "bytes": 532904896,
+  "base_revision": "060db6499f32faf8b98477b0a26969ef7d8b9987",
+  "adapter_revision": "edf1dc6d7f8d983c0adfd251e80a686e5539fc61",
+  "converter_revision": "8f4646a63ee29f2e0ab971b0290b141938769762",
+  "precision": "q8"
+}

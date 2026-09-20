@@ -30,6 +30,7 @@ pub const have_llama = build_options.with_llama;
 // never references llama symbols or headers.
 pub const llama = if (have_llama) @cImport({
     @cInclude("llama.h");
+    @cInclude("gguf.h");
 }) else struct {};
 
 // libc stdio for the load() pre-checks (readable file, size, GGUF magic).

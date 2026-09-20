@@ -1725,3 +1725,23 @@ test "Reads scoring fails closed without a model" {
     try std.testing.expect(slowclaw_feed_reads_model_open("/nonexistent/reads.gguf", "/nonexistent/reads.gguf".len) == null);
     _ = reads_decision;
 }
+
+// Caller owns buffers. A positive count is the only successful result.
+const kev_decision = @import("kev_decision.zig");
+pub export fn slowclaw_feed_kev_open(path: [*]const u8, path_len: usize) ?*anyopaque {
+    return kev_decision.load(path[0..path_len]) catch null;
+}
+pub export fn slowclaw_feed_kev_close(handle: ?*anyopaque) void {
+    kev_decision.free(handle);
+}
+pub export fn slowclaw_feed_kev_evaluate(handle: ?*anyopaque, request: [*]const u8, request_len: usize, out: [*]f64, capacity: usize) c_int {
+    if (capacity > 64) return -1;
+    @memset(out[0..capacity], -1);
+    return @intCast(kev_decision.evaluate(handle, request[0..request_len], out[0..capacity]) catch return -1);
+}
+test "Kev absent model abstains and clears outputs" {
+    var out = [_]f64{1} ** 2;
+    try std.testing.expectEqual(@as(c_int, -1), slowclaw_feed_kev_evaluate(null, "{}", 2, &out, out.len));
+    try std.testing.expectEqual(@as(f64, -1), out[0]);
+    slowclaw_feed_kev_close(null);
+}

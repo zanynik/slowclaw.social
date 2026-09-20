@@ -315,6 +315,11 @@ int32_t slowclaw_feed_local_llm_generate_title(
     SlowclawChatResult *out_result
 );
 
+// Independent Kev judge; flattened probabilities are valid only for a positive count.
+void *slowclaw_feed_kev_open(const char *path, size_t path_len);
+void slowclaw_feed_kev_close(void *handle);
+int slowclaw_feed_kev_evaluate(void *handle, const char *request, size_t request_len, double *out, size_t capacity);
+
 /* Dedicated local Reads reranker. Inputs are borrowed; close each non-null
  * model handle exactly once, after all scoring calls finish. Score is [0,1]
  * on success, -1 on error. No strings/results require slowclaw_feed_free. */
