@@ -213,6 +213,16 @@ public final class SlowClawSqliteMemory {
         return (decoded.map { $0.toSwift() }, next)
     }
 
+    public func list(sessionID: String) throws -> [SlowClawMemoryEntry] {
+        guard let h = handle else { throw SlowClawFeedError.internalError("closed") }
+        var result = SlowclawRankResult()
+        defer { slowclaw_feed_sqlite_result_free(&result) }
+        let status = sessionID.withCString { slowclaw_feed_sqlite_list_session(h, $0, sessionID.utf8.count, &result) }
+        guard status == SLOWCLAW_OK else { throw SlowClawFeedError.recallFailed("Could not load saved drafts.") }
+        guard let bytes = result.items_json.bytes else { return [] }
+        return try JSONDecoder().decode([MemoryEntryDTO].self, from: Data(bytes: bytes, count: result.items_json.len)).map { $0.toSwift() }
+    }
+
     /// Hybrid recall (FTS5 keyword + vector similarity if embedder is set).
     /// Returns matching entries ordered by relevance.
     public func recall(query: String, limit: Int = 10, sessionID: String? = nil) throws -> [SlowClawMemoryEntry] {

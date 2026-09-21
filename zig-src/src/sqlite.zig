@@ -433,10 +433,7 @@ pub const SqliteMemory = struct {
         }
 
         var stmt: ?*c.sqlite3_stmt = null;
-        const sql = if (category != null)
-            "SELECT id, key, content, category, created_at, session_id, source, media_url FROM memories WHERE category = ?1 ORDER BY rowid DESC LIMIT 1000"
-        else
-            "SELECT id, key, content, category, created_at, session_id, source, media_url FROM memories ORDER BY rowid DESC LIMIT 1000";
+        const sql = "SELECT id, key, content, category, created_at, session_id, source, media_url FROM memories WHERE (?1 IS NULL OR category = ?1) AND (?2 IS NULL OR session_id = ?2) ORDER BY rowid DESC LIMIT 1000";
         const sql_z = try self.allocator.dupeZ(u8, sql);
         defer self.allocator.free(sql_z);
         if (c.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
@@ -445,6 +442,7 @@ pub const SqliteMemory = struct {
         if (category) |cat| {
             try bindText(stmt.?, 1, categoryToText(cat));
         }
+        if (session_id) |sid| try bindText(stmt.?, 2, sid);
 
         while (true) {
             const rc = c.sqlite3_step(stmt.?);

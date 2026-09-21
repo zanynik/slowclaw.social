@@ -161,6 +161,8 @@ int32_t slowclaw_feed_sqlite_forget(SlowclawSqlite *handle, const uint8_t *key, 
 
 /// Count stored memories. Returns count (>= 0) or negative on error.
 int32_t slowclaw_feed_sqlite_count(SlowclawSqlite *handle);
+// Direct session listing, newest first, up to 1000 entries. Free result below.
+int32_t slowclaw_feed_sqlite_list_session(SlowclawSqlite *handle, const uint8_t *session_id, size_t session_id_len, SlowclawRankResult *out_result);
 
 /// Hybrid recall (FTS5 + vector if embedder set). out_result.items_json is a
 /// Zig-owned JSON array of full entries. Free via slowclaw_feed_sqlite_result_free.

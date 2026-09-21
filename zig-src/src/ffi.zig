@@ -443,6 +443,20 @@ pub export fn slowclaw_feed_sqlite_archive_page(handle: *SlowclawSqlite, before:
     return SLOWCLAW_OK;
 }
 
+/// List a session directly, without content search. Same result ownership.
+pub export fn slowclaw_feed_sqlite_list_session(handle: *SlowclawSqlite, session_id: [*]const u8, session_id_len: usize, out_result: *SlowclawRankResult) c_int {
+    out_result.* = .{ .items_json = SlowclawString.empty(), .status = SLOWCLAW_ERR_INTERNAL };
+    const db: *sqlite.SqliteMemory = @ptrCast(@alignCast(handle));
+    const entries = db.list(c_allocator, null, session_id[0..session_id_len]) catch return SLOWCLAW_ERR_INTERNAL;
+    defer {
+        for (entries) |e| sqlite.freeEntry(c_allocator, e);
+        c_allocator.free(entries);
+    }
+    const json = serializeEntriesFull(c_allocator, entries) catch return SLOWCLAW_ERR_OUT_OF_MEMORY;
+    out_result.* = .{ .items_json = SlowclawString.fromOwnedSlice(json), .status = SLOWCLAW_OK };
+    return SLOWCLAW_OK;
+}
+
 pub export fn slowclaw_feed_sqlite_result_free(result: *SlowclawRankResult) void {
     if (result.items_json.bytes) |b| {
         const slice = b[0..result.items_json.len];
@@ -1561,6 +1575,26 @@ test "ffi: sqlite recall returns JSON array via C ABI" {
     defer parsed.deinit();
     try testing.expectEqual(Tag.array, std.meta.activeTag(parsed.value));
     try testing.expect(parsed.value.array.items.len >= 1);
+}
+
+test "ffi: session listing exposes exact sentence drafts without keyword matches" {
+    const handle = slowclaw_feed_sqlite_open(":memory:", ":memory:".len, null) orelse return error.OOM;
+    defer slowclaw_feed_sqlite_close(handle);
+    const sentence = "SlowClawAgent learns through patient observation.";
+    _ = slowclaw_feed_sqlite_store(handle, "short_idea", 10, sentence, sentence.len, "core", 4, "drafts", 6, null, 0, null, 0);
+    // Session filtering must happen before the 1000-row listing limit.
+    for (0..1001) |i| {
+        var buffer: [64]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buffer, "journal_{d}", .{i});
+        _ = slowclaw_feed_sqlite_store(handle, key.ptr, key.len, "ordinary note", 13, "core", 4, "journals", 8, null, 0, null, 0);
+    }
+    var result: SlowclawRankResult = std.mem.zeroes(SlowclawRankResult);
+    try testing.expectEqual(SLOWCLAW_OK, slowclaw_feed_sqlite_list_session(handle, "drafts", 6, &result));
+    defer slowclaw_feed_sqlite_result_free(&result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result.items_json.bytes.?[0..result.items_json.len], .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    try testing.expectEqualStrings(sentence, parsed.value.array.items[0].object.get("content").?.string);
 }
 
 test "ffi: parse_and_rank frees feed_items with the matching allocator (regression for iOS Reads SIGABRT)" {
