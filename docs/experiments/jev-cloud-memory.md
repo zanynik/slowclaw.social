@@ -1,5 +1,56 @@
 # Jev cloud memory experiment
 
+## Topic persona and visible passage drafts
+
+This revision replaces cloud Reads passage-to-item comparisons with a shared,
+versioned 224-topic space. Jev scores topics independently in batches of 32.
+Every bounded portion of a journal or incoming text contributes to its
+length-weighted mean vector. Scores below 0.5 contribute no evidence; remaining
+scores are rescaled to 0–1. Each included journal contributes once with a 90-day
+half-life. Edits replace its contribution; deletion and exclusion remove it.
+Existing journals are backfilled from their source text, not their selected
+highlights. Original journal dates drive decay.
+
+Reads and weekly source previews are classified in the same space. Their
+cosine similarity (normalized dot product) to the summed persona determines
+descending rank. An initial similarity floor of 0.15 suppresses weak overlap;
+this is a tunable ranking heuristic, not a calibrated relevance probability.
+The top contributing topics explain each match. Topic vectors are cached on
+the device separately from persona-dependent scores. Cached source previews
+are reranked immediately as journals change and reclassified weekly.
+An initial full scan is more expensive than subsequent incremental updates.
+The fixed catalog remains the discovery boundary.
+
+Create now visibly lists Jev-selected passages with Source, Dismiss and Make
+draft. The action assembles exact source sentences up to 280 characters into
+an editable private draft; a short passage can be used directly. Oversized
+passages without a complete short sentence explicitly abstain. Nothing posts
+automatically. Passage importance is not a privacy or public-sharing guarantee.
+Settings replaces Memory with Your interests and relative topic weights;
+passage selection is retained solely to support Create.
+
+Draft loading now lists the drafts session directly through an additive C ABI,
+instead of searching for the words "draft post". This fixes saved original
+sentences being invisible in Create. The SQLite session predicate precedes
+the listing limit. A real in-memory SQLite/FFI regression covers a draft with
+no search keywords behind 1001 newer journals, including result ownership.
+
+Proven → Better: reuse the existing classifier, consent, device sessions,
+source fetching and draft storage. Only the cloud classification/ranking
+policy and its two user surfaces change. Optional local Kev remains available.
+Rollback is to revert this app revision; old memory/reading service endpoints
+remain compatible. Tests cover fixed topic coverage, score rejection, recency
+decay, ranking, journal replacement/removal, and existing session restrictions.
+Physical-device UI and real-journal quality still require TestFlight evaluation.
+
+The following sections document earlier revisions and their validation.
+
+Validation for this revision: all app Swift files parsed; the executable
+persona tests passed; SQLite and C ABI tests passed (287 passed, one skipped).
+The service TypeScript check, six tests and production build passed. A live
+synthetic topic request returned all 224 valid scores and its temporary session
+was revoked. This checks protocol compatibility, not personalized quality.
+
 This branch improves the journal-first reading loop: exact useful journal passages become the authority for admitting incoming content. It is an opt-in cloud experiment. Capture stays on-device.
 
 The owner configures OpenRouter in the separate SlowClaw Jev service. Its owner-only form verifies `jev-1.13` through `/api/v1/systemone` before encrypting the key at rest. No shared API key ships in the app. After first-use consent, each tester device automatically obtains a revocable session token and stores it in Keychain. The service does not persist journal or reading text. OpenRouter/provider policies still apply; the app explains this before enabling cloud processing. There are no per-user usage quotas. One request per device runs at a time.

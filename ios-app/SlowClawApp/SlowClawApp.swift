@@ -423,6 +423,7 @@ final class AppState: ObservableObject {
     @Published var jevConnecting = false
     @Published var jevProblem: String?
     @Published private var jevCache = JevMemory.Cache.load()
+    @Published private var personaCache = JevPersona.Cache.load()
     @Published private var jevFeedCache = JevFeeds.Cache.load()
     @Published var jevFeedsBusy = false
     @Published var jevFeedsStatus: String?
@@ -490,7 +491,7 @@ final class AppState: ObservableObject {
         guard jevEnabled || readsModelEnabled else { return [] }
         return readsItems.filter { item in
             readingSignals[item.id]?.preference != -1 && ReadsRelevance.accepts(
-                readsDecisions[item.id], text: Self.readsDecisionText(item), revision: memoryRevision, threshold: jevEnabled ? JevMemory.threshold : (kevStrongMatchesOnly ? 0.8 : 0))
+                readsDecisions[item.id], text: Self.readsDecisionText(item), revision: memoryRevision, threshold: jevEnabled ? JevPersona.threshold : (kevStrongMatchesOnly ? 0.8 : 0))
         }.sorted {
             let left = readsDecisions[$0.id]?.score ?? 0
             let right = readsDecisions[$1.id]?.score ?? 0
@@ -663,8 +664,8 @@ final class AppState: ObservableObject {
     func recommendationReason(for item: RankedFeedItem) -> String {
         if jevEnabled {
             guard let decision = readsDecisions[item.id] else { return "Awaiting Jev" }
-            let quote = jevReadSources[item.id] ?? "your saved memory"
-            return "Relevance \(Int(decision.score * 100)) · \(quote)"
+            let quote = jevReadSources[item.id] ?? "your interests"
+            return "Topic match \(Int(decision.score * 100)) · \(quote)"
         }
         guard let detail = kevReadDetails[item.id] else { return "Awaiting Kev" }
         return "Relevance \(Int(detail.relevance * 100)) · \(detail.topic) · \(detail.priority) priority"
@@ -1122,7 +1123,7 @@ final class AppState: ObservableObject {
                 QuestionThread.isJournalRecord(key: $0.key, category: $0.category, sessionID: $0.sessionID)
                     && !deletedKeys.contains($0.key)
             }
-            drafts = try memory.recall(query: "draft post", limit: 20, sessionID: "drafts")
+            drafts = try memory.list(sessionID: "drafts")
             // The index can now span years. Yield between small validation
             // batches so a refresh doesn't monopolize the UI. Read and remove
             // each record without suspension between them, preserving edits.
@@ -1496,7 +1497,7 @@ final class AppState: ObservableObject {
             try memory.store(key: key, content: post, category: "core", sessionID: "drafts",
                              source: "automatic:" + entry.key, mediaURL: nil)
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "slowclaw.memory.last-draft")
-            drafts = try memory.recall(query: "draft post", limit: 20, sessionID: "drafts")
+            drafts = try memory.list(sessionID: "drafts")
         } catch { memoryStatus = "An idea was found, but its draft couldn't be saved. Your journal is safe." }
     }
 
@@ -2686,7 +2687,7 @@ struct JournalDetailView: View {
                     }
 
                     // ── Audio player (only for audio entries with a file) ──
-                    Button(state.excludedMemoryKeys.contains(entry.key) ? "Include in personal memory" : "Exclude from personal memory") {
+                    Button(state.excludedMemoryKeys.contains(entry.key) ? "Include in interests and ideas" : "Exclude from interests and ideas") {
                         if state.excludedMemoryKeys.contains(entry.key) { state.includeInMemory(entry.key) }
                         else { state.excludeFromMemory(entry.key) }
                     }.font(DS.captionFont).padding(.horizontal, 16)
@@ -3440,7 +3441,7 @@ struct JournalView: View {
                         Button("Done") { isSelectingAudio = false; selectedAudioKeys.removeAll() }
                     } else {
                         Menu {
-                            Button("Memory") { showContext = true }
+                            Button("Your interests") { showContext = true }
                             sortMenu
                             Button("Select recordings") { isSelectingAudio = true }
                                 .disabled(selectableAudioKeys.isEmpty)
@@ -5005,16 +5006,74 @@ extension AppState {
 
 // MARK: - Jev sources and private draft suggestions
 extension AppState {
+    var personaWeights: [Double] {
+        let records = personaCache.journals.compactMap { key, record -> JevPersona.Record? in
+            guard let entry = jevSource(key), record.fingerprint == JevCloud.fingerprint(entry.content) else { return nil }
+            return record
+        }
+        return JevPersona.vector(records)
+    }
+    var personaTopics: [(name: String, weight: Double)] {
+        let weights = personaWeights
+        let total = weights.reduce(0, +)
+        guard total > 0 else { return [] }
+        return weights.indices.filter { weights[$0] > 0 }
+            .sorted { weights[$0] == weights[$1] ? $0 < $1 : weights[$0] > weights[$1] }
+            .map { (name: JevPersona.topics[$0], weight: weights[$0] / total) }
+    }
+    /// Cache the input vector independently from the changing persona.
+    /// Long journals and posts use every bounded portion, weighted by length.
+    private func topicScores(_ text: String) async throws -> [Double] {
+        let key = "text:" + JevCloud.fingerprint(text)
+        if let cached = personaCache.content[key] { return cached }
+        var result = Array(repeating: 0.0, count: JevPersona.topics.count)
+        let chunks = JevMemory.chunks(text, maximum: 10000)
+        let length = max(1, chunks.reduce(0) { $0 + $1.utf16.count })
+        for chunk in chunks {
+            try checkJevWork()
+            let scores = try await JevCloud.shared.topics(chunk)
+            for i in result.indices { result[i] += scores[i] * Double(chunk.utf16.count) / Double(length) }
+        }
+        try checkJevWork()
+        result = result.map { min(1, max(0, $0)) }
+        var next = personaCache
+        // Bound cached candidate text vectors without dropping source previews.
+        if next.content.count >= 1500 {
+            next.content = next.content.filter { $0.key.hasPrefix("feed:") }
+        }
+        next.content[key] = result
+        try next.save(); personaCache = next
+        return result
+    }
+    func makePassageDraft(_ passage: JevMemory.Passage) {
+        guard jevPassages.contains(where: { $0.id == passage.id }),
+              let entry = jevSource(passage.sourceKey) else { return }
+        let source = journalBodyOf(entry.content)
+        let draft = KevLite.compose(KevLite.sentences(passage.text), source: source)
+            ?? (passage.text.count <= 280 ? passage.text : nil)
+        guard let draft else { kevJournalStatus = "This passage needs a shorter complete sentence. Open its journal to edit it."; return }
+        saveKevDraft(.init(id: entry.key, source: entry.content, highlight: passage.text, question: nil, draft: draft))
+    }
     var jevFeedCatalog: [SlowClawFeedSource] { catalog }
     var jevSelectedFeedURLs: Set<String> {
-        let active = Set(jevPassages.map(\.id))
-        return Set(jevFeedCache.decisions.filter { $0.value.selected(activePassages: active) }.keys)
+        let weights = personaWeights
+        return Set(catalog.filter {
+            guard let scores = personaCache.content["feed:" + $0.xmlURL] else { return false }
+            return JevPersona.similarity(weights, scores) >= JevPersona.threshold
+        }.map(\.xmlURL))
     }
-    func jevFeedScore(_ source: SlowClawFeedSource) -> Double? { jevFeedCache.decisions[source.xmlURL]?.score }
+    func jevFeedScore(_ source: SlowClawFeedSource) -> Double? {
+        guard let scores = personaCache.content["feed:" + source.xmlURL] else { return nil }
+        return JevPersona.similarity(personaWeights, scores)
+    }
     private var selectedJevFeeds: [SlowClawFeedSource] {
         let selectedURLs = jevSelectedFeedURLs
+        let weights = personaWeights
+        let scores = Dictionary(uniqueKeysWithValues: catalog.map { source in
+            (source.xmlURL, personaCache.content["feed:" + source.xmlURL].map { JevPersona.similarity(weights, $0) } ?? 0)
+        })
         let selected = catalog.filter { selectedURLs.contains($0.xmlURL) }.sorted {
-            let left = jevFeedScore($0) ?? 0, right = jevFeedScore($1) ?? 0
+            let left = scores[$0.xmlURL] ?? 0, right = scores[$1.xmlURL] ?? 0
             return left == right ? $0.xmlURL < $1.xmlURL : left > right
         }
         // Rotate the selected pool daily so a high scoring large catalog does
@@ -5026,22 +5085,21 @@ extension AppState {
             if force { jevFeedsStatus = "Finish the current selection, then try again." }
             return
         }
-        let memories = jevPassages
-        guard !memories.isEmpty else { jevFeedsStatus = "Find useful passages in Personal memory first."; return }
-        let active = Set(memories.map(\.id))
-        let pending = catalog.filter { force || (jevFeedCache.decisions[$0.xmlURL]?.needsRefresh(activePassages: active) ?? true) }
+        guard personaWeights.contains(where: { $0 > 0 }) else { jevFeedsStatus = "Record a journal to discover your interests."; return }
+        let active: Set<String> = [JevPersona.version]
+        let pending = catalog.filter { force || personaCache.content["feed:" + $0.xmlURL] == nil || (jevFeedCache.decisions[$0.xmlURL]?.needsRefresh(activePassages: active) ?? true) }
         guard !pending.isEmpty, force || Date().timeIntervalSince(lastFeedAttempt) >= 3600 else { return }
         lastFeedAttempt = Date()
         jevFeedsBusy = true
         jevFeedsTask = Task {
-            let changed = await refreshJevFeeds(pending, memories: memories)
+            let changed = await refreshJevFeeds(pending)
             jevFeedsBusy = false
             jevFeedsTask = nil
             if changed && jevEnabled && !Task.isCancelled { await loadReads(force: true) }
         }
     }
     func pauseJevFeedSelection() { jevFeedsTask?.cancel() }
-    private func refreshJevFeeds(_ sources: [SlowClawFeedSource], memories: [JevMemory.Passage]) async -> Bool {
+    private func refreshJevFeeds(_ sources: [SlowClawFeedSource]) async -> Bool {
         let revision = memoryRevision
         var changed = false, unavailable = 0, checked = 0
         do {
@@ -5069,18 +5127,14 @@ extension AppState {
                     guard let items = previews[source.xmlURL], !items.isEmpty else { unavailable += 1; checked += 1; continue }
                     let sample = items.prefix(5).map { String($0.title.prefix(180)) + "\n" + String($0.description.strippingHTML().prefix(400)) }.joined(separator: "\n\n")
                     let profile = "Source: \(source.title) (\(source.domain))\nRecent stories:\n" + sample
-                    var best: JevCloud.Match?
-                    for start in stride(from: 0, to: memories.count, by: 16) {
-                        try checkJevWork()
-                        guard revision == memoryRevision else { throw CancellationError() }
-                        for match in try await JevCloud.shared.reading(profile, memories: Array(memories[start..<min(start + 16, memories.count)])) {
-                            if match.score > (best?.score ?? -1) { best = match }
-                        }
-                    }
+                    let scores = try await topicScores(profile)
                     try checkJevWork()
-                    guard revision == memoryRevision, let best else { throw CancellationError() }
+                    guard revision == memoryRevision else { throw CancellationError() }
+                    var persona = personaCache
+                    persona.content["feed:" + source.xmlURL] = scores
+                    try persona.save(); personaCache = persona
                     var next = jevFeedCache
-                    next.decisions[source.xmlURL] = .init(score: best.score, passageID: best.id, checkedAt: Date())
+                    next.decisions[source.xmlURL] = .init(score: JevPersona.similarity(personaWeights, scores), passageID: JevPersona.version, checkedAt: Date())
                     try next.save(); jevFeedCache = next
                     changed = true; checked += 1
                     jevFeedsStatus = "Choosing sources · \(checked)/\(sources.count) checked"
@@ -5151,10 +5205,11 @@ extension AppState {
         }
         guard jevEnabled, JevCloud.shared.connected, !jevBusy, !readsDecisionBusy, !jevFeedsBusy, !kevJournalBusy else { return }
         let pending = liteJournals.contains { entry in
-            jevCache.records[entry.key]?.fingerprint != JevCloud.fingerprint(entry.content)
+            let fingerprint = JevCloud.fingerprint(entry.content)
+            return jevCache.records[entry.key]?.fingerprint != fingerprint || personaCache.journals[entry.key]?.fingerprint != fingerprint
         }
         if pending { startJevMemory() }
-        else if !jevPassages.isEmpty {
+        else if !personaCache.journals.isEmpty {
             prepareJevDrafts()
             if readsItems.isEmpty { await loadReads() }
         }
@@ -5176,6 +5231,16 @@ extension AppState {
         }
     }
     private func pruneJevMemory() {
+        var persona = personaCache
+        persona.journals = persona.journals.filter { key, record in
+            guard let entry = jevSource(key) else { return false }
+            return record.fingerprint == JevCloud.fingerprint(entry.content)
+        }
+        if persona.journals.count != personaCache.journals.count {
+            personaCache = persona
+            memoryRevision += 1; readsDecisions = [:]; jevReadSources = [:]
+            do { try persona.save() } catch { jevProblem = "Could not save your updated interests." }
+        }
         var next = jevCache
         next.records = next.records.filter { key, record in
             guard let entry = jevSource(key) else { return false }
@@ -5263,9 +5328,19 @@ extension AppState {
                     try checkJevWork()
                     guard let current = jevSource(entry.key), current.content == entry.content else { continue }
                     let fingerprint = JevCloud.fingerprint(entry.content)
-                    if let previous = jevCache.records[entry.key], previous.fingerprint == fingerprint, previous.version == JevMemory.version { continue }
                     let body = journalBodyOf(entry.content)
                     guard Self.hasMeaningfulBody(body) else { continue }
+                    if personaCache.journals[entry.key]?.fingerprint != fingerprint {
+                        jevStatus = "Updating your interests…"
+                        let scores = try await topicScores(body)
+                        try checkJevWork()
+                        guard jevSource(entry.key)?.content == entry.content else { continue }
+                        var persona = personaCache
+                        persona.journals[entry.key] = .init(fingerprint: fingerprint, date: journalDate(entry) ?? Date(), scores: scores)
+                        try persona.save(); personaCache = persona
+                        memoryRevision += 1; readsDecisions = [:]; jevReadSources = [:]
+                    }
+                    if let previous = jevCache.records[entry.key], previous.fingerprint == fingerprint, previous.version == JevMemory.version { continue }
                     jevStatus = "Finding useful passages · \(checked) journals checked"
                     var passages: [JevMemory.Passage] = []
                     for chunk in JevMemory.chunks(body) {
@@ -5293,8 +5368,8 @@ extension AppState {
     }
     private func rankJevReads() async {
         guard jevEnabled, !readsDecisionBusy, !jevBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
-        let memories = jevPassages
-        guard !memories.isEmpty else { readsDecisions = [:]; readsDecisionStatus = "Find useful passages in Personal memory first."; return }
+        let weights = personaWeights
+        guard weights.contains(where: { $0 > 0 }) else { readsDecisions = [:]; readsDecisionStatus = "Record a journal to discover your interests."; return }
         readsDecisionBusy = true
         defer { readsDecisionBusy = false; prepareDailySelection() }
         let revision = memoryRevision
@@ -5304,24 +5379,13 @@ extension AppState {
                 guard revision == memoryRevision else { return }
                 let identity = Self.readsDecisionText(item)
                 if let previous = readsDecisions[item.id], previous.revision == revision, previous.text == identity { continue }
-                readsDecisionStatus = "Comparing incoming stories with your memory…"
+                readsDecisionStatus = "Matching stories to your interests…"
                 let text = item.title + "\n" + item.description.strippingHTML()
-                var best: JevCloud.Match?
-                // Long posts are judged in full, in bounded portions, never just the lead.
-                for portion in JevMemory.chunks(text, maximum: 10000) {
-                    for offset in stride(from: 0, to: memories.count, by: 16) {
-                        try checkJevWork()
-                        guard revision == memoryRevision else { return }
-                        let batch = Array(memories[offset..<min(offset + 16, memories.count)])
-                        for match in try await JevCloud.shared.reading(portion, memories: batch) {
-                            if match.score > (best?.score ?? -1) { best = match }
-                        }
-                    }
-                }
+                let scores = try await topicScores(text)
                 try checkJevWork()
-                guard revision == memoryRevision, let best else { continue }
-                readsDecisions[item.id] = .init(text: identity, score: best.score, revision: revision)
-                jevReadSources[item.id] = memories.first(where: { $0.id == best.id }).map { String($0.text.prefix(110)).trimmingCharacters(in: .whitespacesAndNewlines) }
+                guard revision == memoryRevision else { continue }
+                readsDecisions[item.id] = .init(text: identity, score: JevPersona.similarity(weights, scores), revision: revision)
+                jevReadSources[item.id] = JevPersona.explanation(weights, scores)
             }
             readsDecisionStatus = nil
             jevProblem = nil

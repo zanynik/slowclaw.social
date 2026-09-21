@@ -8,7 +8,7 @@ struct JevSourcesView: View {
         NavigationStack {
             List {
                 Section {
-                    Text("Jev compares recent stories from the catalog with your saved journal passages. Selected sources are refreshed weekly when you use Reads; each incoming item still needs its own strong match.")
+                    Text("Jev matches recent stories to your topic profile. Sources refresh weekly when you use Reads.")
                         .font(.subheadline)
                     Button("Recheck sources now") { state.startJevFeedSelection(force: true) }
                         .disabled(!state.jevEnabled || state.jevFeedsBusy || state.jevBusy || state.readsDecisionBusy || state.kevJournalBusy)
@@ -26,7 +26,7 @@ struct JevSourcesView: View {
                                 Text(source.title)
                                 Text(source.domain).font(.caption).foregroundStyle(.secondary)
                                 if let score = state.jevFeedScore(source) {
-                                    Text("Memory match \(Int(score * 100))% — an estimate").font(.caption2).foregroundStyle(.secondary)
+                                    Text("Topic match \(Int(score * 100))").font(.caption2).foregroundStyle(.secondary)
                                 } else {
                                     Text("Not checked yet, or feed unavailable").font(.caption2).foregroundStyle(.secondary)
                                 }

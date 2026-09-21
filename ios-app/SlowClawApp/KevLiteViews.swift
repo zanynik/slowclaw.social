@@ -24,6 +24,8 @@ struct DraftsView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.colorScheme) var scheme
     @State private var showPosts = false
+    @State private var passageLimit = 10
+    @State private var source: SlowClawMemoryEntry?
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
@@ -43,11 +45,38 @@ struct DraftsView: View {
                             .disabled(state.jevBusy || state.jevFeedsBusy || state.readsDecisionBusy || state.kevJournalBusy)
                     }
                 }
-                if state.kevJournalBusy { ProgressView("Finding ideas…") }
+                if state.kevJournalBusy || state.jevBusy { ProgressView("Jev is finding ideas…") }
+                if let status = state.kevJournalStatus { Text(status).font(.footnote).foregroundStyle(.secondary) }
                 ForEach(state.drafts, id: \.id) { draft in DraftCard(draft: draft, sourceJournalContent: nil) }
+                if state.jevEnabled {
+                    HStack {
+                        Text("From your journals").font(.headline)
+                        Spacer()
+                        Button("Find passages") { state.startJevMemory() }
+                            .disabled(state.jevBusy || state.jevFeedsBusy || state.readsDecisionBusy || state.kevJournalBusy)
+                    }
+                    if state.jevPassages.isEmpty && !state.jevBusy {
+                        Text("Jev-selected passages appear here. Choose one to make a private short post.")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(Array(state.jevPassages.prefix(passageLimit))) { passage in
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text(passage.text)
+                            HStack {
+                                Button("Make draft") { state.makePassageDraft(passage) }.buttonStyle(.bordered)
+                                Spacer()
+                                Button("Source") { source = state.memorySource(passage.sourceKey) }
+                                Button { state.dismissJevPassage(passage.id) } label: { Image(systemName: "xmark") }
+                                    .accessibilityLabel("Dismiss passage")
+                            }
+                        }.padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 16))
+                    }
+                    if state.jevPassages.count > passageLimit { Button("More passages") { passageLimit += 10 } }
+                }
             }.padding(20)
         }.background(DS.bg(scheme))
             .sheet(isPresented: $showPosts) { NostrPostsView() }
+            .sheet(item: $source) { JournalDetailView(entry: $0).environmentObject(state) }
             .refreshable { await state.refreshDraftIdeas() }
     }
 }
@@ -60,7 +89,7 @@ struct ProfileView: View {
         NavigationStack {
             Form {
                 Section {
-                    Button { showMemory = true } label: { Label("Memory", systemImage: "brain") }
+                    Button { showMemory = true } label: { Label("Your interests", systemImage: "chart.bar") }
                     NavigationLink { JevPrivacyView() } label: { Label("Privacy & connection", systemImage: "lock") }
                     Picker("Appearance", selection: $theme) {
                         Text("System").tag("")

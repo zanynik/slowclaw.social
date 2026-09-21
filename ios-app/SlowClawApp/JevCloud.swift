@@ -57,6 +57,20 @@ final class JevCloud {
         return answer
     }
     struct Match: Decodable { let id: String; let score: Double }
+    private struct TopicBatch: Decodable { let version: String; let offset: Int; let scores: [Double] }
+    func topics(_ text: String) async throws -> [Double] {
+        var scores: [Double] = []
+        for offset in stride(from: 0, to: JevPersona.topics.count, by: 32) {
+            let batch: TopicBatch = try await request("topics", body: ["text": text, "version": JevPersona.version, "offset": offset])
+            guard batch.version == JevPersona.version, batch.offset == offset,
+                  batch.scores.count == min(32, JevPersona.topics.count - offset),
+                  batch.scores.allSatisfy({ $0.isFinite && (0...1).contains($0) }) else {
+                throw Failure(message: "Jev returned invalid topic scores.")
+            }
+            scores += batch.scores
+        }
+        return scores
+    }
     func reading(_ text: String, memories: [JevMemory.Passage]) async throws -> [Match] {
         struct Result: Decodable { let matches: [Match]; let version: String }
         let result: Result = try await request("reading", body: ["text": text, "memories": memories.map { ["id": $0.id, "text": $0.text] }])
