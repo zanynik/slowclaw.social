@@ -117,9 +117,16 @@ async function request(token, method, path, body) {
     Date.parse(right.profile.attributes?.createdDate || 0) -
     Date.parse(left.profile.attributes?.createdDate || 0)
   );
+  const retentionMinutes = Number(process.env.SIGNING_RETENTION_MINUTES || "30");
+  if (!Number.isFinite(retentionMinutes) || retentionMinutes < 0) {
+    throw new Error("SIGNING_RETENTION_MINUTES must be a non-negative number.");
+  }
+  const retentionMs = retentionMinutes * 60 * 1000;
   for (const [index, owned] of ownedProfiles.entries()) {
-    if (index === 0) {
-      console.log("Retaining the newest prior SlowClaw CI signing assets during Apple processing.");
+    const createdAt = Date.parse(owned.profile.attributes?.createdDate || "");
+    const insideGracePeriod = Number.isFinite(createdAt) && Date.now() - createdAt < retentionMs;
+    if (index === 0 && (!Number.isFinite(createdAt) || insideGracePeriod)) {
+      console.log(`Retaining the newest prior SlowClaw CI signing assets for the ${retentionMinutes}-minute Apple processing grace period.`);
       continue;
     }
     for (const certificate of owned.certificates) {
@@ -128,6 +135,7 @@ async function request(token, method, path, body) {
       }
     }
     await request(token, "DELETE", `/v1/profiles/${owned.profile.id}`);
+    console.log("Released an expired SlowClaw CI signing certificate and profile.");
   }
 
   const csrContent = fs.readFileSync(process.env.CERT_CSR_PATH, "utf8");
