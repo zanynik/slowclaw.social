@@ -4601,6 +4601,14 @@ struct FeedCard: View {
     private var liked: Bool { state.readingSignals[item.id]?.preference == 1 }
     private var disliked: Bool { state.readingSignals[item.id]?.preference == -1 }
 
+    private var thumbnailURL: URL? {
+        guard let raw = item.thumbnailURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let url = URL(string: raw.decodingHTMLEntities(), relativeTo: URL(string: item.link))?.absoluteURL,
+              let scheme = url.scheme?.lowercased(),
+              ["https", "http"].contains(scheme), url.host != nil else { return nil }
+        return raw.isEmpty ? nil : url
+    }
+
     private var host: String {
         guard let url = URL(string: item.link), let h = url.host else {
             return item.sourceLabel
@@ -4610,6 +4618,19 @@ struct FeedCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if let thumbnailURL {
+                AsyncImage(url: thumbnailURL) { phase in
+                    if let image = phase.image {
+                        Color.clear
+                            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                            .overlay {
+                                image.resizable().scaledToFill()
+                            }
+                            .clipped()
+                    }
+                }
+                .accessibilityHidden(true)
+            }
             VStack(alignment: .leading, spacing: 6) {
                 // Source row: accent-green uppercase host + read time / video badge.
                 HStack(spacing: 8) {
