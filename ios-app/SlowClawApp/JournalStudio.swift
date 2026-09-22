@@ -118,6 +118,7 @@ struct PublishDraftSheet: View {
     let draftKey: String
     let content: String
     let article: Bool
+    var contentHasTitle = false
     @Environment(\.dismiss) private var dismiss
     @StateObject private var publisher = NostrPublisher.shared
     @State private var identity: String?
@@ -173,8 +174,8 @@ struct PublishDraftSheet: View {
                         Task {
                             do {
                                 _ = try await publisher.publish(draftKey: draftKey,
-                                    content: article ? journalBodyOf(content) : content,
-                                    title: content.components(separatedBy: "\n").first ?? "Reflection",
+                                    content: article && contentHasTitle ? journalBodyOf(content) : content,
+                                    title: String((content.components(separatedBy: "\n").first ?? "Reflection").prefix(120)),
                                     article: article)
                                 published = true
                             } catch { self.error = error.localizedDescription }

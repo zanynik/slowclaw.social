@@ -22,62 +22,62 @@ struct WelcomeView: View {
 
 struct DraftsView: View {
     @EnvironmentObject var state: AppState
-    @Environment(\.colorScheme) var scheme
-    @State private var showPosts = false
-    @State private var passageLimit = 10
+    @State private var inbox: DraftInboxState = .new
     @State private var source: SlowClawMemoryEntry?
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    Text("Create").font(DS.titleFont)
-                    Spacer()
-                    Button { showPosts = true } label: { Image(systemName: "paperplane") }
-                        .accessibilityLabel("Published posts")
+        NavigationStack {
+            List {
+                Section {
+                    Picker("Draft inbox", selection: $inbox) {
+                        ForEach(DraftInboxState.allCases) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.segmented)
                 }
-                if state.drafts.isEmpty {
-                    ContentUnavailableView("Your words, ready to share", systemImage: "text.quote",
-                        description: Text("Ideas from your journals become private drafts here."))
-                    if state.liteJournals.isEmpty {
-                        Button("Record a journal") { state.selectedTab = .journal }.buttonStyle(.borderedProminent)
-                    } else {
-                        Button("Find ideas") { Task { await state.refreshDraftIdeas() } }.buttonStyle(.borderedProminent)
-                            .disabled(state.jevBusy || state.jevFeedsBusy || state.readsDecisionBusy || state.kevJournalBusy)
+                if inbox == .new && state.jevEnabled {
+                    Section("Ideas worth sharing") {
+                        if state.jevBusy { ProgressView("Finding ideas…") }
+                        ForEach(Array(state.sharingIdeas.prefix(5))) { passage in
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack {
+                                    Text("Your words").font(.caption).foregroundStyle(.secondary)
+                                    Spacer()
+                                    CopyTextButton(text: passage.text)
+                                }
+                                Text(passage.text).textSelection(.enabled)
+                                HStack {
+                                    Button("Make draft") { state.makePassageDraft(passage) }
+                                    Spacer()
+                                    Button("Source") { source = state.memorySource(passage.sourceKey) }
+                                }.font(.caption).buttonStyle(.borderless)
+                            }.padding(.vertical, 8)
+                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                    Button("Dismiss") { state.dismissJevPassage(passage.id) }.tint(.orange)
+                                }
+                        }
+                        if state.sharingIdeas.isEmpty && !state.jevBusy {
+                            Text("Journal first. Thoughts that may help someone else will appear here.").foregroundStyle(.secondary)
+                        }
                     }
                 }
-                if state.kevJournalBusy || state.jevBusy { ProgressView("Jev is finding ideas…") }
-                if let status = state.kevJournalStatus { Text(status).font(.footnote).foregroundStyle(.secondary) }
-                ForEach(state.drafts, id: \.id) { draft in DraftCard(draft: draft, sourceJournalContent: nil) }
-                if state.jevEnabled {
-                    HStack {
-                        Text("From your journals").font(.headline)
-                        Spacer()
-                        Button("Find passages") { state.startJevMemory() }
-                            .disabled(state.jevBusy || state.jevFeedsBusy || state.readsDecisionBusy || state.kevJournalBusy)
-                    }
-                    if state.jevPassages.isEmpty && !state.jevBusy {
-                        Text("Jev-selected passages appear here. Choose one to make a private short post.")
+                Section(inbox.rawValue) {
+                    let items = state.drafts.filter { state.draftState($0) == inbox }
+                    ForEach(items, id: \.id) { DraftCard(draft: $0, sourceJournalContent: nil) }
+                    if items.isEmpty {
+                        Text(inbox == .new ? "Choose an idea to start a draft." : "No \(inbox.rawValue.lowercased()) drafts yet.")
                             .foregroundStyle(.secondary)
                     }
-                    ForEach(Array(state.jevPassages.prefix(passageLimit))) { passage in
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text(passage.text)
-                            HStack {
-                                Button("Make draft") { state.makePassageDraft(passage) }.buttonStyle(.bordered)
-                                Spacer()
-                                Button("Source") { source = state.memorySource(passage.sourceKey) }
-                                Button { state.dismissJevPassage(passage.id) } label: { Image(systemName: "xmark") }
-                                    .accessibilityLabel("Dismiss passage")
-                            }
-                        }.padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 16))
-                    }
-                    if state.jevPassages.count > passageLimit { Button("More passages") { passageLimit += 10 } }
                 }
-            }.padding(20)
-        }.background(DS.bg(scheme))
-            .sheet(isPresented: $showPosts) { NostrPostsView() }
+                if let status = state.kevJournalStatus {
+                    Section { Text(status).font(.caption).foregroundStyle(.secondary) }
+                }
+            }
+            .navigationTitle("Create")
             .sheet(item: $source) { JournalDetailView(entry: $0).environmentObject(state) }
             .refreshable { await state.refreshDraftIdeas() }
+            .toolbar {
+                Button("Find ideas", systemImage: "arrow.clockwise") { state.startJevMemory() }
+                    .disabled(state.jevBusy || state.jevFeedsBusy || state.readsDecisionBusy || state.kevJournalBusy)
+            }
+        }
     }
 }
 
@@ -88,8 +88,24 @@ struct ProfileView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("What's on your mind") {
+                    let topics = Array(state.personaTopics.prefix(8))
+                    let trends = state.personaTrends
+                    if topics.isEmpty { Text("Start with a journal.").foregroundStyle(.secondary) }
+                    ForEach(topics, id: \.name) { topic in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text(topic.name)
+                                Spacer()
+                                Text(topic.weight, format: .percent.precision(.fractionLength(1)))
+                                Text(trends[topic.name] ?? "–")
+                            }.font(.subheadline)
+                            ProgressView(value: topic.weight / max(topics.first?.weight ?? 1, 0.001))
+                        }.padding(.vertical, 4)
+                    }
+                    Button("All interests") { showMemory = true }
+                }
                 Section {
-                    Button { showMemory = true } label: { Label("Your interests", systemImage: "chart.bar") }
                     NavigationLink { JevPrivacyView() } label: { Label("Privacy & connection", systemImage: "lock") }
                     Picker("Appearance", selection: $theme) {
                         Text("System").tag("")
@@ -98,7 +114,7 @@ struct ProfileView: View {
                     }
                     NavigationLink { AdvancedSettingsView() } label: { Label("Advanced", systemImage: "slider.horizontal.3") }
                 }
-            }.navigationTitle("Settings")
+            }.navigationTitle("Profile")
                 .sheet(isPresented: $showMemory) { PersonalMemoryView().environmentObject(state) }
         }
     }

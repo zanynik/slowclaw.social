@@ -8,6 +8,7 @@ struct WeeklyReflectionCard: View {
                 HStack {
                     Text("A reflection for this week").font(.headline)
                     Spacer()
+                    CopyTextButton(text: weekly.reflection.observation + "\n\n" + weekly.reflection.question)
                     Button { state.dismissWeeklyReflection() } label: { Image(systemName: "xmark") }
                         .accessibilityLabel("Dismiss this reflection")
                 }

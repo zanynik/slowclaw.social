@@ -12,6 +12,7 @@ struct PersonalMemoryView: View {
     @State private var source: SlowClawMemoryEntry?
     var body: some View {
         let topics = state.personaTopics
+        let trends = state.personaTrends
         NavigationStack {
             List {
                 if state.jevBusy { ProgressView(state.jevStatus ?? "Updating your interests…") }
@@ -25,12 +26,14 @@ struct PersonalMemoryView: View {
                                     Text(topic.name)
                                     Spacer()
                                     Text(topic.weight, format: .percent.precision(.fractionLength(1))).foregroundStyle(.secondary)
+                                    Text(trends[topic.name] ?? "–")
+                                        .accessibilityLabel(trends[topic.name] == "↑" ? "Rising this week" : trends[topic.name] == "↓" ? "Falling this week" : trends[topic.name] == "→" ? "Stable this week" : "Not enough history")
                                 }
                                 ProgressView(value: topic.weight / max(topics.first?.weight ?? 1, 0.001))
                             }
                         }
                     } footer: {
-                        Text("Your share of interest across 224 topics, built from journals. Recent journals count more. These weights rank Reads; they are not personality facts.")
+                        Text("Share of attention across 224 topics, not personality facts. Arrows compare the last seven days with the previous seven; a dash means there is not enough history. Changes within one percentage point count as stable.")
                     }
                 }
                 Button("Update interests") { state.startJevMemory() }.disabled(state.jevBusy)

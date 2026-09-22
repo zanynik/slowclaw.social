@@ -18,6 +18,7 @@ import UIKit
 import AVFoundation
 import BackgroundTasks
 import ImageIO
+import UniformTypeIdentifiers
 
 // MARK: - Design System (from the original app's styles.css, with dark mode)
 
@@ -489,6 +490,12 @@ final class AppState: ObservableObject {
     /// Discovery candidates stay cached, but the default reading surface must
     /// have a strong connection to a currently included journal.
     var relevantReads: [RankedFeedItem] {
+        relevantFeedItems.filter { $0.sourceLabel != "Nostr posts" }
+    }
+    var relevantPulse: [RankedFeedItem] {
+        relevantFeedItems.filter { $0.sourceLabel == "Nostr posts" }
+    }
+    private var relevantFeedItems: [RankedFeedItem] {
         guard jevEnabled || readsModelEnabled else { return [] }
         return readsItems.filter { item in
             readingSignals[item.id]?.preference != -1 && ReadsRelevance.accepts(
@@ -672,14 +679,34 @@ final class AppState: ObservableObject {
         return "Relevance \(Int(detail.relevance * 100)) · \(detail.topic) · \(detail.priority) priority"
     }
     @Published var readingSignals = ReadingHistory.load()
+    @Published var readingVisits = ReadingVisit.load()
+    @Published var readingHistoryError: String?
+    @Published var draftInboxStates = DraftInbox.load()
+    @Published var ideaCache = JevIdeas.Cache.load()
+    var sharingIdeas: [JevMemory.Passage] {
+        JevIdeas.select(jevPassages, decisions: ideaCache.decisions)
+    }
+    func draftState(_ draft: SlowClawMemoryEntry) -> DraftInboxState {
+        DraftInbox.state(for: draft.key, states: draftInboxStates,
+            confirmed: UserDefaults.standard.string(forKey: "slowclaw.nostr.receipt." + draft.key) != nil)
+    }
+    func moveDraft(_ key: String, to destination: DraftInboxState) {
+        guard destination != .published else { return }
+        draftInboxStates[key] = destination.rawValue
+        UserDefaults.standard.set(draftInboxStates, forKey: DraftInbox.key)
+    }
+    func publicationDidFinish() { objectWillChange.send() }
     private var readingCandidate: RankedFeedItem?
     private var readingStarted: Date?
     private var readingSeconds: TimeInterval = 0
+    private var readingRecordedSeconds: TimeInterval = 0
 
     func openArticle(_ item: RankedFeedItem) {
-        guard let url = URL(string: item.link) else { return }
+        guard let url = URL(string: item.link), ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else { return }
+        finishReading()
         readingCandidate = item
         readingSeconds = 0
+        readingRecordedSeconds = 0
         readingStarted = Date()
         openWebLink(url)
     }
@@ -690,20 +717,40 @@ final class AppState: ObservableObject {
             description: article.excerpt, sourceLabel: article.source, score: 0, readMinutes: 1,
             sourcePlatform: "web", thumbnailURL: nil)
         readingSeconds = 0
+        readingRecordedSeconds = 0
         readingStarted = Date()
     }
 
     func readingActivityChanged(active: Bool) {
-        if let started = readingStarted { readingSeconds += Date().timeIntervalSince(started) }
+        if let started = readingStarted { readingSeconds += max(0, Date().timeIntervalSince(started)) }
         readingStarted = active && readingCandidate != nil ? Date() : nil
+        if !active { recordReadingProgress() }
     }
 
     func finishReading() {
         readingActivityChanged(active: false)
-        if let item = readingCandidate, readingSeconds >= 20, readingSignals[item.id] == nil {
-            rememberArticle(item, preference: 0)
-        }
         readingCandidate = nil
+        readingSeconds = 0
+        readingRecordedSeconds = 0
+    }
+
+    private func recordReadingProgress() {
+        if let item = readingCandidate, readingSeconds >= ReadingVisit.minimumSeconds {
+            if readingSignals[item.id] == nil { rememberArticle(item, preference: 0) }
+            // Pulse is a separate, lightweight mode, not reading history.
+            if item.sourceLabel != "Nostr posts", readingSeconds > readingRecordedSeconds {
+                var next = readingVisits
+                let previous = next[item.link]?.seconds ?? 0
+                next[item.link] = ReadingVisit(url: item.link, title: item.title, source: item.sourceLabel,
+                    date: Date(), seconds: previous + readingSeconds - readingRecordedSeconds)
+                next = Dictionary(uniqueKeysWithValues: next.sorted { $0.value.date > $1.value.date }.prefix(200).map { ($0.key, $0.value) })
+                do {
+                    try ReadingVisit.save(next); readingVisits = next; readingHistoryError = nil
+                    readingRecordedSeconds = readingSeconds
+                }
+                catch { readingHistoryError = "Could not save reading history on this device." }
+            }
+        }
     }
 
     func rememberArticle(_ item: RankedFeedItem, preference: Int) {
@@ -717,6 +764,9 @@ final class AppState: ObservableObject {
     }
 
     func clearReadingHistory() {
+        do { try ReadingVisit.save([:]); readingVisits = [:]; readingHistoryError = nil }
+        catch { readingHistoryError = "Could not clear history. Please try again."; return }
+        readingCandidate = nil; readingStarted = nil; readingSeconds = 0; readingRecordedSeconds = 0
         readingSignals = [:]
         ReadingHistory.save(readingSignals)
         rebuildInterestLens()
@@ -1102,10 +1152,13 @@ final class AppState: ObservableObject {
         }
     }
 
+    private var journalRefreshGeneration = 0
     func refreshJournals() async {
+        journalRefreshGeneration += 1
+        let generation = journalRefreshGeneration
         let previousReadsSources = journals.map { $0.key + "\n" + $0.content }
         defer {
-            if previousReadsSources != journals.map({ $0.key + "\n" + $0.content }) {
+            if generation == journalRefreshGeneration, previousReadsSources != journals.map({ $0.key + "\n" + $0.content }) {
                 memoryRevision += 1
                 readsDecisions = [:]
                 kevReadDetails = [:]
@@ -1113,12 +1166,17 @@ final class AppState: ObservableObject {
             }
         }
         do {
-            // Journals: all entries EXCEPT drafts (sessionID="drafts") and
-            // soft-deleted keys. Drafts (TweetClaw-generated posts) belong in
-            // the Drafts tab only; soft-deleted entries sit in Recently Deleted
-            // for 30 days. recall doesn't support an exclude-session filter, so
-            // fetch a wider set and drop both client-side. Order newest-first.
-            let all = try memory.recall(query: "the a an of to and", limit: 60)
+            // Enumerate actual journal records, not a search for English stop
+            // words: imported notes in any language must remain discoverable.
+            var all: [SlowClawMemoryEntry] = []
+            var cursor: Int64 = 0
+            repeat {
+                let page = try await JournalArchive.shared.page(before: cursor)
+                guard generation == journalRefreshGeneration else { return }
+                all += page.entries
+                guard page.next != cursor else { break }
+                cursor = page.next
+            } while cursor != 0
             let deletedKeys = Set(Self.softDeletedKeys().keys)
             journals = all.filter {
                 QuestionThread.isJournalRecord(key: $0.key, category: $0.category, sessionID: $0.sessionID)
@@ -1133,6 +1191,7 @@ final class AppState: ObservableObject {
             for (offset, key) in Array(journalInterestRecords.keys).enumerated() {
                 if offset % 8 == 0 {
                     await Task.yield()
+                    guard generation == journalRefreshGeneration else { return }
                     currentDeleted = Set(Self.softDeletedKeys().keys)
                 }
                 guard let record = journalInterestRecords[key] else { continue }
@@ -2294,9 +2353,9 @@ final class AppState: ObservableObject {
 // MARK: - Tab enum
 
 enum AppTab: String, CaseIterable {
-    case journal, reads, drafts, profile
+    case journal, reads, drafts, pulse, profile
 
-    var label: String { self == .drafts ? "Create" : self == .profile ? "Settings" : rawValue.capitalized }
+    var label: String { self == .drafts ? "Create" : rawValue.capitalized }
     /// Line-style SF Symbol matching the reference SVG icons in BottomNav.tsx.
     var icon: String {
         switch self {
@@ -2304,6 +2363,7 @@ enum AppTab: String, CaseIterable {
         case .journal: return "square.and.pencil" // capture/compose
         case .drafts: return "sparkles"           // AI-distilled drafts
         case .profile: return "person.crop.circle"
+        case .pulse: return "bubble.left.and.bubble.right"
         }
     }
 }
@@ -2347,6 +2407,12 @@ struct AppShell: View {
                     .opacity(state.selectedTab == .profile ? 1 : 0)
                     .allowsHitTesting(state.selectedTab == .profile)
                     .accessibilityHidden(state.selectedTab != .profile)
+            }
+            if visitedTabs.contains(.pulse) {
+                PulseView()
+                    .opacity(state.selectedTab == .pulse ? 1 : 0)
+                    .allowsHitTesting(state.selectedTab == .pulse)
+                    .accessibilityHidden(state.selectedTab != .pulse)
             }
         }
         .onAppear { visitedTabs.insert(state.selectedTab) }
@@ -2601,6 +2667,7 @@ struct JournalDetailView: View {
     @State private var showRetranscribeFailedAlert = false
     @State private var showSaveErrorAlert = false
     @State private var showDeleteConfirmation = false
+    @State private var showOriginalTranscript = false
     /// Last successfully persisted title/body — the baseline the combined
     /// save compares against and updates after each successful store, so a
     /// no-change open→back (or a repeated back) can never overwrite content
@@ -2712,6 +2779,7 @@ struct JournalDetailView: View {
                                     .foregroundStyle(DS.muted(scheme))
                                     .textCase(.uppercase)
                                 Spacer()
+                                CopyTextButton(text: TranscriptCleanup.clean(editedBody))
                                 if hasAudioFile {
                                     Button {
                                         Task { await retranscribe() }
@@ -2733,6 +2801,15 @@ struct JournalDetailView: View {
                                     .disabled(isRetranscribing)
                                 }
                             }
+                            if !showOriginalTranscript {
+                                Text(TranscriptCleanup.clean(editedBody))
+                                    .font(DS.bodyFont).textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            Button(showOriginalTranscript ? "Show clean text" : "Original / edit") {
+                                showOriginalTranscript.toggle()
+                            }.font(.caption)
+                            if showOriginalTranscript {
                             TextEditor(text: $editedBody)
                                 .frame(minHeight: 180)
                                 .scrollContentBackground(.hidden)
@@ -2744,6 +2821,7 @@ struct JournalDetailView: View {
                                 // editor on success instead).
                                 .disabled(isRetranscribing)
                                 .onChange(of: editedBody) { scheduleBodyAutosave() }
+                            }
                             if let status = state.lastTranscriptionStatus {
                                 Text(status)
                                     .font(DS.microFont)
@@ -3136,6 +3214,12 @@ struct TextComposeSheet: View {
                     .padding(.horizontal, 4)
 
                 DS.card(scheme) {
+                    VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Text").font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        CopyTextButton(text: bodyText)
+                    }
                     TextEditor(text: $bodyText)
                         .frame(minHeight: 240)
                         .scrollContentBackground(.hidden)
@@ -3150,6 +3234,7 @@ struct TextComposeSheet: View {
                                     .allowsHitTesting(false)
                             }
                         }
+                    }
                 }
                 Spacer()
             }
@@ -3203,6 +3288,9 @@ struct JournalView: View {
     @State private var sortOrder: JournalSort = .newestFirst
     @State private var selectedDetail: SlowClawMemoryEntry?
     @State private var showCompose = false
+    @State private var showTextImport = false
+    @State private var textImportStatus: String?
+    @State private var importingText = false
     @State private var showContext = false
     @State private var isSavingRecording = false
     @State private var recordingSaveFailed = false
@@ -3346,6 +3434,47 @@ struct JournalView: View {
                 .environmentObject(state)
         }
         .sheet(isPresented: $showContext) { PersonalMemoryView().environmentObject(state) }
+        .fileImporter(isPresented: $showTextImport, allowedContentTypes: [.plainText], allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls): Task { await importTexts(urls) }
+            case .failure: textImportStatus = "Could not open these files. Please try again."
+            }
+        }
+    }
+
+    @MainActor
+    private func importTexts(_ urls: [URL]) async {
+        guard !importingText else { return }
+        guard urls.count <= JournalTextImport.maximumFiles else {
+            textImportStatus = "Choose up to 100 text files at a time."; return
+        }
+        importingText = true
+        defer { importingText = false }
+        var added = 0, duplicates = 0, failed = 0
+        for (index, url) in urls.enumerated() {
+            textImportStatus = "Importing \(index + 1) of \(urls.count)…"
+            let text = await Task.detached(priority: .utility) { () -> String? in
+                let access = url.startAccessingSecurityScopedResource()
+                defer { if access { url.stopAccessingSecurityScopedResource() } }
+                guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+                defer { try? handle.close() }
+                guard let data = try? handle.read(upToCount: JournalTextImport.maximumBytes + 1) else { return nil }
+                return JournalTextImport.decode(data)
+            }.value
+            guard let text else { failed += 1; continue }
+            // Deterministic keys make retry/importing the same file idempotent.
+            let key = "journal_import_" + JevCloud.fingerprint(text)
+            do {
+                if try state.memory.get(key: key) != nil { duplicates += 1; continue }
+                let title = url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "\n", with: " ")
+                try state.memory.store(key: key, content: title + "\n\n" + text,
+                    category: "daily", sessionID: nil, source: "text_import", mediaURL: nil)
+                added += 1
+            } catch { failed += 1 }
+            await Task.yield()
+        }
+        await state.refreshJournals()
+        textImportStatus = "\(added) imported · \(duplicates) already present · \(failed) could not be imported"
     }
 
     /// Auto-save a finished recording as a journal immediately (Voice Memos).
@@ -3443,6 +3572,7 @@ struct JournalView: View {
                     } else {
                         Menu {
                             Button("Your interests") { showContext = true }
+                            Button("Import text files") { showTextImport = true }.disabled(importingText)
                             sortMenu
                             Button("Select recordings") { isSelectingAudio = true }
                                 .disabled(selectableAudioKeys.isEmpty)
@@ -3479,6 +3609,7 @@ struct JournalView: View {
                 .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
                 .padding(.horizontal, 16)
 
+                if let textImportStatus { Text(textImportStatus).font(.caption).padding(.horizontal, 16) }
                 if let status = voiceMemoImporter.status {
                     HStack(spacing: 6) {
                         if voiceMemoImporter.isImporting {
@@ -3882,6 +4013,7 @@ struct ReadsView: View {
     @State private var linkText = ""
     @State private var showLink = false
     @State private var showSources = false
+    @State private var showHistory = false
     @State private var addingLink = false
     private var items: [RankedFeedItem] { state.relevantReads }
     private var busy: Bool { state.jevBusy || state.jevFeedsBusy || state.readsDecisionBusy || state.readsLoading || state.jevConnecting }
@@ -3893,6 +4025,7 @@ struct ReadsView: View {
                     Spacer()
                     Menu {
                         Button("Sources") { showSources = true }
+                        Button("History") { showHistory = true }
                         Button("Add a link") { showLink = true }
                         Button("Refresh") { Task { await state.loadReads(force: true) } }
                     } label: { Image(systemName: "ellipsis.circle").font(.title3) }
@@ -3927,6 +4060,7 @@ struct ReadsView: View {
             }.padding(20)
         }.background(DS.bg(scheme))
             .sheet(isPresented: $showSources) { JevSourcesView().environmentObject(state) }
+            .sheet(isPresented: $showHistory) { ReadingHistoryView().environmentObject(state) }
             .refreshable { await state.loadReads(force: true) }
             .alert("Add a link", isPresented: $showLink) {
                 TextField("https://…", text: $linkText).textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -3951,170 +4085,104 @@ struct DraftCard: View {
     @Environment(\.colorScheme) var scheme
     @EnvironmentObject var state: AppState
     let draft: SlowClawMemoryEntry
-    let sourceJournalContent: String? // the journal this was drafted from (for regenerate)
-
-    @State private var editedText = ""
-    @State private var isEditing = false
-    @State private var expanded = false
-    @State private var isRegenerating = false
-    @State private var showCopyAlert = false
+    let sourceJournalContent: String?
+    @State private var editedText: String
     @State private var showPublish = false
+    @State private var publishAsArticle = false
     @State private var sourceEntry: SlowClawMemoryEntry?
     @State private var saveError: String?
 
-    private var isArticle: Bool { draft.source == "blogclaw" }
-    private var maxChars: Int { isArticle ? 60_000 : 300 }
-
-    var charCount: Int { editedText.count }
-    var charCountColor: Color {
-        if charCount > maxChars { return .red }
-        if charCount > maxChars - 50 { return .orange }
-        return DS.muted(scheme)
+    init(draft: SlowClawMemoryEntry, sourceJournalContent: String?) {
+        self.draft = draft
+        self.sourceJournalContent = sourceJournalContent
+        _editedText = State(initialValue: draft.content)
+        _publishAsArticle = State(initialValue: draft.source == "blogclaw")
     }
-
+    private var published: Bool {
+        UserDefaults.standard.string(forKey: "slowclaw.nostr.receipt." + draft.key) != nil
+    }
     var body: some View {
-        DS.card(scheme) {
-            VStack(alignment: .leading, spacing: 10) {
-                // TweetClaw byline (🐾 avatar + handle), like the reference.
-                HStack(spacing: 8) {
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text(isArticle ? "Article" : "Short post")
-                            .font(DS.captionFont.weight(.semibold))
-                            .foregroundStyle(DS.ink(scheme))
-                        Text("Private draft")
-                            .font(DS.microFont)
-                            .foregroundStyle(DS.muted(scheme))
-                    }
-                    Spacer()
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(published ? "Published" : "Private draft").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                CopyTextButton(text: editedText)
+            }
+            if published {
+                Text(editedText).textSelection(.enabled)
+            } else {
+                TextField("Your thought…", text: $editedText, axis: .vertical)
+                    .font(DS.bodyFont).lineLimit(3...16)
+                    .accessibilityLabel("Draft text")
+                    .onChange(of: editedText) { _, _ in _ = saveDraft() }
+            }
+            DraftEvidenceView(draftKey: draft.key)
+            if let source = draft.source,
+               source.hasPrefix("kev:") || source.hasPrefix("automatic:") {
+                Button("Source journal") {
+                    let prefix = source.hasPrefix("kev:") ? "kev:" : "automatic:"
+                    sourceEntry = state.memorySource(String(source.dropFirst(prefix.count)))
+                }.font(.caption)
+            }
+            HStack {
+                Text("\(editedText.count) characters").font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                if !published {
+                    Button("Review & publish") { review(article: draft.source == "blogclaw") }
+                        .buttonStyle(.bordered)
+                        .disabled(editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-
-                // Editable text or display text
-                DraftEvidenceView(draftKey: draft.key)
-                if isEditing {
-                    TextEditor(text: $editedText)
-                        .font(DS.bodyFont)
-                        .frame(minHeight: 80)
-                        .scrollContentBackground(.hidden)
-                        .padding(8)
-                        .background(DS.surface2(scheme), in: RoundedRectangle(cornerRadius: 8))
-                } else {
-                    Text(editedText.isEmpty ? draft.content : editedText)
-                        .font(DS.bodyFont)
-                        .foregroundStyle(DS.ink(scheme))
-                        .lineLimit(expanded ? nil : 6)
-                    if (editedText.isEmpty ? draft.content : editedText).count > 240 {
-                        Button(expanded ? "Show less" : "Read full draft") { expanded.toggle() }
-                            .font(DS.captionFont)
-                    }
-                }
-
-                // Toolbar
-                if let source = draft.source, source.hasPrefix("kev:") {
-                    Button("Source journal") { sourceEntry = state.memorySource(String(source.dropFirst(4))) }
-                        .font(DS.captionFont)
-                }
-                if let source = draft.source, source.hasPrefix("automatic:") {
-                    Button("Source journal") { sourceEntry = state.memorySource(String(source.dropFirst("automatic:".count))) }
-                        .font(DS.captionFont)
-                }
-                HStack(spacing: 8) {
-                    // Character count
-                    Text(isArticle ? "\(editedText.split { $0.isWhitespace }.count) words" : "\(charCount) characters")
-                        .font(DS.microFont.monospacedDigit())
-                        .foregroundStyle(charCountColor)
-
-                    Spacer()
-
-                    // Edit / Done toggle
-                    Button {
-                        if isEditing {
-                            editedText = editedText.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard saveDraft() else { return }
-                        }
-                        isEditing.toggle()
-                    } label: {
-                        Image(systemName: isEditing ? "checkmark.circle.fill" : "pencil")
-                            .font(.system(size: 16))
-                            .foregroundStyle(DS.accent(scheme))
-                    }
-
-                    Menu {
-                    // Regenerate (if we have the source journal)
-                    if sourceJournalContent != nil && state.anyLLMAvailable {
-                        Button {
-                            Task { await regenerate() }
-                        } label: {
-                            Label("Regenerate", systemImage: "arrow.clockwise")
-                        }
-                        .disabled(isRegenerating)
-                    }
-
-                    // Copy
-                    Button {
-                        UIPasteboard.general.string = editedText.isEmpty ? draft.content : editedText
-                        showCopyAlert = true
-                    } label: {
-                        Label("Copy text", systemImage: "doc.on.doc")
-                    }
-
-                    // Delete
-                    Button(role: .destructive) {
-                        try? state.memory.forget(key: draft.key)
-                        Task { await state.refreshJournals() }
-                    } label: {
-                        Label("Delete draft", systemImage: "trash")
-                    }
-                    ShareLink(item: editedText) { Label("Export draft", systemImage: "square.and.arrow.up") }
-                    } label: {
-                        Image(systemName: "ellipsis").frame(minWidth: 44, minHeight: 44)
-                    }.accessibilityLabel("More draft actions")
-                }
-                if let saveError { Text(saveError).font(.caption).foregroundStyle(.red) }
-                HStack {
-                    Button {
-                        guard saveDraft() else { return }
-                        isEditing = false
-                        showPublish = true
-                    } label: {
-                        Label("Review & publish", systemImage: "paperplane")
-                            .frame(maxWidth: .infinity)
-                    }.buttonStyle(.borderedProminent).tint(DS.accent(scheme))
-                }
+                Menu {
+                    Button("Keep") { state.moveDraft(draft.key, to: .kept) }
+                    Button("Archive") { state.moveDraft(draft.key, to: .archived) }
+                    Button("Move to New") { state.moveDraft(draft.key, to: .new) }
+                    ShareLink(item: editedText) { Label("Share", systemImage: "square.and.arrow.up") }
+                } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44) }
+                    .accessibilityLabel("Draft actions")
+            }
+            if let saveError {
+                Text(saveError).font(.caption).foregroundStyle(.red)
+                Button("Retry save") { _ = saveDraft() }
             }
         }
-        .sheet(isPresented: $showPublish) {
-            PublishDraftSheet(draftKey: draft.key, content: editedText, article: isArticle)
+        .padding(.vertical, 8)
+        .contextMenu {
+            Button("Copy", systemImage: "doc.on.doc") { UIPasteboard.general.string = editedText }
+            ShareLink(item: editedText) { Label("Share", systemImage: "square.and.arrow.up") }
+            if !published {
+                Button("Nostr post") { review(article: false) }
+                Button("Blog · Nostr article") { review(article: true) }
+            }
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button { state.moveDraft(draft.key, to: .archived) } label: { Label("Discard", systemImage: "archivebox") }
+                .tint(.orange)
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+            Button { state.moveDraft(draft.key, to: .kept) } label: { Label("Keep", systemImage: "bookmark") }
+                .tint(DS.accentColor)
+        }
+        .sheet(isPresented: $showPublish, onDismiss: { state.publicationDidFinish() }) {
+            PublishDraftSheet(draftKey: draft.key, content: editedText, article: publishAsArticle,
+                contentHasTitle: draft.source == "blogclaw")
         }
         .sheet(item: $sourceEntry) { JournalDetailView(entry: $0).environmentObject(state) }
-        .alert("Copied", isPresented: $showCopyAlert) {
-            Button("OK", role: .cancel) {}
-        }
-        .onAppear {
-            if editedText.isEmpty { editedText = draft.content }
-        }
+        .onDisappear { Task { await state.refreshJournals() } }
     }
 
-    private func regenerate() async {
-        guard state.anyLLMAvailable, let source = sourceJournalContent else { return }
-        isRegenerating = true
-        defer { isRegenerating = false }
-        if let newDraft = try? await state.aiDraftPost(from: source) {
-            editedText = newDraft
-        }
+    private func review(article: Bool) {
+        guard !editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, saveDraft() else { return }
+        publishAsArticle = article
+        showPublish = true
     }
-
+    @discardableResult
     private func saveDraft() -> Bool {
-        guard !editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            saveError = "Write something before saving or publishing."
-            return false
-        }
         do {
             try state.memory.store(key: draft.key, content: editedText,
                 category: draft.category, sessionID: "drafts", source: draft.source, mediaURL: draft.mediaURL)
             saveError = nil
-            Task { await state.refreshJournals() }
             return true
-        } catch { saveError = "Could not save your edits. Please try again."; return false }
+        } catch { saveError = "Could not save your edits. Keep this draft open and retry."; return false }
     }
 }
 
@@ -4983,6 +5051,7 @@ extension AppState {
     }
     func refreshDraftIdeas() async {
         guard !kevJournalBusy, !jevBusy, !jevFeedsBusy, !readsDecisionBusy else { return }
+        if jevEnabled { startJevMemory(); return }
         for entry in liteJournals.prefix(6) {
             if Task.isCancelled || contextWorkPaused { break }
             if drafts.contains(where: { $0.source == "kev:" + entry.key }) { continue }
@@ -5092,6 +5161,13 @@ extension AppState {
         return weights.indices.filter { weights[$0] > 0 }
             .sorted { weights[$0] == weights[$1] ? $0 < $1 : weights[$0] > weights[$1] }
             .map { (name: JevPersona.topics[$0], weight: weights[$0] / total) }
+    }
+    var personaTrends: [String: String] {
+        let records = personaCache.journals.compactMap { key, record -> JevPersona.Record? in
+            guard let entry = jevSource(key), record.fingerprint == JevCloud.fingerprint(entry.content) else { return nil }
+            return record
+        }
+        return JevPersona.trends(records)
     }
     /// Cache the input vector independently from the changing persona.
     /// Long journals and posts use every bounded portion, weighted by length.
@@ -5285,26 +5361,9 @@ extension AppState {
             let fingerprint = JevCloud.fingerprint(entry.content)
             return jevCache.records[entry.key]?.fingerprint != fingerprint || personaCache.journals[entry.key]?.fingerprint != fingerprint
         }
-        if pending { startJevMemory() }
+        if pending || jevPassages.contains(where: { ideaCache.decisions[$0.id] == nil }) { startJevMemory() }
         else if !personaCache.journals.isEmpty {
-            prepareJevDrafts()
             if readsItems.isEmpty { await loadReads() }
-        }
-    }
-    /// Jev has already selected these passages. Assemble original sentences
-    /// into private suggestions without another model call or rewriting.
-    private func prepareJevDrafts() {
-        guard jevEnabled else { return }
-        let passages = jevPassages
-        for entry in liteJournals.prefix(6) {
-            // Deleting a suggestion is intentional; never recreate it every
-            // time the background worker wakes for an unchanged journal.
-            guard jevDraftedSources[entry.key] != JevCloud.fingerprint(entry.content) else { continue }
-            guard !drafts.contains(where: { $0.source == "kev:" + entry.key }) else { continue }
-            let sentences = passages.filter { $0.sourceKey == entry.key }.flatMap { KevLite.sentences($0.text) }
-            guard let draft = KevLite.compose(Array(sentences.prefix(2)), source: journalBodyOf(entry.content)) else { continue }
-            let selection = KevJournalSelection(id: entry.key, source: entry.content, highlight: nil, question: nil, draft: draft)
-            saveKevDraft(selection)
         }
     }
     private func pruneJevMemory() {
@@ -5390,7 +5449,6 @@ extension AppState {
             jevBusy = false
             if jevEnabled && !Task.isCancelled {
                 Task {
-                    prepareJevDrafts()
                     await loadReads()
                     startJevFeedSelection()
                 }
@@ -5438,10 +5496,28 @@ extension AppState {
                 guard page.next != cursor else { break }
                 cursor = page.next
             } while cursor != 0
-            jevStatus = "\(jevPassages.count) passages remembered"
+            try await scoreSharingIdeas()
+            jevStatus = "\(sharingIdeas.count) ideas worth reviewing"
         } catch is CancellationError {
             jevStatus = "Paused. Completed journals are saved; continue when ready."
         } catch { jevStatus = error.localizedDescription; jevProblem = error.localizedDescription }
+    }
+    private func scoreSharingIdeas() async throws {
+        let pending = jevPassages.filter { ideaCache.decisions[$0.id] == nil }
+        for offset in stride(from: 0, to: pending.count, by: 12) {
+            try checkJevWork()
+            jevStatus = "Finding ideas worth sharing…"
+            let current = Set(jevPassages.map(\.id))
+            let batch = Array(pending[offset..<min(offset + 12, pending.count)]).filter { current.contains($0.id) }
+            guard !batch.isEmpty else { continue }
+            let decisions = try await JevCloud.shared.ideas(batch)
+            try checkJevWork()
+            let active = Set(jevPassages.map(\.id))
+            var next = ideaCache
+            next.decisions = next.decisions.filter { active.contains($0.key) }
+            for decision in decisions where active.contains(decision.id) { next.decisions[decision.id] = decision }
+            try next.save(); ideaCache = next
+        }
     }
     private func rankJevReads() async {
         guard jevEnabled, !readsDecisionBusy, !jevBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
