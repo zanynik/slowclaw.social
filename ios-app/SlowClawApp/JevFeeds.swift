@@ -3,6 +3,7 @@ import Foundation
 /// Weekly source decisions are separate from article admission. A selected
 /// feed only earns a fetch; every article still needs its own memory match.
 enum JevFeeds {
+    static let maximumCandidates = 120
     static let interval: TimeInterval = 7 * 24 * 60 * 60
     struct Decision: Codable {
         let score: Double
@@ -34,16 +35,23 @@ enum JevFeeds {
     /// Reserve candidate space, not visible feed space. Platform quotas never
     /// bypass Jev. Interleave so video/social also get judged early in a scan.
     static func candidates(_ items: [RankedFeedItem]) -> [RankedFeedItem] {
-        let groups = ["rss", "youtube", "nostr"]
-        let budgets = [40, 20, 20]
+        let groups = ["rss", "youtube", "nostr", "pulse"]
+        let budgets = [40, 20, 20, 40]
         var queues: [[RankedFeedItem]] = []
         var seen = Set<String>()
         for (index, platform) in groups.enumerated() {
-            let sorted = items.filter { platform == "rss" ? !["youtube", "nostr"].contains($0.sourcePlatform) : $0.sourcePlatform == platform }
+            let sorted = items.filter { item in
+                switch platform {
+                case "rss": return !["youtube", "nostr"].contains(item.sourcePlatform)
+                case "pulse": return item.sourceLabel == "Nostr posts"
+                case "nostr": return item.sourcePlatform == "nostr" && item.sourceLabel != "Nostr posts"
+                default: return item.sourcePlatform == platform
+                }
+            }
                 .sorted { $0.score == $1.score ? $0.id < $1.id : $0.score > $1.score }
             var counts: [String: Int] = [:]
             queues.append(Array(sorted.filter { item in
-                let cap = platform == "nostr" ? 10 : 5
+                let cap = platform == "pulse" ? 40 : platform == "nostr" ? 20 : 5
                 guard counts[item.sourceLabel, default: 0] < cap,
                       seen.insert(item.link.isEmpty ? item.id : item.link).inserted else { return false }
                 counts[item.sourceLabel, default: 0] += 1

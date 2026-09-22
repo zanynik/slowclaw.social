@@ -66,6 +66,19 @@ final class JevCloud {
               result.matches.allSatisfy(\.valid) else { throw Failure(message: "Jev returned invalid sharing scores.") }
         return result.matches
     }
+    private struct RelevanceResult: Decodable { let version: String; let matches: [JevBatch.Score] }
+    func relevance(_ items: [JevBatch.Candidate], interests: [JevBatch.Interest]) async throws -> [JevBatch.Score] {
+        guard !items.isEmpty, items.count <= JevBatch.limit, !interests.isEmpty, interests.count <= 15 else {
+            throw Failure(message: "Invalid relevance batch.")
+        }
+        let result: RelevanceResult = try await request("relevance", body: ["version": JevBatch.version,
+            "interests": interests.map { ["topic": $0.topic, "weight": $0.weight] as [String: Any] },
+            "items": items.map { ["id": $0.id, "text": $0.text] }])
+        guard result.version == JevBatch.version, JevBatch.valid(result.matches, for: items) else {
+            throw Failure(message: "Jev returned invalid relevance scores.")
+        }
+        return result.matches
+    }
     private struct TopicBatch: Decodable { let version: String; let offset: Int; let scores: [Double] }
     func topics(_ text: String) async throws -> [Double] {
         var scores: [Double] = []

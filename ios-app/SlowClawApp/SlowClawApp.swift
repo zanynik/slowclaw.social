@@ -499,7 +499,7 @@ final class AppState: ObservableObject {
         guard jevEnabled || readsModelEnabled else { return [] }
         return readsItems.filter { item in
             readingSignals[item.id]?.preference != -1 && ReadsRelevance.accepts(
-                readsDecisions[item.id], text: Self.readsDecisionText(item), revision: memoryRevision, threshold: jevEnabled ? JevPersona.threshold : (kevStrongMatchesOnly ? 0.8 : 0))
+                readsDecisions[item.id], text: Self.readsDecisionText(item), revision: memoryRevision, threshold: jevEnabled ? JevBatch.threshold : (kevStrongMatchesOnly ? 0.8 : 0))
         }.sorted {
             let left = readsDecisions[$0.id]?.score ?? 0
             let right = readsDecisions[$1.id]?.score ?? 0
@@ -673,7 +673,7 @@ final class AppState: ObservableObject {
         if jevEnabled {
             guard let decision = readsDecisions[item.id] else { return "Awaiting Jev" }
             let quote = jevReadSources[item.id] ?? "your interests"
-            return "Topic match \(Int(decision.score * 100)) · \(quote)"
+            return "Interest match \(Int(decision.score * 100)) · \(quote)"
         }
         guard let detail = kevReadDetails[item.id] else { return "Awaiting Kev" }
         return "Relevance \(Int(detail.relevance * 100)) · \(detail.topic) · \(detail.priority) priority"
@@ -682,6 +682,7 @@ final class AppState: ObservableObject {
     @Published var readingVisits = ReadingVisit.load()
     @Published var readingHistoryError: String?
     @Published var draftInboxStates = DraftInbox.load()
+    private var batchRelevanceCache = JevBatch.Cache.load()
     @Published var ideaCache = JevIdeas.Cache.load()
     var sharingIdeas: [JevMemory.Passage] {
         JevIdeas.select(jevPassages, decisions: ideaCache.decisions)
@@ -1782,7 +1783,7 @@ final class AppState: ObservableObject {
                 !existing.contains($0.id) && ($0.link.isEmpty || !existingLinks.contains($0.link))
             }
             if !fresh.isEmpty {
-                readsItems = (fresh + readsItems).prefix(80).map { $0 }
+                readsItems = (fresh + readsItems).prefix(JevFeeds.maximumCandidates).map { $0 }
             }
         }
         readsRefreshedAt = Date()
@@ -1856,7 +1857,7 @@ final class AppState: ObservableObject {
         return ReadsCache(
             version: cache.version,
             refreshedAt: cache.refreshedAt,
-            items: Array(cache.items.prefix(80)), semanticMatches: cache.semanticMatches
+            items: Array(cache.items.prefix(JevFeeds.maximumCandidates)), semanticMatches: cache.semanticMatches
         )
     }
 
@@ -1865,7 +1866,7 @@ final class AppState: ObservableObject {
         let cache = ReadsCache(
             version: readsCacheVersion,
             refreshedAt: refreshedAt,
-            items: Array(items.prefix(80)), semanticMatches: matches
+            items: Array(items.prefix(JevFeeds.maximumCandidates)), semanticMatches: matches
         )
         guard let data = try? JSONEncoder().encode(cache) else { return }
         try? data.write(to: url, options: .atomic)
@@ -5137,7 +5138,7 @@ extension AppState {
                 sourceLabel: "Web link", score: 0, readMinutes: 3, sourcePlatform: "web", thumbnailURL: nil)
             readsItems.removeAll { $0.link == item.link || $0.id == item.id }
             readsDecisions[item.id] = nil; kevReadDetails[item.id] = nil
-            readsItems = Array(([item] + readsItems).prefix(80))
+            readsItems = Array(([item] + readsItems).prefix(JevFeeds.maximumCandidates))
             Self.saveReadsCache(items: readsItems, refreshedAt: Date(), matches: [:])
             readsError = nil
             await refreshReadsDecisions()
@@ -5521,27 +5522,48 @@ extension AppState {
     }
     private func rankJevReads() async {
         guard jevEnabled, !readsDecisionBusy, !jevBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
-        let weights = personaWeights
-        guard weights.contains(where: { $0 > 0 }) else { readsDecisions = [:]; readsDecisionStatus = "Record a journal to discover your interests."; return }
+        let interests = JevBatch.profile(personaWeights)
+        guard !interests.isEmpty else { readsDecisions = [:]; readsDecisionStatus = "Record a journal to discover your interests."; return }
+        let profile = JevBatch.profileID(interests), revision = memoryRevision
         readsDecisionBusy = true
         defer { readsDecisionBusy = false; prepareDailySelection() }
-        let revision = memoryRevision
         do {
-            for item in readsItems where readingSignals[item.id]?.preference != -1 {
-                try checkJevWork()
-                guard revision == memoryRevision else { return }
-                let identity = Self.readsDecisionText(item)
-                if let previous = readsDecisions[item.id], previous.revision == revision, previous.text == identity { continue }
-                readsDecisionStatus = "Matching stories to your interests…"
-                let text = item.title + "\n" + item.description.strippingHTML()
-                let scores = try await topicScores(text)
-                try checkJevWork()
-                guard revision == memoryRevision else { continue }
-                readsDecisions[item.id] = .init(text: identity, score: JevPersona.similarity(weights, scores), revision: revision)
-                jevReadSources[item.id] = JevPersona.explanation(weights, scores)
+            if batchRelevanceCache.profile != profile { batchRelevanceCache = .init(profile: profile) }
+            let current = readsItems.filter { readingSignals[$0.id]?.preference != -1 }
+            var pending: [JevBatch.Candidate] = [], seen = Set<String>()
+            for item in current {
+                let identity = Self.readsDecisionText(item), id = JevBatch.digest(identity)
+                if let score = batchRelevanceCache.score(for: id, profile: profile) {
+                    readsDecisions[item.id] = .init(text: identity, score: score, revision: revision)
+                    jevReadSources[item.id] = "your top weighted interests"
+                } else {
+                    readsDecisions.removeValue(forKey: item.id)
+                    let text = JevBatch.excerpt(title: item.title, body: item.description.strippingHTML())
+                    if !text.isEmpty, seen.insert(id).inserted { pending.append(.init(id: id, text: text)) }
+                }
             }
-            readsDecisionStatus = nil
-            jevProblem = nil
+            for batch in JevBatch.batches(pending) {
+                try checkJevWork()
+                guard revision == memoryRevision, profile == JevBatch.profileID(JevBatch.profile(personaWeights)) else { return }
+                readsDecisionStatus = "Matching stories and conversations…"
+                let scores = try await JevCloud.shared.relevance(batch, interests: interests)
+                try checkJevWork()
+                guard revision == memoryRevision, profile == JevBatch.profileID(JevBatch.profile(personaWeights)) else { return }
+                var next = batchRelevanceCache
+                for score in scores { next.entries[score.id] = .init(score: score.score, date: Date()) }
+                next.trim(); try next.save(); batchRelevanceCache = next
+                // Re-read current candidates after suspension. An edited/replaced
+                // candidate cannot inherit a decision for the old content.
+                for item in readsItems where readingSignals[item.id]?.preference != -1 {
+                    let identity = Self.readsDecisionText(item)
+                    if let score = next.score(for: JevBatch.digest(identity), profile: profile) {
+                        readsDecisions[item.id] = .init(text: identity, score: score, revision: revision)
+                        jevReadSources[item.id] = "your top weighted interests"
+                    }
+                }
+                await Task.yield()
+            }
+            readsDecisionStatus = nil; jevProblem = nil
         } catch is CancellationError { readsDecisionStatus = "Selection paused. Pull to continue." }
         catch { readsDecisionStatus = error.localizedDescription; jevProblem = error.localizedDescription }
     }

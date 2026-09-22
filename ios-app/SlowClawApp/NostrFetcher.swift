@@ -118,7 +118,8 @@ enum NostrFetcher {
                 title: String(body.replacingOccurrences(of: "\n", with: " ").prefix(100)),
                 link: "https://njump.me/\(event.id)", description: body,
                 sourceLabel: "Nostr posts", score: 1 + 0.5 * pow(0.5, age / 72) + topicBoost(article: quality, topics: topics),
-                readMinutes: max(1, body.count / 900), sourcePlatform: "nostr", thumbnailURL: nil))
+                readMinutes: max(1, body.count / 900), sourcePlatform: "nostr", thumbnailURL: nil,
+                nostrEventJSON: (try? JSONEncoder().encode(event)).flatMap { String(data: $0, encoding: .utf8) }))
         }
         return Array(result.sorted { $0.score == $1.score ? $0.id < $1.id : $0.score > $1.score }.prefix(40))
     }

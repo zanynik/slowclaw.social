@@ -338,10 +338,12 @@ public struct RankedFeedItem: Identifiable, Codable {
     public let sourcePlatform: String
     /// Optional cover image (YouTube thumbnail or Nostr article image).
     public let thumbnailURL: String?
+    /// Original signed kind-1 event, used for native Pulse replies. Optional for older caches.
+    public let nostrEventJSON: String?
 
     public init(id: String, title: String, link: String, description: String,
                 sourceLabel: String, score: Double, readMinutes: Int,
-                sourcePlatform: String = "rss", thumbnailURL: String? = nil) {
+                sourcePlatform: String = "rss", thumbnailURL: String? = nil, nostrEventJSON: String? = nil) {
         self.id = id
         self.title = title
         self.link = link
@@ -351,6 +353,7 @@ public struct RankedFeedItem: Identifiable, Codable {
         self.readMinutes = readMinutes
         self.sourcePlatform = sourcePlatform
         self.thumbnailURL = thumbnailURL
+        self.nostrEventJSON = nostrEventJSON
     }
 }
 

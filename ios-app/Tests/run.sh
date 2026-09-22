@@ -13,6 +13,7 @@ end = source.index("private struct RankedFeedItemDTO:", start)
 (pathlib.Path(sys.argv[2]) / "Sources/Runtime/RankedFeedItem.swift").write_text("import Foundation\n" + source[start:end])
 PYDTO
 cp "$APP_ROOT/SlowClawApp/JevMemory.swift" "$TEST_ROOT/Sources/Runtime/"
+cp "$APP_ROOT/SlowClawApp/JevBatch.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/JevPersona.swift" "$APP_ROOT/SlowClawApp/JevIdeas.swift" "$APP_ROOT/SlowClawApp/JournalPolish.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/JevFeeds.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/KevLite.swift" "$TEST_ROOT/Sources/Runtime/"
@@ -30,6 +31,7 @@ cp "$APP_ROOT/SlowClawApp/NostrReply.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/WeeklyReflection.swift" "$TEST_ROOT/Sources/Runtime/"
 swiftc -frontend -parse "$APP_ROOT"/SlowClawApp/*.swift
 cp "$APP_ROOT/Tests/RuntimeTests.swift" "$TEST_ROOT/Tests/RuntimeTests/"
+cp "$APP_ROOT/Tests/JevBatchTests.swift" "$TEST_ROOT/Tests/RuntimeTests/"
 cp "$APP_ROOT/Tests/JournalPolishTests.swift" "$TEST_ROOT/Tests/RuntimeTests/"
 cat > "$TEST_ROOT/Package.swift" <<'SWIFT'
 // swift-tools-version: 6.1

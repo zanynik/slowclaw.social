@@ -19,12 +19,12 @@ final class RuntimeTests: XCTestCase {
         }
         let rss = (0..<200).map { item($0, "rss", "Feed \($0 % 40)") }
         let videos = (0..<20).map { item($0, "youtube", "Channel \($0 % 4)") }
-        let social = (0..<60).map { item($0, "nostr", $0 < 30 ? "Nostr" : "Nostr posts") }
+        let social = (0..<90).map { item($0, "nostr", $0 < 30 ? "Nostr" : "Nostr posts") }
         let selected = JevFeeds.candidates(rss + videos + social + [rss[0]])
-        XCTAssertEqual(selected.count, 80)
+        XCTAssertEqual(selected.count, JevFeeds.maximumCandidates)
         XCTAssertEqual(selected.filter { $0.sourcePlatform == "youtube" }.count, 20)
-        XCTAssertEqual(selected.filter { $0.sourceLabel == "Nostr" }.count, 10)
-        XCTAssertEqual(selected.filter { $0.sourceLabel == "Nostr posts" }.count, 10)
+        XCTAssertEqual(selected.filter { $0.sourceLabel == "Nostr" }.count, 20)
+        XCTAssertEqual(selected.filter { $0.sourceLabel == "Nostr posts" }.count, 40)
         XCTAssertEqual(Set(selected.prefix(3).map(\.sourcePlatform)), ["rss", "youtube", "nostr"])
         XCTAssertEqual(Set(selected.map(\.link)).count, selected.count)
     }
@@ -74,6 +74,10 @@ final class RuntimeTests: XCTestCase {
         XCTAssertEqual(candidates.first?.id, "nostr:" + note.id)
         XCTAssertEqual(candidates.first?.link, "https://njump.me/" + note.id)
         XCTAssertEqual(candidates.first?.sourcePlatform, "nostr")
+        let eventData = try XCTUnwrap(candidates.first?.nostrEventJSON?.data(using: .utf8))
+        let preserved = try JSONDecoder().decode(PublishedEvent.self, from: eventData)
+        XCTAssertEqual(preserved.pubkey, note.pubkey)
+        XCTAssertTrue(NostrEventVerifier.verify(preserved))
         // Becoming a candidate alone must never grant Reads admission.
         XCTAssertFalse(ReadsRelevance.accepts(nil, text: note.content, revision: 0))
     }
