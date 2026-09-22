@@ -99,20 +99,35 @@ async function request(token, method, path, body) {
     throw new Error(`Bundle ID ${bundleId} was not found in App Store Connect.`);
   }
 
-  // Recover prior SlowClaw CI assets. The user authorized ongoing signing
-  // maintenance; constrain ownership by both the CI name and bundle relation.
+  // Recover prior SlowClaw CI assets. Keep the newest previous certificate
+  // alive while Apple processes the current upload. Revoking the certificate
+  // immediately after altool returns success makes App Store processing reject
+  // the binary with ITMS-90721. Ownership remains constrained by both the CI
+  // profile name and bundle relation.
   const old = await request(token, "GET", "/v1/profiles?filter[profileType]=IOS_APP_STORE&limit=200");
+  const ownedProfiles = [];
   for (const profile of old.data || []) {
     if (!/^SlowClaw CI App Store \d+-\d+$/.test(profile.attributes?.name || "")) continue;
     const owner = await request(token, "GET", `/v1/profiles/${profile.id}/bundleId`);
     if (owner.data?.id !== bundleRecord.id) continue;
     const certs = await request(token, "GET", `/v1/profiles/${profile.id}/certificates?limit=20`);
-    for (const certificate of certs.data || []) {
+    ownedProfiles.push({ profile, certificates: certs.data || [] });
+  }
+  ownedProfiles.sort((left, right) =>
+    Date.parse(right.profile.attributes?.createdDate || 0) -
+    Date.parse(left.profile.attributes?.createdDate || 0)
+  );
+  for (const [index, owned] of ownedProfiles.entries()) {
+    if (index === 0) {
+      console.log("Retaining the newest prior SlowClaw CI signing assets during Apple processing.");
+      continue;
+    }
+    for (const certificate of owned.certificates) {
       if (["DISTRIBUTION", "IOS_DISTRIBUTION"].includes(certificate.attributes?.certificateType)) {
         await request(token, "DELETE", `/v1/certificates/${certificate.id}`);
       }
     }
-    await request(token, "DELETE", `/v1/profiles/${profile.id}`);
+    await request(token, "DELETE", `/v1/profiles/${owned.profile.id}`);
   }
 
   const csrContent = fs.readFileSync(process.env.CERT_CSR_PATH, "utf8");

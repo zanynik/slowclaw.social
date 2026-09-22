@@ -359,8 +359,11 @@ jobs:
                     --apiIssuer "${APP_STORE_CONNECT_ISSUER_ID}" \
                     --verbose
 
-            - name: Release temporary Apple signing assets
-              if: always()
+            # Apple validates the signing certificate asynchronously after
+            # altool accepts the upload. Keep successful-run assets alive; the
+            # next run retains the newest set and removes older CI-owned sets.
+            - name: Release signing assets after failed delivery
+              if: failure()
               env:
                   ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
                   ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
