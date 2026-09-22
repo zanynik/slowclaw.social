@@ -40,3 +40,26 @@ enum ReadingHistory {
         return words
     }
 }
+
+/// Local metadata only. No page contents/cookies; bounded to 200 by the caller.
+struct ReadingVisit: Codable, Identifiable {
+    static let minimumSeconds: TimeInterval = 30
+    let url: String
+    let title: String
+    let source: String
+    let date: Date
+    let seconds: TimeInterval
+    var id: String { url }
+    var duration: String { seconds < 60 ? "<1 min" : "\(Int(seconds / 60)) min" }
+    private static var file: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("reading-history-v1.json")
+    }
+    static func load() -> [String: ReadingVisit] {
+        (try? JSONDecoder().decode([String: ReadingVisit].self, from: Data(contentsOf: file))) ?? [:]
+    }
+    static func save(_ visits: [String: ReadingVisit]) throws {
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(visits).write(to: file, options: [.atomic, .completeFileProtection])
+    }
+}

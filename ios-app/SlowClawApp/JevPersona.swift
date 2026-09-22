@@ -43,6 +43,28 @@ enum JevPersona {
         return weights
     }
     static func evidence(_ value: Double) -> Double { max(0, (value - 0.5) * 2) }
+    /// Compare topic share in the last seven days with the seven before.
+    /// No baseline is different from stable. Ignore future-dated journals.
+    static func trends(_ records: [Record], now: Date = Date()) -> [String: String] {
+        let week: TimeInterval = 7 * 86400
+        let recent = records.filter { valid($0.scores) && (0..<week).contains(now.timeIntervalSince($0.date)) }
+        let prior = records.filter { valid($0.scores) && (week..<(2 * week)).contains(now.timeIntervalSince($0.date)) }
+        guard !recent.isEmpty, !prior.isEmpty else { return [:] }
+        func shares(_ entries: [Record]) -> [Double] {
+            var values = Array(repeating: 0.0, count: topics.count)
+            for entry in entries { for i in values.indices { values[i] += evidence(entry.scores[i]) } }
+            let total = values.reduce(0, +)
+            return total > 0 ? values.map { $0 / total } : []
+        }
+        let a = shares(recent), b = shares(prior)
+        guard a.count == topics.count, b.count == topics.count else { return [:] }
+        var result: [String: String] = [:]
+        for i in topics.indices {
+            let delta = a[i] - b[i]
+            result[topics[i]] = delta > 0.01 ? "↑" : delta < -0.01 ? "↓" : "→"
+        }
+        return result
+    }
     /// Cosine similarity is a dot product after unit-length normalization.
     /// This is a ranking score, never a calibrated probability of interest.
     static func similarity(_ weights: [Double], _ scores: [Double]) -> Double {

@@ -57,6 +57,15 @@ final class JevCloud {
         return answer
     }
     struct Match: Decodable { let id: String; let score: Double }
+    private struct IdeasResult: Decodable { let version: String; let matches: [JevIdeas.Decision] }
+    func ideas(_ passages: [JevMemory.Passage]) async throws -> [JevIdeas.Decision] {
+        let result: IdeasResult = try await request("ideas", body: ["version": JevIdeas.version,
+            "passages": passages.map { ["id": $0.id, "text": $0.text] }])
+        guard result.version == JevIdeas.version, result.matches.count == passages.count,
+              Set(result.matches.map(\.id)) == Set(passages.map(\.id)),
+              result.matches.allSatisfy(\.valid) else { throw Failure(message: "Jev returned invalid sharing scores.") }
+        return result.matches
+    }
     private struct TopicBatch: Decodable { let version: String; let offset: Int; let scores: [Double] }
     func topics(_ text: String) async throws -> [Double] {
         var scores: [Double] = []
