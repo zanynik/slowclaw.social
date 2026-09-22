@@ -17,6 +17,7 @@ import SwiftUI
 import UIKit
 import AVFoundation
 import BackgroundTasks
+import ImageIO
 
 // MARK: - Design System (from the original app's styles.css, with dark mode)
 
@@ -4589,6 +4590,65 @@ struct FlowChips: View {
 /// Ranked feed card mirroring the reference `.reads-card`:
 /// 8px radius, 1px border, accent-green uppercase source + read time, title,
 /// 3-line summary, 👍/👎 actions, and a "✨ {topic}" rationale chip.
+/// Feed images are untrusted and may be full-resolution photographs. Bound both
+/// transfer size and decoded pixels; never decode an original into a SwiftUI image.
+private struct ReadsThumbnail: View {
+    let url: URL
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Color.clear
+                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                    .overlay { Image(uiImage: image).resizable().scaledToFill() }
+                    .clipped()
+            }
+        }
+        .task(id: url) {
+            image = nil
+            let worker = Task.detached(priority: .utility) {
+                await Self.load(url)
+            }
+            let result = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard !Task.isCancelled else { return }
+            image = result
+        }
+    }
+
+    nonisolated private static func load(_ url: URL) async -> UIImage? {
+        do {
+            let limit = 4 * 1024 * 1024
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 12
+            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  response.expectedContentLength <= Int64(limit),
+                  response.mimeType?.hasPrefix("image/") == true else { return nil }
+            var data = Data()
+            for try await byte in bytes {
+                if data.count % 16384 == 0 { try Task.checkCancellation() }
+                guard data.count < limit else { return nil }
+                data.append(byte)
+            }
+            try Task.checkCancellation()
+            guard let source = CGImageSourceCreateWithData(data as CFData,
+                [kCGImageSourceShouldCache: false] as CFDictionary),
+                let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 960,
+                    kCGImageSourceShouldCacheImmediately: true
+                ] as CFDictionary) else { return nil }
+            return UIImage(cgImage: thumbnail)
+        } catch { return nil } // A failed cover never prevents reading the text.
+    }
+}
+
 struct FeedCard: View {
     @Environment(\.colorScheme) var scheme
     @EnvironmentObject var state: AppState
@@ -4619,16 +4679,7 @@ struct FeedCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let thumbnailURL {
-                AsyncImage(url: thumbnailURL) { phase in
-                    if let image = phase.image {
-                        Color.clear
-                            .aspectRatio(16.0 / 9.0, contentMode: .fit)
-                            .overlay {
-                                image.resizable().scaledToFill()
-                            }
-                            .clipped()
-                    }
-                }
+                ReadsThumbnail(url: thumbnailURL)
                 .accessibilityHidden(true)
             }
             VStack(alignment: .leading, spacing: 6) {
