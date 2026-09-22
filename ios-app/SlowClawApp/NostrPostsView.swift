@@ -109,7 +109,7 @@ struct NostrPostsView: View {
     }
 }
 
-private struct NostrPostDetail: View {
+struct NostrPostDetail: View {
     let post: PublishedEvent
     @StateObject private var inbox = NostrInbox.shared
     @State private var replyTarget: PublishedEvent?
@@ -145,7 +145,7 @@ private struct NostrPostDetail: View {
             }
         }
         .buttonStyle(.borderless)
-        .navigationTitle(post.kind == 30023 ? "Your article" : "Your post")
+        .navigationTitle("Conversation")
         .sheet(item: $replyTarget) { target in NostrReplySheet(root: post, parent: target) }
         .task { await inbox.refresh(force: true, post: post); inbox.markRead(post) }
         .refreshable { await inbox.refresh(force: true, post: post); inbox.markRead(post) }
