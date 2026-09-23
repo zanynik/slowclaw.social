@@ -1,5 +1,55 @@
 # Needle 3 local Pulse feasibility — 2026-09-22
 
+## Follow-up: hybrid experiment authorized, native iOS compatibility blocked (2026-09-23)
+
+The owner authorized an experimental Needle + BM25 Pulse despite the quality
+limitations below. `needle-pulse-rank.zig` implements weighted BM25 (k1=1.2,
+b=0.75) and reciprocal-rank fusion (60% lexical, 40% semantic, k=60).
+There is no probability threshold. Two executable Zig tests cover keyword
+evidence, semantic-only ordering and invalid scores. This prototype is kept
+outside the app until the native dependency can run on supported iPhones.
+It does not prove that BM25 fixes keyword bait; lexical scoring can also
+reward keyword stuffing. The first iteration uses simple word tokenization,
+case-insensitive ASCII matching, and no multilingual stemming.
+
+**Concrete blocker:** the current published `ios-arm64/libneedle.a`, pinned
+at revision `b274efcb211a9eef48c9a88da4b43bd569696a39`, contains a Mach-O
+`LC_BUILD_VERSION` for iOS **27.0**. The simulator archive targets 27.0 too.
+The earlier `c1fc4d4cb32993156a880ceb8ff171b03b1f166a` device archive also
+targets 27.0; the earliest binary revision checked,
+`afb64c7f069abd958aa9cadb2cee0b17ca6bf757`, targets **26.5**. These were read
+from the `needle.cpp.o` archive member, not inferred from marketing docs.
+Device archive SHA256: `236aae1ab238d815217a59c5ba4ce513a2b60aba10356499893dfdbbf6b4341b`.
+Simulator SHA256: `02f0e6ab33ccc0addc0997f66fb5c8490d023d87516d65dd256031e097004c2c`.
+
+SlowClaw targets iOS 18. Neither the app minimum nor binary metadata was
+lowered/raised to force compatibility. The published client repository does
+not include the native engine implementation needed for a source rebuild.
+Needed next: an official iOS 18-compatible Needle 3 library, or the engine
+source to compile with Apple's supported deployment target. No Needle native
+symbols, resources or downloads ship in this revision. Pulse still uses Jev.
+
+The independent UX work is implemented: a protected, atomically written
+last-ranked Pulse snapshot (up to 40 posts) loads at launch and survives
+fetching, incomplete classification, empty results and failures. A complete,
+nonempty new ranking replaces it. Muted authors and negative reading feedback
+still hide cached posts. Pull-to-refresh schedules work without waiting on a
+blocking refresh spinner. Before the first successful snapshot there is still
+an empty state; old cached posts can remain stale until new matches arrive.
+
+Create adds a cleanup preview using Apple's on-device Foundation Models on
+iOS 26+ when available. It requests only fillers/spelling/punctuation/grammar
+changes, never automatically saves the model response, and provides Cancel,
+Use changes and an in-view Undo cleanup. Original journals are untouched.
+Unavailable models, failures and drafts over 3000 characters use the existing
+conservative filler/punctuation cleanup with an explicit basic-mode message.
+System autocorrection is enabled while editing; iOS 18 does not get automatic
+Foundation Models grammar correction. No cloud cleanup request is made.
+Physical iPhone proofreading quality and cached-feed UX need device testing.
+Rollback: revert the app snapshot/cleanup changes; the prototype is standalone.
+
+The original feasibility results follow.
+
 Decision: **do not replace the existing Pulse ranker with this release yet**.
 No app, backend, signing, workflow, or persona behavior changed. This is a
 reproducible feasibility checkpoint, not a shipped integration.

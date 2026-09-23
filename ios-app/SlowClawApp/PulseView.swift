@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-/// Short, personally relevant notes. Latest changes order, never admission.
+/// Old ranked posts stay visible while a replacement is fetched and ranked.
 struct PulseView: View {
     @EnvironmentObject var state: AppState
     @StateObject private var inbox = NostrInbox.shared
@@ -26,12 +26,11 @@ struct PulseView: View {
                         Text("For you").tag(false)
                         Text("Latest").tag(true)
                     }.pickerStyle(.segmented).padding()
-                    if state.readsLoading || state.readsDecisionBusy { ProgressView().padding(8) }
-                    if items.isEmpty && !state.readsLoading && !state.readsDecisionBusy {
+                    if items.isEmpty {
                         ContentUnavailableView("Find your conversations", systemImage: "bubble.left.and.bubble.right",
                             description: Text("Relevant Nostr posts appear here as you journal. Pull to refresh."))
                     }
-                    if let status = state.readsDecisionStatus, !state.readsDecisionBusy {
+                    if let status = state.pulseSnapshotError {
                         Text(status).font(.caption).foregroundStyle(.secondary).padding(.horizontal)
                     }
                     ForEach(items) { item in
@@ -55,7 +54,7 @@ struct PulseView: View {
             }
             .sheet(isPresented: $showConversations) { NostrPostsView() }
             .sheet(isPresented: $compose) { PulseComposer() }
-            .refreshable { await state.loadReads(force: true) }
+            .refreshable { Task { await state.loadReads(force: true) } }
             .task { await state.loadReads() }
         }
     }

@@ -493,7 +493,25 @@ final class AppState: ObservableObject {
         relevantFeedItems.filter { $0.sourceLabel != "Nostr posts" }
     }
     var relevantPulse: [RankedFeedItem] {
-        relevantFeedItems.filter { $0.sourceLabel == "Nostr posts" }
+        pulseSnapshot.filter { readingSignals[$0.id]?.preference != -1 }
+    }
+    @Published private var pulseSnapshot = PulseSnapshot.load()
+    @Published private(set) var pulseSnapshotError: String?
+
+    private func keepRankedPulse() {
+        // Publishing one snapshot after a completed ranking prevents refresh
+        // invalidation from making the visible timeline disappear.
+        let candidates = readsItems.filter { $0.sourceLabel == "Nostr posts" && readingSignals[$0.id]?.preference != -1 }
+        guard !candidates.isEmpty, candidates.allSatisfy({ item in
+            guard let decision = readsDecisions[item.id] else { return false }
+            return decision.revision == memoryRevision && decision.text == Self.readsDecisionText(item)
+        }) else { return }
+        let next = Array(relevantFeedItems.filter { $0.sourceLabel == "Nostr posts" }.prefix(40))
+        guard !next.isEmpty else { return }
+        do {
+            try PulseSnapshot.save(next)
+            pulseSnapshot = next; pulseSnapshotError = nil
+        } catch { pulseSnapshotError = "Could not save the refreshed Pulse. Previous posts are still available." }
     }
     private var relevantFeedItems: [RankedFeedItem] {
         guard jevEnabled || readsModelEnabled else { return [] }
@@ -578,6 +596,7 @@ final class AppState: ObservableObject {
     /// The larger generative model and keyword/embedding retrieval never grant
     /// admission. Pauses, missing context, missing models and errors abstain.
     func refreshReadsDecisions() async {
+        defer { keepRankedPulse() }
         if jevEnabled {
             guard jevReadingTask == nil else { return }
             let task = Task { await rankJevReads() }
@@ -4092,6 +4111,8 @@ struct DraftCard: View {
     @State private var publishAsArticle = false
     @State private var sourceEntry: SlowClawMemoryEntry?
     @State private var saveError: String?
+    @State private var showCleanup = false
+    @State private var cleanupOriginal: String?
 
     init(draft: SlowClawMemoryEntry, sourceJournalContent: String?) {
         self.draft = draft
@@ -4113,6 +4134,7 @@ struct DraftCard: View {
                 Text(editedText).textSelection(.enabled)
             } else {
                 TextField("Your thought…", text: $editedText, axis: .vertical)
+                    .autocorrectionDisabled(false)
                     .font(DS.bodyFont).lineLimit(3...16)
                     .accessibilityLabel("Draft text")
                     .onChange(of: editedText) { _, _ in _ = saveDraft() }
@@ -4129,11 +4151,17 @@ struct DraftCard: View {
                 Text("\(editedText.count) characters").font(.caption2).foregroundStyle(.secondary)
                 Spacer()
                 if !published {
+                    Button { showCleanup = true } label: { Image(systemName: "sparkles") }
+                        .accessibilityLabel("Clean up draft")
+                        .disabled(editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     Button("Review & publish") { review(article: draft.source == "blogclaw") }
                         .buttonStyle(.bordered)
                         .disabled(editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
                 Menu {
+                    if let original = cleanupOriginal, !published {
+                        Button("Undo cleanup") { editedText = original; cleanupOriginal = nil }
+                    }
                     Button("Keep") { state.moveDraft(draft.key, to: .kept) }
                     Button("Archive") { state.moveDraft(draft.key, to: .archived) }
                     Button("Move to New") { state.moveDraft(draft.key, to: .new) }
@@ -4168,6 +4196,12 @@ struct DraftCard: View {
                 contentHasTitle: draft.source == "blogclaw")
         }
         .sheet(item: $sourceEntry) { JournalDetailView(entry: $0).environmentObject(state) }
+        .sheet(isPresented: $showCleanup) {
+            DraftCleanupSheet(original: editedText) { cleaned in
+                cleanupOriginal = editedText
+                editedText = cleaned
+            }
+        }
         .onDisappear { Task { await state.refreshJournals() } }
     }
 
