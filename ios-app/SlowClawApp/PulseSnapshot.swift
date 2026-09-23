@@ -2,6 +2,7 @@ import Foundation
 
 /// A bounded, protected last-successful timeline, independent of pending work.
 enum PulseSnapshot {
+    enum Failure: Error { case tooLarge }
     struct Saved: Codable { let version: Int; let items: [RankedFeedItem] }
     private static var file: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -22,7 +23,7 @@ enum PulseSnapshot {
     }
     static func save(_ items: [RankedFeedItem]) throws {
         let data = try JSONEncoder().encode(Saved(version: 1, items: Array(items.prefix(40))))
-        guard data.count <= 4_000_000 else { throw CocoaError(.fileWriteFileTooLarge) }
+        guard data.count <= 4_000_000 else { throw Failure.tooLarge }
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: file, options: [.atomic, .completeFileProtection])
     }
