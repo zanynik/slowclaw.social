@@ -13,6 +13,18 @@ actor PulseRanking {
     private var vectors: [String: [Float]] = [:]
     private var order: [String] = []
 
+    private static func packed(_ strings: [String]) throws -> Data {
+        var result = Data()
+        for string in strings {
+            let bytes = Data(string.utf8)
+            guard bytes.count <= Int(UInt32.max) else { throw Failure.invalid }
+            var length = UInt32(bytes.count).littleEndian
+            withUnsafeBytes(of: &length) { result.append(contentsOf: $0) }
+            result.append(bytes)
+        }
+        return result
+    }
+
     func embedding(_ text: String) async throws -> [Float] {
         let key = JevBatch.digest(text)
         if let vector = vectors[key] { return vector }
@@ -44,13 +56,17 @@ actor PulseRanking {
         let norm = sqrt(centroid.reduce(0) { $0 + $1 * $1 })
         guard norm.isFinite, norm > 0 else { throw Failure.invalid }
         let cosines = postVectors.map { v in zip(v, centroid).reduce(0.0) { $0 + Double($1.0) * $1.1 } / norm }
-        let query = try JSONEncoder().encode(interests), documents = try JSONEncoder().encode(texts)
+        let query = try Self.packed(interests.map(\.topic)), documents = try Self.packed(texts)
+        let weights = interests.map(\.weight)
         return try await OnDeviceAIExecutor.shared.run {
             var scores = [Double](repeating: 0, count: texts.count)
             let rc = query.withUnsafeBytes { q in documents.withUnsafeBytes { d in
-                cosines.withUnsafeBufferPointer { c in scores.withUnsafeMutableBufferPointer { out in
-                    slowclaw_feed_pulse_rank(q.bindMemory(to: UInt8.self).baseAddress, query.count,
-                        d.bindMemory(to: UInt8.self).baseAddress, documents.count, c.baseAddress, out.baseAddress, out.count)
+                weights.withUnsafeBufferPointer { w in cosines.withUnsafeBufferPointer { c in
+                    scores.withUnsafeMutableBufferPointer { out in
+                        slowclaw_feed_pulse_rank(q.bindMemory(to: UInt8.self).baseAddress, query.count,
+                            w.baseAddress, w.count, d.bindMemory(to: UInt8.self).baseAddress, documents.count,
+                            c.baseAddress, out.baseAddress, out.count)
+                    }
                 } }
             } }
             guard rc == 0, scores.allSatisfy(\.isFinite) else { throw Failure.invalid }

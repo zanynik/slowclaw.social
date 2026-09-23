@@ -23,10 +23,13 @@ extern "C" {
 #endif
 
 // Caller-owned buffers; Needle calls must share the serial off-main executor.
-// Embedding output must have 3072 floats. Negative return means no result.
+// Embedding output must have 3072 floats. Pulse query/posts are sequences of
+// little-endian uint32 byte lengths followed by UTF-8 bytes (no padding).
+// Negative return means no result.
 int slowclaw_feed_needle_embed(const uint8_t *text, size_t len, float *out, size_t count);
 int slowclaw_feed_pulse_rank(const uint8_t *query, size_t query_len,
-    const uint8_t *posts, size_t posts_len, const double *cosine, double *out, size_t count);
+    const double *weights, size_t interest_count, const uint8_t *posts, size_t posts_len,
+    const double *cosine, double *out, size_t count);
 
 /// Bounded semantic ranking evidence. Scalar-only, no memory ownership.
 double slowclaw_feed_semantic_score(double base, double similarity, double age_days);

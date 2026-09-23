@@ -39,28 +39,56 @@ export fn slowclaw_feed_needle_embed(text: ?[*]const u8, len: usize, out: ?[*]f3
     pulse_needle.embed(ptr[0..len], result[0..count]) catch return -1;
     return 0;
 }
-export fn slowclaw_feed_pulse_rank(query: ?[*]const u8, query_len: usize, posts: ?[*]const u8, posts_len: usize, cosine: ?[*]const f64, out: ?[*]f64, count: usize) c_int {
-    if (count == 0 or count > 120 or query_len > 10000 or posts_len > 400000) return -1;
+fn parseLengthPrefixed(data: []const u8, count: usize, max_item_len: usize) ![][]const u8 {
+    const items = try std.heap.c_allocator.alloc([]const u8, count);
+    errdefer std.heap.c_allocator.free(items);
+    var cursor: usize = 0;
+    for (items) |*item| {
+        if (data.len - cursor < 4) return error.InvalidInput;
+        const item_len_u32 = @as(u32, data[cursor]) |
+            (@as(u32, data[cursor + 1]) << 8) |
+            (@as(u32, data[cursor + 2]) << 16) |
+            (@as(u32, data[cursor + 3]) << 24);
+        cursor += 4;
+        const item_len: usize = @intCast(item_len_u32);
+        if (item_len > max_item_len or item_len > data.len - cursor) return error.InvalidInput;
+        item.* = data[cursor .. cursor + item_len];
+        cursor += item_len;
+    }
+    if (cursor != data.len) return error.InvalidInput;
+    return items;
+}
+
+export fn slowclaw_feed_pulse_rank(query: ?[*]const u8, query_len: usize, weights: ?[*]const f64, interest_count: usize, posts: ?[*]const u8, posts_len: usize, cosine: ?[*]const f64, out: ?[*]f64, count: usize) c_int {
+    if (count == 0 or count > 120 or interest_count == 0 or interest_count > 15 or query_len > 10000 or posts_len > 400000) return -1;
     const q = query orelse return -1;
+    const w = weights orelse return -1;
     const p = posts orelse return -1;
     const c = cosine orelse return -1;
     const o = out orelse return -1;
-    const interests = std.json.parseFromSlice([]pulse_rank.Interest, std.heap.c_allocator, q[0..query_len], .{}) catch return -1;
-    defer interests.deinit();
-    const documents = std.json.parseFromSlice([][]const u8, std.heap.c_allocator, p[0..posts_len], .{}) catch return -1;
-    defer documents.deinit();
-    pulse_rank.rank(std.heap.c_allocator, interests.value, documents.value, c[0..count], o[0..count]) catch return -1;
+    const topics = parseLengthPrefixed(q[0..query_len], interest_count, 200) catch return -1;
+    defer std.heap.c_allocator.free(topics);
+    const interests = std.heap.c_allocator.alloc(pulse_rank.Interest, interest_count) catch return -1;
+    defer std.heap.c_allocator.free(interests);
+    for (topics, w[0..interest_count], interests) |topic, weight, *interest| {
+        interest.* = .{ .topic = topic, .weight = weight };
+    }
+    const documents = parseLengthPrefixed(p[0..posts_len], count, 2400) catch return -1;
+    defer std.heap.c_allocator.free(documents);
+    pulse_rank.rank(std.heap.c_allocator, interests, documents, c[0..count], o[0..count]) catch return -1;
     return 0;
 }
 
 test "ffi pulse validates buffers and hybrid rank" {
     try testing.expectEqual(@as(c_int, -1), slowclaw_feed_needle_embed(null, 0, null, 0));
-    const q = "[{\"topic\":\"AI\",\"weight\":1}]";
-    const p = "[\"AI on phones\",\"football results\"]";
+    const q = "\x02\x00\x00\x00AI";
+    const p = "\x0c\x00\x00\x00AI on phones\x10\x00\x00\x00football results";
     var scores: [2]f64 = undefined;
-    try testing.expectEqual(@as(c_int, 0), slowclaw_feed_pulse_rank(q, q.len, p, p.len, &.{ 0.9, 0.95 }, &scores, 2));
+    try testing.expectEqual(@as(c_int, 0), slowclaw_feed_pulse_rank(q, q.len, &.{1}, 1, p, p.len, &.{ 0.9, 0.95 }, &scores, 2));
     try testing.expect(scores[0] > scores[1]);
-    try testing.expectEqual(@as(c_int, -1), slowclaw_feed_pulse_rank(q, q.len, p, p.len, &.{ 0.9, 0.95 }, &scores, 1));
+    try testing.expectEqual(@as(c_int, -1), slowclaw_feed_pulse_rank(q, q.len, &.{1}, 1, p, p.len, &.{ 0.9, 0.95 }, &scores, 1));
+    try testing.expectEqual(@as(c_int, -1), slowclaw_feed_pulse_rank(q, q.len, &.{1}, 2, p, p.len, &.{ 0.9, 0.95 }, &scores, 2));
+    try testing.expectEqual(@as(c_int, -1), slowclaw_feed_pulse_rank(q ++ "x", q.len + 1, &.{1}, 1, p, p.len, &.{ 0.9, 0.95 }, &scores, 2));
 }
 
 const ranker = @import("ranker.zig");

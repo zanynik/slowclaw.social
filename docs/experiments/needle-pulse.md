@@ -51,6 +51,13 @@ device archive. CI validates Swift, iOS linking and archive/upload through
 the existing workflow. These checks do not establish physical-device latency,
 battery use, real-journal relevance or iPhone launch behavior.
 
+The first iOS link exposed a Zig 0.16 JSON-float parser dependency on
+quad-precision runtime symbols that iOS does not provide. Pulse's private C
+transport now sends length-prefixed UTF-8 topic/post strings and a native f64
+weight array instead of decoding floating-point JSON in Zig. The public app
+behavior and rank math are unchanged; malformed lengths, extra bytes and
+count mismatches fail closed at the C boundary.
+
 The prior snapshot build's compile error (`fileWriteFileTooLarge`) was fixed
 with an app-defined error; the repaired Swift regression suite passed in CI.
 Rollback: revert this activation commit to restore Jev Pulse ranking and the
