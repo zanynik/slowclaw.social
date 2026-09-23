@@ -25,6 +25,7 @@ pub const rss_parser = @import("rss_parser.zig");
 pub const local_inference = @import("local_inference.zig");
 
 test {
+    _ = @import("pulse_rank.zig");
     _ = vector_math;
     _ = text_util;
     _ = porter_stemmer;

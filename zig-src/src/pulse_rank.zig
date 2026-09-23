@@ -1,5 +1,4 @@
-//! Experimental weighted BM25 + Needle rank fusion. Not linked into the app.
-//! Test with `zig test docs/experiments/needle-pulse-rank.zig` (Zig 0.16).
+//! Experimental weighted BM25 + Needle rank fusion. Scores are not probabilities.
 const std = @import("std");
 pub const Interest = struct { topic: []const u8, weight: f64 };
 

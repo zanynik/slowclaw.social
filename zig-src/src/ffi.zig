@@ -28,6 +28,40 @@
 
 const std = @import("std");
 const testing = std.testing;
+const pulse_rank = @import("pulse_rank.zig");
+const pulse_needle = @import("pulse_needle.zig");
+
+/// Serial executor only. All buffers are caller-owned for this call.
+export fn slowclaw_feed_needle_embed(text: ?[*]const u8, len: usize, out: ?[*]f32, count: usize) c_int {
+    if (len == 0 or len > 1200 or count != 3072) return -1;
+    const ptr = text orelse return -1;
+    const result = out orelse return -1;
+    pulse_needle.embed(ptr[0..len], result[0..count]) catch return -1;
+    return 0;
+}
+export fn slowclaw_feed_pulse_rank(query: ?[*]const u8, query_len: usize, posts: ?[*]const u8, posts_len: usize, cosine: ?[*]const f64, out: ?[*]f64, count: usize) c_int {
+    if (count == 0 or count > 120 or query_len > 10000 or posts_len > 400000) return -1;
+    const q = query orelse return -1;
+    const p = posts orelse return -1;
+    const c = cosine orelse return -1;
+    const o = out orelse return -1;
+    const interests = std.json.parseFromSlice([]pulse_rank.Interest, std.heap.c_allocator, q[0..query_len], .{}) catch return -1;
+    defer interests.deinit();
+    const documents = std.json.parseFromSlice([][]const u8, std.heap.c_allocator, p[0..posts_len], .{}) catch return -1;
+    defer documents.deinit();
+    pulse_rank.rank(std.heap.c_allocator, interests.value, documents.value, c[0..count], o[0..count]) catch return -1;
+    return 0;
+}
+
+test "ffi pulse validates buffers and hybrid rank" {
+    try testing.expectEqual(@as(c_int, -1), slowclaw_feed_needle_embed(null, 0, null, 0));
+    const q = "[{\"topic\":\"AI\",\"weight\":1}]";
+    const p = "[\"AI on phones\",\"football results\"]";
+    var scores: [2]f64 = undefined;
+    try testing.expectEqual(@as(c_int, 0), slowclaw_feed_pulse_rank(q, q.len, p, p.len, &.{ 0.9, 0.95 }, &scores, 2));
+    try testing.expect(scores[0] > scores[1]);
+    try testing.expectEqual(@as(c_int, -1), slowclaw_feed_pulse_rank(q, q.len, p, p.len, &.{ 0.9, 0.95 }, &scores, 1));
+}
 
 const ranker = @import("ranker.zig");
 const embeddings = @import("embeddings.zig");

@@ -1,5 +1,64 @@
 # Needle 3 local Pulse feasibility — 2026-09-22
 
+## Activated experiment for iOS 26.5+ — 2026-09-23
+
+The owner now explicitly accepts a newer-iOS experiment for an iOS 26.7 phone.
+This branch therefore raises the app minimum to **26.5** and enables local
+Needle + BM25 for Pulse. Existing iOS 18 installations need an earlier build.
+Main and signing safeguards are unchanged. Reads and persona learning keep
+their existing Jev paths; short Pulse posts are excluded from cloud relevance
+requests and from the optional Kev Reads judge.
+
+Runtime pin: `Cactus-Compute/needle3`, revision
+`afb64c7f069abd958aa9cadb2cee0b17ca6bf757` (Needle 3.0.0).
+Device SHA256: `716efc8e2cdf345e46d13d3914e6fb856c16704b04d0fddbb045c95fa8f5b4e3`.
+Simulator SHA256: `7ef8de3687103c64551131001d09057403705b0762112ab73b01e3ce3fb029b9`.
+Both archive Mach-O build-version commands specify 26.5. Unlike current 3.0.1,
+this library embeds its weights (~46 MB archive). No additional .cact asset,
+app API key, first-use model download or user enrollment is needed for Needle.
+The build script fetches only pinned public artifacts and verifies SHA256
+before linking; Apache-2.0 attribution/license ships in the app.
+
+**ABI difference:** this release's `needle_embed` takes a nullable audio
+argument. The Zig wrapper uses that exact signature, with audio null. It
+initializes the embedded model once, validates 3072 finite output floats and
+normalizes them. All native work shares the existing serial off-main executor.
+Host tests explicitly return unavailable rather than pretending to embed.
+
+The persona is the normalized weighted sum of embeddings of Jev's top 15
+interest labels. Each post contributes its first 100 words, bounded to 1200
+UTF-8 bytes. The existing relay/signature/spam/content-warning/per-author
+filters remain. At most 40 candidates are ranked per refresh; this remains
+bounded polling, not a continuous unbounded firehose subscription.
+`zig-src/src/pulse_rank.zig` performs weighted BM25 plus reciprocal-rank
+fusion (60% lexical / 40% semantic; k=60). This is an experiment, not a claim
+that keyword bait is solved or scores are relevance probabilities.
+
+Up to 240 embeddings are reused in memory. Profile, candidate content and
+negative/mute feedback changes invalidate ranking. Recording/transcription,
+backgrounding, low-power/thermal pauses, or other model generation stop new
+work between native calls. A single complete, still-current nonempty result
+replaces the protected on-disk Pulse snapshot. Failures, pauses and model
+work never blank an existing feed; mute/negative feedback hides items even
+while older rankings are displayed. Initial empty feeds still require a
+journal-derived profile and a successful relay fetch.
+
+Validation: native Linux 3.0.0 smoke confirms the exact audio-argument ABI,
+embedded weights, finite 3072-dimensional vectors, deterministic repeats,
+different inputs, longer input and non-ASCII input. Zig hybrid/FFI tests pass.
+The artifact preparation script successfully downloads and verifies the
+device archive. CI validates Swift, iOS linking and archive/upload through
+the existing workflow. These checks do not establish physical-device latency,
+battery use, real-journal relevance or iPhone launch behavior.
+
+The prior snapshot build's compile error (`fileWriteFileTooLarge`) was fixed
+with an app-defined error; the repaired Swift regression suite passed in CI.
+Rollback: revert this activation commit to restore Jev Pulse ranking and the
+iOS 18 minimum. The snapshot and reversible Apple draft cleanup remain.
+
+Earlier investigation follows; the compatibility block below applied before
+the owner authorized raising the minimum iOS version.
+
 ## Follow-up: hybrid experiment authorized, native iOS compatibility blocked (2026-09-23)
 
 The owner authorized an experimental Needle + BM25 Pulse despite the quality

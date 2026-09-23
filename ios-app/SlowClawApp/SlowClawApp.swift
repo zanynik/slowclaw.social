@@ -498,20 +498,66 @@ final class AppState: ObservableObject {
     @Published private var pulseSnapshot = PulseSnapshot.load()
     @Published private(set) var pulseSnapshotError: String?
 
-    private func keepRankedPulse() {
-        // Publishing one snapshot after a completed ranking prevents refresh
-        // invalidation from making the visible timeline disappear.
-        let candidates = readsItems.filter { $0.sourceLabel == "Nostr posts" && readingSignals[$0.id]?.preference != -1 }
-        guard !candidates.isEmpty, candidates.allSatisfy({ item in
-            guard let decision = readsDecisions[item.id] else { return false }
-            return decision.revision == memoryRevision && decision.text == Self.readsDecisionText(item)
-        }) else { return }
-        let next = Array(relevantFeedItems.filter { $0.sourceLabel == "Nostr posts" }.prefix(40))
-        guard !next.isEmpty else { return }
+    @Published private(set) var pulseRankingBusy = false
+    private var pulseRankedKey = ""
+
+    func startPulseRanking() {
+        guard !pulseRankingBusy, !contextWorkPaused, !localModelBusy, !isGeneratingPosts else { return }
+        pulseRankingBusy = true
+        Task {
+            defer { pulseRankingBusy = false }
+            await rankPulse()
+        }
+    }
+
+    private func rankPulse() async {
+        let interests = JevBatch.profile(personaWeights)
+        guard !interests.isEmpty else { return }
+        let candidates = Array(readsItems.filter {
+            $0.sourceLabel == "Nostr posts" && readingSignals[$0.id]?.preference != -1
+                && !$0.description.contains("\0")
+                && !NostrInbox.shared.hiddenAuthors.contains(PulseNote.decode($0)?.pubkey ?? "")
+        }.prefix(40))
+        guard !candidates.isEmpty else { return }
+        let profile = JevBatch.profileID(interests)
+        let key = JevBatch.digest(profile + candidates.map(Self.readsDecisionText).joined(separator: "\n"))
+        guard key != pulseRankedKey else { return }
+        let revision = memoryRevision
         do {
+            let texts = candidates.map { JevBatch.excerpt(title: "", body: $0.description) }
+            var topicVectors: [[Float]] = [], postVectors: [[Float]] = []
+            for topic in interests {
+                try checkPulseWork()
+                topicVectors.append(try await PulseRanking.shared.embedding(topic.topic))
+            }
+            for text in texts {
+                try checkPulseWork()
+                postVectors.append(try await PulseRanking.shared.embedding(text))
+            }
+            try checkPulseWork()
+            let scores = try await PulseRanking.shared.rank(texts: texts, interests: interests,
+                topicVectors: topicVectors, postVectors: postVectors)
+            try checkPulseWork()
+            guard revision == memoryRevision, profile == JevBatch.profileID(JevBatch.profile(personaWeights)) else { return }
+            // Ignore results for candidates replaced while native work was running.
+            let current = Dictionary(readsItems.map { ($0.id, Self.readsDecisionText($0)) }, uniquingKeysWith: { first, _ in first })
+            guard candidates.allSatisfy({ current[$0.id] == Self.readsDecisionText($0) }) else { return }
+            let next = candidates.indices.sorted {
+                scores[$0] == scores[$1] ? candidates[$0].id < candidates[$1].id : scores[$0] > scores[$1]
+            }.map { candidates[$0] }.filter {
+                readingSignals[$0.id]?.preference != -1
+                    && !NostrInbox.shared.hiddenAuthors.contains(PulseNote.decode($0)?.pubkey ?? "")
+            }
+            guard !next.isEmpty else { return }
             try PulseSnapshot.save(next)
-            pulseSnapshot = next; pulseSnapshotError = nil
-        } catch { pulseSnapshotError = "Could not save the refreshed Pulse. Previous posts are still available." }
+            pulseSnapshot = next; pulseRankedKey = key; pulseSnapshotError = nil
+        } catch is CancellationError { /* Leave the last good timeline visible. */ }
+        catch { pulseSnapshotError = error.localizedDescription }
+    }
+
+    private func checkPulseWork() throws {
+        try Task.checkCancellation()
+        guard !contextWorkPaused, !localModelBusy, !isGeneratingPosts else { throw CancellationError() }
     }
     private var relevantFeedItems: [RankedFeedItem] {
         guard jevEnabled || readsModelEnabled else { return [] }
@@ -596,7 +642,7 @@ final class AppState: ObservableObject {
     /// The larger generative model and keyword/embedding retrieval never grant
     /// admission. Pauses, missing context, missing models and errors abstain.
     func refreshReadsDecisions() async {
-        defer { keepRankedPulse() }
+        startPulseRanking()
         if jevEnabled {
             guard jevReadingTask == nil else { return }
             let task = Task { await rankJevReads() }
@@ -645,7 +691,7 @@ final class AppState: ObservableObject {
         let revision = memoryRevision
         let pending = readsItems.filter {
             let prior = readsDecisions[$0.id]
-            return readingSignals[$0.id]?.preference != -1 &&
+            return $0.sourceLabel != "Nostr posts" && readingSignals[$0.id]?.preference != -1 &&
                 (prior?.revision != revision || prior?.text != Self.readsDecisionText($0))
         }
         guard !pending.isEmpty else { readsDecisionStatus = nil; return }
@@ -5378,6 +5424,7 @@ extension AppState {
         await resumeJevWork()
     }
     func resumeJevWork() async {
+        if selectedTab == .pulse { startPulseRanking() }
         guard jevEnabled, !jevConnecting, !contextWorkPaused else { return }
         if !JevCloud.shared.connected {
             guard Date().timeIntervalSince(lastJevConnectionAttempt) > 60 else { return }
@@ -5563,7 +5610,7 @@ extension AppState {
         defer { readsDecisionBusy = false; prepareDailySelection() }
         do {
             if batchRelevanceCache.profile != profile { batchRelevanceCache = .init(profile: profile) }
-            let current = readsItems.filter { readingSignals[$0.id]?.preference != -1 }
+            let current = readsItems.filter { $0.sourceLabel != "Nostr posts" && readingSignals[$0.id]?.preference != -1 }
             var pending: [JevBatch.Candidate] = [], seen = Set<String>()
             for item in current {
                 let identity = Self.readsDecisionText(item), id = JevBatch.digest(identity)
@@ -5588,7 +5635,7 @@ extension AppState {
                 next.trim(); try next.save(); batchRelevanceCache = next
                 // Re-read current candidates after suspension. An edited/replaced
                 // candidate cannot inherit a decision for the old content.
-                for item in readsItems where readingSignals[item.id]?.preference != -1 {
+                for item in readsItems where item.sourceLabel != "Nostr posts" && readingSignals[item.id]?.preference != -1 {
                     let identity = Self.readsDecisionText(item)
                     if let score = next.score(for: JevBatch.digest(identity), profile: profile) {
                         readsDecisions[item.id] = .init(text: identity, score: score, revision: revision)
