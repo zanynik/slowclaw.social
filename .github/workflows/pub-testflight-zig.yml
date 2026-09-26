@@ -95,9 +95,11 @@ jobs:
                   xcodegen --version
 
             - name: Test studio image and media exports on iOS Simulator
+              timeout-minutes: 10
               run: bash ios-app/Tests/studio-media-smoke.sh
 
             - name: Keep synthetic studio export evidence
+              if: always()
               uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
               with:
                   name: studio-export-evidence

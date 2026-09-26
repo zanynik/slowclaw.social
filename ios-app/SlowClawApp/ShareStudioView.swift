@@ -78,6 +78,7 @@ struct ShareStudioView: View {
     @State private var last = 0
     @State private var envelope: [Float] = []
     @State private var player: AVPlayer?
+    @State private var playing = false
     @State private var elapsed = 0.0
     @State private var preparing = false
     @State private var exporting = false
@@ -138,9 +139,9 @@ struct ShareStudioView: View {
         .onChange(of: mode) { _, _ in stopPreview(); issue = nil; refreshPreview() }
         .onChange(of: scenePhase) { _, phase in if phase == .background { stopPreview(); work?.cancel() } }
         .onReceive(timer) { _ in
-            guard let player, player.rate > 0, let clip else { return }
+            guard playing, let player, let clip else { return }
             elapsed = max(0, player.currentTime().seconds - clip.start)
-            if elapsed >= clip.duration - 0.04 { player.pause() }
+            if elapsed >= clip.duration - 0.04 { player.pause(); playing = false }
             refreshPreview()
         }
         .onDisappear { stopPreview(); work?.cancel() }
@@ -180,7 +181,7 @@ struct ShareStudioView: View {
             if let clip {
                 Text("\(clip.duration, specifier: "%.1f") seconds · original voice").font(.caption).foregroundStyle(.secondary)
                 Text(clip.words.map(\.text).joined(separator: " ")).font(.callout).textSelection(.enabled)
-                Button((player?.rate ?? 0) > 0 ? "Pause preview" : "Play this clip", systemImage: "play.circle") { playPreview() }.disabled(exporting)
+                Button(playing ? "Pause preview" : "Play this clip", systemImage: "play.circle") { playPreview() }.disabled(exporting)
                 if needsSelection { Button("Use the words shown above") { needsSelection = false } }
                 HStack {
                     Button("Share video", systemImage: "film") { exportVideo() }.buttonStyle(.borderedProminent)
@@ -230,9 +231,9 @@ struct ShareStudioView: View {
             catch { issue = error.localizedDescription }
         }
     }
-    private func stopPreview() { player?.pause(); player = nil; elapsed = 0 }
+    private func stopPreview() { player?.pause(); player = nil; playing = false; elapsed = 0 }
     private func playPreview() {
-        if let player, player.rate > 0 { player.pause(); return }
+        if let player, playing { player.pause(); playing = false; return }
         guard let audio = source.audio, let clip else { return }
         guard !state.recorder.isRecording, !state.recorder.isFinalizing else { issue = "Finish recording before playing this clip."; return }
         do { try validateSource(); try AVAudioSession.sharedInstance().setCategory(.playback); try AVAudioSession.sharedInstance().setActive(true) }
@@ -240,7 +241,7 @@ struct ShareStudioView: View {
         let next = AVPlayer(url: audio)
         next.currentItem?.forwardPlaybackEndTime = CMTime(seconds: clip.end, preferredTimescale: 600)
         next.seek(to: CMTime(seconds: clip.start, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
-        player = next; elapsed = 0; next.play()
+        player = next; elapsed = 0; playing = true; next.play()
     }
     private func exportVideo(audioOnly: Bool = false) {
         guard let audio = source.audio, let clip, !exporting else { return }

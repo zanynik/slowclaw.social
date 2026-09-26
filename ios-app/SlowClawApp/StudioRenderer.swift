@@ -214,11 +214,10 @@ enum StudioExporter {
         try v.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: videoTrack, at: .zero)
         try a.insertTimeRange(CMTimeRange(start: CMTime(seconds: clip.start, preferredTimescale: 600), duration: duration), of: audioTrack, at: .zero)
         guard let export = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else { throw StudioError(message: "Cannot prepare the final video.") }
-        export.outputURL = finalURL; export.outputFileType = .mp4; export.shouldOptimizeForNetworkUse = true
-        await withTaskCancellationHandler {
-            await export.export()
+        export.shouldOptimizeForNetworkUse = true
+        try await withTaskCancellationHandler {
+            try await export.export(to: finalURL, as: .mp4)
         } onCancel: { export.cancelExport() }
-        guard export.status == .completed else { throw export.error ?? StudioError(message: "Video export was cancelled.") }
         try Task.checkCancellation()
         try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: finalURL.path)
         try? FileManager.default.removeItem(at: silentURL)

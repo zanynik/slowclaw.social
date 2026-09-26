@@ -14,8 +14,12 @@ lines += ['    settings:', '      base:', '        GENERATE_INFOPLIST_FILE: YES'
 PY
 xcodegen generate --spec "$STUDIO_TEST_ROOT/project.yml"
 STUDIO_DEVICE="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for key,values in d["devices"].items() if "iOS" in key for x in values if "iPhone" in x["name"]))')"
-xcodebuild test -project "$STUDIO_TEST_ROOT/StudioSmoke.xcodeproj" -scheme StudioSmoke -destination "platform=iOS Simulator,id=$STUDIO_DEVICE" -parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 -quiet
 mkdir -p /tmp/slowclaw-studio-evidence
+set +e
+xcodebuild test -project "$STUDIO_TEST_ROOT/StudioSmoke.xcodeproj" -scheme StudioSmoke -destination "platform=iOS Simulator,id=$STUDIO_DEVICE" -parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 -resultBundlePath /tmp/slowclaw-studio-evidence/results.xcresult -test-timeouts-enabled YES -default-test-execution-time-allowance 120
+STUDIO_RESULT=$?
+set -e
+xcrun xcresulttool get test-results summary --path /tmp/slowclaw-studio-evidence/results.xcresult || true
 python3 - "$STUDIO_DEVICE" <<'PY'
 import os, pathlib, shutil, sys
 root=pathlib.Path(os.environ['HOME'])/'Library/Developer/CoreSimulator/Devices'/sys.argv[1]/'data/Containers'
@@ -23,3 +27,5 @@ for p in root.rglob('StudioSmoke/*'):
     if p.is_file() and p.suffix in {'.png','.mp4'}:
         shutil.copy2(p,pathlib.Path('/tmp/slowclaw-studio-evidence')/p.name)
 PY
+
+exit "$STUDIO_RESULT"
