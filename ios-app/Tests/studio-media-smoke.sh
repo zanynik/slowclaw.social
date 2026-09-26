@@ -22,7 +22,7 @@ set -e
 xcrun xcresulttool get test-results summary --path /tmp/slowclaw-studio-evidence/results.xcresult || true
 python3 - "$STUDIO_DEVICE" <<'PY'
 import os, pathlib, shutil, sys
-root=pathlib.Path(os.environ['HOME'])/'Library/Developer/CoreSimulator/Devices'/sys.argv[1]/'data/Containers'
+root=pathlib.Path(os.environ['HOME'])/'Library/Developer/CoreSimulator/Devices'/sys.argv[1]/'data'
 for p in root.rglob('StudioSmoke/*'):
     if p.is_file() and p.suffix in {'.png','.mp4'}:
         shutil.copy2(p,pathlib.Path('/tmp/slowclaw-studio-evidence')/p.name)

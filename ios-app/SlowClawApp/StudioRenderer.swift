@@ -170,9 +170,9 @@ enum StudioExporter {
         let waveform = showWaveform ? try await Task.detached(priority: .userInitiated) { try StudioWaveform.read(audio: audio, clip: clip) }.value : []
         try Task.checkCancellation()
         let writer = try AVAssetWriter(outputURL: silentURL, fileType: .mp4)
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 720, AVVideoHeightKey: 1280, AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 3_000_000]])
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 720, AVVideoHeightKey: 1280, AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 3_000_000, AVVideoAllowFrameReorderingKey: false, AVVideoExpectedSourceFrameRateKey: 24, AVVideoMaxKeyFrameIntervalKey: 24]])
         input.expectsMediaDataInRealTime = false
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB, kCVPixelBufferWidthKey as String: 720, kCVPixelBufferHeightKey as String: 1280, kCVPixelBufferCGImageCompatibilityKey as String: true, kCVPixelBufferCGBitmapContextCompatibilityKey as String: true])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA, kCVPixelBufferWidthKey as String: 720, kCVPixelBufferHeightKey as String: 1280, kCVPixelBufferCGImageCompatibilityKey as String: true, kCVPixelBufferCGBitmapContextCompatibilityKey as String: true, kCVPixelBufferIOSurfacePropertiesKey as String: [:]])
         guard writer.canAdd(input) else { throw StudioError(message: "Video export is unavailable.") }
         writer.add(input)
         guard writer.startWriting() else { throw writer.error ?? StudioError(message: "Could not start video export.") }
@@ -183,7 +183,7 @@ enum StudioExporter {
                 try Task.checkCancellation()
                 let deadline = Date().addingTimeInterval(15)
                 while !input.isReadyForMoreMediaData {
-                    guard writer.status == .writing, Date() < deadline else { throw writer.error ?? StudioError(message: "Video export stalled. Please retry.") }
+                    guard writer.status == .writing, Date() < deadline else { throw writer.error ?? StudioError(message: "Video export stalled at frame \(frame) of \(frames). Please retry.") }
                     try await Task.sleep(nanoseconds: 5_000_000)
                 }
                 try autoreleasepool {
@@ -192,7 +192,7 @@ enum StudioExporter {
                     guard let pool = adaptor.pixelBufferPool, CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optional) == kCVReturnSuccess, let buffer = optional else { throw StudioError(message: "Not enough memory to render video.") }
                     CVPixelBufferLockBaseAddress(buffer, [])
                     defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-                    guard let context = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: 720, height: 1280, bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue), let cgImage = image.cgImage else { throw StudioError(message: "Could not draw a video frame.") }
+                    guard let context = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: 720, height: 1280, bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue), let cgImage = image.cgImage else { throw StudioError(message: "Could not draw a video frame.") }
                     context.draw(cgImage, in: CGRect(x: 0, y: 0, width: 720, height: 1280))
                     guard adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(frame), timescale: 24)) else { throw writer.error ?? StudioError(message: "Could not encode a video frame.") }
                 }

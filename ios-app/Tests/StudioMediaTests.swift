@@ -53,7 +53,7 @@ final class StudioMediaTests: XCTestCase {
         XCTAssertEqual(size, CGSize(width: 720, height: 1280))
         let generator = AVAssetImageGenerator(asset: video)
         generator.requestedTimeToleranceBefore = .zero; generator.requestedTimeToleranceAfter = .zero
-        let frame = try await generator.image(at: CMTime(seconds: 0.2, preferredTimescale: 600)).image
+        let frame = try await generator.image(at: CMTime(value: 5, timescale: 24)).image
         try UIImage(cgImage: frame).pngData()!.write(to: folder.appendingPathComponent("encoded-frame.png"))
         let destination = folder.appendingPathComponent("sample.mp4")
         try? FileManager.default.removeItem(at: destination)
