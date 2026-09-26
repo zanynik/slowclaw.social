@@ -39,5 +39,11 @@ final class TimedTranscriptTests: XCTestCase {
         XCTAssertNotNil(TimedTranscriptStore.load(for: audio))
         try Data([3, 4, 5]).write(to: audio)
         XCTAssertNil(TimedTranscriptStore.load(for: audio))
+        try TimedTranscriptStore.save(value, for: audio)
+        XCTAssertNotNil(TimedTranscriptStore.load(for: audio))
+        let stamp = TimedTranscriptStore.stamp(audio)!
+        try Data([6, 7, 8]).write(to: audio)
+        try FileManager.default.setAttributes([.modificationDate: stamp.modified.addingTimeInterval(1)], ofItemAtPath: audio.path)
+        XCTAssertNil(TimedTranscriptStore.load(for: audio), "Same-size replacements also invalidate timings.")
     }
 }

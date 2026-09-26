@@ -77,9 +77,11 @@ enum TimedTranscriptStore {
         let transcript: TimedTranscript
     }
     static func stamp(_ url: URL) -> AudioStamp? {
-        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
-              let size = values.fileSize, let date = values.contentModificationDate else { return nil }
-        return .init(size: size, modified: date)
+        // URL.resourceValues can reuse cached values after the file changes.
+        // Read filesystem attributes afresh for every source-identity check.
+        guard let values = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = values[.size] as? NSNumber, let date = values[.modificationDate] as? Date else { return nil }
+        return .init(size: size.intValue, modified: date)
     }
     static func url(for audio: URL) -> URL { audio.appendingPathExtension("words.json") }
     static func load(for audio: URL) -> TimedTranscript? {
