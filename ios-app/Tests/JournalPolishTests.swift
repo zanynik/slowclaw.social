@@ -45,12 +45,15 @@ final class JournalPolishTests: XCTestCase {
     func testSharingIdeasFailClosedWithoutConflatingImportanceAndUsefulness() {
         let passage = JevMemory.Passage(id: "source", sourceKey: "journal", text: "A thought.", category: "insight", score: 1)
         XCTAssertTrue(JevIdeas.select([passage], decisions: [:]).isEmpty)
-        for decision in [JevIdeas.Decision(id: "source", score: 0.69, privateScore: 0),
-                         .init(id: "source", score: 1, privateScore: 0.3),
-                         .init(id: "source", score: .nan, privateScore: 0)] {
+        for decision in [JevIdeas.Decision(id: "source", score: 0.69, privateScore: 0, standalone: 1, quote: 1),
+                         .init(id: "source", score: 1, privateScore: 0.3, standalone: 1, quote: 1),
+                         .init(id: "source", score: 1, privateScore: 0, standalone: 0.59, quote: 1),
+                         .init(id: "source", score: .nan, privateScore: 0, standalone: 1, quote: 1)] {
             XCTAssertTrue(JevIdeas.select([passage], decisions: ["source": decision]).isEmpty)
         }
-        XCTAssertEqual(JevIdeas.select([passage], decisions: ["source": .init(id: "source", score: 0.8, privateScore: 0.1)]).count, 1)
+        let decision = JevIdeas.Decision(id: "source", score: 0.8, privateScore: 0.1, standalone: 0.8, quote: 0.8)
+        XCTAssertEqual(JevIdeas.select([passage], decisions: ["source": decision]).count, 1)
+        XCTAssertTrue(decision.shareableQuote)
     }
     func testReadingHistoryDurationIsMeasuredNotArticleEstimate() {
         let visit = ReadingVisit(url: "https://example.com", title: "Article", source: "Web", date: Date(), seconds: 425)

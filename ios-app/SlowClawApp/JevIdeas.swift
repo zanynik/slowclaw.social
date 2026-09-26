@@ -1,19 +1,22 @@
 import Foundation
 
 enum JevIdeas {
-    static let version = "jev-sharing-v1"
+    static let version = "jev-sharing-v2"
     struct Decision: Codable {
         let id: String
         let score: Double
         let privateScore: Double
-        var valid: Bool { score.isFinite && privateScore.isFinite && (0...1).contains(score) && (0...1).contains(privateScore) }
-        var suggested: Bool { valid && score >= 0.7 && privateScore < 0.3 }
+        let standalone: Double
+        let quote: Double
+        var valid: Bool { [score, privateScore, standalone, quote].allSatisfy { $0.isFinite && (0...1).contains($0) } }
+        var suggested: Bool { valid && score >= 0.7 && privateScore < 0.3 && standalone >= 0.6 }
+        var shareableQuote: Bool { suggested && quote >= 0.7 }
     }
     struct Cache: Codable {
         var version = JevIdeas.version
         var decisions: [String: Decision] = [:]
         private static var url: URL {
-            FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("jev-ideas-v1.json")
+            FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("jev-ideas-v2.json")
         }
         static func load() -> Cache {
             guard let cache = try? JSONDecoder().decode(Cache.self, from: Data(contentsOf: url)),

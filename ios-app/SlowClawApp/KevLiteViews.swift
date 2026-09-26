@@ -38,13 +38,17 @@ struct DraftsView: View {
                         ForEach(Array(state.sharingIdeas.prefix(5))) { passage in
                             VStack(alignment: .leading, spacing: 10) {
                                 HStack {
-                                    Text("Your words").font(.caption).foregroundStyle(.secondary)
+                                    Text(state.ideaCache.decisions[passage.id]?.shareableQuote == true ? "A quote in your words" : "An idea in your words")
+                                        .font(.caption).foregroundStyle(.secondary)
                                     Spacer()
                                     CopyTextButton(text: passage.text)
                                 }
                                 Text(passage.text).textSelection(.enabled)
                                 HStack {
                                     Button("Make draft") { state.makePassageDraft(passage) }
+                                    if state.ideaCache.decisions[passage.id]?.shareableQuote == true {
+                                        ShareLink("Share quote", item: passage.text.trimmingCharacters(in: .whitespacesAndNewlines))
+                                    }
                                     Spacer()
                                     Button("Source") { source = state.memorySource(passage.sourceKey) }
                                 }.font(.caption).buttonStyle(.borderless)
