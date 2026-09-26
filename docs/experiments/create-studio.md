@@ -2,7 +2,7 @@
 
 ## Behavior
 
-Create → Make a quote card or audio video opens a journal picker. The Design
+Create → + → Make your own opens a journal picker. The Design
 button on a Jev passage opens the same editor with that exact excerpt. Quote
 cards have editable wording/attribution, Midnight/Cobalt/Paper backgrounds,
 and 1080px exports in 4:5, 9:16 or square. Design changes persist locally without
@@ -76,7 +76,8 @@ Audio windows retain native word indices and a timing fingerprint, including
 repeated text at different positions. Cards are previews; MP4 encoding happens
 only on Share. One preview plays at a time. Designs, chosen format and confirmed
 word boundaries survive editing. Edit opens full-screen above the app tabs;
-its Share and Play/Pause controls stay in a bottom safe-area inset. The feed
+its Share and Play/Pause controls stay in a dedicated bottom row while the
+editing content scrolls. The feed
 keeps direct actions beside each card, with extra bottom scrolling space.
 Manual creation and existing text drafts live in the toolbar menu.
 
@@ -88,5 +89,8 @@ the earlier Create layout; original recordings and journals are untouched.
 Validation adds source-range, overlap/privacy, cache invalidation, and batch
 budget tests. The simulator hosts the actual studio view with synthetic journal
 storage and checks Share and Play/Pause hit targets above a simulated tab bar in
-a 667-point viewport, retaining screenshots. It also reruns PNG/MP4/M4A exports.
+a compact viewport of at most 667 points, retaining screenshots. An Edit → Done
+check verifies changed word boundaries return to the feed card. The host declares
+a native launch screen to avoid legacy iPhone compatibility sizing. The workflow
+also reruns PNG/MP4/M4A exports.
 Real-journal insight quality and device speech alignment require user feedback.
