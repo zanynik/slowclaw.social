@@ -44,12 +44,14 @@ enum AppTab { case drafts, journal }
         WindowGroup {
             if ProcessInfo.processInfo.arguments.contains("--studio-ui-test") {
                 NavigationStack {
-                    ShareStudioView(source: source).environmentObject(state)
+                    if ProcessInfo.processInfo.arguments.contains("--card") {
+                        ScrollView { ShareStudioView(source: source, compact: true).environmentObject(state).padding() }
+                    } else { ShareStudioView(source: source).environmentObject(state) }
                 }
                 .safeAreaInset(edge: .bottom, spacing: 0) {
                     Text("Journal · Reads · Create · Profile").frame(maxWidth: .infinity).frame(height: 70)
                         .background(.regularMaterial).accessibilityIdentifier("slowclaw.tabs")
-                }.frame(height: 667)
+                }.frame(maxHeight: 667)
             } else { Color.black }
         }
     }

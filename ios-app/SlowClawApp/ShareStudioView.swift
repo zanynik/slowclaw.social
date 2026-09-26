@@ -112,11 +112,13 @@ struct ShareStudioView: View {
     var body: some View {
         Group {
             if compact { content }
-            else { ScrollView { content.padding().padding(.bottom, 20) }.scrollDismissesKeyboard(.interactively)
-                .navigationTitle("Edit creation").navigationBarTitleDisplayMode(.inline) }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if !compact { actionBar.controlSize(.large).padding().background(.regularMaterial) }
+            else {
+                VStack(spacing: 0) {
+                    ScrollView { content.padding().padding(.bottom, 20) }.scrollDismissesKeyboard(.interactively)
+                    actionBar.controlSize(.large).padding().background(.regularMaterial)
+                }
+                .navigationTitle("Edit creation").navigationBarTitleDisplayMode(.inline)
+            }
         }
         .toolbar {
             if !compact {
@@ -125,7 +127,7 @@ struct ShareStudioView: View {
         }
         .interactiveDismissDisabled(exporting || preparing)
         .sheet(item: $share) { value in StudioShareSheet(url: value.url) }
-        .fullScreenCover(isPresented: $editing, onDismiss: { draft = StudioDraft.load(source); mode = draft.format ?? mode; refreshPreview(); Task { if let audio = source.audio, let saved = TimedTranscriptStore.load(for: audio) { await useTiming(saved) } } }) {
+        .fullScreenCover(isPresented: $editing, onDismiss: reloadDesign) {
             NavigationStack { ShareStudioView(source: source).environmentObject(state) }
         }
         .task {
@@ -211,6 +213,7 @@ struct ShareStudioView: View {
             Button("Prepare audio story", systemImage: "waveform") { prepareTiming() }.buttonStyle(.borderedProminent).frame(minHeight: 44)
         } else if clip != nil {
             VStack(spacing: 8) {
+                if let clip { Text("\(clip.duration, specifier: "%.1f") seconds").font(.caption).foregroundStyle(.secondary).accessibilityIdentifier("studio.duration") }
                 if needsSelection { Button("Use selected words") { needsSelection = false }.frame(minHeight: 44) }
                 HStack(spacing: 14) {
                     Button(playing ? "Pause" : "Play", systemImage: playing ? "pause.fill" : "play.fill") { playPreview() }
@@ -223,6 +226,22 @@ struct ShareStudioView: View {
                 }
             }
         } else { Text("Choose a clip of up to 90 seconds.").font(.callout) }
+    }
+    private func reloadDesign() {
+        stopPreview()
+        let saved = StudioDraft.load(source)
+        // Restore the edited range before changing mode. Otherwise the mode's
+        // waveform task could persist the old feed range over the new edit.
+        if let transcript, saved.timingID == timingIdentity, saved.selectionConfirmed == true,
+           let a = saved.firstWord, let b = saved.lastWord, a <= b,
+           transcript.words.indices.contains(a), transcript.words.indices.contains(b) {
+            first = a; last = b; needsSelection = false
+        }
+        draft = saved; mode = saved.format ?? mode
+        refreshPreview()
+        if transcript == nil, let audio = source.audio, let timing = TimedTranscriptStore.load(for: audio) {
+            Task { await useTiming(timing) }
+        }
     }
     private func shareQuote() {
         state.studioPlayingID = nil
@@ -256,7 +275,7 @@ struct ShareStudioView: View {
             Text("Start · \(transcript.words[first].text)").font(.subheadline)
             Slider(value: Binding(get: { Double(first) }, set: { first = Int($0); last = max(first, last); needsSelection = false }), in: 0...Double(max(1, transcript.words.count - 1)), step: 1).disabled(transcript.words.count < 2 || exporting)
             Text("End · \(transcript.words[last].text)").font(.subheadline)
-            Slider(value: Binding(get: { Double(last) }, set: { last = max(first, Int($0)); needsSelection = false }), in: 0...Double(max(1, transcript.words.count - 1)), step: 1).disabled(transcript.words.count < 2 || exporting)
+            Slider(value: Binding(get: { Double(last) }, set: { last = max(first, Int($0)); needsSelection = false }), in: 0...Double(max(1, transcript.words.count - 1)), step: 1).disabled(transcript.words.count < 2 || exporting).accessibilityIdentifier("studio.endWord")
             if let clip {
                 Text("\(clip.duration, specifier: "%.1f") seconds · original voice").font(.caption).foregroundStyle(.secondary)
                 Text(clip.words.map(\.text).joined(separator: " ")).font(.callout).textSelection(.enabled)
