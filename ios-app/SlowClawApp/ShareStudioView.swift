@@ -213,7 +213,7 @@ struct ShareStudioView: View {
             Button("Prepare audio story", systemImage: "waveform") { prepareTiming() }.buttonStyle(.borderedProminent).frame(minHeight: 44)
         } else if clip != nil {
             VStack(spacing: 8) {
-                if let clip { Text("\(clip.duration, specifier: "%.1f") seconds").font(.caption).foregroundStyle(.secondary).accessibilityIdentifier("studio.duration") }
+                if let clip { Text("\(clip.duration, specifier: "%.1f") seconds").font(.caption).foregroundStyle(.secondary).accessibilityIdentifier(compact ? "studio.cardDuration" : "studio.duration") }
                 if needsSelection { Button("Use selected words") { needsSelection = false }.frame(minHeight: 44) }
                 HStack(spacing: 14) {
                     Button(playing ? "Pause" : "Play", systemImage: playing ? "pause.fill" : "play.fill") { playPreview() }

@@ -79,7 +79,9 @@ word boundaries survive editing. Edit opens full-screen above the app tabs;
 its Share and Play/Pause controls stay in a dedicated bottom row while the
 editing content scrolls. The feed
 keeps direct actions beside each card, with extra bottom scrolling space.
-Manual creation and existing text drafts live in the toolbar menu.
+The app shell reserves a separate layout row for the activity/tab bar so nested
+navigation content cannot extend its controls beneath the tabs. Manual creation
+and existing text drafts live in the toolbar menu.
 
 Proven → Better → New: reuse the existing studio and multi-question classifier;
 make refresh cheaper and buttons reachable; add the selected media feed on top.

@@ -2546,36 +2546,45 @@ struct AppShell: View {
     @State private var visitedTabs: Set<AppTab> = [.journal]
     @AppStorage("slowclaw.welcome.v1") private var welcomed = false
     var body: some View {
-        ZStack {
-            // Capture and autosave stay alive even while another tab is
-            // visible. Do not recreate the recorder on every tab switch.
-            JournalView(recorder: state.recorder)
-                .opacity(state.selectedTab == .journal ? 1 : 0)
-                .allowsHitTesting(state.selectedTab == .journal)
-                .accessibilityHidden(state.selectedTab != .journal)
-            if visitedTabs.contains(.reads) {
-                ReadsView()
-                    .opacity(state.selectedTab == .reads ? 1 : 0)
-                    .allowsHitTesting(state.selectedTab == .reads)
-                    .accessibilityHidden(state.selectedTab != .reads)
+        VStack(spacing: 0) {
+            ZStack {
+                // Capture and autosave stay alive even while another tab is
+                // visible. Do not recreate the recorder on every tab switch.
+                JournalView(recorder: state.recorder)
+                    .opacity(state.selectedTab == .journal ? 1 : 0)
+                    .allowsHitTesting(state.selectedTab == .journal)
+                    .accessibilityHidden(state.selectedTab != .journal)
+                if visitedTabs.contains(.reads) {
+                    ReadsView()
+                        .opacity(state.selectedTab == .reads ? 1 : 0)
+                        .allowsHitTesting(state.selectedTab == .reads)
+                        .accessibilityHidden(state.selectedTab != .reads)
+                }
+                if visitedTabs.contains(.drafts) {
+                    DraftsView()
+                        .opacity(state.selectedTab == .drafts ? 1 : 0)
+                        .allowsHitTesting(state.selectedTab == .drafts)
+                        .accessibilityHidden(state.selectedTab != .drafts)
+                }
+                if visitedTabs.contains(.profile) {
+                    ProfileView()
+                        .opacity(state.selectedTab == .profile ? 1 : 0)
+                        .allowsHitTesting(state.selectedTab == .profile)
+                        .accessibilityHidden(state.selectedTab != .profile)
+                }
+                if visitedTabs.contains(.pulse) {
+                    PulseView()
+                        .opacity(state.selectedTab == .pulse ? 1 : 0)
+                        .allowsHitTesting(state.selectedTab == .pulse)
+                        .accessibilityHidden(state.selectedTab != .pulse)
+                }
             }
-            if visitedTabs.contains(.drafts) {
-                DraftsView()
-                    .opacity(state.selectedTab == .drafts ? 1 : 0)
-                    .allowsHitTesting(state.selectedTab == .drafts)
-                    .accessibilityHidden(state.selectedTab != .drafts)
-            }
-            if visitedTabs.contains(.profile) {
-                ProfileView()
-                    .opacity(state.selectedTab == .profile ? 1 : 0)
-                    .allowsHitTesting(state.selectedTab == .profile)
-                    .accessibilityHidden(state.selectedTab != .profile)
-            }
-            if visitedTabs.contains(.pulse) {
-                PulseView()
-                    .opacity(state.selectedTab == .pulse ? 1 : 0)
-                    .allowsHitTesting(state.selectedTab == .pulse)
-                    .accessibilityHidden(state.selectedTab != .pulse)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Reserve real layout space for the custom tabs. Nested navigation
+            // containers must not place actions underneath an inset overlay.
+            VStack(spacing: 0) {
+                ActivityBar(recorder: state.recorder)
+                BottomNav(selection: $state.selectedTab, scheme: scheme)
             }
         }
         .onAppear { visitedTabs.insert(state.selectedTab) }
@@ -2589,15 +2598,6 @@ struct AppShell: View {
         .onChange(of: state.selectedTab) { _, tab in visitedTabs.insert(tab) }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.bg(scheme))
-        // Pin the top bar above the content's top safe area, extending the
-        // translucent material under the status bar (matches the reference).
-        // Pin the bottom nav above the home indicator.
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 0) {
-                ActivityBar(recorder: state.recorder)
-                BottomNav(selection: $state.selectedTab, scheme: scheme)
-            }
-        }
         // The Journal tab is now a Voice Memos-style list with the record +
         // pen buttons at its base; the sidebar drawer is removed.
         .background(DS.bg(scheme).ignoresSafeArea())

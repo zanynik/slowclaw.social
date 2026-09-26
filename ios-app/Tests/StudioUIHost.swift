@@ -43,12 +43,13 @@ enum AppTab { case drafts, journal }
     var body: some Scene {
         WindowGroup {
             if ProcessInfo.processInfo.arguments.contains("--studio-ui-test") {
-                NavigationStack {
-                    if ProcessInfo.processInfo.arguments.contains("--card") {
-                        ScrollView { ShareStudioView(source: source, compact: true).environmentObject(state).padding() }
-                    } else { ShareStudioView(source: source).environmentObject(state) }
-                }
-                .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 0) {
+                    NavigationStack {
+                        if ProcessInfo.processInfo.arguments.contains("--card") {
+                            ScrollView { ShareStudioView(source: source, compact: true).environmentObject(state).padding() }
+                        } else { ShareStudioView(source: source).environmentObject(state) }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     Text("Journal · Reads · Create · Profile").frame(maxWidth: .infinity).frame(height: 70)
                         .background(.regularMaterial).accessibilityIdentifier("slowclaw.tabs")
                 }.frame(maxHeight: 667)
