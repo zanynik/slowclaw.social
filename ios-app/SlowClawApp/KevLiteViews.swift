@@ -22,74 +22,75 @@ struct WelcomeView: View {
 
 struct DraftsView: View {
     @EnvironmentObject var state: AppState
+    @State private var choosingSource = false
+    @State private var showingDrafts = false
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 28) {
+                    if state.createIdeas.isEmpty {
+                        ContentUnavailableView("Your moments, ready to share", systemImage: "quote.bubble",
+                            description: Text("Pull down to find quote cards and audio stories in your journals."))
+                        Button("Find moments", systemImage: "sparkles") { Task { await state.refreshCreateIdeas() } }
+                            .buttonStyle(.borderedProminent).disabled(state.createBusy)
+                            .frame(maxWidth: .infinity)
+                    }
+                    if state.createBusy { ProgressView(state.createStatus ?? "Finding moments…") }
+                    ForEach(state.createIdeas) { idea in
+                        if let entry = state.memorySource(idea.key) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                ShareStudioView(source: studioSource(idea, entry: entry), compact: true)
+                                HStack {
+                                    Text(journalTitleOf(entry)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                    Spacer()
+                                    Button("Dismiss", systemImage: "xmark") { state.dismissCreateIdea(idea.id) }
+                                        .font(.caption).frame(minHeight: 44)
+                                }
+                            }.padding(16).background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 20))
+                        }
+                    }
+                    if !state.createBusy, let status = state.createStatus { Text(status).font(.footnote).foregroundStyle(.secondary) }
+                    Color.clear.frame(height: 32)
+                }.padding(.horizontal, 16).padding(.top, 12)
+            }
+            .refreshable { await state.refreshCreateIdeas() }
+            .navigationTitle("Create")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button("Make your own", systemImage: "plus") { choosingSource = true }
+                        Button("Text drafts", systemImage: "text.alignleft") { showingDrafts = true }
+                    } label: { Image(systemName: "plus.circle").frame(width: 44, height: 44) }
+                }
+            }
+            .fullScreenCover(isPresented: $choosingSource) {
+                NavigationStack { CreationSourcePicker().environmentObject(state)
+                    .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { choosingSource = false } } } }
+            }
+            .sheet(isPresented: $showingDrafts) { TextDraftsView().environmentObject(state) }
+            .onChange(of: choosingSource) { _, _ in state.studioPlayingID = nil }
+            .onChange(of: showingDrafts) { _, _ in state.studioPlayingID = nil }
+        }
+    }
+    private func studioSource(_ idea: CreateIdeas.Candidate, entry: SlowClawMemoryEntry) -> StudioSource {
+        var source = StudioSource(entry: entry, excerpt: idea.text)
+        source.id = idea.id; source.segment = idea
+        source.startsWithVideo = idea.timingID != nil && !(state.createCache.decisions[idea.id]?.shareableQuote == true && idea.text.count <= 600)
+        return source
+    }
+}
+
+private struct TextDraftsView: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
     @State private var inbox: DraftInboxState = .new
-    @State private var source: SlowClawMemoryEntry?
-    @State private var studioSource: StudioSource?
     var body: some View {
         NavigationStack {
             List {
-                Section("Studio") {
-                    NavigationLink { CreationSourcePicker().environmentObject(state) } label: {
-                        Label("Make a quote card or audio video", systemImage: "rectangle.portrait.on.rectangle.portrait")
-                    }
-                }
-                Section {
-                    Picker("Draft inbox", selection: $inbox) {
-                        ForEach(DraftInboxState.allCases) { Text($0.rawValue).tag($0) }
-                    }.pickerStyle(.segmented)
-                }
-                if inbox == .new && state.jevEnabled {
-                    Section("Ideas worth sharing") {
-                        if state.jevBusy { ProgressView("Finding ideas…") }
-                        ForEach(Array(state.sharingIdeas.prefix(5))) { passage in
-                            VStack(alignment: .leading, spacing: 10) {
-                                HStack {
-                                    Text(state.ideaCache.decisions[passage.id]?.shareableQuote == true ? "A quote in your words" : "An idea in your words")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                    Spacer()
-                                    CopyTextButton(text: passage.text)
-                                }
-                                Text(passage.text).textSelection(.enabled)
-                                HStack {
-                                    Button("Make draft") { state.makePassageDraft(passage) }
-                                    Button("Design") {
-                                        if let entry = state.memorySource(passage.sourceKey) { studioSource = StudioSource(entry: entry, excerpt: passage.text) }
-                                    }
-                                    Spacer()
-                                    Button("Source") { source = state.memorySource(passage.sourceKey) }
-                                }.font(.caption).buttonStyle(.borderless)
-                            }.padding(.vertical, 8)
-                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                    Button("Dismiss") { state.dismissJevPassage(passage.id) }.tint(.orange)
-                                }
-                        }
-                        if state.sharingIdeas.isEmpty && !state.jevBusy {
-                            Text("Journal first. Thoughts that may help someone else will appear here.").foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                Section(inbox.rawValue) {
-                    let items = state.drafts.filter { state.draftState($0) == inbox }
-                    ForEach(items, id: \.id) { DraftCard(draft: $0, sourceJournalContent: nil) }
-                    if items.isEmpty {
-                        Text(inbox == .new ? "Choose an idea to start a draft." : "No \(inbox.rawValue.lowercased()) drafts yet.")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                if let status = state.kevJournalStatus {
-                    Section { Text(status).font(.caption).foregroundStyle(.secondary) }
-                }
-            }
-            .navigationTitle("Create")
-            .sheet(item: $source) { JournalDetailView(entry: $0).environmentObject(state) }
-            .sheet(item: $studioSource) { value in
-                NavigationStack { ShareStudioView(source: value).environmentObject(state) }
-            }
-            .refreshable { await state.refreshDraftIdeas() }
-            .toolbar {
-                Button("Find ideas", systemImage: "arrow.clockwise") { state.startJevMemory() }
-                    .disabled(state.jevBusy || state.jevFeedsBusy || state.readsDecisionBusy || state.kevJournalBusy)
-            }
+                Picker("Draft inbox", selection: $inbox) { ForEach(DraftInboxState.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented)
+                ForEach(state.drafts.filter { state.draftState($0) == inbox }, id: \.id) { DraftCard(draft: $0, sourceJournalContent: nil) }
+            }.navigationTitle("Text drafts")
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
     }
 }

@@ -2,7 +2,7 @@ import SwiftUI
 import AVKit
 
 struct StudioSource: Identifiable {
-    let id: String
+    var id: String
     let key: String
     let title: String
     let content: String
@@ -10,6 +10,8 @@ struct StudioSource: Identifiable {
     let audio: URL?
     let mediaPath: String?
     let initialQuote: String
+    var segment: CreateIdeas.Candidate? = nil
+    var startsWithVideo = false
     @MainActor init(entry: SlowClawMemoryEntry, excerpt: String? = nil) {
         key = entry.key; title = journalTitleOf(entry); content = entry.content
         self.excerpt = excerpt
@@ -35,6 +37,11 @@ private struct StudioDraft: Codable, Equatable {
     var theme = StudioTheme.midnight
     var aspect = StudioAspect.portrait
     var waveform = true
+    var format: String?
+    var firstWord: Int?
+    var lastWord: Int?
+    var timingID: String?
+    var selectionConfirmed: Bool?
     static func url(_ source: StudioSource) -> URL { StudioDraftFiles.directory(key: source.key).appendingPathComponent(source.id + ".json") }
     static func load(_ source: StudioSource) -> StudioDraft {
         (try? JSONDecoder().decode(Self.self, from: Data(contentsOf: url(source)))) ?? .init(quote: source.initialQuote)
@@ -67,12 +74,16 @@ struct CreationSourcePicker: View {
 @MainActor
 struct ShareStudioView: View {
     let source: StudioSource
+    var compact = false
+    @Environment(\.dismiss) private var dismiss
+    @State private var editing = false
     @EnvironmentObject var state: AppState
     @Environment(\.scenePhase) private var scenePhase
     @State private var draft: StudioDraft
     @State private var mode = "Quote"
     @State private var preview: UIImage?
     @State private var transcript: TimedTranscript?
+    @State private var timingIdentity: String?
     @State private var duration = 0.0
     @State private var first = 0
     @State private var last = 0
@@ -89,40 +100,44 @@ struct ShareStudioView: View {
     @State private var work: Task<Void, Never>?
     @State private var share: SharedAsset?
     private let timer = Timer.publish(every: 0.08, on: .main, in: .common).autoconnect()
-    init(source: StudioSource) { self.source = source; _draft = State(initialValue: StudioDraft.load(source)) }
+    init(source: StudioSource, compact: Bool = false) {
+        self.source = source; self.compact = compact
+        let saved = StudioDraft.load(source)
+        _draft = State(initialValue: saved)
+        _mode = State(initialValue: saved.format ?? (source.startsWithVideo ? "Video" : "Quote"))
+    }
     private var clip: TimedTranscript.Clip? { transcript?.clip(first...max(first, last), audioDuration: duration) }
     private var rangeKey: String { "\(first):\(last):\(transcript?.words.count ?? 0)" }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                Picker("Format", selection: $mode) {
-                    Text("Quote card").tag("Quote")
-                    if source.audio != nil { Text("Audio video").tag("Video") }
-                }.pickerStyle(.segmented).disabled(exporting || preparing)
-                if let preview {
-                    Image(uiImage: preview).resizable().scaledToFit().frame(maxWidth: .infinity, maxHeight: 430)
-                        .clipShape(RoundedRectangle(cornerRadius: 12)).accessibilityLabel(mode == "Quote" ? draft.quote : "Captioned audio preview")
-                }
-                Picker("Background", selection: $draft.theme) { ForEach(StudioTheme.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).disabled(exporting)
-                Group { if mode == "Quote" { quoteControls } else { videoControls } }.disabled(exporting)
-                if let issue { Text(issue).font(.callout).foregroundStyle(.orange) }
-                if exporting {
-                    ProgressView(value: progress) { Text("Rendering · \(Int(progress * 100))%") }
-                    Button("Cancel export", role: .cancel) { work?.cancel() }
-                }
-            }.padding()
+        Group {
+            if compact { content }
+            else { ScrollView { content.padding().padding(.bottom, 20) }.scrollDismissesKeyboard(.interactively)
+                .navigationTitle("Edit creation").navigationBarTitleDisplayMode(.inline) }
         }
-        .navigationTitle("Create studio").navigationBarTitleDisplayMode(.inline)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if !compact { actionBar.controlSize(.large).padding().background(.regularMaterial) }
+        }
+        .toolbar {
+            if !compact {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() }.disabled(exporting || preparing) }
+            }
+        }
         .interactiveDismissDisabled(exporting || preparing)
         .sheet(item: $share) { value in StudioShareSheet(url: value.url) }
+        .fullScreenCover(isPresented: $editing, onDismiss: { draft = StudioDraft.load(source); mode = draft.format ?? mode; refreshPreview(); Task { if let audio = source.audio, let saved = TimedTranscriptStore.load(for: audio) { await useTiming(saved) } } }) {
+            NavigationStack { ShareStudioView(source: source).environmentObject(state) }
+        }
         .task {
             refreshPreview()
             if let audio = source.audio, let saved = TimedTranscriptStore.load(for: audio) { await useTiming(saved) }
         }
-        .task(id: rangeKey) {
+        .task(id: mode + rangeKey) {
             stopPreview()
-            guard let audio = source.audio, let clip else { envelope = []; refreshPreview(); return }
+            if transcript != nil {
+                draft.firstWord = first; draft.lastWord = last; draft.timingID = timingIdentity; draft.selectionConfirmed = !needsSelection
+            }
+            guard mode == "Video", let audio = source.audio, let clip else { envelope = []; refreshPreview(); return }
             envelope = []; refreshPreview()
             do {
                 try await Task.sleep(nanoseconds: 200_000_000)
@@ -136,7 +151,10 @@ struct ShareStudioView: View {
             do { try draft.save(source) } catch { issue = "Could not save this design. Keep the studio open and retry." }
             refreshPreview()
         }
-        .onChange(of: mode) { _, _ in stopPreview(); issue = nil; refreshPreview() }
+        .onChange(of: needsSelection) { _, value in draft.selectionConfirmed = !value }
+        .onChange(of: state.studioPlayingID) { _, id in if id != source.id { stopPreview() } }
+        .onChange(of: state.selectedTab) { _, tab in if tab != .drafts { stopPreview(); work?.cancel() } }
+        .onChange(of: mode) { _, value in draft.format = value; stopPreview(); issue = nil; refreshPreview() }
         .onChange(of: scenePhase) { _, phase in if phase == .background { stopPreview(); work?.cancel() } }
         .onReceive(timer) { _ in
             guard playing, let player, let clip else { return }
@@ -147,20 +165,81 @@ struct ShareStudioView: View {
         .onDisappear { stopPreview(); work?.cancel() }
     }
 
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if compact {
+                HStack {
+                    Label(mode == "Quote" ? "Quote card" : "Audio story", systemImage: mode == "Quote" ? "quote.opening" : "waveform")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Button("Edit", systemImage: "slider.horizontal.3") { stopPreview(); editing = true }
+                        .frame(minHeight: 44).disabled(exporting || preparing)
+                }
+            } else {
+                Picker("Format", selection: $mode) {
+                    Text("Quote card").tag("Quote")
+                    if source.audio != nil { Text("Audio video").tag("Video") }
+                }.pickerStyle(.segmented).disabled(exporting || preparing)
+            }
+            if let preview {
+                Image(uiImage: preview).resizable().scaledToFit().frame(maxWidth: .infinity, maxHeight: compact ? 500 : 380)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .accessibilityLabel(mode == "Quote" ? draft.quote : "Captioned audio preview")
+            }
+            if !compact {
+                Picker("Background", selection: $draft.theme) { ForEach(StudioTheme.allCases) { Text($0.rawValue).tag($0) } }
+                    .pickerStyle(.segmented).disabled(exporting)
+                Group { if mode == "Quote" { quoteControls } else { videoControls } }.disabled(exporting)
+            }
+            if let issue { Text(issue).font(.callout).foregroundStyle(.orange) }
+            if compact { actionBar.controlSize(.large) }
+        }
+    }
+
+    @ViewBuilder private var actionBar: some View {
+        if exporting {
+            VStack {
+                ProgressView(value: progress) { Text("Rendering · \(Int(progress * 100))%") }
+                Button("Cancel export", role: .cancel) { work?.cancel() }.frame(minHeight: 44)
+            }
+        } else if mode == "Quote" {
+            Button("Share quote", systemImage: "square.and.arrow.up") { shareQuote() }
+                .buttonStyle(.borderedProminent).frame(maxWidth: .infinity, minHeight: 44).accessibilityIdentifier("studio.shareQuote")
+        } else if preparing {
+            ProgressView("Preparing captions…").frame(minHeight: 44)
+        } else if transcript == nil {
+            Button("Prepare audio story", systemImage: "waveform") { prepareTiming() }.buttonStyle(.borderedProminent).frame(minHeight: 44)
+        } else if clip != nil {
+            VStack(spacing: 8) {
+                if needsSelection { Button("Use selected words") { needsSelection = false }.frame(minHeight: 44) }
+                HStack(spacing: 14) {
+                    Button(playing ? "Pause" : "Play", systemImage: playing ? "pause.fill" : "play.fill") { playPreview() }
+                        .buttonStyle(.bordered).frame(minHeight: 44).accessibilityIdentifier("studio.playPause")
+                    Button("Share video", systemImage: "square.and.arrow.up") { exportVideo() }
+                        .buttonStyle(.borderedProminent).frame(minHeight: 44).disabled(needsSelection).accessibilityIdentifier("studio.shareVideo")
+                    Menu {
+                        Button("Share audio only", systemImage: "waveform") { exportVideo(audioOnly: true) }
+                    } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44) }.disabled(needsSelection)
+                }
+            }
+        } else { Text("Choose a clip of up to 90 seconds.").font(.callout) }
+    }
+    private func shareQuote() {
+        state.studioPlayingID = nil
+        do {
+            try validateSource()
+            let image = try StudioRenderer.quote(text: draft.quote, attribution: draft.attribution, theme: draft.theme, aspect: draft.aspect)
+            share = .init(url: try StudioExporter.quote(image)); issue = nil
+        } catch { issue = error.localizedDescription }
+    }
+
     private var quoteControls: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Your words, your edit").font(.headline)
             TextEditor(text: $draft.quote).frame(minHeight: 130).overlay(alignment: .bottomTrailing) { Text("\(draft.quote.count)/600").font(.caption).foregroundStyle(.secondary).padding(6).allowsHitTesting(false) }
             TextField("Name or attribution (optional)", text: $draft.attribution).textFieldStyle(.roundedBorder)
             Picker("Shape", selection: $draft.aspect) { ForEach(StudioAspect.allCases) { Text($0.rawValue).tag($0) } }
-            Button("Share quote image", systemImage: "square.and.arrow.up") {
-                do {
-                    try validateSource()
-                    let image = try StudioRenderer.quote(text: draft.quote, attribution: draft.attribution, theme: draft.theme, aspect: draft.aspect)
-                    share = .init(url: try StudioExporter.quote(image))
-                    issue = nil
-                } catch { issue = error.localizedDescription }
-            }.buttonStyle(.borderedProminent).disabled(exporting)
+
         }
     }
 
@@ -181,12 +260,7 @@ struct ShareStudioView: View {
             if let clip {
                 Text("\(clip.duration, specifier: "%.1f") seconds · original voice").font(.caption).foregroundStyle(.secondary)
                 Text(clip.words.map(\.text).joined(separator: " ")).font(.callout).textSelection(.enabled)
-                Button(playing ? "Pause preview" : "Play this clip", systemImage: "play.circle") { playPreview() }.disabled(exporting)
-                if needsSelection { Button("Use the words shown above") { needsSelection = false } }
-                HStack {
-                    Button("Share video", systemImage: "film") { exportVideo() }.buttonStyle(.borderedProminent)
-                    Button("Audio only", systemImage: "waveform") { exportVideo(audioOnly: true) }.buttonStyle(.bordered)
-                }.disabled(exporting || needsSelection)
+
             } else { Text("Choose up to 90 seconds, with the last word after the first.").foregroundStyle(.secondary) }
         }
     }
@@ -208,7 +282,15 @@ struct ShareStudioView: View {
             duration = try await AVURLAsset(url: audio).load(.duration).seconds
             guard duration.isFinite, duration > 0, saved.valid, saved.words.last!.end <= duration + 0.1 else { throw StudioError(message: "Word timings do not match this recording. Prepare captions again.") }
             transcript = saved
-            if let excerpt = source.excerpt, let range = saved.matchingWords(excerpt) {
+            let identity = CreateIdeas.timingID(saved); timingIdentity = identity
+            needsSelection = false
+            if draft.selectionConfirmed == true, draft.timingID == identity, let a = draft.firstWord, let b = draft.lastWord,
+               saved.words.indices.contains(a), saved.words.indices.contains(b), a <= b {
+                first = a; last = b
+            } else if let segment = source.segment, segment.timingID == identity,
+               let a = segment.first, let b = segment.last, saved.words.indices.contains(a), saved.words.indices.contains(b), a <= b {
+                first = a; last = b
+            } else if let excerpt = source.excerpt, let range = saved.matchingWords(excerpt) {
                 first = range.lowerBound; last = range.upperBound
             } else {
                 first = 0; last = saved.words.lastIndex(where: { $0.end - saved.words[0].start <= 59 }) ?? 0
@@ -238,6 +320,8 @@ struct ShareStudioView: View {
         guard !state.recorder.isRecording, !state.recorder.isFinalizing else { issue = "Finish recording before playing this clip."; return }
         do { try validateSource(); try AVAudioSession.sharedInstance().setCategory(.playback); try AVAudioSession.sharedInstance().setActive(true) }
         catch { issue = error.localizedDescription; return }
+        state.studioPlayingID = source.id
+        if let player, player.currentTime().seconds < clip.end - 0.04 { playing = true; player.play(); return }
         let next = AVPlayer(url: audio)
         next.currentItem?.forwardPlaybackEndTime = CMTime(seconds: clip.end, preferredTimescale: 600)
         next.seek(to: CMTime(seconds: clip.start, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
@@ -245,6 +329,7 @@ struct ShareStudioView: View {
     }
     private func exportVideo(audioOnly: Bool = false) {
         guard let audio = source.audio, let clip, !exporting else { return }
+        state.studioPlayingID = nil
         stopPreview(); exporting = true; progress = 0; issue = nil
         let title = draft.title, theme = draft.theme, waveform = draft.waveform
         work = Task {

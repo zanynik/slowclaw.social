@@ -56,3 +56,37 @@ not claim to validate a live microphone or Apple's on-device speech model.
 Rollback: revert the studio and timing commit. Journals and original audio use
 the same storage contract. Sidecars/drafts are additive and can be ignored by
 older builds. No C ABI, signing assets, or hosted Jev API changes are required.
+
+## Scrollable Create feed
+
+Create now shows generated quote cards and audio stories with direct sharing and
+playback. Pull-to-refresh runs a dedicated sharing scan of up to 12 recent
+journals. It upgrades at most one old recording's word timings per refresh,
+forms sentence/pause windows locally, and evaluates at most 24 uncached
+candidates, round-robin across journals. Each existing Jev ideas request carries
+up to 12 segments and six independent judgments per segment, with an additional
+JSON byte budget. It does not invoke the recursive memory/persona scan.
+Accepted and rejected decisions persist. Further pulls advance remaining
+windows rather than reclassifying unchanged text. A source/timing change creates
+new candidate identities. Sensitive/context-dependent passages are filtered,
+overlapping cuts are suppressed, and each journal contributes at most three
+cards. These classifier scores remain heuristics, not privacy guarantees.
+
+Audio windows retain native word indices and a timing fingerprint, including
+repeated text at different positions. Cards are previews; MP4 encoding happens
+only on Share. One preview plays at a time. Designs, chosen format and confirmed
+word boundaries survive editing. Edit opens full-screen above the app tabs;
+its Share and Play/Pause controls stay in a bottom safe-area inset. The feed
+keeps direct actions beside each card, with extra bottom scrolling space.
+Manual creation and existing text drafts live in the toolbar menu.
+
+Proven → Better → New: reuse the existing studio and multi-question classifier;
+make refresh cheaper and buttons reachable; add the selected media feed on top.
+No provider, model, C ABI or signing changes. Revert the feed changes to restore
+the earlier Create layout; original recordings and journals are untouched.
+
+Validation adds source-range, overlap/privacy, cache invalidation, and batch
+budget tests. The simulator hosts the actual studio view with synthetic journal
+storage and checks Share and Play/Pause hit targets above a simulated tab bar in
+a 667-point viewport, retaining screenshots. It also reruns PNG/MP4/M4A exports.
+Real-journal insight quality and device speech alignment require user feedback.

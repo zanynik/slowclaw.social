@@ -749,6 +749,78 @@ final class AppState: ObservableObject {
     @Published var draftInboxStates = DraftInbox.load()
     private var batchRelevanceCache = JevBatch.Cache.load()
     @Published var ideaCache = JevIdeas.Cache.load()
+    @Published var createCache = CreateIdeas.Cache.load()
+    @Published var createBusy = false
+    @Published var createStatus: String?
+    @Published var studioPlayingID: String?
+    var createIdeas: [CreateIdeas.Candidate] {
+        var active = createCache
+        active.candidates = active.candidates.filter { candidate in
+            guard !excludedMemoryKeys.contains(candidate.key), let entry = memorySource(candidate.key) else { return false }
+            return candidate.fingerprint == JevBatch.digest(entry.content)
+        }
+        return CreateIdeas.selected(active)
+    }
+    func dismissCreateIdea(_ id: String) {
+        var next = createCache; next.dismissed.insert(id)
+        do { try next.save(); createCache = next } catch { createStatus = "Could not save this change. Please retry." }
+    }
+    func refreshCreateIdeas() async {
+        guard !createBusy else { return }
+        guard jevEnabled, JevCloud.shared.connected else { createStatus = "Enable Jev in Profile to find new moments. Your saved cards stay here."; return }
+        guard !jevBusy, !jevFeedsBusy, !readsDecisionBusy, !kevJournalBusy, !contextWorkPaused else {
+            createStatus = "Another task is finishing. Pull down again in a moment."; return
+        }
+        createBusy = true; studioPlayingID = nil
+        defer { createBusy = false }
+        do {
+            try checkJevWork()
+            let entries = Array(liteJournals.prefix(12))
+            // Upgrade one older recording per refresh; reuse all other saved
+            // native timings. Avoid transcribing an entire archive at once.
+            if !audioTranscriptionInFlight, let older = entries.first(where: { entry in
+                guard let url = AudioRecorder.absoluteURL(forMediaRelativePath: entry.mediaURL) else { return false }
+                return TimedTranscriptStore.load(for: url) == nil
+            }) {
+                createStatus = "Preparing one recording for audio stories…"
+                _ = try? await prepareStudioTranscript(key: older.key)
+                try checkJevWork()
+            }
+            var groups: [[CreateIdeas.Candidate]] = []
+            for entry in entries {
+                guard !excludedMemoryKeys.contains(entry.key), memorySource(entry.key)?.content == entry.content else { continue }
+                let timing = AudioRecorder.absoluteURL(forMediaRelativePath: entry.mediaURL).flatMap { TimedTranscriptStore.load(for: $0) }
+                groups.append(CreateIdeas.candidates(key: entry.key, content: entry.content, body: journalBodyOf(entry.content), timing: timing))
+            }
+            // Round-robin journals so one long recording cannot consume the
+            // whole refresh budget. Subsequent pulls advance uncached windows.
+            var candidates: [CreateIdeas.Candidate] = []
+            for offset in 0..<(groups.map(\.count).max() ?? 0) {
+                for group in groups where offset < group.count { candidates.append(group[offset]) }
+            }
+            var next = createCache; next.reconcile(candidates)
+            try next.save(); createCache = next
+            let pending = Array(next.candidates.filter { next.decisions[$0.id] == nil && !next.dismissed.contains($0.id) }.prefix(24))
+            for batch in CreateIdeas.batches(pending) {
+                try checkJevWork()
+                createStatus = "Finding moments worth sharing…"
+                let decisions = try await JevCloud.shared.ideas(batch.map(\.passage))
+                try checkJevWork()
+                var updated = createCache
+                updated.reconcile(updated.candidates.filter { item in
+                    guard !excludedMemoryKeys.contains(item.key), let entry = memorySource(item.key) else { return false }
+                    return JevBatch.digest(entry.content) == item.fingerprint
+                })
+                let active = Set(updated.candidates.map(\.id))
+                for decision in decisions where active.contains(decision.id) { updated.decisions[decision.id] = decision }
+                try updated.save(); createCache = updated
+            }
+            let remaining = createCache.candidates.filter { createCache.decisions[$0.id] == nil && !createCache.dismissed.contains($0.id) }.count
+            createStatus = remaining > 0 ? "More moments to explore. Pull down again when you like." : (createIdeas.isEmpty ? "No strong standalone moments yet. Try another journal or make a card yourself." : "You're up to date.")
+        } catch is CancellationError { createStatus = "Paused. Completed cards are saved." }
+        catch { createStatus = error.localizedDescription }
+    }
+
     var sharingIdeas: [JevMemory.Passage] {
         JevIdeas.select(jevPassages, decisions: ideaCache.decisions)
     }
@@ -1715,6 +1787,8 @@ final class AppState: ObservableObject {
                 try? FileManager.default.removeItem(at: mediaURL)
             }
             StudioDraftFiles.remove(key: key)
+            createCache.reconcile(createCache.candidates.filter { $0.key != key })
+            try? createCache.save()
             try? memory.forget(key: key)
             pending.removeAll { $0.key == key }
             journalInterestRecords.removeValue(forKey: key)
@@ -5338,7 +5412,7 @@ extension AppState {
         return Self.selectRSSSources(selected, topics: [])
     }
     func startJevFeedSelection(force: Bool = false) {
-        guard jevEnabled, !jevFeedsBusy, !jevBusy, !readsDecisionBusy, !kevJournalBusy, !contextWorkPaused else {
+        guard !createBusy, jevEnabled, !jevFeedsBusy, !jevBusy, !readsDecisionBusy, !kevJournalBusy, !contextWorkPaused else {
             if force { jevFeedsStatus = "Finish the current selection, then try again." }
             return
         }
@@ -5448,7 +5522,7 @@ extension AppState {
     }
     func resumeJevWork() async {
         if selectedTab == .pulse { startPulseRanking() }
-        guard jevEnabled, !jevConnecting, !contextWorkPaused else { return }
+        guard !createBusy, jevEnabled, !jevConnecting, !contextWorkPaused else { return }
         if !JevCloud.shared.connected {
             guard Date().timeIntervalSince(lastJevConnectionAttempt) > 60 else { return }
             lastJevConnectionAttempt = Date()
@@ -5461,7 +5535,7 @@ extension AppState {
             }
             jevConnecting = false
         }
-        guard jevEnabled, JevCloud.shared.connected, !jevBusy, !readsDecisionBusy, !jevFeedsBusy, !kevJournalBusy else { return }
+        guard !createBusy, jevEnabled, JevCloud.shared.connected, !jevBusy, !readsDecisionBusy, !jevFeedsBusy, !kevJournalBusy else { return }
         let pending = liteJournals.contains { entry in
             let fingerprint = JevCloud.fingerprint(entry.content)
             return jevCache.records[entry.key]?.fingerprint != fingerprint || personaCache.journals[entry.key]?.fingerprint != fingerprint
@@ -5524,7 +5598,7 @@ extension AppState {
         catch { jevStatus = "Could not save this change. Please retry." }
     }
     func startJevMemory() {
-        guard jevEnabled, JevCloud.shared.connected, jevTask == nil, !readsDecisionBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
+        guard !createBusy, jevEnabled, JevCloud.shared.connected, jevTask == nil, !readsDecisionBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
         jevTask = Task { await scanJevMemory(); jevTask = nil }
     }
     private func checkJevWork() throws {
@@ -5625,7 +5699,7 @@ extension AppState {
         }
     }
     private func rankJevReads() async {
-        guard jevEnabled, !readsDecisionBusy, !jevBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
+        guard !createBusy, jevEnabled, !readsDecisionBusy, !jevBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
         let interests = JevBatch.profile(personaWeights)
         guard !interests.isEmpty else { readsDecisions = [:]; readsDecisionStatus = "Record a journal to discover your interests."; return }
         let profile = JevBatch.profileID(interests), revision = memoryRevision
