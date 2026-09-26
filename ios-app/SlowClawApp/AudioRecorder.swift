@@ -129,6 +129,7 @@ final class AudioRecorder: NSObject, ObservableObject {
         tapInstalled = false
         isPaused = false
         accumulatedPaused = 0
+        shared.timingReliable = true
 
         Self.haptic(.impact)
 
@@ -178,8 +179,8 @@ final class AudioRecorder: NSObject, ObservableObject {
                 do {
                     try pipe.audioFile?.write(from: buffer)
                 } catch {
-                    // Swallow per-buffer write errors; a gap beats losing the
-                    // whole journal.
+                    pipe.timingReliable = false
+                    // A write gap invalidates live timing; file transcription can rebuild it.
                 }
                 // Feed the analyzer the same buffer (converted to its format).
                 // A failed conversion drops the buffer (momentary gap) — the
@@ -187,7 +188,7 @@ final class AudioRecorder: NSObject, ObservableObject {
                 if let sessionRef, let converter = pipe.converter,
                    let converted = Self.convert(buffer, with: converter) {
                     sessionRef.process(converted)
-                }
+                } else if sessionRef != nil { pipe.timingReliable = false }
                 // Level meter: compute RMS (pure) and throttle the main-actor
                 // publish to ~10 Hz via the shared holder's timestamp.
                 let now = DispatchTime.now().uptimeNanoseconds
@@ -251,11 +252,11 @@ final class AudioRecorder: NSObject, ObservableObject {
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: micFormat) { [weak self] buffer, _ in
                 do {
                     try pipe.audioFile?.write(from: buffer)
-                } catch {}
+                } catch { pipe.timingReliable = false }
                 if let sessionRef, let converter = pipe.converter,
                    let converted = Self.convert(buffer, with: converter) {
                     sessionRef.process(converted)
-                }
+                } else if sessionRef != nil { pipe.timingReliable = false }
                 let now = DispatchTime.now().uptimeNanoseconds
                 if now &- pipe.lastLevelTs > 100_000_000 {
                     pipe.lastLevelTs = now
@@ -315,6 +316,9 @@ final class AudioRecorder: NSObject, ObservableObject {
         shared.converter = nil
         if let completed = await session?.stop(), !completed.isEmpty {
             transcript = completed
+            if shared.timingReliable, let timing = session?.timedTranscript(), let url = recordedFileURL {
+                try? TimedTranscriptStore.save(timing, for: url)
+            }
         } else if session != nil {
             // A failed/undrained live session cannot vouch for a partial
             // preview. Save a placeholder and let the durable file queue use
@@ -615,6 +619,7 @@ final class AudioRecorder: NSObject, ObservableObject {
 /// the tap's lifetime, so the two sides never mutate the same field concurrently.
 final class AudioPipeState: @unchecked Sendable {
     var audioFile: AVAudioFile?
+    var timingReliable = true
     /// Mic→analyzer format converter, set when the live session starts. Read
     /// from the audio-thread tap to feed converted buffers to the analyzer.
     var converter: AVAudioConverter?

@@ -94,6 +94,17 @@ jobs:
                   fi
                   xcodegen --version
 
+            - name: Test studio image and media exports on iOS Simulator
+              run: bash ios-app/Tests/studio-media-smoke.sh
+
+            - name: Keep synthetic studio export evidence
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+              with:
+                  name: studio-export-evidence
+                  path: /tmp/slowclaw-studio-evidence
+                  retention-days: 7
+                  if-no-files-found: error
+
             - name: Test inference scheduling and Nostr signing
               run: SLOWCLAW_TEST_EVIDENCE=1 bash ios-app/Tests/run.sh
 

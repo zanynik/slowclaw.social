@@ -12,6 +12,7 @@ start = source.index("public struct RankedFeedItem:")
 end = source.index("private struct RankedFeedItemDTO:", start)
 (pathlib.Path(sys.argv[2]) / "Sources/Runtime/RankedFeedItem.swift").write_text("import Foundation\n" + source[start:end])
 PYDTO
+cp "$APP_ROOT/SlowClawApp/TimedTranscript.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/JevMemory.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/JevBatch.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/PulseSnapshot.swift" "$TEST_ROOT/Sources/Runtime/"
@@ -32,6 +33,7 @@ cp "$APP_ROOT/SlowClawApp/NostrReply.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/WeeklyReflection.swift" "$TEST_ROOT/Sources/Runtime/"
 swiftc -frontend -parse "$APP_ROOT"/SlowClawApp/*.swift
 cp "$APP_ROOT/Tests/RuntimeTests.swift" "$TEST_ROOT/Tests/RuntimeTests/"
+cp "$APP_ROOT/Tests/TimedTranscriptTests.swift" "$TEST_ROOT/Tests/RuntimeTests/"
 cp "$APP_ROOT/Tests/JevBatchTests.swift" "$TEST_ROOT/Tests/RuntimeTests/"
 cp "$APP_ROOT/Tests/PulseSnapshotTests.swift" "$TEST_ROOT/Tests/RuntimeTests/"
 cp "$APP_ROOT/Tests/JournalPolishTests.swift" "$TEST_ROOT/Tests/RuntimeTests/"

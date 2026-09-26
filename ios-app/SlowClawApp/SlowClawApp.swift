@@ -1711,8 +1711,10 @@ final class AppState: ObservableObject {
                let rel = entry.mediaURL,
                let mediaURL = AudioRecorder.absoluteURL(forMediaRelativePath: rel),
                Self.isOwnedDocumentURL(mediaURL) {
+                TimedTranscriptStore.remove(for: mediaURL)
                 try? FileManager.default.removeItem(at: mediaURL)
             }
+            StudioDraftFiles.remove(key: key)
             try? memory.forget(key: key)
             pending.removeAll { $0.key == key }
             journalInterestRecords.removeValue(forKey: key)
@@ -2265,7 +2267,8 @@ final class AppState: ObservableObject {
     private func performAudioTranscription(
         url: URL,
         context: AudioSTTContext,
-        keepAliveWhileLocked: Bool
+        keepAliveWhileLocked: Bool,
+        requireTiming: Bool = false
     ) async -> AudioSTTResult {
         audioTranscriptionCount += 1
         audioTranscriptionInFlight = true
@@ -2285,8 +2288,28 @@ final class AppState: ObservableObject {
             }.value
         }
         return await Task.detached(priority: .userInitiated) {
-            await AudioSTT.transcribe(url: url, context: context, progress: report)
+            await AudioSTT.transcribe(url: url, context: context, requireTiming: requireTiming, progress: report)
         }.value
+    }
+
+    /// Prepare media timing for old recordings without replacing journal edits.
+    func prepareStudioTranscript(key: String) async throws -> TimedTranscript {
+        guard !audioTranscriptionInFlight, !recorder.isRecording, !recorder.isFinalizing,
+              let entry = memorySource(key), Self.softDeletedKeys()[key] == nil,
+              let url = AudioRecorder.absoluteURL(forMediaRelativePath: entry.mediaURL) else {
+            throw StudioError(message: "Finish the current recording or transcription, then try again.")
+        }
+        if let saved = TimedTranscriptStore.load(for: url) { return saved }
+        let result = await performAudioTranscription(url: url, context: .retranscribe, keepAliveWhileLocked: false, requireTiming: true)
+        try Task.checkCancellation()
+        guard Self.softDeletedKeys()[key] == nil, memorySource(key)?.mediaURL == entry.mediaURL else {
+            TimedTranscriptStore.remove(for: url)
+            throw StudioError(message: "This recording was removed while captions were being prepared.")
+        }
+        guard let saved = TimedTranscriptStore.load(for: url) else {
+            throw StudioError(message: result.text.isEmpty ? (result.diagnostic ?? "Speech recognition failed. Please try again.") : "Apple Speech returned text without usable word timings. Please try again.")
+        }
+        return saved
     }
 
     // MARK: - Missing-transcript reconciliation

@@ -24,9 +24,15 @@ struct DraftsView: View {
     @EnvironmentObject var state: AppState
     @State private var inbox: DraftInboxState = .new
     @State private var source: SlowClawMemoryEntry?
+    @State private var studioSource: StudioSource?
     var body: some View {
         NavigationStack {
             List {
+                Section("Studio") {
+                    NavigationLink { CreationSourcePicker().environmentObject(state) } label: {
+                        Label("Make a quote card or audio video", systemImage: "rectangle.portrait.on.rectangle.portrait")
+                    }
+                }
                 Section {
                     Picker("Draft inbox", selection: $inbox) {
                         ForEach(DraftInboxState.allCases) { Text($0.rawValue).tag($0) }
@@ -46,8 +52,8 @@ struct DraftsView: View {
                                 Text(passage.text).textSelection(.enabled)
                                 HStack {
                                     Button("Make draft") { state.makePassageDraft(passage) }
-                                    if state.ideaCache.decisions[passage.id]?.shareableQuote == true {
-                                        ShareLink("Share quote", item: passage.text.trimmingCharacters(in: .whitespacesAndNewlines))
+                                    Button("Design") {
+                                        if let entry = state.memorySource(passage.sourceKey) { studioSource = StudioSource(entry: entry, excerpt: passage.text) }
                                     }
                                     Spacer()
                                     Button("Source") { source = state.memorySource(passage.sourceKey) }
@@ -76,6 +82,9 @@ struct DraftsView: View {
             }
             .navigationTitle("Create")
             .sheet(item: $source) { JournalDetailView(entry: $0).environmentObject(state) }
+            .sheet(item: $studioSource) { value in
+                NavigationStack { ShareStudioView(source: value).environmentObject(state) }
+            }
             .refreshable { await state.refreshDraftIdeas() }
             .toolbar {
                 Button("Find ideas", systemImage: "arrow.clockwise") { state.startJevMemory() }

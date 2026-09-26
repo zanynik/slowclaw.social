@@ -29,12 +29,13 @@ enum AudioSTT {
     static func transcribe(
         url: URL,
         context: AudioSTTContext = .automatic,
+        requireTiming: Bool = false,
         progress: (@Sendable (String) -> Void)? = nil
     ) async -> AudioSTTResult {
         let started = DispatchTime.now().uptimeNanoseconds
         progress?("Running Apple's long-form on-device transcription…")
         let failure = SpeechFailureDetail()
-        let text = await Transcriber.transcribe(url: url) { detail in
+        let text = await Transcriber.transcribe(url: url, requireTiming: requireTiming) { detail in
             failure.set(detail)
             progress?(detail)
         }

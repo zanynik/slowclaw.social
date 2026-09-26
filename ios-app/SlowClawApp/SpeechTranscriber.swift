@@ -35,6 +35,7 @@ protocol LiveTranscriptionSession: AnyObject {
     func start()
     func process(_ buffer: AVAudioPCMBuffer)
     func stop() async -> String
+    func timedTranscript() -> TimedTranscript?
 }
 
 /// On-device speech transcription backed by SpeechAnalyzer (iOS 26+). Named
@@ -69,7 +70,7 @@ enum Transcriber {
     ///
     /// Thread-safe: blocking recognition runs on the calling thread; callers
     /// await it off the main actor (e.g. inside a Task.detached).
-    static func transcribe(url: URL, diagnostic: (@Sendable (String) -> Void)? = nil) async -> String {
+    static func transcribe(url: URL, requireTiming: Bool = false, diagnostic: (@Sendable (String) -> Void)? = nil) async -> String {
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
 
@@ -82,7 +83,7 @@ enum Transcriber {
         }
         if #available(iOS 26.0, *) {
             let modern = await transcribeWithAnalyzer(url: url, diagnostic: diagnostic)
-            if !modern.isEmpty { return modern }
+            if !modern.isEmpty && (!requireTiming || TimedTranscriptStore.load(for: url) != nil) { return modern }
         }
         return await LegacyTranscriber.transcribe(url: url)
     }
@@ -93,7 +94,10 @@ enum Transcriber {
     private static func transcribeWithAnalyzer(url: URL, diagnostic: (@Sendable (String) -> Void)?) async -> String {
         do {
             let audioFile = try AVAudioFile(forReading: url)
-            return await transcribe(file: audioFile, diagnostic: diagnostic)
+            let stamp = TimedTranscriptStore.stamp(url)
+            return await transcribe(file: audioFile, diagnostic: diagnostic) { timing in
+                if let stamp { try? TimedTranscriptStore.save(timing, for: url, expected: stamp) }
+            }
         } catch {
             diagnostic?("Cannot open the saved audio (\((error as NSError).domain), \((error as NSError).code)).")
             return ""
@@ -115,7 +119,7 @@ enum Transcriber {
     /// end-of-input, which prevents a converter status mistake from silently
     /// dropping the middle or tail of a long recording.
     @available(iOS 26.0, *)
-    static func transcribe(file: AVAudioFile, diagnostic: (@Sendable (String) -> Void)? = nil) async -> String {
+    static func transcribe(file: AVAudioFile, diagnostic: (@Sendable (String) -> Void)? = nil, onTiming: (@Sendable (TimedTranscript) -> Void)? = nil) async -> String {
         let transcriber: SpeechTranscriber
         do { transcriber = try await preparedOfflineTranscriber() }
         catch {
@@ -125,10 +129,12 @@ enum Transcriber {
         let analyzer = SpeechAnalyzer(modules: [transcriber])
 
         let collected = FinalCollector()
+        let timings = SpeechTimingCollector()
         let recognizerTask = Task<Void, Error> {
             for try await result in transcriber.results {
                 if result.isFinal {
                     collected.append(String(result.text.characters))
+                    timings.append(result.text)
                 }
             }
         }
@@ -161,6 +167,7 @@ enum Transcriber {
             diagnostic?("Speech results did not finish. Retrying with the compatibility recognizer.")
             return ""
         }
+        if let timing = timings.snapshot() { onTiming?(timing) }
         return collected.text()
     }
 
@@ -182,6 +189,7 @@ enum Transcriber {
         let analyzerFormat: AVAudioFormat
         let onTranscript: @MainActor (String) -> Void
         private let accumulator = LiveTranscriptAccumulator()
+        private let timings = SpeechTimingCollector()
 
         init(transcriber: SpeechTranscriber,
              analyzer: SpeechAnalyzer,
@@ -207,6 +215,7 @@ enum Transcriber {
             // so this Task's failure type is Error.
             recognizerTask = Task<Void, Error> { [transcriber] in
                 for try await result in transcriber.results {
+                    if result.isFinal { self.timings.append(result.text) }
                     let snapshot = self.accumulator.apply(
                         String(result.text.characters), isFinal: result.isFinal)
                     await MainActor.run { self.onTranscript(snapshot) }
@@ -225,6 +234,8 @@ enum Transcriber {
         func process(_ buffer: AVAudioPCMBuffer) {
             inputBuilder.yield(AnalyzerInput(buffer: buffer))
         }
+
+        func timedTranscript() -> TimedTranscript? { timings.snapshot() }
 
         /// Stop the session: finish the stream and finalize so any in-flight
         /// finals flush. Safe to call multiple times.
@@ -288,7 +299,7 @@ enum Transcriber {
     @available(iOS 26.0, *)
     private static func preparedOfflineTranscriber() async throws -> SpeechTranscriber {
         let locale = try await supportedCurrentLocale()
-        let transcriber = SpeechTranscriber(locale: locale, preset: .transcription)
+        let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [], attributeOptions: [.audioTimeRange])
         try await installModel(for: transcriber)
         return transcriber
     }
@@ -296,7 +307,8 @@ enum Transcriber {
     @available(iOS 26.0, *)
     private static func preparedLiveTranscriber() async throws -> SpeechTranscriber {
         let locale = try await supportedCurrentLocale()
-        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
+        let preset = SpeechTranscriber.Preset.progressiveTranscription
+        let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: preset.transcriptionOptions, reportingOptions: preset.reportingOptions, attributeOptions: preset.attributeOptions.union([.audioTimeRange]))
         try await installModel(for: transcriber)
         return transcriber
     }
@@ -553,16 +565,16 @@ enum LegacyTranscriber {
         // must not leave the device).
         guard recognizer.supportsOnDeviceRecognition else { return "" }
 
-        if let duration = audioDurationSeconds(url: url),
-           duration > segmentThresholdSeconds {
-            return await transcribeSegmented(url: url, recognizer: recognizer)
+        let stamp = TimedTranscriptStore.stamp(url)
+        let result: TimedTranscript?
+        if let duration = audioDurationSeconds(url: url), duration > segmentThresholdSeconds {
+            result = await transcribeSegmented(url: url, recognizer: recognizer)
+        } else {
+            result = await transcribeFile(url: url, recognizer: recognizer, timeoutSeconds: wholeFileTimeoutSeconds)
         }
-        guard let text = await transcribeFile(url: url,
-                                              recognizer: recognizer,
-                                              timeoutSeconds: wholeFileTimeoutSeconds) else {
-            return ""
-        }
-        return text
+        guard let result else { return "" }
+        if let stamp { try? TimedTranscriptStore.save(result, for: url, expected: stamp) }
+        return result.text
     }
 
     /// Best-effort duration in seconds of the audio at `url`; nil if the file
@@ -581,7 +593,7 @@ enum LegacyTranscriber {
     /// ("") so segmented aggregation can refuse partial results.
     private static func transcribeFile(url: URL,
                                        recognizer: SFSpeechRecognizer,
-                                       timeoutSeconds: UInt64) async -> String? {
+                                       timeoutSeconds: UInt64) async -> TimedTranscript? {
         let request = SFSpeechURLRecognitionRequest(url: url)
         request.shouldReportPartialResults = false
         // Hard privacy requirement for EVERY request issued by this file.
@@ -594,13 +606,16 @@ enum LegacyTranscriber {
         // polling Task.isCancelled — but nothing ever cancelled it, leaking a
         // 200ms poll loop per transcription. This structure has no watcher.)
         let box = RecognitionOutcome()
-        return await withTaskGroup(of: String?.self) { group in
+        return await withTaskGroup(of: TimedTranscript?.self) { group in
             group.addTask {
                 await withCheckedContinuation { cont in
                     box.setContinuation(cont)
                     let task = recognizer.recognitionTask(with: request) { result, error in
                         if let result, result.isFinal {
-                            box.resume(returning: result.bestTranscription.formattedString)
+                            let transcript = result.bestTranscription
+                            box.resume(returning: TimedTranscript(text: transcript.formattedString, words: transcript.segments.map {
+                                .init(text: $0.substring, start: $0.timestamp, end: $0.timestamp + $0.duration)
+                            }))
                         } else if error != nil {
                             box.resume(returning: nil)
                         }
@@ -636,26 +651,21 @@ enum LegacyTranscriber {
     ///
     /// All-or-nothing: a failed/timed-out segment or a failed split discards
     /// the aggregate and returns "" — never a partial transcript.
-    private static func transcribeSegmented(url: URL, recognizer: SFSpeechRecognizer) async -> String {
-        guard let segments = try? splitIntoSegments(url: url, segmentSeconds: segmentSeconds),
-              !segments.isEmpty else {
-            // Split failed (or empty source): refuse to guess from a partial
-            // read — an empty result keeps the caller's placeholder honest.
-            return ""
-        }
+    private static func transcribeSegmented(url: URL, recognizer: SFSpeechRecognizer) async -> TimedTranscript? {
+        guard let segments = try? splitIntoSegments(url: url, segmentSeconds: segmentSeconds), !segments.isEmpty else { return nil }
         defer { segments.forEach { try? FileManager.default.removeItem(at: $0) } }
         var parts: [String] = []
+        var words: [TimedTranscript.Word] = []
+        var offset = 0.0
         for segment in segments {
-            guard let text = await transcribeFile(url: segment,
-                                                  recognizer: recognizer,
-                                                  timeoutSeconds: segmentTimeoutSeconds) else {
-                // Any segment failure invalidates the whole aggregate.
-                return ""
-            }
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let result = await transcribeFile(url: segment, recognizer: recognizer, timeoutSeconds: segmentTimeoutSeconds),
+                  let duration = audioDurationSeconds(url: segment) else { return nil }
+            let trimmed = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { parts.append(trimmed) }
+            words += result.words.map { .init(text: $0.text, start: $0.start + offset, end: $0.end + offset) }
+            offset += duration
         }
-        return parts.joined(separator: " ")
+        return TimedTranscript(text: parts.joined(separator: " "), words: words)
     }
 
     /// Split an audio file into ~`segmentSeconds` temp .caf files on frame
@@ -711,10 +721,10 @@ enum LegacyTranscriber {
 /// callback queue and both tasks.
 private final class RecognitionOutcome: @unchecked Sendable {
     private let lock = NSLock()
-    private var cont: CheckedContinuation<String?, Never>?
+    private var cont: CheckedContinuation<TimedTranscript?, Never>?
     private var task: SFSpeechRecognitionTask?
 
-    func setContinuation(_ cont: CheckedContinuation<String?, Never>) {
+    func setContinuation(_ cont: CheckedContinuation<TimedTranscript?, Never>) {
         lock.lock(); defer { lock.unlock() }
         self.cont = cont
     }
@@ -724,7 +734,7 @@ private final class RecognitionOutcome: @unchecked Sendable {
         self.task = task
     }
 
-    func resume(returning value: String?) {
+    func resume(returning value: TimedTranscript?) {
         lock.lock()
         let target = cont
         cont = nil
@@ -743,5 +753,33 @@ private final class RecognitionOutcome: @unchecked Sendable {
         lock.unlock()
         target?.resume(returning: nil)
         task?.cancel()
+    }
+}
+
+@available(iOS 26.0, *)
+private final class SpeechTimingCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var parts: [String] = []
+    private var words: [TimedTranscript.Word] = []
+    private var missingTiming = false
+    func append(_ text: AttributedString) {
+        lock.lock(); defer { lock.unlock() }
+        parts.append(String(text.characters))
+        for run in text.runs {
+            let value = String(text[run.range].characters).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { continue }
+            if let range = run[AttributeScopes.SpeechAttributes.TimeRangeAttribute.self] {
+                words.append(.init(text: value, start: range.start.seconds, end: CMTimeRangeGetEnd(range).seconds))
+            } else if value.rangeOfCharacter(from: .alphanumerics) != nil {
+                missingTiming = true
+            } else if let last = words.popLast() {
+                words.append(.init(text: last.text + value, start: last.start, end: last.end))
+            }
+        }
+    }
+    func snapshot() -> TimedTranscript? {
+        lock.lock(); defer { lock.unlock() }
+        let result = TimedTranscript(text: parts.joined(separator: " "), words: words)
+        return !missingTiming && result.valid ? result : nil
     }
 }
