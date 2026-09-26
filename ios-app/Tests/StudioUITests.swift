@@ -8,7 +8,7 @@ import XCTest
         publish.tap()
         XCTAssertTrue(app.navigationBars["Publish post"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["A small practice can change how we see things."].exists)
-        app.buttons["Done"].tap()
+        app.navigationBars["Publish post"].buttons["Done"].tap()
         XCTAssertTrue(publish.waitForExistence(timeout: 10))
     }
     func testQuoteShareRemainsAboveTabsOnCompactScreen() {
