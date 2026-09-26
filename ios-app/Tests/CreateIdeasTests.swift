@@ -2,6 +2,22 @@ import XCTest
 @testable import Runtime
 
 final class CreateIdeasTests: XCTestCase {
+    func testSentenceWindowsIsolateInsightsAndPreserveWhitespace() {
+        let insight = "A smaller experiment teaches more than a perfect plan."
+        let body = "Today I bought potatoes at the shop.\n\n" + insight + "  Testing one assumption makes failures useful."
+        let windows = CreateIdeas.textWindows(body)
+        XCTAssertTrue(windows.contains(insight))
+        XCTAssertTrue(windows.allSatisfy { body.contains($0) && $0.count <= 550 })
+        XCTAssertEqual(Set(windows).count, windows.count)
+        let candidates = CreateIdeas.candidates(key: "slowclaw_journal", content: body, body: body, timing: nil)
+        var cache = CreateIdeas.Cache(); cache.reconcile(candidates)
+        for item in candidates {
+            let selected = item.text == insight
+            cache.decisions[item.id] = .init(id: item.id, score: selected ? 0.95 : 0.1,
+                privateScore: 0, standalone: 0.9, quote: selected ? 0.9 : 0.1)
+        }
+        XCTAssertEqual(CreateIdeas.selected(cache).map(\.text), [insight])
+    }
     private func transcript() -> TimedTranscript {
         let words = (0..<60).map { index in TimedTranscript.Word(text: index % 10 == 9 ? "thought." : "word\(index)", start: Double(index), end: Double(index) + 0.7) }
         return .init(text: words.map(\.text).joined(separator: " "), words: words)

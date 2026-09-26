@@ -3,7 +3,7 @@ import Foundation
 /// Local candidate windows, batched classification, and a durable feed. Jev
 /// judges exact source text; it never invents a quotation or an audio boundary.
 enum CreateIdeas {
-    static let version = "create-segments-v1"
+    static let version = "create-segments-v2"
     struct Candidate: Codable, Identifiable, Sendable {
         let id: String
         let key: String
@@ -52,8 +52,7 @@ enum CreateIdeas {
                   start: first.flatMap { timing?.words[$0].start }, end: last.flatMap { timing?.words[$0].end })
         }
         guard let timing, timing.valid else {
-            return JevMemory.chunks(body, maximum: 550).filter { $0.split(whereSeparator: \.isWhitespace).count >= 5 }
-                .prefix(100).map { make($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            return textWindows(body).map { make($0) }
         }
         // Sentence ends and real pauses are natural cut points. Hard bounds
         // keep even unpunctuated dictation within a readable, shareable length.
@@ -79,6 +78,29 @@ enum CreateIdeas {
             }
         }
         return Array(result.prefix(100))
+    }
+    /// Exact sentences and adjacent pairs preserve context without forcing a
+    /// useful thought to compete with unrelated daily logistics in one chunk.
+    static func textWindows(_ body: String) -> [String] {
+        var sentences: [Range<String.Index>] = []
+        body.enumerateSubstrings(in: body.startIndex..<body.endIndex, options: .bySentences) { _, range, _, _ in
+            sentences.append(range)
+        }
+        if sentences.isEmpty, !body.isEmpty { sentences = [body.startIndex..<body.endIndex] }
+        var result: [String] = [], seen = Set<String>()
+        for i in sentences.indices {
+            for count in [1, 2] where i + count <= sentences.count {
+                let text = String(body[sentences[i].lowerBound..<sentences[i + count - 1].upperBound])
+                for window in JevMemory.chunks(text, maximum: 550) {
+                    let clean = window.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard clean.split(whereSeparator: \.isWhitespace).count >= 5,
+                          seen.insert(clean).inserted else { continue }
+                    result.append(clean)
+                    if result.count == 100 { return result }
+                }
+            }
+        }
+        return result
     }
     static func selected(_ cache: Cache) -> [Candidate] {
         let ranked = cache.candidates.filter { item in

@@ -490,7 +490,7 @@ final class AppState: ObservableObject {
     /// Discovery candidates stay cached, but the default reading surface must
     /// have a strong connection to a currently included journal.
     var relevantReads: [RankedFeedItem] {
-        relevantFeedItems.filter { $0.sourceLabel != "Nostr posts" }
+        relevantFeedItems.filter { $0.sourceLabel != "Nostr posts" && readingVisits[$0.link] == nil }
     }
     var relevantPulse: [RankedFeedItem] {
         pulseSnapshot.filter { readingSignals[$0.id]?.preference != -1 }
@@ -767,25 +767,30 @@ final class AppState: ObservableObject {
     }
     func refreshCreateIdeas() async {
         guard !createBusy else { return }
-        guard jevEnabled, JevCloud.shared.connected else { createStatus = "Enable Jev in Profile to find new moments. Your saved cards stay here."; return }
-        guard !jevBusy, !jevFeedsBusy, !readsDecisionBusy, !kevJournalBusy, !contextWorkPaused else {
-            createStatus = "Another task is finishing. Pull down again in a moment."; return
+        guard jevEnabled else { createStatus = "Enable Jev in Profile to find new moments. Your saved cards stay here."; return }
+        guard !contextWorkPaused else {
+            createStatus = "Finish recording or resume AI processing, then try again."; return
         }
         createBusy = true; studioPlayingID = nil
         defer { createBusy = false }
         do {
-            try checkJevWork()
-            let entries = Array(liteJournals.prefix(12))
-            // Upgrade one older recording per refresh; reuse all other saved
-            // native timings. Avoid transcribing an entire archive at once.
-            if !audioTranscriptionInFlight, let older = entries.first(where: { entry in
-                guard let url = AudioRecorder.absoluteURL(forMediaRelativePath: entry.mediaURL) else { return false }
-                return TimedTranscriptStore.load(for: url) == nil
-            }) {
-                createStatus = "Preparing one recording for audio stories…"
-                _ = try? await prepareStudioTranscript(key: older.key)
-                try checkJevWork()
+            // Reserve priority before suspending. Background workers finish
+            // their current HTTP request and yield at checkJevWork, releasing
+            // the server's session lease instead of cancelling it mid-flight.
+            createStatus = "Finishing background work…"
+            await jevTask?.value
+            await jevFeedsTask?.value
+            await jevReadingTask?.value
+            while kevJournalBusy {
+                try await Task.sleep(for: .milliseconds(100))
+                try checkJevWork(allowCreate: true)
             }
+            try checkJevWork(allowCreate: true)
+            try await JevCloud.shared.connectForTesting()
+            let entries = Array(liteJournals.prefix(12))
+            // Text is immediately usable. Older recordings without timings
+            // can prepare captions in Edit; never block all quote cards on a
+            // potentially minutes-long speech recognition pass.
             var groups: [[CreateIdeas.Candidate]] = []
             for entry in entries {
                 guard !excludedMemoryKeys.contains(entry.key), memorySource(entry.key)?.content == entry.content else { continue }
@@ -800,12 +805,12 @@ final class AppState: ObservableObject {
             }
             var next = createCache; next.reconcile(candidates)
             try next.save(); createCache = next
-            let pending = Array(next.candidates.filter { next.decisions[$0.id] == nil && !next.dismissed.contains($0.id) }.prefix(24))
+            let pending = Array(next.candidates.filter { next.decisions[$0.id] == nil && !next.dismissed.contains($0.id) }.prefix(96))
             for batch in CreateIdeas.batches(pending) {
-                try checkJevWork()
+                try checkJevWork(allowCreate: true)
                 createStatus = "Finding moments worth sharing…"
                 let decisions = try await JevCloud.shared.ideas(batch.map(\.passage))
-                try checkJevWork()
+                try checkJevWork(allowCreate: true)
                 var updated = createCache
                 updated.reconcile(updated.candidates.filter { item in
                     guard !excludedMemoryKeys.contains(item.key), let entry = memorySource(item.key) else { return false }
@@ -814,6 +819,7 @@ final class AppState: ObservableObject {
                 let active = Set(updated.candidates.map(\.id))
                 for decision in decisions where active.contains(decision.id) { updated.decisions[decision.id] = decision }
                 try updated.save(); createCache = updated
+                if createIdeas.count >= 6 { break }
             }
             let remaining = createCache.candidates.filter { createCache.decisions[$0.id] == nil && !createCache.dismissed.contains($0.id) }.count
             createStatus = remaining > 0 ? "More moments to explore. Pull down again when you like." : (createIdeas.isEmpty ? "No strong standalone moments yet. Try another journal or make a card yourself." : "You're up to date.")
@@ -897,8 +903,9 @@ final class AppState: ObservableObject {
             date: Date(), preference: preference)
         readingSignals = Dictionary(uniqueKeysWithValues: readingSignals.sorted { $0.value.date > $1.value.date }.prefix(200).map { ($0.key, $0.value) })
         ReadingHistory.save(readingSignals)
-        rebuildInterestLens()
-        readsRefreshedAt = nil
+        // Reading feedback does not change the journal/persona input used by
+        // either relevance model. Keep other articles' successful decisions.
+        // Dislikes are filtered by ID; completed visits are filtered by URL.
     }
 
     func clearReadingHistory() {
@@ -907,8 +914,9 @@ final class AppState: ObservableObject {
         readingCandidate = nil; readingStarted = nil; readingSeconds = 0; readingRecordedSeconds = 0
         readingSignals = [:]
         ReadingHistory.save(readingSignals)
-        rebuildInterestLens()
-        readsRefreshedAt = nil
+        // Reading feedback does not change the journal/persona input used by
+        // either relevance model. Keep other articles' successful decisions.
+        // Dislikes are filtered by ID; completed visits are filtered by URL.
     }
 
     /// Open a web link inside the app (SFSafariViewController sheet).
@@ -5601,9 +5609,9 @@ extension AppState {
         guard !createBusy, jevEnabled, JevCloud.shared.connected, jevTask == nil, !readsDecisionBusy, !jevFeedsBusy, !kevJournalBusy, !contextWorkPaused else { return }
         jevTask = Task { await scanJevMemory(); jevTask = nil }
     }
-    private func checkJevWork() throws {
+    private func checkJevWork(allowCreate: Bool = false) throws {
         try Task.checkCancellation()
-        guard jevEnabled, !contextWorkPaused else { throw CancellationError() }
+        guard jevEnabled, !contextWorkPaused, allowCreate || !createBusy else { throw CancellationError() }
     }
     private func selectJevPassage(_ text: String, key: String, fingerprint: String, depth: Int = 0) async throws -> [JevMemory.Passage] {
         try checkJevWork()

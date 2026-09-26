@@ -1,6 +1,16 @@
 import XCTest
 
 @MainActor final class StudioUITests: XCTestCase {
+    func testQuotePublishOpensReviewWithoutPosting() {
+        let app = XCUIApplication(); app.launchArguments = ["--studio-ui-test"]; app.launch()
+        let publish = app.buttons["studio.publish"]
+        XCTAssertTrue(publish.waitForExistence(timeout: 20)); XCTAssertTrue(publish.isHittable)
+        publish.tap()
+        XCTAssertTrue(app.navigationBars["Publish post"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["A small practice can change how we see things."].exists)
+        app.buttons["Done"].tap()
+        XCTAssertTrue(publish.waitForExistence(timeout: 10))
+    }
     func testQuoteShareRemainsAboveTabsOnCompactScreen() {
         let app = XCUIApplication(); app.launchArguments = ["--studio-ui-test"]; app.launch()
         let share = app.buttons["studio.shareQuote"]

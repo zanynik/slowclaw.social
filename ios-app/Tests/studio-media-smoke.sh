@@ -7,8 +7,12 @@ python3 - "$APP_ROOT" "$STUDIO_TEST_ROOT" <<'PY'
 import json, pathlib, sys
 app, root = map(pathlib.Path, sys.argv[1:])
 paths = [app/'SlowClawApp/TimedTranscript.swift', app/'SlowClawApp/StudioRenderer.swift', app/'Tests/StudioMediaTests.swift']
-host = [app/'Tests/StudioUIHost.swift'] + [app/'SlowClawApp'/name for name in ['ShareStudioView.swift', 'StudioRenderer.swift', 'TimedTranscript.swift', 'CreateIdeas.swift', 'JevIdeas.swift', 'JevMemory.swift', 'JevBatch.swift', 'JevPersona.swift']]
-lines = ['name: StudioSmoke', 'options:', '  deploymentTarget:', '    iOS: "18.0"', 'targets:', '  StudioSmokeHost:', '    type: application', '    platform: iOS', '    sources:']
+host = [app/'Tests/StudioUIHost.swift'] + [app/'SlowClawApp'/name for name in ['ShareStudioView.swift', 'StudioRenderer.swift', 'TimedTranscript.swift', 'CreateIdeas.swift', 'JevIdeas.swift', 'JevMemory.swift', 'JevBatch.swift', 'JevPersona.swift', 'PublishDraftSheet.swift', 'NostrMedia.swift', 'NostrPublisher.swift', 'NostrReply.swift', 'NostrConversations.swift', 'NostrFetcher.swift', 'Nip19.swift', 'ReadsContentFilter.swift']]
+dto = (app/'SlowClawFeed/Sources/SlowClawFeed/SlowClawFeed.swift').read_text()
+start = dto.index('public struct RankedFeedItem:')
+(root/'RankedFeedItem.swift').write_text('import Foundation\n' + dto[start:dto.index('private struct RankedFeedItemDTO:', start)])
+host.append(root/'RankedFeedItem.swift')
+lines = ['name: StudioSmoke', 'packages:', '  NostrCrypto:', '    url: https://github.com/21-DOT-DEV/swift-secp256k1', '    exactVersion: 0.23.2', 'options:', '  deploymentTarget:', '    iOS: "18.0"', 'targets:', '  StudioSmokeHost:', '    type: application', '    dependencies:', '      - package: NostrCrypto', '        product: libsecp256k1', '    platform: iOS', '    sources:']
 lines += ['      - path: '+json.dumps(str(p)) for p in host]
 lines += ['    settings:', '      base:', '        GENERATE_INFOPLIST_FILE: YES', '        PRODUCT_BUNDLE_IDENTIFIER: com.slowclaw.studio-smoke-host', '        INFOPLIST_KEY_UILaunchScreen_Generation: YES', '        TARGETED_DEVICE_FAMILY: \"1,2\"', '        SWIFT_VERSION: "5.9"', '        CODE_SIGNING_ALLOWED: NO', '  StudioSmoke:', '    type: bundle.unit-test', '    platform: iOS', '    sources:']
 lines += ['      - path: '+json.dumps(str(p)) for p in paths]

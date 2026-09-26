@@ -99,6 +99,7 @@ struct ShareStudioView: View {
     @State private var needsSelection = false
     @State private var work: Task<Void, Never>?
     @State private var share: SharedAsset?
+    @State private var publication: SharedAsset?
     private let timer = Timer.publish(every: 0.08, on: .main, in: .common).autoconnect()
     init(source: StudioSource, compact: Bool = false) {
         self.source = source; self.compact = compact
@@ -127,6 +128,11 @@ struct ShareStudioView: View {
         }
         .interactiveDismissDisabled(exporting || preparing)
         .sheet(item: $share) { value in StudioShareSheet(url: value.url) }
+        .sheet(item: $publication) { value in
+            PublishDraftSheet(draftKey: "studio-" + source.id + "-" + mode,
+                content: mode == "Quote" ? draft.quote : (clip?.words.map(\.text).joined(separator: " ") ?? ""),
+                article: false, mediaURL: value.url, validate: validateSource)
+        }
         .fullScreenCover(isPresented: $editing, onDismiss: reloadDesign) {
             NavigationStack { ShareStudioView(source: source).environmentObject(state) }
         }
@@ -205,8 +211,12 @@ struct ShareStudioView: View {
                 Button("Cancel export", role: .cancel) { work?.cancel() }.frame(minHeight: 44)
             }
         } else if mode == "Quote" {
-            Button("Share quote", systemImage: "square.and.arrow.up") { shareQuote() }
-                .buttonStyle(.borderedProminent).frame(maxWidth: .infinity, minHeight: 44).accessibilityIdentifier("studio.shareQuote")
+            HStack {
+                Button("Share quote", systemImage: "square.and.arrow.up") { shareQuote() }
+                    .buttonStyle(.bordered).frame(minHeight: 44).accessibilityIdentifier("studio.shareQuote")
+                Button("Publish", systemImage: "paperplane") { shareQuote(publish: true) }
+                    .buttonStyle(.borderedProminent).frame(minHeight: 44).accessibilityIdentifier("studio.publish")
+            }.frame(maxWidth: .infinity)
         } else if preparing {
             ProgressView("Preparing captions…").frame(minHeight: 44)
         } else if transcript == nil {
@@ -215,14 +225,16 @@ struct ShareStudioView: View {
             VStack(spacing: 8) {
                 if let clip { Text("\(clip.duration, specifier: "%.1f") seconds").font(.caption).foregroundStyle(.secondary).accessibilityIdentifier(compact ? "studio.cardDuration" : "studio.duration") }
                 if needsSelection { Button("Use selected words") { needsSelection = false }.frame(minHeight: 44) }
-                HStack(spacing: 14) {
+                HStack(spacing: 10) {
                     Button(playing ? "Pause" : "Play", systemImage: playing ? "pause.fill" : "play.fill") { playPreview() }
                         .buttonStyle(.bordered).frame(minHeight: 44).accessibilityIdentifier("studio.playPause")
-                    Button("Share video", systemImage: "square.and.arrow.up") { exportVideo() }
-                        .buttonStyle(.borderedProminent).frame(minHeight: 44).disabled(needsSelection).accessibilityIdentifier("studio.shareVideo")
+                    Button("Publish", systemImage: "paperplane") { exportVideo(publish: true) }
+                        .buttonStyle(.borderedProminent).frame(minHeight: 44).disabled(needsSelection).accessibilityIdentifier("studio.publish")
                     Menu {
+                        Button("Share video", systemImage: "square.and.arrow.up") { exportVideo() }
                         Button("Share audio only", systemImage: "waveform") { exportVideo(audioOnly: true) }
-                    } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44) }.disabled(needsSelection)
+                    } label: { Image(systemName: "square.and.arrow.up").frame(width: 44, height: 44) }
+                        .disabled(needsSelection).accessibilityIdentifier("studio.shareVideo")
                 }
             }
         } else { Text("Choose a clip of up to 90 seconds.").font(.callout) }
@@ -243,12 +255,14 @@ struct ShareStudioView: View {
             Task { await useTiming(timing) }
         }
     }
-    private func shareQuote() {
+    private func shareQuote(publish: Bool = false) {
         state.studioPlayingID = nil
         do {
             try validateSource()
             let image = try StudioRenderer.quote(text: draft.quote, attribution: draft.attribution, theme: draft.theme, aspect: draft.aspect)
-            share = .init(url: try StudioExporter.quote(image)); issue = nil
+            let asset = SharedAsset(url: try StudioExporter.quote(image))
+            if publish { publication = asset } else { share = asset }
+            issue = nil
         } catch { issue = error.localizedDescription }
     }
 
@@ -346,7 +360,7 @@ struct ShareStudioView: View {
         next.seek(to: CMTime(seconds: clip.start, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         player = next; elapsed = 0; playing = true; next.play()
     }
-    private func exportVideo(audioOnly: Bool = false) {
+    private func exportVideo(audioOnly: Bool = false, publish: Bool = false) {
         guard let audio = source.audio, let clip, !exporting else { return }
         state.studioPlayingID = nil
         stopPreview(); exporting = true; progress = 0; issue = nil
@@ -361,7 +375,7 @@ struct ShareStudioView: View {
                 else { url = try await StudioExporter.video(audio: audio, clip: clip, title: title, theme: theme, showWaveform: waveform) { progress = $0 } }
                 do { try Task.checkCancellation(); try validateSource() }
                 catch { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()); throw error }
-                share = .init(url: url)
+                if publish { publication = .init(url: url) } else { share = .init(url: url) }
             } catch is CancellationError { issue = "Export cancelled." }
             catch { issue = error.localizedDescription }
         }
