@@ -49,6 +49,8 @@
     </array>
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>Save the quote cards and audio videos you choose to your photo library.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>SlowClaw needs microphone access when you record audio journal entries.</string>
     <key>NSSpeechRecognitionUsageDescription</key>

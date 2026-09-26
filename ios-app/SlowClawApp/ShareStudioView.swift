@@ -10,7 +10,7 @@ struct StudioSource: Identifiable {
     let audio: URL?
     let mediaPath: String?
     let initialQuote: String
-    init(entry: SlowClawMemoryEntry, excerpt: String? = nil) {
+    @MainActor init(entry: SlowClawMemoryEntry, excerpt: String? = nil) {
         key = entry.key; title = journalTitleOf(entry); content = entry.content
         self.excerpt = excerpt
         mediaPath = entry.mediaURL
