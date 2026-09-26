@@ -33,7 +33,13 @@ import XCTest
         let slider = app.sliders["studio.endWord"]
         XCTAssertTrue(slider.waitForExistence(timeout: 10))
         app.scrollViews.firstMatch.swipeUp()
-        slider.adjust(toNormalizedSliderPosition: 0.5)
+        XCTAssertTrue(slider.isHittable)
+        // Drag the visible thumb center. The iOS 26 normalized-position helper
+        // starts at the track's far edge and can leave the SwiftUI value unchanged.
+        let thumb = slider.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5))
+        let middle = slider.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.5))
+        thumb.press(forDuration: 0.2, thenDragTo: middle)
+        let evidence = XCTAttachment(screenshot: app.screenshot()); evidence.name = "edited-word-range"; evidence.lifetime = .keepAlways; add(evidence)
         let duration = app.staticTexts["studio.duration"].label
         XCTAssertNotEqual(duration, original)
         app.buttons["Done"].tap()
