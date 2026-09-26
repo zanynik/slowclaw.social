@@ -42,7 +42,11 @@ import XCTest
         app.buttons["Edit"].tap()
         let slider = app.sliders["studio.endWord"]
         XCTAssertTrue(slider.waitForExistence(timeout: 10))
-        app.scrollViews.firstMatch.swipeUp()
+        let editor = app.scrollViews["studio.editorScroll"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 10))
+        // The feed remains in the accessibility tree behind the cover. Scroll
+        // the editor itself, only until the real slider is reachable.
+        for _ in 0..<3 where !slider.isHittable { editor.swipeUp() }
         XCTAssertTrue(slider.isHittable)
         // Drag the visible thumb center. The iOS 26 normalized-position helper
         // starts at the track's far edge and can leave the SwiftUI value unchanged.

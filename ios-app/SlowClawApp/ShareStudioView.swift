@@ -115,7 +115,8 @@ struct ShareStudioView: View {
             if compact { content }
             else {
                 VStack(spacing: 0) {
-                    ScrollView { content.padding().padding(.bottom, 20) }.scrollDismissesKeyboard(.interactively)
+                    ScrollView { content.padding().padding(.bottom, 20) }
+                        .scrollDismissesKeyboard(.interactively).accessibilityIdentifier("studio.editorScroll")
                     actionBar.controlSize(.large).padding().background(.regularMaterial)
                 }
                 .navigationTitle("Edit creation").navigationBarTitleDisplayMode(.inline)
