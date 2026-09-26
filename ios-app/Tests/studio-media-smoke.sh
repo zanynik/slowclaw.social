@@ -6,10 +6,11 @@ trap 'rm -rf "$STUDIO_TEST_ROOT"' EXIT
 python3 - "$APP_ROOT" "$STUDIO_TEST_ROOT" <<'PY'
 import json, pathlib, sys
 app, root = map(pathlib.Path, sys.argv[1:])
+(root/'Host.swift').write_text('import SwiftUI\n@main struct StudioSmokeHost: App { var body: some Scene { WindowGroup { Color.black } } }\n')
 paths = [app/'SlowClawApp/TimedTranscript.swift', app/'SlowClawApp/StudioRenderer.swift', app/'Tests/StudioMediaTests.swift']
-lines = ['name: StudioSmoke', 'options:', '  deploymentTarget:', '    iOS: "18.0"', 'targets:', '  StudioSmoke:', '    type: bundle.unit-test', '    platform: iOS', '    sources:']
+lines = ['name: StudioSmoke', 'options:', '  deploymentTarget:', '    iOS: "18.0"', 'targets:', '  StudioSmokeHost:', '    type: application', '    platform: iOS', '    sources: [Host.swift]', '    settings:', '      base:', '        GENERATE_INFOPLIST_FILE: YES', '        PRODUCT_BUNDLE_IDENTIFIER: com.slowclaw.studio-smoke-host', '        CODE_SIGNING_ALLOWED: NO', '  StudioSmoke:', '    type: bundle.unit-test', '    platform: iOS', '    sources:']
 lines += ['      - path: '+json.dumps(str(p)) for p in paths]
-lines += ['    settings:', '      base:', '        GENERATE_INFOPLIST_FILE: YES', '        PRODUCT_BUNDLE_IDENTIFIER: com.slowclaw.studio-smoke', '        SWIFT_VERSION: "5.9"', '        CODE_SIGNING_ALLOWED: NO', 'schemes:', '  StudioSmoke:', '    build:', '      targets:', '        StudioSmoke: [test]', '    test:', '      targets: [StudioSmoke]']
+lines += ['    dependencies:', '      - target: StudioSmokeHost', '    settings:', '      base:', '        TEST_HOST: $(BUILT_PRODUCTS_DIR)/StudioSmokeHost.app/StudioSmokeHost', '        BUNDLE_LOADER: $(TEST_HOST)', '        GENERATE_INFOPLIST_FILE: YES', '        PRODUCT_BUNDLE_IDENTIFIER: com.slowclaw.studio-smoke', '        SWIFT_VERSION: "5.9"', '        CODE_SIGNING_ALLOWED: NO', 'schemes:', '  StudioSmoke:', '    build:', '      targets:', '        StudioSmoke: [test]', '    test:', '      targets: [StudioSmoke]']
 (root/'project.yml').write_text('\n'.join(lines)+'\n')
 PY
 xcodegen generate --spec "$STUDIO_TEST_ROOT/project.yml"
@@ -20,6 +21,7 @@ xcodebuild test -project "$STUDIO_TEST_ROOT/StudioSmoke.xcodeproj" -scheme Studi
 STUDIO_RESULT=$?
 set -e
 xcrun xcresulttool get test-results summary --path /tmp/slowclaw-studio-evidence/results.xcresult || true
+xcrun xcresulttool export attachments --path /tmp/slowclaw-studio-evidence/results.xcresult --output-path /tmp/slowclaw-studio-evidence/attachments || true
 python3 - "$STUDIO_DEVICE" <<'PY'
 import os, pathlib, shutil, sys
 root=pathlib.Path(os.environ['HOME'])/'Library/Developer/CoreSimulator/Devices'/sys.argv[1]/'data'

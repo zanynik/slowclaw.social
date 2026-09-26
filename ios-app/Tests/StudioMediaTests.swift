@@ -4,6 +4,11 @@ import AVFoundation
 
 @MainActor
 final class StudioMediaTests: XCTestCase {
+    private func keep(_ image: UIImage, name: String) {
+        let attachment = XCTAttachment(image: image)
+        attachment.name = name; attachment.lifetime = .keepAlways
+        add(attachment)
+    }
     func testQuoteFitsEveryShapeAndExportsPNG() throws {
         let quote = "A small tool can leave more room for a meaningful thought."
         for aspect in StudioAspect.allCases {
@@ -18,6 +23,7 @@ final class StudioMediaTests: XCTestCase {
         try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: true)
         let image = try StudioRenderer.quote(text: quote, attribution: "", theme: .midnight, aspect: .portrait)
         try image.pngData()!.write(to: evidence.appendingPathComponent("quote.png"))
+        keep(image, name: "quote")
     }
     func testVideoAndAudioContainTheSelectedOriginalTimeRange() async throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("StudioSmoke", isDirectory: true)
@@ -42,6 +48,7 @@ final class StudioMediaTests: XCTestCase {
         XCTAssertGreaterThan(waveform.max() ?? 0, 0.1)
         let preview = StudioRenderer.videoFrame(clip: clip, time: 0.2, title: "A little room", theme: .blue, envelope: waveform)
         try preview.pngData()!.write(to: folder.appendingPathComponent("video-preview.png"))
+        keep(preview, name: "video-preview")
         let videoURL = try await StudioExporter.video(audio: audio, clip: clip, title: "A little room", theme: .blue, showWaveform: true) { _ in }
         let video = AVURLAsset(url: videoURL)
         let videoDuration = try await video.load(.duration).seconds
@@ -54,6 +61,7 @@ final class StudioMediaTests: XCTestCase {
         let generator = AVAssetImageGenerator(asset: video)
         generator.requestedTimeToleranceBefore = .zero; generator.requestedTimeToleranceAfter = .zero
         let frame = try await generator.image(at: CMTime(value: 5, timescale: 24)).image
+        keep(UIImage(cgImage: frame), name: "encoded-frame")
         try UIImage(cgImage: frame).pngData()!.write(to: folder.appendingPathComponent("encoded-frame.png"))
         let destination = folder.appendingPathComponent("sample.mp4")
         try? FileManager.default.removeItem(at: destination)

@@ -177,32 +177,10 @@ enum StudioExporter {
         writer.add(input)
         guard writer.startWriting() else { throw writer.error ?? StudioError(message: "Could not start video export.") }
         writer.startSession(atSourceTime: .zero)
-        do {
-            let frames = Int(ceil(clip.duration * 24))
-            for frame in 0..<frames {
-                try Task.checkCancellation()
-                let deadline = Date().addingTimeInterval(15)
-                while !input.isReadyForMoreMediaData {
-                    guard writer.status == .writing, Date() < deadline else { throw writer.error ?? StudioError(message: "Video export stalled at frame \(frame) of \(frames). Please retry.") }
-                    try await Task.sleep(nanoseconds: 5_000_000)
-                }
-                try autoreleasepool {
-                    let image = StudioRenderer.videoFrame(clip: clip, time: Double(frame) / 24, title: title, theme: theme, envelope: waveform)
-                    var optional: CVPixelBuffer?
-                    guard let pool = adaptor.pixelBufferPool, CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optional) == kCVReturnSuccess, let buffer = optional else { throw StudioError(message: "Not enough memory to render video.") }
-                    CVPixelBufferLockBaseAddress(buffer, [])
-                    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-                    guard let context = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: 720, height: 1280, bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue), let cgImage = image.cgImage else { throw StudioError(message: "Could not draw a video frame.") }
-                    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: 720, height: 1280))
-                    guard adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(frame), timescale: 24)) else { throw writer.error ?? StudioError(message: "Could not encode a video frame.") }
-                }
-                if frame % 6 == 0 { progress(Double(frame) / Double(frames) * 0.85); await Task.yield() }
-            }
-            writer.endSession(atSourceTime: CMTime(seconds: clip.duration, preferredTimescale: 600))
-            input.markAsFinished()
-            await writer.finishWriting()
-            guard writer.status == .completed else { throw writer.error ?? StudioError(message: "Video encoding failed.") }
-        } catch { writer.cancelWriting(); throw error }
+        let pump = StudioFramePump(writer: writer, input: input, adaptor: adaptor, clip: clip, title: title, theme: theme, waveform: waveform, progress: progress)
+        try await pump.run()
+        await writer.finishWriting()
+        guard writer.status == .completed else { throw writer.error ?? StudioError(message: "Video encoding failed.") }
         try Task.checkCancellation()
         let source = AVURLAsset(url: audio), video = AVURLAsset(url: silentURL)
         let composition = AVMutableComposition()
@@ -223,5 +201,85 @@ enum StudioExporter {
         try? FileManager.default.removeItem(at: silentURL)
         progress(1); succeeded = true
         return finalURL
+    }
+}
+
+/// AVFoundation pulls offline frames when its encoder can accept them. All
+/// state and UIKit drawing stay on the main queue; waiting never blocks it.
+@MainActor
+private final class StudioFramePump {
+    let writer: AVAssetWriter
+    let input: AVAssetWriterInput
+    let adaptor: AVAssetWriterInputPixelBufferAdaptor
+    let clip: TimedTranscript.Clip
+    let title: String
+    let theme: StudioTheme
+    let waveform: [Float]
+    let progress: (Double) -> Void
+    var frame = 0
+    var lastAdvance = Date()
+    var continuation: CheckedContinuation<Void, Error>?
+    var watchdog: Task<Void, Never>?
+    var frames: Int { Int(ceil(clip.duration * 24)) }
+    init(writer: AVAssetWriter, input: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor, clip: TimedTranscript.Clip, title: String, theme: StudioTheme, waveform: [Float], progress: @escaping (Double) -> Void) {
+        self.writer = writer; self.input = input; self.adaptor = adaptor
+        self.clip = clip; self.title = title; self.theme = theme
+        self.waveform = waveform; self.progress = progress
+    }
+    func run() async throws {
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                self.continuation = continuation
+                input.requestMediaDataWhenReady(on: .main) { [weak self] in
+                    MainActor.assumeIsolated { self?.pump() }
+                }
+                watchdog = Task { [self] in
+                    while !Task.isCancelled {
+                        do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+                        if Date().timeIntervalSince(lastAdvance) > 30 {
+                            finish(StudioError(message: "Video export stalled at frame \(frame) of \(frames). Please retry.")); return
+                        }
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [self] in finish(CancellationError()) }
+        }
+    }
+    private func finish(_ error: Error? = nil) {
+        guard let pending = continuation else { return }
+        continuation = nil; watchdog?.cancel(); watchdog = nil
+        if let error { writer.cancelWriting(); pending.resume(throwing: error) }
+        else {
+            writer.endSession(atSourceTime: CMTime(seconds: clip.duration, preferredTimescale: 600))
+            input.markAsFinished(); pending.resume()
+        }
+    }
+    private func pump() {
+        guard continuation != nil else { return }
+        do {
+            while input.isReadyForMoreMediaData, frame < frames {
+                try appendFrame()
+                frame += 1; lastAdvance = Date()
+                if frame % 6 == 0 { progress(Double(frame) / Double(frames) * 0.85) }
+            }
+            if frame == frames { finish() }
+            else if writer.status != .writing { finish(writer.error ?? StudioError(message: "Video encoding failed.")) }
+        } catch { finish(error) }
+    }
+    private func appendFrame() throws {
+        try autoreleasepool {
+            let image = StudioRenderer.videoFrame(clip: clip, time: Double(frame) / 24, title: title, theme: theme, envelope: waveform)
+            var optional: CVPixelBuffer?
+            guard let pool = adaptor.pixelBufferPool, CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optional) == kCVReturnSuccess, let buffer = optional else { throw StudioError(message: "Not enough memory to render video.") }
+            do {
+                CVPixelBufferLockBaseAddress(buffer, [])
+                defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+                guard let context = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: 720, height: 1280, bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue), let cgImage = image.cgImage else { throw StudioError(message: "Could not draw a video frame.") }
+                context.draw(cgImage, in: CGRect(x: 0, y: 0, width: 720, height: 1280))
+            }
+            guard adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(frame), timescale: 24)) else { throw writer.error ?? StudioError(message: "Could not encode a video frame.") }
+        }
     }
 }
