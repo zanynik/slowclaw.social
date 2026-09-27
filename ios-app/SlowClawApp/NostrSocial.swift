@@ -112,3 +112,25 @@ actor NostrDiscovery {
         return batch.events
     }
 }
+
+/// A useful starting feed even before the first follow or journal. The provider
+/// supplies public candidates only; no identity, persona or journal is sent.
+actor NostrPopular {
+    static let shared = NostrPopular()
+    private var cached: [PublishedEvent] = []
+    private var refreshed: Date = .distantPast
+    func posts(relays: [String]) async -> [PublishedEvent] {
+        if !cached.isEmpty, Date().timeIntervalSince(refreshed) < 3600 { return cached }
+        let trending = await NostrConversations.shared.popularPosts()
+        let notes = trending.filter { $0.kind == 1 && NostrSocialRules.parent($0) == nil }
+        var authors = Set<String>()
+        let roots = Array(notes.filter { authors.insert($0.pubkey).inserted }.prefix(4).map(\.pubkey))
+        let network = await NostrDiscovery.shared.posts(roots: roots, relays: relays)
+        var ids = Set<String>()
+        let next = Array((notes + network).filter { ids.insert($0.id).inserted }.prefix(120))
+        if !next.isEmpty { cached = next; refreshed = Date() }
+        // An outage retains recent public discovery rather than replacing it
+        // with an empty result. Old material expires after one day.
+        return Date().timeIntervalSince(refreshed) < 86400 ? cached : []
+    }
+}

@@ -110,7 +110,8 @@ struct PulseSourcesView: View {
     var body: some View {
         Form {
             Section {
-                Text("Pulse finds posts from your follows and people they follow, then ranks them using your journal interests. Wider discovery keeps new voices in the mix.")
+                Text("Start with popular public posts and their authors’ networks automatically—even before you follow anyone. As your network grows, Pulse mixes in your follows and people they follow, ranked by your journal interests.")
+                Text("Popular discovery comes from Primal’s public feed. Your identity and journal interests are not sent to Primal.").font(.caption).foregroundStyle(.secondary)
                 Text("Add a public account you trust or find interesting—even a well-known person—to explore their network. This does not follow them publicly.")
                     .font(.footnote).foregroundStyle(.secondary)
             }

@@ -82,23 +82,40 @@ enum NostrFetcher {
     }
 
     private static func fetchPosts(topics: [String], roots: [String], discoveryRelays: [String]) async -> [RankedFeedItem] {
+        async let popular = NostrPopular.shared.posts(relays: discoveryRelays)
         async let network = NostrDiscovery.shared.posts(roots: roots, relays: discoveryRelays)
         var events: [[String: Any]] = []
         await withTaskGroup(of: [[String: Any]]?.self) { group in
             for relay in relays { group.addTask { await queryRelay(relay, kinds: [1], limit: 60) } }
             for await batch in group { events += batch ?? [] }
         }
-        let networkEvents = await network
-        let rawNetwork = networkEvents.compactMap { event -> [String: Any]? in
-            guard let data = try? JSONEncoder().encode(event) else { return nil }
-            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        func candidates(_ signed: [PublishedEvent]) -> [RankedFeedItem] {
+            let raw = signed.compactMap { event -> [String: Any]? in
+                guard let data = try? JSONEncoder().encode(event) else { return nil }
+                return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            }
+            return shortPostCandidates(raw, topics: topics)
         }
-        let trusted = shortPostCandidates(rawNetwork, topics: topics)
+        let trusted = candidates(await network)
+        let popularItems = candidates(await popular)
         let global = shortPostCandidates(events, topics: topics)
-        // Reserve discovery space while preserving a path beyond the follow graph.
-        var seen = Set<String>()
-        return Array((Array(trusted.prefix(30)) + global + trusted.dropFirst(30))
-            .filter { seen.insert($0.id).inserted }.prefix(40))
+        return blendPosts(network: trusted, popular: popularItems, global: global)
+    }
+
+    /// New identities receive popular-network candidates automatically. Existing
+    /// networks keep most slots, with room for popular and wider discovery.
+    static func blendPosts(network: [RankedFeedItem], popular: [RankedFeedItem], global: [RankedFeedItem]) -> [RankedFeedItem] {
+        let first = Array(network.prefix(24)) + Array(popular.prefix(network.isEmpty ? 32 : 12))
+        var seen = Set<String>(), authors: [String: Int] = [:]
+        return Array((first + global + network + popular).filter { item in
+            guard !seen.contains(item.id) else { return false }
+            if let raw = item.nostrEventJSON, let event = try? JSONDecoder().decode(PublishedEvent.self, from: Data(raw.utf8)) {
+                guard authors[event.pubkey, default: 0] < 2 else { return false }
+                authors[event.pubkey, default: 0] += 1
+            }
+            seen.insert(item.id)
+            return true
+        }.prefix(40))
     }
 
     /// Only signed, substantive text notes become candidates. They still must

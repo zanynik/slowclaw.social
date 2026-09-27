@@ -10,6 +10,23 @@ final class NostrSocialTests: XCTestCase {
         let hash = Array(SHA256.hash(data: data))
         return PublishedEvent(id: NostrIdentity.hex(hash), pubkey: key, created_at: date, kind: kind, tags: tags, content: content, sig: try NostrIdentity.sign(hash: hash, secret: secret))
     }
+    func testColdStartNeedsNoFollowsAndRetainsPopularCandidates() {
+        func item(_ n: Int) -> RankedFeedItem {
+            .init(id: "nostr:\(n)", title: "SlowClaw sample", link: "https://example.com/\(n)", description: "Public observation",
+                sourceLabel: "Nostr posts", score: 1, readMinutes: 1, sourcePlatform: "nostr")
+        }
+        let popular = (0..<40).map(item), global = (30..<70).map(item)
+        let cold = NostrFetcher.blendPosts(network: [], popular: popular, global: global)
+        XCTAssertEqual(cold.count, 40)
+        XCTAssertEqual(Array(cold.prefix(32).map(\.id)), Array(popular.prefix(32).map(\.id)))
+        XCTAssertEqual(Set(cold.map(\.id)).count, cold.count)
+        let fallback = NostrFetcher.blendPosts(network: [], popular: [], global: global)
+        XCTAssertEqual(fallback.map(\.id), global.map(\.id))
+        let personal = (100..<140).map(item)
+        let warm = NostrFetcher.blendPosts(network: personal, popular: popular, global: global)
+        XCTAssertEqual(Array(warm.prefix(24).map(\.id)), Array(personal.prefix(24).map(\.id)))
+        XCTAssertTrue(warm.contains { $0.id == popular[0].id })
+    }
     func testPublicKeyParsingNeverAcceptsNsec() throws {
         let bytes = Array(repeating: UInt8(1), count: 32)
         let key = NostrIdentity.hex(bytes)

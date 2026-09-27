@@ -155,6 +155,18 @@ actor NostrConversations {
         return Batch(events: events, completed: completed, total: urls.count)
     }
 
+    /// Anonymous Primal public discovery. Its synthetic stats are not trusted
+    /// as signed Nostr events; only verified kind-1 notes enter the candidate pool.
+    func popularPosts() async -> [PublishedEvent] {
+        let sub = "sc_popular_" + UUID().uuidString
+        let options: [String: Any] = [:]
+        let request: [Any] = ["REQ", sub, ["cache": ["explore_global_trending_24h", options] as [Any]]]
+        guard let data = try? JSONSerialization.data(withJSONObject: request),
+              let wire = String(data: data, encoding: .utf8),
+              let url = URL(string: "wss://cache2.primal.net/v1") else { return [] }
+        return await Self.query(url, wire: wire, subscription: sub, kinds: [1]).events
+    }
+
     nonisolated static func matches(_ event: PublishedEvent, filter: [String: Any]) -> Bool {
         if let kinds = filter["kinds"] as? [Int], !kinds.contains(event.kind) { return false }
         if let authors = filter["authors"] as? [String], !authors.contains(event.pubkey) { return false }

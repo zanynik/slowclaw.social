@@ -5,7 +5,7 @@
 Proven: native Nostr metadata (NIP-01), follows (NIP-02), text-note threads
 (NIP-10), and reactions (NIP-25). Better: present those familiar social
 features alongside the existing journal-driven Needle + BM25 ranking.
-No new ranking model, hosted discovery dependency, or analytics service.
+No new ranking model or analytics service. Optional public Primal discovery supplies cold-start candidates; direct relay discovery remains available during outages.
 
 Research sources reviewed on 2026-09-27:
 - https://github.com/nostr-protocol/nips/blob/master/01.md
@@ -34,11 +34,19 @@ judge. Do not hard-code celebrity identities or equate popularity with trust.
   Starting accounts do not publish a follow event. The author sample rotates
   daily; follow graphs are cached for six hours. Root posts are preferred over
   contextless replies, and each source author contributes at most two candidates.
-- Reserve up to 30 of the existing 40 candidate slots for the discovered network;
-  wider relay discovery fills remaining slots. Needle + BM25 and existing cached
+- Automatically fetch Primal’s public 24-hour trending notes and sample the
+  authors’ networks. No user identity, journal text or interest vector enters
+  that public request. Verify original note signatures and ignore synthetic
+  statistics. Cache successful popular discovery for one hour and retain it
+  for up to a day during outages.
+- Reserve 24 of the existing 40 candidate slots for a personal network and
+  12 for popular discovery. With no personal network, reserve 32 for popular
+  discovery. Wider relay discovery fills remaining slots. Needle + BM25 and existing cached
   ranked snapshots remain unchanged. Empty/unreachable graphs fall back to the
-  existing global discovery path. A new identity can add public source accounts
-  in Profile → Pulse discovery sources or via a post's menu.
+  existing global discovery path. A new identity receives popular discovery automatically and can add public source accounts
+  in Profile → Pulse discovery sources or via a post's menu. Without journal
+  interests, show these discovery candidates immediately instead of an empty
+  Pulse; start personalized ranking when interests become available.
 - Profile → Username & description creates/imports an identity if needed, loads
   its latest signed kind-0 metadata, and publishes only on an explicit button
   tap. Preserve avatar, website, payment address, and unknown metadata fields.
@@ -64,3 +72,14 @@ assets, and release workflow are unchanged. Queries expose public author/event
 IDs to configured relays, never journal content. Roll back this feature commit
 to restore the previous Pulse UI and global candidate sampling; published
 profile events remain public, as with any Nostr client.
+
+## Cold-start source evidence
+
+Primal server `src/app_ext.jl` implements `explore_global_trending_24h` without
+requiring a user pubkey. The web client `src/lib/feed.ts` uses that operation
+and its public configuration points to `wss://cache2.primal.net/v1`.
+Source repositories were cloned and inspected directly. A read-only public
+WebSocket probe from this Linux workspace timed out during the handshake;
+therefore live provider availability is not claimed. The existing bounded
+relay transport and deterministic cold/warm/offline blending tests cover the
+client path. Provider outage falls back to cached and direct relay candidates.

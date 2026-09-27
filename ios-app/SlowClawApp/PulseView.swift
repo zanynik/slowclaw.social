@@ -28,7 +28,7 @@ struct PulseView: View {
                         Text("For you").tag(false)
                         Text("Latest").tag(true)
                     }.pickerStyle(.segmented).padding()
-                    Text("Conversations picked for you").font(.caption2).foregroundStyle(.secondary).padding(.bottom, 8)
+                    Text(state.personaTopics.isEmpty ? "Discover conversations" : "Conversations picked for you").font(.caption2).foregroundStyle(.secondary).padding(.bottom, 8)
                     if items.isEmpty {
                         ContentUnavailableView("Find your conversations", systemImage: "bubble.left.and.bubble.right",
                             description: Text("Relevant Nostr posts appear here as you journal. Pull to refresh."))

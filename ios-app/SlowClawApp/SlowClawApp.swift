@@ -512,13 +512,20 @@ final class AppState: ObservableObject {
 
     private func rankPulse() async {
         let interests = JevBatch.profile(personaWeights)
-        guard !interests.isEmpty else { return }
         let candidates = Array(readsItems.filter {
             $0.sourceLabel == "Nostr posts" && readingSignals[$0.id]?.preference != -1
                 && !$0.description.contains("\0")
                 && !NostrInbox.shared.hiddenAuthors.contains(PulseNote.decode($0)?.pubkey ?? "")
         }.prefix(40))
         guard !candidates.isEmpty else { return }
+        if interests.isEmpty {
+            do {
+                try PulseSnapshot.save(candidates)
+                pulseSnapshot = candidates; pulseRankedKey = ""
+                pulseSnapshotError = "Popular and network discovery. Add a journal to personalize your feed."
+            } catch { pulseSnapshotError = error.localizedDescription }
+            return
+        }
         let profile = JevBatch.profileID(interests)
         let key = JevBatch.digest(profile + candidates.map(Self.readsDecisionText).joined(separator: "\n"))
         guard key != pulseRankedKey else { return }
