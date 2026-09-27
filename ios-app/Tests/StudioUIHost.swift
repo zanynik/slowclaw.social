@@ -5,6 +5,11 @@ import CryptoKit
 // Only compiled into the isolated simulator test host. The actual studio view
 // and render/export code are exercised; the journal store is a synthetic fixture.
 struct SlowClawMemoryEntry { let key: String; let content: String; let mediaURL: String? }
+func journalDate(_ entry: SlowClawMemoryEntry) -> Date? { Date() }
+struct WebMemoryFixture {
+    func get(key: String) throws -> SlowClawMemoryEntry? { nil }
+    func store(key: String, content: String, category: String, sessionID: String?, source: String?, mediaURL: String?) throws {}
+}
 func journalTitleOf(_ entry: SlowClawMemoryEntry) -> String { "Studio sample" }
 func journalBodyOf(_ text: String) -> String { text }
 @MainActor final class AudioRecorder {
@@ -17,6 +22,16 @@ enum AppTab { case drafts, journal }
     @Published var studioPlayingID: String?
     @Published var selectedTab = AppTab.drafts
     let recorder = AudioRecorder()
+    let memory = WebMemoryFixture()
+    var journals: [SlowClawMemoryEntry] { liteJournals }
+    var excludedMemoryKeys: Set<String> = []
+    var createIdeas: [CreateIdeas.Candidate] = []
+    var relevantPulse: [RankedFeedItem] = []
+    static let transcribingPlaceholder = "Transcribing…"
+    static func needsTranscript(_ content: String?) -> Bool { content == nil }
+    func refreshJournals() async {}
+    func enqueuePendingTranscription(key: String, mediaPath: String, drainNow: Bool) async -> Bool { true }
+    func drainPendingTranscriptions() async {}
     let entry: SlowClawMemoryEntry
     var liteJournals: [SlowClawMemoryEntry] { [entry] }
     init() {
@@ -45,7 +60,9 @@ enum AppTab { case drafts, journal }
     @State private var sourceID = "studio-ui-" + UUID().uuidString
     var body: some Scene {
         WindowGroup {
-            if ProcessInfo.processInfo.arguments.contains("--pulse-ui-test") {
+            if ProcessInfo.processInfo.arguments.contains("--web-ui-test") {
+                NavigationStack { WebCompanionView().environmentObject(state) }
+            } else if ProcessInfo.processInfo.arguments.contains("--pulse-ui-test") {
                 NavigationStack { ScrollView { PulseRow(item: PulseUIFixture.item).environmentObject(state).padding(.top) } }
             } else if ProcessInfo.processInfo.arguments.contains("--studio-ui-test") {
                 VStack(spacing: 0) {

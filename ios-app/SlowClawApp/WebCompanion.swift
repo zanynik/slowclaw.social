@@ -54,7 +54,8 @@ final class WebCompanion: ObservableObject {
         let (data, response) = try await http.data(for: req)
         guard let response = response as? HTTPURLResponse else { throw PublishingError.message("No response from SlowClaw Web.") }
         guard (200..<300).contains(response.statusCode) else {
-            if response.statusCode == 410, self.session?.id == session.id { forget() }
+            if self.session?.id == session.id,
+               response.statusCode == 410 || (response.statusCode == 403 && self.session?.pair != nil) { forget() }
             let problem = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
             throw PublishingError.message(problem ?? "Web sync could not finish. Please retry.")
         }
@@ -165,7 +166,7 @@ final class WebCompanion: ObservableObject {
         let title = String(URL(fileURLWithPath: metadata.name).deletingPathExtension().lastPathComponent.prefix(240)).replacingOccurrences(of: "\n", with: " ")
         if metadata.type == "text" {
             guard let text = JournalTextImport.decode(data) else { throw PublishingError.message("Text must be UTF-8 and at most \(JournalTextImport.maximumBytes / 1024) KB.") }
-            let key = "journal_import_" + JevCloud.fingerprint(text)
+            let key = "journal_import_" + WebSessionProtocol.digest(Data(text.utf8))
             if try state.memory.get(key: key) == nil {
                 try state.memory.store(key: key, content: title + "\n\n" + text, category: "daily", sessionID: nil, source: "text_import", mediaURL: nil)
             }
@@ -212,7 +213,7 @@ struct WebCompanionView: View {
                     Button { scanning = true } label: { Label("Scan web sign-in code", systemImage: "qrcode.viewfinder") }
                     Text("Open the site on your laptop, show its QR code, then scan it here. Set up your Nostr identity in Username & description first.").font(.footnote).foregroundStyle(.secondary)
                 } else {
-                    Label("Browser paired", systemImage: "laptopcomputer")
+                    Label(web.session?.pair == nil ? "Browser paired" : "Pairing not finished", systemImage: "laptopcomputer")
                     if let date = web.lastSync { Text("Last sync: \(date.formatted(date: .omitted, time: .shortened))").font(.footnote) }
                     Button("Sync now") { Task { await web.sync(state: state) } }.disabled(web.busy)
                     Button("Disconnect & delete web session", role: .destructive) { confirmDisconnect = true }.disabled(web.busy)
@@ -232,6 +233,7 @@ struct WebCompanionView: View {
                 do { pairing = try WebSessionProtocol.pairing(value); problem = nil } catch { problem = error.localizedDescription }
             }.ignoresSafeArea(edges: .bottom).navigationTitle("Scan laptop QR code")
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { scanning = false } } }
+            }
         }
         .confirmationDialog("Connect this browser?", isPresented: Binding(get: { pairing != nil }, set: { if !$0 { pairing = nil } }), titleVisibility: .visible) {
             if let next = pairing { Button("Connect & share last 7 days") { pairing = nil; Task { await web.connect(next, state: state) } } }
@@ -258,6 +260,7 @@ private struct WebQRScanner: UIViewControllerRepresentable {
             super.viewDidLoad(); view.backgroundColor = .black
             Task { @MainActor in
                 let allowed = await AVCaptureDevice.requestAccess(for: .video)
+                guard viewIfLoaded?.window != nil else { return }
                 guard allowed, let camera = AVCaptureDevice.default(for: .video), let input = try? AVCaptureDeviceInput(device: camera), capture.canAddInput(input) else { showError(); return }
                 capture.addInput(input)
                 let output = AVCaptureMetadataOutput()

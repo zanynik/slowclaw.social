@@ -1,6 +1,12 @@
 import XCTest
 
 @MainActor final class StudioUITests: XCTestCase {
+    func testWebPairingEntryExplainsTemporarySharing() {
+        let app = XCUIApplication(); app.launchArguments = ["--web-ui-test"]; app.launch()
+        XCTAssertTrue(app.navigationBars["SlowClaw Web"].waitForExistence(timeout: 20))
+        XCTAssertTrue(app.buttons["Scan web sign-in code"].exists)
+        XCTAssertTrue(app.staticTexts["Read your recent week and send journals or audio from your laptop."].exists)
+    }
     func testPulseShowsNamesCountsAndExpandableRepliesWithoutPublishing() {
         let app = XCUIApplication(); app.launchArguments = ["--pulse-ui-test"]; app.launch()
         XCTAssertTrue(app.staticTexts["SlowClawAgent"].waitForExistence(timeout: 20))
