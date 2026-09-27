@@ -104,12 +104,12 @@ final class WebCompanion: ObservableObject {
         do {
             try await completePair(session)
             let status = try JSONDecoder().decode(Status.self, from: await request(session))
-            var failed = 0
+            var failed = 0, received = 0
             for transfer in status.transfers where transfer.status == "ready" {
-                do { try await receive(transfer, session: session, state: state) }
+                do { try await receive(transfer, session: session, state: state); received += 1 }
                 catch { failed += 1; message = "A file could not be imported: " + error.localizedDescription }
             }
-            await state.refreshJournals()
+            if received > 0 { await state.refreshJournals() }
             let snapshot = try makeSnapshot(state: state)
             let fingerprint = WebSessionProtocol.digest(snapshot)
             if fingerprint != lastSnapshot {
@@ -202,6 +202,7 @@ struct WebCompanionView: View {
     @StateObject private var web = WebCompanion.shared
     @State private var scanning = false
     @State private var pairing: WebSessionProtocol.Pairing?
+    @State private var pendingPairing: WebSessionProtocol.Pairing?
     @State private var problem: String?
     @State private var confirmDisconnect = false
     var body: some View {
@@ -227,10 +228,14 @@ struct WebCompanionView: View {
                 Text("Keep SlowClaw open to receive laptop uploads. Files marked Saved on phone stay here after logout. Sessions expire after 24 hours; logging out deletes pending uploads too.")
             }.font(.footnote)
         }.navigationTitle("SlowClaw Web")
-        .sheet(isPresented: $scanning) {
+        .sheet(isPresented: $scanning, onDismiss: {
+            pairing = pendingPairing
+            pendingPairing = nil
+        }) {
             NavigationStack { WebQRScanner { value in
+                do { pendingPairing = try WebSessionProtocol.pairing(value); problem = nil }
+                catch { pendingPairing = nil; problem = error.localizedDescription }
                 scanning = false
-                do { pairing = try WebSessionProtocol.pairing(value); problem = nil } catch { problem = error.localizedDescription }
             }.ignoresSafeArea(edges: .bottom).navigationTitle("Scan laptop QR code")
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { scanning = false } } }
             }
@@ -251,6 +256,7 @@ private struct WebQRScanner: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: ScannerController, context: Context) {}
     final class ScannerController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
         let capture = AVCaptureSession()
+        private let cameraQueue = DispatchQueue(label: "com.slowclaw.web.camera")
         let scanned: (String) -> Void
         var preview: AVCaptureVideoPreviewLayer?
         var delivered = false
@@ -269,7 +275,7 @@ private struct WebQRScanner: UIViewControllerRepresentable {
                 let layer = AVCaptureVideoPreviewLayer(session: capture); layer.videoGravity = .resizeAspectFill
                 view.layer.addSublayer(layer); preview = layer; layer.frame = view.bounds
                 let capture = self.capture
-                DispatchQueue.global(qos: .userInitiated).async { capture.startRunning() }
+                cameraQueue.async { capture.startRunning() }
             }
         }
         private func showError() {
@@ -277,7 +283,7 @@ private struct WebQRScanner: UIViewControllerRepresentable {
             label.frame = view.bounds.insetBy(dx: 30, dy: 100); label.autoresizingMask = [.flexibleWidth, .flexibleHeight]; view.addSubview(label)
         }
         override func viewDidLayoutSubviews() { super.viewDidLayoutSubviews(); preview?.frame = view.bounds }
-        override func viewWillDisappear(_ animated: Bool) { super.viewWillDisappear(animated); let capture = self.capture; DispatchQueue.global().async { capture.stopRunning() } }
+        override func viewWillDisappear(_ animated: Bool) { super.viewWillDisappear(animated); let capture = self.capture; cameraQueue.async { capture.stopRunning() } }
         func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
             guard !delivered, let object = metadataObjects.first as? AVMetadataMachineReadableCodeObject, let value = object.stringValue else { return }
             delivered = true; scanned(value)
