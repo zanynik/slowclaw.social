@@ -83,7 +83,7 @@ enum NostrFetcher {
 
     private static func fetchPosts(topics: [String], roots: [String], discoveryRelays: [String]) async -> [RankedFeedItem] {
         async let popular = NostrPopular.shared.posts(relays: discoveryRelays)
-        async let network = NostrDiscovery.shared.posts(roots: roots, relays: discoveryRelays)
+        async let network = NostrDiscovery.shared.result(roots: roots, relays: discoveryRelays)
         var events: [[String: Any]] = []
         await withTaskGroup(of: [[String: Any]]?.self) { group in
             for relay in relays { group.addTask { await queryRelay(relay, kinds: [1], limit: 60) } }
@@ -96,16 +96,20 @@ enum NostrFetcher {
             }
             return shortPostCandidates(raw, topics: topics)
         }
-        let trusted = candidates(await network)
+        let discovery = await network
+        let trusted = candidates(discovery.events)
         let popularItems = candidates(await popular)
         let global = shortPostCandidates(events, topics: topics)
-        return blendPosts(network: trusted, popular: popularItems, global: global)
+        return blendPosts(network: trusted, popular: popularItems, global: global, followCount: discovery.followCount)
     }
 
     /// New identities receive popular-network candidates automatically. Existing
     /// networks keep most slots, with room for popular and wider discovery.
-    static func blendPosts(network: [RankedFeedItem], popular: [RankedFeedItem], global: [RankedFeedItem]) -> [RankedFeedItem] {
-        let first = Array(network.prefix(24)) + Array(popular.prefix(network.isEmpty ? 32 : 12))
+    static func blendPosts(network: [RankedFeedItem], popular: [RankedFeedItem], global: [RankedFeedItem], followCount: Int = 100) -> [RankedFeedItem] {
+        // 8 personal slots at zero follows, gradually 24 at 100. Popular
+        // discovery always keeps at least 12/40 slots; four wider slots remain.
+        let personalSlots = network.isEmpty ? 0 : 8 + 16 * min(100, max(0, followCount)) / 100
+        let first = Array(network.prefix(personalSlots)) + Array(popular.prefix(36 - personalSlots))
         var seen = Set<String>(), authors: [String: Int] = [:]
         return Array((first + global + network + popular).filter { item in
             guard !seen.contains(item.id) else { return false }

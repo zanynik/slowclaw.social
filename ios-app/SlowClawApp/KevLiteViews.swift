@@ -110,6 +110,11 @@ struct ProfileView: View {
                         Label("Pulse discovery sources", systemImage: "person.2")
                     }
                 }
+                Section("Connected devices") {
+                    NavigationLink { WebCompanionView() } label: {
+                        Label("SlowClaw Web", systemImage: "qrcode.viewfinder")
+                    }
+                }
                 Section("What's on your mind") {
                     let topics = Array(state.personaTopics.prefix(8))
                     let trends = state.personaTrends

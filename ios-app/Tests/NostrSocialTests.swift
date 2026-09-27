@@ -26,6 +26,14 @@ final class NostrSocialTests: XCTestCase {
         let warm = NostrFetcher.blendPosts(network: personal, popular: popular, global: global)
         XCTAssertEqual(Array(warm.prefix(24).map(\.id)), Array(personal.prefix(24).map(\.id)))
         XCTAssertTrue(warm.contains { $0.id == popular[0].id })
+        let small = NostrFetcher.blendPosts(network: personal, popular: popular, global: global, followCount: 5)
+        XCTAssertEqual(small.filter { personal.map(\.id).contains($0.id) }.count, 8)
+        XCTAssertEqual(Array(small.dropFirst(8).prefix(28).map(\.id)), Array(popular.prefix(28).map(\.id)))
+        let middle = NostrFetcher.blendPosts(network: personal, popular: popular, global: global, followCount: 50)
+        XCTAssertEqual(middle.filter { personal.map(\.id).contains($0.id) }.count, 16)
+        let mature = NostrFetcher.blendPosts(network: personal, popular: popular, global: global, followCount: 1000)
+        XCTAssertEqual(mature.filter { personal.map(\.id).contains($0.id) }.count, 24)
+        XCTAssertEqual(Array(mature.dropFirst(24).prefix(12).map(\.id)), Array(popular.prefix(12).map(\.id)))
     }
     func testPublicKeyParsingNeverAcceptsNsec() throws {
         let bytes = Array(repeating: UInt8(1), count: 32)

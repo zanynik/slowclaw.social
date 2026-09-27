@@ -98,6 +98,7 @@ enum AppTheme: String {
 
 @main
 struct SlowClawApp: App {
+    @Environment(\.scenePhase) private var webScenePhase
     @StateObject private var appState = AppState()
     @StateObject private var voiceMemoImporter = VoiceMemoImporter()
     // Catches URLs delivered during cold launch from a share sheet (Voice Memos
@@ -121,6 +122,13 @@ struct SlowClawApp: App {
             AppShell()
                 .environmentObject(appState)
                 .environmentObject(voiceMemoImporter)
+                .task(id: webScenePhase) {
+                    guard webScenePhase == .active else { return }
+                    while !Task.isCancelled {
+                        await WebCompanion.shared.sync(state: appState)
+                        do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { break }
+                    }
+                }
                 .preferredColorScheme(preferredScheme)
                 .tint(DS.accentColor)
                 // Voice Memos / Files share-sheet entry point: iOS delivers the
@@ -2128,7 +2136,7 @@ final class AppState: ObservableObject {
     /// then a foreground drain is attempted either way.
     @discardableResult
     func enqueuePendingTranscription(key: String, mediaPath: String,
-                                      generateTitleAfter: Bool = false) async -> Bool {
+                                      generateTitleAfter: Bool = false, drainNow: Bool = true) async -> Bool {
         guard let url = Self.pendingTranscriptionsURL else { return false }
         var items = Self.loadPendingTranscriptions(at: url)
         let entry = PendingTranscription(key: key, mediaPath: mediaPath,
@@ -2145,7 +2153,7 @@ final class AppState: ObservableObject {
         await scheduleNextBackgroundTranscription()
         // Try to drain immediately (foreground) — usually the asset is warm and
         // the transcript lands within a couple seconds.
-        await drainPendingTranscriptions()
+        if drainNow { await drainPendingTranscriptions() }
         return persisted
     }
 

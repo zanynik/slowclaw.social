@@ -51,6 +51,8 @@
     <false/>
     <key>NSPhotoLibraryAddUsageDescription</key>
     <string>Save the quote cards and audio videos you choose to your photo library.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Scan a SlowClaw Web QR code to connect your own browser.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>SlowClaw needs microphone access when you record audio journal entries.</string>
     <key>NSSpeechRecognitionUsageDescription</key>

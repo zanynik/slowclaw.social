@@ -76,24 +76,30 @@ enum NostrSocialRules {
 actor NostrDiscovery {
     static let shared = NostrDiscovery()
     static let sourcesKey = "slowclaw.pulse.sources.v1"
-    private var graphs: [String: (date: Date, direct: [String], network: [String])] = [:]
+    private var graphs: [String: (date: Date, direct: [String], network: [String], counts: [String: Int])] = [:]
 
     func posts(roots: [String], relays: [String]) async -> [PublishedEvent] {
+        await result(roots: roots, relays: relays).events
+    }
+    struct Result { let events: [PublishedEvent]; let followCount: Int }
+    func result(roots: [String], relays: [String]) async -> Result {
+        let owner = roots.first
         let roots = Array(Set(roots.filter { NostrEventVerifier.bytes($0, count: 32) != nil })).sorted().prefix(9).map { $0 }
-        guard !roots.isEmpty else { return [] }
+        guard !roots.isEmpty else { return .init(events: [], followCount: 0) }
         let key = (roots + relays.sorted()).joined(separator: ",")
-        let direct: [String], network: [String]
+        let direct: [String], network: [String], counts: [String: Int]
         if let cached = graphs[key], Date().timeIntervalSince(cached.date) < 6 * 3600 {
-            direct = cached.direct; network = cached.network
+            direct = cached.direct; network = cached.network; counts = cached.counts
         } else {
             let first = await NostrConversations.shared.read(filters: roots.map { ["kinds": [3], "authors": [$0], "limit": 1] }, relays: relays)
+            counts = NostrSocialRules.latest(first.events, kind: 3).mapValues { NostrSocialRules.follows($0).count }
             direct = NostrSocialRules.network(first.events, roots: roots, excluding: Set(roots), limit: 60)
             let bridges = Array(direct.prefix(12))
             let second = await NostrConversations.shared.read(filters: bridges.map { ["kinds": [3], "authors": [$0], "limit": 1] }, relays: relays)
             network = NostrSocialRules.network(second.events, roots: bridges, excluding: Set(roots + direct), limit: 40)
             if first.completed > 0 {
                 if graphs.count >= 4 { graphs.removeAll() }
-                graphs[key] = (Date(), direct, network)
+                graphs[key] = (Date(), direct, network, counts)
             }
         }
         // Author-specific limits prevent one prolific account filling a batch.
@@ -109,7 +115,7 @@ actor NostrDiscovery {
         let batch = await NostrConversations.shared.read(filters: authors.prefix(24).map {
             ["kinds": [1], "authors": [$0], "since": since, "limit": 4]
         }, relays: relays)
-        return batch.events
+        return .init(events: batch.events, followCount: owner.flatMap { counts[$0] } ?? 0)
     }
 }
 
