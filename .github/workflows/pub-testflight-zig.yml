@@ -95,7 +95,9 @@ jobs:
                   xcodegen --version
 
             - name: Test studio image and media exports on iOS Simulator
-              timeout-minutes: 10
+              # Package resolution + a cold simulator can consume most of ten
+              # minutes before XCTest starts; keep all test assertions enabled.
+              timeout-minutes: 15
               run: bash ios-app/Tests/studio-media-smoke.sh
 
             - name: Keep synthetic studio export evidence

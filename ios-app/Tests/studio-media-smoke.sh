@@ -24,6 +24,9 @@ lines += ['    dependencies:', '      - target: StudioSmokeHost', '    settings:
 PY
 xcodegen generate --spec "$STUDIO_TEST_ROOT/project.yml"
 STUDIO_DEVICE="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for key,values in d["devices"].items() if "iOS" in key for x in values if "iPhone" in x["name"]))')"
+# Boot while Xcode resolves packages and compiles, rather than serializing
+# the simulator cold start after compilation. Already-booted is harmless.
+xcrun simctl boot "$STUDIO_DEVICE" 2>/dev/null || true
 mkdir -p /tmp/slowclaw-studio-evidence
 set +e
 xcodebuild test -project "$STUDIO_TEST_ROOT/StudioSmoke.xcodeproj" -scheme StudioSmoke -destination "platform=iOS Simulator,id=$STUDIO_DEVICE" -parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 -resultBundlePath /tmp/slowclaw-studio-evidence/results.xcresult -test-timeouts-enabled YES -default-test-execution-time-allowance 120

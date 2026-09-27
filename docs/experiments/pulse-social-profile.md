@@ -93,3 +93,9 @@ watchdog on the same main actor. It only appends while the input is ready,
 retains the 30-second no-progress deadline and reports writer status on a real
 stall. No test assertions, media timing, resolution or signing gates are relaxed.
 The full media test is rerun through the release pipeline.
+
+Build 174 passed both media tests (including the previously stalled export),
+but its simulator step reached the existing ten-minute wall-clock budget after
+slow package resolution/compilation and cold simulator startup. Boot the
+simulator alongside compilation and allow fifteen minutes for that step only.
+Per-test deadlines, all assertions, and signing/upload logic are unchanged.
