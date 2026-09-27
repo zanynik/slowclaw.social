@@ -7,6 +7,7 @@
 ## Table of contents
 
 - [What it is (the 30-second version)](#what-it-is-the-30-second-version)
+- [Why it exists](#why-it-exists)
 - [The three loops (product thesis)](#the-three-loops-product-thesis)
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Diagram 1 — The two-layer architecture](#diagram-1--the-two-layer-architecture)
@@ -24,19 +25,25 @@
 - [Guidance for further development](#guidance-for-further-development)
 - [Vision & governance](#vision--governance)
 
-> **This README is the single source of truth.** The sub-READMEs in [`zig-src/`](zig-src/README.md) and [`ios-app/`](ios-app/README.md) cover build/link details for their layer; if anything there disagrees with this file, this file wins.
+> **This README is the architecture and build overview.** The sub-READMEs in [`zig-src/`](zig-src/README.md) and [`ios-app/`](ios-app/README.md) cover details for their layer. The [vision contract](docs/vision-contract.md) governs product intent.
 
 ---
 
 ## What it is (the 30-second version)
 
-SlowClaw Social is an iOS app that helps you **think better by writing**. Three things happen, all on your phone:
+SlowClaw Social is an iOS app that helps you **understand yourself through journaling and turn what you learn into something useful to others**. Its current experience centers on three actions:
 
 1. You **capture** — mostly by recording audio (the default), sometimes by typing.
 2. What you write becomes a **lens** — the app mines your journals for your interests.
-3. That lens steers **what you read back** (articles, news, video) and helps you **turn your thinking into posts**.
+3. That lens steers **what you read back** (articles, news, video) and helps you **review and share expressions drawn from your journals**.
 
-Everything runs **on-device**: transcription via iOS Speech, the AI via a local llama.cpp model. Your journals and your lens never leave your phone.
+Journals remain under the user's control. On-device processing is preferred; optional connected services require an explicit connection and are described in the app's privacy settings.
+
+## Why it exists
+
+The deeper loop is **live → journal → understand → create → give → live again**. The point is to notice recurring struggles, changing beliefs, and ideas grounded in experience. Sharing can take the form of a quote today, a slowly developed book years later, or a conversation offered to someone facing a similar question. Creating and publishing remain separate choices.
+
+The current Create feed offers short, reviewable moments. A future **Work** could be an essay, podcast, book, or collection of letters that grows through small, sourced edits accepted by its author. See the [vision contract](docs/vision-contract.md) for the long-term direction and the distinction between what exists and what is proposed.
 
 ---
 
@@ -68,6 +75,8 @@ flowchart LR
 ```
 
 The arrow that matters most: **your journals → the feed ranking**. That is the differentiator. A relevant older piece can outrank a generic fresh one, because what *you* have written is the dominant scoring signal.
+
+These three loops describe the current product mechanics. The wider purpose is to help a person understand their life and decide what, if anything, to give back. A proposed draft or change to an evolving Work should always remain grounded in source journals and subject to review.
 
 ---
 
@@ -561,7 +570,7 @@ Full engineering protocol, risk tiers, and validation matrix: [`AGENTS.md`](AGEN
 
 ## Vision & governance
 
-- **Vision contract:** [`docs/vision-contract.md`](docs/vision-contract.md) (where present) is the authoritative statement of the three-loops thesis. When this README and the vision contract conflict, the vision contract wins.
+- **Vision contract:** [`docs/vision-contract.md`](docs/vision-contract.md) states the purpose, product principles, and possible direction for evolving Works. When this README and the vision contract conflict on product intent, the vision contract wins.
 - **Open protocols preferred:** Nostr, RSS, Atom for ingestion and publishing. No closed-platform lock-in for core surfaces.
 - **Read-only ingestion:** Video/YouTube is a first-class *ingestion* source; the user's own content and publishing stay open-protocol-bound.
 - **License:** Apache-2.0 OR MIT (dual-licensed).

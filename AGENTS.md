@@ -7,7 +7,7 @@ Scope: entire repository (`slowclaw.social`).
 
 ## 1) Project Snapshot (Read First)
 
-**SlowClaw Social** is a local-first, **journal-first brain-feeder** — a personal capture and curation app organized around three loops:
+**SlowClaw Social** is a local-first, **journal-first brain-feeder** whose purpose is to help people understand themselves through journaling and turn chosen insights into something useful to others. Its current app is organized around three loops:
 
 1. **Capture loop** — one workspace for journals, **audio-first** (the default), plus video and text. Capture stays on-device (transcription via the native iOS speech bridge, AI via on-device inference).
 2. **Feed loop (journal-driven curation)** — articles, news, and video flow *into* the user through curated surfaces ranked by **relevance to the user's own journals**, not generic popularity. This is the core differentiator: **the journal is the lens.**
@@ -43,7 +43,7 @@ The workspace lets a single user:
 
 ### Product direction (merge gate)
 
-The pipeline is the **three loops**: **multimodal capture (audio-first, on-device) → journal-driven curation (the journal is the lens; articles + news + video incl. YouTube) → draft review → open publishing/ingestion (Nostr / RSS / Atom).** Video/YouTube is a first-class *ingestion* source (read-only) while the user's own content and publishing stay open-protocol-bound. Reject changes that add cognitive load, fragmented UX, or closed-platform lock-in without a documented user-value reason. New ranking/curation surfaces must be journal-driven (or justify the exception).
+The pipeline is the **three loops**: **multimodal capture (audio-first) → journal-driven understanding and curation → draft review → optional open publishing/ingestion (Nostr / RSS / Atom).** The broader direction is described in [`docs/vision-contract.md`](docs/vision-contract.md): notice what matters, ground proposals in the user's journals, preserve a canonical user-approved Work, and keep creation separate from publishing. Video/YouTube is a first-class *ingestion* source (read-only) while the user's own content and publishing stay open-protocol-bound. Reject changes that add cognitive load, fragmented UX, or closed-platform lock-in without a documented user-value reason. New ranking/curation surfaces must be journal-driven (or justify the exception).
 
 ---
 
@@ -287,6 +287,7 @@ When working in fast iterative mode:
 
 ## 12) Reference Docs
 - [`README.md`](README.md)
+- [`docs/vision-contract.md`](docs/vision-contract.md) — product purpose, principles, and future Works direction.
 - [`zig-src/README.md`](zig-src/README.md) — Zig core: build targets, FFI, modules, known iOS link issues.
 - [`ios-app/README.md`](ios-app/README.md) — iOS app: XcodeGen, signing, build flow.
 - [`.github/workflows/pub-testflight-zig.yml`](.github/workflows/pub-testflight-zig.yml) — TestFlight publish pipeline.

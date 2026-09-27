@@ -10,6 +10,7 @@ The previous Rust/Tauri/React documentation was removed during the
 ## Entry points
 
 - [`../README.md`](../README.md) — project overview, build, and architecture.
+- [`vision-contract.md`](vision-contract.md) — product purpose, principles, and longer-term Works direction.
 - [`../AGENTS.md`](../AGENTS.md) — agent engineering protocol.
 - [`../zig-src/README.md`](../zig-src/README.md) — Zig core: build targets, FFI, modules.
 - [`../ios-app/README.md`](../ios-app/README.md) — iOS app: Xcode project, signing, build flow.
