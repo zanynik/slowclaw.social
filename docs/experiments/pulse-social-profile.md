@@ -83,3 +83,13 @@ WebSocket probe from this Linux workspace timed out during the handshake;
 therefore live provider availability is not claimed. The existing bounded
 relay transport and deterministic cold/warm/offline blending tests cover the
 client path. Provider outage falls back to cached and direct relay candidates.
+
+## Release-gate export recovery
+
+Builds 171 and 173 passed all five UI tests, including actual Pulse expansion,
+but the unchanged AVAssetWriter frame pump stalled at frames 8 and 3 in the
+existing media-export test. Add a bounded readiness re-check to its existing
+watchdog on the same main actor. It only appends while the input is ready,
+retains the 30-second no-progress deadline and reports writer status on a real
+stall. No test assertions, media timing, resolution or signing gates are relaxed.
+The full media test is rerun through the release pipeline.

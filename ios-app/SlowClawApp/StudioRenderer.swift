@@ -237,8 +237,13 @@ private final class StudioFramePump {
                 watchdog = Task { [self] in
                     while !Task.isCancelled {
                         do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+                        // A readiness notification can be delayed while the main
+                        // queue is drawing. Re-check on the same actor: pump still
+                        // obeys encoder backpressure and cannot race the callback.
+                        pump()
+                        guard continuation != nil else { return }
                         if Date().timeIntervalSince(lastAdvance) > 30 {
-                            finish(StudioError(message: "Video export stalled at frame \(frame) of \(frames). Please retry.")); return
+                            finish(writer.error ?? StudioError(message: "Video export stalled at frame \(frame) of \(frames) (writer \(writer.status.rawValue), ready \(input.isReadyForMoreMediaData)). Please retry.")); return
                         }
                     }
                 }
