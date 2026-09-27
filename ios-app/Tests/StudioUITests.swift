@@ -1,6 +1,19 @@
 import XCTest
 
 @MainActor final class StudioUITests: XCTestCase {
+    func testPulseShowsNamesCountsAndExpandableRepliesWithoutPublishing() {
+        let app = XCUIApplication(); app.launchArguments = ["--pulse-ui-test"]; app.launch()
+        XCTAssertTrue(app.staticTexts["SlowClawAgent"].waitForExistence(timeout: 20))
+        XCTAssertTrue(app.staticTexts["@slowclaw_agent"].exists)
+        XCTAssertTrue(app.staticTexts["Garden reply 1"].exists)
+        XCTAssertFalse(app.staticTexts["Garden reply 3"].exists)
+        let expand = app.buttons["View 3 replies"]
+        XCTAssertTrue(expand.waitForExistence(timeout: 10))
+        if !expand.isHittable { app.scrollViews.firstMatch.swipeUp() }
+        expand.tap()
+        XCTAssertTrue(app.staticTexts["Garden reply 3"].waitForExistence(timeout: 10))
+        let evidence = XCTAttachment(screenshot: app.screenshot()); evidence.name = "pulse-expanded-replies"; evidence.lifetime = .keepAlways; add(evidence)
+    }
     func testQuotePublishOpensReviewWithoutPosting() {
         let app = XCUIApplication(); app.launchArguments = ["--studio-ui-test"]; app.launch()
         let publish = app.buttons["studio.publish"]

@@ -112,10 +112,13 @@ struct NostrPostsView: View {
 struct NostrPostDetail: View {
     let post: PublishedEvent
     @StateObject private var inbox = NostrInbox.shared
+    @StateObject private var social = NostrSocialStore.shared
     @State private var replyTarget: PublishedEvent?
+    @State private var loading = false
     var body: some View {
         List {
             Section {
+                NostrAuthorHeader(pubkey: post.pubkey, created: post.created_at)
                 Text(post.content).textSelection(.enabled)
                 Button("Reply") { replyTarget = post }
                 if let url = URL(string: "https://njump.me/" + post.id) {
@@ -124,10 +127,10 @@ struct NostrPostDetail: View {
                 }
             }
             Section("Replies in this conversation") {
-                if inbox.busy { ProgressView() }
-                ForEach(inbox.replies(to: post)) { reply in
+                if loading { ProgressView() }
+                ForEach(social.replies(post, hidden: inbox.hiddenAuthors)) { reply in
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(String(reply.pubkey.prefix(12)) + "…").font(.caption.monospaced()).foregroundStyle(.secondary)
+                        NostrAuthorHeader(pubkey: reply.pubkey, created: reply.created_at)
                         Text(reply.content).textSelection(.enabled)
                         Text(Date(timeIntervalSince1970: Double(reply.created_at)), style: .date).font(.caption).foregroundStyle(.secondary)
                         HStack {
@@ -138,16 +141,24 @@ struct NostrPostDetail: View {
                         }.font(.caption)
                     }.padding(.vertical, 5)
                 }
-                if inbox.replies(to: post).isEmpty && !inbox.busy { Text("No replies found on the checked relays.").foregroundStyle(.secondary) }
-                if let status = inbox.status { Text(status).font(.caption).foregroundStyle(.secondary) }
+                if social.replies(post, hidden: inbox.hiddenAuthors).isEmpty && !loading { Text("No replies found on the checked relays.").foregroundStyle(.secondary) }
+                if let status = social.coverage[post.id] { Text(status).font(.caption).foregroundStyle(.secondary) }
                 Text("Signatures verify authorship, not accuracy. Replies remain private drafts until you choose Publish reply.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .buttonStyle(.borderless)
         .navigationTitle("Conversation")
-        .sheet(item: $replyTarget) { target in NostrReplySheet(root: post, parent: target) }
-        .task { await inbox.refresh(force: true, post: post); inbox.markRead(post) }
-        .refreshable { await inbox.refresh(force: true, post: post); inbox.markRead(post) }
+        .sheet(item: $replyTarget, onDismiss: { Task { await refresh() } }) { target in NostrReplySheet(root: post, parent: target) }
+        .task { await refresh() }
+        .refreshable { await refresh() }
+    }
+    private func refresh() async {
+        loading = true
+        await social.load([post], force: true)
+        var seen = Set<String>()
+        inbox.events = Array(((social.events[post.id] ?? []) + inbox.events).filter { seen.insert($0.id).inserted }.prefix(600))
+        inbox.markRead(post)
+        loading = false
     }
 }

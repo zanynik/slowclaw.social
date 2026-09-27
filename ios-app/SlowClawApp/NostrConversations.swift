@@ -22,7 +22,7 @@ enum NostrEventVerifier {
 
     static func verify(_ event: PublishedEvent, now: Date = Date()) -> Bool {
         guard event.created_at >= 0, Double(event.created_at) <= now.timeIntervalSince1970 + 600,
-              event.content.utf8.count <= 60_000, event.tags.count <= 256,
+              event.content.utf8.count <= 60_000, event.tags.count <= (event.kind == 3 ? 2000 : 256),
               event.tags.allSatisfy({ $0.count <= 8 && $0.allSatisfy { $0.utf8.count <= 2048 } }),
               let id = bytes(event.id, count: 32), let pubkey = bytes(event.pubkey, count: 32),
               let signature = bytes(event.sig, count: 64),
@@ -130,7 +130,45 @@ actor NostrConversations {
         return Batch(events: events, completed: completed, total: urls.count)
     }
 
-    nonisolated private static func query(_ url: URL, wire: String, subscription: String) async -> (events: [PublishedEvent], completed: Bool) {
+    /// Same bounded, signature-verified transport for public profiles and discovery.
+    func read(filters: [[String: Any]], relays: [String]) async -> Batch {
+        guard !filters.isEmpty, filters.count <= 24 else { return Batch(events: [], completed: 0, total: 0) }
+        let sub = "sc_social_" + UUID().uuidString
+        guard let data = try? JSONSerialization.data(withJSONObject: ["REQ", sub] + filters.map { $0 as Any }),
+              let wire = String(data: data, encoding: .utf8) else { return Batch(events: [], completed: 0, total: 0) }
+        let kinds = Array(Set(filters.flatMap { $0["kinds"] as? [Int] ?? [] }))
+        let urls = Array(Set(relays)).sorted().prefix(5).compactMap { raw -> URL? in
+            guard let url = URL(string: raw), url.scheme == "wss", url.host != nil,
+                  url.user == nil, url.password == nil else { return nil }
+            return url
+        }
+        var seen = Set<String>(), events: [PublishedEvent] = [], completed = 0
+        await withTaskGroup(of: (events: [PublishedEvent], completed: Bool).self) { group in
+            for url in urls { group.addTask { await Self.query(url, wire: wire, subscription: sub, kinds: kinds) } }
+            for await result in group {
+                if result.completed { completed += 1 }
+                for event in result.events where filters.contains(where: { Self.matches(event, filter: $0) }) && seen.insert(event.id).inserted {
+                    events.append(event)
+                }
+            }
+        }
+        return Batch(events: events, completed: completed, total: urls.count)
+    }
+
+    nonisolated static func matches(_ event: PublishedEvent, filter: [String: Any]) -> Bool {
+        if let kinds = filter["kinds"] as? [Int], !kinds.contains(event.kind) { return false }
+        if let authors = filter["authors"] as? [String], !authors.contains(event.pubkey) { return false }
+        if let ids = filter["ids"] as? [String], !ids.contains(event.id) { return false }
+        if let since = filter["since"] as? Int, event.created_at < since { return false }
+        for (key, value) in filter where key.hasPrefix("#") {
+            guard let values = value as? [String], event.tags.contains(where: {
+                $0.count >= 2 && $0[0] == String(key.dropFirst()) && values.contains($0[1])
+            }) else { return false }
+        }
+        return true
+    }
+
+    nonisolated private static func query(_ url: URL, wire: String, subscription: String, kinds: [Int] = [1, 7, 1111, 30023]) async -> (events: [PublishedEvent], completed: Bool) {
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieStorage = nil
         let session = URLSession(configuration: config)
@@ -156,7 +194,7 @@ actor NostrConversations {
                 guard frame[0] as? String == "EVENT", frame.count >= 3,
                       let raw = try? JSONSerialization.data(withJSONObject: frame[2]),
                       let event = try? JSONDecoder().decode(PublishedEvent.self, from: raw),
-                      [1, 7, 1111, 30023].contains(event.kind), NostrEventVerifier.verify(event) else { continue }
+                      kinds.contains(event.kind), NostrEventVerifier.verify(event) else { continue }
                 events.append(event)
             }
         } catch { /* Partial results remain usable; the UI reports incomplete coverage. */ }

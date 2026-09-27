@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import CryptoKit
 
 // Only compiled into the isolated simulator test host. The actual studio view
 // and render/export code are exercised; the journal store is a synthetic fixture.
@@ -33,6 +34,8 @@ enum AppTab { case drafts, journal }
         let timing = TimedTranscript(text: text, words: text.split(separator: " ").enumerated().map { .init(text: String($0.element), start: Double($0.offset) * 2 + 1, end: Double($0.offset) * 2 + 2) })
         try! TimedTranscriptStore.save(timing, for: audio)
     }
+    func loadReads(force: Bool = false) async {}
+    func rememberArticle(_ item: RankedFeedItem, preference: Int) {}
     func memorySource(_ key: String) -> SlowClawMemoryEntry? { key == entry.key ? entry : nil }
     static func softDeletedKeys() -> [String: Double] { [:] }
     func prepareStudioTranscript(key: String) async throws -> TimedTranscript { TimedTranscriptStore.load(for: URL(fileURLWithPath: entry.mediaURL!))! }
@@ -42,7 +45,9 @@ enum AppTab { case drafts, journal }
     @State private var sourceID = "studio-ui-" + UUID().uuidString
     var body: some Scene {
         WindowGroup {
-            if ProcessInfo.processInfo.arguments.contains("--studio-ui-test") {
+            if ProcessInfo.processInfo.arguments.contains("--pulse-ui-test") {
+                NavigationStack { ScrollView { PulseRow(item: PulseUIFixture.item).environmentObject(state).padding(.top) } }
+            } else if ProcessInfo.processInfo.arguments.contains("--studio-ui-test") {
                 VStack(spacing: 0) {
                     NavigationStack {
                         if ProcessInfo.processInfo.arguments.contains("--card") {
@@ -62,4 +67,26 @@ enum AppTab { case drafts, journal }
         source.startsWithVideo = ProcessInfo.processInfo.arguments.contains("--video")
         return source
     }
+}
+
+@MainActor enum PulseUIFixture {
+    static let item: RankedFeedItem = {
+        func signed(_ kind: Int, author: UInt8, tags: [[String]] = [], text: String, date: Int = 1) -> PublishedEvent {
+            let secret = Array(repeating: UInt8(0), count: 31) + [author]
+            let pubkey = try! NostrIdentity.publicKey(secret)
+            let bytes = try! JSONSerialization.data(withJSONObject: [0, pubkey, date, kind, tags, text], options: [.withoutEscapingSlashes])
+            let hash = Array(SHA256.hash(data: bytes))
+            return PublishedEvent(id: NostrIdentity.hex(hash), pubkey: pubkey, created_at: date, kind: kind, tags: tags, content: text, sig: try! NostrIdentity.sign(hash: hash, secret: secret))
+        }
+        let post = signed(1, author: 1, text: "Small gardens can teach us patience. A little attention every morning changes what we notice.")
+        let profile = signed(0, author: 1, text: #"{"name":"slowclaw_agent","display_name":"SlowClawAgent"}"#)
+        let replyProfile = signed(0, author: 2, text: #"{"name":"slowclaw_user"}"#)
+        let replies = (1...3).map { signed(1, author: 2, tags: [["e", post.id, "", "root"]], text: "Garden reply \($0)", date: $0 + 1) }
+        let like = signed(7, author: 2, tags: [["e", post.id]], text: "+")
+        NostrSocialStore.shared.mergeProfiles([profile, replyProfile])
+        NostrSocialStore.shared.record(.init(events: replies + [like], completed: 1, total: 1), posts: [post])
+        return RankedFeedItem(id: "nostr:" + post.id, title: "Garden", link: "https://example.com/post", description: post.content,
+            sourceLabel: "Nostr", score: 1, readMinutes: 1, sourcePlatform: "nostr", thumbnailURL: nil,
+            nostrEventJSON: String(decoding: try! JSONEncoder().encode(post), as: UTF8.self))
+    }()
 }

@@ -75,19 +75,30 @@ enum NostrFetcher {
 
     /// Query kinds separately so a high-volume short-post relay cannot crowd
     /// long-form articles out of its result limit. No journal text leaves device.
-    static func fetchReads(topics: [String]) async -> [RankedFeedItem] {
+    static func fetchReads(topics: [String], discoveryRoots: [String] = [], discoveryRelays: [String] = relays) async -> [RankedFeedItem] {
         async let articles = fetchArticles(topics: topics)
-        async let posts = fetchPosts(topics: topics)
+        async let posts = fetchPosts(topics: topics, roots: discoveryRoots, discoveryRelays: discoveryRelays)
         return await articles + posts
     }
 
-    private static func fetchPosts(topics: [String]) async -> [RankedFeedItem] {
+    private static func fetchPosts(topics: [String], roots: [String], discoveryRelays: [String]) async -> [RankedFeedItem] {
+        async let network = NostrDiscovery.shared.posts(roots: roots, relays: discoveryRelays)
         var events: [[String: Any]] = []
         await withTaskGroup(of: [[String: Any]]?.self) { group in
             for relay in relays { group.addTask { await queryRelay(relay, kinds: [1], limit: 60) } }
             for await batch in group { events += batch ?? [] }
         }
-        return shortPostCandidates(events, topics: topics)
+        let networkEvents = await network
+        let rawNetwork = networkEvents.compactMap { event -> [String: Any]? in
+            guard let data = try? JSONEncoder().encode(event) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        }
+        let trusted = shortPostCandidates(rawNetwork, topics: topics)
+        let global = shortPostCandidates(events, topics: topics)
+        // Reserve discovery space while preserving a path beyond the follow graph.
+        var seen = Set<String>()
+        return Array((Array(trusted.prefix(30)) + global + trusted.dropFirst(30))
+            .filter { seen.insert($0.id).inserted }.prefix(40))
     }
 
     /// Only signed, substantive text notes become candidates. They still must
@@ -106,6 +117,7 @@ enum NostrFetcher {
         for event in verified {
             let body = event.content.trimmingCharacters(in: .whitespacesAndNewlines)
             guard seen.insert(event.id).inserted, body.count >= 30,
+                  NostrSocialRules.parent(event) == nil,
                   !event.tags.contains(where: { $0.first == "content-warning" }),
                   ReadsContentFilter.isAllowed(body),
                   let quality = Article(event: ["id": event.id, "pubkey": event.pubkey, "content": body]),

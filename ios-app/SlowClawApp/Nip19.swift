@@ -36,6 +36,21 @@ enum Nip19 {
         return bytes.count == 32 ? bytes : nil
     }
 
+    static func decodePublicKey(_ input: String) -> String? {
+        let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "nostr:", with: "")
+        if value.count == 64, let bytes = hexBytes(value), bytes.count == 32 { return value.lowercased() }
+        guard value == value.lowercased() || value == value.uppercased() else { return nil }
+        let normalized = value.lowercased()
+        guard normalized.hasPrefix("npub1"), normalized.count == 63 else { return nil }
+        let chars = normalized.dropFirst(5)
+        let words = chars.compactMap { charset.firstIndex(of: $0).map(UInt8.init) }
+        guard words.count == chars.count, bech32Polymod(bech32HrpExpand("npub") + words) == 1,
+              words.dropLast(6).last.map({ $0 & 15 == 0 }) == true else { return nil }
+        let bytes = convertBits(Array(words.dropLast(6)), fromBits: 5, toBits: 8, pad: false)
+        return bytes.count == 32 ? bytes.map { String(format: "%02x", $0) }.joined() : nil
+    }
+
     private static let charset: [Character] = Array("qpzry9x8gf2tvdw0s3jn54khce6mua7l")
 
     /// Encode an naddr. Returns nil if the pubkey isn't a valid 32-byte hex.

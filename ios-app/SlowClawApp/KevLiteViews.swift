@@ -102,6 +102,14 @@ struct ProfileView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("Public profile") {
+                    NavigationLink { NostrProfileEditor() } label: {
+                        Label("Username & description", systemImage: "person.crop.circle")
+                    }
+                    NavigationLink { PulseSourcesView() } label: {
+                        Label("Pulse discovery sources", systemImage: "person.2")
+                    }
+                }
                 Section("What's on your mind") {
                     let topics = Array(state.personaTopics.prefix(8))
                     let trends = state.personaTrends

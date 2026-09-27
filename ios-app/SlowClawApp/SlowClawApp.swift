@@ -1884,10 +1884,15 @@ final class AppState: ObservableObject {
         let topics: [SlowClawTopic] = []
         let sources = jevEnabled ? selectedJevFeeds : Self.selectRSSSources(catalog, topics: topics)
 
+        let ownNostrKey = try? NostrIdentity.publicKey(NostrIdentity.secret())
+        let seeds = (UserDefaults.standard.stringArray(forKey: NostrDiscovery.sourcesKey) ?? []).compactMap(Nip19.decodePublicKey)
+        let discoveryRoots = (ownNostrKey.map { [$0] } ?? []) + seeds
+        let discoveryRelays = NostrPublisher.relayText.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+
         // Snapshot fetch happens off the main actor.
         let fetched = await Task.detached(priority: .userInitiated) {
             async let rssResult = Self.fetchAllRSS(sources: sources, topics: topics)
-            async let nostrResult = NostrFetcher.fetchReads(topics: topics.map(\.label))
+            async let nostrResult = NostrFetcher.fetchReads(topics: topics.map(\.label), discoveryRoots: discoveryRoots, discoveryRelays: discoveryRelays)
             // rssResult is ([RankedFeedItem], Bool); nostrResult is [RankedFeedItem].
             return await (rssResult, nostrResult)
         }.value

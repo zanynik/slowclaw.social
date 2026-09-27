@@ -7,7 +7,10 @@ python3 - "$APP_ROOT" "$STUDIO_TEST_ROOT" <<'PY'
 import json, pathlib, sys
 app, root = map(pathlib.Path, sys.argv[1:])
 paths = [app/'SlowClawApp/TimedTranscript.swift', app/'SlowClawApp/StudioRenderer.swift', app/'Tests/StudioMediaTests.swift']
-host = [app/'Tests/StudioUIHost.swift'] + [app/'SlowClawApp'/name for name in ['ShareStudioView.swift', 'StudioRenderer.swift', 'TimedTranscript.swift', 'CreateIdeas.swift', 'JevIdeas.swift', 'JevMemory.swift', 'JevBatch.swift', 'JevPersona.swift', 'PublishDraftSheet.swift', 'NostrMedia.swift', 'NostrPublisher.swift', 'NostrReply.swift', 'NostrConversations.swift', 'NostrFetcher.swift', 'Nip19.swift', 'ReadsContentFilter.swift']]
+host = [app/'Tests/StudioUIHost.swift'] + [app/'SlowClawApp'/name for name in ['ShareStudioView.swift', 'StudioRenderer.swift', 'TimedTranscript.swift', 'CreateIdeas.swift', 'JevIdeas.swift', 'JevMemory.swift', 'JevBatch.swift', 'JevPersona.swift', 'PublishDraftSheet.swift', 'NostrMedia.swift', 'NostrPublisher.swift', 'NostrReply.swift', 'NostrConversations.swift', 'NostrFetcher.swift', 'Nip19.swift', 'ReadsContentFilter.swift', 'NostrSocial.swift', 'NostrSocialStore.swift', 'NostrProfileEditor.swift', 'NostrPostsView.swift', 'NostrReplySheet.swift']]
+pulse = (app/'SlowClawApp/PulseView.swift').read_text()
+(root/'PulseRow.swift').write_text('import SwiftUI\nimport UIKit\n' + pulse[pulse.index('enum PulseNote'):pulse.index('private struct PulseComposer:')])
+host.append(root/'PulseRow.swift')
 dto = (app/'SlowClawFeed/Sources/SlowClawFeed/SlowClawFeed.swift').read_text()
 start = dto.index('public struct RankedFeedItem:')
 (root/'RankedFeedItem.swift').write_text('import Foundation\n' + dto[start:dto.index('private struct RankedFeedItemDTO:', start)])
