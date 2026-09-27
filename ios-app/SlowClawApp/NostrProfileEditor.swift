@@ -65,8 +65,13 @@ struct NostrProfileEditor: View {
     private func fetch(_ key: String) async throws -> PublishedEvent? {
         let batch = await NostrConversations.shared.read(filters: [["kinds": [0], "authors": [key], "limit": 1]], relays: NostrSocialStore.relays)
         guard batch.completed > 0 else { throw PublishingError.message("Couldn’t check your existing profile. Retry when connected to preserve your other profile details.") }
-        social.mergeProfiles(batch.events + NostrPublisher.confirmedEvents().filter { $0.kind == 0 && $0.pubkey == key })
-        return social.profiles[key]
+        let candidates = batch.events + NostrPublisher.confirmedEvents().filter { $0.kind == 0 && $0.pubkey == key }
+            + (social.profiles[key].map { [$0] } ?? [])
+        let current = NostrSocialRules.latest(candidates, kind: 0)[key]
+        social.mergeProfiles(candidates)
+        // Editing must not depend on whether this old profile survives the
+        // bounded feed-avatar cache's eviction policy.
+        return current
     }
     private func load() async {
         key = try? NostrIdentity.publicKey(NostrIdentity.secret())

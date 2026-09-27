@@ -55,10 +55,10 @@ enum NostrSocialRules {
         }
     }
     static func network(_ lists: [PublishedEvent], roots: [String], excluding: Set<String> = [], limit: Int = 80) -> [String] {
-        let latest = latest(lists, kind: 3)
+        let currentLists = latest(lists, kind: 3)
         var counts: [String: Int] = [:]
         for root in Set(roots) {
-            if let event = latest[root] {
+            if let event = currentLists[root] {
                 for key in follows(event) where !excluding.contains(key) { counts[key, default: 0] += 1 }
             }
         }
