@@ -1,0 +1,62 @@
+name: Intern-Decision GGUF compatibility smoke
+
+on:
+  push:
+    branches:
+      - bench/slowclaw-decision-models
+    paths:
+      - ".github/workflows/intern-decision-gguf-smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build SlowClaw vendored llama.cpp CLI
+        run: |
+          cmake -S zig-src/vendor/llama.cpp -B /tmp/llama-build \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/llama-build --target llama-cli -j4
+          /tmp/llama-build/bin/llama-cli --version
+
+      - name: Download Intern-Decision Q8
+        run: |
+          python -m pip install --upgrade huggingface_hub
+          MODEL_PATH="$(python - <<'PY'
+from huggingface_hub import hf_hub_download
+print(hf_hub_download(
+    repo_id="bombdefuser-124/Intern-Decision-0.8B-GGUF",
+    filename="intern-decision-0.8b-q8_0.gguf",
+    revision="main",
+))
+PY
+)"
+          echo "MODEL_PATH=$MODEL_PATH" >> "$GITHUB_ENV"
+          ls -lh "$MODEL_PATH"
+
+      - name: Open and run one token with SlowClaw runtime
+        run: |
+          set -o pipefail
+          /usr/bin/time -v /tmp/llama-build/bin/llama-cli \
+            -m "$MODEL_PATH" \
+            -ngl 0 \
+            -c 512 \
+            -p "State: local compatibility smoke. Answer briefly." \
+            -n 1 \
+            --no-display-prompt 2>&1 | tee /tmp/intern-gguf-smoke.log
+          grep -E "model|qwen35|load|memory|eval|tokens per second|MiB|MB" /tmp/intern-gguf-smoke.log || true
