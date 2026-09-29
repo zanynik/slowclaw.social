@@ -96,9 +96,13 @@ decision prompt, request logits at each decision slot, restrict each slot to its
 candidate symbols, and apply the checkpoint calibration. Q8 quantization also
 needs parity/calibration testing against the BF16 reference before shipping.
 
-A repository smoke workflow is being used to verify that the current SlowClaw
-native runtime can load the GGUF. This document should be updated with that
-result before using Intern-Decision in the app.
+The native compatibility smoke passed through SlowClaw's current Zig +
+vendored llama.cpp runtime. It loaded the Q8 model as `Intern Decision 0.8B`,
+mapped approximately 763.8 MiB of model data, created the recurrent/KV/compute
+buffers, and produced a local reply. The full build-plus-smoke process peaked at
+about 878 MiB RSS on the Linux runner. This verifies model/runtime
+compatibility; it does **not** yet verify the proper structured decision
+readout or Q8 probability parity.
 
 ## Product interpretation
 
@@ -121,5 +125,6 @@ The harness is in `ios-app/Tests/decision_models/slowclaw_benchmark.py` and the
 CI workflow is `.github/workflows/decision-model-benchmark.yml`.
 
 Successful benchmark run: GitHub Actions run `36534773347`.
+Native Intern Q8 compatibility smoke: GitHub Actions run `36535704744`.
 Raw JSON outputs were uploaded as the
 `slowclaw-decision-model-benchmark` artifact.
