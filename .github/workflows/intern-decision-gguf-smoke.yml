@@ -37,15 +37,7 @@ jobs:
       - name: Download Intern-Decision Q8
         run: |
           python -m pip install --upgrade huggingface_hub
-          MODEL_PATH="$(python - <<'PY'
-from huggingface_hub import hf_hub_download
-print(hf_hub_download(
-    repo_id="bombdefuser-124/Intern-Decision-0.8B-GGUF",
-    filename="intern-decision-0.8b-q8_0.gguf",
-    revision="main",
-))
-PY
-)"
+          MODEL_PATH="$(python -c 'from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id="bombdefuser-124/Intern-Decision-0.8B-GGUF", filename="intern-decision-0.8b-q8_0.gguf", revision="main"))')"
           echo "MODEL_PATH=$MODEL_PATH" >> "$GITHUB_ENV"
           ls -lh "$MODEL_PATH"
 
