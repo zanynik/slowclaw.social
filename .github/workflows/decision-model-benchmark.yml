@@ -1,0 +1,80 @@
+name: SlowClaw decision-model benchmark
+
+on:
+  push:
+    branches:
+      - bench/slowclaw-decision-models
+    paths:
+      - "ios-app/Tests/decision_models/**"
+      - ".github/workflows/decision-model-benchmark.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      TOKENIZERS_PARALLELISM: "false"
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Runner information
+        run: |
+          lscpu
+          free -h
+          df -h
+
+      - name: Benchmark GLiNER2.5-Decide
+        run: |
+          python -m venv /tmp/slowclaw-gliner
+          /tmp/slowclaw-gliner/bin/python -m pip install --upgrade pip
+          /tmp/slowclaw-gliner/bin/python -m pip install gliner2 huggingface_hub
+          mkdir -p artifacts/decision-model-benchmark
+          HF_HOME=/tmp/hf-gliner /tmp/slowclaw-gliner/bin/python \
+            ios-app/Tests/decision_models/slowclaw_benchmark.py \
+            --backend gliner \
+            --output artifacts/decision-model-benchmark/gliner.json
+          /tmp/slowclaw-gliner/bin/python -m pip freeze > artifacts/decision-model-benchmark/gliner-requirements.txt
+          rm -rf /tmp/slowclaw-gliner /tmp/hf-gliner
+
+      - name: Benchmark Intern-Decision-0.8B
+        run: |
+          python -m venv /tmp/slowclaw-intern
+          /tmp/slowclaw-intern/bin/python -m pip install --upgrade pip
+          /tmp/slowclaw-intern/bin/python -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.9.1 torchvision==0.24.1
+          /tmp/slowclaw-intern/bin/python -m pip install \
+            transformers==5.0.0 huggingface_hub safetensors "Pillow>=10"
+          HF_HOME=/tmp/hf-intern /tmp/slowclaw-intern/bin/python \
+            ios-app/Tests/decision_models/slowclaw_benchmark.py \
+            --backend intern \
+            --output artifacts/decision-model-benchmark/intern.json
+          /tmp/slowclaw-intern/bin/python -m pip freeze > artifacts/decision-model-benchmark/intern-requirements.txt
+
+      - name: Build comparison report
+        if: always()
+        run: |
+          if [[ -f artifacts/decision-model-benchmark/gliner.json && -f artifacts/decision-model-benchmark/intern.json ]]; then
+            python ios-app/Tests/decision_models/summarize.py
+          fi
+          df -h
+
+      - name: Upload benchmark output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slowclaw-decision-model-benchmark
+          path: artifacts/decision-model-benchmark
+          if-no-files-found: warn
+          retention-days: 14
