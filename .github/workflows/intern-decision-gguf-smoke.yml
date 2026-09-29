@@ -15,6 +15,8 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      ZIG_BIN: ${{ github.workspace }}/tools-zig/zig
     steps:
       - uses: actions/checkout@v4
 
@@ -22,17 +24,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build SlowClaw vendored llama.cpp CLI
+      - name: Setup Zig
         run: |
-          cmake -S zig-src/vendor/llama.cpp -B /tmp/llama-build \
-            -DGGML_NATIVE=OFF \
-            -DGGML_CUDA=OFF \
-            -DLLAMA_CURL=OFF \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_EXAMPLES=ON \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build /tmp/llama-build --target llama-cli -j4
-          /tmp/llama-build/bin/llama-cli --version
+          set -euo pipefail
+          ZIG_VERSION="0.16.0"
+          curl -L --fail -o /tmp/zig.tar.xz \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p tools-zig
+          tar -xf /tmp/zig.tar.xz -C tools-zig --strip-components=1
+          "$ZIG_BIN" version
 
       - name: Download Intern-Decision Q8
         run: |
@@ -41,14 +41,10 @@ jobs:
           echo "MODEL_PATH=$MODEL_PATH" >> "$GITHUB_ENV"
           ls -lh "$MODEL_PATH"
 
-      - name: Open and run one token with SlowClaw runtime
+      - name: Load Intern-Decision with SlowClaw local inference
+        working-directory: zig-src
         run: |
-          set -o pipefail
-          /usr/bin/time -v /tmp/llama-build/bin/llama-cli \
-            -m "$MODEL_PATH" \
-            -ngl 0 \
-            -c 512 \
-            -p "State: local compatibility smoke. Answer briefly." \
-            -n 1 \
-            --no-display-prompt 2>&1 | tee /tmp/intern-gguf-smoke.log
-          grep -E "model|qwen35|load|memory|eval|tokens per second|MiB|MB" /tmp/intern-gguf-smoke.log || true
+          set -euo pipefail
+          /usr/bin/time -v env SLOWCLAW_TEST_GGUF="$MODEL_PATH" \
+            "$ZIG_BIN" build test-local-llm -Doptimize=ReleaseFast 2>&1 | tee /tmp/intern-gguf-smoke.log
+          grep -E "qwen35|model|load|MiB|MB|tokens|Maximum resident" /tmp/intern-gguf-smoke.log || true
