@@ -13,6 +13,7 @@ import XCTest
         XCTAssertTrue(profile.waitForExistence(timeout: 20)); profile.tap()
         XCTAssertTrue(app.navigationBars["Profile"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["Recent posts"].exists)
+        XCTAssertTrue(app.staticTexts["@slowclaw_agent"].exists)
         XCTAssertTrue(app.staticTexts["Small gardens can teach us patience. A little attention every morning changes what we notice."].exists)
         let evidence = XCTAttachment(screenshot: app.screenshot()); evidence.name = "pulse-author-profile"; evidence.lifetime = .keepAlways; add(evidence)
     }
@@ -24,8 +25,10 @@ import XCTest
     }
     func testPulseShowsNamesCountsAndExpandableRepliesWithoutPublishing() {
         let app = XCUIApplication(); app.launchArguments = ["--pulse-ui-test"]; app.launch()
-        XCTAssertTrue(app.staticTexts["SlowClawAgent"].waitForExistence(timeout: 20))
-        XCTAssertTrue(app.staticTexts["@slowclaw_agent"].exists)
+        let author = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "nostr.profile.")).firstMatch
+        XCTAssertTrue(author.waitForExistence(timeout: 20))
+        XCTAssertTrue(author.label.contains("SlowClawAgent"))
+        XCTAssertTrue(author.label.contains("@slowclaw_agent"))
         XCTAssertTrue(app.staticTexts["Garden reply 1"].exists)
         XCTAssertFalse(app.staticTexts["Garden reply 3"].exists)
         let expand = app.buttons["View 3 replies"]

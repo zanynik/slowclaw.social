@@ -147,6 +147,10 @@ struct NostrAuthorHeader: View {
     var created: Int? = nil
     @StateObject private var social = NostrSocialStore.shared
     @State private var showingProfile = false
+    private var profileLabel: String {
+        let username = social.profile(pubkey)?.name ?? ""
+        return "View profile: " + social.name(pubkey) + (username.isEmpty ? "" : ", @" + username)
+    }
     var body: some View {
         Button { showingProfile = true } label: {
         HStack(spacing: 10) {
@@ -162,7 +166,7 @@ struct NostrAuthorHeader: View {
                 }.font(.caption).foregroundStyle(.secondary)
             }
         }
-        }.buttonStyle(.plain).accessibilityLabel("View profile: " + social.name(pubkey))
+        }.buttonStyle(.plain).accessibilityLabel(profileLabel)
             .accessibilityIdentifier("nostr.profile." + pubkey)
             .sheet(isPresented: $showingProfile) { NostrProfileView(pubkey: pubkey) }
     }
