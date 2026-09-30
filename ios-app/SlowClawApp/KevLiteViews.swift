@@ -24,6 +24,7 @@ struct DraftsView: View {
     @EnvironmentObject var state: AppState
     @State private var choosingSource = false
     @State private var showingDrafts = false
+    @State private var visibleCount = 6
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -36,7 +37,7 @@ struct DraftsView: View {
                             .frame(maxWidth: .infinity)
                     }
                     if state.createBusy { ProgressView(state.createStatus ?? "Finding moments…") }
-                    ForEach(state.createIdeas) { idea in
+                    ForEach(Array(state.createIdeas.prefix(visibleCount))) { idea in
                         if let entry = state.memorySource(idea.key) {
                             VStack(alignment: .leading, spacing: 10) {
                                 ShareStudioView(source: studioSource(idea, entry: entry), compact: true)
@@ -50,10 +51,22 @@ struct DraftsView: View {
                         }
                     }
                     if !state.createBusy, let status = state.createStatus { Text(status).font(.footnote).foregroundStyle(.secondary) }
+                    if !state.createIdeas.isEmpty && (visibleCount < state.createIdeas.count || state.hasMoreCreateIdeas) {
+                        Button("More moments", systemImage: "sparkles") { loadMore() }
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .disabled(state.createBusy)
+                            .onAppear { loadMore() }
+                    }
                     Color.clear.frame(height: 32)
                 }.padding(.horizontal, 16).padding(.top, 12)
             }
-            .refreshable { await state.refreshCreateIdeas() }
+            .refreshable {
+                await state.refreshCreateIdeas()
+                visibleCount = max(visibleCount, state.createIdeas.count)
+            }
+            .task {
+                if state.createIdeas.isEmpty { await state.refreshCreateIdeas() }
+            }
             .navigationTitle("Create")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -70,6 +83,16 @@ struct DraftsView: View {
             .sheet(isPresented: $showingDrafts) { TextDraftsView().environmentObject(state) }
             .onChange(of: choosingSource) { _, _ in state.studioPlayingID = nil }
             .onChange(of: showingDrafts) { _, _ in state.studioPlayingID = nil }
+        }
+    }
+    private func loadMore() {
+        guard !state.createBusy else { return }
+        if visibleCount < state.createIdeas.count { visibleCount += 6 }
+        else {
+            Task {
+                await state.refreshCreateIdeas()
+                visibleCount += 6
+            }
         }
     }
     private func studioSource(_ idea: CreateIdeas.Candidate, entry: SlowClawMemoryEntry) -> StudioSource {

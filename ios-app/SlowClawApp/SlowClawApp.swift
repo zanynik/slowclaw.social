@@ -657,6 +657,7 @@ final class AppState: ObservableObject {
     /// The larger generative model and keyword/embedding retrieval never grant
     /// admission. Pauses, missing context, missing models and errors abstain.
     func refreshReadsDecisions() async {
+        restoreCachedReadsDecisions()
         startPulseRanking()
         if jevEnabled {
             guard jevReadingTask == nil else { return }
@@ -765,6 +766,7 @@ final class AppState: ObservableObject {
     private var batchRelevanceCache = JevBatch.Cache.load()
     @Published var ideaCache = JevIdeas.Cache.load()
     @Published var createCache = CreateIdeas.Cache.load()
+    private var createTask: Task<Void, Never>?
     @Published var createBusy = false
     @Published var createStatus: String?
     @Published var studioPlayingID: String?
@@ -780,14 +782,29 @@ final class AppState: ObservableObject {
         var next = createCache; next.dismissed.insert(id)
         do { try next.save(); createCache = next } catch { createStatus = "Could not save this change. Please retry." }
     }
+    var hasMoreCreateIdeas: Bool {
+        createCache.candidates.isEmpty || createCache.candidates.contains {
+            createCache.decisions[$0.id] == nil && !createCache.dismissed.contains($0.id)
+        }
+    }
     func refreshCreateIdeas() async {
-        guard !createBusy else { return }
+        // SwiftUI can cancel refreshable when the gesture/view ends. The
+        // durable scan belongs to AppState; repeated pulls join the same scan.
+        if let createTask { await createTask.value; return }
+        createBusy = true
+        let task = Task { await findCreateIdeas() }
+        createTask = task
+        await task.value
+        createTask = nil
+        createBusy = false
+        Task { await resumeJevWork() }
+    }
+    private func findCreateIdeas() async {
         guard jevEnabled else { createStatus = "Enable Jev in Profile to find new moments. Your saved cards stay here."; return }
         guard !contextWorkPaused else {
             createStatus = "Finish recording or resume AI processing, then try again."; return
         }
-        createBusy = true; studioPlayingID = nil
-        defer { createBusy = false }
+        studioPlayingID = nil
         do {
             // Reserve priority before suspending. Background workers finish
             // their current HTTP request and yield at checkJevWork, releasing
@@ -820,6 +837,7 @@ final class AppState: ObservableObject {
             }
             var next = createCache; next.reconcile(candidates)
             try next.save(); createCache = next
+            let previousIDs = Set(createIdeas.map(\.id))
             let pending = Array(next.candidates.filter { next.decisions[$0.id] == nil && !next.dismissed.contains($0.id) }.prefix(96))
             for batch in CreateIdeas.batches(pending) {
                 try checkJevWork(allowCreate: true)
@@ -833,12 +851,16 @@ final class AppState: ObservableObject {
                 })
                 let active = Set(updated.candidates.map(\.id))
                 for decision in decisions where active.contains(decision.id) { updated.decisions[decision.id] = decision }
+                updated.feedOrder = CreateIdeas.selected(updated).map(\.id)
                 try updated.save(); createCache = updated
-                if createIdeas.count >= 6 { break }
+                if CreateIdeas.hasNewPage(createIdeas, after: previousIDs) { break }
             }
             let remaining = createCache.candidates.filter { createCache.decisions[$0.id] == nil && !createCache.dismissed.contains($0.id) }.count
             createStatus = remaining > 0 ? "More moments to explore. Pull down again when you like." : (createIdeas.isEmpty ? "No strong standalone moments yet. Try another journal or make a card yourself." : "You're up to date.")
-        } catch is CancellationError { createStatus = "Paused. Completed cards are saved." }
+        } catch is CancellationError { createStatus = "Paused. Completed cards are saved. Pull down to continue." }
+        catch let error as URLError where error.code == .cancelled {
+            createStatus = "Paused. Completed cards are saved. Pull down to continue."
+        }
         catch { createStatus = error.localizedDescription }
     }
 
@@ -978,7 +1000,7 @@ final class AppState: ObservableObject {
     private static let readsCacheVersion = 6
     private static let readsCacheMaxAge: TimeInterval = 30 * 60
     private static let rssSourceLimit = 32
-    private var readsRefreshInFlight = false
+    private var readsRefreshTask: Task<Void, Never>?
 
     private struct ReadsCache: Codable {
         let version: Int
@@ -1047,6 +1069,7 @@ final class AppState: ObservableObject {
             self.readsItems = cache.items
             self.readsRefreshedAt = cache.refreshedAt
             self.readsLoadedOnce = true
+            restoreCachedReadsDecisions()
             self.semanticMatches = (cache.semanticMatches ?? [:]).filter {
                 journalInterestRecords[$0.value.journalKey]?.insight != nil && !excludedMemoryKeys.contains($0.value.journalKey)
                     && Self.softDeletedKeys()[$0.value.journalKey] == nil
@@ -1869,26 +1892,62 @@ final class AppState: ObservableObject {
                                    xmlURL: "https://hnrss.org/frontpage")]
     }
 
-    /// Load the Reads feed. On the first call (or when forced) this replaces the
-    /// list; on subsequent calls it background-refreshes and merges new items in
-    /// so switching tabs never wipes what's already shown. Pull-to-refresh forces
-    /// a foreground refresh (spinner visible).
+    /// Refreshes are owned by AppState, so tab/gesture cancellation cannot
+    /// strand the feed. Cached decisions are restored before any network wait.
     func loadReads(force: Bool = false) async {
-        // A just-refreshed disk cache is the normal relaunch path. It was
-        // hydrated in init, so do not fetch the world again until it is stale;
-        // pull-to-refresh is always an explicit bypass.
-        if !force,
-           !readsItems.isEmpty,
-           let refreshedAt = readsRefreshedAt,
+        restoreCachedReadsDecisions()
+        if let readsRefreshTask { await readsRefreshTask.value; return }
+        if !force, !readsItems.isEmpty, let refreshedAt = readsRefreshedAt,
            Date().timeIntervalSince(refreshedAt) < Self.readsCacheMaxAge {
             await refreshReadsDecisions()
             startJevFeedSelection()
             return
         }
-        guard !readsRefreshInFlight else { return }
-        readsRefreshInFlight = true
-        defer { readsRefreshInFlight = false }
+        let task = Task { await fetchReads(force: force) }
+        readsRefreshTask = task
+        await task.value
+        readsRefreshTask = nil
+    }
 
+    private func restoreCachedReadsDecisions() {
+        guard jevEnabled else { return }
+        let interests = JevBatch.profile(personaWeights)
+        guard !interests.isEmpty else { return }
+        let profile = JevBatch.profileID(interests)
+        for item in readsItems where item.sourceLabel != "Nostr posts" {
+            let text = Self.readsDecisionText(item)
+            if let score = batchRelevanceCache.score(for: JevBatch.digest(text), profile: profile) {
+                readsDecisions[item.id] = .init(text: text, score: score, revision: memoryRevision)
+                jevReadSources[item.id] = "your top weighted interests"
+            }
+        }
+    }
+
+    /// Keep approved reads through transport refreshes, including force pulls.
+    /// Reuse the previous object for unchanged content whose transport ID moved;
+    /// edited content must earn a fresh decision. Bound both old and new items.
+    private func mergeReads(_ incoming: [RankedFeedItem]) {
+        let priorByText = Dictionary(readsItems.map { (Self.readsDecisionText($0), $0) },
+            uniquingKeysWith: { first, _ in first })
+        let fetched = incoming.map { priorByText[Self.readsDecisionText($0)] ?? $0 }
+        let incomingLinks = Set(incoming.map(\.link).filter { !$0.isEmpty })
+        let incomingTexts = Set(incoming.map(Self.readsDecisionText))
+        let incomingIDs = Set(incoming.map(\.id))
+        let retained = readsItems.filter {
+            incomingTexts.contains(Self.readsDecisionText($0)) ||
+                (!incomingIDs.contains($0.id) && ($0.link.isEmpty || !incomingLinks.contains($0.link)))
+        }
+        let approvedIDs = Set(relevantReads.map(\.id))
+        let kept = Array(retained.filter { approvedIDs.contains($0.id) }.prefix(40))
+        var ids = Set<String>(), links = Set<String>()
+        readsItems = Array((kept + fetched + retained).filter {
+            guard ids.insert($0.id).inserted else { return false }
+            return $0.link.isEmpty || links.insert($0.link).inserted
+        }.prefix(JevFeeds.maximumCandidates))
+    }
+
+    private func fetchReads(force: Bool) async {
+        defer { readsLoading = false }
         let isFirst = !readsLoadedOnce || readsItems.isEmpty
         if force || isFirst {
             readsLoading = true
@@ -1938,23 +1997,8 @@ final class AppState: ObservableObject {
             return
         }
 
-        // Merge: keep the existing list visible; replace on force/first load.
-        if force || readsItems.isEmpty {
-            readsItems = capped
-        } else {
-            // Background refresh: prepend new items not already present. Dedup
-            // on BOTH id and link — ids embed the item's batch index, which
-            // shifts as feeds update, so id-only dedup let the same article
-            // back in on the next refresh (duplicates in the list).
-            let existing = Set(readsItems.map { $0.id })
-            let existingLinks = Set(readsItems.map { $0.link }.filter { !$0.isEmpty })
-            let fresh = capped.filter {
-                !existing.contains($0.id) && ($0.link.isEmpty || !existingLinks.contains($0.link))
-            }
-            if !fresh.isEmpty {
-                readsItems = (fresh + readsItems).prefix(JevFeeds.maximumCandidates).map { $0 }
-            }
-        }
+        mergeReads(capped)
+        restoreCachedReadsDecisions()
         readsRefreshedAt = Date()
         Self.saveReadsCache(items: readsItems, refreshedAt: readsRefreshedAt!, matches: semanticMatches)
         readsError = nil
@@ -5570,7 +5614,9 @@ extension AppState {
         }
         if pending || jevPassages.contains(where: { ideaCache.decisions[$0.id] == nil }) { startJevMemory() }
         else if !personaCache.journals.isEmpty {
-            if readsItems.isEmpty { await loadReads() }
+            // Retry ranking deferred by Create, source selection or memory
+            // work, even when transport candidates are already cached.
+            await loadReads()
         }
     }
     private func pruneJevMemory() {

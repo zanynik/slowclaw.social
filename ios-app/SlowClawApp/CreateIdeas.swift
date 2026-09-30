@@ -22,6 +22,7 @@ enum CreateIdeas {
         var candidates: [Candidate] = []
         var decisions: [String: JevIdeas.Decision] = [:]
         var dismissed: Set<String> = []
+        var feedOrder: [String]?
         private static var url: URL { FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("create-segments-v1.json") }
         static func load() -> Cache {
             guard let value = try? JSONDecoder().decode(Self.self, from: Data(contentsOf: url)), value.version == CreateIdeas.version,
@@ -33,6 +34,7 @@ enum CreateIdeas {
             let active = Set(candidates.map(\.id))
             decisions = decisions.filter { active.contains($0.key) }
             dismissed.formIntersection(active)
+            feedOrder = feedOrder?.filter { active.contains($0) }
         }
         func save() throws {
             try FileManager.default.createDirectory(at: Self.url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -103,25 +105,34 @@ enum CreateIdeas {
         return result
     }
     static func selected(_ cache: Cache) -> [Candidate] {
+        let positions = Dictionary((cache.feedOrder ?? []).enumerated().map { ($0.element, $0.offset) },
+            uniquingKeysWith: { first, _ in first })
         let ranked = cache.candidates.filter { item in
             guard !cache.dismissed.contains(item.id), let decision = cache.decisions[item.id], decision.suggested else { return false }
             return item.timingID != nil || (decision.shareableQuote && item.text.count <= 600)
         }.sorted {
+            let a = positions[$0.id] ?? Int.max, b = positions[$1.id] ?? Int.max
+            if a != b { return a < b }
             let left = cache.decisions[$0.id]!.score, right = cache.decisions[$1.id]!.score
             return left == right ? $0.id < $1.id : left > right
         }
         var result: [Candidate] = []
         for item in ranked {
-            guard result.filter({ $0.key == item.key }).count < 3,
-                  !result.contains(where: { existing in
+            guard !result.contains(where: { existing in
                       if existing.text == item.text { return true }
-                      guard existing.key == item.key, let a = existing.first, let b = existing.last, let c = item.first, let d = item.last else { return false }
+                      guard existing.key == item.key else { return false }
+                      if existing.text.contains(item.text) || item.text.contains(existing.text) { return true }
+                      guard let a = existing.first, let b = existing.last, let c = item.first, let d = item.last else { return false }
                       return max(a, c) <= min(b, d)
                   }) else { continue }
             result.append(item)
-            if result.count == 24 { break }
+
         }
         return result
+    }
+    /// Every pull needs a new page, rather than stopping at the lifetime total.
+    static func hasNewPage(_ items: [Candidate], after previousIDs: Set<String>, size: Int = 6) -> Bool {
+        items.filter { !previousIDs.contains($0.id) }.count >= size
     }
     static func batches(_ items: [Candidate]) -> [[Candidate]] {
         // Existing endpoint evaluates six questions per segment, at most 12

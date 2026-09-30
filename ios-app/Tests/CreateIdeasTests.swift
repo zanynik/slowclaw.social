@@ -18,6 +18,28 @@ final class CreateIdeasTests: XCTestCase {
         }
         XCTAssertEqual(CreateIdeas.selected(cache).map(\.text), [insight])
     }
+    func testLaterPullNeedsSixNewCardsAndFeedCanGrowPastTwentyFour() {
+        let values = (0..<36).map { index in
+            CreateIdeas.Candidate(id: "moment-\(index)", key: "slowclaw_journal", fingerprint: "source",
+                text: "A distinct insight numbered \(index) with enough context to share.",
+                timingID: nil, first: nil, last: nil, start: nil, end: nil)
+        }
+        var cache = CreateIdeas.Cache(); cache.reconcile(values)
+        for item in values.prefix(30) {
+            cache.decisions[item.id] = .init(id: item.id, score: 0.9, privateScore: 0, standalone: 0.9, quote: 0.9)
+        }
+        let firstPage = CreateIdeas.selected(cache)
+        XCTAssertEqual(firstPage.count, 30)
+        cache.feedOrder = firstPage.map(\.id)
+        let previous = Set(firstPage.map(\.id))
+        XCTAssertFalse(CreateIdeas.hasNewPage(firstPage, after: previous))
+        for item in values.suffix(6) {
+            cache.decisions[item.id] = .init(id: item.id, score: 0.99, privateScore: 0, standalone: 0.9, quote: 0.9)
+        }
+        let nextPage = CreateIdeas.selected(cache)
+        XCTAssertTrue(CreateIdeas.hasNewPage(nextPage, after: previous))
+        XCTAssertEqual(Array(nextPage.prefix(30).map(\.id)), firstPage.map(\.id), "New scores must not displace cards already shown.")
+    }
     private func transcript() -> TimedTranscript {
         let words = (0..<60).map { index in TimedTranscript.Word(text: index % 10 == 9 ? "thought." : "word\(index)", start: Double(index), end: Double(index) + 0.7) }
         return .init(text: words.map(\.text).joined(separator: " "), words: words)
@@ -44,7 +66,6 @@ final class CreateIdeasTests: XCTestCase {
         }
         let selected = CreateIdeas.selected(cache)
         XCTAssertFalse(selected.contains { $0.id == values[0].id })
-        XCTAssertLessThanOrEqual(selected.count, 3)
         for a in selected { for b in selected where a.id != b.id { XCTAssertTrue(a.last! < b.first! || b.last! < a.first!) } }
         cache.dismissed.formUnion(selected.map(\.id))
         XCTAssertTrue(Set(CreateIdeas.selected(cache).map(\.id)).isDisjoint(with: selected.map(\.id)))
