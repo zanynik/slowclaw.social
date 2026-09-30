@@ -27,8 +27,8 @@ import XCTest
         let app = XCUIApplication(); app.launchArguments = ["--pulse-ui-test"]; app.launch()
         let author = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "nostr.profile.")).firstMatch
         XCTAssertTrue(author.waitForExistence(timeout: 20))
-        XCTAssertTrue(author.label.contains("SlowClawAgent"))
-        XCTAssertTrue(author.label.contains("@slowclaw_agent"))
+        XCTAssertTrue(author.label.contains("SlowClawAgent"), author.label)
+        XCTAssertTrue(author.label.contains("@slowclaw_agent"), author.label)
         XCTAssertTrue(app.staticTexts["Garden reply 1"].exists)
         XCTAssertFalse(app.staticTexts["Garden reply 3"].exists)
         let expand = app.buttons["View 3 replies"]

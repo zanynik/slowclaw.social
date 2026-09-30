@@ -91,9 +91,13 @@ enum AppTab { case drafts, journal }
 }
 
 @MainActor enum PulseUIFixture {
+    // A globally known test key can already have newer metadata on public
+    // relays. Use fresh synthetic identities so profile reads cannot replace
+    // the fixture's names or bring unrelated posts into the test timeline.
+    private static let session = UUID().uuidString
     static let item: RankedFeedItem = {
         func signed(_ kind: Int, author: UInt8, tags: [[String]] = [], text: String, date: Int = 1) -> PublishedEvent {
-            let secret = Array(repeating: UInt8(0), count: 31) + [author]
+            let secret = Array(SHA256.hash(data: Data(("slowclaw-ui-" + session + "-" + String(author)).utf8)))
             let pubkey = try! NostrIdentity.publicKey(secret)
             let bytes = try! JSONSerialization.data(withJSONObject: [0, pubkey, date, kind, tags, text], options: [.withoutEscapingSlashes])
             let hash = Array(SHA256.hash(data: bytes))
