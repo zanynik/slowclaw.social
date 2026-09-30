@@ -119,7 +119,7 @@ struct NostrPostDetail: View {
         List {
             Section {
                 NostrAuthorHeader(pubkey: post.pubkey, created: post.created_at)
-                Text(post.content).textSelection(.enabled)
+                NostrPostContent(content: post.content, tags: post.tags)
                 Button("Reply") { replyTarget = post }
                 if let url = URL(string: "https://njump.me/" + post.id) {
                     Link("Open on the web", destination: url)
@@ -131,7 +131,7 @@ struct NostrPostDetail: View {
                 ForEach(social.replies(post, hidden: inbox.hiddenAuthors)) { reply in
                     VStack(alignment: .leading, spacing: 8) {
                         NostrAuthorHeader(pubkey: reply.pubkey, created: reply.created_at)
-                        Text(reply.content).textSelection(.enabled)
+                        NostrPostContent(content: reply.content, tags: reply.tags)
                         Text(Date(timeIntervalSince1970: Double(reply.created_at)), style: .date).font(.caption).foregroundStyle(.secondary)
                         HStack {
                             Button("Reply") { replyTarget = reply }

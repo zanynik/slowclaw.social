@@ -6,6 +6,14 @@ final class NostrSocialStore: ObservableObject {
     static let shared = NostrSocialStore()
     @Published private(set) var profiles: [String: PublishedEvent] = [:]
     @Published private(set) var events: [String: [PublishedEvent]] = [:]
+    @Published private(set) var authorPosts: [String: [PublishedEvent]] = [:]
+    @Published private(set) var authorStatus: [String: String] = [:]
+    @Published private(set) var followList: PublishedEvent?
+    @Published private(set) var followsReady = false
+    @Published private(set) var followBusy = false
+    @Published private(set) var followStatus: String?
+    private var followOwner: String?
+    private var loadingAuthors = Set<String>()
     @Published private(set) var coverage: [String: String] = [:]
     private var loaded: [String: Date] = [:]
     private var profileLoaded: [String: Date] = [:]
@@ -87,6 +95,61 @@ final class NostrSocialStore: ObservableObject {
                 : "Counts cover fetched events from \(batch.completed) of \(batch.total) relays; more may exist."
             if batch.completed > 0 { loaded[post.id] = Date() }
         }
+    }
+    func loadAuthor(_ key: String, before: Int? = nil) async {
+        guard NostrEventVerifier.bytes(key, count: 32) != nil, !loadingAuthors.contains(key) else { return }
+        loadingAuthors.insert(key)
+        defer { loadingAuthors.remove(key) }
+        var filter: [String: Any] = ["kinds": [1, 30023], "authors": [key], "limit": 30]
+        if let before { filter["until"] = before }
+        async let profile: Void = loadProfiles([key])
+        let batch = await NostrConversations.shared.read(filters: [filter], relays: Self.relays)
+        recordAuthor(batch, key: key)
+        await profile
+    }
+    func recordAuthor(_ batch: NostrConversations.Batch, key: String) {
+        let incoming = batch.events.filter {
+            $0.pubkey == key && [1, 30023].contains($0.kind) && NostrEventVerifier.verify($0)
+                && ReadsContentFilter.isAllowed($0.content) && !$0.tags.contains(where: { $0.first == "content-warning" })
+        }
+        authorPosts[key] = Array(NostrConversationRules.mergedPosts(incoming + (authorPosts[key] ?? []), author: key).prefix(120))
+        if authorPosts.count > 40, let evicted = authorPosts.keys.filter({ $0 != key }).sorted().first {
+            authorPosts.removeValue(forKey: evicted); authorStatus.removeValue(forKey: evicted)
+        }
+        authorStatus[key] = batch.completed == 0 ? "Couldn’t load posts. Pull to retry." : incoming.isEmpty ? "No more posts found on these relays." : nil
+    }
+    func isFollowing(_ key: String) -> Bool { followList.map { NostrSocialRules.follows($0).contains(key) } ?? false }
+    func loadFollows() async {
+        followsReady = false
+        do {
+            let owner = try NostrIdentity.publicKey(NostrIdentity.secret())
+            if followOwner != owner { followList = nil; followOwner = owner }
+            let relays = Array(Set(Self.relays))
+            guard !relays.isEmpty, relays.count <= 5 else { throw PublishingError.message("Choose one to five relays in your publishing settings.") }
+            let batch = await NostrConversations.shared.read(filters: [["kinds": [3], "authors": [owner], "limit": 1]], relays: relays)
+            // Never overwrite a partially loaded list with just one new follow.
+            guard batch.completed == relays.count else { throw PublishingError.message("Couldn’t check the full follow list. Retry before changing it.") }
+            let local = NostrPublisher.confirmedEvents().filter { $0.pubkey == owner && $0.kind == 3 && NostrEventVerifier.verify($0) }
+            followList = NostrSocialRules.latest(batch.events + local + (followList.map { [$0] } ?? []), kind: 3)[owner]
+            followsReady = true; followStatus = nil
+        } catch { followStatus = error.localizedDescription }
+    }
+    func setFollowing(_ key: String, following: Bool) async throws {
+        guard !followBusy else { throw PublishingError.message("A follow update is already in progress.") }
+        followBusy = true
+        defer { followBusy = false }
+        await loadFollows()
+        guard followsReady, let owner = followOwner else { throw PublishingError.message(followStatus ?? "Load your follow list first.") }
+        let tags = try NostrSocialRules.followTags(existing: followList, owner: owner, target: key, following: following)
+        if tags == followList?.tags { return }
+        let id = try await NostrPublisher.shared.publish(draftKey: "follow-list-" + owner,
+            content: followList?.content ?? "", title: "", article: false,
+            metadataAfter: followList?.created_at, followTags: tags)
+        guard let confirmed = NostrPublisher.confirmedEvents().first(where: { $0.id == id && $0.kind == 3 }) else {
+            throw PublishingError.message("Could not find the confirmed follow update. Reload to check it.")
+        }
+        followList = confirmed; followStatus = nil
+        await NostrDiscovery.shared.invalidate()
     }
     func replies(_ post: PublishedEvent, hidden: Set<String>) -> [PublishedEvent] {
         NostrConversationRules.replies((events[post.id] ?? []).filter { !hidden.contains($0.pubkey) && ReadsContentFilter.isAllowed($0.content) && !$0.tags.contains(where: { $0.first == "content-warning" }) }, to: post)

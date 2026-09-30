@@ -114,7 +114,7 @@ struct PulseRow: View {
                 } label: { Image(systemName: "ellipsis").frame(width: 32, height: 32) }
                     .accessibilityLabel("Post actions")
             }
-            Text(item.description).font(.body).lineLimit(expanded ? nil : 8).textSelection(.enabled)
+            NostrPostContent(content: item.description, tags: event?.tags ?? [], lineLimit: expanded ? nil : 8)
             if item.description.count > 300 {
                 Button(expanded ? "Show less" : "Show more") { expanded.toggle() }.font(.subheadline)
             }
@@ -144,7 +144,7 @@ struct PulseRow: View {
                                 if let parent = NostrSocialRules.parent(reply), parent != event.id {
                                     Text("Reply in thread").font(.caption2).foregroundStyle(.secondary)
                                 }
-                                Text(reply.content).font(.subheadline).lineLimit(showReplies ? nil : 3)
+                                NostrPostContent(content: reply.content, tags: reply.tags, lineLimit: showReplies ? nil : 3).font(.subheadline)
                                 Button("Reply") { replyTarget = reply }.font(.caption)
                             }.accessibilityIdentifier("pulse.reply." + reply.id)
                         }

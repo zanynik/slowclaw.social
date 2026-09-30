@@ -89,4 +89,36 @@ final class NostrSocialTests: XCTestCase {
         XCTAssertNil(NostrSocialRules.parent(mention))
         XCTAssertEqual(NostrSocialRules.parent(reply), root.id)
     }
+    func testMediaURLsUseMimeHintsDeduplicateAndKeepSignedQueries() {
+        let image = "https://example.com/photo.jpg?signature=keep-me"
+        let hinted = "https://example.com/opaque?token=unchanged"
+        let values = NostrContent.attachments("See \(image) and https://example.com/movie.mp4 and https://example.com/sound.mp3 and https://example.com/article", tags: [
+            ["imeta", "url " + image, "m image/jpeg"], ["imeta", "url " + hinted, "m video/mp4"]])
+        XCTAssertEqual(values.map(\.kind), [.image, .video, .audio, .link, .video])
+        XCTAssertEqual(values[0].url.absoluteString, image)
+        XCTAssertEqual(values.last?.url.absoluteString, hinted)
+        XCTAssertTrue(NostrContent.attachments("https://user:pass@example.com/private http://example.com/plain file:///tmp/local").isEmpty)
+        XCTAssertEqual(NostrContent.attachments((0..<20).map { "https://example.com/\($0).jpg" }.joined(separator: " ")).count, 8)
+    }
+    func testFollowChangesPreserveExistingContactsAndUnknownTags() throws {
+        let target = try event(1, author: 2).pubkey, other = try event(1, author: 3).pubkey
+        let initial = try event(3, tags: [["p", other, "wss://example.com", "slowclaw_user"], ["custom", "keep"]])
+        let followed = try NostrSocialRules.followTags(existing: initial, owner: initial.pubkey, target: target, following: true)
+        XCTAssertEqual(Array(followed.prefix(2)), initial.tags)
+        XCTAssertEqual(followed.last, ["p", target, ""])
+        let current = try event(3, date: 2, tags: followed)
+        XCTAssertEqual(try NostrSocialRules.followTags(existing: current, owner: current.pubkey, target: target, following: true), followed)
+        XCTAssertEqual(try NostrSocialRules.followTags(existing: current, owner: current.pubkey, target: target, following: false), initial.tags)
+        XCTAssertThrowsError(try NostrSocialRules.followTags(existing: initial, owner: other, target: target, following: true))
+    }
+    @MainActor func testAuthorTimelineKeepsPriorPostsOnOutageAndFiltersOtherAuthors() throws {
+        let own = try event(1, content: "SlowClaw public observation"), other = try event(1, author: 2)
+        let store = NostrSocialStore(defaults: UserDefaults(suiteName: "slowclaw-author-test-" + UUID().uuidString)!)
+        store.recordAuthor(.init(events: [own, own, other], completed: 1, total: 1), key: own.pubkey)
+        XCTAssertEqual(store.authorPosts[own.pubkey]?.map(\.id), [own.id])
+        store.recordAuthor(.init(events: [], completed: 0, total: 1), key: own.pubkey)
+        XCTAssertEqual(store.authorPosts[own.pubkey]?.map(\.id), [own.id])
+        XCTAssertFalse(NostrConversations.matches(own, filter: ["until": 0]))
+    }
+
 }

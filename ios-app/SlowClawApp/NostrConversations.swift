@@ -172,6 +172,7 @@ actor NostrConversations {
         if let authors = filter["authors"] as? [String], !authors.contains(event.pubkey) { return false }
         if let ids = filter["ids"] as? [String], !ids.contains(event.id) { return false }
         if let since = filter["since"] as? Int, event.created_at < since { return false }
+        if let until = filter["until"] as? Int, event.created_at > until { return false }
         for (key, value) in filter where key.hasPrefix("#") {
             guard let values = value as? [String], event.tags.contains(where: {
                 $0.count >= 2 && $0[0] == String(key.dropFirst()) && values.contains($0[1])

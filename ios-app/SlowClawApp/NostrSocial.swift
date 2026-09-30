@@ -54,6 +54,25 @@ enum NostrSocialRules {
             return tag[1]
         }
     }
+    /// Edit the complete latest list, preserving relay hints, petnames and
+    /// unknown tags. A kind-3 event replaces the whole previous follow list.
+    static func followTags(existing: PublishedEvent?, owner: String, target: String, following: Bool) throws -> [[String]] {
+        guard NostrEventVerifier.bytes(owner, count: 32) != nil,
+              NostrEventVerifier.bytes(target, count: 32) != nil, owner != target else {
+            throw PublishingError.message("Invalid follow target.")
+        }
+        if let existing {
+            guard existing.kind == 3, existing.pubkey == owner, NostrEventVerifier.verify(existing) else {
+                throw PublishingError.message("Could not verify the current follow list. Retry loading it.")
+            }
+        }
+        var tags = existing?.tags ?? []
+        if following {
+            if !tags.contains(where: { $0.count >= 2 && $0[0] == "p" && $0[1] == target }) { tags.append(["p", target, ""]) }
+        } else { tags.removeAll { $0.count >= 2 && $0[0] == "p" && $0[1] == target } }
+        guard tags.count <= 2000 else { throw PublishingError.message("The follow list is too large to update here.") }
+        return tags
+    }
     static func network(_ lists: [PublishedEvent], roots: [String], excluding: Set<String> = [], limit: Int = 80) -> [String] {
         let currentLists = latest(lists, kind: 3)
         var counts: [String: Int] = [:]
@@ -76,6 +95,7 @@ enum NostrSocialRules {
 actor NostrDiscovery {
     static let shared = NostrDiscovery()
     static let sourcesKey = "slowclaw.pulse.sources.v1"
+    func invalidate() { graphs.removeAll() }
     private var graphs: [String: (date: Date, direct: [String], network: [String], counts: [String: Int])] = [:]
 
     func posts(roots: [String], relays: [String]) async -> [PublishedEvent] {

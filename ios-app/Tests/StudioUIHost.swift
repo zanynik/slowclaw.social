@@ -60,7 +60,11 @@ enum AppTab { case drafts, journal }
     @State private var sourceID = "studio-ui-" + UUID().uuidString
     var body: some Scene {
         WindowGroup {
-            if ProcessInfo.processInfo.arguments.contains("--web-ui-test") {
+            if ProcessInfo.processInfo.arguments.contains("--pulse-media-test") {
+                NavigationStack { ScrollView {
+                    NostrPostContent(content: "Look at this clip https://example.com/clip.mp4 and recording https://example.com/audio.mp3").padding()
+                } }
+            } else if ProcessInfo.processInfo.arguments.contains("--web-ui-test") {
                 NavigationStack { WebCompanionView().environmentObject(state) }
             } else if ProcessInfo.processInfo.arguments.contains("--pulse-ui-test") {
                 NavigationStack { ScrollView { PulseRow(item: PulseUIFixture.item).environmentObject(state).padding(.top) } }
@@ -101,6 +105,7 @@ enum AppTab { case drafts, journal }
         let replies = (1...3).map { signed(1, author: 2, tags: [["e", post.id, "", "root"]], text: "Garden reply \($0)", date: $0 + 1) }
         let like = signed(7, author: 2, tags: [["e", post.id]], text: "+")
         NostrSocialStore.shared.mergeProfiles([profile, replyProfile])
+        NostrSocialStore.shared.recordAuthor(.init(events: [post], completed: 1, total: 1), key: post.pubkey)
         NostrSocialStore.shared.record(.init(events: replies + [like], completed: 1, total: 1), posts: [post])
         return RankedFeedItem(id: "nostr:" + post.id, title: "Garden", link: "https://example.com/post", description: post.content,
             sourceLabel: "Nostr", score: 1, readMinutes: 1, sourcePlatform: "nostr", thumbnailURL: nil,

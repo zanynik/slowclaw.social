@@ -118,10 +118,10 @@ final class NostrPublisher: ObservableObject {
     }
 
     func publish(draftKey: String, content: String, title: String, article: Bool,
-                 replyRoot: PublishedEvent? = nil, replyParent: PublishedEvent? = nil, metadata: Bool = false, metadataAfter: Int? = nil) async throws -> String {
+                 replyRoot: PublishedEvent? = nil, replyParent: PublishedEvent? = nil, metadata: Bool = false, metadataAfter: Int? = nil, followTags: [[String]]? = nil) async throws -> String {
         guard !busy else { throw PublishingError.message("A publication is already in progress.") }
         let text = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, text.utf8.count <= 60_000 else {
+        guard (!text.isEmpty || followTags != nil), text.utf8.count <= 60_000 else {
             throw PublishingError.message("The draft is empty or too large.")
         }
         let relays = Array(Set(Self.relayText.split(whereSeparator: { $0.isWhitespace }).map(String.init))).sorted()
@@ -141,18 +141,26 @@ final class NostrPublisher: ObservableObject {
                 throw PublishingError.message("Invalid public profile.")
             }
         }
-        let kind = metadata ? 0 : (reply?.kind ?? (article ? 30023 : 1))
+        if let followTags {
+            guard !metadata, !article, reply == nil, followTags.count <= 2000,
+                  followTags.allSatisfy({ $0.count <= 8 && $0.allSatisfy { $0.utf8.count <= 2048 } }) else {
+                throw PublishingError.message("Invalid follow list.")
+            }
+        }
+        let replaceable = metadata || followTags != nil
+        let kind = followTags != nil ? 3 : metadata ? 0 : (reply?.kind ?? (article ? 30023 : 1))
         let event: PublishedEvent
         if let cached = UserDefaults.standard.data(forKey: cacheKey),
            let saved = try? JSONDecoder().decode(PublishedEvent.self, from: cached),
            saved.content == text, saved.pubkey == pubkey, saved.kind == kind,
-           (!metadata || saved.created_at >= (metadataAfter ?? 0)),
+           (!replaceable || saved.created_at > (metadataAfter ?? 0)),
+           (followTags.map { saved.tags == $0 } ?? true),
            (!article || saved.tags.contains(["title", title])),
            (reply.map { saved.tags == $0.tags } ?? true) {
             event = saved // Retry the same event ID after a timeout or relaunch.
         } else {
-            let created = max(Int(Date().timeIntervalSince1970), metadata ? (metadataAfter ?? 0) + 1 : 0)
-            let tags = reply?.tags ?? (article ? [["d", draftKey], ["title", title], ["published_at", String(created)]] : [])
+            let created = max(Int(Date().timeIntervalSince1970), replaceable ? (metadataAfter ?? 0) + 1 : 0)
+            let tags = followTags ?? reply?.tags ?? (article ? [["d", draftKey], ["title", title], ["published_at", String(created)]] : [])
             let canonical = try JSONSerialization.data(withJSONObject: [0, pubkey, created, kind, tags, text], options: [.withoutEscapingSlashes])
             let hash = Array(SHA256.hash(data: canonical))
             event = PublishedEvent(id: NostrIdentity.hex(hash), pubkey: pubkey,

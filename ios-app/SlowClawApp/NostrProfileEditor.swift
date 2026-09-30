@@ -146,7 +146,9 @@ struct NostrAuthorHeader: View {
     let pubkey: String
     var created: Int? = nil
     @StateObject private var social = NostrSocialStore.shared
+    @State private var showingProfile = false
     var body: some View {
+        Button { showingProfile = true } label: {
         HStack(spacing: 10) {
             AsyncImage(url: social.profile(pubkey)?.picture) { image in image.resizable().scaledToFill() } placeholder: {
                 Image(systemName: "person.fill").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity).background(.quaternary)
@@ -160,5 +162,8 @@ struct NostrAuthorHeader: View {
                 }.font(.caption).foregroundStyle(.secondary)
             }
         }
+        }.buttonStyle(.plain).accessibilityLabel("View profile: " + social.name(pubkey))
+            .accessibilityIdentifier("nostr.profile." + pubkey)
+            .sheet(isPresented: $showingProfile) { NostrProfileView(pubkey: pubkey) }
     }
 }

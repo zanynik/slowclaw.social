@@ -1,6 +1,21 @@
 import XCTest
 
 @MainActor final class StudioUITests: XCTestCase {
+    func testPulseMediaOffersPlayersAndProfileOpensRecentPosts() {
+        let app = XCUIApplication(); app.launchArguments = ["--pulse-media-test"]; app.launch()
+        XCTAssertTrue(app.buttons["pulse.media.video"].waitForExistence(timeout: 20))
+        XCTAssertTrue(app.buttons["pulse.media.audio"].exists)
+        app.buttons["pulse.media.video"].tap()
+        XCTAssertTrue(app.navigationBars["Video"].waitForExistence(timeout: 10))
+        app.navigationBars["Video"].buttons["Done"].tap()
+        app.terminate(); app.launchArguments = ["--pulse-ui-test"]; app.launch()
+        let profile = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "nostr.profile.")).firstMatch
+        XCTAssertTrue(profile.waitForExistence(timeout: 20)); profile.tap()
+        XCTAssertTrue(app.navigationBars["Profile"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Recent posts"].exists)
+        XCTAssertTrue(app.staticTexts["Small gardens can teach us patience. A little attention every morning changes what we notice."].exists)
+        let evidence = XCTAttachment(screenshot: app.screenshot()); evidence.name = "pulse-author-profile"; evidence.lifetime = .keepAlways; add(evidence)
+    }
     func testWebPairingEntryExplainsTemporarySharing() {
         let app = XCUIApplication(); app.launchArguments = ["--web-ui-test"]; app.launch()
         XCTAssertTrue(app.navigationBars["SlowClaw Web"].waitForExistence(timeout: 20))
