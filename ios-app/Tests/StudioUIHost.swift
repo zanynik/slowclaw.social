@@ -4,7 +4,14 @@ import CryptoKit
 
 // Only compiled into the isolated simulator test host. The actual studio view
 // and render/export code are exercised; the journal store is a synthetic fixture.
-struct SlowClawMemoryEntry { let key: String; let content: String; let mediaURL: String? }
+struct SlowClawMemoryEntry {
+    let key: String
+    let content: String
+    let mediaURL: String?
+    let category = "daily"
+    let sessionID: String? = nil
+    let source: String? = nil
+}
 func journalDate(_ entry: SlowClawMemoryEntry) -> Date? { Date() }
 struct WebMemoryFixture {
     func get(key: String) throws -> SlowClawMemoryEntry? { nil }
