@@ -16,8 +16,9 @@ remains on device. No C ABI or signing infrastructure changes.
   duplicate events or more than two notes per author. These are candidate quotas;
   subsequent local relevance ranking can change the visible proportions.
 - New: phone-approved temporary access to recent journal text, moment/story excerpts
-  and current Pulse; laptop text/audio imports. No arbitrary remote signing,
-  publishing, edits to existing journal text, original-audio export or video playback.
+  and current Pulse; laptop text/audio imports. No arbitrary remote signing, publishing, original-audio export or video playback.
+  The text notepad extends this flow with new journals, existing-entry edits and
+  on-demand older transcript reads; the phone is still the canonical store.
 
 ## Session contract
 
@@ -72,3 +73,40 @@ before removing the companion. Existing imported journals are normal local recor
 and must never be deleted as part of rollback.
 
 Protocol reference: https://github.com/nostr-protocol/nips/blob/master/98.md
+
+## Browser notepad (2026-10)
+
+The Journals tab has a white text editor, optional title, New entry button and
+searchable history index. Recent text is sent with the snapshot; older text and
+transcripts are requested individually. Audio originals are never requested.
+Notes are capped at 1 MB; the snapshot/history index retains the existing bounded
+payload budget for unusually large archives. Excluded and deleted entries cannot
+be opened or edited. QR consent explicitly grants reading and editing journals.
+
+Each AES-GCM operation is bound to session/note/operation ID; receipts use a
+separate /result context. Browser drafts and exact pending operations are encrypted
+in sessionStorage for reload recovery. A stable browser journal key makes new
+entry retries idempotent. Only the paired phone can acknowledge an operation,
+after the canonical SQLite write succeeds. Transcript writes preserve category,
+session, source and media URL. No new C ABI or audio transfer path is introduced.
+
+Autosave queues the latest draft about once per second, with one unacknowledged
+operation per note. The phone polls while foregrounded every 15 seconds. The UI
+distinguishes unsaved changes, waiting for phone and saved on phone. Editing can
+continue during an in-flight save; a receipt advances the revision without
+overwriting newer browser text. Writes compare the exact full-content SHA-256
+revision synchronously with the upsert. Concurrent phone changes return the phone
+version and keep browser text; the user can use the phone version or save browser
+text as a new entry. Missing/excluded entries are rejected without resurrection.
+
+Sessions still expire after 24 hours. Logout removes encrypted drafts and pending
+operations and warns that unsynced edits will be lost. Closing a page with pending
+changes prompts the browser's unsaved-work warning. Browser tests cover receipt
+reconciliation and encrypted reload recovery; Worker/D1 tests cover ownership,
+idempotent queueing, immutable receipts and deletion. Swift tests cover revision
+conflicts, retry behavior, missing/excluded entry protection and payload validation.
+
+Vision alignment: proven SQLite journal persistence plus the encrypted companion;
+a simpler laptop capture surface that feeds the same journal-driven understanding
+and curation. Rollback the notepad component and phone edit receiver together;
+existing saved journals remain ordinary local records.

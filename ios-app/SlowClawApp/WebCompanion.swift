@@ -9,7 +9,8 @@ final class WebCompanion: ObservableObject {
     static let shared = WebCompanion()
     struct Session: Codable { let id: String; let key: Data; let pubkey: String; let expires: Int; var pair: String? = nil }
     struct Transfer: Decodable { let id: String; let meta: String; let bytes: Int; let status: String }
-    struct Status: Decodable { let expires: Int; let transfers: [Transfer] }
+    struct Edit: Decodable { let id: String; let sealed: String; let status: String }
+    struct Status: Decodable { let expires: Int; let transfers: [Transfer]; let edits: [Edit]? }
     struct Metadata: Decodable { let name: String; let type: String }
     @Published private(set) var session: Session?
     @Published private(set) var busy = false
@@ -70,7 +71,7 @@ final class WebCompanion: ObservableObject {
             // Save the recovery key before approving the server session.
             try save(provisional)
             try await completePair(provisional)
-            message = "Connected. Sharing your recent week…"
+            message = "Connected. Preparing your journal workspace…"
         } catch { message = error.localizedDescription }
         busy = false
         if session != nil { await sync(state: state) }
@@ -105,6 +106,10 @@ final class WebCompanion: ObservableObject {
             try await completePair(session)
             let status = try JSONDecoder().decode(Status.self, from: await request(session))
             var failed = 0, received = 0
+            for edit in status.edits ?? [] where edit.status == "queued" {
+                do { try await receiveEdit(edit, session: session, state: state); received += 1 }
+                catch { failed += 1; message = "A journal edit is waiting: " + error.localizedDescription }
+            }
             for transfer in status.transfers where transfer.status == "ready" {
                 do { try await receive(transfer, session: session, state: state); received += 1 }
                 catch { failed += 1; message = "A file could not be imported: " + error.localizedDescription }
@@ -119,18 +124,24 @@ final class WebCompanion: ObservableObject {
                 lastSnapshot = fingerprint
             }
             lastSync = Date()
-            if failed == 0 { message = "Recent journals, moments and Pulse are synced." }
+            if failed == 0 { message = "Journals, browser edits, moments and Pulse are synced." }
         } catch { message = error.localizedDescription }
     }
     private func makeSnapshot(state: AppState) throws -> Data {
         let since = Date().addingTimeInterval(-7 * 86400)
+        let available = state.journals.filter { !state.excludedMemoryKeys.contains($0.key) }
+        var index: [[String: String]] = available.map {
+            ["id": $0.key, "title": String(journalTitleOf($0).prefix(240)),
+             "date": ISO8601DateFormatter().string(from: journalDate($0) ?? Date()),
+             "kind": $0.mediaURL == nil ? "JOURNAL" : "TRANSCRIPT",
+             "revision": WebSessionProtocol.digest(Data($0.content.utf8))]
+        }
         let recent = state.journals.filter { !state.excludedMemoryKeys.contains($0.key) && (journalDate($0) ?? .distantPast) >= since }.prefix(200)
         let keys = Set(recent.map(\.key))
         var budget = 650_000
         var journals: [[String: String]] = recent.compactMap { entry in
             guard entry.content.utf8.count <= budget else { return nil }; budget -= entry.content.utf8.count
-            let lines = entry.content.components(separatedBy: "\n")
-            return ["id": entry.key, "title": lines.first ?? "Journal", "text": lines.dropFirst().joined(separator: "\n"), "date": ISO8601DateFormatter().string(from: journalDate(entry) ?? Date())]
+            return journalPayload(entry)
         }
         var creations: [[String: String]] = state.createIdeas.filter { keys.contains($0.key) }.prefix(100).map {
             ["id": $0.id, "text": $0.text, "kind": $0.start == nil ? "QUOTE" : "STORY EXCERPT"]
@@ -141,19 +152,62 @@ final class WebCompanion: ObservableObject {
             return ["id": event.id, "text": String(event.content.prefix(2000)), "author": NostrSocialStore.shared.profiles[event.pubkey].flatMap(NostrProfile.init)?.displayName ?? String(event.pubkey.prefix(12)),
                     "date": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: Double(event.created_at))), "url": "https://njump.me/" + event.id]
         }
-        // No audio originals, Nostr secrets, excluded entries or full history.
+        // Only text and an encrypted history index; never audio originals or Nostr secrets.
         func encode() throws -> Data {
-            try JSONSerialization.data(withJSONObject: ["journals": journals, "creations": creations, "pulse": pulse], options: [.sortedKeys, .withoutEscapingSlashes])
+            try JSONSerialization.data(withJSONObject: ["journals": journals, "index": index, "editorVersion": 1, "creations": creations, "pulse": pulse], options: [.sortedKeys, .withoutEscapingSlashes])
         }
         var encoded = try encode()
         while encoded.count > 1_200_000 {
             if !journals.isEmpty { journals.removeLast() }
             else if !creations.isEmpty { creations.removeLast() }
             else if !pulse.isEmpty { pulse.removeLast() }
+            else if !index.isEmpty { index.removeLast() }
             else { break }
             encoded = try encode()
         }
         return encoded
+    }
+    private func journalPayload(_ entry: SlowClawMemoryEntry) -> [String: String] {
+        // Keep the exact separator in the editable text for lossless round trips.
+        let lines = entry.content.components(separatedBy: "\n")
+        var body = lines.dropFirst().joined(separator: "\n")
+        if body.hasPrefix("\n") { body.removeFirst() }
+        return ["id": entry.key, "title": lines.first ?? "Journal", "text": body,
+                "revision": WebSessionProtocol.digest(Data(entry.content.utf8)),
+                "date": ISO8601DateFormatter().string(from: journalDate(entry) ?? Date()),
+                "kind": entry.mediaURL == nil ? "JOURNAL" : "TRANSCRIPT"]
+    }
+    private func receiveEdit(_ edit: Edit, session: Session, state: AppState) async throws {
+        guard WebSessionProtocol.validID(edit.id), let sealed = Data(base64Encoded: edit.sealed) else {
+            throw PublishingError.message("Invalid journal operation.")
+        }
+        let context = session.id + "/note/" + edit.id
+        let operation = try JSONDecoder().decode(WebJournalEdit.self, from: WebSessionProtocol.open(sealed, key: session.key, context: context))
+        try operation.validate()
+        let existing = try state.memory.get(key: operation.key)
+        let available = state.journals.contains { $0.key == operation.key } && !state.excludedMemoryKeys.contains(operation.key)
+        let revision = existing.map { WebSessionProtocol.digest(Data($0.content.utf8)) }
+        var outcome = operation.decision(current: existing?.content, revision: revision, available: available)
+        if AppState.softDeletedKeys()[operation.key] != nil || state.excludedMemoryKeys.contains(operation.key) { outcome = "rejected" }
+        // No suspension between revision check and SQLite upsert. Preserve audio
+        // provenance and never turn an excluded/deleted record back into a journal.
+        if outcome == "saved" {
+            if let existing {
+                try state.memory.store(key: existing.key, content: operation.content, category: existing.category,
+                                       sessionID: existing.sessionID, source: existing.source, mediaURL: existing.mediaURL)
+            } else {
+                try state.memory.store(key: operation.key, content: operation.content, category: "daily",
+                                       sessionID: nil, source: "text", mediaURL: nil)
+            }
+        }
+        var result: [String: Any] = ["key": operation.key]
+        if outcome != "rejected", let entry = try state.memory.get(key: operation.key) {
+            if entry.content.utf8.count <= 1_000_000 { result["entry"] = journalPayload(entry) }
+            else { outcome = "rejected"; result["error"] = "This transcript is over the 1 MB editor limit." }
+        } else { result["error"] = "This entry is unavailable or excluded on your phone." }
+        let response = try WebSessionProtocol.seal(JSONSerialization.data(withJSONObject: result), key: session.key, context: context + "/result")
+        let body = try JSONSerialization.data(withJSONObject: ["status": outcome, "result": response.base64EncodedString()])
+        _ = try await request(session, path: "/note/" + edit.id, method: "POST", body: body)
     }
     private func receive(_ transfer: Transfer, session: Session, state: AppState) async throws {
         guard WebSessionProtocol.validID(transfer.id), transfer.bytes > 28, transfer.bytes <= 50 * 1024 * 1024 + 28,
@@ -208,7 +262,7 @@ struct WebCompanionView: View {
     var body: some View {
         Form {
             Section {
-                Text("Read your recent week and send journals or audio from your laptop.")
+                Text("Write journals on your laptop and edit notes or transcripts.")
                 Link("Open SlowClaw Web", destination: URL(string: WebSessionProtocol.origin)!)
                 if web.session == nil {
                     Button { scanning = true } label: { Label("Scan web sign-in code", systemImage: "qrcode.viewfinder") }
@@ -224,8 +278,8 @@ struct WebCompanionView: View {
                 if let problem { Text(problem).font(.footnote).foregroundStyle(.red) }
             }
             Section("Temporary by design") {
-                Text("The last 7 days of journal text, selected moment excerpts and your current Pulse are encrypted for this browser. Audio recordings and your Nostr secret key stay on this iPhone.")
-                Text("Keep SlowClaw open to receive laptop uploads. Files marked Saved on phone stay here after logout. Sessions expire after 24 hours; logging out deletes pending uploads too.")
+                Text("Your journal index, recent text, requested older entries, selected moment excerpts and current Pulse are encrypted for this browser. Audio recordings and your Nostr secret key stay on this iPhone.")
+                Text("Keep SlowClaw open to save browser edits and receive laptop uploads. Files marked Saved on phone stay here after logout. Sessions expire after 24 hours; logging out deletes pending uploads too.")
             }.font(.footnote)
         }.navigationTitle("SlowClaw Web")
         .sheet(isPresented: $scanning, onDismiss: {
@@ -241,9 +295,9 @@ struct WebCompanionView: View {
             }
         }
         .confirmationDialog("Connect this browser?", isPresented: Binding(get: { pairing != nil }, set: { if !$0 { pairing = nil } }), titleVisibility: .visible) {
-            if let next = pairing { Button("Connect & share last 7 days") { pairing = nil; Task { await web.connect(next, state: state) } } }
+            if let next = pairing { Button("Connect journal workspace") { pairing = nil; Task { await web.connect(next, state: state) } } }
             Button("Cancel", role: .cancel) { pairing = nil }
-        } message: { Text("Only approve a code displayed on your own laptop at slowclaw-web.zanynik.chatgpt.site. This browser can read recent text and send imports until logout or expiry. Your Nostr signing key stays here.") }
+        } message: { Text("Only approve a code displayed on your own laptop at slowclaw-web.zanynik.chatgpt.site. This browser can read and edit journals and transcripts, create text entries and send imports until logout or expiry. Your Nostr signing key stays here.") }
         .confirmationDialog("Delete this web session?", isPresented: $confirmDisconnect, titleVisibility: .visible) {
             Button("Disconnect & delete", role: .destructive) { Task { await web.disconnect() } }
         } message: { Text("Uploads not yet received by this iPhone will be deleted. Check the browser transfer list first. Files already saved here are kept.") }
