@@ -1,0 +1,7 @@
+# torch is installed separately from the official CPU wheel index on Linux.
+transformers==5.15.0
+peft==0.21.0
+safetensors==0.8.0
+huggingface_hub==1.5.0
+numpy==2.3.5
+sentencepiece==0.2.2

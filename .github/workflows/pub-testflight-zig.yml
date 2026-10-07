@@ -44,9 +44,9 @@ permissions:
     contents: read
 
 jobs:
-    kev-model:
-        name: Package pinned Kev model
-        if: github.ref == 'refs/heads/feat/kev-reads-judge'
+    decider-model:
+        name: Package pinned Strands Decider model
+        if: github.ref == 'refs/heads/main'
         runs-on: ubuntu-24.04
         timeout-minutes: 25
         permissions:
@@ -57,11 +57,11 @@ jobs:
             - name: Package or verify the tested model asset
               env:
                   GH_TOKEN: ${{ github.token }}
-              run: bash ios-app/Tests/kev/package-model.sh
+              run: bash ios-app/Tests/decider/package-model.sh
 
     build-and-upload:
-        needs: kev-model
-        if: always() && !cancelled() && (needs.kev-model.result == 'success' || needs.kev-model.result == 'skipped')
+        needs: decider-model
+        if: always() && !cancelled() && (needs.decider-model.result == 'success' || needs.decider-model.result == 'skipped')
         name: Build and Upload iOS App (Zig)
         runs-on: macos-26
         timeout-minutes: 45
@@ -121,23 +121,23 @@ jobs:
               timeout-minutes: 20
               run: bash ios-app/Tests/minicpm-smoke.sh
 
-            - name: Test actual Kev model and C ABI
-              if: github.ref == 'refs/heads/feat/kev-reads-judge'
+            - name: Test actual Strands Decider model and C ABI
+              if: github.ref == 'refs/heads/main'
               timeout-minutes: 15
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
                   set -euo pipefail
-                  gh release download kev-lite-model-v1 --pattern slowclaw-kev-q8.gguf --dir /tmp/kev-model
+                  gh release download strands-decider-model-v21 --pattern slowclaw-decider-q6.gguf --dir /tmp/decider-model
                   python3 - <<'PY'
                   import hashlib, json
-                  manifest = json.load(open('ios-app/Tests/kev/model-manifest.json'))
+                  manifest = json.load(open('ios-app/Tests/decider/model-manifest.json'))
                   h = hashlib.sha256()
-                  with open('/tmp/kev-model/slowclaw-kev-q8.gguf', 'rb') as f:
+                  with open('/tmp/decider-model/slowclaw-decider-q6.gguf', 'rb') as f:
                       while chunk := f.read(1048576): h.update(chunk)
                   assert h.hexdigest() == manifest['sha256']
                   PY
-                  SLOWCLAW_KEV_GGUF=/tmp/kev-model/slowclaw-kev-q8.gguf bash ios-app/Tests/kev/native-smoke.sh
+                  SLOWCLAW_DECIDER_GGUF=/tmp/decider-model/slowclaw-decider-q6.gguf bash ios-app/Tests/decider/native-smoke.sh
 
             - name: Build Zig staticlib (iOS device)
               working-directory: zig-src

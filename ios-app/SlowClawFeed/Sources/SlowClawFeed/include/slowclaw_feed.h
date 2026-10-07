@@ -327,6 +327,10 @@ int32_t slowclaw_feed_local_llm_generate_title(
 );
 
 // Independent Kev judge; flattened probabilities are valid only for a positive count.
+void *slowclaw_feed_decider_open(const char *path, size_t path_len);
+void slowclaw_feed_decider_close(void *handle);
+int slowclaw_feed_decider_evaluate(void *handle, const char *request, size_t request_len, double *out, size_t capacity);
+
 void *slowclaw_feed_kev_open(const char *path, size_t path_len);
 void slowclaw_feed_kev_close(void *handle);
 int slowclaw_feed_kev_evaluate(void *handle, const char *request, size_t request_len, double *out, size_t capacity);

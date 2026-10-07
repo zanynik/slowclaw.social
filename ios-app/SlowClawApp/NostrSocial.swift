@@ -91,7 +91,7 @@ enum NostrSocialRules {
     }
 }
 
-/// Candidate sourcing only; the final relevance scores remain Needle + BM25.
+/// Candidate sourcing only; the final relevance scores remain Strands Decider.
 actor NostrDiscovery {
     static let shared = NostrDiscovery()
     static let sourcesKey = "slowclaw.pulse.sources.v1"

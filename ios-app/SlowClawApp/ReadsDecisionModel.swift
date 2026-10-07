@@ -1,15 +1,15 @@
 import Foundation
 import CryptoKit
 
-/// A separate Kev handle, used and closed only on OnDeviceAIExecutor.
+/// A separate Strands Decider handle, used and closed only on OnDeviceAIExecutor.
 final class ReadsDecisionModel: @unchecked Sendable {
     static let preset = LocalModelPreset(
-        id: "kev-0.5b-q8-v1", title: "Kev-0.5B",
+        id: "strands-decider-v21-q6", title: "Strands Decider",
         detail: "Local judge for Reads and journal selections · Apache 2.0",
-        fileName: "slowclaw-kev-q8.gguf",
-        downloadURL: URL(string: "https://github.com/zanynik/slowclaw.social/releases/download/kev-lite-model-v1/slowclaw-kev-q8.gguf")!,
-        sizeBytes: 532904896, sizeLabel: "533 MB")
-    static let digest = "4606b739bd5fae0c77c2dc978a8983a9cc1eccd476d97d02f2e1e154ea537686"
+        fileName: "slowclaw-decider-q6.gguf",
+        downloadURL: URL(string: "https://github.com/zanynik/slowclaw.social/releases/download/strands-decider-model-v21/slowclaw-decider-q6.gguf")!,
+        sizeBytes: 1560603488, sizeLabel: "1.56 GB")
+    static let digest = "87ab3efc8922c94da29349fa4ce0f1a5888b4b265a695fd35e8c371686d331c0"
     private var handle: UnsafeMutableRawPointer?
     init(path: String) throws {
         let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
@@ -17,10 +17,10 @@ final class ReadsDecisionModel: @unchecked Sendable {
         var hash = SHA256()
         while let chunk = try file.read(upToCount: 1_048_576), !chunk.isEmpty { hash.update(data: chunk) }
         guard hash.finalize().map({ String(format: "%02x", $0) }).joined() == Self.digest else {
-            throw PublishingError.message("Kev's download is incomplete or different. Remove it and download again.")
+            throw PublishingError.message("Strands Decider's download is incomplete or different. Remove it and download again.")
         }
-        handle = path.withCString { slowclaw_feed_kev_open($0, path.utf8.count) }
-        guard handle != nil else { throw PublishingError.message("Couldn't load Kev. Try again after closing other model work.") }
+        handle = path.withCString { slowclaw_feed_decider_open($0, path.utf8.count) }
+        guard handle != nil else { throw PublishingError.message("Couldn't load Strands Decider. Try again after closing other model work.") }
     }
     func evaluate(state: String, questions: [KevQuestion]) -> [[Double]]? {
         struct Request: Encodable { let state: String; let questions: [KevQuestion] }
@@ -30,7 +30,7 @@ final class ReadsDecisionModel: @unchecked Sendable {
               let json = String(data: data, encoding: .utf8) else { return nil }
         var values = [Double](repeating: -1, count: questions.reduce(0) { $0 + $1.options.count })
         let capacity = values.count
-        let count = json.withCString { slowclaw_feed_kev_evaluate(handle, $0, json.utf8.count, &values, capacity) }
+        let count = json.withCString { slowclaw_feed_decider_evaluate(handle, $0, json.utf8.count, &values, capacity) }
         guard count == capacity else { return nil }
         var offset = 0
         var result: [[Double]] = []
@@ -44,7 +44,7 @@ final class ReadsDecisionModel: @unchecked Sendable {
     func judge(memory: String, document: String) -> KevReadingJudgement? {
         evaluate(state: document, questions: KevReadingJudgement.questions(memory: memory)).flatMap(KevReadingJudgement.init)
     }
-    func close() { slowclaw_feed_kev_close(handle); handle = nil }
+    func close() { slowclaw_feed_decider_close(handle); handle = nil }
 }
 
 import SwiftUI
@@ -57,29 +57,29 @@ struct ReadsModelCard: View {
         let downloading = state.activeDownloadIDs.contains(preset.id)
         VStack(alignment: .leading, spacing: 8) {
             if showRemove || !state.readsModelInstalled || !state.readsModelEnabled {
-                Text("Kev-0.5B · Lite experiment").font(.headline)
+                Text("Strands Decider").font(.headline)
                 Text("Ranks reading and selects your own journal sentences, entirely on this device.")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("533 MB · Apache 2.0 · Experimental rankings")
+                Text("1.56 GB · Apache 2.0 · Local decision model")
                     .font(.caption2).foregroundStyle(.secondary)
             }
             if !state.readsModelInstalled {
                 if downloading {
                     ProgressView(value: state.localModelProgress[preset.id] ?? 0)
                 } else {
-                    Button("Download · 533 MB") { Task { await state.downloadReadsModel() } }
+                    Button("Download · 1.56 GB") { Task { await state.downloadReadsModel() } }
                         .buttonStyle(.bordered)
                 }
                 if let error = state.localModelError { Text(error).font(.caption) }
             } else if showRemove || !state.readsModelEnabled {
                 HStack {
                     if state.readsModelEnabled {
-                        Label("Kev active", systemImage: "checkmark.circle.fill")
+                        Label("Decider active", systemImage: "checkmark.circle.fill")
                             .font(.caption).foregroundStyle(.green)
                         Spacer()
                         Button("Deactivate") { state.deactivateReadsModel() }
                     } else {
-                        Button(state.readsModelActivating ? "Activating…" : "Activate Kev") {
+                        Button(state.readsModelActivating ? "Activating…" : "Activate Decider") {
                             Task { await state.activateReadsModel() }
                         }.buttonStyle(.bordered)
                             .disabled(state.readsModelActivating || state.readsDecisionBusy || state.kevJournalBusy)
@@ -96,7 +96,7 @@ struct ReadsModelCard: View {
                 }
             }
             if showRemove && state.readsModelInstalled {
-                Button("Remove Kev model", role: .destructive) { Task { await state.removeReadsModel() } }
+                Button("Remove Decider model", role: .destructive) { Task { await state.removeReadsModel() } }
                     .disabled(state.readsDecisionBusy || state.readsModelActivating || state.kevJournalBusy || downloading)
             }
         }.padding(.horizontal)

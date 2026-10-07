@@ -31,7 +31,7 @@ struct ContextExplorer: View {
                     if let status = state.kevJournalStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
                 }
                 Section("Related journals") {
-                    Button("Find connections with Kev") {
+                    Button("Find connections with Strands Decider") {
                         busy = true
                         Task {
                             related = await state.searchPersonalContext(current.text, excluding: journalKey)

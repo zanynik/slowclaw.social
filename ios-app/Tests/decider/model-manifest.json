@@ -1,0 +1,9 @@
+{
+  "file": "slowclaw-decider-q6.gguf",
+  "sha256": "87ab3efc8922c94da29349fa4ce0f1a5888b4b265a695fd35e8c371686d331c0",
+  "bytes": 1560603488,
+  "base_revision": "b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+  "adapter_revision": "2b52a6235c1b8306bbfa30b00b9d4b74b63a39f5",
+  "converter_revision": "8f4646a63ee29f2e0ab971b0290b141938769762",
+  "precision": "Q6_K"
+}

@@ -81,7 +81,7 @@ struct QuestionThreadView: View {
                             }.font(.caption)
                         }
                     }
-                    if related.isEmpty { Text("No checked journal matches yet. Activate Kev and retry when idle.").foregroundStyle(.secondary) }
+                    if related.isEmpty { Text("No checked journal matches yet. Activate Strands Decider and retry when idle.").foregroundStyle(.secondary) }
                 }
                 Section("Reading to explore") {
                     ForEach(evidence) { article in

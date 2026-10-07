@@ -1841,3 +1841,23 @@ test "Kev absent model abstains and clears outputs" {
     try std.testing.expectEqual(@as(f64, -1), out[0]);
     slowclaw_feed_kev_close(null);
 }
+
+// Additive ABI; each Decider handle is owned by the serial on-device executor.
+const strands_decider = @import("strands_decider.zig");
+pub export fn slowclaw_feed_decider_open(path: [*]const u8, path_len: usize) ?*anyopaque {
+    return strands_decider.load(path[0..path_len]) catch null;
+}
+pub export fn slowclaw_feed_decider_close(handle: ?*anyopaque) void {
+    strands_decider.free(handle);
+}
+pub export fn slowclaw_feed_decider_evaluate(handle: ?*anyopaque, request: [*]const u8, request_len: usize, out: [*]f64, capacity: usize) c_int {
+    if (capacity > 64) return -1;
+    @memset(out[0..capacity], -1);
+    return @intCast(strands_decider.evaluate(handle, request[0..request_len], out[0..capacity]) catch return -1);
+}
+test "Decider absent model abstains and clears outputs" {
+    var out = [_]f64{1} ** 2;
+    try std.testing.expectEqual(@as(c_int, -1), slowclaw_feed_decider_evaluate(null, "{}", 2, &out, out.len));
+    try std.testing.expectEqual(@as(f64, -1), out[0]);
+    slowclaw_feed_decider_close(null);
+}

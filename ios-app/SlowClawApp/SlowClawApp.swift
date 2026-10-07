@@ -544,18 +544,12 @@ final class AppState: ObservableObject {
         let revision = memoryRevision
         do {
             let texts = candidates.map { JevBatch.excerpt(title: "", body: $0.description) }
-            var topicVectors: [[Float]] = [], postVectors: [[Float]] = []
-            for topic in interests {
-                try checkPulseWork()
-                topicVectors.append(try await PulseRanking.shared.embedding(topic.topic))
+            guard readsModelInstalled, readsModelEnabled else {
+                throw PublishingError.message("Download and activate Strands Decider in Advanced settings to organize Pulse.")
             }
-            for text in texts {
-                try checkPulseWork()
-                postVectors.append(try await PulseRanking.shared.embedding(text))
-            }
-            try checkPulseWork()
-            let scores = try await PulseRanking.shared.rank(texts: texts, interests: interests,
-                topicVectors: topicVectors, postVectors: postVectors)
+            let modelPath = try LocalModelStore.fileURL(for: ReadsDecisionModel.preset).path
+            let scores = try await PulseRanking.shared.rank(texts: texts, interests: interests, modelPath: modelPath,
+                shouldContinue: { await MainActor.run { self.readsModelEnabled && !self.contextWorkPaused && !self.localModelBusy && !self.isGeneratingPosts } })
             try checkPulseWork()
             guard revision == memoryRevision, profile == JevBatch.profileID(JevBatch.profile(personaWeights)) else { return }
             // Ignore results for candidates replaced while native work was running.
@@ -604,7 +598,7 @@ final class AppState: ObservableObject {
     @Published var readsDecisionStatus: String? = nil
     @Published private var readsDecisions: [String: ReadsRelevance.Decision] = [:]
     @Published var readsDecisionBusy = false
-    @Published private(set) var readsModelEnabled = UserDefaults.standard.bool(forKey: "slowclaw.kev.enabled.v1")
+    @Published private(set) var readsModelEnabled = UserDefaults.standard.bool(forKey: "slowclaw.decider.enabled.v21")
     @Published private(set) var readsModelActivating = false
 
     func activateReadsModel() async {
@@ -623,7 +617,7 @@ final class AppState: ObservableObject {
             }
             if jevEnabled { disableJev() }
             readsModelEnabled = true
-            UserDefaults.standard.set(true, forKey: "slowclaw.kev.enabled.v1")
+            UserDefaults.standard.set(true, forKey: "slowclaw.decider.enabled.v21")
             readsDecisionStatus = nil
         } catch { readsDecisionStatus = error.localizedDescription }
         readsModelActivating = false
@@ -632,11 +626,11 @@ final class AppState: ObservableObject {
 
     func deactivateReadsModel() {
         readsModelEnabled = false
-        UserDefaults.standard.set(false, forKey: "slowclaw.kev.enabled.v1")
+        UserDefaults.standard.set(false, forKey: "slowclaw.decider.enabled.v21")
         readsDecisions = [:]
         kevJournalSelections = [:]
         kevReadDetails = [:]
-        readsDecisionStatus = "Activate Kev to rank your Reads."
+        readsDecisionStatus = "Activate Strands Decider to rank your Reads."
     }
 
     var readsDecisionRevision: Int { memoryRevision }
@@ -760,7 +754,7 @@ final class AppState: ObservableObject {
             let quote = jevReadSources[item.id] ?? "your interests"
             return "Interest match \(Int(decision.score * 100)) · \(quote)"
         }
-        guard let detail = kevReadDetails[item.id] else { return "Awaiting Kev" }
+        guard let detail = kevReadDetails[item.id] else { return "Awaiting Strands Decider" }
         return "Relevance \(Int(detail.relevance * 100)) · \(detail.topic) · \(detail.priority) priority"
     }
     @Published var readingSignals = ReadingHistory.load()
@@ -5261,9 +5255,9 @@ extension AppState {
     }
     func selectKevJournal(_ entry: SlowClawMemoryEntry) async {
         if jevEnabled { await selectJevJournal(entry); return }
-        guard readsModelEnabled, readsModelInstalled else { kevJournalStatus = "Download and activate Kev in Settings first."; return }
+        guard readsModelEnabled, readsModelInstalled else { kevJournalStatus = "Download and activate Strands Decider in Settings first."; return }
         guard !kevJournalBusy, !readsDecisionBusy, !readsModelActivating, !contextWorkPaused, !localModelBusy, !isGeneratingPosts else {
-            kevJournalStatus = "Kev will be available when current work finishes. Tap again to retry."; return
+            kevJournalStatus = "Strands Decider will be available when current work finishes. Tap again to retry."; return
         }
         guard !excludedMemoryKeys.contains(entry.key), memorySource(entry.key)?.content == entry.content else { return }
         let source = journalBodyOf(entry.content)
@@ -5284,7 +5278,7 @@ extension AppState {
                   !excludedMemoryKeys.contains(entry.key), memorySource(entry.key)?.content == entry.content else {
                 kevJournalStatus = "The journal changed. Tap again for a fresh selection."; return
             }
-            guard let answers, answers.count == 3 else { kevJournalStatus = "Kev couldn't check this journal. Its text is unchanged."; return }
+            guard let answers, answers.count == 3 else { kevJournalStatus = "Strands Decider couldn't check this journal. Its text is unchanged."; return }
             let highlight = KevLite.selected(answers[0], sentences: sentences, source: source)
             let question = KevLite.selected(answers[1], sentences: sentences, source: source)
             let publicSentence = KevLite.selected(answers[2], sentences: sentences, source: source)
