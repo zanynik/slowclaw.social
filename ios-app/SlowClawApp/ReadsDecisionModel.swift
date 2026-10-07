@@ -82,7 +82,7 @@ struct ReadsModelCard: View {
                         Button(state.readsModelActivating ? "Activating…" : "Activate Decider") {
                             Task { await state.activateReadsModel() }
                         }.buttonStyle(.bordered)
-                            .disabled(state.readsModelActivating || state.readsDecisionBusy || state.kevJournalBusy)
+                            .disabled(state.pulseRankingBusy || state.readsModelActivating || state.readsDecisionBusy || state.kevJournalBusy)
                     }
                 }
             }
@@ -97,7 +97,7 @@ struct ReadsModelCard: View {
             }
             if showRemove && state.readsModelInstalled {
                 Button("Remove Decider model", role: .destructive) { Task { await state.removeReadsModel() } }
-                    .disabled(state.readsDecisionBusy || state.readsModelActivating || state.kevJournalBusy || downloading)
+                    .disabled(state.pulseRankingBusy || state.readsDecisionBusy || state.readsModelActivating || state.kevJournalBusy || downloading)
             }
         }.padding(.horizontal)
     }

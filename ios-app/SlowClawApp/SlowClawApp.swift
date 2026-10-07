@@ -514,7 +514,8 @@ final class AppState: ObservableObject {
     private var pulseRankedKey = ""
 
     func startPulseRanking() {
-        guard !pulseRankingBusy, !contextWorkPaused, !localModelBusy, !isGeneratingPosts else { return }
+        guard !pulseRankingBusy, !readsDecisionBusy, !readsModelActivating, !kevJournalBusy,
+              !contextWorkPaused, !localModelBusy, !isGeneratingPosts else { return }
         pulseRankingBusy = true
         Task {
             defer { pulseRankingBusy = false }
@@ -602,7 +603,7 @@ final class AppState: ObservableObject {
     @Published private(set) var readsModelActivating = false
 
     func activateReadsModel() async {
-        guard readsModelInstalled, !readsModelActivating, !readsDecisionBusy, !kevJournalBusy else { return }
+        guard readsModelInstalled, !pulseRankingBusy, !readsModelActivating, !readsDecisionBusy, !kevJournalBusy else { return }
         guard !contextWorkPaused, !localModelBusy, !isGeneratingPosts else {
             readsDecisionStatus = "Activate when recording or writing finishes."
             return
@@ -642,7 +643,7 @@ final class AppState: ObservableObject {
     }
 
     func removeReadsModel() async {
-        guard !readsDecisionBusy, !readsModelActivating, !kevJournalBusy, !activeDownloadIDs.contains(ReadsDecisionModel.preset.id) else { return }
+        guard !pulseRankingBusy, !readsDecisionBusy, !readsModelActivating, !kevJournalBusy, !activeDownloadIDs.contains(ReadsDecisionModel.preset.id) else { return }
         do {
             try LocalModelStore.delete(ReadsDecisionModel.preset)
             deactivateReadsModel()
@@ -656,7 +657,7 @@ final class AppState: ObservableObject {
     /// admission. Pauses, missing context, missing models and errors abstain.
     func refreshReadsDecisions() async {
         restoreCachedReadsDecisions()
-        startPulseRanking()
+        defer { startPulseRanking() }
         if jevEnabled {
             guard jevReadingTask == nil else { return }
             let task = Task { await rankJevReads() }
@@ -665,7 +666,7 @@ final class AppState: ObservableObject {
             jevReadingTask = nil
             return
         }
-        guard !readsDecisionBusy, !readsModelActivating, !kevJournalBusy else { return }
+        guard !pulseRankingBusy, !readsDecisionBusy, !readsModelActivating, !kevJournalBusy else { return }
         guard readsModelInstalled else {
             readsDecisions = [:]
             readsDecisionStatus = "Download the relevance model to select your Reads."
@@ -5256,7 +5257,7 @@ extension AppState {
     func selectKevJournal(_ entry: SlowClawMemoryEntry) async {
         if jevEnabled { await selectJevJournal(entry); return }
         guard readsModelEnabled, readsModelInstalled else { kevJournalStatus = "Download and activate Strands Decider in Settings first."; return }
-        guard !kevJournalBusy, !readsDecisionBusy, !readsModelActivating, !contextWorkPaused, !localModelBusy, !isGeneratingPosts else {
+        guard !pulseRankingBusy, !kevJournalBusy, !readsDecisionBusy, !readsModelActivating, !contextWorkPaused, !localModelBusy, !isGeneratingPosts else {
             kevJournalStatus = "Strands Decider will be available when current work finishes. Tap again to retry."; return
         }
         guard !excludedMemoryKeys.contains(entry.key), memorySource(entry.key)?.content == entry.content else { return }
@@ -5339,7 +5340,7 @@ extension AppState {
     }
     private func rankKevContext(_ query: String, documents: [ContextDocument]) async -> [(String, Double)] {
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              readsModelEnabled, !kevJournalBusy, !readsDecisionBusy, !readsModelActivating,
+              readsModelEnabled, !pulseRankingBusy, !kevJournalBusy, !readsDecisionBusy, !readsModelActivating,
               !contextWorkPaused, !localModelBusy, !isGeneratingPosts else { return [] }
         kevJournalBusy = true
         defer { kevJournalBusy = false }
