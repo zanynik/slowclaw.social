@@ -138,6 +138,11 @@ struct ProfileView: View {
                         Label("SlowClaw Web", systemImage: "qrcode.viewfinder")
                     }
                 }
+                Section("Your thoughts") {
+                    NavigationLink { JournalUnitsView() } label: {
+                        Label("Grouped thoughts", systemImage: "square.grid.2x2")
+                    }
+                }
                 Section("What's on your mind") {
                     let topics = Array(state.personaTopics.prefix(8))
                     let trends = state.personaTrends

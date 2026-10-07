@@ -433,6 +433,10 @@ final class AppState: ObservableObject {
     @Published var jevConnecting = false
     @Published var jevProblem: String?
     @Published private var jevCache = JevMemory.Cache.load()
+    @Published private var journalUnitCache = JournalUnits.Cache.load()
+    @Published private var groupedJournalUnits: [JournalUnits.Group] = []
+    private var journalGroupingTask: Task<[JournalUnits.Group], Never>?
+    private var journalGroupingGeneration = 0
     @Published private var personaCache = JevPersona.Cache.load()
     @Published private var jevFeedCache = JevFeeds.Cache.load()
     @Published var jevFeedsBusy = false
@@ -1366,6 +1370,7 @@ final class AppState: ObservableObject {
                 QuestionThread.isJournalRecord(key: $0.key, category: $0.category, sessionID: $0.sessionID)
                     && !deletedKeys.contains($0.key)
             }
+            pruneJournalUnits()
             drafts = try memory.list(sessionID: "drafts")
             // The index can now span years. Yield between small validation
             // batches so a refresh doesn't monopolize the UI. Read and remove
@@ -1397,6 +1402,7 @@ final class AppState: ObservableObject {
             drafts = []
         }
         pruneJevMemory()
+        refreshJournalUnitGroups()
         scheduleInterestIndexing()
     }
 
@@ -1607,6 +1613,7 @@ final class AppState: ObservableObject {
 
     func includeInMemory(_ key: String) {
         excludedMemoryKeys.remove(key)
+        refreshJournalUnitGroups()
         UserDefaults.standard.set(excludedMemoryKeys.sorted(), forKey: "slowclaw.memory.excluded")
         rebuildInterestLens()
         Task { await refreshReadsDecisions() }
@@ -5644,6 +5651,59 @@ extension AppState {
         guard !excludedMemoryKeys.contains(key), let entry = memorySource(key),
               QuestionThread.isJournalRecord(key: entry.key, category: entry.category, sessionID: entry.sessionID) else { return nil }
         return entry
+    }
+    var journalUnits: [JournalUnits.Unit] {
+        journals.filter { !excludedMemoryKeys.contains($0.key) && Self.softDeletedKeys()[$0.key] == nil }.flatMap { entry -> [JournalUnits.Unit] in
+            guard let record = journalUnitCache.records[entry.key], record.model == JournalUnits.model,
+                  record.revision == WebSessionProtocol.digest(Data(entry.content.utf8)) else { return [] }
+            return record.units.filter { !journalUnitCache.dismissed.contains($0.id) }
+        }
+    }
+    var journalUnitGroups: [JournalUnits.Group] {
+        let visible = Set(journalUnits.map(\.id))
+        return groupedJournalUnits.compactMap { group in
+            let units = group.units.filter { visible.contains($0.id) }
+            return units.isEmpty ? nil : JournalUnits.Group(id: group.id, units: units)
+        }
+    }
+    private func pruneJournalUnits() {
+        let current = Dictionary(journals.map { ($0.key, WebSessionProtocol.digest(Data($0.content.utf8))) }, uniquingKeysWith: { first, _ in first })
+        var next = journalUnitCache
+        next.records = next.records.filter { key, record in
+            !excludedMemoryKeys.contains(key) && current[key] == record.revision
+        }
+        guard next.records.count != journalUnitCache.records.count else { return }
+        do { try next.save(); journalUnitCache = next }
+        catch { jevStatus = "Could not update grouped thoughts. Please retry." }
+    }
+    private func refreshJournalUnitGroups() {
+        journalGroupingGeneration += 1
+        let generation = journalGroupingGeneration, units = journalUnits
+        journalGroupingTask?.cancel()
+        let work = Task.detached(priority: .utility) { JournalUnits.groups(units) }
+        journalGroupingTask = work
+        Task {
+            let groups = await work.value
+            guard generation == journalGroupingGeneration else { return }
+            groupedJournalUnits = groups; journalGroupingTask = nil
+        }
+    }
+    var journalUnitRevisions: [String: String] {
+        Dictionary(uniqueKeysWithValues: journals.compactMap { entry -> (String, String)? in
+            guard !excludedMemoryKeys.contains(entry.key), let record = journalUnitCache.records[entry.key],
+                  record.model == JournalUnits.model,
+                  record.revision == WebSessionProtocol.digest(Data(entry.content.utf8)) else { return nil }
+            return (entry.key, record.revision)
+        })
+    }
+    func saveJournalUnits(_ record: JournalUnits.Record, key: String) throws {
+        var next = journalUnitCache; next.records[key] = record
+        try next.save(); journalUnitCache = next; refreshJournalUnitGroups()
+    }
+    func dismissJournalUnit(_ id: String) {
+        var next = journalUnitCache; next.dismissed.insert(id)
+        do { try next.save(); journalUnitCache = next; refreshJournalUnitGroups() }
+        catch { jevStatus = "Could not save this change. Please retry." }
     }
     var jevPassages: [JevMemory.Passage] {
         jevCache.records.flatMap { key, record -> [JevMemory.Passage] in

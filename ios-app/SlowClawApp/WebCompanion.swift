@@ -152,13 +152,19 @@ final class WebCompanion: ObservableObject {
             return ["id": event.id, "text": String(event.content.prefix(2000)), "author": NostrSocialStore.shared.profiles[event.pubkey].flatMap(NostrProfile.init)?.displayName ?? String(event.pubkey.prefix(12)),
                     "date": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: Double(event.created_at))), "url": "https://njump.me/" + event.id]
         }
+        var unitGroups: [[String: Any]] = state.journalUnitGroups.prefix(100).map { group in
+            ["id": group.id, "title": group.title, "units": group.units.prefix(30).map {
+                ["id": $0.id, "sourceKey": $0.sourceKey, "text": $0.text]
+            }]
+        }
         // Only text and an encrypted history index; never audio originals or Nostr secrets.
         func encode() throws -> Data {
-            try JSONSerialization.data(withJSONObject: ["journals": journals, "index": index, "editorVersion": 1, "creations": creations, "pulse": pulse], options: [.sortedKeys, .withoutEscapingSlashes])
+            try JSONSerialization.data(withJSONObject: ["journals": journals, "index": index, "editorVersion": 1, "unitsVersion": 1, "unitRevisions": state.journalUnitRevisions, "unitGroups": unitGroups, "creations": creations, "pulse": pulse], options: [.sortedKeys, .withoutEscapingSlashes])
         }
         var encoded = try encode()
         while encoded.count > 1_200_000 {
-            if !journals.isEmpty { journals.removeLast() }
+            if !unitGroups.isEmpty { unitGroups.removeLast() }
+            else if !journals.isEmpty { journals.removeLast() }
             else if !creations.isEmpty { creations.removeLast() }
             else if !pulse.isEmpty { pulse.removeLast() }
             else if !index.isEmpty { index.removeLast() }
@@ -184,7 +190,12 @@ final class WebCompanion: ObservableObject {
             throw PublishingError.message("Invalid journal operation.")
         }
         let context = session.id + "/note/" + edit.id
-        let operation = try JSONDecoder().decode(WebJournalEdit.self, from: WebSessionProtocol.open(sealed, key: session.key, context: context))
+        let plaintext = try WebSessionProtocol.open(sealed, key: session.key, context: context)
+        if (try? JSONSerialization.jsonObject(with: plaintext) as? [String: Any])?["kind"] as? String == "units" {
+            try await receiveUnits(plaintext, edit: edit, session: session, state: state, context: context)
+            return
+        }
+        let operation = try JSONDecoder().decode(WebJournalEdit.self, from: plaintext)
         try operation.validate()
         let existing = try state.memory.get(key: operation.key)
         let available = state.journals.contains { $0.key == operation.key } && !state.excludedMemoryKeys.contains(operation.key)
@@ -209,6 +220,27 @@ final class WebCompanion: ObservableObject {
         } else { result["error"] = "This entry is unavailable or excluded on your phone." }
         let response = try WebSessionProtocol.seal(JSONSerialization.data(withJSONObject: result), key: session.key, context: context + "/result")
         let body = try JSONSerialization.data(withJSONObject: ["status": outcome, "result": response.base64EncodedString()])
+        _ = try await request(session, path: "/note/" + edit.id, method: "POST", body: body)
+    }
+    private func receiveUnits(_ plaintext: Data, edit: Edit, session: Session, state: AppState, context: String) async throws {
+        var status = "rejected"
+        var result: [String: Any] = [:]
+        do {
+            let operation = try JSONDecoder().decode(JournalUnits.Submission.self, from: plaintext)
+            guard let entry = try state.memory.get(key: operation.key),
+                  state.journals.contains(where: { $0.key == entry.key }),
+                  !state.excludedMemoryKeys.contains(entry.key), AppState.softDeletedKeys()[entry.key] == nil else {
+                throw PublishingError.message("This entry is unavailable on your phone.")
+            }
+            guard operation.base == WebSessionProtocol.digest(Data(entry.content.utf8)) else {
+                throw PublishingError.message("This journal changed. Organize its current version again.")
+            }
+            let record = try operation.record(source: journalPayload(entry)["text"] ?? "")
+            try state.saveJournalUnits(record, key: entry.key)
+            status = "saved"; result = ["key": entry.key, "revision": record.revision]
+        } catch { result["error"] = error.localizedDescription }
+        let response = try WebSessionProtocol.seal(JSONSerialization.data(withJSONObject: result), key: session.key, context: context + "/result")
+        let body = try JSONSerialization.data(withJSONObject: ["status": status, "result": response.base64EncodedString()])
         _ = try await request(session, path: "/note/" + edit.id, method: "POST", body: body)
     }
     private func receive(_ transfer: Transfer, session: Session, state: AppState) async throws {
