@@ -52,6 +52,12 @@ def main():
     class DeciderModel(Qwen3_5TextModel):
         model_arch = gguf.MODEL_ARCH.QWEN35
         no_mtp = True
+        def modify_tensors(self, data, name, bid):
+            # FP32 vector exp differs by one ULP between CPU kernels. Evaluate
+            # SSM exponentials in FP64, then round once to the stored FP32.
+            ssm=name.endswith('.A_log')
+            for tensor_name,value in super().modify_tensors(data.double() if ssm else data,name,bid):
+                yield tensor_name,value.float() if ssm else value
         def set_gguf_parameters(self):
             super().set_gguf_parameters()
             self.gguf_writer.add_string('slowclaw.decider.version','strands-decider-v21')

@@ -213,5 +213,7 @@
       0.331245251,
       0.139316899
     ]
-  ]
+  ],
+  "artifact_sha256": "a0549f7dc2cc31badd145ccf7a5677f5ce99e5dd54804d7bb7656200b9375afc",
+  "conversion_stage": "Before FP64 SSM exponential rounding; canonical constant and score checks are recorded separately."
 }
