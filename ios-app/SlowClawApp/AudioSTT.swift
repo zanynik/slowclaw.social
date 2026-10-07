@@ -39,6 +39,15 @@ enum AudioSTT {
             failure.set(detail)
             progress?(detail)
         }
+        // The analyzer saved word times for a successful m4a transcription.
+        // Compact the file before the journal is updated, including imported
+        // recordings and recordings that needed the offline retry path.
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           url.pathExtension.lowercased() == "m4a",
+           let timing = TimedTranscriptStore.load(for: url) {
+            do { _ = try await RecordingSilence.trim(url, timing: timing) }
+            catch { progress?("Transcript saved; quiet gaps could not be removed.") }
+        }
         let result = AudioSTTResult(
             text: text,
             engine: .appleSpeech,
