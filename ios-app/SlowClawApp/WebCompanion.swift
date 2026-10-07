@@ -168,11 +168,13 @@ final class WebCompanion: ObservableObject {
         return encoded
     }
     private func journalPayload(_ entry: SlowClawMemoryEntry) -> [String: String] {
-        // Keep the exact separator in the editable text for lossless round trips.
         let lines = entry.content.components(separatedBy: "\n")
         var body = lines.dropFirst().joined(separator: "\n")
         if body.hasPrefix("\n") { body.removeFirst() }
-        return ["id": entry.key, "title": lines.first ?? "Journal", "text": body,
+        // The phone keeps the canonical journal; the browser receives a
+        // readable projection for audio transcripts and may edit that text.
+        let displayBody = entry.mediaURL == nil ? body : TranscriptCleanup.clean(body)
+        return ["id": entry.key, "title": lines.first ?? "Journal", "text": displayBody,
                 "revision": WebSessionProtocol.digest(Data(entry.content.utf8)),
                 "date": ISO8601DateFormatter().string(from: journalDate(entry) ?? Date()),
                 "kind": entry.mediaURL == nil ? "JOURNAL" : "TRANSCRIPT"]
