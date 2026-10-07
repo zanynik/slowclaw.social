@@ -64,4 +64,9 @@ def main():
         while chunk:=f.read(1048576):h.update(chunk)
     manifest={'file':a.output.name,'sha256':h.hexdigest(),'bytes':a.output.stat().st_size,'base_revision':BASE,'adapter_revision':ADAPTER,'converter_revision':CONVERTER,'precision':a.precision}
     a.output.with_suffix('.json').write_text(json.dumps(manifest,indent=2)+'\n');print(json.dumps(manifest),flush=True)
+    # Public model digests identify metadata versus numerical conversion drift.
+    reader=gguf.GGUFReader(a.output)
+    fingerprints={'fields':{name:hashlib.sha256(b''.join(part.tobytes() for part in field.parts)).hexdigest() for name,field in reader.fields.items()},
+                  'tensors':{tensor.name:hashlib.sha256(tensor.data.tobytes()).hexdigest() for tensor in reader.tensors}}
+    print('GGUF_FINGERPRINTS '+json.dumps(fingerprints,sort_keys=True),flush=True)
 if __name__=='__main__':main()

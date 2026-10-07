@@ -5,5 +5,6 @@
   "base_revision": "b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
   "adapter_revision": "2b52a6235c1b8306bbfa30b00b9d4b74b63a39f5",
   "converter_revision": "8f4646a63ee29f2e0ab971b0290b141938769762",
-  "precision": "Q6_K"
+  "precision": "Q6_K",
+  "f16_sha256": "bcae06f7541d86763ef2f7cd97a249c06973fa530fb829be2774f2b5a469a210"
 }

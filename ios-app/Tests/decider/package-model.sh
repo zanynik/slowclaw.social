@@ -14,6 +14,11 @@ else
     git clone --depth 1 --branch b10201 https://github.com/ggml-org/llama.cpp.git "$DECIDER_RELEASE_DIR/converter"
     HF_HUB_DISABLE_XET=1 python3 ios-app/Tests/decider/export.py --converter "$DECIDER_RELEASE_DIR/converter" \
         --work "$DECIDER_RELEASE_DIR/merged" --output "$DECIDER_RELEASE_DIR/decider-f16.gguf" --precision f16
+    python3 - "$DECIDER_RELEASE_DIR/decider-f16.json" <<'PY'
+import json,sys
+expected=json.load(open('ios-app/Tests/decider/model-manifest.json'))['f16_sha256']
+assert json.load(open(sys.argv[1]))['sha256']==expected, 'Intermediate conversion differs; inspect GGUF_FINGERPRINTS before quantizing.'
+PY
     cmake -S "$DECIDER_RELEASE_DIR/converter" -B "$DECIDER_RELEASE_DIR/build" \
         -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
     cmake --build "$DECIDER_RELEASE_DIR/build" --target llama-quantize -j2
