@@ -7,9 +7,28 @@ from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForCausalLM
 from safetensors.torch import load_file
 from peft import PeftModel
+from peft.tuners.lora.layer import Linear
 BASE = 'b1485b2fa6dfa1287294f269f5fb618e03d52d7c'
 ADAPTER = '2b52a6235c1b8306bbfa30b00b9d4b74b63a39f5'
 CONVERTER = '8f4646a63ee29f2e0ab971b0290b141938769762'
+def merge_portably(torso, run):
+    """Fixed-order FP64 rank sums, then one BF16 rounding across CPU types."""
+    adapted = PeftModel.from_pretrained(torso, run/'lora')
+    with torch.no_grad():
+        for layer in adapted.modules():
+            if not isinstance(layer, Linear): continue
+            assert not layer.fan_in_fan_out and not layer.lora_variant
+            assert list(layer.lora_A)==['default'] and not layer.lora_bias['default']
+            a=layer.lora_A['default'].weight.double();b=layer.lora_B['default'].weight.double()
+            weight=layer.get_base_layer().weight
+            delta=torch.zeros(weight.shape,dtype=torch.float64)
+            for rank in range(a.shape[0]):
+                delta.add_(b[:,rank:rank+1]*a[rank:rank+1,:])
+            delta.mul_(layer.scaling['default'])
+            merged=(weight.double()+delta).to(weight.dtype)
+            assert torch.isfinite(merged).all()
+            weight.copy_(merged);layer.merged_adapters.append('default')
+    return adapted.unload()
 def main():
     p=argparse.ArgumentParser();p.add_argument('--converter',type=Path,required=True);p.add_argument('--work',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--precision',choices=['q8','f16'],default='q8');p.add_argument('--reuse-merged',action='store_true');a=p.parse_args()
     assert subprocess.check_output(['git','-C',str(a.converter),'rev-parse','HEAD'],text=True).strip()==CONVERTER
@@ -24,7 +43,7 @@ def main():
     if not a.reuse_merged:
         cfg=AutoConfig.from_pretrained(config['base_model'],revision=BASE).get_text_config()
         model=Qwen3_5ForCausalLM.from_pretrained(config['base_model'],revision=BASE,config=cfg,dtype=torch.bfloat16)
-        model.model=PeftModel.from_pretrained(model.model,run/'lora').merge_and_unload()
+        model.model=merge_portably(model.model,run)
         a.work.mkdir(parents=True,exist_ok=True);model.save_pretrained(a.work,safe_serialization=True)
         AutoTokenizer.from_pretrained(run).save_pretrained(a.work);del model
     sys.path.insert(0,str(a.converter));sys.path.insert(0,str(a.converter/'gguf-py'))

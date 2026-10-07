@@ -25,6 +25,7 @@ import hashlib,json,sys
 manifest=json.load(open('ios-app/Tests/decider/model-manifest.json'));h=hashlib.sha256()
 with open(sys.argv[1],'rb') as f:
     while chunk:=f.read(1048576):h.update(chunk)
+print(json.dumps({'artifact_sha256': h.hexdigest()}), flush=True)
 assert h.hexdigest()==manifest['sha256'], 'Artifact differs from the validated model; do not publish.'
 PY
 if ! gh release view "$DECIDER_TAG" >/dev/null 2>&1; then

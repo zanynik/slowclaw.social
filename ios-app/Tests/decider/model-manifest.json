@@ -1,6 +1,6 @@
 {
   "file": "slowclaw-decider-q6.gguf",
-  "sha256": "87ab3efc8922c94da29349fa4ce0f1a5888b4b265a695fd35e8c371686d331c0",
+  "sha256": "a0549f7dc2cc31badd145ccf7a5677f5ce99e5dd54804d7bb7656200b9375afc",
   "bytes": 1560603488,
   "base_revision": "b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
   "adapter_revision": "2b52a6235c1b8306bbfa30b00b9d4b74b63a39f5",

@@ -9,7 +9,7 @@ final class ReadsDecisionModel: @unchecked Sendable {
         fileName: "slowclaw-decider-q6.gguf",
         downloadURL: URL(string: "https://github.com/zanynik/slowclaw.social/releases/download/strands-decider-model-v21/slowclaw-decider-q6.gguf")!,
         sizeBytes: 1560603488, sizeLabel: "1.56 GB")
-    static let digest = "87ab3efc8922c94da29349fa4ce0f1a5888b4b265a695fd35e8c371686d331c0"
+    static let digest = "a0549f7dc2cc31badd145ccf7a5677f5ce99e5dd54804d7bb7656200b9375afc"
     private var handle: UnsafeMutableRawPointer?
     init(path: String) throws {
         let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
