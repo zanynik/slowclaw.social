@@ -17,6 +17,7 @@ cp "$APP_ROOT/SlowClawApp/WebSessionProtocol.swift" "$TEST_ROOT/Sources/Runtime/
 cp "$APP_ROOT/Tests/WebSessionTests.swift" "$TEST_ROOT/Tests/RuntimeTests/"
 cp "$APP_ROOT/SlowClawApp/CreateIdeas.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/TimedTranscript.swift" "$TEST_ROOT/Sources/Runtime/"
+cp "$APP_ROOT/SlowClawApp/RecordingSilence.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/JevMemory.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/JevBatch.swift" "$TEST_ROOT/Sources/Runtime/"
 cp "$APP_ROOT/SlowClawApp/PulseSnapshot.swift" "$TEST_ROOT/Sources/Runtime/"
