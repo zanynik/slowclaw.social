@@ -331,6 +331,18 @@ final class AudioRecorder: NSObject, ObservableObject {
             transcript = ""
         }
 
+        if transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let url = recordedFileURL,
+           await Task.detached(priority: .utility, operation: {
+               RecordingSilence.isClearlySilent(url)
+           }).value {
+            // No intelligible speech and no audible signal: skip the empty
+            // journal and remove the recording before the view auto-saves it.
+            try? FileManager.default.removeItem(at: url)
+            TimedTranscriptStore.remove(for: url)
+            recordedFileURL = nil
+        }
+
         isFinalizing = false
         isRecording = false
         isPaused = false
