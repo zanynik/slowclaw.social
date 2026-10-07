@@ -24,6 +24,7 @@ The GGUF is Q6_K, about 1.56 GB; the model's SHA-256 is verified before loading.
 
 - Web: source-excerpt and vector tests, autosave/receipt tests, paired-session security tests, TypeScript, production build, real EmbeddingGemma 2 WASM inference.
 - Native: Zig unit/FFI tests, full host archive build, actual Q6 model/reference comparison, independent-question isolation, repeatability and malformed/context-limit rejection.
+- Final canonical Q6 host validation: maximum reference score drift 0.0407, 59/60 choices, packed/separate questions and repeats identical, invalid-input abstention, and Unicode choices pass. Full evidence is in `decider-native-validation.json`.
 - Canonical export: all metadata and 320 F16 tensors match CI. Compared with the earlier local export, only two SSM values change by one FP32 ULP; 10/10 focused classification choices are preserved (maximum reference score drift 0.0269). The existing release job runs the full native comparison before app upload.
 - Prior portable Q6 comparison: maximum score drift 0.0378, 59/60 reference winners, packed/separate questions and repeats identical. Q4 was rejected at 0.1229 maximum drift.
 - Swift/iOS: source tests and full device build in the existing TestFlight workflow; Linux cannot execute Apple's SwiftUI/AVFoundation UI.
