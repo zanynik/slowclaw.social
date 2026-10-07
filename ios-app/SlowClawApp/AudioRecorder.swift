@@ -318,6 +318,11 @@ final class AudioRecorder: NSObject, ObservableObject {
             transcript = completed
             if shared.timingReliable, let timing = session?.timedTranscript(), let url = recordedFileURL {
                 try? TimedTranscriptStore.save(timing, for: url)
+                do {
+                    _ = try await RecordingSilence.trim(url, timing: timing)
+                } catch {
+                    errorMessage = "Recording saved, but quiet gaps could not be removed."
+                }
             }
         } else if session != nil {
             // A failed/undrained live session cannot vouch for a partial

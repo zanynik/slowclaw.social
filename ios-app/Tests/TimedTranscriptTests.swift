@@ -46,4 +46,23 @@ final class TimedTranscriptTests: XCTestCase {
         try FileManager.default.setAttributes([.modificationDate: stamp.modified.addingTimeInterval(1)], ofItemAtPath: audio.path)
         XCTAssertNil(TimedTranscriptStore.load(for: audio), "Same-size replacements also invalidate timings.")
     }
+    func testSilencePlanRemovesLongGapsAndKeepsWordTimes() {
+        let timing = TimedTranscript(text: "first second third", words: [
+            .init(text: "first", start: 2, end: 2.4),
+            .init(text: "second", start: 3, end: 3.3),
+            .init(text: "third", start: 13, end: 13.5)
+        ])
+        let plan = RecordingSilencePlan.make(timing, duration: 18)!
+        XCTAssertEqual(plan.segments.count, 2)
+        XCTAssertEqual(plan.segments[0].start, 1.75, accuracy: 0.001)
+        XCTAssertEqual(plan.transcript.words[0].start, 0.25, accuracy: 0.001)
+        XCTAssertEqual(plan.transcript.words[2].start,
+                       plan.segments[0].duration + 0.25, accuracy: 0.001)
+        XCTAssertNotNil(plan.transcript.matchingWords("third"))
+        XCTAssertNil(RecordingSilencePlan.make(timing, duration: 3))
+        XCTAssertNil(RecordingSilencePlan.make(
+            TimedTranscript(text: "brief", words: [.init(text: "brief", start: 0.5, end: 1)]),
+            duration: 2))
+    }
+
 }
