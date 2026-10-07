@@ -34,6 +34,9 @@ enum AppTab { case drafts, journal }
     var excludedMemoryKeys: Set<String> = []
     var createIdeas: [CreateIdeas.Candidate] = []
     var relevantPulse: [RankedFeedItem] = []
+    var journalUnitGroups: [JournalUnits.Group] { [] }
+    var journalUnitRevisions: [String: String] { [:] }
+    func saveJournalUnits(_ record: JournalUnits.Record, key: String) throws {}
     static let transcribingPlaceholder = "Transcribing…"
     static func needsTranscript(_ content: String?) -> Bool { content == nil }
     func refreshJournals() async {}
