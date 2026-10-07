@@ -50,6 +50,26 @@ struct RecordingSilencePlan {
 
 @MainActor
 enum RecordingSilence {
+    /// Only discard a no-transcript recording when its decoded PCM is near
+    /// digital silence. Recognition failure with audible audio must be retried.
+    nonisolated static func isClearlySilent(_ url: URL) -> Bool {
+        guard let file = try? AVAudioFile(forReading: url), file.length > 0,
+              file.processingFormat.commonFormat == .pcmFormatFloat32,
+              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 4096) else { return false }
+        do {
+            while file.framePosition < file.length {
+                try file.read(into: buffer)
+                guard buffer.frameLength > 0, let channels = buffer.floatChannelData else { return false }
+                for channel in 0..<Int(file.processingFormat.channelCount) {
+                    for frame in 0..<Int(buffer.frameLength) {
+                        if abs(channels[channel][frame]) > 0.002 { return false }
+                    }
+                }
+            }
+            return true
+        } catch { return false }
+    }
+
     /// Returns false when word timing is absent or no substantial silence exists.
     /// A failed export leaves the original recording in place.
     static func trim(_ audioURL: URL, timing: TimedTranscript) async throws -> Bool {
