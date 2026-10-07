@@ -62,7 +62,7 @@ enum RecordingSilence {
         for segment in plan.segments {
             let start = CMTime(seconds: segment.start, preferredTimescale: 600)
             let length = CMTime(seconds: segment.duration, preferredTimescale: 600)
-            try composition.insertTimeRange(CMTimeRange(start: start, duration: length),
+            try await composition.insertTimeRange(CMTimeRange(start: start, duration: length),
                                             of: asset, at: cursor)
             cursor = CMTimeAdd(cursor, length)
         }
@@ -77,7 +77,7 @@ enum RecordingSilence {
         guard let bytes = TimedTranscriptStore.stamp(temporary)?.size, bytes > 0 else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        try FileManager.default.replaceItemAt(audioURL, withItemAt: temporary)
+        _ = try FileManager.default.replaceItemAt(audioURL, withItemAt: temporary)
         try TimedTranscriptStore.save(plan.transcript, for: audioURL)
         return true
     }
