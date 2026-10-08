@@ -64,7 +64,7 @@ jobs:
         if: always() && !cancelled() && (needs.decider-model.result == 'success' || needs.decider-model.result == 'skipped')
         name: Build and Upload iOS App (Zig)
         runs-on: macos-26
-        timeout-minutes: 45
+        timeout-minutes: 90
         env:
             ZIG_BIN: ${{ github.workspace }}/tools-zig/zig
         steps:
@@ -123,7 +123,9 @@ jobs:
 
             - name: Test actual Strands Decider model and C ABI
               if: github.ref == 'refs/heads/main'
-              timeout-minutes: 15
+              # Cold native compilation consumed nine minutes in run 197,
+              # leaving too little time for the full CPU reference suite.
+              timeout-minutes: 35
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |

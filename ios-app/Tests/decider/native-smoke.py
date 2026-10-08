@@ -7,8 +7,23 @@ root=Path(__file__).parent;reference=json.loads((root/'reference-results.json').
 requests=[r['request'] for r in reference]
 requests.extend({'state':requests[0]['state'],'questions':[q]} for q in requests[0]['questions'])
 requests.extend([requests[0],{'state':'','questions':requests[0]['questions']}, {'state':' x'*4000,'questions':requests[0]['questions']}, {'state':'source','questions':[{'instruction':'pick','options':['one\ntwo','three']}]}])
-started=time.monotonic();run=subprocess.run([a.binary,a.model],input='\n'.join(json.dumps(r,ensure_ascii=False) for r in requests)+'\n',text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,check=True)
-rows=[json.loads(line) for line in run.stdout.splitlines()];assert len(rows)==len(requests)
+started=time.monotonic()
+print(f'Running {len(requests)} native requests (reference, isolation, repeat and rejection)', flush=True)
+rows=[]
+with subprocess.Popen([a.binary,a.model],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True) as run:
+    for index,request in enumerate(requests,1):
+        run.stdin.write(json.dumps(request,ensure_ascii=False)+'\n');run.stdin.flush()
+        line=run.stdout.readline()
+        if not line:
+            raise RuntimeError(f'Native runner stopped before result {index}; exit={run.poll()}')
+        rows.append(json.loads(line))
+        print(f'Native request {index}/{len(requests)} complete ({time.monotonic()-started:.1f}s)', flush=True)
+    run.stdin.close()
+    if run.stdout.read().strip():
+        raise RuntimeError('Native runner returned unexpected extra results')
+    if run.wait()!=0:
+        raise RuntimeError(f'Native runner failed: exit={run.returncode}')
+assert len(rows)==len(requests)
 assert rows[-1] is None and rows[-2] is None and rows[-3] is None
 assert rows[-4]==rows[0], 'same input must be repeatable'
 deltas=[];winners=[]

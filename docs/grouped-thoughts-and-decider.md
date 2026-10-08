@@ -30,3 +30,7 @@ The GGUF is Q6_K, about 1.56 GB; the model's SHA-256 is verified before loading.
 - Swift/iOS: source tests and full device build in the existing TestFlight workflow; Linux cannot execute Apple's SwiftUI/AVFoundation UI.
 
 Synthetic model fixtures contain no real journals. Native runtime latency on an actual iPhone remains to be measured. Grouping may leave genuinely related passages separate; it does not change their text. Rolling back the feature commits restores the previous model/UI while original journals remain intact. Removing the grouped-thoughts feature leaves its cache available for a later compatible release; no source journals depend on it.
+
+## Build 197 recovery
+
+Run 197 passed 87 Swift source tests, simulator exports, Zig unit/FFI tests and pinned model packaging. Its native Decider step hit the 15-minute limit after a cold archive compilation consumed about nine minutes. The same complete reference, isolation, repeatability and rejection checks now have a bounded 35-minute step allowance; the publishing job has 90 minutes for the full simulator/native/device/archive/upload path. Request-count and elapsed-time progress identify where time is spent without logging source text. Model pins, tolerances, signing and upload gates stay intact. This improves the proven release path; rollback is reverting this recovery commit. Apple CI remains the native validation authority.
