@@ -1,8 +1,10 @@
 # SlowClaw Social
 
-> **Local-first, journal-first brain-feeder.** Your journals are the lens that decides what flows back to you. An iOS app built from a **Zig core** + a **native Swift shell**. No Rust, no Tauri, no React, no web bundle, no server.
+> **Local-first, journal-first brain-feeder.** Your journals are the lens that decides what flows back to you. An iOS app built from a **Zig core** + a **native Swift shell**. The native app uses no Rust, Tauri, or embedded web bundle. A separate browser companion lives in [`web/`](web/README.md).
 
 ---
+
+The browser companion source and its temporary encrypted session server are now included in [`web/`](web/README.md). See the [Vercel/Supabase migration plan](docs/web-migration.md) before deploying it or changing `slowclaw.social`.
 
 ## Table of contents
 

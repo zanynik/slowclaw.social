@@ -1,0 +1,26 @@
+name: Web companion checks
+on:
+  pull_request:
+    paths: ['web/**', '.github/workflows/web-checks.yml']
+  push:
+    branches: [main]
+    paths: ['web/**', '.github/workflows/web-checks.yml']
+permissions:
+  contents: read
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --global pnpm@11.25.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build

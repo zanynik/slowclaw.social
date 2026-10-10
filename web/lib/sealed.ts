@@ -1,0 +1,5 @@
+export const toBase64=(bytes:Uint8Array)=>{let s='';for(let i=0;i<bytes.length;i+=8192)s+=String.fromCharCode(...bytes.subarray(i,i+8192));return btoa(s);};
+export const fromBase64=(s:string)=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+export async function keyFrom(hex:string){if(!/^[0-9a-f]{64}$/.test(hex))throw Error('Invalid session key');return crypto.subtle.importKey('raw',Uint8Array.from(hex.match(/../g)!,s=>parseInt(s,16)),{name:'AES-GCM'},false,['encrypt','decrypt']);}
+export async function seal(key:CryptoKey,bytes:Uint8Array,aad:string){const iv=crypto.getRandomValues(new Uint8Array(12));const encrypted=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:new TextEncoder().encode(aad)},key,Uint8Array.from(bytes)));const out=new Uint8Array(12+encrypted.length);out.set(iv);out.set(encrypted,12);return out;}
+export async function unseal(key:CryptoKey,bytes:Uint8Array,aad:string){return new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:Uint8Array.from(bytes.slice(0,12)),additionalData:new TextEncoder().encode(aad)},key,Uint8Array.from(bytes.slice(12))));}

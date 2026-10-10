@@ -1,0 +1,31 @@
+import {createRequire} from 'node:module';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {pathToFileURL} from 'node:url';
+import assert from 'node:assert/strict';
+const require=createRequire(import.meta.url),wr=createRequire(require.resolve('wrangler/package.json')),{build}=wr('esbuild');
+const dir=mkdtempSync(join(tmpdir(),'slowclaw-journal-'));
+try{
+ await build({entryPoints:['lib/journal-draft.ts','lib/sealed.ts'],outdir:dir,format:'esm',platform:'node'});
+ const {applyJournalReceipt}=await import(pathToFileURL(join(dir,'journal-draft.js')));
+ const {keyFrom,seal,unseal}=await import(pathToFileURL(join(dir,'sealed.js')));
+ const pending={id:'operation',kind:'write',title:'Journal',text:'Saved text',sealed:'ciphertext'};
+ const draft={id:'journal_web_a',title:'Journal',text:'Saved text',base:null,dirty:true,pending,status:'Waiting for phone'};
+ const entry={id:draft.id,title:'Journal',text:'Saved text',revision:'new-revision'};
+ const saved=applyJournalReceipt(draft,pending,'saved',{entry});
+ assert.equal(saved.dirty,false);assert.equal(saved.status,'Saved on phone');assert.equal(saved.pending,undefined);assert.equal(saved.base,entry.revision);
+ const typing=applyJournalReceipt({...draft,text:'Still typing while phone saves'},pending,'saved',{entry});
+ assert.equal(typing.text,'Still typing while phone saves');assert.equal(typing.dirty,true);assert.equal(typing.base,entry.revision);
+ const conflict=applyJournalReceipt(draft,pending,'conflict',{entry:{...entry,text:'Changed on phone'}});
+ assert.equal(conflict.text,draft.text);assert.equal(conflict.conflict.text,'Changed on phone');assert.equal(conflict.dirty,true);
+ const rejected=applyJournalReceipt(draft,pending,'rejected',{error:'Entry excluded'});assert.equal(rejected.text,draft.text);assert.equal(rejected.dirty,true);
+ const loaded=applyJournalReceipt({...draft,text:''},{...pending,kind:'read'},'loaded',{entry});assert.equal(loaded.text,entry.text);assert.equal(loaded.dirty,false);
+ assert.throws(()=>applyJournalReceipt(draft,pending,'saved',{entry:{...entry,id:'other'}}));
+ const key=await keyFrom('07'.repeat(32)),context='session/note/operation',payload=new TextEncoder().encode(JSON.stringify({kind:'write',key:draft.id,base:null,title:draft.title,text:draft.text}));
+ const sealed=await seal(key,payload,context);assert.deepEqual(await unseal(key,sealed,context),payload);
+ await assert.rejects(unseal(key,sealed,'other/note/operation'));
+ const encryptedDraft=await seal(key,new TextEncoder().encode(JSON.stringify({drafts:{[draft.id]:draft},selected:draft.id})),'session/drafts');
+ const restored=JSON.parse(new TextDecoder().decode(await unseal(key,encryptedDraft,'session/drafts')));assert.deepEqual(restored.drafts[draft.id].pending,pending);
+ console.log('PASS: autosave receipts, typing during saves, conflicts, unavailable entries, transcript loads and encrypted draft recovery');
+}finally{rmSync(dir,{recursive:true,force:true});}
