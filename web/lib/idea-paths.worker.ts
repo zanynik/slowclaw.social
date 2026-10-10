@@ -5,12 +5,12 @@ let cpu:any;
 self.onmessage=async(e:MessageEvent<{texts:string[];backend:EmbeddingBackend}>)=>{
  try{
   if(e.data.backend==='wasm'&&!cpu){
-   postMessage({status:'Preparing the smaller CPU model…'});
+   postMessage({status:'Preparing the CPU model…'});
    const {UniversalEmbedder,FilesetResolver}=await import('@mediapipe/tasks-retrieval');
    const files=await FilesetResolver.forRetrievalTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-retrieval@1.1.0-rc.20260929/wasm',true);
    const bytes=await modelBytes(cpuIdeaModelURL,status=>postMessage({status}));
    postMessage({status:'Starting the local model…'});
-   cpu=await UniversalEmbedder.createFromOptions(files,{baseOptions:{modelAssetBuffer:bytes,delegate:'CPU'},l2Normalize:true,activationDataType:'FLOAT32'});
+   cpu=await UniversalEmbedder.createFromOptions(files,{baseOptions:{modelAssetBuffer:bytes,delegate:'CPU'},maxInputLength:2048,visionTokensPerImage:70,l2Normalize:true,activationDataType:'FLOAT32'});
   }
   if(e.data.backend==='webgpu'&&!extractor){postMessage({status:'Downloading the local model…'});
    const runtime='https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1';
