@@ -1,9 +1,10 @@
 import {UniversalEmbedder,FilesetResolver} from '@mediapipe/tasks-retrieval';
 import {extractUnits,normalize,modelURL} from './journal-units';
+import {modelBytes} from './local-model-assets';
 let model:Promise<UniversalEmbedder>|undefined;
 const runtime='https://cdn.jsdelivr.net/npm/@mediapipe/tasks-retrieval@1.1.0-rc.20260929/wasm';
 async function embed(text:string){
- model??=(async()=>{postMessage({status:'Preparing the local model…'});const files=await FilesetResolver.forRetrievalTasks(runtime,true);return UniversalEmbedder.createFromOptions(files,{baseOptions:{modelAssetPath:modelURL,delegate:'CPU'},l2Normalize:false,activationDataType:'FLOAT32'});})();
+ model??=(async()=>{postMessage({status:'Preparing the local model…'});const files=await FilesetResolver.forRetrievalTasks(runtime,true);const bytes=await modelBytes(modelURL,status=>postMessage({status}));return UniversalEmbedder.createFromOptions(files,{baseOptions:{modelAssetBuffer:bytes,delegate:'CPU'},l2Normalize:false,activationDataType:'FLOAT32'});})();
  const result=await (await model).embedText('task: clustering | query: '+text);
  return normalize(result.embeddings[0]?.floatEmbedding||[]);
 }

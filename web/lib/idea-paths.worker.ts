@@ -1,4 +1,5 @@
 import {ideaModel,ideaRevision,cpuIdeaModelURL,normalizeIdea,EmbeddingBackend} from './idea-paths';
+import {modelBytes} from './local-model-assets';
 let extractor:any;
 let cpu:any;
 self.onmessage=async(e:MessageEvent<{texts:string[];backend:EmbeddingBackend}>)=>{
@@ -7,7 +8,9 @@ self.onmessage=async(e:MessageEvent<{texts:string[];backend:EmbeddingBackend}>)=
    postMessage({status:'Preparing the smaller CPU model…'});
    const {UniversalEmbedder,FilesetResolver}=await import('@mediapipe/tasks-retrieval');
    const files=await FilesetResolver.forRetrievalTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-retrieval@1.1.0-rc.20260929/wasm',true);
-   cpu=await UniversalEmbedder.createFromOptions(files,{baseOptions:{modelAssetPath:cpuIdeaModelURL,delegate:'CPU'},l2Normalize:true,activationDataType:'FLOAT32'});
+   const bytes=await modelBytes(cpuIdeaModelURL,status=>postMessage({status}));
+   postMessage({status:'Starting the local model…'});
+   cpu=await UniversalEmbedder.createFromOptions(files,{baseOptions:{modelAssetBuffer:bytes,delegate:'CPU'},l2Normalize:true,activationDataType:'FLOAT32'});
   }
   if(e.data.backend==='webgpu'&&!extractor){postMessage({status:'Downloading the local model…'});
    const runtime='https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1';
