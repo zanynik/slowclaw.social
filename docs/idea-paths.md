@@ -7,7 +7,7 @@ The web organizer now uses the working Idea Path Laboratory embedding approach i
 ## Proven → Better → New
 
 - Proven: reuse the measured prototype's Transformers.js 4.3.1, `onnx-community/embeddinggemma-2-ONNX`, q4/WebGPU, 768 dimensions, `title: none | text: ` prefix and cosine/step-alignment scoring.
-- Better: use a dedicated embedding worker, visible model-download/inference progress, pause/retry, encrypted local caches and exact source references. A saved journal revision reuses its embeddings. WebGPU uses the prototype's q4 model; browsers without an adapter use q8/WASM because q4's GatherBlockQuantized operator is unsupported by the CPU backend. Backend-specific caches prevent mixing quantizations in one chain. Pin model revision `daa72c51243991dfcaf9f9137d2c573d8f7790c0` rather than mutable main.
+- Better: use a dedicated embedding worker, visible model-download/inference progress, pause/retry, encrypted local caches and exact source references. A saved journal revision reuses its embeddings. WebGPU uses the prototype's q4 model; browsers without an adapter use fp32/WASM because the quantized GatherBlockQuantized operator in both q4 and q8 is unsupported by the CPU backend. Backend-specific caches prevent mixing quantizations in one chain. The CPU fallback downloads larger unquantized weights; GPU is preferred. Pin model revision `daa72c51243991dfcaf9f9137d2c573d8f7790c0` rather than mutable main.
 - New: create complete-link semantic groups, then score ordered chains inside each group. Earliest/latest passages anchor each chain; score averages adjacent idea similarity and step-vector alignment with equal weights, as in the prototype. These are suggested connections, not evidence of cause or a generated summary.
 
 ## Processing bounds
@@ -26,6 +26,6 @@ The previous browser waited for complete ICE discovery and rejected after 20 sec
 
 ## Verification
 
-`pnpm typecheck`, `pnpm test`, and `pnpm build` passed. The initial live q4/WASM check caught an unsupported GatherBlockQuantized operator; this prompted the q4/WebGPU and q8/WASM split rather than treating a successful build as inference verification. Tests exercise exact five-line/prose chunks, Unicode/oversized passages, full 768-dimensional validation, the prototype's geometric step score, bounded complete-link grouping, stalled ICE with candidates, no candidates and connection cancellation. A real iPhone/browser sync still requires the user's compatible TestFlight build 201 and an open phone app.
+`pnpm typecheck`, `pnpm test`, and `pnpm build` passed. The initial live q4/WASM check caught an unsupported GatherBlockQuantized operator; this prompted the q4/WebGPU and fp32/WASM split rather than treating a successful build as inference verification. Tests exercise exact five-line/prose chunks, Unicode/oversized passages, full 768-dimensional validation, the prototype's geometric step score, bounded complete-link grouping, stalled ICE with candidates, no candidates and connection cancellation. A real iPhone/browser sync still requires the user's compatible TestFlight build 201 and an open phone app.
 
 Rollback: revert the Idea Paths web commit to restore the previous web surface. The existing Pages workflow's `legacy_landing` input can restore the original static landing page. Neither action deletes phone journals.

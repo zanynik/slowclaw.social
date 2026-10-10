@@ -6,7 +6,7 @@ self.onmessage=async(e:MessageEvent<{texts:string[];backend:EmbeddingBackend}>)=
    const runtime='https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1';
    const {pipeline,env}=await import(/* @vite-ignore */runtime);
    env.allowLocalModels=false;env.backends.onnx.wasm.numThreads=1;
-   extractor=await pipeline('feature-extraction',ideaModel,{revision:ideaRevision,device:e.data.backend,dtype:e.data.backend==='webgpu'?'q4':'q8',progress_callback:(p:any)=>postMessage({status:'Loading model'+(typeof p.progress==='number'?' · '+Math.round(p.progress)+'%':'…')})});
+   extractor=await pipeline('feature-extraction',ideaModel,{revision:ideaRevision,device:e.data.backend,dtype:e.data.backend==='webgpu'?'q4':'fp32',progress_callback:(p:any)=>postMessage({status:'Loading model'+(typeof p.progress==='number'?' · '+Math.round(p.progress)+'%':'…')})});
   }
   const vectors:number[][]=[];
   for(let i=0;i<e.data.texts.length;i++){
