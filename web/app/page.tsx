@@ -4,7 +4,7 @@ import {JournalNotepad,JournalOperation} from '@/components/journal-notepad';
 import QRCode from 'qrcode';
 import {PeerMailbox,PeerSession} from '@/lib/peer-mailbox';
 import {BrowserPeer} from '@/lib/peer-connection';
-import {localStore,restoreSession,saveSession} from '@/lib/local-store';
+import {clearWorkspace,restoreSession,saveSession} from '@/lib/local-store';
 import {JournalThoughts} from '@/components/journal-thoughts';
 import {UnitGroup} from '@/lib/journal-units';
 import {BookOpen,Feather,Radio,Upload,Smartphone,LockKeyhole,LogOut,RefreshCw,ArrowUpRight} from 'lucide-react';
@@ -25,7 +25,7 @@ export default function Home(){
  const releaseLock=useRef<(()=>void)|null>(null);
  const mailbox=useRef<PeerMailbox|null>(null),peer=useRef<BrowserPeer|null>(null);
  const current=useRef<Session|null>(null),polling=useRef(false),revision=useRef(''),fileInput=useRef<HTMLInputElement>(null);
- async function forget(){peer.current?.close();const id=current.current?.id;if(id){await mailbox.current?.clear();await localStore.remove('slowclaw.web.drafts.'+id);await localStore.remove('slowclaw.web.units.'+id);}await localStore.remove('session');setOperations([]);revision.current='';current.current=null;mailbox.current=null;setSession(null);setPaired(false);setQr('');setData(empty);setTransfers([]);setLastSeen(0);setOnline(false);}
+ async function forget(){peer.current?.close();const id=current.current?.id;if(id)await clearWorkspace(id);current.current=null;mailbox.current=null;setSession(null);setPaired(false);setQr('');setData(empty);setTransfers([]);setLastSeen(0);setOnline(false);setOperations([]);revision.current='';}
  async function api(s:Session,path='',options:RequestInit={}){if(mailbox.current?.session.id!==s.id)throw Error('Browser workspace ended.');let bytes=new Uint8Array();if(typeof options.body==='string')bytes=new TextEncoder().encode(options.body);else if(options.body instanceof Uint8Array)bytes=new Uint8Array(options.body);const value=await mailbox.current.request(path,options.method||'GET',bytes);return JSON.parse(new TextDecoder().decode(value));}
  async function refresh(s:Session){if(polling.current)return;polling.current=true;try{const next=await api(s);if(current.current?.id!==s.id)return;const key=await keyFrom(s.key);setOperations(next.edits||[]);setPaired(next.paired);setOnline(!!peer.current?.online);setLastSeen(next.updated||0);if(next.paired&&peer.current?.online)setQr('');
   if(next.snapshot){const snapshot=JSON.parse(new TextDecoder().decode(await unseal(key,fromBase64(next.snapshot),s.id+'/snapshot')));if(current.current?.id===s.id)setData(snapshot);}

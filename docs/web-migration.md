@@ -40,7 +40,7 @@ Direct connectivity can fail through restrictive NAT/firewalls. The default STUN
 
 ## Deploy the Cloudflare signaling Worker
 
-No Cloudflare deployment credential was available in this workspace and no matching ChatGPT plugin was found. The implementation can be deployed without a plugin.
+The initial Worker was deployed through the connected Cloudflare plugin on 10 October 2026 at **https://slowclaw-signaling.zanynik.workers.dev**. It uses the `PairingRooms` Durable Object binding, migration `v1`, and disables observability/logpush. No deployment token was created or stored in the repository. The GitHub workflow below is an optional way to deploy future updates; the connected plugin can also update the Worker directly.
 
 1. In Cloudflare, enable Workers for the intended account. Create an API token using the Workers deployment template, restricted to that account. Keep it outside source control.
 2. In `zanynik/slowclaw.social` → Settings → Secrets and variables → Actions, add secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
@@ -55,6 +55,8 @@ pnpm install --frozen-lockfile
 pnpm exec wrangler login
 pnpm signal:deploy
 ```
+
+Deployment health can be checked with `node web/tests/signaling-live.mjs https://slowclaw-signaling.zanynik.workers.dev`. This opt-in check uses synthetic offer/answer payloads and deletes its temporary pairing room.
 
 The Worker permits browser origin `https://slowclaw.social`; configure explicit local/test origins only for separate development Workers. Do not add a wildcard production origin.
 
@@ -71,6 +73,8 @@ The public site must remain usable while the infrastructure is being configured.
 Rollback: remove `SLOWCLAW_SIGNALING_ORIGIN` and rerun the same Pages workflow to restore the static landing page. This does not delete journals on the iPhone. Export unsynced browser text first. The legacy companion remains available throughout.
 
 ## Validation and remaining live checks
+
+The deployed Cloudflare Worker passed the opt-in live signaling check on 10 October 2026: forbidden origin, unauthenticated access, role separation, immutable offer/answer, no journal endpoint, and deletion.
 
 Automated checks cover the static build, existing encryption/conflict/unit tests, IndexedDB recovery, peer RPC replay/identity isolation, immutable receipts, chunked files, and real Worker/Durable Object origin/capability/size checks. iOS parser/crypto tests run in the existing release workflow; native framework linking is verified by its archive step.
 
