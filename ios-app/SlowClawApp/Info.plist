@@ -51,6 +51,8 @@
     <false/>
     <key>NSPhotoLibraryAddUsageDescription</key>
     <string>Save the quote cards and audio videos you choose to your photo library.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Connect directly to your laptop to securely sync SlowClaw journals without a cloud journal store.</string>
     <key>NSCameraUsageDescription</key>
     <string>Scan a SlowClaw Web QR code to connect your own browser.</string>
     <key>NSMicrophoneUsageDescription</key>

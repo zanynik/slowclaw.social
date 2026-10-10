@@ -30,7 +30,7 @@ The browser must receive a durable phone receipt before saying **Saved on phone*
 
 ## Operational limits
 
-Keep SlowClaw open on the phone to sync. iOS can suspend background apps, and a browser may throttle a background tab. Offline edits wait locally; neither the Worker nor an inactive phone acts as an always-on mailbox.
+Keep SlowClaw open on the phone to sync. Allow its Local Network permission when pairing on Wi-Fi; if access was denied, enable it in iPhone Settings before retrying. The permission is used for direct encrypted laptop sync, not journal upload to the cloud. iOS can suspend background apps, and a browser may throttle a background tab. Offline edits wait locally; neither the Worker nor an inactive phone acts as an always-on mailbox.
 
 IndexedDB is working storage, not a backup. Browsers, private browsing, clearing site data and storage pressure may remove it. Export unsynced drafts before clearing the workspace. Local storage remains until browser logout/explicit deletion; a 24-hour pairing expiry never silently deletes unsynced text. Moving between domains creates separate browser storage: export old browser drafts before moving to slowclaw.social.
 
@@ -65,12 +65,12 @@ The Worker permits browser origin `https://slowclaw.social`; configure explicit 
 The public site must remain usable while the infrastructure is being configured.
 
 1. Complete the iPhone CI archive/upload and install the compatible TestFlight build. Existing builds support only the legacy companion.
-2. Set repository variable `SLOWCLAW_SIGNALING_ORIGIN` on **`zanynik/slowclaw_static`** to the deployed Worker origin. The updated Pages workflow builds `web/` from `zanynik/slowclaw.social` main and writes this public endpoint into `peer-config.json`.
-3. Run the static repository's existing **Deploy static content to Pages** workflow. With the variable absent it still deploys the original landing page. With it present it runs web tests/build and deploys the static companion into the same Pages project. The existing custom domain/DNS can stay in place.
+2. Set repository variable `SLOWCLAW_SIGNALING_ORIGIN` on **`zanynik/slowclaw_static`** to `https://slowclaw-signaling.zanynik.workers.dev`. This is public configuration, not a deployment credential.
+3. Run the static repository's existing **Deploy static content to Pages** workflow. It builds `web/` from `zanynik/slowclaw.social` main, writes the public endpoint into `peer-config.json`, runs the web checks and live signaling check, and deploys the companion into the same Pages project. With the signaling variable absent it deploys the original landing page. The existing custom domain/DNS stay in place.
 4. Pair an iPhone/browser on slowclaw.social. Test a new journal, transcript conflict, meaningful units, reload recovery, disconnect/reconnect, draft export, phone text export and a near-limit import. Verify the phone receipt and ciphertext deletion after importing. Test cellular/different-network pairing and forced TURN if configured.
 5. Only after those checks should the new companion be treated as production-ready. Keep the legacy Sites host available for older builds and pending sessions.
 
-Rollback: remove `SLOWCLAW_SIGNALING_ORIGIN` and rerun the same Pages workflow to restore the static landing page. This does not delete journals on the iPhone. Export unsynced browser text first. The legacy companion remains available throughout.
+Rollback: remove `SLOWCLAW_SIGNALING_ORIGIN` from the static repository and rerun the same Pages workflow to restore the static landing page. This does not delete journals on the iPhone. Export unsynced browser text first. The legacy companion remains available throughout.
 
 ## Validation and remaining live checks
 

@@ -16,7 +16,7 @@ pnpm build
 pnpm dev
 ```
 
-The static output is `dist-static/`. Set `public/peer-config.json` to the deployed Worker origin for pairing; its empty default deliberately prevents pairing before infrastructure is configured. The production phone only accepts the real slowclaw.social origin. Local browser tests can use the local queue/Worker integration tests; real development phone pairing needs an explicitly reviewed development origin.
+The static output is `dist-static/`. `public/peer-config.json` points to the deployed `https://slowclaw-signaling.zanynik.workers.dev` pairing Worker; the Pages workflow can override this public origin. The production phone only accepts the real slowclaw.social origin. Local browser tests can use the local queue/Worker integration tests; real development phone pairing needs an explicitly reviewed development origin.
 
 See [deployment, privacy, recovery and rollout](../docs/web-migration.md). Vercel and Supabase are not used. The old D1/R2 server source remains for legacy regression tests and compatibility reference, and is excluded from the static bundle. `pnpm build:legacy` builds that reference runtime; do not mistake it for the new static architecture.
 
