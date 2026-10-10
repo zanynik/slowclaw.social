@@ -1,7 +1,8 @@
 import type {JournalEntry} from './journal-draft';
 export const ideaModel='onnx-community/embeddinggemma-2-ONNX';
 export const ideaRevision='daa72c51243991dfcaf9f9137d2c573d8f7790c0';
-export const ideaModelVersion=ideaModel+'@'+ideaRevision+':768:title-none:v2';
+export const cpuIdeaModelURL='https://huggingface.co/litert-community/embeddinggemma-2-text-270m-litert-lm/resolve/9be6e8b90982095dc05c2bd162e4b954ee4dbac7/embeddinggemma-2-text-270m.litertlm';
+export const ideaModelVersion=ideaModel+'@'+ideaRevision+':768:title-none:cpu-litert-9be6e8b90982095dc05c2bd162e4b954ee4dbac7:v3';
 export type EmbeddingBackend='webgpu'|'wasm';
 export async function embeddingBackend():Promise<EmbeddingBackend>{
  const gpu=(navigator as Navigator&{gpu?:{requestAdapter:()=>Promise<unknown>}}).gpu;
