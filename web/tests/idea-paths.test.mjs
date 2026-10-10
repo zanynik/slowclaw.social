@@ -6,9 +6,19 @@ import assert from 'node:assert/strict';
 const require=createRequire(import.meta.url),wr=createRequire(require.resolve('wrangler/package.json')),{build}=wr('esbuild');
 const dir=mkdtempSync(join(tmpdir(),'slowclaw-paths-'));
 try{
- await build({entryPoints:['lib/idea-paths.ts','lib/ice-gathering.ts'],outdir:dir,format:'esm',platform:'node'});
+ await build({entryPoints:['lib/idea-paths.ts','lib/ice-gathering.ts','lib/local-model-assets.ts'],outdir:dir,format:'esm',platform:'node'});
  const {journalChunks,latestJournals,normalizeIdea,pathMetrics,buildIdeaPaths}=await import(join(dir,'idea-paths.js'));
  const {gatherCandidates}=await import(join(dir,'ice-gathering.js'));
+ const {modelBytes}=await import(join(dir,'local-model-assets.js'));
+ const originalFetch=globalThis.fetch,originalCache=Object.getOwnPropertyDescriptor(globalThis,'caches'),weights=new Map();let fetched=0;
+ try{
+  Object.defineProperty(globalThis,'caches',{configurable:true,value:{open:async()=>({match:async url=>weights.get(url)?.clone(),put:async(url,response)=>weights.set(url,response.clone())})}});
+  globalThis.fetch=async(url,options)=>{fetched++;assert.equal(options.credentials,'omit');assert.equal(options.body,undefined);return new Response(new Uint8Array([1,2,3,4]));};
+  assert.deepEqual(await modelBytes('https://models.example/weights.litertlm'),new Uint8Array([1,2,3,4]));
+  assert.deepEqual(await modelBytes('https://models.example/weights.litertlm'),new Uint8Array([1,2,3,4]));assert.equal(fetched,1,'public weights are reused without a network request');
+  globalThis.fetch=async()=>new Response(null,{status:403});await assert.rejects(modelBytes('https://models.example/blocked.litertlm'),/Model download failed/);
+  globalThis.fetch=async()=>new Response(null,{headers:{'Content-Length':String(501*1024*1024)}});await assert.rejects(modelBytes('https://models.example/oversized.litertlm'),/size limit/);
+ }finally{globalThis.fetch=originalFetch;if(originalCache)Object.defineProperty(globalThis,'caches',originalCache);else delete globalThis.caches;}
  const entry={id:'journal_example',revision:'revision_example',title:'Example',text:Array.from({length:11},(_,i)=>'Line '+i+' 👩🏽‍💻').join('\n')};
  const chunks=journalChunks(entry);assert.equal(chunks.length,3);assert.equal(chunks[0].text.split('\n').length,5);for(const c of chunks)assert.equal(entry.text.slice(c.start,c.end),c.text);
  const prose={...entry,text:'One sentence. Two sentences. Three sentences. Four sentences. Five sentences. Six sentences.'};assert.equal(journalChunks(prose).length,2);

@@ -2,7 +2,7 @@
 
 > Your journals live with you. The website is simply another window into them.
 
-A static browser companion: a journal notepad, transcript edits, grouped thoughts, moments, Pulse and encrypted imports. GitHub Pages hosts the code. IndexedDB keeps temporary encrypted working copies. WebRTC syncs directly with the iPhone, which remains authoritative. A minimal Cloudflare Worker exchanges encrypted connection setup messages without storing journals.
+A static browser companion: a journal notepad, transcript edits, local Idea Paths, saved thought groups, moments, Pulse and encrypted imports. GitHub Pages hosts the code. IndexedDB keeps temporary encrypted working copies. WebRTC syncs directly with the iPhone, which remains authoritative. A minimal Cloudflare Worker exchanges encrypted connection setup messages without storing journals.
 
 ## Run
 
@@ -19,6 +19,8 @@ pnpm dev
 The static output is `dist-static/`. `public/peer-config.json` points to the deployed `https://slowclaw-signaling.zanynik.workers.dev` pairing Worker; the Pages workflow can override this public origin. The production phone only accepts the real slowclaw.social origin. Local browser tests can use the local queue/Worker integration tests; real development phone pairing needs an explicitly reviewed development origin.
 
 See [deployment, privacy, recovery and rollout](../docs/web-migration.md). Vercel and Supabase are not used. The old D1/R2 server source remains for legacy regression tests and compatibility reference, and is excluded from the static bundle. `pnpm build:legacy` builds that reference runtime; do not mistake it for the new static architecture.
+
+After pairing, open **Your thoughts → Build idea paths** to connect exact passages from your three latest journals. EmbeddingGemma 2 runs locally; its public model downloads on first use. See [Idea Paths and model verification](../docs/idea-paths.md).
 
 ## Recovery
 

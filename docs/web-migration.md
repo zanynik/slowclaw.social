@@ -9,7 +9,7 @@ This plan replaces the earlier Vercel/Supabase migration. Neither service is nee
 | Component | Home | Content retained |
 | --- | --- | --- |
 | Website/editor/model worker | GitHub Pages, `slowclaw.social` | Public static code/assets |
-| Drafts, transcripts, meaningful units and import queue | IndexedDB in the browser | Encrypted temporary working copies, until explicitly cleared |
+| Drafts, transcripts, Idea Paths, meaningful units and import queue | IndexedDB in the browser | Encrypted temporary working copies, until explicitly cleared |
 | Phone sync | WebRTC ordered data channel | Encrypted peer requests/responses; no cloud journal queue |
 | QR signaling | Cloudflare Worker + in-memory Durable Object | Encrypted SDP, capability hashes and a five-minute room; no D1/R2/KV journal store |
 | Canonical journals and media | iPhone | Authoritative originals and revisions |
@@ -27,6 +27,10 @@ The browser must receive a durable phone receipt before saying **Saved on phone*
 - `WebPeerTransport.swift` provides native WebRTC data channels using pinned WebRTC 154.0.0. No camera/microphone streams or background audio entitlement are added. QR version 2 is accepted only from `https://slowclaw.social/`, with HTTPS signaling restricted to public `*.workers.dev` endpoints. The Worker is not trusted with journal plaintext or the QR key.
 - `WebCompanion.swift` reuses the phone's revision checks, SQLite writes, import deduplication, unit validation and receipt handling. The legacy Sites HTTP pairing remains compatible during rollout.
 - Browser draft export and phone journal-text export provide explicit local recovery files. Phone text export does not include audio/video originals or app settings; a device backup remains necessary for a complete backup.
+
+## Idea Paths
+
+After pairing, open **Your thoughts → Build idea paths**. The browser locally embeds five-line passages from the three latest journals with EmbeddingGemma 2, groups related excerpts and orders them using the Idea Path prototype. Exact excerpts and vectors are encrypted in browser working storage; cards do not change phone journals. Existing phone thought groups remain visible. See [model, processing bounds and verification](idea-paths.md). The public sample uses invented journals only.
 
 ## Operational limits
 
@@ -68,7 +72,7 @@ The actual Pages owner is **`zanynik/slowclaw.social`**, which already has the c
 2. The **Deploy SlowClaw Web to Pages** workflow in this repository builds and checks `web/`, tests the live signaling API, and publishes `dist-static` into the existing Pages project. It runs on companion changes to main or can be run manually. No DNS or custom-domain reassignment is needed.
 3. The default signaling origin is `https://slowclaw-signaling.zanynik.workers.dev`. An optional repository variable `SLOWCLAW_SIGNALING_ORIGIN` on **this repository** overrides that public endpoint. No deployment credential belongs in it.
 4. On your laptop open slowclaw.social. On the updated iPhone open **Profile → SlowClaw Web**, disconnect an older session if needed, scan the QR code and approve it. Keep the app open and allow Local Network access for same-Wi-Fi pairing.
-5. Test a new journal, transcript conflict, meaningful units, reload recovery, disconnect/reconnect, draft export, phone text export and a near-limit import. Verify the phone receipt and ciphertext deletion after importing. Test cellular/different-network pairing and forced TURN if configured. These checks need a real iPhone and are not implied by CI success.
+5. Test a new journal, transcript conflict, Idea Paths, meaningful units, reload recovery, disconnect/reconnect, draft export, phone text export and a near-limit import. Verify the phone receipt and ciphertext deletion after importing. Test cellular/different-network pairing and forced TURN if configured. These checks need a real iPhone and are not implied by CI success.
 
 Rollback: manually run **Deploy SlowClaw Web to Pages** with **legacy_landing** checked. It checks out the backup landing repository and deploys that content to the same domain. Export unsynced browser text before switching. This does not delete phone journals. A normal run restores the companion. The legacy Sites companion remains available for older builds and pending sessions.
 
@@ -78,7 +82,9 @@ The deployed Cloudflare Worker passed the opt-in live signaling check on 10 Octo
 
 Automated checks cover the static build, existing encryption/conflict/unit tests, IndexedDB recovery, peer RPC replay/identity isolation, immutable receipts, chunked files, and real Worker/Durable Object origin/capability/size checks. iOS parser/crypto tests run in the existing release workflow; native framework linking is verified by its archive step.
 
-Live phone/browser connectivity, Safari storage behavior, actual relay credentials and production signaling require the deployed Worker and a compatible phone build. Passing local tests is not a claim that this final end-to-end check has happened.
+The deployed Pages site was checked in Chrome: QR creation and **New pairing code** retries worked; local sample inference and cached refresh produced Idea Path cards. The browser now proceeds with gathered ICE candidates after bounded discovery, instead of rejecting usable candidates when STUN discovery stalls. These checks used synthetic data and did not expose private journals.
+
+Live phone/browser connectivity, Safari storage behavior and actual TURN relay credentials still require a compatible phone build and real-device checks. TURN is not configured. Passing CI and browser-only checks is not a claim that the real phone-to-browser test has happened.
 
 ## Primary references
 

@@ -59,7 +59,7 @@ export function IdeaPaths({session,index,recent,operations,api,sample=false}:{se
    });let n=0;chunks.forEach((c,i)=>{if(!ideas[i])ideas[i]={...c,vector:normalizeIdea(vectors[n++])};});}
    if(run!==generation.current)return;
    const embedded=ideas as EmbeddedIdea[];await store({model:ideaModelVersion,backend,signature,entries,ideas:embedded});
-   if(run!==generation.current)return;setPaths(buildIdeaPaths(embedded));setSavedSignature(signature);setStatus(`${entries.length} journal${entries.length===1?'':'s'} · ${chunks.length} passages${all.length>chunks.length?' · first 20 passages per journal':''} · saved in this browser`);
+   if(run!==generation.current)return;setPaths(buildIdeaPaths(embedded));setSavedSignature(signature);setStatus(`${entries.length} journal${entries.length===1?'':'s'} · ${chunks.length} passages${all.length>chunks.length?' · first 20 passages per journal':''} · ${sample?'computed locally':'saved in this browser'}`);
   }catch(e){if(run===generation.current)setError((e as Error).message);}finally{if(run===generation.current){worker.current?.terminate();worker.current=null;cancelWorker.current=null;running.current=false;setBusy(false);}}
  }
  function pause(){generation.current++;cancelWorker.current?.();cancelWorker.current=null;worker.current?.terminate();worker.current=null;running.current=false;setBusy(false);setStatus('Paused. Previously saved paths are kept.');}
