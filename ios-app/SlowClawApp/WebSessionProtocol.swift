@@ -9,22 +9,34 @@ enum WebSessionProtocol {
         let id: String
         let pair: String
         let key: Data
+        var origin: String = WebSessionProtocol.origin
+        var signaling: String? = nil
     }
     static func pairing(_ value: String) throws -> Pairing {
-        guard value.utf8.count < 1500, let url = URLComponents(string: value),
-              url.scheme == "https", url.host == "slowclaw-web.zanynik.chatgpt.site",
-              url.port == nil, url.user == nil, url.password == nil, url.path == "/pair", url.query == nil,
+        guard value.utf8.count < 2000, let url = URLComponents(string: value), url.scheme == "https",
+              url.port == nil, url.user == nil, url.password == nil, url.query == nil,
               let fragment = url.fragment,
               let fields = URLComponents(string: "https://example.com/?" + fragment)?.queryItems,
-              fields.count == 3, Set(fields.map(\.name)) == Set(["id", "pair", "key"]),
+              Set(fields.map(\.name)).count == fields.count,
               let id = fields.first(where: { $0.name == "id" })?.value,
               let pair = fields.first(where: { $0.name == "pair" })?.value,
               let rawKey = fields.first(where: { $0.name == "key" })?.value,
-              validID(id), validID(pair), validID(rawKey),
-              let bytes = NostrEventVerifier.bytes(rawKey, count: 32) else {
+              validID(id), validID(pair), validID(rawKey), let bytes = NostrEventVerifier.bytes(rawKey, count: 32) else {
             throw PublishingError.message("Scan a fresh QR code from SlowClaw Web.")
         }
-        return Pairing(id: id, pair: pair, key: Data(bytes))
+        if fields.count == 3, url.host == "slowclaw-web.zanynik.chatgpt.site", url.path == "/pair" {
+            return Pairing(id: id, pair: pair, key: Data(bytes))
+        }
+        guard fields.count == 5, Set(fields.map(\.name)) == Set(["v", "id", "pair", "key", "signal"]),
+              fields.first(where: { $0.name == "v" })?.value == "2", url.host == "slowclaw.social", url.path == "/",
+              let signal = fields.first(where: { $0.name == "signal" })?.value,
+              let endpoint = URLComponents(string: signal), endpoint.scheme == "https",
+              endpoint.host?.hasSuffix(".workers.dev") == true, endpoint.host != "workers.dev",
+              endpoint.user == nil, endpoint.password == nil, endpoint.port == nil,
+              (endpoint.path == "" || endpoint.path == "/"), endpoint.query == nil, endpoint.fragment == nil else {
+            throw PublishingError.message("Use a pairing code from slowclaw.social with a Cloudflare signaling Worker.")
+        }
+        return Pairing(id: id, pair: pair, key: Data(bytes), origin: "https://slowclaw.social", signaling: "https://" + endpoint.host!)
     }
     static func validID(_ value: String) -> Bool {
         value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }

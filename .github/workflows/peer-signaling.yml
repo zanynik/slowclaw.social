@@ -1,0 +1,38 @@
+name: Deploy peer signaling
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --global pnpm@11.25.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck && pnpm test && pnpm build
+      - name: Deploy encrypted pairing service
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo 'Configure CLOUDFLARE_API_TOKEN in repository Actions secrets.'; exit 1; }
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo 'Configure CLOUDFLARE_ACCOUNT_ID in repository Actions secrets.'; exit 1; }
+          pnpm signal:deploy > deployment-output.txt
+          cat deployment-output.txt
+          python - <<'PY'
+          import os, pathlib, re
+          text = pathlib.Path('deployment-output.txt').read_text()
+          urls = re.findall(r'https://[a-z0-9.-]+\.workers\.dev', text)
+          if not urls:
+              raise SystemExit('No Worker URL returned; inspect the deployment output.')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write('Signaling Worker: ' + urls[-1] + '\n\nSet SLOWCLAW_SIGNALING_ORIGIN on zanynik/slowclaw_static to this public origin, then run its Pages workflow after verifying the compatible iPhone build.\n')
+          PY

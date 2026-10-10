@@ -3,11 +3,12 @@ import Foundation
 import CryptoKit
 import Security
 import AVFoundation
+import UniformTypeIdentifiers
 
 @MainActor
 final class WebCompanion: ObservableObject {
     static let shared = WebCompanion()
-    struct Session: Codable { let id: String; let key: Data; let pubkey: String; let expires: Int; var pair: String? = nil }
+    struct Session: Codable { let id: String; let key: Data; let pubkey: String; let expires: Int; var pair: String? = nil; var origin: String? = nil; var signaling: String? = nil }
     struct Transfer: Decodable { let id: String; let meta: String; let bytes: Int; let status: String }
     struct Edit: Decodable { let id: String; let sealed: String; let status: String }
     struct Status: Decodable { let expires: Int; let transfers: [Transfer]; let edits: [Edit]? }
@@ -16,6 +17,7 @@ final class WebCompanion: ObservableObject {
     @Published private(set) var busy = false
     @Published var message: String?
     @Published private(set) var lastSync: Date?
+    private let peer = WebPeerTransport()
     private var lastSnapshot: String?
     private static let keychain: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "com.slowclaw.web", kSecAttrAccount as String: "temporary-session"]
@@ -44,11 +46,13 @@ final class WebCompanion: ObservableObject {
         } else if result != errSecSuccess { throw PublishingError.message("Could not save this connection securely.") }
         session = next
     }
-    private func forget() { SecItemDelete(Self.keychain as CFDictionary); session = nil; lastSnapshot = nil; lastSync = nil }
+    private func forget() { peer.close(); SecItemDelete(Self.keychain as CFDictionary); session = nil; lastSnapshot = nil; lastSync = nil }
     private func request(_ session: Session, path: String = "", method: String = "GET", body: Data = Data()) async throws -> Data {
         let secret = try NostrIdentity.secret()
         guard try NostrIdentity.publicKey(secret) == session.pubkey else { throw PublishingError.message("This session belongs to a different Nostr identity.") }
-        let url = URL(string: WebSessionProtocol.origin + "/api/session/" + session.id + path)!
+        let url = URL(string: (session.origin ?? WebSessionProtocol.origin) + "/api/session/" + session.id + path)!
+        let authorization = try WebSessionProtocol.authorization(url: url, method: method, body: body, secret: secret)
+        if session.signaling != nil { return try await peer.request(path: path, method: method, body: body, authorization: authorization) }
         var req = URLRequest(url: url); req.httpMethod = method
         if method != "GET" { req.httpBody = body; req.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         req.setValue(try WebSessionProtocol.authorization(url: url, method: method, body: body, secret: secret), forHTTPHeaderField: "Authorization")
@@ -67,9 +71,10 @@ final class WebCompanion: ObservableObject {
         busy = true; message = nil
         do {
             let key = try NostrIdentity.publicKey(NostrIdentity.secret())
-            let provisional = Session(id: pairing.id, key: pairing.key, pubkey: key, expires: Int(Date().timeIntervalSince1970) + 86400, pair: pairing.pair)
+            let provisional = Session(id: pairing.id, key: pairing.key, pubkey: key, expires: Int(Date().timeIntervalSince1970) + 86400, pair: pairing.pair, origin: pairing.origin, signaling: pairing.signaling)
             // Save the recovery key before approving the server session.
             try save(provisional)
+            if pairing.signaling != nil { try await peer.connect(pairing) }
             try await completePair(provisional)
             message = "Connected. Preparing your journal workspace…"
         } catch { message = error.localizedDescription }
@@ -90,11 +95,11 @@ final class WebCompanion: ObservableObject {
             do { expires = try JSONDecoder().decode(Status.self, from: await request(pending)).expires }
             catch { throw error }
         }
-        try save(.init(id: pending.id, key: pending.key, pubkey: pending.pubkey, expires: expires))
+        try save(.init(id: pending.id, key: pending.key, pubkey: pending.pubkey, expires: expires, origin: pending.origin, signaling: pending.signaling))
     }
     func disconnect() async {
         guard let session, !busy else { return }; busy = true
-        do { _ = try await request(session, method: "DELETE"); forget(); message = "Web session deleted." }
+        do { if session.signaling == nil { _ = try await request(session, method: "DELETE") }; forget(); message = "Phone disconnected. Browser drafts remain on the laptop until cleared there." }
         catch { message = error.localizedDescription }
         busy = false
     }
@@ -248,7 +253,15 @@ final class WebCompanion: ObservableObject {
               let sealedMeta = Data(base64Encoded: transfer.meta) else { throw PublishingError.message("Invalid transfer.") }
         let context = session.id + "/" + transfer.id
         let metadata = try JSONDecoder().decode(Metadata.self, from: WebSessionProtocol.open(sealedMeta, key: session.key, context: context + "/meta"))
-        let encrypted = try await request(session, path: "/file/" + transfer.id)
+        var encrypted = Data()
+        if session.signaling != nil {
+            while encrypted.count < transfer.bytes {
+                let length = min(32768, transfer.bytes - encrypted.count)
+                let part = try await request(session, path: "/file/" + transfer.id + "?offset=" + String(encrypted.count) + "&length=" + String(length))
+                guard part.count == length else { throw PublishingError.message("Incomplete file. Reconnect and retry.") }
+                encrypted.append(part)
+            }
+        } else { encrypted = try await request(session, path: "/file/" + transfer.id) }
         guard encrypted.count == transfer.bytes else { throw PublishingError.message("Incomplete file. Retry while connected.") }
         let data = try WebSessionProtocol.open(encrypted, key: session.key, context: context + "/file")
         let title = String(URL(fileURLWithPath: metadata.name).deletingPathExtension().lastPathComponent.prefix(240)).replacingOccurrences(of: "\n", with: " ")
@@ -293,11 +306,16 @@ struct WebCompanionView: View {
     @State private var pendingPairing: WebSessionProtocol.Pairing?
     @State private var problem: String?
     @State private var confirmDisconnect = false
+    @State private var exporting = false
+    @State private var exportDocument = WebJournalExport(data: Data())
     var body: some View {
         Form {
             Section {
                 Text("Write journals on your laptop and edit notes or transcripts.")
-                Link("Open SlowClaw Web", destination: URL(string: WebSessionProtocol.origin)!)
+                Link("Open SlowClaw Web", destination: URL(string: web.session?.origin ?? "https://slowclaw.social")!)
+                if web.session?.signaling == nil {
+                    Link("Existing web companion", destination: URL(string: WebSessionProtocol.origin)!)
+                }
                 if web.session == nil {
                     Button { scanning = true } label: { Label("Scan web sign-in code", systemImage: "qrcode.viewfinder") }
                     Text("Open the site on your laptop, show its QR code, then scan it here. Set up your Nostr identity in Username & description first.").font(.footnote).foregroundStyle(.secondary)
@@ -313,9 +331,22 @@ struct WebCompanionView: View {
             }
             Section("Temporary by design") {
                 Text("Your journal index, recent text, requested older entries, selected moment excerpts and current Pulse are encrypted for this browser. Audio recordings and your Nostr secret key stay on this iPhone.")
-                Text("Keep SlowClaw open to save browser edits and receive laptop uploads. Files marked Saved on phone stay here after logout. Sessions expire after 24 hours; logging out deletes pending uploads too.")
+                Text("Keep SlowClaw open to save browser edits and receive laptop uploads. Files marked Saved on phone stay here after logout. Peer sessions last 24 hours. Browser drafts and encrypted import queues stay locally until cleared in the browser; there is no server journal copy.")
             }.font(.footnote)
+            Section("Keep a copy") {
+                Button("Export journals as text data") {
+                    do {
+                        let entries = state.journals.map { ["id": $0.key, "content": $0.content] }
+                        exportDocument = WebJournalExport(data: try JSONSerialization.data(withJSONObject: ["version": 1, "journals": entries], options: [.prettyPrinted, .sortedKeys]))
+                        exporting = true
+                    } catch { problem = "Could not prepare the journal export." }
+                }
+                Text("This export contains readable journal text and transcripts. Save it somewhere private. Audio/video originals and app settings are not included; keep a device backup for those.").font(.footnote).foregroundStyle(.secondary)
+            }
         }.navigationTitle("SlowClaw Web")
+        .fileExporter(isPresented: $exporting, document: exportDocument, contentType: .json, defaultFilename: "slowclaw-journals") { result in
+            if case .failure = result { problem = "The export was not saved." }
+        }
         .sheet(isPresented: $scanning, onDismiss: {
             pairing = pendingPairing
             pendingPairing = nil
@@ -331,11 +362,19 @@ struct WebCompanionView: View {
         .confirmationDialog("Connect this browser?", isPresented: Binding(get: { pairing != nil }, set: { if !$0 { pairing = nil } }), titleVisibility: .visible) {
             if let next = pairing { Button("Connect journal workspace") { pairing = nil; Task { await web.connect(next, state: state) } } }
             Button("Cancel", role: .cancel) { pairing = nil }
-        } message: { Text("Only approve a code displayed on your own laptop at slowclaw-web.zanynik.chatgpt.site. This browser can read and edit journals and transcripts, create text entries and send imports until logout or expiry. Your Nostr signing key stays here.") }
+        } message: { Text("Only approve a code displayed on your own laptop at slowclaw.social (or the existing companion site). This browser can read and edit journals and transcripts, create text entries and send imports until logout or expiry. Your Nostr signing key stays here.") }
         .confirmationDialog("Delete this web session?", isPresented: $confirmDisconnect, titleVisibility: .visible) {
             Button("Disconnect & delete", role: .destructive) { Task { await web.disconnect() } }
         } message: { Text("Uploads not yet received by this iPhone will be deleted. Check the browser transfer list first. Files already saved here are kept.") }
     }
+}
+
+private struct WebJournalExport: FileDocument {
+    static var readableContentTypes: [UTType] { [.json] }
+    var data: Data
+    init(data: Data) { self.data = data }
+    init(configuration: ReadConfiguration) throws { data = configuration.file.regularFileContents ?? Data() }
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { FileWrapper(regularFileWithContents: data) }
 }
 
 private struct WebQRScanner: UIViewControllerRepresentable {

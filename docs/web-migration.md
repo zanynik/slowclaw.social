@@ -1,85 +1,86 @@
-# SlowClaw Web migration and domain cutover
+# SlowClaw Web: journals live with you
 
-Prepared 10 October 2026. Source is merged into `web/`; hosting and DNS have not changed. The existing Sites companion and static domain remain available. The opening page keeps the companion design and adds a journal-first introduction inspired by the static site.
+This plan replaces the earlier Vercel/Supabase migration. Neither service is needed for this architecture. No projects or databases were created in those accounts.
 
-## Architecture
+> Your journals live with you. The website is simply another window into them.
 
-GitHub Pages serves static files. This companion also needs signed pairing, temporary encrypted snapshots/edit queues, and encrypted file transfers. GitHub stores code; a runtime and database supply those services.
+## Where things live
 
-| Component | Current | Proposed |
+| Component | Home | Content retained |
 | --- | --- | --- |
-| UI and API | Sites-managed Vinext/Vite Cloudflare Worker | Standard Next.js App Router on Vercel |
-| Sessions, proofs, edits, transfer metadata | D1 SQLite | Supabase Postgres, server access only |
-| Temporary encrypted files | Private R2 | Private Supabase Storage |
-| Pairing identity | Browser capability + phone NIP-98 signatures | Preserve; Supabase Auth is unnecessary |
-| Journal originals and keys | iPhone and paired browser | Preserve existing ownership |
-| Text embeddings | Browser Web Worker | Keep client-side |
+| Website/editor/model worker | GitHub Pages, `slowclaw.social` | Public static code/assets |
+| Drafts, transcripts, meaningful units and import queue | IndexedDB in the browser | Encrypted temporary working copies, until explicitly cleared |
+| Phone sync | WebRTC ordered data channel | Encrypted peer requests/responses; no cloud journal queue |
+| QR signaling | Cloudflare Worker + in-memory Durable Object | Encrypted SDP, capability hashes and a five-minute room; no D1/R2/KV journal store |
+| Canonical journals and media | iPhone | Authoritative originals and revisions |
+| Network fallback | Optional TURN relay | Encrypted packets relayed in transit, without a journal database |
 
-Vercel/Supabase is reasonable but not required simply to leave GitHub Pages. Keeping the Cloudflare architecture or using the existing Sites host with a custom domain entails less backend work. Both paths still need the iOS domain update below.
+The browser must receive a durable phone receipt before saying **Saved on phone**. It keeps unsynced drafts when the phone is offline or disconnected. Old revisions still produce a conflict instead of silently overwriting phone edits. Existing excluded/deleted-entry checks and content-derived import keys are preserved.
 
-## 1. Accounts and infrastructure
+## Implemented source
 
-**Vercel and Supabase are both connected in ChatGPT.** Account inspection found no SlowClaw Supabase project. The existing projects belong to other applications and are inactive; use a dedicated new project rather than repurposing them. The account has one organization, `zanynik's Org`. Plugins are optional; their exposed permissions determine which setup operations can be automated.
+- `web/vite.pages.config.ts` builds a static client into `dist-static`; no API routes are shipped to Pages.
+- `web/lib/local-store.ts` saves encrypted local drafts/queues. A non-extractable browser wrapping key protects the locally stored pairing key. This protects file contents at rest, not against a compromised/unlocked browser profile or same-origin malicious JavaScript.
+- `peer-mailbox.ts` preserves the existing encrypted edit/receipt protocol as a serialized local queue. Phone requests remain NIP-98 signed and bound to exact URL, method and body. A reconnect must use the same phone identity or the old workspace must first be exported/cleared.
+- `peer-connection.ts` authenticates SDP with the QR key and encrypts sequence-bound data-channel RPCs. Large messages are fragmented into bounded frames; imports are downloaded by the phone in 32 KiB ranges. Signaling never receives these RPCs or files.
+- `web/signaling/worker.ts` has only pairing room/offer/answer endpoints, with origin checks, separate random role capabilities, immutable SDP, rate/size limits, and no content logging. Rooms expire after five minutes and are removed after successful pairing. Restart/eviction may end a pending room; show a new QR code. There is deliberately no persistent recovery of SDP.
+- `WebPeerTransport.swift` provides native WebRTC data channels using pinned WebRTC 154.0.0. No camera/microphone streams or background audio entitlement are added. QR version 2 is accepted only from `https://slowclaw.social/`, with HTTPS signaling restricted to public `*.workers.dev` endpoints. The Worker is not trusted with journal plaintext or the QR key.
+- `WebCompanion.swift` reuses the phone's revision checks, SQLite writes, import deduplication, unit validation and receipt handling. The legacy Sites HTTP pairing remains compatible during rollout.
+- Browser draft export and phone journal-text export provide explicit local recovery files. Phone text export does not include audio/video originals or app settings; a device backup remains necessary for a complete backup.
 
-Create a Supabase project in a region near the intended Vercel function region (Frankfurt is an option for European users). Create a private `slowclaw-transfers` bucket. Anonymous/browser users must have no general table access, bucket listing, or upload permission.
+## Operational limits
 
-After the runtime port, connect a Vercel project to `zanynik/slowclaw.social`, root directory `web`. **Importing this export into Vercel alone will not work:** it still requires Cloudflare D1/R2. No SlowClaw project was found in the connected Vercel account during this export. Configure server-only values from `web/.env.migration.example` in Vercel settings. Never commit secrets or expose them through `NEXT_PUBLIC_*`. Use separate staging/production resources.
+Keep SlowClaw open on the phone to sync. iOS can suspend background apps, and a browser may throttle a background tab. Offline edits wait locally; neither the Worker nor an inactive phone acts as an always-on mailbox.
 
-## 2. Runtime port
+IndexedDB is working storage, not a backup. Browsers, private browsing, clearing site data and storage pressure may remove it. Export unsynced drafts before clearing the workspace. Local storage remains until browser logout/explicit deletion; a 24-hour pairing expiry never silently deletes unsynced text. Moving between domains creates separate browser storage: export old browser drafts before moving to slowclaw.social.
 
-`web/migrations/supabase/0001_sessions.sql` is an unapplied starting schema. Review/apply it with an administrator, then provision a least-privilege server role with schema/table/sequence grants and RLS policies. Anonymous/authenticated client access is deliberately absent. Private Storage is provisioned separately.
+One browser tab owns a workspace at a time to prevent local lost updates. Reconnect currently requires disconnecting the old phone session and scanning a fresh QR code. Stored drafts/receipts keep their operation identities so retries do not duplicate saved entries. Phone disconnect keeps browser drafts; browser logout explicitly clears them after confirmation.
 
-Replace D1/R2 in `web/lib/session-server.ts` with a Postgres/private Storage adapter. Parameterize queries; replace SQLite placeholders and `rowid` ordering with Postgres parameters and `queue_order`. Preserve Unix-second timestamps, error codes, quotas, receipt status and conflicts. Make replay-proof insertion, quota admission, and queue transitions transactional under concurrent requests. Do not translate D1 batch operations into independent queries.
+Direct connectivity can fail through restrictive NAT/firewalls. The default STUN discovery is sufficient on some networks, not all. For reliable cellular/corporate-network use, configure TURN. TURN relays encrypted traffic; it does not decrypt journals. Worker and TURN usage may incur charges, even though there is no cloud journal database.
 
-Use Supabase's transaction pooler for serverless connections, TLS and a small per-function pool. Avoid named prepared statements and session-local settings; check driver-specific pooling/pipelining limitations in the connection guide.
+## Deploy the Cloudflare signaling Worker
 
-Convert framework scripts/configuration from Vinext/Vite/Cloudflare to standard Next.js. Adapt browser worker/model assets to its bundler and verify the production build. Use a validated server-only `APP_ORIGIN` for canonical phone signature validation; never derive trust from caller-controlled forwarded hosts.
+No Cloudflare deployment credential was available in this workspace and no matching ChatGPT plugin was found. The implementation can be deployed without a plugin.
 
-Preserve `/api/session` routes, browser authorization, same-origin checks, pairing/session expiry, timestamp/replay checks, signed body digests, exact revision conflicts, and logout deletion. Never log private payloads, tokens, QR fragments or signed URLs.
+1. In Cloudflare, enable Workers for the intended account. Create an API token using the Workers deployment template, restricted to that account. Keep it outside source control.
+2. In `zanynik/slowclaw.social` → Settings → Secrets and variables → Actions, add secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
+3. Run the **Deploy peer signaling** GitHub Actions workflow manually. It tests the protocol and deploys `web/signaling/wrangler.jsonc`, then writes the resulting `https://slowclaw-signaling.<account>.workers.dev` URL to the run summary.
+4. Optional: provision a coturn-compatible relay. Set Worker variable `TURN_URL` (for example a `turns:` URL) and secret `TURN_SECRET`. The Worker creates ten-minute HMAC credentials; the clients receive credentials, never the shared secret. Match the relay's REST shared-secret configuration and test forced-relay connections. Do not commit static TURN credentials into the website.
 
-### Large files require direct Storage transfers
+Local alternative:
 
-Vercel Functions have a **4.5 MB request/response limit**. The current API proxies roughly 50 MiB encrypted files and cannot be moved unchanged.
+```sh
+cd web
+pnpm install --frozen-lockfile
+pnpm exec wrangler login
+pnpm signal:deploy
+```
 
-Use small authenticated API calls to reserve an upload and obtain a restricted signed Storage upload URL. Send ciphertext directly from browser to Storage, with resumable uploads for larger files. An authenticated completion endpoint must verify object existence/size and active session before marking it ready. Use unique paths, no overwrites, transaction-safe quotas and idempotent completion.
+The Worker permits browser origin `https://slowclaw.social`; configure explicit local/test origins only for separate development Workers. Do not add a wildcard production origin.
 
-The phone obtains a restricted download URL through a signed API request, downloads ciphertext directly, decrypts locally, then sends its signed receipt. Do not forward API Authorization headers to the Storage host. Handle abandoned/resumed uploads, signed URL lifetime and concurrent session closure. Expired sessions must never be revived. Scheduled cleanup must delete orphan objects and expired session data; SQL cascading does not remove Storage objects.
+## Release and switch the existing Pages site
 
-Account for encryption overhead: the current limit is 50 MiB plaintext plus 28 bytes. If the plan/bucket cap is exactly 50 MiB, lower the plaintext allowance or raise that cap. Verify current plan limits before choosing a plan.
+The public site must remain usable while the infrastructure is being configured.
 
-## 3. iPhone domain support and release
+1. Complete the iPhone CI archive/upload and install the compatible TestFlight build. Existing builds support only the legacy companion.
+2. Set repository variable `SLOWCLAW_SIGNALING_ORIGIN` on **`zanynik/slowclaw_static`** to the deployed Worker origin. The updated Pages workflow builds `web/` from `zanynik/slowclaw.social` main and writes this public endpoint into `peer-config.json`.
+3. Run the static repository's existing **Deploy static content to Pages** workflow. With the variable absent it still deploys the original landing page. With it present it runs web tests/build and deploys the static companion into the same Pages project. The existing custom domain/DNS can stay in place.
+4. Pair an iPhone/browser on slowclaw.social. Test a new journal, transcript conflict, meaningful units, reload recovery, disconnect/reconnect, draft export, phone text export and a near-limit import. Verify the phone receipt and ciphertext deletion after importing. Test cellular/different-network pairing and forced TURN if configured.
+5. Only after those checks should the new companion be treated as production-ready. Keep the legacy Sites host available for older builds and pending sessions.
 
-`ios-app/SlowClawApp/WebSessionProtocol.swift` accepts only `https://slowclaw-web.zanynik.chatgpt.site`. `WebCompanion.swift` sends all requests to that fixed origin. DNS changes alone therefore break pairing.
+Rollback: remove `SLOWCLAW_SIGNALING_ORIGIN` and rerun the same Pages workflow to restore the static landing page. This does not delete journals on the iPhone. Export unsynced browser text first. The legacy companion remains available throughout.
 
-Add an explicit production allowlist for `https://slowclaw.social` and the legacy host. Carry the validated origin in pairing and persisted sessions; sign/send each request to that same origin. Default existing persisted sessions to the legacy origin. Update links and confirmation text. Preserve exact HTTPS/host/path validation and rejection of arbitrary QR domains, credentials, ports and signature-breaking redirects.
+## Validation and remaining live checks
 
-Use a specifically pinned staging hostname in development builds. Release the new production domain support through TestFlight before domain cutover. Keep the legacy service available for older app versions and in-flight sessions.
+Automated checks cover the static build, existing encryption/conflict/unit tests, IndexedDB recovery, peer RPC replay/identity isolation, immutable receipts, chunked files, and real Worker/Durable Object origin/capability/size checks. iOS parser/crypto tests run in the existing release workflow; native framework linking is verified by its archive step.
 
-## 4. Acceptance checks
-
-Run typecheck, journal/unit tests and the production build. Port the Worker integration tests to real Postgres/Storage: the existing Miniflare tests do not verify a new adapter.
-
-- New/legacy pairing succeeds; foreign hosts, expired/replayed proofs and altered signed bodies fail.
-- Snapshots, journal edits, receipts and conflicts preserve revisions and unsaved typing.
-- Grouped thoughts retain exact excerpts; browser embedding workers load correctly.
-- Small text and near-limit encrypted audio transfer directly, save on the phone, and delete after receipt.
-- Duplicate requests, interrupted uploads, quota concurrency, logout, expiry and orphan cleanup behave correctly.
-- Anonymous table/bucket access fails, sensitive responses are not publicly cached, and logs contain no secrets.
-
-Canonical journals do not need migration into Supabase. Finish old transfer/edit queues, save unsaved browser drafts, and end old sessions. Fresh pairing recreates temporary state. Keep the original deployment until the replacement passes checks.
-
-## 5. Domain cutover
-
-Add `slowclaw.social` and optionally `www.slowclaw.social` to the verified Vercel project. Use apex as canonical origin and redirect www for landing navigation. Signed phone API calls must go directly to canonical HTTPS.
-
-Save the current GitHub Pages domain/DNS settings for rollback. Use the exact DNS records supplied by Vercel, replacing conflicting Pages records. Wait for verification/TLS, then test landing, pairing, edits and large file transfers again. Keep `slowclaw_static` as historical source. If acceptance fails, restore saved DNS; retain the legacy companion throughout.
+Live phone/browser connectivity, Safari storage behavior, actual relay credentials and production signaling require the deployed Worker and a compatible phone build. Passing local tests is not a claim that this final end-to-end check has happened.
 
 ## Primary references
 
-- [GitHub Pages static hosting](https://docs.github.com/en/pages/getting-started-with-github-pages/what-is-github-pages)
-- [Vercel frameworks](https://vercel.com/docs/frameworks)
-- [Vercel Function limits](https://vercel.com/docs/functions/limitations)
-- [Supabase connections/pooling](https://supabase.com/docs/guides/database/connecting-to-postgres)
-- [Signed Storage uploads](https://supabase.com/docs/reference/javascript/storage-from-createsigneduploadurl)
-- [Storage upload guidance](https://supabase.com/docs/guides/storage/uploads/standard-uploads)
-- [Bucket configuration](https://supabase.com/docs/guides/storage/buckets/creating-buckets)
+- [WebRTC data channels](https://webrtc.org/getting-started/data-channels)
+- [WebRTC TURN connectivity](https://webrtc.org/getting-started/turn-server)
+- [Browser storage quotas and eviction](https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria)
+- [iOS background execution](https://developer.apple.com/documentation/uikit/extending-your-app-s-background-execution-time)
+- [Pinned native WebRTC package](https://github.com/stasel/WebRTC/tree/154.0.0)
+- [Cloudflare Durable Object lifecycle](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/)

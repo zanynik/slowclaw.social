@@ -1,12 +1,12 @@
 # SlowClaw Web
 
-The standalone browser companion for SlowClaw: encrypted phone pairing, a journal notepad, transcript edits, grouped thoughts, moments, and encrypted file imports. The iPhone keeps the original journals and runs its existing local processing.
+> Your journals live with you. The website is simply another window into them.
 
-Exported from SlowClaw Web version 6, commit `89cdf784f6c37297c97a66747964995e59c96395`. The unpaired opening page adds a short introduction inspired by `zanynik/slowclaw_static` commit `19b86df2cb386b928a1f10afa03380ad14f20ff2`; the existing companion interface is preserved.
+A static browser companion: a journal notepad, transcript edits, grouped thoughts, moments, Pulse and encrypted imports. GitHub Pages hosts the code. IndexedDB keeps temporary encrypted working copies. WebRTC syncs directly with the iPhone, which remains authoritative. A minimal Cloudflare Worker exchanges encrypted connection setup messages without storing journals.
 
-## Run and verify
+## Run
 
-Requires Node 22.13+ and pnpm 11.25.0.
+Node 22.13+ and pnpm 11.25.0:
 
 ```sh
 pnpm install --frozen-lockfile
@@ -16,14 +16,12 @@ pnpm build
 pnpm dev
 ```
 
-The current runtime is Vinext/Vite on a Cloudflare Worker, with D1 (`DB`) and private R2 (`BUCKET`) bindings. Local Worker tests provision isolated D1/R2 through Miniflare. Production bindings and their migrations must be provisioned before deploying this export outside Sites; `.openai/hosting.json` records the original managed project, not credentials.
+The static output is `dist-static/`. Set `public/peer-config.json` to the deployed Worker origin for pairing; its empty default deliberately prevents pairing before infrastructure is configured. The production phone only accepts the real slowclaw.social origin. Local browser tests can use the local queue/Worker integration tests; real development phone pairing needs an explicitly reviewed development origin.
 
-**This source export is not yet a Vercel/Supabase runtime port.** Importing this directory into Vercel alone will not produce a working companion. See [the migration and domain cutover plan](../docs/web-migration.md) for the required backend, file transfer, and iOS changes. The Supabase SQL and environment template are preparation only and are not used by the current runtime.
+See [deployment, privacy, recovery and rollout](../docs/web-migration.md). Vercel and Supabase are not used. The old D1/R2 server source remains for legacy regression tests and compatibility reference, and is excluded from the static bundle. `pnpm build:legacy` builds that reference runtime; do not mistake it for the new static architecture.
 
-The original deployed companion remains at https://slowclaw-web.zanynik.chatgpt.site until a replacement passes the acceptance checks.
+## Recovery
 
-## Security boundaries
+Keep the phone app open to sync. **Saved on phone** follows its durable receipt. Offline drafts wait in IndexedDB and can be exported. Phone disconnect keeps them; browser logout explicitly removes the workspace. Browser data eviction or clearing can lose unsynced drafts, so export before clearing. Local key wrapping does not protect against an unlocked or compromised browser profile.
 
-Session keys remain in the QR URL fragment and browser/phone. The server handles encrypted payloads, hashed browser capabilities, pairing proofs, and temporary queues. Supabase Auth must not replace the existing phone signature protocol. Never commit environment secrets, private journals, pairing links, or tokens.
-
-`tests/session.test.mjs` covers signed pairing, replay rejection, encrypted snapshots, journal edit receipts/conflicts, transfers, and cleanup. Journal and unit tests cover encryption and exact source passages. Browser embeddings remain in a Web Worker.
+Source originally exported from SlowClaw Web version 6, commit `89cdf784f6c37297c97a66747964995e59c96395`. The opening page is lightly inspired by `slowclaw_static` commit `19b86df2cb386b928a1f10afa03380ad14f20ff2`. The original companion remains available during rollout at https://slowclaw-web.zanynik.chatgpt.site.

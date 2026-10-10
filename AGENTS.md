@@ -20,12 +20,12 @@ The workspace lets a single user:
 - curate personalized Nostr and web/article/**video** (incl. YouTube) feeds from local interests
 - keep the core runtime, storage, and AI workflows on their own device
 
-**Primary (and currently only) product surface:** an **iOS app** built from two layers:
+**Primary product surface:** an **iOS app** built from two layers:
 
 - A **Zig core** (`zig-src/`) — compiled to a static library (`libslowclaw_feed.a`) that exposes a C ABI. Owns ranking, memory, SQLite persistence, RSS parsing, on-device LLM inference (llama.cpp), and the speech/transcription logic is delegated to iOS-native frameworks.
 - A **thin native Swift shell** (`ios-app/`) — SwiftUI app that links the Zig staticlib + vendored SQLite + vendored llama.cpp (CPU backend) and calls the core through the C ABI. There is no Rust, no Tauri, no React, no npm, no web bundle, no embedded HTTP gateway.
 
-> **🎯 iOS is the primary and only target.** macOS/desktop, the CLI, gateway, and daemon surfaces from the earlier Rust-era fork have been removed. When adding AI-powered features (generation, extraction, synthesis, summarization, transcription), **default to the on-device path** — the Zig core's `local_inference.zig` (llama.cpp/GGUF) and the Swift `SpeechTranscriber.swift` (iOS `SFSpeechRecognizer`). Treat the on-device LLM + journal synthesis + TweetClaw-style post drafting as the **reference pattern** for any new AI feature.
+> **🎯 iOS is the primary target.** The separately authorized browser companion lives in `web/`; it is static GitHub Pages code with local IndexedDB and direct encrypted WebRTC sync. Follow `web/AGENTS.md` there. The phone remains authoritative. macOS/desktop, the CLI, gateway, and daemon surfaces from the earlier Rust-era fork have been removed. When adding AI-powered features (generation, extraction, synthesis, summarization, transcription), **default to the on-device path** — the Zig core's `local_inference.zig` (llama.cpp/GGUF) and the Swift `SpeechTranscriber.swift` (iOS `SFSpeechRecognizer`). Treat the on-device LLM + journal synthesis + TweetClaw-style post drafting as the **reference pattern** for any new AI feature.
 
 - Repo: `slowclaw.social`
 - iOS bundle id: `com.slowclaw.app`, product name **SlowClaw Social**

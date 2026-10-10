@@ -19,6 +19,9 @@
 
 name: SlowClaw
 packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC
+    exactVersion: 154.0.0
   NostrCrypto:
     url: https://github.com/21-DOT-DEV/swift-secp256k1
     exactVersion: 0.23.2
@@ -52,6 +55,7 @@ targets:
   SlowClaw:
     type: application
     dependencies:
+      - package: WebRTC
       - package: NostrCrypto
         product: libsecp256k1
     platform: iOS

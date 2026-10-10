@@ -10,6 +10,15 @@ final class WebSessionTests: XCTestCase {
         XCTAssertThrowsError(try WebSessionProtocol.pairing(value.replacingOccurrences(of: "https://", with: "http://")))
         XCTAssertThrowsError(try WebSessionProtocol.pairing(value.replacingOccurrences(of: "/pair#", with: "/pair?untrusted=1#")))
     }
+    func testStaticPeerPairingPinsWebsiteAndRestrictsSignaling() throws {
+        let value = "https://slowclaw.social/#v=2&id=" + String(repeating: "1", count: 64) + "&pair=" + String(repeating: "2", count: 64) + "&key=" + String(repeating: "3", count: 64) + "&signal=https%3A%2F%2Fslowclaw-test.example.workers.dev"
+        let pairing = try WebSessionProtocol.pairing(value)
+        XCTAssertEqual(pairing.origin, "https://slowclaw.social")
+        XCTAssertEqual(pairing.signaling, "https://slowclaw-test.example.workers.dev")
+        for invalid in [value.replacingOccurrences(of: "slowclaw.social/", with: "example.com/"), value.replacingOccurrences(of: ".workers.dev", with: ".example.com"), value.replacingOccurrences(of: "v=2", with: "v=3"), value + "&v=2", value.replacingOccurrences(of: "signal=https", with: "signal=http")] {
+            XCTAssertThrowsError(try WebSessionProtocol.pairing(invalid))
+        }
+    }
     func testCiphertextIsBoundToSessionAndTransfer() throws {
         let key = Data(repeating: 7, count: 32), body = Data("SlowClawAgent garden journal".utf8)
         let sealed = try WebSessionProtocol.seal(body, key: key, context: "session/file")

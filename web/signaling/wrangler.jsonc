@@ -1,0 +1,9 @@
+{
+  "name": "slowclaw-signaling",
+  "main": "worker.ts",
+  "compatibility_date": "2026-05-15",
+  "observability": {"enabled": false},
+  "vars": {"ALLOWED_ORIGINS": "https://slowclaw.social"},
+  "durable_objects": {"bindings": [{"name": "PAIRING", "class_name": "PairingRooms"}]},
+  "migrations": [{"tag": "v1", "new_sqlite_classes": ["PairingRooms"]}]
+}

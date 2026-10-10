@@ -1,4 +1,5 @@
 'use client';
+import {localStore} from '@/lib/local-store';
 import {useEffect,useRef,useState} from 'react';
 import {Button} from './ui/button';
 import {JournalOperation} from './journal-notepad';
@@ -12,14 +13,14 @@ export function JournalThoughts({session,index,recent,groups,revisions,operation
  const [running,setRunning]=useState(false),[status,setStatus]=useState(''),[problem,setProblem]=useState(''),[ready,setReady]=useState(false);
  const job=useRef<Pending|null>(null),worker=useRef<Worker|null>(null),working=useRef(false),alive=useRef(true),active=useRef(false),done=useRef<Record<string,string>>({}),blocked=useRef(new Set<string>());
  const storage='slowclaw.web.units.'+session.id;
- useEffect(()=>{alive.current=true;void(async()=>{try{const saved=sessionStorage.getItem(storage);if(saved){const key=await keyFrom(session.key);job.current=JSON.parse(new TextDecoder().decode(await unseal(key,fromBase64(saved),session.id+'/units-pending')));}}catch{setProblem('The previous organizing request could not be restored.');}finally{if(alive.current)setReady(true);}})();return()=>{alive.current=false;active.current=false;worker.current?.terminate();};},[session.id]);
+ useEffect(()=>{alive.current=true;void(async()=>{try{const saved=await localStore.get(storage);if(saved){const key=await keyFrom(session.key);job.current=JSON.parse(new TextDecoder().decode(await unseal(key,fromBase64(saved),session.id+'/units-pending')));}}catch{setProblem('The previous organizing request could not be restored.');}finally{if(alive.current)setReady(true);}})();return()=>{alive.current=false;active.current=false;worker.current?.terminate();};},[session.id]);
  async function queue(payload:any,kind:Pending['kind'],key:string,revision:string){
   const bytes=new TextEncoder().encode(JSON.stringify(payload));
   if(bytes.length>950000)throw Error('This journal has too many separate thoughts to sync in one pass. Its original text is kept.');
   const id=random(),secret=await keyFrom(session.key),sealed=toBase64(await seal(secret,bytes,session.id+'/note/'+id));
   const pending={id,sealed,kind,key,revision};
   const stored=toBase64(await seal(secret,new TextEncoder().encode(JSON.stringify(pending)),session.id+'/units-pending'));
-  if(!alive.current)return;sessionStorage.setItem(storage,stored);job.current=pending;
+  if(!alive.current)return;await localStore.set(storage,stored);job.current=pending;
  }
  async function organize(entry:JournalEntry){
   if(!entry.revision||typeof entry.text!=='string')throw Error('This journal has no current source text.');
@@ -46,7 +47,7 @@ export function JournalThoughts({session,index,recent,groups,revisions,operation
       // Clear only after the next encrypted operation has been persisted.
       attempted=result.entry;await organize(result.entry);
      }else if(pending.kind==='units'&&receipt.status==='saved'&&result.key===pending.key&&result.revision===pending.revision){
-      done.current[pending.key]=pending.revision;job.current=null;sessionStorage.removeItem(storage);setStatus('Saved on phone.');
+      done.current[pending.key]=pending.revision;job.current=null;await localStore.remove(storage);setStatus('Saved on phone.');
      }else throw Error('Unexpected phone receipt.');
      await api(session,'/note/'+pending.id,{method:'DELETE'});
     }else{
@@ -59,7 +60,7 @@ export function JournalThoughts({session,index,recent,groups,revisions,operation
    }
   }catch(e){if(attempted?.revision){blocked.current.add(attempted.id+'@'+attempted.revision);const pending=job.current;if(pending?.kind==='read')blocked.current.add(pending.key+'@'+pending.revision);}
    setProblem((e as Error).message);active.current=false;setRunning(false);
-   const pending=job.current;if(pending&&blocked.current.has(pending.key+'@'+pending.revision)){await api(session,'/note/'+pending.id,{method:'DELETE'}).catch(()=>{});job.current=null;sessionStorage.removeItem(storage);}
+   const pending=job.current;if(pending&&blocked.current.has(pending.key+'@'+pending.revision)){await api(session,'/note/'+pending.id,{method:'DELETE'}).catch(()=>{});job.current=null;await localStore.remove(storage);}
   }finally{working.current=false;}
  }
  useEffect(()=>{const timer=setInterval(()=>void tick(),1500);return()=>clearInterval(timer);},[ready,enabled,operations,index,recent,revisions]);

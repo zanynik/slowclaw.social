@@ -4,7 +4,7 @@
 
 ---
 
-The browser companion source and its temporary encrypted session server are now included in [`web/`](web/README.md). See the [Vercel/Supabase migration plan](docs/web-migration.md) before deploying it or changing `slowclaw.social`.
+The browser companion source and its direct encrypted phone transport are now included in [`web/`](web/README.md). See the [static hosting and direct phone sync plan](docs/web-migration.md) before deploying it or changing `slowclaw.social`.
 
 ## Table of contents
 
