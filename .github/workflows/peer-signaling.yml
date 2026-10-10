@@ -34,5 +34,5 @@ jobs:
           if not urls:
               raise SystemExit('No Worker URL returned; inspect the deployment output.')
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
-              output.write('Signaling Worker: ' + urls[-1] + '\n\nSet SLOWCLAW_SIGNALING_ORIGIN on zanynik/slowclaw_static to this public origin, then run its Pages workflow after verifying the compatible iPhone build.\n')
+              output.write('Signaling Worker: ' + urls[-1] + '\n\nSet SLOWCLAW_SIGNALING_ORIGIN on zanynik/slowclaw.social (optional) to this public origin, then run Deploy SlowClaw Web to Pages after verifying the compatible iPhone build.\n')
           PY

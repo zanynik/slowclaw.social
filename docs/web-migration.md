@@ -60,17 +60,17 @@ Deployment health can be checked with `node web/tests/signaling-live.mjs https:/
 
 The Worker permits browser origin `https://slowclaw.social`; configure explicit local/test origins only for separate development Workers. Do not add a wildcard production origin.
 
-## Release and switch the existing Pages site
+## Release and deploy the existing Pages site
 
-The public site must remain usable while the infrastructure is being configured.
+The actual Pages owner is **`zanynik/slowclaw.social`**, which already has the custom domain `slowclaw.social` and HTTPS enabled. `zanynik/slowclaw_static` preserves the original landing page as a backup; its separate project Pages URL does not own the domain.
 
-1. Complete the iPhone CI archive/upload and install the compatible TestFlight build. Existing builds support only the legacy companion.
-2. Set repository variable `SLOWCLAW_SIGNALING_ORIGIN` on **`zanynik/slowclaw_static`** to `https://slowclaw-signaling.zanynik.workers.dev`. This is public configuration, not a deployment credential.
-3. Run the static repository's existing **Deploy static content to Pages** workflow. It builds `web/` from `zanynik/slowclaw.social` main, writes the public endpoint into `peer-config.json`, runs the web checks and live signaling check, and deploys the companion into the same Pages project. With the signaling variable absent it deploys the original landing page. The existing custom domain/DNS stay in place.
-4. Pair an iPhone/browser on slowclaw.social. Test a new journal, transcript conflict, meaningful units, reload recovery, disconnect/reconnect, draft export, phone text export and a near-limit import. Verify the phone receipt and ciphertext deletion after importing. Test cellular/different-network pairing and forced TURN if configured.
-5. Only after those checks should the new companion be treated as production-ready. Keep the legacy Sites host available for older builds and pending sessions.
+1. Install compatible TestFlight **build 201** after Apple processing. Its simulator/runtime/model/device build, archive, export and upload completed successfully: [release run](https://github.com/zanynik/slowclaw.social/actions/runs/38087593444).
+2. The **Deploy SlowClaw Web to Pages** workflow in this repository builds and checks `web/`, tests the live signaling API, and publishes `dist-static` into the existing Pages project. It runs on companion changes to main or can be run manually. No DNS or custom-domain reassignment is needed.
+3. The default signaling origin is `https://slowclaw-signaling.zanynik.workers.dev`. An optional repository variable `SLOWCLAW_SIGNALING_ORIGIN` on **this repository** overrides that public endpoint. No deployment credential belongs in it.
+4. On your laptop open slowclaw.social. On the updated iPhone open **Profile → SlowClaw Web**, disconnect an older session if needed, scan the QR code and approve it. Keep the app open and allow Local Network access for same-Wi-Fi pairing.
+5. Test a new journal, transcript conflict, meaningful units, reload recovery, disconnect/reconnect, draft export, phone text export and a near-limit import. Verify the phone receipt and ciphertext deletion after importing. Test cellular/different-network pairing and forced TURN if configured. These checks need a real iPhone and are not implied by CI success.
 
-Rollback: remove `SLOWCLAW_SIGNALING_ORIGIN` from the static repository and rerun the same Pages workflow to restore the static landing page. This does not delete journals on the iPhone. Export unsynced browser text first. The legacy companion remains available throughout.
+Rollback: manually run **Deploy SlowClaw Web to Pages** with **legacy_landing** checked. It checks out the backup landing repository and deploys that content to the same domain. Export unsynced browser text before switching. This does not delete phone journals. A normal run restores the companion. The legacy Sites companion remains available for older builds and pending sessions.
 
 ## Validation and remaining live checks
 

@@ -1,0 +1,72 @@
+name: Deploy SlowClaw Web to Pages
+on:
+  push:
+    branches: [main]
+    paths: ['web/**', '.github/workflows/pages.yml']
+  workflow_dispatch:
+    inputs:
+      legacy_landing:
+        description: 'Restore the original landing page instead of the companion'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: slowclaw-pages
+  cancel-in-progress: false
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LEGACY_LANDING: ${{ inputs.legacy_landing && 'true' || 'false' }}
+      SIGNALING_ORIGIN: ${{ vars.SLOWCLAW_SIGNALING_ORIGIN || 'https://slowclaw-signaling.zanynik.workers.dev' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Checkout original landing backup
+        if: env.LEGACY_LANDING == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: zanynik/slowclaw_static
+          ref: main
+          path: landing-source
+      - uses: actions/setup-node@v4
+        if: env.LEGACY_LANDING != 'true'
+        with:
+          node-version: '22'
+      - name: Build and verify static companion
+        if: env.LEGACY_LANDING != 'true'
+        working-directory: web
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, urllib.parse
+          endpoint = urllib.parse.urlsplit(os.environ['SIGNALING_ORIGIN'])
+          if endpoint.scheme != 'https' or not endpoint.hostname or not endpoint.hostname.endswith('.workers.dev') or endpoint.username or endpoint.password or endpoint.port or endpoint.path not in ('', '/') or endpoint.query or endpoint.fragment:
+              raise SystemExit('Use the HTTPS Cloudflare Worker origin, without a path or credentials.')
+          pathlib.Path('public/peer-config.json').write_text(json.dumps({'signalingOrigin': 'https://' + endpoint.hostname, 'iceServers': [{'urls': ['stun:stun.l.google.com:19302']}]}))
+          PY
+          npm install --global pnpm@11.25.0
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm test
+          pnpm build
+          node tests/signaling-live.mjs "$SIGNALING_ORIGIN"
+      - uses: actions/configure-pages@v5
+      - name: Upload companion
+        if: env.LEGACY_LANDING != 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist-static
+      - name: Upload original landing
+        if: env.LEGACY_LANDING == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: landing-source
+      - name: Deploy to existing Pages domain
+        id: deployment
+        uses: actions/deploy-pages@v4
