@@ -1,7 +1,12 @@
 import type {JournalEntry} from './journal-draft';
 export const ideaModel='onnx-community/embeddinggemma-2-ONNX';
 export const ideaRevision='daa72c51243991dfcaf9f9137d2c573d8f7790c0';
-export const ideaModelVersion=ideaModel+'@'+ideaRevision+':q4:768:title-none:v1';
+export const ideaModelVersion=ideaModel+'@'+ideaRevision+':768:title-none:v2';
+export type EmbeddingBackend='webgpu'|'wasm';
+export async function embeddingBackend():Promise<EmbeddingBackend>{
+ const gpu=(navigator as Navigator&{gpu?:{requestAdapter:()=>Promise<unknown>}}).gpu;
+ try{if(gpu&&await gpu.requestAdapter())return 'webgpu';}catch{}return 'wasm';
+}
 export type IdeaChunk={id:string;sourceKey:string;revision:string;title:string;date?:string;text:string;start:number;end:number};
 export type EmbeddedIdea=IdeaChunk&{vector:number[]};
 export type IdeaPath={ideas:EmbeddedIdea[];similarity:number;alignment:number;score:number};

@@ -3,12 +3,12 @@ import {useEffect,useRef,useState} from 'react';
 import {Button} from './ui/button';
 import {JournalEntry} from '@/lib/journal-draft';
 import {JournalOperation} from './journal-notepad';
-import {buildIdeaPaths,EmbeddedIdea,IdeaPath,ideaModelVersion,journalChunks,latestJournals,normalizeIdea} from '@/lib/idea-paths';
+import {buildIdeaPaths,EmbeddedIdea,IdeaPath,ideaModelVersion,journalChunks,latestJournals,normalizeIdea,EmbeddingBackend,embeddingBackend} from '@/lib/idea-paths';
 import {localStore} from '@/lib/local-store';
 import {keyFrom,seal,unseal,toBase64,fromBase64} from '@/lib/sealed';
 type Session={id:string;key:string};
 type API=(s:any,path?:string,options?:RequestInit)=>Promise<any>;
-type Cache={model:string;signature:string;entries:JournalEntry[];ideas:EmbeddedIdea[]};
+type Cache={model:string;backend?:EmbeddingBackend;signature:string;entries:JournalEntry[];ideas:EmbeddedIdea[]};
 const emptyCache=():Cache=>({model:ideaModelVersion,signature:'',entries:[],ideas:[]});
 const encode=(v:unknown)=>new TextEncoder().encode(JSON.stringify(v));
 export function IdeaPaths({session,index,recent,operations,api,sample=false}:{session?:Session;index:JournalEntry[];recent:JournalEntry[];operations:JournalOperation[];api?:API;sample?:boolean}){
@@ -47,17 +47,18 @@ export function IdeaPaths({session,index,recent,operations,api,sample=false}:{se
    const entries:JournalEntry[]=[];for(const entry of latest){if(run!==generation.current)return;setStatus('Loading '+(entry.title||'journal')+'…');entries.push(await read(entry,run));}
    const all=entries.flatMap(journalChunks),chunks=entries.flatMap(e=>journalChunks(e).slice(0,20));
    if(!chunks.length){setStatus('These journals have no text yet.');setPaths([]);return;}
-   const ideas=chunks.map(c=>{const old=cache.current.ideas.find(i=>i.id===c.id&&i.text===c.text);return old?{...c,vector:old.vector}:undefined;});
+   const backend=await embeddingBackend();if(run!==generation.current)return;
+   const ideas=chunks.map(c=>{const old=cache.current.backend===backend?cache.current.ideas.find(i=>i.id===c.id&&i.text===c.text):undefined;return old?{...c,vector:old.vector}:undefined;});
    const missing=chunks.filter((_,i)=>!ideas[i]);
    if(missing.length){const vectors=await new Promise<number[][]>((resolve,reject)=>{
     cancelWorker.current=()=>reject(Error('Paused.'));
     const w=new Worker(new URL('../lib/idea-paths.worker.ts',import.meta.url),{type:'module'});worker.current=w;
     w.onmessage=e=>{if(run!==generation.current){reject(Error('Paused.'));return;}if(e.data.status)setStatus(e.data.status);else if(e.data.error)reject(Error(e.data.error));else resolve(e.data.vectors);};
     w.onerror=()=>reject(Error('The embedding worker could not start. Check your connection and retry in a current desktop browser.'));
-    w.postMessage({texts:missing.map(c=>c.text)});
+    w.postMessage({texts:missing.map(c=>c.text),backend});
    });let n=0;chunks.forEach((c,i)=>{if(!ideas[i])ideas[i]={...c,vector:normalizeIdea(vectors[n++])};});}
    if(run!==generation.current)return;
-   const embedded=ideas as EmbeddedIdea[];await store({model:ideaModelVersion,signature,entries,ideas:embedded});
+   const embedded=ideas as EmbeddedIdea[];await store({model:ideaModelVersion,backend,signature,entries,ideas:embedded});
    if(run!==generation.current)return;setPaths(buildIdeaPaths(embedded));setSavedSignature(signature);setStatus(`${entries.length} journal${entries.length===1?'':'s'} · ${chunks.length} passages${all.length>chunks.length?' · first 20 passages per journal':''} · saved in this browser`);
   }catch(e){if(run===generation.current)setError((e as Error).message);}finally{if(run===generation.current){worker.current?.terminate();worker.current=null;cancelWorker.current=null;running.current=false;setBusy(false);}}
  }
