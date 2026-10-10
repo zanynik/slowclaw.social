@@ -19,7 +19,7 @@ Vercel/Supabase is reasonable but not required simply to leave GitHub Pages. Kee
 
 ## 1. Accounts and infrastructure
 
-**Vercel is connected in ChatGPT. Supabase is awaiting connection.** Connect the suggested Supabase plugin, or use its dashboard. Plugins are optional; their exposed permissions determine which setup operations can be automated.
+**Vercel and Supabase are both connected in ChatGPT.** Account inspection found no SlowClaw Supabase project. The existing projects belong to other applications and are inactive; use a dedicated new project rather than repurposing them. The account has one organization, `zanynik's Org`. Plugins are optional; their exposed permissions determine which setup operations can be automated.
 
 Create a Supabase project in a region near the intended Vercel function region (Frankfurt is an option for European users). Create a private `slowclaw-transfers` bucket. Anonymous/browser users must have no general table access, bucket listing, or upload permission.
 
