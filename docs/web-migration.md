@@ -94,3 +94,9 @@ Live phone/browser connectivity, Safari storage behavior and actual TURN relay c
 - [iOS background execution](https://developer.apple.com/documentation/uikit/extending-your-app-s-background-execution-time)
 - [Pinned native WebRTC package](https://github.com/stasel/WebRTC/tree/154.0.0)
 - [Cloudflare Durable Object lifecycle](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/)
+
+## Pairing setup repair (11 October 2026)
+
+A saved phone session or browser Log out button alone does not mean peer approval succeeded. The phone previously waited for complete ICE discovery, then attempted sync even when connection setup failed, replacing the useful error with a generic connection-ended message. The phone now accepts usable gathered candidates after 12 seconds, preserves setup failures, and displays offline/incomplete pairing honestly. A new phone release is required for that repair. The website still uses the full migrated workspace: journal/transcript editor, Moments, Pulse, imports and Idea Paths. Once its first snapshot arrives, the editor opens the latest recent entry; restored drafts take priority. No journal data goes through the signaling Worker.
+
+Regression coverage exercises signed approval, status and a fragmented encrypted transcript snapshot into the browser mailbox, plus real simulator WebRTC channels with approval/status/650 KB transfers and native candidate timeout decisions. Real-device checks remain necessary for network and iOS Local Network permission differences. Rollback: revert this repair commit; phone and browser draft data are not deleted by the revert. This applies Proven → Better → New: restore the proven Sites workspace first, improve connection setup/recovery, and retain Idea Paths as the additive feature.

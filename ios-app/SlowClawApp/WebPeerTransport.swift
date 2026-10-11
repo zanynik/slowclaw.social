@@ -13,7 +13,11 @@ final class WebPeerTransport: NSObject, RTCPeerConnectionDelegate, RTCDataChanne
     private var fragments: [String] = []
     private var sending: [Int: Task<Void, Never>] = [:]
     private var pending: [Int: CheckedContinuation<Data, Error>] = [:]
-    private let http = URLSession(configuration: .ephemeral)
+    private let http: URLSession
+    init(http: URLSession = URLSession(configuration: .ephemeral)) {
+        self.http = http
+        super.init()
+    }
     private var generation = UUID()
     var online: Bool { channel?.readyState == .open }
     private func problem(_ text: String = "Phone connection ended. Browser drafts are kept; disconnect and scan a fresh code.") -> Error { PublishingError.message(text) }
@@ -54,9 +58,10 @@ final class WebPeerTransport: NSObject, RTCPeerConnectionDelegate, RTCDataChanne
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
             pc.setLocalDescription(answer) { error in if let error { c.resume(throwing: error) } else { c.resume() } }
         }
-        let deadline = Date().addingTimeInterval(20)
-        while pc.iceGatheringState != .complete {
-            guard Date() < deadline, connection === pc else { throw problem("Network setup timed out. Try again.") }
+        let discoveryStarted = Date()
+        while true {
+            guard connection === pc else { throw problem("Pairing was interrupted. Scan a fresh browser code.") }
+            if try WebPeerSetup.ready(sdp: pc.localDescription?.sdp ?? "", complete: pc.iceGatheringState == .complete, elapsed: Date().timeIntervalSince(discoveryStarted)) { break }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         guard let local = pc.localDescription else { throw problem() }
@@ -67,7 +72,8 @@ final class WebPeerTransport: NSObject, RTCPeerConnectionDelegate, RTCDataChanne
         while !online { guard Date() < connectedBy, connection === pc else { throw problem("Could not reach the browser. Try the same Wi-Fi or configure a TURN relay.") }; try await Task.sleep(nanoseconds: 50_000_000) }
     }
     func request(path: String, method: String, body: Data, authorization: String) async throws -> Data {
-        guard let pairing, let channel, online, pending.isEmpty else { throw problem() }
+        guard let pairing, let channel, online else { throw problem("The browser is not connected. Disconnect this phone session and scan a fresh code; browser drafts are kept.") }
+        guard pending.isEmpty else { throw problem("A browser request is still running. Please wait and retry.") }
         sent += 1; let id = sent, generation = self.generation
         let request = try JSONSerialization.data(withJSONObject: ["id": id, "path": path, "method": method, "body": body.base64EncodedString(), "authorization": authorization])
         let sealed = try WebSessionProtocol.seal(request, key: pairing.key, context: pairing.id + "/rpc/phone/" + String(id)).base64EncodedString()

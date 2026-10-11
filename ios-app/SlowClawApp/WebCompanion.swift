@@ -17,6 +17,7 @@ final class WebCompanion: ObservableObject {
     @Published private(set) var busy = false
     @Published var message: String?
     @Published private(set) var lastSync: Date?
+    @Published private(set) var peerConnected = false
     private let peer = WebPeerTransport()
     private var lastSnapshot: String?
     private static let keychain: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
@@ -46,7 +47,7 @@ final class WebCompanion: ObservableObject {
         } else if result != errSecSuccess { throw PublishingError.message("Could not save this connection securely.") }
         session = next
     }
-    private func forget() { peer.close(); SecItemDelete(Self.keychain as CFDictionary); session = nil; lastSnapshot = nil; lastSync = nil }
+    private func forget() { peer.close(); peerConnected = false; SecItemDelete(Self.keychain as CFDictionary); session = nil; lastSnapshot = nil; lastSync = nil }
     private func request(_ session: Session, path: String = "", method: String = "GET", body: Data = Data()) async throws -> Data {
         let secret = try NostrIdentity.secret()
         guard try NostrIdentity.publicKey(secret) == session.pubkey else { throw PublishingError.message("This session belongs to a different Nostr identity.") }
@@ -77,7 +78,13 @@ final class WebCompanion: ObservableObject {
             if pairing.signaling != nil { try await peer.connect(pairing) }
             try await completePair(provisional)
             message = "Connected. Preparing your journal workspace…"
-        } catch { message = error.localizedDescription }
+            peerConnected = pairing.signaling != nil
+        } catch {
+            peer.close(); peerConnected = false
+            message = error.localizedDescription
+            busy = false
+            return // Preserve the setup error; never sync a failed connection.
+        }
         busy = false
         if session != nil { await sync(state: state) }
     }
@@ -106,6 +113,12 @@ final class WebCompanion: ObservableObject {
     func sync(state: AppState) async {
         guard let session, !busy else { return }
         if session.expires <= Int(Date().timeIntervalSince1970) { forget(); message = "Web session expired."; return }
+        if session.signaling != nil && !peer.online {
+            peerConnected = false
+            // Keep the original setup error instead of replacing it every poll.
+            if message == nil || session.pair == nil { message = "Phone offline. Browser drafts are kept. Disconnect this session and scan a fresh browser code." }
+            return
+        }
         busy = true; defer { busy = false }
         do {
             try await completePair(session)
@@ -130,7 +143,7 @@ final class WebCompanion: ObservableObject {
             }
             lastSync = Date()
             if failed == 0 { message = "Journals, browser edits, moments and Pulse are synced." }
-        } catch { message = error.localizedDescription }
+        } catch { peerConnected = peer.online; message = error.localizedDescription }
     }
     private func makeSnapshot(state: AppState) throws -> Data {
         let since = Date().addingTimeInterval(-7 * 86400)
@@ -320,7 +333,7 @@ struct WebCompanionView: View {
                     Button { scanning = true } label: { Label("Scan web sign-in code", systemImage: "qrcode.viewfinder") }
                     Text("Open the site on your laptop, show its QR code, then scan it here. Set up your Nostr identity in Username & description first.").font(.footnote).foregroundStyle(.secondary)
                 } else {
-                    Label(web.session?.pair == nil ? "Browser paired" : "Pairing not finished", systemImage: "laptopcomputer")
+                    Label(web.session?.pair != nil ? "Pairing not finished" : web.session?.signaling != nil && !web.peerConnected ? "Phone offline" : "Browser paired", systemImage: "laptopcomputer")
                     if let date = web.lastSync { Text("Last sync: \(date.formatted(date: .omitted, time: .shortened))").font(.footnote) }
                     Button("Sync now") { Task { await web.sync(state: state) } }.disabled(web.busy)
                     Button("Disconnect & delete web session", role: .destructive) { confirmDisconnect = true }.disabled(web.busy)

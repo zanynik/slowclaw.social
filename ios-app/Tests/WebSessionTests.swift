@@ -2,6 +2,15 @@ import XCTest
 import CryptoKit
 @testable import Runtime
 final class WebSessionTests: XCTestCase {
+    func testStalledDiscoveryKeepsCandidatesAndRejectsNoRoute() throws {
+        let sdp = "v=0\r\na=candidate:1 1 udp 1 192.0.2.1 12345 typ host\r\n"
+        XCTAssertFalse(try WebPeerSetup.ready(sdp: sdp, complete: false, elapsed: 1))
+        XCTAssertTrue(try WebPeerSetup.ready(sdp: sdp, complete: true, elapsed: 1))
+        XCTAssertTrue(try WebPeerSetup.ready(sdp: sdp, complete: false, elapsed: 12))
+        XCTAssertFalse(try WebPeerSetup.ready(sdp: "v=0", complete: false, elapsed: 1))
+        XCTAssertThrowsError(try WebPeerSetup.ready(sdp: "v=0", complete: false, elapsed: 12))
+        XCTAssertThrowsError(try WebPeerSetup.ready(sdp: "v=0", complete: true, elapsed: 1))
+    }
     func testPairingRejectsDifferentOriginAndDuplicateFields() throws {
         let value = WebSessionProtocol.origin + "/pair#id=" + String(repeating: "1", count: 64) + "&pair=" + String(repeating: "2", count: 64) + "&key=" + String(repeating: "3", count: 64)
         XCTAssertEqual(try WebSessionProtocol.pairing(value).key.count, 32)

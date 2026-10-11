@@ -29,10 +29,24 @@ try{
  assert.deepEqual(await call('/file/'+transfer+'?offset=32768&length=32768','GET',undefined,true),file.slice(32768,65536));await assert.rejects(call('/file/'+transfer+'?offset=0&length=999999','GET',undefined,true),/range/);
  await call('/file/'+transfer,'POST',undefined,true);assert.equal(await localStore.get(id+'/file/'+transfer),undefined);
  const wire=new BrowserPeer(box,()=>{},()=>{}),frames=[];wire.dc={readyState:'open',bufferedAmount:0,send:frame=>frames.push(JSON.parse(frame))};
- const raw=encode(JSON.stringify({id:1,path:'',method:'GET',body:'',authorization:await sign('','GET',new Uint8Array())}));const cryptoKey=await keyFrom(key),sealedWire=toBase64(await seal(cryptoKey,raw,id+'/rpc/phone/1'));let part=0;
- for(let offset=0;offset<sealedWire.length;offset+=14000)await wire.receive(JSON.stringify({seq:1,part:part++,data:sealedWire.slice(offset,offset+14000),last:offset+14000>=sealedWire.length}));
- const answer=JSON.parse(new TextDecoder().decode(await unseal(cryptoKey,fromBase64(frames.map(f=>f.data).join('')),id+'/rpc/browser/1')));assert.equal(answer.id,1);assert.equal(JSON.parse(Buffer.from(answer.body,'base64').toString()).paired,true);
- await assert.rejects(wire.receive(JSON.stringify({seq:1,part:0,data:sealedWire,last:true})),undefined,'replayed data-channel frames rejected');
+ const cryptoKey=await keyFrom(key);let phoneSequence=0;
+ async function phoneRPC(path,method,body){
+  const seq=++phoneSequence,raw=encode(JSON.stringify({id:seq,path,method,body:toBase64(body),authorization:await sign(path,method,body)}));
+  const encoded=toBase64(await seal(cryptoKey,raw,id+'/rpc/phone/'+seq));let part=0;
+  for(let offset=0;offset<encoded.length;offset+=14000)await wire.receive(JSON.stringify({seq,part:part++,data:encoded.slice(offset,offset+14000),last:offset+14000>=encoded.length}));
+  const response=JSON.parse(new TextDecoder().decode(await unseal(cryptoKey,fromBase64(frames.filter(f=>f.seq===seq).map(f=>f.data).join('')),id+'/rpc/browser/'+seq)));
+  assert.equal(response.id,seq);assert.equal(response.error,undefined);return JSON.parse(Buffer.from(response.body,'base64').toString());
+ }
+ assert.equal(wire.online,false,'transport must not be online before signed approval');
+ await phoneRPC('/pair','POST',encode(JSON.stringify({pair})));assert.equal(wire.online,true);
+ assert.equal((await phoneRPC('','GET',new Uint8Array())).paired,true);
+ const snapshot={editorVersion:1,journals:[{id:'journal_example',title:'Recent transcript',kind:'TRANSCRIPT',text:'A calm start.\n'+ 'A meaningful thought. '.repeat(25000),revision:'example-revision'}],index:[],creations:[{id:'moment_example',text:'A meaningful thought.'}],pulse:[]};
+ const snapshotSeal=toBase64(await seal(cryptoKey,encode(JSON.stringify(snapshot)),id+'/snapshot'));
+ await phoneRPC('/snapshot','PUT',encode(JSON.stringify({sealed:snapshotSeal})));
+ const workspace=JSON.parse(new TextDecoder().decode(await box.request('','GET',new Uint8Array())));
+ assert.equal(workspace.paired,true);assert(workspace.updated>0);
+ assert.deepEqual(JSON.parse(new TextDecoder().decode(await unseal(cryptoKey,fromBase64(workspace.snapshot),id+'/snapshot'))),snapshot,'the full journal/transcript workspace follows approval over fragmented RPC');
+ assert.equal(frames.length,3);await assert.rejects(wire.receive(JSON.stringify({seq:3,part:0,data:'replay',last:true})),undefined,'replayed data-channel frames rejected');
  await localStore.set('slowclaw.web.drafts.'+id,'encrypted-draft');await call('','DELETE',undefined,true);assert.equal(await localStore.get('slowclaw.web.drafts.'+id),'encrypted-draft');await box.clear();assert.equal(await localStore.get(id+'/mailbox'),undefined);
  await clearWorkspace(id);await localStore.set('slowclaw.web.drafts.'+id,'late-draft');await localStore.set(id+'/mailbox',{snapshot:'late-snapshot'});await saveSession(session);assert.equal(await restoreSession(),null);assert.equal(await localStore.get('slowclaw.web.drafts.'+id),undefined);assert.equal(await localStore.get(id+'/mailbox'),undefined);
  console.log('PASS: IndexedDB recovery, key wrapping, signed pairing/replay, identity isolation, idempotent queues, immutable receipts, chunked imports and draft preservation');
