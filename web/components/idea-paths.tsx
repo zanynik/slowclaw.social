@@ -11,14 +11,14 @@ type API=(s:any,path?:string,options?:RequestInit)=>Promise<any>;
 type Cache={model:string;backend?:EmbeddingBackend;signature:string;entries:JournalEntry[];ideas:EmbeddedIdea[]};
 const emptyCache=():Cache=>({model:ideaModelVersion,signature:'',entries:[],ideas:[]});
 const encode=(v:unknown)=>new TextEncoder().encode(JSON.stringify(v));
-export function IdeaPaths({session,index,recent,operations,api,sample=false}:{session?:Session;index:JournalEntry[];recent:JournalEntry[];operations:JournalOperation[];api?:API;sample?:boolean}){
+export function IdeaPaths({session,index,recent,operations,api,sample=false,onPaths}:{session?:Session;index:JournalEntry[];recent:JournalEntry[];operations:JournalOperation[];api?:API;sample?:boolean;onPaths?:(paths:IdeaPath[])=>void}){
  const [ready,setReady]=useState(false),[busy,setBusy]=useState(false),[status,setStatus]=useState(''),[error,setError]=useState(''),[paths,setPaths]=useState<IdeaPath[]>([]),[savedSignature,setSavedSignature]=useState('');
  const cache=useRef(emptyCache()),worker=useRef<Worker|null>(null),generation=useRef(0),receipts=useRef(operations),running=useRef(false),cancelWorker=useRef<(()=>void)|null>(null);
  receipts.current=operations;
  const latest=latestJournals(index),signature=latest.map(e=>e.id+'@'+e.revision).join('|');
  const storage=session?.id+'/idea-paths';
  async function store(value:Cache){if(session&&storage){const key=await keyFrom(session.key);await localStore.set(storage,toBase64(await seal(key,encode(value),session.id+'/idea-paths')));}cache.current=value;}
- useEffect(()=>{let alive=true;void(async()=>{try{if(session&&storage){const raw=await localStore.get(storage);if(raw){const key=await keyFrom(session.key),value:Cache=JSON.parse(new TextDecoder().decode(await unseal(key,fromBase64(raw),session.id+'/idea-paths')));if(value.model===ideaModelVersion&&value.ideas.length<=60){value.ideas.forEach(i=>normalizeIdea(i.vector));if(alive){cache.current=value;setPaths(buildIdeaPaths(value.ideas));setSavedSignature(value.signature);}}}}}catch{if(alive)setError('Previous Idea Paths could not be restored. Your journals are kept.');}finally{if(alive)setReady(true);}})();return()=>{alive=false;generation.current++;cancelWorker.current?.();worker.current?.terminate();worker.current=null;};},[session?.id]);
+ useEffect(()=>{let alive=true;void(async()=>{try{if(session&&storage){const raw=await localStore.get(storage);if(raw){const key=await keyFrom(session.key),value:Cache=JSON.parse(new TextDecoder().decode(await unseal(key,fromBase64(raw),session.id+'/idea-paths')));if(value.model===ideaModelVersion&&value.ideas.length<=60){value.ideas.forEach(i=>normalizeIdea(i.vector));if(alive){cache.current=value;setPaths(buildIdeaPaths(value.ideas));onPaths?.(buildIdeaPaths(value.ideas));setSavedSignature(value.signature);}}}}}catch{if(alive)setError('Previous Idea Paths could not be restored. Your journals are kept.');}finally{if(alive)setReady(true);}})();return()=>{alive=false;generation.current++;cancelWorker.current?.();worker.current?.terminate();worker.current=null;};},[session?.id]);
  async function read(entry:JournalEntry,run:number){
   const available=recent.find(e=>e.id===entry.id&&e.revision===entry.revision&&typeof e.text==='string')||cache.current.entries.find(e=>e.id===entry.id&&e.revision===entry.revision);
   if(available)return available;
@@ -59,7 +59,7 @@ export function IdeaPaths({session,index,recent,operations,api,sample=false}:{se
    });let n=0;chunks.forEach((c,i)=>{if(!ideas[i])ideas[i]={...c,vector:normalizeIdea(vectors[n++])};});}
    if(run!==generation.current)return;
    const embedded=ideas as EmbeddedIdea[];await store({model:ideaModelVersion,backend,signature,entries,ideas:embedded});
-   if(run!==generation.current)return;setPaths(buildIdeaPaths(embedded));setSavedSignature(signature);setStatus(`${entries.length} journal${entries.length===1?'':'s'} · ${chunks.length} passages${all.length>chunks.length?' · first 20 passages per journal':''} · ${sample?'computed locally':'saved in this browser'}`);
+   if(run!==generation.current)return;setPaths(buildIdeaPaths(embedded));onPaths?.(buildIdeaPaths(embedded));setSavedSignature(signature);setStatus(`${entries.length} journal${entries.length===1?'':'s'} · ${chunks.length} passages${all.length>chunks.length?' · first 20 passages per journal':''} · ${sample?'computed locally':'saved in this browser'}`);
   }catch(e){if(run===generation.current)setError((e as Error).message);}finally{if(run===generation.current){worker.current?.terminate();worker.current=null;cancelWorker.current=null;running.current=false;setBusy(false);}}
  }
  function pause(){generation.current++;cancelWorker.current?.();cancelWorker.current=null;worker.current?.terminate();worker.current=null;running.current=false;setBusy(false);setStatus('Paused. Previously saved paths are kept.');}
