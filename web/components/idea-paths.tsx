@@ -15,10 +15,10 @@ export function IdeaPaths({session,index,recent,operations,api,sample=false,onPa
  const [ready,setReady]=useState(false),[busy,setBusy]=useState(false),[status,setStatus]=useState(''),[error,setError]=useState(''),[paths,setPaths]=useState<IdeaPath[]>([]),[savedSignature,setSavedSignature]=useState('');
  const cache=useRef(emptyCache()),worker=useRef<Worker|null>(null),generation=useRef(0),receipts=useRef(operations),running=useRef(false),cancelWorker=useRef<(()=>void)|null>(null);
  receipts.current=operations;
- const latest=embeddedOnly?latestJournals(index).slice(0,30):latestJournals(index),signature=latest.map(e=>e.id+'@'+e.revision).join('|');
+ const latest=embeddedOnly?[...index].filter(e=>e.revision).sort((a,b)=>(b.date||'').localeCompare(a.date||'')).slice(0,30):latestJournals(index),signature=latest.map(e=>e.id+'@'+e.revision).join('|');
  const storage=session?.id+'/idea-paths';
  async function store(value:Cache){if(session&&storage){const key=await keyFrom(session.key);await localStore.set(storage,toBase64(await seal(key,encode(value),session.id+'/idea-paths')));}cache.current=value;}
- useEffect(()=>{let alive=true;void(async()=>{try{if(session&&storage){const raw=await localStore.get(storage);if(raw){const key=await keyFrom(session.key),value:Cache=JSON.parse(new TextDecoder().decode(await unseal(key,fromBase64(raw),session.id+'/idea-paths')));if(value.model===ideaModelVersion&&value.ideas.length<=60){value.ideas.forEach(i=>normalizeIdea(i.vector));if(alive){cache.current=value;setPaths(buildIdeaPaths(value.ideas));onIdeas?.(value.ideas);onPaths?.(buildIdeaPaths(value.ideas));setSavedSignature(value.signature);}}}}}catch{if(alive)setError('Previous Idea Paths could not be restored. Your journals are kept.');}finally{if(alive)setReady(true);}})();return()=>{alive=false;generation.current++;cancelWorker.current?.();worker.current?.terminate();worker.current=null;};},[session?.id]);
+ useEffect(()=>{let alive=true;void(async()=>{try{if(session&&storage){const raw=await localStore.get(storage);if(raw){const key=await keyFrom(session.key),value:Cache=JSON.parse(new TextDecoder().decode(await unseal(key,fromBase64(raw),session.id+'/idea-paths')));if(value.model===ideaModelVersion&&value.ideas.length<=(embeddedOnly?600:60)){value.ideas.forEach(i=>normalizeIdea(i.vector));if(alive){cache.current=value;setPaths(buildIdeaPaths(value.ideas));onIdeas?.(value.ideas);onPaths?.(buildIdeaPaths(value.ideas));setSavedSignature(value.signature);}}}}}catch{if(alive)setError('Previous Idea Paths could not be restored. Your journals are kept.');}finally{if(alive)setReady(true);}})();return()=>{alive=false;generation.current++;cancelWorker.current?.();worker.current?.terminate();worker.current=null;};},[session?.id]);
  async function read(entry:JournalEntry,run:number){
   const available=recent.find(e=>e.id===entry.id&&e.revision===entry.revision&&typeof e.text==='string')||cache.current.entries.find(e=>e.id===entry.id&&e.revision===entry.revision);
   if(available)return available;
@@ -34,7 +34,7 @@ export function IdeaPaths({session,index,recent,operations,api,sample=false,onPa
    if(receipt){const key=await keyFrom(session.key),result=JSON.parse(new TextDecoder().decode(await unseal(key,fromBase64(receipt.result!),session.id+'/note/'+pending.id+'/result')));
     if(receipt.status!=='loaded'){await api(session,'/note/'+pending.id,{method:'DELETE'});await localStore.remove(record);throw Error(result.error||'The phone could not load this journal.');}
     const loaded=result.entry as JournalEntry;if(loaded.id!==entry.id||typeof loaded.text!=='string'||!loaded.revision)throw Error('Invalid journal receipt.');
-    await store({...cache.current,entries:[...cache.current.entries.filter(e=>e.id!==entry.id),loaded].slice(-3)});
+    await store({...cache.current,entries:[...cache.current.entries.filter(e=>e.id!==entry.id),loaded].slice(-(embeddedOnly?30:3))});
     await api(session,'/note/'+pending.id,{method:'DELETE'});await localStore.remove(record);
     if(loaded.revision!==entry.revision)throw Error('A journal changed on your phone. Refresh, then build again.');return loaded;
    }
@@ -45,7 +45,7 @@ export function IdeaPaths({session,index,recent,operations,api,sample=false,onPa
  async function build(){if(running.current)return;running.current=true;setBusy(true);setError('');const run=++generation.current;
   try{
    const entries:JournalEntry[]=[];for(const entry of latest){if(run!==generation.current)return;setStatus('Loading '+(entry.title||'journal')+'…');entries.push(await read(entry,run));}
-   const all=entries.flatMap(journalChunks),chunks=entries.flatMap(e=>journalChunks(e).slice(0,20));
+   const all=entries.flatMap(journalChunks),chunks=entries.flatMap(e=>journalChunks(e).slice(0,embeddedOnly?20:20));
    if(!chunks.length){setStatus('These journals have no text yet.');setPaths([]);return;}
    const backend=await embeddingBackend();if(run!==generation.current)return;
    const ideas=chunks.map(c=>{const old=cache.current.backend===backend?cache.current.ideas.find(i=>i.id===c.id&&i.text===c.text):undefined;return old?{...c,vector:old.vector}:undefined;});
