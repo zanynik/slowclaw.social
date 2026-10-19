@@ -1,0 +1,7 @@
+{
+  "passages": [
+    {"id":"example:1","source":"synthetic-journal:1","revision":1,"occurred_at":"2026-01-01T09:00:00Z","body":"I want to build useful tools for journaling and reflection, connecting ideas across notebooks and finding meaningful patterns."},
+    {"id":"example:2","source":"synthetic-journal:2","revision":1,"occurred_at":"2026-01-02T09:00:00Z","body":"When journaling, I see recurring ideas about reflection, meaningful patterns, and building small useful tools."},
+    {"id":"example:3","source":"synthetic-journal:3","revision":1,"occurred_at":"2026-01-03T09:00:00Z","body":"The garden is full of flowering plants and quiet birds during the morning walk."}
+  ]
+}

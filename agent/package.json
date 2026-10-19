@@ -1,0 +1,13 @@
+{
+  "name": "@slowclaw/local-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "start": "node src/main.mjs serve",
+    "test": "node --test tests/*.test.mjs",
+    "demo": "node src/main.mjs import examples/synthetic-passages.json",
+    "token": "node src/main.mjs token"
+  }
+}
