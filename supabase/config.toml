@@ -1,0 +1,22 @@
+project_id = "slowclaw"
+[api]
+enabled = true
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+[db]
+major_version = 17
+[auth]
+enabled = true
+site_url = "https://slowclaw.social"
+additional_redirect_urls = ["https://slowclaw.social/**", "http://localhost:5173/**", "http://127.0.0.1:5173/**"]
+minimum_password_length = 10
+[auth.email]
+enable_signup = true
+enable_confirmations = true
+secure_password_change = true
+[functions.cloud-api]
+verify_jwt = true
+[functions.cloud-worker]
+# Authenticated user JWT or private scheduler capability is checked in the handler.
+verify_jwt = false
