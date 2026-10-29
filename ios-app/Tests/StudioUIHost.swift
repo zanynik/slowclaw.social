@@ -7,6 +7,7 @@ import CryptoKit
 struct SlowClawMemoryEntry {
     let key: String
     let content: String
+    let timestamp = "2026-01-01T00:00:00Z"
     let mediaURL: String?
     let category = "daily"
     let sessionID: String? = nil
@@ -40,6 +41,8 @@ enum AppTab { case drafts, journal }
     static let transcribingPlaceholder = "Transcribing…"
     static func needsTranscript(_ content: String?) -> Bool { content == nil }
     func refreshJournals() async {}
+    func softDelete(key: String) {}
+    func storeJournalNow(text: String, source: String?, mediaURL: String?) async -> String { "slowclaw_cloud_fixture" }
     func enqueuePendingTranscription(key: String, mediaPath: String, drainNow: Bool) async -> Bool { true }
     func drainPendingTranscriptions() async {}
     let entry: SlowClawMemoryEntry
@@ -64,6 +67,11 @@ enum AppTab { case drafts, journal }
     func memorySource(_ key: String) -> SlowClawMemoryEntry? { key == entry.key ? entry : nil }
     static func softDeletedKeys() -> [String: Double] { [:] }
     func prepareStudioTranscript(key: String) async throws -> TimedTranscript { TimedTranscriptStore.load(for: URL(fileURLWithPath: entry.mediaURL!))! }
+}
+// Detail presentation is outside this isolated media/WebRTC host. CloudSync itself is real.
+struct JournalDetailView: View {
+    let entry: SlowClawMemoryEntry
+    var body: some View { Text(entry.content) }
 }
 @main struct StudioSmokeHost: App {
     @StateObject private var state = AppState()
