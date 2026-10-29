@@ -7,7 +7,7 @@ insert into public.cloud_settings(user_id,sync_enabled,ai_enabled,daily_enabled,
  ('11111111-1111-4111-8111-111111111111',true,true,true,10,50),
  ('22222222-2222-4222-8222-222222222222',true,true,true,10,50);
 select public.cloud_provider_secret('11111111-1111-4111-8111-111111111111','openai','slowclaw_test_key_not_a_real_provider_key');
-do $
+do $$
 declare u uuid:='11111111-1111-4111-8111-111111111111'; r jsonb; j jsonb; j2 jsonb; committed boolean;
 begin
   r:=public.cloud_save_entry(u,'journal_test','🌿 A meaningful journal entry.','Journal','text',now(),0,false);
@@ -40,6 +40,18 @@ begin
   assert (r->>'ok')::boolean,'deletion lost receipt is idempotent';
   assert not has_function_privilege('authenticated','public.cloud_provider_secret(uuid,text,text,boolean)','execute'),'Vault RPC denied to ordinary users';
   assert not has_function_privilege('anon','public.cloud_claim_job(uuid)','execute'),'job claim denied anonymously';
+  -- Explicit leases exercise consent guards without making provider calls.
+  r:=public.cloud_save_entry(u,'transcript_test','','Audio','audio',now(),0,false);
+  insert into public.cloud_jobs(user_id,kind,entry_id,input_hash,status,lease_token,lease_until)
+    values(u,'transcribe','transcript_test','test_transcript','running',gen_random_uuid(),now()+interval '5 minutes') returning to_jsonb(cloud_jobs.*) into j;
+  update public.cloud_settings set ai_enabled=false where user_id=u;
+  assert not public.cloud_commit_transcript((j->>'id')::uuid,(j->>'lease_token')::uuid,1,'Must not overwrite after consent revoked'),'revoked AI consent discards transcript';
+  assert (select text='' from public.cloud_entries where user_id=u and id='transcript_test'),'revoked transcript leaves source unchanged';
+  update public.cloud_settings set ai_enabled=true where user_id=u;
+  update public.cloud_jobs set status='running' where id=(j->>'id')::uuid;
+  assert public.cloud_commit_transcript((j->>'id')::uuid,(j->>'lease_token')::uuid,1,'Synthetic verified transcript'),'current consent and lease allow atomic transcript';
+  assert (select text='Synthetic verified transcript' and revision=2 from public.cloud_entries where user_id=u and id='transcript_test'),'transcript advances source revision';
+  update public.cloud_jobs set status='cancelled' where user_id=u and status='pending' and entry_id='transcript_test';
   update public.cloud_settings set daily_budget=0 where user_id=u;
   insert into public.cloud_jobs(user_id,kind,input_hash) values(u,'daily','test_day');
   -- First claim performs deletion maintenance, which remains allowed when AI budget is zero.

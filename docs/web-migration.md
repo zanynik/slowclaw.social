@@ -1,6 +1,8 @@
 # SlowClaw Web: journals live with you
 
-This plan replaces the earlier Vercel/Supabase migration. Neither service is needed for this architecture. No projects or databases were created in those accounts.
+Optional Supabase cloud storage, scheduled AI, setup, limits, and release status are documented in [Cloud workspace](cloud-workspace.md). Direct phone pairing remains a separate mode.
+
+This plan describes static hosting with direct encrypted phone pairing. Neither Vercel nor Supabase is needed for that mode. The separately authorized optional cloud workspace now provisions Supabase; see the cloud guide above.
 
 > Your journals live with you. The website is simply another window into them.
 

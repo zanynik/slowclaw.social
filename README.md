@@ -1,5 +1,7 @@
 # SlowClaw Social
 
+Optional Supabase cloud storage, scheduled AI, setup, limits, and release status are documented in [Cloud workspace](docs/cloud-workspace.md). Direct phone pairing remains a separate mode.
+
 > **Local-first, journal-first brain-feeder.** Your journals are the lens that decides what flows back to you. An iOS app built from a **Zig core** + a **native Swift shell**. The native app uses no Rust, Tauri, or embedded web bundle. A separate browser companion lives in [`web/`](web/README.md).
 
 ---
