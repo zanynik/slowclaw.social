@@ -52,6 +52,14 @@ begin
   assert public.cloud_commit_transcript((j->>'id')::uuid,(j->>'lease_token')::uuid,1,'Synthetic verified transcript'),'current consent and lease allow atomic transcript';
   assert (select text='Synthetic verified transcript' and revision=2 from public.cloud_entries where user_id=u and id='transcript_test'),'transcript advances source revision';
   update public.cloud_jobs set status='cancelled' where user_id=u and status='pending' and entry_id='transcript_test';
+  assert not has_function_privilege('authenticated','public.cloud_phone_user(text)','execute'),'phone identity lookup denied to clients';
+  assert not has_function_privilege('anon','public.cloud_phone_claim(text,text,bigint)','execute'),'anonymous phone proof insertion denied';
+  perform public.cloud_phone_claim(repeat('a',64),repeat('b',64),extract(epoch from now())::bigint);
+  begin
+    perform public.cloud_phone_claim(repeat('a',64),repeat('b',64),extract(epoch from now())::bigint);
+    raise exception 'replay accepted';
+  exception when unique_violation then null;
+  end;
   update public.cloud_settings set daily_budget=0 where user_id=u;
   insert into public.cloud_jobs(user_id,kind,input_hash) values(u,'daily','test_day');
   -- First claim performs deletion maintenance, which remains allowed when AI budget is zero.

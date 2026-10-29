@@ -20,3 +20,6 @@ verify_jwt = true
 [functions.cloud-worker]
 # Authenticated user JWT or private scheduler capability is checked in the handler.
 verify_jwt = false
+
+[functions.cloud-login]
+verify_jwt = false

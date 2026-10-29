@@ -8,10 +8,22 @@ import {indexedDB} from 'fake-indexeddb';
 const require=createRequire(import.meta.url),wr=createRequire(require.resolve('wrangler/package.json')),{build}=wr('esbuild');
 const dir=mkdtempSync(join(tmpdir(),'slowclaw-cloud-'));
 try{
-  await build({entryPoints:['lib/cloud.ts','../supabase/functions/_shared/ai.ts','../supabase/functions/_shared/reads.ts'],outdir:dir,outbase:'..',format:'esm',platform:'node',bundle:true,plugins:[{name:'pinned-supabase',setup(b){b.onResolve({filter:/^npm:@supabase\/supabase-js@/},()=>({path:require.resolve('@supabase/supabase-js')}));}}]});
+  await build({entryPoints:['lib/cloud.ts','../supabase/functions/_shared/ai.ts','../supabase/functions/_shared/reads.ts','../supabase/functions/_shared/phone-proof.ts'],outdir:dir,outbase:'..',format:'esm',platform:'node',bundle:true,plugins:[{name:'pinned-supabase',setup(b){b.onResolve({filter:/^npm:@supabase\/supabase-js@/},()=>({path:require.resolve('@supabase/supabase-js')}));b.onResolve({filter:/^npm:@noble\/curves@/},()=>({path:require.resolve('@noble/curves/secp256k1.js')}));}}]});
   globalThis.indexedDB=indexedDB;
   Object.defineProperty(globalThis,'navigator',{value:{locks:{request:async(_name,run)=>run()}}});
   const cloud=await import(pathToFileURL(join(dir,'web/lib/cloud.js')));
+  const {phoneProof}=await import(pathToFileURL(join(dir,'supabase/functions/_shared/phone-proof.js')));
+  const {schnorr}=await import('@noble/curves/secp256k1.js');
+  const h=x=>Buffer.from(x).toString('hex'),hash=async x=>h(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(x))));
+  const secret=schnorr.utils.randomSecretKey(),pubkey=h(schnorr.getPublicKey(secret)),payload=new TextEncoder().encode('{"nonce":"test"}'),endpoint='https://project.supabase.co/functions/v1/cloud-login',now=Math.floor(Date.now()/1000);
+  const tags=[['u',endpoint],['method','POST'],['payload',await hash(new TextDecoder().decode(payload))]],id=await hash(JSON.stringify([0,pubkey,now,27235,tags,'']));
+  const event={id,pubkey,created_at:now,kind:27235,tags,content:'',sig:h(schnorr.sign(Buffer.from(id,'hex'),secret))},authorization='Nostr '+Buffer.from(JSON.stringify(event)).toString('base64');
+  assert.equal((await phoneProof(authorization,endpoint,payload,now)).pubkey,pubkey);
+  await assert.rejects(()=>phoneProof(null,endpoint,payload,now));
+  await assert.rejects(()=>phoneProof(authorization,endpoint,payload,now+61));
+  await assert.rejects(()=>phoneProof(authorization,endpoint,new TextEncoder().encode('tampered'),now));
+  await assert.rejects(()=>phoneProof(authorization,endpoint+'/other',payload,now));
+
   const ai=await import(pathToFileURL(join(dir,'supabase/functions/_shared/ai.js')));
   const reads=await import(pathToFileURL(join(dir,'supabase/functions/_shared/reads.js')));
   assert.throws(()=>cloud.validateCloudConfig({url:'https://example.com',publishableKey:'sb_publishable_test'}));

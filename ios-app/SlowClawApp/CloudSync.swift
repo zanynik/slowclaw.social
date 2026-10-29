@@ -107,6 +107,40 @@ import Security
         let value = try await api(["action":"settings"])
         if let s = value["settings"] as? [String:Any] { syncEnabled = s["sync_enabled"] as? Bool ?? false; aiEnabled = s["ai_enabled"] as? Bool ?? false; dailyEnabled = s["daily_enabled"] as? Bool ?? false }
     }
+    /// Only the approved, encrypted browser connection may request this scoped login.
+    func authorizeBrowser(_ input: [String:Any]) async throws -> [String:Any] {
+        guard !busy, let config = input["config"] as? [String:Any], let raw = config["url"] as? String, let key = config["publishableKey"] as? String, let nonce = input["nonce"] as? String, WebSessionProtocol.validID(nonce), let expires = input["expires"] as? Double, expires > Date().timeIntervalSince1970, expires < Date().timeIntervalSince1970+125 else { throw PublishingError.message("Cloud sign-in expired. Retry from your connected browser.") }
+        busy = true; defer { busy = false }
+        let host = try validate(raw,key:key)
+        // Trust deployment configuration, never an arbitrary project supplied by a browser.
+        let (data,response) = try await http.data(from:URL(string:"https://slowclaw-cloud-config.zanynik.workers.dev/")!)
+        guard (response as? HTTPURLResponse)?.statusCode == 200, let trusted = try JSONSerialization.jsonObject(with:data) as? [String:Any], trusted["url"] as? String == host, trusted["publishableKey"] as? String == key else { throw PublishingError.message("Cloud connection does not match SlowClaw's deployed project.") }
+        let endpoint = URL(string:host+"/functions/v1/cloud-login")!, secret = try NostrIdentity.secret()
+        func login() async throws -> [String:Any] {
+            let body = try JSONSerialization.data(withJSONObject:["nonce":nonce],options:[.withoutEscapingSlashes])
+            var request = URLRequest(url:endpoint); request.httpMethod = "POST"; request.httpBody = body
+            request.setValue("application/json",forHTTPHeaderField:"Content-Type"); request.setValue(key,forHTTPHeaderField:"apikey")
+            request.setValue(try WebSessionProtocol.authorization(url:endpoint,method:"POST",body:body,secret:secret),forHTTPHeaderField:"Authorization")
+            let (bytes,result) = try await http.data(for:request)
+            guard let result = result as? HTTPURLResponse, result.statusCode == 200, let value = try JSONSerialization.jsonObject(with:bytes) as? [String:Any] else { throw PublishingError.message("Cloud phone sign-in failed. Retry shortly.") }
+            return value
+        }
+        let browser = try await login()
+        guard let user = browser["user"] as? [String:Any], let id = user["id"] as? String else { throw PublishingError.message("Cloud sign-in returned no account.") }
+        let binding = Self.hash(host+id)
+        if let owner = UserDefaults.standard.string(forKey:"slowclaw.cloud.local-owner"), owner != binding { throw PublishingError.message("Local journals belong to another cloud account. Sign in with that account first.") }
+        if let account, account.user != id || account.url != host { throw PublishingError.message("This phone is connected to a different cloud account.") }
+        if account == nil {
+            // Separate Auth sessions: browser logout/refresh never consumes the phone's refresh token.
+            let phone = try await login()
+            guard let access = phone["access_token"] as? String, let refresh = phone["refresh_token"] as? String else { throw PublishingError.message("Could not save the phone connection.") }
+            try saveAccount(Account(url:host,key:key,access:access,refresh:refresh,expires:Date().timeIntervalSince1970+(phone["expires_in"] as? Double ?? 3600),user:id))
+            UserDefaults.standard.set(binding,forKey:"slowclaw.cloud.local-owner")
+            try readLedger(); projectURL = host; publishableKey = key; connected = true
+        }
+        status = "Browser signed in with this phone. Enable cloud sync when ready."
+        return browser
+    }
     func signIn(email: String, password: String) async {
         guard !busy else { return }; busy = true; defer { busy = false }
         do {

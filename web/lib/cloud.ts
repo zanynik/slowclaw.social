@@ -57,5 +57,12 @@ export async function uploadAudio(client:SupabaseClient,entryId:string,file:File
   onProgress('Uploading audio…');const result=await client.storage.from('slowclaw-audio').uploadToSignedUrl(start.media.object_path,start.upload.token,file,{contentType:mime});
   if(result.error)onProgress('Checking whether the previous upload completed…');
   onProgress('Verifying uploaded audio…');const done=await cloudAPI(client,{action:'upload_finish',id:start.media.id});
-  onProgress(done.transcriptionSupported?'Audio uploaded and verified.':'Audio stored. Split files over 25 MB before cloud transcription.');
+  onProgress('Audio uploaded and verified. Transcripts come from the app.');
+}
+
+export async function configuredCloud():Promise<CloudConfig>{
+ const stored=await loadPrivateRecord<CloudConfig>('cloud/config');if(stored)return validateCloudConfig(stored);
+ let value:Partial<CloudConfig>={};try{value=await (await fetch('/cloud-config.json',{cache:'no-store'})).json() as CloudConfig;}catch{}
+ if(!value?.url)value=await (await fetch('https://slowclaw-cloud-config.zanynik.workers.dev/',{cache:'no-store'})).json() as CloudConfig;
+ return validateCloudConfig(value as CloudConfig);
 }

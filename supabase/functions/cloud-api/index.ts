@@ -66,10 +66,7 @@ Deno.serve(req=>serve(req,async req=>{
     const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',await blob.arrayBuffer())),x=>x.toString(16).padStart(2,'0')).join('');
     if(hash!==media.sha256)throw new Problem('UPLOAD_HASH_MISMATCH',409);
     checked(await db.from('cloud_media').update({status:'uploaded'}).eq('user_id',uid).eq('id',media.id));
-    if(settings.ai_enabled&&(!entry.text.trim()||entry.text.includes('transcribing…'))&&media.bytes<=25000000){
-      checked(await db.from('cloud_jobs').upsert({user_id:uid,kind:'transcribe',entry_id:entry.id,input_hash:entry.id+':'+entry.revision+':'+media.sha256,payload:{media_id:media.id,revision:entry.revision}},{onConflict:'user_id,kind,input_hash',ignoreDuplicates:true}));
-    }
-    return {uploaded:true,transcriptionSupported:media.bytes<=25000000};
+    return {uploaded:true,transcriptionSupported:false,transcriptSource:'app'};
   }
   if(action==='audio_url'){
     const media=checked(await db.from('cloud_media').select('*').eq('user_id',uid).eq('id',string(input.id,100)).eq('status','uploaded').single());

@@ -1,6 +1,6 @@
 import {admin,body,checked,DB,failure,Problem,rpc,serve,user} from '../_shared/http.ts';
 import {analysisArtifacts} from '../_shared/ai.ts';
-import {credential,dailyArtifacts,embeddings,generate,relatedGroups,Source} from '../_shared/ai.ts';
+import {dailyArtifacts,embeddings,generate,relatedGroups,Source} from '../_shared/ai.ts';
 import {candidates} from '../_shared/reads.ts';
 
 type Job={id:string;user_id:string;entry_id:string;kind:string;input_hash:string;payload:Record<string,any>;lease_token:string;attempts:number};
@@ -27,21 +27,7 @@ async function process(db:DB,j:Job){
     await embeddings(db,j.user_id,result.units,settings.provider);
     await rpc(db,'cloud_commit_analysis',{p_job:j.id,p_lease:j.lease_token,p_revision:entry.revision,p_artifacts:result.artifacts,p_units:result.units,p_model:model});return;
   }
-  if(j.kind==='transcribe'){
-    const entry=checked(await db.from('cloud_entries').select('*').eq('user_id',j.user_id).eq('id',j.entry_id).single());
-    if(entry.deleted_at||entry.revision!==j.payload.revision)throw new Problem('SOURCE_CHANGED',409);
-    const media=checked(await db.from('cloud_media').select('*').eq('user_id',j.user_id).eq('id',j.payload.media_id).eq('status','uploaded').single());
-    if(media.entry_id!==entry.id||media.bytes>25000000)throw new Problem('AUDIO_SPLIT_REQUIRED',409);
-    const key=await credential(db,j.user_id,'openai'),audio=checked(await db.storage.from('slowclaw-audio').download(media.object_path));
-    const form=new FormData();form.append('file',audio,media.filename);form.append('model','gpt-transcribe');
-    const response=await fetch('https://api.openai.com/v1/audio/transcriptions',{method:'POST',headers:{Authorization:'Bearer '+key},body:form,signal:AbortSignal.timeout(75000)});
-    if(!response.ok)throw new Problem(response.status===429?'PROVIDER_RATE_LIMIT':'TRANSCRIPTION_FAILED',503);
-    const value=await response.json();if(typeof value.text!=='string'||value.text.length>1000000)throw new Problem('INVALID_TRANSCRIPT',502);
-    await current(db,j);
-    const committed=await rpc(db,'cloud_commit_transcript',{p_job:j.id,p_lease:j.lease_token,p_revision:entry.revision,p_text:value.text});
-    if(!committed)throw new Problem('SOURCE_CHANGED',409);
-    return;
-  }
+  if(j.kind==='transcribe')throw new Problem('APP_TRANSCRIPTION_ONLY',409);
   if(j.kind==='daily'){
     const entries=checked(await db.from('cloud_entries').select('id,revision,text,title,recorded_at').eq('user_id',j.user_id).is('deleted_at',null).order('updated_at',{ascending:false}).limit(30)) as Source[];
     const summaries=checked(await db.from('cloud_artifacts').select('body,sources').eq('user_id',j.user_id).eq('kind','summary').eq('stale',false).order('created_at',{ascending:false}).limit(60));
@@ -74,7 +60,7 @@ Deno.serve(req=>serve(req,async req=>{
   }
   const job=await rpc<Job|null>(db,'cloud_claim_job',{p_user:uid});if(!job)return {processed:false};
   try{await process(db,job);return {processed:true,job_id:job.id};}
-  catch(e){const p=failure(e);const blocked=['OPENAI_KEY_REQUIRED','OPENROUTER_KEY_REQUIRED','BUDGET_LIMIT','PROCESSING_DISABLED','AUDIO_SPLIT_REQUIRED','JOURNAL_TOO_LONG_SPLIT_REQUIRED','JOURNALS_REQUIRED'].includes(p.error);
+  catch(e){const p=failure(e);const blocked=['APP_TRANSCRIPTION_ONLY','OPENAI_KEY_REQUIRED','OPENROUTER_KEY_REQUIRED','BUDGET_LIMIT','PROCESSING_DISABLED','AUDIO_SPLIT_REQUIRED','JOURNAL_TOO_LONG_SPLIT_REQUIRED','JOURNALS_REQUIRED'].includes(p.error);
     checked(await db.from('cloud_jobs').update({status:p.error==='SOURCE_CHANGED'?'cancelled':blocked?'blocked':job.attempts>=4?'failed':'pending',error_code:p.error,available_at:new Date(Date.now()+Math.min(3600,60*2**job.attempts)*1000).toISOString(),lease_until:null,updated_at:new Date().toISOString()}).eq('id',job.id).eq('status','running').eq('lease_token',job.lease_token));
     return {processed:false,job_id:job.id,error:p.error};}
 }));

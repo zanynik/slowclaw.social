@@ -64,12 +64,16 @@ jobs:
           SLOWCLAW_SUPABASE_PUBLISHABLE_KEY: ${{ vars.SLOWCLAW_SUPABASE_PUBLISHABLE_KEY }}
         run: |
           python - <<'PYCONFIG'
-          import json, os, pathlib, re
+          import json, os, pathlib, re, urllib.request
           url = os.environ.get('SLOWCLAW_SUPABASE_URL', '')
           key = os.environ.get('SLOWCLAW_SUPABASE_PUBLISHABLE_KEY', '')
           if bool(url) != bool(key):
               raise SystemExit('Set both public cloud connection variables, or neither.')
           value = {}
+          if not url:
+              with urllib.request.urlopen('https://slowclaw-cloud-config.zanynik.workers.dev/', timeout=20) as response:
+                  value = json.load(response)
+              url, key = value.get('url', ''), value.get('publishableKey', '')
           if url:
               if not re.fullmatch(r'https://[a-z0-9]+\.supabase\.co', url) or not re.fullmatch(r'sb_publishable_[A-Za-z0-9_-]+', key):
                   raise SystemExit('Use a Supabase HTTPS project URL and a publishable key.')
