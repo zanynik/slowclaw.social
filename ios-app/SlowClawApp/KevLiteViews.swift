@@ -29,6 +29,7 @@ struct DraftsView: View {
         NavigationStack {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 28) {
+                    CloudSuggestionCards(kind: "moment")
                     if state.createIdeas.isEmpty {
                         ContentUnavailableView("Your moments, ready to share", systemImage: "quote.bubble",
                             description: Text("Pull down to find quote cards and audio stories in your journals."))
@@ -134,6 +135,7 @@ struct ProfileView: View {
                     }
                 }
                 Section("Connected devices") {
+                    NavigationLink { CloudWorkspaceView() } label: { Label("Cloud workspace", systemImage: "icloud") }
                     NavigationLink { WebCompanionView() } label: {
                         Label("SlowClaw Web", systemImage: "qrcode.viewfinder")
                     }

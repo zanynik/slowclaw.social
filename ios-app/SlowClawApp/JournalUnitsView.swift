@@ -5,6 +5,7 @@ struct JournalUnitsView: View {
     @State private var source: SlowClawMemoryEntry?
     var body: some View {
         List {
+            Section { NavigationLink("Cloud Spaces & action points") { CloudWorkspaceView() } }
             if state.journalUnitGroups.isEmpty {
                 Section {
                     Text("Your thoughts, grouped by what connects them.").font(.headline)
