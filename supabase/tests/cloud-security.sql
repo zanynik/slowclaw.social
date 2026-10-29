@@ -52,6 +52,9 @@ begin
   assert public.cloud_commit_transcript((j->>'id')::uuid,(j->>'lease_token')::uuid,1,'Synthetic verified transcript'),'current consent and lease allow atomic transcript';
   assert (select text='Synthetic verified transcript' and revision=2 from public.cloud_entries where user_id=u and id='transcript_test'),'transcript advances source revision';
   update public.cloud_jobs set status='cancelled' where user_id=u and status='pending' and entry_id='transcript_test';
+  assert public.cloud_phone_email(repeat('a',64))<>repeat('a',64)||'@phone.slowclaw.invalid','opaque phone auth email';
+  assert public.cloud_phone_email(repeat('a',64))=public.cloud_phone_email(repeat('a',64)),'stable phone auth email';
+  assert not has_function_privilege('authenticated','public.cloud_phone_email(text)','execute'),'phone auth derivation denied to clients';
   assert not has_function_privilege('authenticated','public.cloud_phone_user(text)','execute'),'phone identity lookup denied to clients';
   assert not has_function_privilege('anon','public.cloud_phone_claim(text,text,bigint)','execute'),'anonymous phone proof insertion denied';
   perform public.cloud_phone_claim(repeat('a',64),repeat('b',64),extract(epoch from now())::bigint);

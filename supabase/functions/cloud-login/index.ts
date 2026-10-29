@@ -9,14 +9,16 @@ Deno.serve(req=>serve(req,async req=>{
  const proof=await phoneProof(req.headers.get('Authorization'),url,new Uint8Array(await req.arrayBuffer()));
  const db=admin();
  await rpc(db,'cloud_phone_claim',{p_proof:proof.id,p_pubkey:proof.pubkey,p_created:proof.created_at});
- const email=proof.pubkey+'@phone.slowclaw.invalid';
+ const email=await rpc<string>(db,'cloud_phone_email',{p_pubkey:proof.pubkey});
  let uid=await rpc<string|null>(db,'cloud_phone_user',{p_pubkey:proof.pubkey});
  if(!uid){
   const created=await db.auth.admin.createUser({email,email_confirm:true,app_metadata:{slowclaw_pubkey:proof.pubkey}});
   uid=created.data.user?.id||await rpc<string|null>(db,'cloud_phone_user',{p_pubkey:proof.pubkey});
   if(!uid)throw new Problem('PHONE_ACCOUNT_UNAVAILABLE',503);
  }
- const link=await db.auth.admin.generateLink({type:'magiclink',email});
+ const owner=await db.auth.admin.getUserById(uid);
+ if(owner.error||!owner.data.user?.email)throw new Problem('PHONE_ACCOUNT_UNAVAILABLE',503);
+ const link=await db.auth.admin.generateLink({type:'magiclink',email:owner.data.user.email});
  if(link.error||!link.data.properties?.hashed_token||link.data.user.id!==uid)throw new Problem('PHONE_LOGIN_UNAVAILABLE',503);
  const auth=await admin().auth.verifyOtp({token_hash:link.data.properties.hashed_token,type:'email'});
  if(auth.error||!auth.data.session||auth.data.user?.id!==uid)throw new Problem('PHONE_LOGIN_UNAVAILABLE',503);
