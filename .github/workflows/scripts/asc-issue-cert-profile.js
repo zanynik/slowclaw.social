@@ -99,6 +99,11 @@ async function request(token, method, path, body) {
     throw new Error(`Bundle ID ${bundleId} was not found in App Store Connect.`);
   }
 
+  if (process.env.SIGNING_PREFLIGHT === "1") {
+    console.log("App Store Connect membership and bundle access verified. No signing assets changed.");
+    return;
+  }
+
   // Recover prior SlowClaw CI assets. Keep the newest previous certificate
   // alive while Apple processes the current upload. Revoking the certificate
   // immediately after altool returns success makes App Store processing reject

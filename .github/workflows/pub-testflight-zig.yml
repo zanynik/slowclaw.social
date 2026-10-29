@@ -71,6 +71,36 @@ jobs:
             - name: Checkout
               uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+            - name: Prepare App Store Connect API key
+              env:
+                  APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+                  APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+                  APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+              run: |
+                  set -euo pipefail
+                  : "${APP_STORE_CONNECT_ISSUER_ID:?APP_STORE_CONNECT_ISSUER_ID secret is required}"
+                  : "${APP_STORE_CONNECT_KEY_ID:?APP_STORE_CONNECT_KEY_ID secret is required}"
+                  : "${APP_STORE_CONNECT_PRIVATE_KEY:?APP_STORE_CONNECT_PRIVATE_KEY secret is required}"
+
+                  printf '::add-mask::%s\n' "${APP_STORE_CONNECT_ISSUER_ID}"
+                  printf '::add-mask::%s\n' "${APP_STORE_CONNECT_KEY_ID}"
+
+                  ASC_KEY_DIR="${HOME}/.appstoreconnect/private_keys"
+                  printf 'ASC_KEY_DIR=%s\n' "${ASC_KEY_DIR}" >>"${GITHUB_ENV}"
+                  mkdir -p "${ASC_KEY_DIR}"
+                  chmod 700 "${ASC_KEY_DIR}"
+                  perl -pe 's/\\n/\n/g' <<<"${APP_STORE_CONNECT_PRIVATE_KEY}" >"${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+                  chmod 600 "${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+
+            - name: Check Apple membership before building
+              env:
+                  ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+                  ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+                  APP_BUNDLE_ID: com.slowclaw.app
+              run: |
+                  ASC_KEY_PATH="${ASC_KEY_DIR}/AuthKey_${ASC_KEY_ID}.p8" SIGNING_PREFLIGHT=1 \
+                    node .github/workflows/scripts/asc-issue-cert-profile.js
+
             - name: Setup Zig
               run: |
                   set -euo pipefail
@@ -200,27 +230,6 @@ jobs:
                     -configuration Release \
                     -destination "generic/platform=iOS" \
                     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
-
-            - name: Prepare App Store Connect API key
-              env:
-                  APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-                  APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-                  APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
-              run: |
-                  set -euo pipefail
-                  : "${APP_STORE_CONNECT_ISSUER_ID:?APP_STORE_CONNECT_ISSUER_ID secret is required}"
-                  : "${APP_STORE_CONNECT_KEY_ID:?APP_STORE_CONNECT_KEY_ID secret is required}"
-                  : "${APP_STORE_CONNECT_PRIVATE_KEY:?APP_STORE_CONNECT_PRIVATE_KEY secret is required}"
-
-                  printf '::add-mask::%s\n' "${APP_STORE_CONNECT_ISSUER_ID}"
-                  printf '::add-mask::%s\n' "${APP_STORE_CONNECT_KEY_ID}"
-
-                  ASC_KEY_DIR="${HOME}/.appstoreconnect/private_keys"
-                  printf 'ASC_KEY_DIR=%s\n' "${ASC_KEY_DIR}" >>"${GITHUB_ENV}"
-                  mkdir -p "${ASC_KEY_DIR}"
-                  chmod 700 "${ASC_KEY_DIR}"
-                  perl -pe 's/\\n/\n/g' <<<"${APP_STORE_CONNECT_PRIVATE_KEY}" >"${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
-                  chmod 600 "${ASC_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
 
             - name: Prepare Apple distribution signing assets
               env:
