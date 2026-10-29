@@ -49,3 +49,5 @@ ios-app/build/
 DerivedData/
 *.xcuserstate
 xcuserdata/
+
+web/public/cloud-config.json

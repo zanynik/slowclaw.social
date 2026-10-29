@@ -56,6 +56,26 @@ jobs:
           pnpm test
           pnpm build
           node tests/signaling-live.mjs "$SIGNALING_ORIGIN"
+      - name: Add optional public cloud configuration
+        if: env.LEGACY_LANDING != 'true'
+        working-directory: web
+        env:
+          SLOWCLAW_SUPABASE_URL: ${{ vars.SLOWCLAW_SUPABASE_URL }}
+          SLOWCLAW_SUPABASE_PUBLISHABLE_KEY: ${{ vars.SLOWCLAW_SUPABASE_PUBLISHABLE_KEY }}
+        run: |
+          python - <<'PYCONFIG'
+          import json, os, pathlib, re
+          url = os.environ.get('SLOWCLAW_SUPABASE_URL', '')
+          key = os.environ.get('SLOWCLAW_SUPABASE_PUBLISHABLE_KEY', '')
+          if bool(url) != bool(key):
+              raise SystemExit('Set both public cloud connection variables, or neither.')
+          value = {}
+          if url:
+              if not re.fullmatch(r'https://[a-z0-9]+\.supabase\.co', url) or not re.fullmatch(r'sb_publishable_[A-Za-z0-9_-]+', key):
+                  raise SystemExit('Use a Supabase HTTPS project URL and a publishable key.')
+              value = {'url': url, 'publishableKey': key}
+          pathlib.Path('dist-static/cloud-config.json').write_text(json.dumps(value))
+          PYCONFIG
       - uses: actions/configure-pages@v5
       - name: Upload companion
         if: env.LEGACY_LANDING != 'true'
