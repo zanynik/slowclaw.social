@@ -213,6 +213,16 @@ final class WebCompanion: ObservableObject {
             try await receiveUnits(plaintext, edit: edit, session: session, state: state, context: context)
             return
         }
+        if let input = try JSONSerialization.jsonObject(with:plaintext) as? [String:Any], input["kind"] as? String == "cloud_login" {
+            guard session.origin == "https://slowclaw.social", session.signaling != nil else { throw PublishingError.message("Cloud login requires the current SlowClaw website.") }
+            let result: [String:Any]
+            do { result = try await CloudSync.shared.authorizeBrowser(input) }
+            catch { result = ["error":error.localizedDescription] }
+            let receipt = try WebSessionProtocol.seal(JSONSerialization.data(withJSONObject:result),key:session.key,context:context+"/result")
+            let body = try JSONSerialization.data(withJSONObject:["status":result["error"] == nil ? "saved":"rejected","result":receipt.base64EncodedString()])
+            _ = try await request(session,path:"/note/"+edit.id,method:"POST",body:body)
+            return
+        }
         let operation = try JSONDecoder().decode(WebJournalEdit.self, from: plaintext)
         try operation.validate()
         let existing = try state.memory.get(key: operation.key)

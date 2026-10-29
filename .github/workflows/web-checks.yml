@@ -1,10 +1,10 @@
 name: Web companion checks
 on:
   pull_request:
-    paths: ['web/**', '.github/workflows/web-checks.yml']
+    paths: ['web/**', 'supabase/**', '.github/workflows/web-checks.yml']
   push:
-    branches: [main]
-    paths: ['web/**', '.github/workflows/web-checks.yml']
+    branches: [main, feat/supabase-cloud]
+    paths: ['web/**', 'supabase/**', '.github/workflows/web-checks.yml']
 permissions:
   contents: read
 jobs:
@@ -22,5 +22,6 @@ jobs:
       - run: npm install --global pnpm@11.25.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm run typecheck:cloud
       - run: pnpm test
       - run: pnpm build

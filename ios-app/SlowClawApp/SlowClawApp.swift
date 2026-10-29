@@ -126,6 +126,7 @@ struct SlowClawApp: App {
                     guard webScenePhase == .active else { return }
                     while !Task.isCancelled {
                         await WebCompanion.shared.sync(state: appState)
+                        await CloudSync.shared.sync(state: appState)
                         do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { break }
                     }
                 }
@@ -135,6 +136,7 @@ struct SlowClawApp: App {
                 // audio file URL here. enqueue copies it into the Inbox and the
                 // serial worker transcribes on-device + auto-stores as a journal.
                 .onOpenURL { url in
+                    if url.scheme == "slowclaw", url.host == "cloud" { CloudSync.shared.connectionLink(url); return }
                     guard url.scheme != "slowclaw" else { return }
                     voiceMemoImporter.appState = appState
                     voiceMemoImporter.enqueue(url)
@@ -145,12 +147,14 @@ struct SlowClawApp: App {
                     // Warm-delivery path for shared files routed through the
                     // app delegate (see ShareURLDelegate.openURLHandler).
                     urlDelegate.openURLHandler = { [weak voiceMemoImporter] url in
+                        if url.scheme == "slowclaw", url.host == "cloud" { CloudSync.shared.connectionLink(url); return }
                         guard url.scheme != "slowclaw" else { return }
                         voiceMemoImporter?.appState = appState
                         voiceMemoImporter?.enqueue(url)
                     }
                     // Flush any URL the delegate captured during cold launch.
                     for pending in urlDelegate.flushPending() {
+                        if pending.scheme == "slowclaw", pending.host == "cloud" { CloudSync.shared.connectionLink(pending); continue }
                         voiceMemoImporter.enqueue(pending)
                     }
                     // Reattach any user-started background model transfer so
@@ -253,6 +257,7 @@ final class ShareURLDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ app: UIApplication, open url: URL,
                      options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+        if url.scheme == "slowclaw", url.host == "cloud" { MainActor.assumeIsolated { CloudSync.shared.connectionLink(url) }; return true }
         if url.scheme == "slowclaw" { return true }
         // Warm delivery: hand it straight to the importer if wired; otherwise
         // capture for the cold-launch flush.
@@ -1797,6 +1802,7 @@ final class AppState: ObservableObject {
     /// Soft-delete a journal entry (moves it to Recently Deleted; the row stays
     /// in the store). Idempotent.
     func softDelete(key: String) {
+        CloudSync.shared.markDeleted(key, deleted: true)
         lastDeletedJournalKey = key
         var live = Self.softDeletedKeys()
         live[key] = Date().timeIntervalSince1970
@@ -1811,6 +1817,7 @@ final class AppState: ObservableObject {
 
     /// Restore a soft-deleted entry (removes it from Recently Deleted).
     func restore(key: String) {
+        CloudSync.shared.markDeleted(key, deleted: false)
         if lastDeletedJournalKey == key { lastDeletedJournalKey = nil }
         var live = Self.softDeletedKeys()
         live.removeValue(forKey: key)
@@ -3113,10 +3120,12 @@ struct JournalDetailView: View {
             }
         }
         .onAppear {
+            CloudSync.shared.beginEditing(entry.key)
             preparePlayerIfNeeded()
             extractWaveformIfNeeded()
         }
         .onDisappear {
+            CloudSync.shared.endEditing(entry.key)
             pollTimer?.invalidate()
             player?.stop()
         }
@@ -4244,6 +4253,7 @@ struct JournalView: View {
 // MARK: - Reads View (Feed loop) — crash-safe
 
 struct ReadsView: View {
+    @StateObject private var cloud = CloudSync.shared
     @EnvironmentObject var state: AppState
     @Environment(\.colorScheme) var scheme
     @State private var visibleCount = 10
@@ -4268,6 +4278,7 @@ struct ReadsView: View {
                     } label: { Image(systemName: "ellipsis.circle").font(.title3) }
                     .accessibilityLabel("Reading options")
                 }
+                CloudSuggestionCards(kind: "read")
                 if busy || addingLink {
                     ProgressView(state.jevBusy ? "Finding your ideas…" : state.jevFeedsBusy ? "Choosing your sources…" : "Finding your reads…")
                         .font(.subheadline).foregroundStyle(.secondary)
@@ -4276,11 +4287,11 @@ struct ReadsView: View {
                         Label(problem, systemImage: "arrow.clockwise").font(.footnote)
                     }
                 }
-                if !state.jevEnabled && !state.readsModelEnabled {
+                if !state.jevEnabled && !state.readsModelEnabled && !cloud.aiEnabled {
                     ContentUnavailableView("Cloud processing is off", systemImage: "cloud",
                         description: Text("Turn it on in Settings to find reads from your journals."))
                     Button("Open Settings") { state.selectedTab = .profile }
-                } else if items.isEmpty && !busy {
+                } else if items.isEmpty && !busy && !cloud.suggestions.contains(where: { $0.kind == "read" }) {
                     ContentUnavailableView(state.liteJournals.isEmpty ? "A feed that starts with you" : "Nothing new for you yet",
                         systemImage: "book",
                         description: Text(state.liteJournals.isEmpty ? "Record a journal to find things worth your time." : "Your next good read will appear here."))
