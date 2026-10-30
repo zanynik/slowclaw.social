@@ -23,3 +23,7 @@ verify_jwt = false
 
 [functions.cloud-login]
 verify_jwt = false
+
+[functions.cloud-qr]
+# Approval validates a user JWT in the handler; browser polling uses a random capability.
+verify_jwt = false

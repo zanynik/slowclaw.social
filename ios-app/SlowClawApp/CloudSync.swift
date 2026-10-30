@@ -145,6 +145,19 @@ import Security
         status = "Browser signed in with this phone. Enable cloud sync when ready."
         return browser
     }
+    func approveCloudCode(_ raw: String) async {
+        do {
+            guard let bytes = raw.data(using:.utf8), bytes.count<1500, let q = try JSONSerialization.jsonObject(with:bytes) as? [String:Any], q["type"] as? String == "slowclaw-cloud", let id = q["id"] as? String, WebSessionProtocol.validID(id), let keyHex = q["key"] as? String, WebSessionProtocol.validID(keyHex), let key = NostrEventVerifier.bytes(keyHex,count:32), let expires = q["expires"] as? Double, expires.isFinite, expires>Date().timeIntervalSince1970, expires<Date().timeIntervalSince1970+125 else { throw PublishingError.message("Scan a fresh cloud sign-in code from slowclaw.social.") }
+            let (data,response) = try await http.data(from:URL(string:"https://slowclaw-cloud-config.zanynik.workers.dev/")!)
+            guard (response as? HTTPURLResponse)?.statusCode == 200, let config = try JSONSerialization.jsonObject(with:data) as? [String:Any] else { throw PublishingError.message("Could not load the cloud connection.") }
+            let browser = try await authorizeBrowser(["config":config,"nonce":id,"expires":expires])
+            guard let a = account, let token = browser["access_token"] as? String else { throw PublishingError.message("Could not sign in with this phone.") }
+            let sealed = try WebSessionProtocol.seal(JSONSerialization.data(withJSONObject:browser),key:Data(key),context:"cloud-qr/"+id)
+            let reply = try await request(URL(string:a.url+"/functions/v1/cloud-qr")!,value:["action":"complete","id":id,"payload":sealed.base64EncodedString()],key:a.key,token:token)
+            guard let result = try JSONSerialization.jsonObject(with:reply) as? [String:Any], result["ok"] as? Bool == true else { throw PublishingError.message("Sign-in expired. Show a new cloud code and scan again.") }
+            try await loadSettings(); status = "Cloud browser signed in. Wi-Fi syncing is not needed."; signInError = nil
+        } catch { signInError = error.localizedDescription; status = error.localizedDescription }
+    }
     func signIn(email: String, password: String) async -> Bool {
         guard !busy else { return false }; busy = true; signInError = nil; defer { busy = false }
         do {
@@ -298,8 +311,15 @@ struct CloudWorkspaceView: View {
     @StateObject private var cloud = CloudSync.shared
     @State private var email = ""
     @State private var password = ""
+    @State private var scanning = false
+    @State private var scannedCode: String?
+    @State private var pendingCode: String?
     var body: some View {
         Form {
+            Section("Sign in on the web") {
+                Button("Scan cloud sign-in code") { scanning = true }.disabled(cloud.busy)
+                Text("Show the QR code on the website's Cloud page. Wi-Fi or mobile data both work.").font(.caption)
+            }
             if let error = cloud.signInError { Section { Text(error).foregroundStyle(.red).accessibilityLabel("Sign-in error: "+error) } }
             if !cloud.connected {
                 Section("Connect your cloud account") {
@@ -340,7 +360,15 @@ struct CloudWorkspaceView: View {
                 }
             }
             Section { Text(cloud.status).font(.caption); if cloud.busy { ProgressView() } }
-        }.navigationTitle("Cloud workspace").task { if cloud.connected { await cloud.sync(state:state,force:true) } }
+        }.navigationTitle("Cloud workspace")
+        .sheet(isPresented:$scanning,onDismiss:{pendingCode = scannedCode; scannedCode = nil}) {
+            NavigationStack { WebQRScanner { value in scannedCode = value; scanning = false }.navigationTitle("Scan cloud code").toolbar { ToolbarItem(placement:.cancellationAction) { Button("Cancel") { scanning = false } } } }
+        }
+        .confirmationDialog("Sign in on this browser?",isPresented:Binding(get:{pendingCode != nil},set:{if !$0 { pendingCode = nil }}),titleVisibility:.visible) {
+            if let code = pendingCode { Button("Approve cloud sign-in") { pendingCode = nil; Task { await cloud.approveCloudCode(code) } } }
+            Button("Cancel",role:.cancel) { pendingCode = nil }
+        } message: { Text("Only approve a code displayed on your own browser at slowclaw.social. This browser can access your cloud workspace.") }
+        .task { if cloud.connected { await cloud.sync(state:state,force:true) } }
     }
 }
 
