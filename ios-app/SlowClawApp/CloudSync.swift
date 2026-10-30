@@ -12,6 +12,7 @@ import Security
     struct Conflict: Codable, Identifiable { var id: String; var local: String; var remote: Entry }
     struct Ledger: Codable { var entries: [String:Checkpoint] = [:]; var deletions: [String:Bool] = [:]; var conflicts: [String:Conflict] = [:] }
     struct Suggestion: Identifiable { var id: String; var kind: String; var title: String; var text: String; var state: String; var sources: [String]; var url: URL? }
+    @Published private(set) var signInError: String?
     @Published var projectURL = ""
     @Published var publishableKey = ""
     @Published private(set) var connected = false
@@ -81,7 +82,10 @@ import Security
         r.httpBody = try value.map{try JSONSerialization.data(withJSONObject:$0)} ?? bytes
         let (data,response) = try await http.data(for:r)
         guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) else {
-            let code = ((try? JSONSerialization.jsonObject(with:data)) as? [String:Any])?["error"] as? String
+            let failure = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any]
+            let descriptions = ["email_not_confirmed":"Confirm your email first. Request a new confirmation link on SlowClaw Web.", "invalid_credentials":"Email or password is incorrect. Check both and try again.", "over_request_rate_limit":"Too many attempts. Wait a few minutes before signing in again."]
+            if let code = failure?["error_code"] as? String, let message = descriptions[code] { throw PublishingError.message(message) }
+            let code = failure?["error"] as? String
             throw PublishingError.message(code?.range(of:"^[A-Z_]{3,80}$",options:.regularExpression) != nil ? code! : "Cloud request failed. Local journals and pending edits are kept.")
         }
         return data
@@ -141,9 +145,27 @@ import Security
         status = "Browser signed in with this phone. Enable cloud sync when ready."
         return browser
     }
-    func signIn(email: String, password: String) async {
-        guard !busy else { return }; busy = true; defer { busy = false }
+    func approveCloudCode(_ raw: String) async {
         do {
+            guard let bytes = raw.data(using:.utf8), bytes.count<1500, let q = try JSONSerialization.jsonObject(with:bytes) as? [String:Any], q["type"] as? String == "slowclaw-cloud", let id = q["id"] as? String, WebSessionProtocol.validID(id), let keyHex = q["key"] as? String, WebSessionProtocol.validID(keyHex), let key = NostrEventVerifier.bytes(keyHex,count:32), let expires = q["expires"] as? Double, expires.isFinite, expires>Date().timeIntervalSince1970, expires<Date().timeIntervalSince1970+125 else { throw PublishingError.message("Scan a fresh cloud sign-in code from slowclaw.social.") }
+            let (data,response) = try await http.data(from:URL(string:"https://slowclaw-cloud-config.zanynik.workers.dev/")!)
+            guard (response as? HTTPURLResponse)?.statusCode == 200, let config = try JSONSerialization.jsonObject(with:data) as? [String:Any] else { throw PublishingError.message("Could not load the cloud connection.") }
+            let browser = try await authorizeBrowser(["config":config,"nonce":id,"expires":expires])
+            guard let a = account, let token = browser["access_token"] as? String else { throw PublishingError.message("Could not sign in with this phone.") }
+            let sealed = try WebSessionProtocol.seal(JSONSerialization.data(withJSONObject:browser),key:Data(key),context:"cloud-qr/"+id)
+            let reply = try await request(URL(string:a.url+"/functions/v1/cloud-qr")!,value:["action":"complete","id":id,"payload":sealed.base64EncodedString()],key:a.key,token:token)
+            guard let result = try JSONSerialization.jsonObject(with:reply) as? [String:Any], result["ok"] as? Bool == true else { throw PublishingError.message("Sign-in expired. Show a new cloud code and scan again.") }
+            try await loadSettings(); status = "Cloud browser signed in. Wi-Fi syncing is not needed."; signInError = nil
+        } catch { signInError = error.localizedDescription; status = error.localizedDescription }
+    }
+    func signIn(email: String, password: String) async -> Bool {
+        guard !busy else { return false }; busy = true; signInError = nil; defer { busy = false }
+        do {
+            if projectURL.isEmpty || publishableKey.isEmpty {
+                let (bytes,response) = try await http.data(from:URL(string:"https://slowclaw-cloud-config.zanynik.workers.dev/")!)
+                guard (response as? HTTPURLResponse)?.statusCode == 200, let value = try JSONSerialization.jsonObject(with:bytes) as? [String:Any], let url = value["url"] as? String, let key = value["publishableKey"] as? String else { throw PublishingError.message("Could not load the cloud connection. Check your internet and try again.") }
+                projectURL = try validate(url,key:key); publishableKey = key
+            }
             let host = try validate(projectURL,key:publishableKey)
             let data = try await request(URL(string:host+"/auth/v1/token?grant_type=password")!,value:["email":email,"password":password],key:publishableKey)
             guard let v = try JSONSerialization.jsonObject(with:data) as? [String:Any], let access = v["access_token"] as? String, let refresh = v["refresh_token"] as? String, let u = v["user"] as? [String:Any], let id = u["id"] as? String else { throw PublishingError.message("Confirm your email on SlowClaw Web, then sign in.") }
@@ -151,7 +173,8 @@ import Security
             try saveAccount(Account(url:host,key:publishableKey,access:access,refresh:refresh,expires:Date().timeIntervalSince1970+(v["expires_in"] as? Double ?? 3600),user:id))
             UserDefaults.standard.set(Self.hash(host+id),forKey:"slowclaw.cloud.local-owner")
             try readLedger(); connected = true; try await loadSettings(); status = "Signed in. Cloud sync uploads your journals when enabled."
-        } catch { status = error.localizedDescription }
+            return true
+        } catch { status = error.localizedDescription; signInError = error.localizedDescription; return false }
     }
     func signOut() async {
         guard !busy else { return }; busy = true; defer { busy = false }
@@ -288,17 +311,27 @@ struct CloudWorkspaceView: View {
     @StateObject private var cloud = CloudSync.shared
     @State private var email = ""
     @State private var password = ""
+    @State private var scanning = false
+    @State private var scannedCode: String?
+    @State private var pendingCode: String?
     var body: some View {
         Form {
+            Section("Sign in on the web") {
+                Button("Scan cloud sign-in code") { scanning = true }.disabled(cloud.busy)
+                Text("Show the QR code on the website's Cloud page. Wi-Fi or mobile data both work.").font(.caption)
+            }
+            if let error = cloud.signInError { Section { Text(error).foregroundStyle(.red).accessibilityLabel("Sign-in error: "+error) } }
             if !cloud.connected {
                 Section("Connect your cloud account") {
-                    TextField("Supabase project URL",text:$cloud.projectURL).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    TextField("Publishable key",text:$cloud.publishableKey).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    DisclosureGroup("Advanced connection") {
+                        TextField("Project URL",text:$cloud.projectURL).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        TextField("Publishable key",text:$cloud.publishableKey).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    }
                     TextField("Email",text:$email).textInputAutocapitalization(.never).keyboardType(.emailAddress).autocorrectionDisabled()
                     SecureField("Password",text:$password)
-                    Button("Sign in") { Task { await cloud.signIn(email:email,password:password); password = "" } }.disabled(cloud.busy)
+                    Button("Sign in") { Task { if await cloud.signIn(email:email,password:password) { password = "" } } }.disabled(cloud.busy)
                     Link("Create an account on SlowClaw Web",destination:URL(string:"https://slowclaw.social/?cloud")!)
-                    Text("Use the connection link in web Cloud Settings to fill the project details.").font(.caption)
+                    Text("The cloud connection is loaded automatically. Sign-in errors appear above.").font(.caption)
                 }
             } else {
                 Section("Your choices") {
@@ -327,7 +360,15 @@ struct CloudWorkspaceView: View {
                 }
             }
             Section { Text(cloud.status).font(.caption); if cloud.busy { ProgressView() } }
-        }.navigationTitle("Cloud workspace").task { if cloud.connected { await cloud.sync(state:state,force:true) } }
+        }.navigationTitle("Cloud workspace")
+        .sheet(isPresented:$scanning,onDismiss:{pendingCode = scannedCode; scannedCode = nil}) {
+            NavigationStack { WebQRScanner { value in scannedCode = value; scanning = false }.navigationTitle("Scan cloud code").toolbar { ToolbarItem(placement:.cancellationAction) { Button("Cancel") { scanning = false } } } }
+        }
+        .confirmationDialog("Sign in on this browser?",isPresented:Binding(get:{pendingCode != nil},set:{if !$0 { pendingCode = nil }}),titleVisibility:.visible) {
+            if let code = pendingCode { Button("Approve cloud sign-in") { pendingCode = nil; Task { await cloud.approveCloudCode(code) } } }
+            Button("Cancel",role:.cancel) { pendingCode = nil }
+        } message: { Text("Only approve a code displayed on your own browser at slowclaw.social. This browser can access your cloud workspace.") }
+        .task { if cloud.connected { await cloud.sync(state:state,force:true) } }
     }
 }
 

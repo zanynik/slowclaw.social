@@ -400,7 +400,7 @@ private struct WebJournalExport: FileDocument {
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { FileWrapper(regularFileWithContents: data) }
 }
 
-private struct WebQRScanner: UIViewControllerRepresentable {
+struct WebQRScanner: UIViewControllerRepresentable {
     let scanned: (String) -> Void
     func makeUIViewController(context: Context) -> ScannerController { ScannerController(scanned: scanned) }
     func updateUIViewController(_ controller: ScannerController, context: Context) {}
