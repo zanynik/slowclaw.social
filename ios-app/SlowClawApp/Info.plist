@@ -20,11 +20,6 @@
     <string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key>
     <string>$(CURRENT_PROJECT_VERSION)</string>
-    <key>CFBundleURLTypes</key>
-    <array><dict>
-        <key>CFBundleURLName</key><string>com.slowclaw.app.jev</string>
-        <key>CFBundleURLSchemes</key><array><string>slowclaw</string></array>
-    </dict></array>
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>UILaunchScreen</key>
@@ -49,12 +44,6 @@
     </array>
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
-    <key>NSPhotoLibraryAddUsageDescription</key>
-    <string>Save the quote cards and audio videos you choose to your photo library.</string>
-    <key>NSLocalNetworkUsageDescription</key>
-    <string>Connect directly to your laptop to securely sync SlowClaw journals without a cloud journal store.</string>
-    <key>NSCameraUsageDescription</key>
-    <string>Scan a SlowClaw Web QR code to connect your own browser.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>SlowClaw needs microphone access when you record audio journal entries.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
@@ -67,67 +56,7 @@
     <array>
         <string>audio</string>
     </array>
-    <!-- Permitted background task identifiers. The transcription task lets iOS
-         resume on-device transcription of an audio journal that was auto-saved
-         before its transcript landed, even after the app was killed. Best-effort
-         (OS-gated). Registered in ShareURLDelegate at launch. -->
-    <key>BGTaskSchedulerPermittedIdentifiers</key>
-    <array>
-        <string>com.slowclaw.app.transcription</string>
-    </array>
-    <!-- ATS is on by default (no NSAllowsArbitraryLoads). The only legacy
-         plain-HTTP feed in the catalog is www.aaronsw.com (Paul Graham essays
-         RSS), so it gets the sole insecure-load exception. -->
-    <key>NSAppTransportSecurity</key>
-    <dict>
-        <key>NSExceptionDomains</key>
-        <dict>
-            <key>www.aaronsw.com</key>
-            <dict>
-                <key>NSExceptionAllowsInsecureHTTPLoads</key>
-                <true/>
-            </dict>
-        </dict>
-    </dict>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
-    <!-- UIFileSharingEnabled is intentionally absent (defaults to NO):
-         Documents contains private journals, audio, and local models, and
-         export already happens explicitly through ShareLink. -->
-    <!-- iOS may deliver copy-style imports through its read-only Documents/Inbox.
-         SlowClaw copies shared audio into writable Documents/ImportedAudio (see
-         VoiceMemoImporter.copyAndValidateAudio); it never edits the source
-         file in place.
-         Declaring in-place support here made iOS take the open-in-place route
-         for Voice Memos shares, which stalls at the share sheet's "Preparing"
-         spinner and then silently dismisses without launching the app.
-         Copy-style import is what we want, so declare NO. -->
-    <key>LSSupportsOpeningDocumentsInPlace</key>
-    <false/>
-    <!-- Declare SlowClaw as a handler for audio files so iOS shows it in the
-         share sheet ("Copy to SlowClaw") from Voice Memos / Files. Alternate
-         rank keeps Voice Memos/Files as the default and SlowClaw as an option.
-         Mirrors web/src-tauri/Info.ios.plist CFBundleDocumentTypes. -->
-    <key>CFBundleDocumentTypes</key>
-    <array>
-        <dict>
-            <key>CFBundleTypeName</key>
-            <string>Audio Recording</string>
-            <key>CFBundleTypeRole</key>
-            <string>Viewer</string>
-            <key>LSHandlerRank</key>
-            <string>Alternate</string>
-            <key>LSItemContentTypes</key>
-            <array>
-                <string>public.audio</string>
-                <string>public.mpeg-4-audio</string>
-                <string>public.mp3</string>
-                <string>com.apple.m4a-audio</string>
-                <!-- com.apple.protected-mpeg-4-audio intentionally omitted: the
-                     runtime importer rejects DRM-protected audio at the decode
-                     validation step. -->
-            </array>
-        </dict>
-    </array>
 </dict>
 </plist>
