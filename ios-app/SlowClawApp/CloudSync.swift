@@ -1,389 +1,357 @@
 import Foundation
-import SwiftUI
-import CryptoKit
 import Security
 
-/// Opt-in cloud transport. Native capture and SQLite persistence still use the existing Swift/Zig boundary.
-@MainActor final class CloudSync: ObservableObject {
+/// Text-only sync with Supabase (journals, spaces, items). Audio never leaves
+/// the phone. Last edit wins per record; the server rejects older writes.
+@MainActor
+final class CloudSync: ObservableObject {
     static let shared = CloudSync()
-    struct Account: Codable { var url: String; var key: String; var access: String; var refresh: String; var expires: Double; var user: String }
-    struct Entry: Codable { var id: String; var text: String; var title: String; var source: String; var recorded_at: String; var revision: Int; var content_hash: String; var deleted_at: String? }
-    struct Checkpoint: Codable { var revision: Int; var localHash: String; var remoteHash: String; var audioHash: String?; var deleted: Bool }
-    struct Conflict: Codable, Identifiable { var id: String; var local: String; var remote: Entry }
-    struct Ledger: Codable { var entries: [String:Checkpoint] = [:]; var deletions: [String:Bool] = [:]; var conflicts: [String:Conflict] = [:] }
-    struct Suggestion: Identifiable { var id: String; var kind: String; var title: String; var text: String; var state: String; var sources: [String]; var url: URL? }
-    @Published private(set) var signInError: String?
-    @Published var projectURL = ""
-    @Published var publishableKey = ""
-    @Published private(set) var connected = false
-    @Published private(set) var busy = false
-    @Published private(set) var syncEnabled = false
-    @Published private(set) var aiEnabled = false
-    @Published private(set) var dailyEnabled = false
-    @Published private(set) var status = "Cloud sync is optional."
-    @Published private(set) var suggestions: [Suggestion] = []
-    @Published private(set) var conflicts: [Conflict] = []
-    private var account: Account?
-    private var ledger = Ledger()
-    private var editingKeys = Set<String>()
-    private var retryAfter = Date.distantPast
-    private static let keychain: [String:Any] = [kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:"com.slowclaw.cloud",kSecAttrAccount as String:"account"]
+
+    // Public client configuration (safe to ship; access is enforced by row-level security).
+    static let projectURL = "https://docmtelcjyvfyjlujibb.supabase.co"
+    static let publishableKey = "sb_publishable_w9ZdQLfwKjo56BDs24ziag_tt2_X_Z3"
+
+    struct Session: Codable {
+        var access: String
+        var refresh: String
+        var expires: Double
+        var userID: String
+        var email: String
+    }
+
+    @Published private(set) var session: Session?
+    @Published private(set) var syncing = false
+    @Published private(set) var lastSynced: Date?
+    @Published var status: String?
+
+    private let store = Store.shared
+    private var pushTask: Task<Void, Never>?
     private let http: URLSession = {
         let c = URLSessionConfiguration.ephemeral
-        c.timeoutIntervalForRequest = 60; c.timeoutIntervalForResource = 180
-        c.urlCache = nil; c.httpCookieStorage = nil
-        return URLSession(configuration:c)
+        c.timeoutIntervalForRequest = 30
+        c.urlCache = nil
+        return URLSession(configuration: c)
     }()
+
+    private static let keychain: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "com.slowclaw.supabase",
+        kSecAttrAccount as String: "session",
+    ]
+
     init() {
-        var q = Self.keychain; q[kSecReturnData as String] = true; var item: CFTypeRef?
-        if SecItemCopyMatching(q as CFDictionary,&item) == errSecSuccess, let data = item as? Data, let saved = try? JSONDecoder().decode(Account.self,from:data) {
-            account = saved; projectURL = saved.url; publishableKey = saved.key
-            do { try readLedger(); connected = true } catch { status = "Cloud checkpoints could not be read. Sync is paused." }
+        var q = Self.keychain
+        q[kSecReturnData as String] = true
+        var item: CFTypeRef?
+        if SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess, let data = item as? Data {
+            session = try? JSONDecoder().decode(Session.self, from: data)
         }
+        if let t = UserDefaults.standard.object(forKey: "slowclaw.sync.last") as? Double {
+            lastSynced = Date(timeIntervalSince1970: t)
+        }
+        store.onLocalChange = { [weak self] in self?.schedulePush() }
     }
-    func beginEditing(_ key: String) { editingKeys.insert(key) }
-    func endEditing(_ key: String) { editingKeys.remove(key) }
-    private static func hash(_ value: String) -> String { SHA256.hash(data:Data(value.utf8)).map{String(format:"%02x",$0)}.joined() }
-    private func validate(_ raw: String, key: String) throws -> String {
-        guard let u = URL(string:raw), u.scheme == "https", let host = u.host, host.hasSuffix(".supabase.co"), u.user == nil, u.password == nil, u.port == nil, u.query == nil, u.fragment == nil, u.path.isEmpty || u.path == "/", key.hasPrefix("sb_publishable_"), key.count < 500 else { throw PublishingError.message("Use your Supabase project HTTPS URL and publishable key, never a secret key.") }
-        return "https://"+host
+
+    var signedIn: Bool { session != nil }
+
+    // MARK: - Auth
+
+    struct CloudError: LocalizedError {
+        let message: String
+        /// True when the auth server answered 400/401/403 (as opposed to a network failure).
+        var rejected = false
+        var errorDescription: String? { message }
     }
-    func connectionLink(_ url: URL) {
-        guard !connected, url.scheme == "slowclaw", url.host == "cloud", let parts = URLComponents(url:url,resolvingAgainstBaseURL:false), let raw = parts.queryItems?.first(where:{$0.name == "url"})?.value, let key = parts.queryItems?.first(where:{$0.name == "key"})?.value else { return }
-        do { projectURL = try validate(raw,key:key); publishableKey = key; status = "Connection ready. Open Profile → Cloud workspace to sign in." } catch { status = error.localizedDescription }
+
+    func signIn(email: String, password: String) async throws {
+        let v = try await authRequest(path: "/auth/v1/token?grant_type=password",
+                                      body: ["email": email, "password": password])
+        try adopt(v, fallbackEmail: email)
+        // A new sign-in pushes everything once so the cloud has a full copy.
+        store.markAllDirty()
+        resetCursors()
+        await sync()
     }
-    private func saveAccount(_ next: Account) throws {
-        let bytes = try JSONEncoder().encode(next)
-        var q = Self.keychain; q[kSecValueData as String] = bytes; q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        let result = SecItemAdd(q as CFDictionary,nil)
-        if result == errSecDuplicateItem {
-            guard SecItemUpdate(Self.keychain as CFDictionary,[kSecValueData as String:bytes] as CFDictionary) == errSecSuccess else { throw PublishingError.message("Could not securely save cloud sign-in.") }
-        } else if result != errSecSuccess { throw PublishingError.message("Could not securely save cloud sign-in.") }
-        account = next
+
+    /// Returns true when a session was created immediately (no email confirmation needed).
+    func signUp(email: String, password: String) async throws -> Bool {
+        let v = try await authRequest(path: "/auth/v1/signup", body: ["email": email, "password": password])
+        if v["access_token"] != nil {
+            try adopt(v, fallbackEmail: email)
+            store.markAllDirty()
+            resetCursors()
+            await sync()
+            return true
+        }
+        return false
     }
-    private var ledgerURL: URL? {
-        guard let account, let directory = FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask).first else { return nil }
-        return directory.appendingPathComponent("CloudSync",isDirectory:true).appendingPathComponent(Self.hash(account.user)+".json")
+
+    func sendPasswordReset(email: String) async throws {
+        _ = try await authRequest(path: "/auth/v1/recover", body: ["email": email])
     }
-    private func readLedger() throws {
-        guard let url = ledgerURL else { return }
-        ledger = FileManager.default.fileExists(atPath:url.path) ? try JSONDecoder().decode(Ledger.self,from:Data(contentsOf:url)) : Ledger()
-        conflicts = Array(ledger.conflicts.values)
+
+    func signOut() {
+        session = nil
+        SecItemDelete(Self.keychain as CFDictionary)
+        resetCursors()
+        status = nil
     }
-    private func saveLedger() throws {
-        guard let url = ledgerURL else { throw PublishingError.message("Connect a cloud account first.") }
-        try FileManager.default.createDirectory(at:url.deletingLastPathComponent(),withIntermediateDirectories:true)
-        try JSONEncoder().encode(ledger).write(to:url,options:[.atomic,.completeFileProtection])
-        conflicts = Array(ledger.conflicts.values)
+
+    private func adopt(_ v: [String: Any], fallbackEmail: String) throws {
+        guard let access = v["access_token"] as? String, let refresh = v["refresh_token"] as? String else {
+            throw CloudError(message: "Sign-in did not return a session.")
+        }
+        let user = v["user"] as? [String: Any]
+        guard let id = user?["id"] as? String else { throw CloudError(message: "Sign-in returned no account.") }
+        let expiresIn = (v["expires_in"] as? Double) ?? Double(v["expires_in"] as? Int ?? 3600)
+        let s = Session(access: access, refresh: refresh, expires: Date().timeIntervalSince1970 + expiresIn,
+                        userID: id, email: (user?["email"] as? String) ?? fallbackEmail)
+        if let old = session, old.userID != s.userID { resetCursors() }
+        try saveSession(s)
     }
-    private func request(_ url: URL, method: String = "POST", value: [String:Any]? = nil, bytes: Data? = nil, key: String, token: String? = nil, mime: String = "application/json") async throws -> Data {
-        var r = URLRequest(url:url); r.httpMethod = method; r.setValue(key,forHTTPHeaderField:"apikey"); r.setValue(mime,forHTTPHeaderField:"Content-Type")
-        if let token { r.setValue("Bearer "+token,forHTTPHeaderField:"Authorization") }
-        r.httpBody = try value.map{try JSONSerialization.data(withJSONObject:$0)} ?? bytes
-        let (data,response) = try await http.data(for:r)
-        guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) else {
-            let failure = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any]
-            let descriptions = ["email_not_confirmed":"Confirm your email first. Request a new confirmation link on SlowClaw Web.", "invalid_credentials":"Email or password is incorrect. Check both and try again.", "over_request_rate_limit":"Too many attempts. Wait a few minutes before signing in again."]
-            if let code = failure?["error_code"] as? String, let message = descriptions[code] { throw PublishingError.message(message) }
-            let code = failure?["error"] as? String
-            throw PublishingError.message(code?.range(of:"^[A-Z_]{3,80}$",options:.regularExpression) != nil ? code! : "Cloud request failed. Local journals and pending edits are kept.")
+
+    private func saveSession(_ s: Session) throws {
+        let data = try JSONEncoder().encode(s)
+        SecItemDelete(Self.keychain as CFDictionary)
+        var q = Self.keychain
+        q[kSecValueData as String] = data
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        guard SecItemAdd(q as CFDictionary, nil) == errSecSuccess else {
+            throw CloudError(message: "Could not save the sign-in securely.")
+        }
+        session = s
+    }
+
+    private func validSession() async throws -> Session {
+        guard var s = session else { throw CloudError(message: "Not signed in.") }
+        if s.expires < Date().timeIntervalSince1970 + 120 {
+            let v: [String: Any]
+            do {
+                v = try await authRequest(path: "/auth/v1/token?grant_type=refresh_token", body: ["refresh_token": s.refresh])
+            } catch let error as CloudError where error.rejected {
+                // The refresh token was revoked or already used: the session cannot recover.
+                signOut()
+                throw CloudError(message: "Signed out. Please sign in again to keep syncing.")
+            }
+            guard let access = v["access_token"] as? String, let refresh = v["refresh_token"] as? String else {
+                throw CloudError(message: "Please sign in again.")
+            }
+            s.access = access
+            s.refresh = refresh
+            s.expires = Date().timeIntervalSince1970 + ((v["expires_in"] as? Double) ?? 3600)
+            try saveSession(s)
+        }
+        return s
+    }
+
+    private func authRequest(path: String, body: [String: Any]) async throws -> [String: Any] {
+        var r = URLRequest(url: URL(string: Self.projectURL + path)!)
+        r.httpMethod = "POST"
+        r.setValue(Self.publishableKey, forHTTPHeaderField: "apikey")
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        r.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await http.data(for: r)
+        let v = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        guard let code = (response as? HTTPURLResponse)?.statusCode, (200..<300).contains(code) else {
+            let known: [String: String] = [
+                "invalid_credentials": "Email or password is incorrect.",
+                "email_not_confirmed": "Confirm your email first (check your inbox), then sign in.",
+                "user_already_exists": "An account with this email already exists. Sign in instead.",
+                "weak_password": "Choose a longer password (at least 10 characters).",
+                "over_email_send_rate_limit": "Too many emails were sent. Try again in an hour.",
+                "over_request_rate_limit": "Too many attempts. Wait a few minutes.",
+            ]
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let rejected = [400, 401, 403].contains(status)
+            if let c = v["error_code"] as? String, let m = known[c] { throw CloudError(message: m, rejected: rejected) }
+            let msg = (v["msg"] as? String) ?? (v["error_description"] as? String) ?? (v["message"] as? String)
+            throw CloudError(message: msg ?? "Request failed (\(status)).", rejected: rejected)
+        }
+        return v
+    }
+
+    // MARK: - REST
+
+    private func rest(_ method: String, _ pathAndQuery: String, body: Data? = nil, prefer: String? = nil) async throws -> Data {
+        let s = try await validSession()
+        var r = URLRequest(url: URL(string: Self.projectURL + "/rest/v1/" + pathAndQuery)!)
+        r.httpMethod = method
+        r.setValue(Self.publishableKey, forHTTPHeaderField: "apikey")
+        r.setValue("Bearer " + s.access, forHTTPHeaderField: "Authorization")
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let prefer { r.setValue(prefer, forHTTPHeaderField: "Prefer") }
+        r.httpBody = body
+        let (data, response) = try await http.data(for: r)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 401 {
+            throw CloudError(message: "Session expired. Please sign in again.")
+        }
+        guard (200..<300).contains(code) else {
+            let v = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            throw CloudError(message: (v?["message"] as? String) ?? "Sync failed (\(code)).")
         }
         return data
     }
-    private func session() async throws -> Account {
-        guard var a = account else { throw PublishingError.message("Sign in to your cloud account first.") }
-        if a.expires < Date().timeIntervalSince1970+120 {
-            let data = try await request(URL(string:a.url+"/auth/v1/token?grant_type=refresh_token")!,value:["refresh_token":a.refresh],key:a.key)
-            guard let v = try JSONSerialization.jsonObject(with:data) as? [String:Any], let access = v["access_token"] as? String, let refresh = v["refresh_token"] as? String else { throw PublishingError.message("Sign in again to renew your cloud connection.") }
-            a.access = access; a.refresh = refresh; a.expires = Date().timeIntervalSince1970+(v["expires_in"] as? Double ?? 3600); try saveAccount(a)
+
+    // MARK: - Sync
+
+    private func cursorKey(_ table: String) -> String { "slowclaw.sync.cursor.\(table)" }
+
+    private func resetCursors() {
+        for t in ["journals", "spaces", "space_items"] { UserDefaults.standard.removeObject(forKey: cursorKey(t)) }
+    }
+
+    func schedulePush() {
+        guard signedIn else { return }
+        pushTask?.cancel()
+        pushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            await self?.sync()
         }
-        return a
     }
-    private func api(_ value: [String:Any], worker: Bool = false) async throws -> [String:Any] {
-        let a = try await session()
-        let data = try await request(URL(string:a.url+"/functions/v1/"+(worker ? "cloud-worker":"cloud-api"))!,value:value,key:a.key,token:a.access)
-        guard let v = try JSONSerialization.jsonObject(with:data) as? [String:Any] else { throw PublishingError.message("Cloud returned an unreadable response.") }
-        if let error = v["error"] as? String { throw PublishingError.message(error) }
-        return v
-    }
-    private func entries(_ value: Any?) throws -> [Entry] { try JSONDecoder().decode([Entry].self,from:JSONSerialization.data(withJSONObject:value ?? [])) }
-    private func loadSettings() async throws {
-        let value = try await api(["action":"settings"])
-        if let s = value["settings"] as? [String:Any] { syncEnabled = s["sync_enabled"] as? Bool ?? false; aiEnabled = s["ai_enabled"] as? Bool ?? false; dailyEnabled = s["daily_enabled"] as? Bool ?? false }
-    }
-    /// Only the approved, encrypted browser connection may request this scoped login.
-    func authorizeBrowser(_ input: [String:Any]) async throws -> [String:Any] {
-        guard !busy, let config = input["config"] as? [String:Any], let raw = config["url"] as? String, let key = config["publishableKey"] as? String, let nonce = input["nonce"] as? String, WebSessionProtocol.validID(nonce), let expires = input["expires"] as? Double, expires > Date().timeIntervalSince1970, expires < Date().timeIntervalSince1970+125 else { throw PublishingError.message("Cloud sign-in expired. Retry from your connected browser.") }
-        busy = true; defer { busy = false }
-        let host = try validate(raw,key:key)
-        // Trust deployment configuration, never an arbitrary project supplied by a browser.
-        let (data,response) = try await http.data(from:URL(string:"https://slowclaw-cloud-config.zanynik.workers.dev/")!)
-        guard (response as? HTTPURLResponse)?.statusCode == 200, let trusted = try JSONSerialization.jsonObject(with:data) as? [String:Any], trusted["url"] as? String == host, trusted["publishableKey"] as? String == key else { throw PublishingError.message("Cloud connection does not match SlowClaw's deployed project.") }
-        let endpoint = URL(string:host+"/functions/v1/cloud-login")!, secret = try NostrIdentity.secret()
-        func login() async throws -> [String:Any] {
-            let body = try JSONSerialization.data(withJSONObject:["nonce":nonce],options:[.withoutEscapingSlashes])
-            var request = URLRequest(url:endpoint); request.httpMethod = "POST"; request.httpBody = body
-            request.setValue("application/json",forHTTPHeaderField:"Content-Type"); request.setValue(key,forHTTPHeaderField:"apikey")
-            request.setValue(try WebSessionProtocol.authorization(url:endpoint,method:"POST",body:body,secret:secret),forHTTPHeaderField:"Authorization")
-            let (bytes,result) = try await http.data(for:request)
-            guard let result = result as? HTTPURLResponse, result.statusCode == 200, let value = try JSONSerialization.jsonObject(with:bytes) as? [String:Any] else { throw PublishingError.message("Cloud phone sign-in failed. Retry shortly.") }
-            return value
-        }
-        let browser = try await login()
-        guard let user = browser["user"] as? [String:Any], let id = user["id"] as? String else { throw PublishingError.message("Cloud sign-in returned no account.") }
-        let binding = Self.hash(host+id)
-        if let owner = UserDefaults.standard.string(forKey:"slowclaw.cloud.local-owner"), owner != binding { throw PublishingError.message("Local journals belong to another cloud account. Sign in with that account first.") }
-        if let account, account.user != id || account.url != host { throw PublishingError.message("This phone is connected to a different cloud account.") }
-        if account == nil {
-            // Separate Auth sessions: browser logout/refresh never consumes the phone's refresh token.
-            let phone = try await login()
-            guard let access = phone["access_token"] as? String, let refresh = phone["refresh_token"] as? String else { throw PublishingError.message("Could not save the phone connection.") }
-            try saveAccount(Account(url:host,key:key,access:access,refresh:refresh,expires:Date().timeIntervalSince1970+(phone["expires_in"] as? Double ?? 3600),user:id))
-            UserDefaults.standard.set(binding,forKey:"slowclaw.cloud.local-owner")
-            try readLedger(); projectURL = host; publishableKey = key; connected = true
-        }
-        status = "Browser signed in with this phone. Enable cloud sync when ready."
-        return browser
-    }
-    func approveCloudCode(_ raw: String) async {
+
+    func sync() async {
+        guard signedIn, !syncing else { return }
+        syncing = true
+        defer { syncing = false }
         do {
-            guard let bytes = raw.data(using:.utf8), bytes.count<1500, let q = try JSONSerialization.jsonObject(with:bytes) as? [String:Any], q["type"] as? String == "slowclaw-cloud", let id = q["id"] as? String, WebSessionProtocol.validID(id), let keyHex = q["key"] as? String, WebSessionProtocol.validID(keyHex), let key = NostrEventVerifier.bytes(keyHex,count:32), let expires = q["expires"] as? Double, expires.isFinite, expires>Date().timeIntervalSince1970, expires<Date().timeIntervalSince1970+125 else { throw PublishingError.message("Scan a fresh cloud sign-in code from slowclaw.social.") }
-            let (data,response) = try await http.data(from:URL(string:"https://slowclaw-cloud-config.zanynik.workers.dev/")!)
-            guard (response as? HTTPURLResponse)?.statusCode == 200, let config = try JSONSerialization.jsonObject(with:data) as? [String:Any] else { throw PublishingError.message("Could not load the cloud connection.") }
-            let browser = try await authorizeBrowser(["config":config,"nonce":id,"expires":expires])
-            guard let a = account, let token = browser["access_token"] as? String else { throw PublishingError.message("Could not sign in with this phone.") }
-            let sealed = try WebSessionProtocol.seal(JSONSerialization.data(withJSONObject:browser),key:Data(key),context:"cloud-qr/"+id)
-            let reply = try await request(URL(string:a.url+"/functions/v1/cloud-qr")!,value:["action":"complete","id":id,"payload":sealed.base64EncodedString()],key:a.key,token:token)
-            guard let result = try JSONSerialization.jsonObject(with:reply) as? [String:Any], result["ok"] as? Bool == true else { throw PublishingError.message("Sign-in expired. Show a new cloud code and scan again.") }
-            try await loadSettings(); status = "Cloud browser signed in. Wi-Fi syncing is not needed."; signInError = nil
-        } catch { signInError = error.localizedDescription; status = error.localizedDescription }
+            // Pull first so same-named default spaces merge before we push ours.
+            try await pull("spaces") { rows in for r in rows { if let s = Self.space(from: r) { self.store.applyRemote(space: s) } } }
+            try await pull("journals") { rows in for r in rows { if let j = Self.journal(from: r) { self.store.applyRemote(journal: j) } } }
+            try await pull("space_items") { rows in for r in rows { if let i = Self.item(from: r) { self.store.applyRemote(item: i) } } }
+            try await push()
+            lastSynced = Date()
+            UserDefaults.standard.set(lastSynced!.timeIntervalSince1970, forKey: "slowclaw.sync.last")
+            status = nil
+        } catch {
+            status = error.localizedDescription
+        }
     }
-    func signIn(email: String, password: String) async -> Bool {
-        guard !busy else { return false }; busy = true; signInError = nil; defer { busy = false }
-        do {
-            if projectURL.isEmpty || publishableKey.isEmpty {
-                let (bytes,response) = try await http.data(from:URL(string:"https://slowclaw-cloud-config.zanynik.workers.dev/")!)
-                guard (response as? HTTPURLResponse)?.statusCode == 200, let value = try JSONSerialization.jsonObject(with:bytes) as? [String:Any], let url = value["url"] as? String, let key = value["publishableKey"] as? String else { throw PublishingError.message("Could not load the cloud connection. Check your internet and try again.") }
-                projectURL = try validate(url,key:key); publishableKey = key
+
+    private func pull(_ table: String, apply: ([[String: Any]]) -> Void) async throws {
+        var firstPage = true
+        while true {
+            var query = "\(table)?select=*&order=synced_at.asc&limit=500"
+            if let cursor = UserDefaults.standard.string(forKey: cursorKey(table)) {
+                // Re-read a short window before the cursor: a row from a transaction that
+                // committed late can carry an earlier synced_at. Re-applying rows is harmless.
+                // Only on the first page, so paging always moves forward.
+                let since = firstPage
+                    ? (CloudDates.parse(cursor).map { CloudDates.format($0.addingTimeInterval(-60)) } ?? cursor)
+                    : cursor
+                let encoded = since.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? since
+                query += "&synced_at=gt.\(encoded)"
             }
-            let host = try validate(projectURL,key:publishableKey)
-            let data = try await request(URL(string:host+"/auth/v1/token?grant_type=password")!,value:["email":email,"password":password],key:publishableKey)
-            guard let v = try JSONSerialization.jsonObject(with:data) as? [String:Any], let access = v["access_token"] as? String, let refresh = v["refresh_token"] as? String, let u = v["user"] as? [String:Any], let id = u["id"] as? String else { throw PublishingError.message("Confirm your email on SlowClaw Web, then sign in.") }
-            if let owner = UserDefaults.standard.string(forKey:"slowclaw.cloud.local-owner"), owner != Self.hash(host+id) { throw PublishingError.message("These local journals are linked to another cloud account. Sign in to that account to avoid mixing private workspaces.") }
-            try saveAccount(Account(url:host,key:publishableKey,access:access,refresh:refresh,expires:Date().timeIntervalSince1970+(v["expires_in"] as? Double ?? 3600),user:id))
-            UserDefaults.standard.set(Self.hash(host+id),forKey:"slowclaw.cloud.local-owner")
-            try readLedger(); connected = true; try await loadSettings(); status = "Signed in. Cloud sync uploads your journals when enabled."
-            return true
-        } catch { status = error.localizedDescription; signInError = error.localizedDescription; return false }
-    }
-    func signOut() async {
-        guard !busy else { return }; busy = true; defer { busy = false }
-        do { let a = try await session(); _ = try await request(URL(string:a.url+"/auth/v1/logout?scope=local")!,value:[:],key:a.key,token:a.access)
-            SecItemDelete(Self.keychain as CFDictionary); account = nil; connected = false; syncEnabled = false; aiEnabled = false; dailyEnabled = false; suggestions = []; conflicts = []; status = "Signed out. Local journals and pending checkpoints are kept."
-        } catch { status = "Could not revoke the session. Retry sign out. "+error.localizedDescription }
-    }
-    func configure(_ name: String, enabled: Bool) async {
-        guard !busy else { return }; busy = true; defer { busy = false }
-        do { _ = try await api(["action":"configure",name:enabled]); try await loadSettings(); status = "Cloud choices saved." } catch { status = error.localizedDescription }
-    }
-    func markDeleted(_ key: String, deleted: Bool) {
-        guard connected else { return }; ledger.deletions[key] = deleted
-        if !deleted { ledger.entries[key]?.audioHash = nil }
-        do { try saveLedger() } catch { status = "Cloud deletion could not be queued. Retry sync before clearing the local journal." }
-    }
-    private func remember(_ row: Entry, local: String, audio: String? = nil) throws {
-        ledger.entries[row.id] = Checkpoint(revision:row.revision,localHash:Self.hash(local),remoteHash:row.content_hash,audioHash:audio ?? ledger.entries[row.id]?.audioHash,deleted:row.deleted_at != nil)
-        // Do not lose a deletion/restore intent that arrived while a network save was in flight.
-        if let intent = ledger.deletions[row.id], intent == (row.deleted_at != nil) { ledger.deletions.removeValue(forKey:row.id) }
-        try saveLedger()
-    }
-    private func push(id: String, text: String, title: String, source: String, revision: Int, deleted: Bool = false, recordedAt: String? = nil) async throws -> Entry? {
-        var v: [String:Any] = ["action":"save","id":id,"text":text,"title":String(title.prefix(240)),"source":source,"revision":revision,"deleted":deleted]
-        if let recordedAt {
-            let raw = recordedAt.replacingOccurrences(of:" ",with:"T"), f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime,.withFractionalSeconds]
-            if let date = f.date(from:raw) ?? ISO8601DateFormatter().date(from:raw.hasSuffix("Z") ? raw:raw+"Z") { v["recorded_at"] = ISO8601DateFormatter().string(from:date) }
-        }
-        let result = try await api(v)
-        if result["ok"] as? Bool == true { return try entries([result["entry"]!]).first }
-        if let r = result["conflict"] as? [String:Any], let row = try entries([r]).first { ledger.conflicts[id] = Conflict(id:id,local:text,remote:row); try saveLedger() }
-        throw PublishingError.message("A journal changed on another device. Both versions are kept under Cloud conflicts.")
-    }
-    func sync(state: AppState, force: Bool = false) async {
-        guard connected, !busy, force || Date() >= retryAfter else { return }; busy = true; defer { busy = false }
-        do {
-            try await loadSettings(); guard syncEnabled else { status = "Cloud sync paused. Journals stay on this phone."; return }
-            let snapshot = try await api(["action":"snapshot"])
-            var remote = try entries(snapshot["entries"]), offset = remote.count
-            while offset > 0 && offset % 200 == 0 && offset < 20000 { let p = try entries(try await api(["action":"snapshot","offset":offset])["entries"]); remote += p; offset += p.count; if p.count < 200 { break } }
-            for row in remote where ledger.conflicts[row.id] == nil && !editingKeys.contains(row.id) {
-                let local = try state.memory.get(key:row.id), old = ledger.entries[row.id]
-                if ledger.deletions[row.id] != nil { continue }
-                if row.deleted_at != nil, old?.deleted == true, old?.revision == row.revision { continue }
-                if let local, let old, Self.hash(local.content) != old.localHash {
-                    if row.revision != old.revision { ledger.conflicts[row.id] = Conflict(id:row.id,local:local.content,remote:row); try saveLedger() }; continue
-                }
-                if let local, old == nil, Self.hash(local.content) != row.content_hash { ledger.conflicts[row.id] = Conflict(id:row.id,local:local.content,remote:row); try saveLedger(); continue }
-                if row.deleted_at != nil { if local != nil { state.softDelete(key:row.id) }; try remember(row,local:local?.content ?? "") }
-                else if old?.revision != row.revision || local == nil {
-                    if AppState.softDeletedKeys()[row.id] != nil { ledger.deletions[row.id] = true; try saveLedger(); continue }
-                    try state.memory.store(key:row.id,content:row.text,category:"daily",sessionID:nil,source:row.source,mediaURL:local?.mediaURL); try remember(row,local:row.text)
-                }
+            let data = try await rest("GET", query)
+            let rows = (try JSONSerialization.jsonObject(with: data) as? [[String: Any]]) ?? []
+            apply(rows)
+            firstPage = false
+            if let last = rows.last?["synced_at"] as? String {
+                UserDefaults.standard.set(last, forKey: cursorKey(table))
             }
-            for (id,deleted) in Array(ledger.deletions) where ledger.conflicts[id] == nil {
-                let local = try state.memory.get(key:id)
-                if let row = try await push(id:id,text:deleted ? "":local?.content ?? "",title:"",source:local?.source ?? "text",revision:ledger.entries[id]?.revision ?? 0,deleted:deleted) { try remember(row,local:local?.content ?? "") }
-            }
-            await state.refreshJournals(); var count = 0
-            for entry in state.journals where !state.excludedMemoryKeys.contains(entry.key) && !editingKeys.contains(entry.key) && ledger.conflicts[entry.key] == nil {
-                if count >= 10 { break }; let old = ledger.entries[entry.key]
-                if old?.localHash != Self.hash(entry.content) || old?.deleted == true {
-                    if let row = try await push(id:entry.key,text:entry.content,title:journalTitleOf(entry),source:entry.source ?? "text",revision:old?.revision ?? 0,recordedAt:entry.timestamp) { try remember(row,local:entry.content); count += 1 }
-                }
-                if let rel = entry.mediaURL, let file = AudioRecorder.absoluteURL(forMediaRelativePath:rel), ledger.entries[entry.key]?.audioHash == nil { try await upload(file,entry:entry.key); count += 1 }
-            }
-            try await downloadAudio(snapshot["media"],state:state); suggestions = decodeSuggestions(snapshot)
-            status = conflicts.isEmpty ? "Cloud checked. \(count) uploads saved." : "\(conflicts.count) cloud conflict(s) need review. Both versions are kept."
-            retryAfter = Date().addingTimeInterval(30)
-        } catch { status = error.localizedDescription; retryAfter = Date().addingTimeInterval(60) }
-    }
-    private func upload(_ file: URL, entry: String) async throws {
-        guard let docs = FileManager.default.urls(for:.documentDirectory,in:.userDomainMask).first, file.standardizedFileURL.path.hasPrefix(docs.standardizedFileURL.path+"/") else { throw PublishingError.message("Audio must be inside the app's own recordings directory.") }
-        let size = (try FileManager.default.attributesOfItem(atPath:file.path)[.size] as? NSNumber)?.intValue ?? 0
-        guard size > 0, size <= 52428800 else { throw PublishingError.message("Cloud audio uploads support files up to 50 MB. The original stays on this phone.") }
-        let bytes = try Data(contentsOf:file,options:.mappedIfSafe), hash = SHA256.hash(data:bytes).map{String(format:"%02x",$0)}.joined()
-        let mime = ["m4a":"audio/mp4","mp3":"audio/mpeg","wav":"audio/wav","aac":"audio/aac","flac":"audio/flac"][file.pathExtension.lowercased()] ?? "application/octet-stream"
-        let start = try await api(["action":"upload_start","entry_id":entry,"filename":file.lastPathComponent,"mime":mime,"bytes":size,"sha256":hash])
-        if start["complete"] as? Bool != true {
-            guard let m = start["media"] as? [String:Any], let id = m["id"] as? String, let signed = start["upload"] as? [String:Any], let raw = signed["signedUrl"] as? String, let url = URL(string:raw), url.host == URL(string:account!.url)?.host else { throw PublishingError.message("Cloud upload could not be prepared.") }
-            let a = try await session()
-            do { _ = try await request(url,method:"PUT",bytes:bytes,key:a.key,mime:mime) } catch { /* The verification endpoint resolves an already uploaded object or a lost receipt. */ }
-            _ = try await api(["action":"upload_finish","id":id])
-        }
-        ledger.entries[entry]?.audioHash = hash; try saveLedger()
-    }
-    private func downloadAudio(_ value: Any?, state: AppState) async throws {
-        guard let rows = value as? [[String:Any]], let docs = FileManager.default.urls(for:.documentDirectory,in:.userDomainMask).first else { return }; var count = 0
-        for m in rows where count < 2 {
-            guard m["status"] as? String == "uploaded", let key = m["entry_id"] as? String, ledger.conflicts[key] == nil, !editingKeys.contains(key), let id = m["id"] as? String, let hash = m["sha256"] as? String, let local = try state.memory.get(key:key), local.mediaURL == nil, let size = m["bytes"] as? Int, size <= 52428800, AppState.softDeletedKeys()[key] == nil else { continue }
-            let link = try await api(["action":"audio_url","id":id])
-            guard let raw = link["signedUrl"] as? String, let url = URL(string:raw), url.host == URL(string:account!.url)?.host else { continue }
-            let a = try await session(), bytes = try await request(url,method:"GET",key:a.key)
-            guard bytes.count == size, SHA256.hash(data:bytes).map({String(format:"%02x",$0)}).joined() == hash else { throw PublishingError.message("Downloaded audio failed its checksum. Retry sync.") }
-            let ext = URL(fileURLWithPath:m["filename"] as? String ?? "audio.m4a").pathExtension.lowercased()
-            let rel = "CloudAudio/"+Self.hash(id)+"."+(["m4a","mp3","wav","aac","flac","webm"].contains(ext) ? ext:"m4a"), file = docs.appendingPathComponent(rel)
-            try FileManager.default.createDirectory(at:file.deletingLastPathComponent(),withIntermediateDirectories:true); try bytes.write(to:file,options:[.atomic,.completeFileProtection])
-            try state.memory.store(key:key,content:local.content,category:local.category,sessionID:local.sessionID,source:local.source,mediaURL:rel); ledger.entries[key]?.audioHash = hash; try saveLedger(); count += 1
+            if rows.count < 500 { break }
         }
     }
-    private func decodeSuggestions(_ snapshot: [String:Any]) -> [Suggestion] {
-        var rows: [Suggestion] = []
-        for a in snapshot["artifacts"] as? [[String:Any]] ?? [] {
-            guard a["stale"] as? Bool != true, a["state"] as? String != "dismissed", let id = a["id"] as? String, let kind = a["kind"] as? String, let body = a["body"] as? [String:Any] else { continue }
-            rows.append(Suggestion(id:id,kind:kind,title:a["title"] as? String ?? "Reflection",text:body["text"] as? String ?? "",state:a["state"] as? String ?? "proposed",sources:(a["sources"] as? [[String:Any]] ?? []).compactMap{$0["id"] as? String},url:nil))
+
+    private func push() async throws {
+        guard let s = session else { return }
+        let spaces = store.dirtySpaces
+        let journals = store.dirtyJournals
+        let items = store.dirtyItems.filter { item in store.spaces.contains { $0.id == item.spaceID } }
+        try await upsert("spaces", spaces.map { Self.row(from: $0, user: s.userID) })
+        try await upsert("journals", journals.map { Self.row(from: $0, user: s.userID) })
+        try await upsert("space_items", items.map { Self.row(from: $0, user: s.userID) })
+        store.markPushed(journals: journals, spaces: spaces, items: items)
+    }
+
+    private func upsert(_ table: String, _ rows: [[String: Any]]) async throws {
+        var start = 0
+        while start < rows.count {
+            let batch = Array(rows[start..<min(start + 200, rows.count)])
+            let body = try JSONSerialization.data(withJSONObject: batch)
+            _ = try await rest("POST", "\(table)?on_conflict=user_id,id", body: body,
+                               prefer: "resolution=merge-duplicates,return=minimal")
+            start += 200
         }
-        for r in snapshot["reads"] as? [[String:Any]] ?? [] where r["read_at"] is NSNull {
-            if let raw = r["url"] as? String, let url = URL(string:raw), url.scheme == "https" { rows.append(Suggestion(id:raw,kind:"read",title:r["title"] as? String ?? "Read",text:r["reason"] as? String ?? "",state:"unread",sources:[],url:url)) }
-        }
-        return rows
     }
-    func review(_ item: Suggestion, state: String) async {
-        guard !busy else { return }; busy = true; defer { busy = false }
-        do { _ = try await api(item.kind == "read" ? ["action":"read","url":item.id] : ["action":"artifact_state","id":item.id,"state":state]); suggestions = decodeSuggestions(try await api(["action":"snapshot"])); status = "Saved." } catch { status = error.localizedDescription }
+
+    // MARK: - Row mapping
+
+    private static func orNull(_ value: String?) -> Any {
+        if let value { return value }
+        return NSNull()
     }
-    func processNow() async {
-        guard !busy else { return }; busy = true; defer { busy = false }
-        do { _ = try await api(["action":"enqueue","daily":dailyEnabled,"retry":true]); _ = try await api([:],worker:true); status = "Processing requested. Remaining work continues in the cloud." } catch { status = error.localizedDescription }
+
+    private static func row(from j: Journal, user: String) -> [String: Any] {
+        ["user_id": user, "id": j.id, "title": j.title, "body": j.body,
+         "space_id": orNull(j.spaceID), "created_at": CloudDates.format(j.createdAt),
+         "updated_at": CloudDates.format(j.updatedAt), "deleted": j.deleted]
     }
-    func keepConflictAsCopy(_ conflict: Conflict, state: AppState) async {
-        guard !busy else { return }
-        let key = await state.storeJournalNow(text:conflict.local,source:"cloud_conflict_copy",mediaURL:nil)
-        guard !key.isEmpty else { status = "Could not save the copy. Both versions are still kept."; return }
-        do {
-            if conflict.remote.deleted_at != nil { state.softDelete(key:conflict.id) }
-            else { let old = try state.memory.get(key:conflict.id); try state.memory.store(key:conflict.id,content:conflict.remote.text,category:"daily",sessionID:nil,source:conflict.remote.source,mediaURL:old?.mediaURL) }
-            try remember(conflict.remote,local:conflict.remote.text); ledger.conflicts.removeValue(forKey:conflict.id); try saveLedger(); await state.refreshJournals(); status = "Your edit is a new journal. The original now follows the cloud revision."
-        } catch { status = error.localizedDescription }
+
+    private static func row(from s: Space, user: String) -> [String: Any] {
+        ["user_id": user, "id": s.id, "name": s.name, "icon": s.icon, "summary": s.summary,
+         "sort_order": s.sortOrder, "created_at": CloudDates.format(s.createdAt),
+         "updated_at": CloudDates.format(s.updatedAt), "deleted": s.deleted]
+    }
+
+    private static func row(from i: SpaceItem, user: String) -> [String: Any] {
+        ["user_id": user, "id": i.id, "space_id": i.spaceID, "journal_id": orNull(i.journalID),
+         "kind": i.kind.rawValue, "text": i.text, "done": i.done,
+         "created_at": CloudDates.format(i.createdAt), "updated_at": CloudDates.format(i.updatedAt),
+         "deleted": i.deleted]
+    }
+
+    private static func journal(from r: [String: Any]) -> Journal? {
+        guard let id = r["id"] as? String,
+              let created = CloudDates.parse(r["created_at"] as? String),
+              let updated = CloudDates.parse(r["updated_at"] as? String) else { return nil }
+        let spaceID = r["space_id"] as? String
+        return Journal(id: id, title: r["title"] as? String ?? "", body: r["body"] as? String ?? "",
+                       transcript: nil, audioPath: nil, spaceID: spaceID, createdAt: created, updatedAt: updated,
+                       status: .ready, organized: spaceID != nil, deleted: r["deleted"] as? Bool ?? false, dirty: false)
+    }
+
+    private static func space(from r: [String: Any]) -> Space? {
+        guard let id = r["id"] as? String, let name = r["name"] as? String,
+              let created = CloudDates.parse(r["created_at"] as? String),
+              let updated = CloudDates.parse(r["updated_at"] as? String) else { return nil }
+        return Space(id: id, name: name, icon: r["icon"] as? String ?? "tray", summary: r["summary"] as? String ?? "",
+                     sortOrder: r["sort_order"] as? Int ?? 0, createdAt: created, updatedAt: updated,
+                     deleted: r["deleted"] as? Bool ?? false, dirty: false)
+    }
+
+    private static func item(from r: [String: Any]) -> SpaceItem? {
+        guard let id = r["id"] as? String, let spaceID = r["space_id"] as? String,
+              let kind = ItemKind(rawValue: r["kind"] as? String ?? ""),
+              let created = CloudDates.parse(r["created_at"] as? String),
+              let updated = CloudDates.parse(r["updated_at"] as? String) else { return nil }
+        return SpaceItem(id: id, spaceID: spaceID, journalID: r["journal_id"] as? String, kind: kind,
+                         text: r["text"] as? String ?? "", done: r["done"] as? Bool ?? false,
+                         createdAt: created, updatedAt: updated, deleted: r["deleted"] as? Bool ?? false, dirty: false)
     }
 }
 
-struct CloudWorkspaceView: View {
-    @EnvironmentObject var state: AppState
-    @StateObject private var cloud = CloudSync.shared
-    @State private var email = ""
-    @State private var password = ""
-    @State private var scanning = false
-    @State private var scannedCode: String?
-    @State private var pendingCode: String?
-    var body: some View {
-        Form {
-            Section("Sign in on the web") {
-                Button("Scan cloud sign-in code") { scanning = true }.disabled(cloud.busy)
-                Text("Show the QR code on the website's Cloud page. Wi-Fi or mobile data both work.").font(.caption)
-            }
-            if let error = cloud.signInError { Section { Text(error).foregroundStyle(.red).accessibilityLabel("Sign-in error: "+error) } }
-            if !cloud.connected {
-                Section("Connect your cloud account") {
-                    DisclosureGroup("Advanced connection") {
-                        TextField("Project URL",text:$cloud.projectURL).textInputAutocapitalization(.never).autocorrectionDisabled()
-                        TextField("Publishable key",text:$cloud.publishableKey).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    }
-                    TextField("Email",text:$email).textInputAutocapitalization(.never).keyboardType(.emailAddress).autocorrectionDisabled()
-                    SecureField("Password",text:$password)
-                    Button("Sign in") { Task { if await cloud.signIn(email:email,password:password) { password = "" } } }.disabled(cloud.busy)
-                    Link("Create an account on SlowClaw Web",destination:URL(string:"https://slowclaw.social/?cloud")!)
-                    Text("The cloud connection is loaded automatically. Sign-in errors appear above.").font(.caption)
-                }
-            } else {
-                Section("Your choices") {
-                    Text("Cloud sync uploads your journals and recordings into your private account. Cloud AI sends selected content to your chosen model provider. Local capture remains available.")
-                    Toggle("Sync journals & audio",isOn:Binding(get:{cloud.syncEnabled},set:{v in Task { await cloud.configure("sync_enabled",enabled:v) }}))
-                    Toggle("Allow cloud AI",isOn:Binding(get:{cloud.aiEnabled},set:{v in Task { await cloud.configure("ai_enabled",enabled:v) }}))
-                    Toggle("Daily reflection, Spaces & Reads",isOn:Binding(get:{cloud.dailyEnabled},set:{v in Task { await cloud.configure("daily_enabled",enabled:v) }}))
-                    Button("Sync now") { Task { await cloud.sync(state:state,force:true) } }
-                    Button("Process now") { Task { await cloud.processNow() } }.disabled(!cloud.syncEnabled || !cloud.aiEnabled)
-                    Link("Provider keys, budgets & export",destination:URL(string:"https://slowclaw.social/?cloud")!)
-                    Button("Sign out") { Task { await cloud.signOut() } }
-                }.disabled(cloud.busy)
-                if !cloud.conflicts.isEmpty { Section("Cloud conflicts") { ForEach(cloud.conflicts) { item in VStack(alignment:.leading,spacing:8) { Text(item.local).lineLimit(5); Text("Cloud: "+(item.remote.deleted_at == nil ? item.remote.text:"Deleted")).font(.caption).lineLimit(5); Button("Keep my edit as a new journal") { Task { await cloud.keepConflictAsCopy(item,state:state) } } } } } }
-                ForEach(["space","action","read","moment","daily","summary"],id:\.self) { kind in
-                    let items = cloud.suggestions.filter{$0.kind == kind}
-                    if !items.isEmpty { Section(["space":"Spaces","action":"Action points","read":"Reads","moment":"Moments","daily":"Daily reflection","summary":"Journal summaries"][kind] ?? kind) { ForEach(items) { item in
-                        VStack(alignment:.leading,spacing:8) {
-                            Text(item.title).font(.headline); Text(item.text).textSelection(.enabled)
-                            if let url = item.url { Link("Open article",destination:url); Button("Mark read") { Task { await cloud.review(item,state:"completed") } } }
-                            else { Text(item.state == "proposed" ? "Suggestion for your review":item.state).font(.caption).foregroundStyle(.secondary)
-                                HStack { if item.state == "proposed" { Button("Keep") { Task { await cloud.review(item,state:"accepted") } } }; if kind == "action" && item.state != "completed" { Button("Done") { Task { await cloud.review(item,state:"completed") } } }; Button("Dismiss") { Task { await cloud.review(item,state:"dismissed") } } }
-                                ForEach(item.sources,id:\.self) { key in if let entry = state.journals.first(where:{$0.key == key}) { NavigationLink("Source journal") { JournalDetailView(entry:entry) } } }
-                            }
-                        }.padding(.vertical,6)
-                    } } }
-                }
-            }
-            Section { Text(cloud.status).font(.caption); if cloud.busy { ProgressView() } }
-        }.navigationTitle("Cloud workspace")
-        .sheet(isPresented:$scanning,onDismiss:{pendingCode = scannedCode; scannedCode = nil}) {
-            NavigationStack { WebQRScanner { value in scannedCode = value; scanning = false }.navigationTitle("Scan cloud code").toolbar { ToolbarItem(placement:.cancellationAction) { Button("Cancel") { scanning = false } } } }
-        }
-        .confirmationDialog("Sign in on this browser?",isPresented:Binding(get:{pendingCode != nil},set:{if !$0 { pendingCode = nil }}),titleVisibility:.visible) {
-            if let code = pendingCode { Button("Approve cloud sign-in") { pendingCode = nil; Task { await cloud.approveCloudCode(code) } } }
-            Button("Cancel",role:.cancel) { pendingCode = nil }
-        } message: { Text("Only approve a code displayed on your own browser at slowclaw.social. This browser can access your cloud workspace.") }
-        .task { if cloud.connected { await cloud.sync(state:state,force:true) } }
-    }
-}
+/// Postgres timestamps come back with microseconds and an offset; normalize to milliseconds.
+enum CloudDates {
+    private static let withFraction: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let plain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
 
-struct CloudSuggestionCards: View {
-    let kind: String
-    @EnvironmentObject var state: AppState
-    @StateObject private var cloud = CloudSync.shared
-    var body: some View {
-        if cloud.connected && cloud.syncEnabled { ForEach(Array(cloud.suggestions.filter{$0.kind == kind}.prefix(6))) { item in
-            VStack(alignment:.leading,spacing:10) {
-                Text(kind == "read" ? "From your cloud reading refresh":"A moment from your journals").font(.caption).foregroundStyle(.secondary)
-                Text(item.title).font(.headline); Text(item.text).textSelection(.enabled)
-                if let url = item.url { Link("Open article",destination:url); Button("Mark read") { Task { await cloud.review(item,state:"completed") } } }
-                else { ShareLink(item:item.text) { Label("Share…",systemImage:"square.and.arrow.up") }; Text("Sharing happens only when you choose it.").font(.caption).foregroundStyle(.secondary); Button("Dismiss") { Task { await cloud.review(item,state:"dismissed") } } }
-            }.padding(16).background(Color.secondary.opacity(0.07),in:RoundedRectangle(cornerRadius:20))
-        } }
+    static func format(_ date: Date) -> String { withFraction.string(from: date) }
+
+    static func parse(_ raw: String?) -> Date? {
+        guard var s = raw, !s.isEmpty else { return nil }
+        s = s.replacingOccurrences(of: " ", with: "T")
+        s = s.replacingOccurrences(of: #"(\.\d{3})\d+"#, with: "$1", options: .regularExpression)
+        if s.hasSuffix("+00") { s += ":00" }
+        return withFraction.date(from: s) ?? plain.date(from: s)
     }
 }

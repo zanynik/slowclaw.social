@@ -27,27 +27,3 @@ credentials.json
 
 # Worktrees
 .worktrees/
-
-# --- Zig core ---
-# Local toolchain (downloaded locally, never committed — ~177MB binary).
-# CI downloads its own copy to tools-zig/ (different path, also ignored below).
-tools/
-tools-zig/
-# Vendored llama.cpp ships tools/mtmd/ (the multimodal layer). The broad
-# `tools/` rule above is for the local zig toolchain; un-ignore ONLY the
-# vendored mtmd source so it's tracked like the rest of vendor/llama.cpp.
-!zig-src/vendor/llama.cpp/tools/
-
-# Zig build cache + install output
-zig-src/.zig-cache/
-zig-src/zig-out/
-
-# --- iOS app ---
-# The Xcode project is regenerated from ios-app/project.yml via XcodeGen.
-ios-app/SlowClaw.xcodeproj/
-ios-app/build/
-DerivedData/
-*.xcuserstate
-xcuserdata/
-
-web/public/cloud-config.json
