@@ -58,6 +58,8 @@ final class CloudSync: ObservableObject {
 
     struct CloudError: LocalizedError {
         let message: String
+        /// True when the auth server answered 400/401/403 (as opposed to a network failure).
+        var rejected = false
         var errorDescription: String? { message }
     }
 
@@ -123,7 +125,14 @@ final class CloudSync: ObservableObject {
     private func validSession() async throws -> Session {
         guard var s = session else { throw CloudError(message: "Not signed in.") }
         if s.expires < Date().timeIntervalSince1970 + 120 {
-            let v = try await authRequest(path: "/auth/v1/token?grant_type=refresh_token", body: ["refresh_token": s.refresh])
+            let v: [String: Any]
+            do {
+                v = try await authRequest(path: "/auth/v1/token?grant_type=refresh_token", body: ["refresh_token": s.refresh])
+            } catch let error as CloudError where error.rejected {
+                // The refresh token was revoked or already used: the session cannot recover.
+                signOut()
+                throw CloudError(message: "Signed out. Please sign in again to keep syncing.")
+            }
             guard let access = v["access_token"] as? String, let refresh = v["refresh_token"] as? String else {
                 throw CloudError(message: "Please sign in again.")
             }
@@ -152,9 +161,11 @@ final class CloudSync: ObservableObject {
                 "over_email_send_rate_limit": "Too many emails were sent. Try again in an hour.",
                 "over_request_rate_limit": "Too many attempts. Wait a few minutes.",
             ]
-            if let c = v["error_code"] as? String, let m = known[c] { throw CloudError(message: m) }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let rejected = [400, 401, 403].contains(status)
+            if let c = v["error_code"] as? String, let m = known[c] { throw CloudError(message: m, rejected: rejected) }
             let msg = (v["msg"] as? String) ?? (v["error_description"] as? String) ?? (v["message"] as? String)
-            throw CloudError(message: msg ?? "Request failed (\((response as? HTTPURLResponse)?.statusCode ?? 0)).")
+            throw CloudError(message: msg ?? "Request failed (\(status)).", rejected: rejected)
         }
         return v
     }
@@ -219,15 +230,23 @@ final class CloudSync: ObservableObject {
     }
 
     private func pull(_ table: String, apply: ([[String: Any]]) -> Void) async throws {
+        var firstPage = true
         while true {
             var query = "\(table)?select=*&order=synced_at.asc&limit=500"
             if let cursor = UserDefaults.standard.string(forKey: cursorKey(table)) {
-                let encoded = cursor.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? cursor
+                // Re-read a short window before the cursor: a row from a transaction that
+                // committed late can carry an earlier synced_at. Re-applying rows is harmless.
+                // Only on the first page, so paging always moves forward.
+                let since = firstPage
+                    ? (CloudDates.parse(cursor).map { CloudDates.format($0.addingTimeInterval(-60)) } ?? cursor)
+                    : cursor
+                let encoded = since.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? since
                 query += "&synced_at=gt.\(encoded)"
             }
             let data = try await rest("GET", query)
             let rows = (try JSONSerialization.jsonObject(with: data) as? [[String: Any]]) ?? []
             apply(rows)
+            firstPage = false
             if let last = rows.last?["synced_at"] as? String {
                 UserDefaults.standard.set(last, forKey: cursorKey(table))
             }

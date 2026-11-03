@@ -25,7 +25,9 @@ Read `README.md` first.
   - `LegacyImport.swift` — one-time read-only import from the old `slowclaw.sqlite`.
   - `AudioRecorder.swift`, `SpeechTranscriber.swift`, `TimedTranscript.swift`,
     `RecordingSilence.swift` — proven capture/transcription code; change with care.
-  - Views: `JournalViews.swift`, `RecordView.swift`, `SpacesViews.swift`, `SettingsView.swift`.
+  - `Shortcuts.swift` — "Record a journal" App Intent (Siri, Action Button, Shortcuts).
+  - Views: `JournalViews.swift`, `RecordView.swift`, `TodosView.swift`, `SpacesViews.swift`,
+    `SettingsView.swift`.
 - `web/` — static site, plain JS. Set text with `textContent` only (the `h()` helper does this).
 - `supabase/migrations/` — never edit an applied migration; add a new one.
 

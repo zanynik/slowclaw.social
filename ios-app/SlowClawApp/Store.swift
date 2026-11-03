@@ -10,6 +10,9 @@ final class Store: ObservableObject {
     @Published private(set) var spaces: [Space] = []
     @Published private(set) var items: [SpaceItem] = []
     @Published var loadError: String?
+    /// Set when store.json exists but could not be decoded. Saving stays off for the
+    /// rest of the session so the unreadable file is never replaced by an empty store.
+    private var readOnly = false
 
     /// Called after any local change; CloudSync uses it to schedule a push.
     var onLocalChange: (@MainActor () -> Void)?
@@ -58,7 +61,8 @@ final class Store: ObservableObject {
             let backup = url.deletingLastPathComponent()
                 .appendingPathComponent("store-unreadable-\(Int(Date().timeIntervalSince1970)).json")
             try? FileManager.default.copyItem(at: url, to: backup)
-            loadError = "Saved journals could not be read. A backup copy was kept."
+            readOnly = true
+            loadError = "Saved journals could not be read. A backup copy was kept, and nothing new will be saved until the app is updated or reinstalled."
         }
     }
 
@@ -81,7 +85,7 @@ final class Store: ObservableObject {
     }
 
     func saveNow() {
-        guard loadError == nil else { return }
+        guard !readOnly else { return }
         let snap = Snapshot(version: 1, journals: journals, spaces: spaces, items: items)
         do {
             let url = Self.fileURL

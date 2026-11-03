@@ -109,8 +109,12 @@ async function fetchAll(table) {
   return rows;
 }
 
+// Background refreshes must not rebuild the editor under the cursor.
+const editorOpen = () => !!document.querySelector('.editor');
+const renderUnlessEditing = () => { if (!editorOpen()) render(); };
+
 async function loadAll() {
-  state.loading = true; state.error = null; render();
+  state.loading = true; state.error = null; renderUnlessEditing();
   try {
     if (!state.session.email) {
       const res = await fetch(SUPABASE_URL + '/auth/v1/user', { headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + (await token()) } });
@@ -123,10 +127,10 @@ async function loadAll() {
     state.error = e.message;
   }
   state.loading = false;
-  render();
+  renderUnlessEditing();
 }
 
-async function save(table, row) {
+async function save(table, row, { quiet = false } = {}) {
   const now = new Date().toISOString();
   const full = { ...row, updated_at: now };
   flash('Saving…');
@@ -139,8 +143,10 @@ async function save(table, row) {
     flash('Saved');
   } catch (e) {
     flash(e.message, true);
+    return false;
   }
-  render();
+  if (!quiet) render();
+  return true;
 }
 
 const uid = prefix => prefix + '_' + (crypto.randomUUID ? crypto.randomUUID()
@@ -238,6 +244,7 @@ function shell() {
     h('div', { class: 'brand' }, 'SlowClaw', h('button', { class: 'icon', title: 'Refresh', onclick: loadAll }, '↻')),
     h('ul', { class: 'nav' },
       navItem('All journals', '#/journals', state.journals.length, r.view === 'journals'),
+      navItem('To-dos', '#/todos', state.items.filter(i => i.kind === 'todo' && !i.done && spaceById(i.space_id)).length, r.view === 'todos'),
       navItem('Unsorted', '#/unsorted', unsorted.length, r.view === 'unsorted')),
     h('div', { class: 'nav-title' }, 'Spaces'),
     h('ul', { class: 'nav' },
@@ -251,6 +258,8 @@ function shell() {
   if (state.loading && !state.journals.length && !state.spaces.length) content = h('p', { class: 'muted' }, 'Loading…');
   else if (r.view === 'space') content = spaceView(r.id);
   else if (r.view === 'journal') content = journalView(r.id);
+  else if (r.view === 'new') content = journalView(null);
+  else if (r.view === 'todos') content = todosView();
   else if (r.view === 'unsorted') content = journalsView('Unsorted', unsorted, 'Journals the phone has not filed yet. Open one to choose a space.');
   else content = journalsView('Journal', state.journals);
 
@@ -342,34 +351,93 @@ function itemsCard(space, kind, items) {
 }
 
 function journalView(id) {
-  const j = state.journals.find(x => x.id === id);
-  if (!j) return h('p', { class: 'muted' }, 'This entry was not found.');
+  // id === null is a new entry that is only stored once it has some text.
+  let j = id === null ? null : state.journals.find(x => x.id === id);
+  if (id !== null && !j) return h('p', { class: 'muted' }, 'This entry was not found.');
+  const isNew = !j;
+  if (isNew) j = { id: uid('journal'), title: '', body: '', space_id: null, created_at: new Date().toISOString(), deleted: false };
+  let stored = !isNew;
   const title = h('input', { class: 'title-input', type: 'text', value: j.title, placeholder: 'Title' });
-  const body = h('textarea', { value: j.body });
+  const body = h('textarea', { value: j.body, placeholder: isNew ? 'Write…' : null });
   const select = h('select', {},
     h('option', { value: '' }, 'Unsorted'),
     sortedSpaces().map(s => h('option', { value: s.id }, s.name)));
   select.value = j.space_id || '';
-  const fromThis = state.items.filter(i => i.journal_id === id);
+  const current = () => ({ ...j, title: title.value.trim(), body: body.value, space_id: select.value || null });
+  const dirty = () => { const c = current(); return c.title !== j.title || c.body !== j.body || c.space_id !== (j.space_id || null); };
+
+  // Autosave quietly a moment after typing stops, and when leaving the page.
+  let timer, closed = false;
+  const persist = async (quiet = true) => {
+    clearTimeout(timer);
+    if (closed || !dirty()) return;
+    const next = current();
+    if (!stored && !next.title && !next.body.trim()) return;
+    if (await save('journals', next, { quiet })) {
+      j = state.journals.find(x => x.id === next.id) || next;
+      if (!stored) { stored = true; history.replaceState(null, '', '#/journal/' + encodeURIComponent(next.id)); }
+    }
+  };
+  const later = () => { clearTimeout(timer); timer = setTimeout(persist, 1200); };
+  title.addEventListener('input', later);
+  body.addEventListener('input', later);
+  select.addEventListener('change', () => persist());
+  title.addEventListener('blur', () => persist());
+  body.addEventListener('blur', () => persist());
+  // Leaving the editor: save and redraw the page we moved to with the new text.
+  window.addEventListener('hashchange', () => persist(false), { once: true });
+
+  const fromThis = isNew ? [] : state.items.filter(i => i.journal_id === id);
+  if (isNew) setTimeout(() => body.focus(), 0);
   return h('div', { class: 'editor' },
     h('button', { class: 'link', onclick: () => history.back() }, '← Back'),
     title,
-    h('div', { class: 'small muted' }, new Date(j.created_at).toLocaleString()),
+    h('div', { class: 'small muted' }, new Date(j.created_at).toLocaleString(), ' · saves automatically'),
     h('label', { class: 'small muted' }, 'Space', select),
     body,
     h('div', { class: 'toolbar' },
-      h('button', { class: 'primary', onclick: () => save('journals', { ...j, title: title.value.trim(), body: body.value, space_id: select.value || null }) }, 'Save'),
-      h('button', { onclick: () => { if (confirm('Delete this entry?')) { save('journals', { ...j, deleted: true, title: '', body: '' }); go('#/'); } } }, 'Delete')),
+      h('button', { class: 'primary', onclick: () => go('#/') }, 'Done'),
+      isNew ? null : h('button', { onclick: () => { if (confirm('Delete this entry?')) { closed = true; clearTimeout(timer); save('journals', { ...j, deleted: true, title: '', body: '' }); go('#/'); } } }, 'Delete')),
     fromThis.length ? h('div', { class: 'card' }, h('h2', {}, 'From this entry'),
-      h('ul', { class: 'items' }, fromThis.map(i => h('li', {}, h('span', { class: 'chip' }, i.kind), h('span', { class: 'text' }, i.text))))) : null);
+      h('ul', { class: 'items' }, fromThis.map(i => h('li', {}, h('span', { class: 'chip' }, KINDS.find(k => k.id === i.kind)?.one || i.kind), h('span', { class: 'text' }, i.text))))) : null);
+}
+
+function todosView() {
+  const spaces = sortedSpaces();
+  if (!spaces.length) return h('div', {}, h('h1', {}, 'To-dos'), h('p', { class: 'muted' }, 'Create a space first.'));
+  let last = '';
+  try { last = localStorage.getItem('slowclaw.todos.space') || ''; } catch {}
+  const select = h('select', {}, spaces.map(s => h('option', { value: s.id }, s.name)));
+  select.value = spaceById(last) ? last : spaces[0].id;
+  const input = h('input', { type: 'text', placeholder: 'Add a to-do…' });
+  const add = () => {
+    const text = input.value.trim();
+    if (!text) return;
+    try { localStorage.setItem('slowclaw.todos.space', select.value); } catch {}
+    save('space_items', { id: uid('item'), space_id: select.value, journal_id: null, kind: 'todo', text, done: false, created_at: new Date().toISOString(), deleted: false });
+  };
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
+  const groups = spaces.map(s => [s, state.items.filter(i => i.space_id === s.id && i.kind === 'todo' && !i.done)
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))]).filter(([, list]) => list.length);
+  const row = item => h('li', {},
+    h('input', { type: 'checkbox', 'aria-label': 'Done', onchange: () => save('space_items', { ...item, done: true }) }),
+    h('span', { class: 'text' }, item.text),
+    item.journal_id && state.journals.some(j => j.id === item.journal_id)
+      ? h('button', { class: 'icon', title: 'Open source journal', onclick: () => go('#/journal/' + encodeURIComponent(item.journal_id)) }, '↗')
+      : null);
+  return h('div', {},
+    h('h1', {}, 'To-dos'),
+    h('div', { class: 'add-row' }, input, select, h('button', { onclick: add }, 'Add')),
+    groups.length
+      ? groups.map(([s, list]) => h('div', { class: 'card' },
+          h('h2', {}, h('button', { class: 'link', onclick: () => go('#/space/' + encodeURIComponent(s.id)) }, s.name)),
+          h('ul', { class: 'items' }, list.map(row))))
+      : h('p', { class: 'muted' }, 'Nothing to do. To-dos from your recordings show up here.'));
 }
 
 // ---------- actions ----------
-async function newJournal() {
-  const id = uid('journal');
-  const now = new Date().toISOString();
-  await save('journals', { id, title: '', body: '', space_id: null, created_at: now, deleted: false });
-  go('#/journal/' + encodeURIComponent(id));
+function newJournal() {
+  go('#/new');
 }
 
 async function addSpace() {

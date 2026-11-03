@@ -8,6 +8,7 @@ struct RecordView: View {
     @State private var title = ""
     @State private var saving = false
     @State private var started = false
+    @State private var confirmDiscard = false
 
     var body: some View {
         NavigationStack {
@@ -79,9 +80,16 @@ struct RecordView: View {
             .padding(.top)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Discard", role: .destructive) { Task { await discard() } }
-                        .disabled(saving)
+                    Button("Discard", role: .destructive) {
+                        // A stray tap must not throw away a real recording.
+                        if recorder.elapsedSeconds >= 5 { confirmDiscard = true } else { Task { await discard() } }
+                    }
+                    .disabled(saving)
                 }
+            }
+            .confirmationDialog("Discard this recording?", isPresented: $confirmDiscard, titleVisibility: .visible) {
+                Button("Discard recording", role: .destructive) { Task { await discard() } }
+                Button("Keep recording", role: .cancel) {}
             }
             .interactiveDismissDisabled()
             .task {

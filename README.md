@@ -28,8 +28,15 @@ audio stays on the phone                      owner-only RLS                  st
 | Tab | What it does |
 | --- | --- |
 | Journal | All entries by day, search, big record button, write button. Tap an entry to edit it, move it to another space, replay its audio or see the original transcript. |
+| To-dos | Every open to-do from every space in one list. Check things off, or add one and pick its space. |
 | Spaces | Your areas of life. Each space has an on-device overview, to-dos (with checkboxes), ideas, questions, notes and its journal entries. "Organize unsorted" files older entries in one go. |
 | Settings | Email sign-in for sync, "open straight into recording", automatic organizing, export. |
+
+Say "Record a journal in SlowClaw" to Siri, or put the **Record journal** shortcut on the Action
+Button or Lock Screen, to start recording without tapping through the app. Leaving a recording
+takes a confirmation once it is longer than a few seconds.
+
+The website has the same To-dos page, and journal edits there save automatically.
 
 Journals from earlier SlowClaw builds are imported automatically on first launch (read-only;
 the old database and recordings are left in place).

@@ -35,7 +35,7 @@ struct SlowClawApp: App {
     }
 }
 
-enum AppTab: Hashable { case journal, spaces, settings }
+enum AppTab: Hashable { case journal, todos, spaces, settings }
 
 struct RootView: View {
     @EnvironmentObject private var store: Store
@@ -44,12 +44,16 @@ struct RootView: View {
     @State private var showRecorder = false
     @AppStorage("slowclaw.open-into-recording") private var openIntoRecording = false
     @State private var didAutoOpen = false
+    @ObservedObject private var recordRequest = RecordRequest.shared
 
     var body: some View {
         TabView(selection: $tab) {
             JournalListView(showRecorder: $showRecorder)
                 .tabItem { Label("Journal", systemImage: "book.closed") }
                 .tag(AppTab.journal)
+            TodosView()
+                .tabItem { Label("To-dos", systemImage: "checklist") }
+                .tag(AppTab.todos)
             SpacesView()
                 .tabItem { Label("Spaces", systemImage: "square.grid.2x2") }
                 .tag(AppTab.spaces)
@@ -61,10 +65,18 @@ struct RootView: View {
             RecordView()
         }
         .onAppear {
-            if openIntoRecording && !didAutoOpen {
+            if (openIntoRecording || recordRequest.pending) && !didAutoOpen {
                 didAutoOpen = true
+                recordRequest.pending = false
                 showRecorder = true
             }
+        }
+        .onChange(of: recordRequest.pending) { _, pending in
+            // Siri / Action Button / Shortcuts asked to record.
+            guard pending else { return }
+            recordRequest.pending = false
+            tab = .journal
+            showRecorder = true
         }
         .alert("Storage problem", isPresented: Binding(
             get: { store.loadError != nil },
