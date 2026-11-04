@@ -75,6 +75,10 @@ final class Processor: ObservableObject {
             } else if autoOrganize,
                       let j = store.visibleJournals.last(where: { $0.status == .ready && !$0.organized && $0.createdAt >= autoOrganizeSince && $0.spaceID == nil }) {
                 await organize(j.id)
+            } else if let j = store.visibleJournals.last(where: { BookStore.shared.needsReading($0) }) {
+                // Oldest first, so the book grows in the order life happened.
+                activity = "Reading into your book…"
+                await BookStore.shared.read(j)
             } else {
                 break
             }

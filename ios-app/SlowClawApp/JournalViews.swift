@@ -8,6 +8,7 @@ struct JournalListView: View {
     @Binding var showRecorder: Bool
     @State private var search = ""
     @State private var showWriter = false
+    @State private var showSettings = false
 
     private var filtered: [Journal] {
         let all = store.visibleJournals
@@ -63,11 +64,16 @@ struct JournalListView: View {
             .navigationDestination(for: String.self) { id in JournalDetailView(journalID: id) }
             .refreshable { await cloud.sync() }
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                        .accessibilityLabel("Settings")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showWriter = true } label: { Image(systemName: "square.and.pencil") }
                         .accessibilityLabel("Write")
                 }
             }
+            .sheet(isPresented: $showSettings) { SettingsView() }
             .overlay(alignment: .bottom) {
                 Button { showRecorder = true } label: {
                     Image(systemName: "mic.fill")

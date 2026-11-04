@@ -6,6 +6,9 @@ struct SlowClawApp: App {
     @StateObject private var processor = Processor.shared
     @StateObject private var cloud = CloudSync.shared
     @StateObject private var recorder = AudioRecorder()
+    @StateObject private var book = BookStore.shared
+    @StateObject private var news = NewsStore.shared
+    @StateObject private var local = LocalServer.shared
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -15,9 +18,14 @@ struct SlowClawApp: App {
                 .environmentObject(processor)
                 .environmentObject(cloud)
                 .environmentObject(recorder)
+                .environmentObject(book)
+                .environmentObject(news)
+                .environmentObject(local)
                 .task {
                     LegacyImport.runIfNeeded(store: store)
+                    book.onLocalChange = { CloudSync.shared.schedulePush() }
                     processor.start()
+                    if local.enabled { local.start() }
                     await cloud.sync()
                 }
         }
@@ -25,9 +33,13 @@ struct SlowClawApp: App {
             switch phase {
             case .active:
                 processor.kick()
+                if local.enabled { local.start() }
                 Task { await cloud.sync() }
             case .background:
                 store.saveNow()
+                book.saveNow()
+                // iOS suspends the app in the background; the browser reconnects on return.
+                local.stop()
             default:
                 break
             }
@@ -35,7 +47,7 @@ struct SlowClawApp: App {
     }
 }
 
-enum AppTab: Hashable { case journal, todos, spaces, settings }
+enum AppTab: Hashable { case journal, todos, spaces, book, news }
 
 struct RootView: View {
     @EnvironmentObject private var store: Store
@@ -57,9 +69,12 @@ struct RootView: View {
             SpacesView()
                 .tabItem { Label("Spaces", systemImage: "square.grid.2x2") }
                 .tag(AppTab.spaces)
-            SettingsView()
-                .tabItem { Label("Settings", systemImage: "gearshape") }
-                .tag(AppTab.settings)
+            BookView()
+                .tabItem { Label("Book", systemImage: "book") }
+                .tag(AppTab.book)
+            NewsView()
+                .tabItem { Label("News", systemImage: "newspaper") }
+                .tag(AppTab.news)
         }
         .fullScreenCover(isPresented: $showRecorder) {
             RecordView()

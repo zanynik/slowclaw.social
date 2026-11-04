@@ -46,6 +46,10 @@
     <false/>
     <key>NSMicrophoneUsageDescription</key>
     <string>SlowClaw needs microphone access when you record audio journal entries.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>SlowClaw uses the camera to scan the sign-in code a browser shows.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>SlowClaw shows your journals to a browser on your Wi-Fi when you turn on the local view, without using the cloud.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>SlowClaw uses on-device speech recognition to transcribe your audio journal entries.</string>
     <!-- Background audio: lets a recording in progress survive screen lock
