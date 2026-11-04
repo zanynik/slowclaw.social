@@ -376,7 +376,7 @@ final class BookStore: ObservableObject {
     }
 
     /// Without Apple Intelligence: the entry's own substantial paragraphs.
-    static func fallbackPassages(_ body: String) -> [String] {
+    nonisolated static func fallbackPassages(_ body: String) -> [String] {
         var out: [String] = []
         for para in body.components(separatedBy: "\n\n") {
             let p = para.trimmingCharacters(in: .whitespacesAndNewlines)
