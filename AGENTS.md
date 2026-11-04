@@ -12,7 +12,10 @@ Read `README.md` first.
    daily use.
 3. **On-device AI only.** Use Apple Foundation Models (`OnDeviceAI.swift`) with a rule-based
    fallback. Do not add server-side model calls or API keys.
-4. **Audio stays on the phone.** Only text rows sync.
+4. **Audio stays on the phone.** Only text rows sync. Book vectors stay on the phone too.
+5. **Journal text never leaves for third parties.** News sends only topic words. Anything sent
+   to a service other than the user's own Supabase rows must be shown to the user first.
+6. **One package.** `libsecp256k1` (pinned) is the only dependency; prefer Apple frameworks.
 
 ## Code map
 
@@ -26,9 +29,18 @@ Read `README.md` first.
   - `AudioRecorder.swift`, `SpeechTranscriber.swift`, `TimedTranscript.swift`,
     `RecordingSilence.swift` — proven capture/transcription code; change with care.
   - `Shortcuts.swift` — "Record a journal" App Intent (Siri, Action Button, Shortcuts).
+  - `BookEngine.swift` (pure rules: gate, insertion, chapters, PCA map), `Book.swift` (store,
+    embeddings, passages, sync rows), `BookViews.swift`.
+  - `News.swift` (topics, RSS, clustering, summaries), `NewsViews.swift`.
+  - `Nostr.swift` (Keychain key, BIP-340 signing, NIP-19/NIP-98), `QRScanner.swift`
+    (browser codes), `LocalServer.swift` (Wi-Fi web server + JSON API for the local view).
   - Views: `JournalViews.swift`, `RecordView.swift`, `TodosView.swift`, `SpacesViews.swift`,
     `SettingsView.swift`.
+- `ios-app/Tests/` — unit tests; the PR check runs them on the simulator.
 - `web/` — static site, plain JS. Set text with `textContent` only (the `h()` helper does this).
+  Cloud and local mode share `app.js`; keep `LocalServer.swift`'s `/api/data` rows in the same
+  shape as the Supabase tables.
+- `supabase/functions/` — redeploy after editing (`cloud-login`, `cloud-qr`).
 - `supabase/migrations/` — never edit an applied migration; add a new one.
 
 ## Workflow

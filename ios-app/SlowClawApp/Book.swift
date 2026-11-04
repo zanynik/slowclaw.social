@@ -189,8 +189,8 @@ final class BookStore: ObservableObject {
         let passages = await Self.passages(from: j)
         var accepted = 0
         for text in passages {
-            guard let (vector, lang) = Embedder.vector(for: text) else { continue }
-            if consider(text: text, vector: vector, language: lang, journalID: j.id, candidateID: nil) { accepted += 1 }
+            guard let e = Embedder.vector(for: text) else { continue }
+            if consider(text: text, vector: e.vector, language: e.language, journalID: j.id, candidateID: nil) { accepted += 1 }
         }
         if accepted > 0 {
             retryWaiting()
@@ -448,7 +448,8 @@ final class BookStore: ObservableObject {
                 continue
             }
             guard r["deleted"] as? Bool != true, let text = r["text"] as? String,
-                  let (vector, lang) = Embedder.vector(for: text) else { continue }
+                  let embedded = Embedder.vector(for: text) else { continue }
+            let vector = embedded.vector, lang = embedded.language
             let journalID = r["journal_id"] as? String
             if let journalID { processed[journalID] = processed[journalID] ?? updated }
             nodes.append(BookNode(id: id, journalID: journalID, text: text, vectorData: BookVectors.encode(vector),

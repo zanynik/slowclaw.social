@@ -433,8 +433,8 @@ final class NewsStore: ObservableObject {
         r.setValue("SlowClaw", forHTTPHeaderField: "User-Agent")
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieStorage = nil
-        guard let (data, response) = try? await URLSession(configuration: config).data(for: r),
-              (response as? HTTPURLResponse)?.statusCode == 200 else { return [] }
-        return Array(RSSParser.parse(data).prefix(30))
+        guard let result = try? await URLSession(configuration: config).data(for: r),
+              (result.1 as? HTTPURLResponse)?.statusCode == 200 else { return [] }
+        return Array(RSSParser.parse(result.0).prefix(30))
     }
 }
