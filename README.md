@@ -2,8 +2,9 @@
 
 Open the app, tap the red button, talk. SlowClaw transcribes on the iPhone, cleans the
 transcript up, and files the entry into a **space** (Work, Health, Ideas…) together with the
-**to-dos, ideas, questions and notes** it contains. Everything syncs as text to
-[slowclaw.social](https://slowclaw.social), where you can read and tend the same lists.
+**to-dos, ideas, questions and notes** it contains. The passages worth keeping grow into a
+**living book**, and a **news** tab follows the topics you write about. Everything syncs as text
+to [slowclaw.social](https://slowclaw.social), or stays on your Wi-Fi with the local view.
 
 ## How it fits together
 
@@ -29,14 +30,38 @@ audio stays on the phone                      owner-only RLS                  st
 | --- | --- |
 | Journal | All entries by day, search, big record button, write button. Tap an entry to edit it, move it to another space, replay its audio or see the original transcript. |
 | To-dos | Every open to-do from every space in one list. Check things off, or add one and pick its space. |
+| Book | A living book grown from your journal: a map of passages (the table of contents), chapters, and a reader. See below. |
+| News | Story cards on topics found in your journal, summarized on the phone. Only topic words are sent to Google News. |
 | Spaces | Your areas of life. Each space has an on-device overview, to-dos (with checkboxes), ideas, questions, notes and its journal entries. "Organize unsorted" files older entries in one go. |
-| Settings | Email sign-in for sync, "open straight into recording", automatic organizing, export. |
+| Settings (gear on Journal) | Sync (with this iPhone's key or email), sign a browser in by QR, the local view, Nostr identity backup, capture options, export. |
 
 Say "Record a journal in SlowClaw" to Siri, or put the **Record journal** shortcut on the Action
 Button or Lock Screen, to start recording without tapping through the app. Leaving a recording
 takes a confirmation once it is longer than a few seconds.
 
 The website has the same To-dos page, and journal edits there save automatically.
+
+### The living book
+
+Each node is a short passage plus an on-device sentence vector. The book is a graph with one
+reading path through it. A new passage joins only if it **attaches** (it is about as close to
+its nearest passage as the book's passages usually are to each other) and **adds information**
+(at least 30% of its content words are new to that neighbourhood). Near-repeats are refused.
+Refused passages wait and are retried as the book grows; you can also add them anyway.
+Passages join the path where they fit best, chapters break where the thread changes, and a 2D
+projection of the vectors is the map you navigate by. Vectors never leave the phone.
+
+### Signing in a browser
+
+- **slowclaw.social:** the page shows a QR code. Scan it in Settings. The phone proves it holds
+  its Nostr key, the server issues a session for your account, and the phone encrypts it with
+  a key that only exists in the QR code; the relay in between only sees ciphertext.
+- **Local view (no cloud):** turn on "View on a computer, without the cloud", open the address
+  it shows on a computer on the same Wi-Fi, and scan that page's code. The phone serves the
+  website and your data directly; keep SlowClaw open while you use it.
+
+The Nostr key is created on the phone (or carried over from older builds), kept in iCloud
+Keychain, and can be backed up as an `nsec` from Settings.
 
 Journals from earlier SlowClaw builds are imported automatically on first launch (read-only;
 the old database and recordings are left in place).
@@ -45,9 +70,10 @@ the old database and recordings are left in place).
 
 | Path | Contents |
 | --- | --- |
-| `ios-app/` | SwiftUI app. `project.yml` is the XcodeGen spec. No third-party packages. |
-| `web/` | Static website (`index.html`, `app.js`, `style.css`). No build step. |
-| `supabase/migrations/` | Database history. `20261103094822_simple_journal_sync.sql` defines the current tables. |
+| `ios-app/` | SwiftUI app. `project.yml` is the XcodeGen spec. One package: `libsecp256k1` for Nostr signatures. `Tests/` runs on the simulator in the PR check. |
+| `web/` | Static website (`index.html`, `app.js`, `style.css`). No build step. `mode.js` picks cloud or local; the app bundles this folder and serves it for the local view. |
+| `supabase/migrations/` | Database history. `20261103094822_simple_journal_sync.sql` and `20261104090000_book_and_nostr_links.sql` define the current tables. |
+| `supabase/functions/` | `cloud-login` (Nostr-proof sign-in and key linking) and `cloud-qr` (two-minute relay for sealed browser sessions). |
 | `.github/workflows/` | `pub-testflight.yml` (PR compile check; TestFlight upload on `main`), `pages.yml` (website deploy). |
 
 ## Building
@@ -69,11 +95,13 @@ Run the website locally with any static server, e.g. `cd web && python3 -m http.
 
 ## Supabase notes
 
-- Tables: `journals`, `spaces`, `space_items`, all keyed by `(user_id, id)` with owner-only RLS.
+- Tables: `journals`, `spaces`, `space_items`, `book_nodes`, all keyed by `(user_id, id)` with
+  owner-only RLS. `cloud_private.nostr_links` maps Nostr keys to accounts (service role only).
 - The client URL and publishable key are in `CloudSync.swift` and `web/app.js`; they are public
   by design. Never put a secret/service key in client code.
-- Older `cloud_*` tables, Edge Functions and the private audio bucket belong to the previous
-  version. They are no longer used and can be removed once you no longer need that data.
+- The `cloud-api` and `cloud-worker` functions, older `cloud_*` tables and the private audio bucket
+  belong to the previous version and are unused. `cloud-login`, `cloud-qr` and the
+  `cloud_phone_*` / `cloud_qr` database functions are in use.
 
 ## License
 

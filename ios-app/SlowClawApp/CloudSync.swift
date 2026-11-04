@@ -1,8 +1,9 @@
 import Foundation
+import CryptoKit
 import Security
 
-/// Text-only sync with Supabase (journals, spaces, items). Audio never leaves
-/// the phone. Last edit wins per record; the server rejects older writes.
+/// Text-only sync with Supabase (journals, spaces, items, book passages). Audio never
+/// leaves the phone. Last edit wins per record; the server rejects older writes.
 @MainActor
 final class CloudSync: ObservableObject {
     static let shared = CloudSync()
@@ -54,6 +55,12 @@ final class CloudSync: ObservableObject {
 
     var signedIn: Bool { session != nil }
 
+    /// Accounts created from the phone's Nostr key have a placeholder email.
+    var accountLabel: String {
+        guard let s = session else { return "" }
+        return s.email.hasSuffix("@phone.slowclaw.invalid") ? "This iPhone's key" : s.email
+    }
+
     // MARK: - Auth
 
     struct CloudError: LocalizedError {
@@ -69,7 +76,9 @@ final class CloudSync: ObservableObject {
         try adopt(v, fallbackEmail: email)
         // A new sign-in pushes everything once so the cloud has a full copy.
         store.markAllDirty()
+        BookStore.shared.markAllDirty()
         resetCursors()
+        await linkIdentity()
         await sync()
     }
 
@@ -79,11 +88,97 @@ final class CloudSync: ObservableObject {
         if v["access_token"] != nil {
             try adopt(v, fallbackEmail: email)
             store.markAllDirty()
+            BookStore.shared.markAllDirty()
             resetCursors()
+            await linkIdentity()
             await sync()
             return true
         }
         return false
+    }
+
+    // MARK: - Nostr key sign-in
+
+    private var functionsURL: String { Self.projectURL + "/functions/v1/" }
+
+    /// Calls an edge function. `nostr` signs the exact body with the phone's key (NIP-98).
+    private func function(_ name: String, _ value: [String: Any], nostr: Bool = false, bearer: String? = nil) async throws -> [String: Any] {
+        let url = functionsURL + name
+        let body = try JSONSerialization.data(withJSONObject: value, options: [.withoutEscapingSlashes])
+        var r = URLRequest(url: URL(string: url)!)
+        r.httpMethod = "POST"
+        r.setValue(Self.publishableKey, forHTTPHeaderField: "apikey")
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if nostr {
+            r.setValue(try NostrIdentity.httpAuthorization(url: url, body: body), forHTTPHeaderField: "Authorization")
+        } else if let bearer {
+            r.setValue("Bearer " + bearer, forHTTPHeaderField: "Authorization")
+        }
+        r.httpBody = body
+        let (data, response) = try await http.data(for: r)
+        let v = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if let error = v["error"] as? String {
+            let known: [String: String] = [
+                "QR_EXPIRED": "That code has expired. Refresh the page for a new one.",
+                "PHONE_PROOF_INVALID": "This iPhone's clock looks wrong. Check Date & Time in Settings.",
+                "SIGN_IN_REQUIRED": "Please sign in again.",
+            ]
+            throw CloudError(message: known[error] ?? "The server said: \(error)", rejected: true)
+        }
+        guard (200..<300).contains(code) else { throw CloudError(message: "Request failed (\(code)).") }
+        return v
+    }
+
+    /// Signs in with the phone's Nostr key: no email or password. The first time this
+    /// creates an account that belongs to the key.
+    func signInWithKey() async throws {
+        let v = try await function("cloud-login", ["action": "login", "nonce": Hex.random(32)], nostr: true)
+        try adopt(v, fallbackEmail: "")
+        UserDefaults.standard.set(session?.userID, forKey: linkedKey)
+        store.markAllDirty()
+        BookStore.shared.markAllDirty()
+        resetCursors()
+        await sync()
+    }
+
+    private var linkedKey: String { "slowclaw.nostr.linked-account" }
+
+    /// Ties the phone's key to the signed-in account so browsers can be signed in by QR.
+    /// Needs both a fresh signature from the key and this account's session.
+    func linkIdentity() async {
+        guard let s = try? await validSession(), UserDefaults.standard.string(forKey: linkedKey) != s.userID else { return }
+        do {
+            _ = try await function("cloud-login", ["action": "link", "access_token": s.access], nostr: true)
+            UserDefaults.standard.set(s.userID, forKey: linkedKey)
+        } catch {
+            status = "Could not link this iPhone's key: \(error.localizedDescription)"
+        }
+    }
+
+    /// Hands a browser its own session: the server issues one for this account after
+    /// checking the key's signature, and the phone seals it with the key from the QR code
+    /// so the relay only ever sees ciphertext.
+    func approveBrowser(id: String, key: String) async throws {
+        guard signedIn else { throw CloudError(message: "Turn on sync first (Settings → Sync), then scan again.") }
+        UserDefaults.standard.removeObject(forKey: linkedKey)
+        await linkIdentity()
+        let current = try await validSession()
+        let v = try await function("cloud-login", ["action": "login", "nonce": id], nostr: true)
+        guard let access = v["access_token"] as? String, let refresh = v["refresh_token"] as? String,
+              let user = v["user"] as? [String: Any], user["id"] as? String == current.userID else {
+            throw CloudError(message: "This iPhone's key belongs to a different account. Sign out and back in, then try again.")
+        }
+        let payload: [String: Any] = ["nonce": id, "access_token": access, "refresh_token": refresh,
+                                      "expires_in": v["expires_in"] ?? 3600,
+                                      "email": current.email, "expires_at": Date().timeIntervalSince1970 + 120]
+        guard let keyBytes = Hex.bytes(key), keyBytes.count == 32 else { throw CloudError(message: "Invalid code.") }
+        let sealed = try AES.GCM.seal(try JSONSerialization.data(withJSONObject: payload),
+                                      using: SymmetricKey(data: keyBytes),
+                                      authenticating: Data(("cloud-qr/" + id).utf8))
+        guard let combined = sealed.combined else { throw CloudError(message: "Could not seal the session.") }
+        _ = try await function("cloud-qr", ["action": "complete", "id": id, "payload": combined.base64EncodedString()],
+                               bearer: current.access)
     }
 
     func sendPasswordReset(email: String) async throws {
@@ -92,6 +187,7 @@ final class CloudSync: ObservableObject {
 
     func signOut() {
         session = nil
+        UserDefaults.standard.removeObject(forKey: linkedKey)
         SecItemDelete(Self.keychain as CFDictionary)
         resetCursors()
         status = nil
@@ -103,7 +199,7 @@ final class CloudSync: ObservableObject {
         }
         let user = v["user"] as? [String: Any]
         guard let id = user?["id"] as? String else { throw CloudError(message: "Sign-in returned no account.") }
-        let expiresIn = (v["expires_in"] as? Double) ?? Double(v["expires_in"] as? Int ?? 3600)
+        let expiresIn = (v["expires_in"] as? NSNumber)?.doubleValue ?? 3600
         let s = Session(access: access, refresh: refresh, expires: Date().timeIntervalSince1970 + expiresIn,
                         userID: id, email: (user?["email"] as? String) ?? fallbackEmail)
         if let old = session, old.userID != s.userID { resetCursors() }
@@ -198,7 +294,7 @@ final class CloudSync: ObservableObject {
     private func cursorKey(_ table: String) -> String { "slowclaw.sync.cursor.\(table)" }
 
     private func resetCursors() {
-        for t in ["journals", "spaces", "space_items"] { UserDefaults.standard.removeObject(forKey: cursorKey(t)) }
+        for t in ["journals", "spaces", "space_items", "book_nodes"] { UserDefaults.standard.removeObject(forKey: cursorKey(t)) }
     }
 
     func schedulePush() {
@@ -215,11 +311,14 @@ final class CloudSync: ObservableObject {
         guard signedIn, !syncing else { return }
         syncing = true
         defer { syncing = false }
+        // Accounts signed in before keys existed get linked once, quietly.
+        await linkIdentity()
         do {
             // Pull first so same-named default spaces merge before we push ours.
             try await pull("spaces") { rows in for r in rows { if let s = Self.space(from: r) { self.store.applyRemote(space: s) } } }
             try await pull("journals") { rows in for r in rows { if let j = Self.journal(from: r) { self.store.applyRemote(journal: j) } } }
             try await pull("space_items") { rows in for r in rows { if let i = Self.item(from: r) { self.store.applyRemote(item: i) } } }
+            try await pull("book_nodes") { rows in BookStore.shared.applyRemote(rows: rows) }
             try await push()
             lastSynced = Date()
             UserDefaults.standard.set(lastSynced!.timeIntervalSince1970, forKey: "slowclaw.sync.last")
@@ -263,6 +362,9 @@ final class CloudSync: ObservableObject {
         try await upsert("journals", journals.map { Self.row(from: $0, user: s.userID) })
         try await upsert("space_items", items.map { Self.row(from: $0, user: s.userID) })
         store.markPushed(journals: journals, spaces: spaces, items: items)
+        let nodes = BookStore.shared.dirtyNodes
+        try await upsert("book_nodes", nodes.map { BookStore.row(from: $0, user: s.userID) })
+        BookStore.shared.markPushed(nodes)
     }
 
     private func upsert(_ table: String, _ rows: [[String: Any]]) async throws {
@@ -283,26 +385,32 @@ final class CloudSync: ObservableObject {
         return NSNull()
     }
 
-    private static func row(from j: Journal, user: String) -> [String: Any] {
-        ["user_id": user, "id": j.id, "title": j.title, "body": j.body,
+    static func row(from j: Journal, user: String?) -> [String: Any] {
+        var r: [String: Any] = ["id": j.id, "title": j.title, "body": j.body,
          "space_id": orNull(j.spaceID), "created_at": CloudDates.format(j.createdAt),
          "updated_at": CloudDates.format(j.updatedAt), "deleted": j.deleted]
+        if let user { r["user_id"] = user }
+        return r
     }
 
-    private static func row(from s: Space, user: String) -> [String: Any] {
-        ["user_id": user, "id": s.id, "name": s.name, "icon": s.icon, "summary": s.summary,
+    static func row(from s: Space, user: String?) -> [String: Any] {
+        var r: [String: Any] = ["id": s.id, "name": s.name, "icon": s.icon, "summary": s.summary,
          "sort_order": s.sortOrder, "created_at": CloudDates.format(s.createdAt),
          "updated_at": CloudDates.format(s.updatedAt), "deleted": s.deleted]
+        if let user { r["user_id"] = user }
+        return r
     }
 
-    private static func row(from i: SpaceItem, user: String) -> [String: Any] {
-        ["user_id": user, "id": i.id, "space_id": i.spaceID, "journal_id": orNull(i.journalID),
+    static func row(from i: SpaceItem, user: String?) -> [String: Any] {
+        var r: [String: Any] = ["id": i.id, "space_id": i.spaceID, "journal_id": orNull(i.journalID),
          "kind": i.kind.rawValue, "text": i.text, "done": i.done,
          "created_at": CloudDates.format(i.createdAt), "updated_at": CloudDates.format(i.updatedAt),
          "deleted": i.deleted]
+        if let user { r["user_id"] = user }
+        return r
     }
 
-    private static func journal(from r: [String: Any]) -> Journal? {
+    static func journal(from r: [String: Any]) -> Journal? {
         guard let id = r["id"] as? String,
               let created = CloudDates.parse(r["created_at"] as? String),
               let updated = CloudDates.parse(r["updated_at"] as? String) else { return nil }
@@ -312,7 +420,7 @@ final class CloudSync: ObservableObject {
                        status: .ready, organized: spaceID != nil, deleted: r["deleted"] as? Bool ?? false, dirty: false)
     }
 
-    private static func space(from r: [String: Any]) -> Space? {
+    static func space(from r: [String: Any]) -> Space? {
         guard let id = r["id"] as? String, let name = r["name"] as? String,
               let created = CloudDates.parse(r["created_at"] as? String),
               let updated = CloudDates.parse(r["updated_at"] as? String) else { return nil }
@@ -321,7 +429,7 @@ final class CloudSync: ObservableObject {
                      deleted: r["deleted"] as? Bool ?? false, dirty: false)
     }
 
-    private static func item(from r: [String: Any]) -> SpaceItem? {
+    static func item(from r: [String: Any]) -> SpaceItem? {
         guard let id = r["id"] as? String, let spaceID = r["space_id"] as? String,
               let kind = ItemKind(rawValue: r["kind"] as? String ?? ""),
               let created = CloudDates.parse(r["created_at"] as? String),

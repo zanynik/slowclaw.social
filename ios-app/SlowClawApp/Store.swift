@@ -175,6 +175,7 @@ final class Store: ObservableObject {
         if let path = journal(id)?.audioPath, let url = AudioRecorder.absoluteURL(forMediaRelativePath: path) {
             try? FileManager.default.removeItem(at: url)
         }
+        BookStore.shared.journalDeleted(id)
     }
 
     /// Bulk insert used by the one-time legacy import. Skips IDs already present.

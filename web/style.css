@@ -111,3 +111,35 @@ main h1 { font-size: 28px; margin: 0 0 6px; }
   .menu-btn { display: inline-block; margin-bottom: 10px; }
   main { padding-top: 16px; }
 }
+
+/* QR sign-in */
+.qr-box { display: grid; place-items: center; min-height: 260px; }
+canvas.qr { width: 240px; height: 240px; image-rendering: pixelated; border-radius: 8px; }
+.auth details { margin-top: 16px; }
+
+/* Book */
+.map-card { padding: 8px; }
+.book-map { width: 100%; height: auto; display: block; }
+.book-path { fill: none; stroke: var(--muted); stroke-opacity: .45; stroke-width: 1.5; stroke-linejoin: round; }
+.book-map circle { cursor: pointer; stroke: var(--panel); stroke-width: 1.5; }
+.book-map circle:hover, .book-map circle:focus { r: 9; outline: none; }
+.toc { margin: 0; padding-left: 22px; }
+.toc li { padding: 3px 0; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: middle; }
+.chapter { margin: 36px 0 0; }
+.chapter h2 { font: 600 24px/1.3 Georgia, "Iowan Old Style", serif; margin: 2px 0 12px; }
+.passage { scroll-margin-top: 16px; margin-bottom: 18px; }
+.passage p { font: 18px/1.7 Georgia, "Iowan Old Style", serif; margin: 0 0 4px; }
+.caps { text-transform: uppercase; letter-spacing: .06em; }
+.accent { color: var(--accent); font-weight: 600; }
+
+/* News */
+.news-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; margin-top: 14px; }
+.news-card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; display: flex; flex-direction: column; }
+.news-card img, .news-fallback { width: 100%; height: 150px; object-fit: cover; display: block; }
+.news-fallback { display: grid; place-items: center; color: #fff; font: 700 56px Georgia, serif; opacity: .85; }
+.news-body { padding: 12px 14px 14px; display: grid; gap: 6px; }
+.news-body h2 { font-size: 18px; margin: 0; line-height: 1.3; }
+.news-body p { margin: 0; font-size: 14px; }
+.sources { padding-left: 18px; margin: 6px 0 0; font-size: 14px; }
+.sources a { color: var(--text); }

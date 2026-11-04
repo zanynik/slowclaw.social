@@ -3,8 +3,9 @@
 #   brew install xcodegen
 #   cd ios-app && xcodegen generate && open SlowClaw.xcodeproj
 #
-# The .xcodeproj is generated (gitignored). No third-party packages, no native
-# libraries: SwiftUI + Apple frameworks (Speech, AVFoundation, FoundationModels).
+# The .xcodeproj is generated (gitignored). One package: libsecp256k1 (Bitcoin Core's
+# audited secp256k1 library) for Nostr signatures. Everything else is Apple frameworks.
+# The website in ../web is bundled so the phone can serve it over Wi-Fi (local view).
 
 name: SlowClaw
 options:
@@ -12,6 +13,11 @@ options:
   deploymentTarget:
     iOS: "26.0"
   createIntermediateGroups: true
+
+packages:
+  NostrCrypto:
+    url: https://github.com/21-DOT-DEV/swift-secp256k1
+    exactVersion: 0.23.2
 
 settings:
   base:
@@ -26,11 +32,17 @@ targets:
     deploymentTarget: "26.0"
     sources:
       - path: SlowClawApp
+      - path: ../web
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - package: NostrCrypto
+        product: libsecp256k1
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.slowclaw.app
         PRODUCT_NAME: SlowClaw
-        MARKETING_VERSION: "0.3.0"
+        MARKETING_VERSION: "0.4.0"
         CURRENT_PROJECT_VERSION: "1"
         # Scope the app-store profile to the application target.
         CODE_SIGN_IDENTITY: "Apple Distribution"
@@ -40,6 +52,21 @@ targets:
         ENABLE_BITCODE: NO
         TARGETED_DEVICE_FAMILY: "1,2"
 
+  SlowClawTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: Tests
+    dependencies:
+      - target: SlowClaw
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/SlowClaw.app/SlowClaw"
+
 schemes:
   SlowClaw:
     build:
@@ -47,5 +74,9 @@ schemes:
         SlowClaw: all
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - SlowClawTests
     archive:
       config: Release
