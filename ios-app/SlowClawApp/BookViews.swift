@@ -4,7 +4,7 @@ struct BookView: View {
     @EnvironmentObject private var book: BookStore
     @EnvironmentObject private var store: Store
     @State private var openChapter: Int?
-    @State private var openNode: String?
+    @State private var openNode: String?   // kept for deep links to a passage
     @State private var reading = false
     @State private var confirmRebuild = false
 
@@ -17,20 +17,6 @@ struct BookView: View {
                                            systemImage: "book",
                                            description: Text("As you journal, the passages worth keeping join a living book: grouped into chapters by theme, in the order you lived them."))
                 } else {
-                    Section {
-                        BookMapView(nodes: book.passages) { id in
-                            openNode = id
-                            openChapter = nil
-                            reading = true
-                        }
-                        .frame(height: 300)
-                        .listRowInsets(EdgeInsets())
-                    } header: {
-                        Text("Map")
-                    } footer: {
-                        Text("Each dot is a passage, placed by meaning. The line is the reading path. Tap a dot to read from there.")
-                    }
-
                     Section("Contents") {
                         ForEach(chapters) { c in
                             Button {
@@ -93,47 +79,6 @@ struct BookView: View {
 enum BookPalette {
     static let colors: [Color] = [.blue, .orange, .green, .pink, .purple, .teal, .red, .indigo, .brown, .mint]
     static func color(_ chapter: Int) -> Color { colors[abs(chapter) % colors.count] }
-}
-
-/// The table of contents as a map: dots by meaning, the reading path as a line.
-struct BookMapView: View {
-    let nodes: [BookNode]
-    var onSelect: (String) -> Void
-
-    var body: some View {
-        GeometryReader { geo in
-            let size = geo.size
-            let points = nodes.map { CGPoint(x: $0.x * size.width, y: (1 - $0.y) * size.height) }
-            Canvas { ctx, _ in
-                var line = Path()
-                for (i, p) in points.enumerated() {
-                    if i == 0 { line.move(to: p) } else { line.addLine(to: p) }
-                }
-                ctx.stroke(line, with: .color(.secondary.opacity(0.35)), style: StrokeStyle(lineWidth: 1.5, lineJoin: .round))
-                for (n, p) in zip(nodes, points) {
-                    let r: CGFloat = 5
-                    ctx.fill(Path(ellipseIn: CGRect(x: p.x - r, y: p.y - r, width: 2 * r, height: 2 * r)),
-                             with: .color(BookPalette.color(n.chapter)))
-                }
-                if let first = points.first {
-                    ctx.draw(Text("start").font(.caption2).foregroundColor(.secondary), at: CGPoint(x: first.x, y: first.y - 12))
-                }
-            }
-            .contentShape(Rectangle())
-            .gesture(SpatialTapGesture().onEnded { tap in
-                let nearest = zip(nodes, points).min {
-                    hypot($0.1.x - tap.location.x, $0.1.y - tap.location.y) < hypot($1.1.x - tap.location.x, $1.1.y - tap.location.y)
-                }
-                if let nearest, hypot(nearest.1.x - tap.location.x, nearest.1.y - tap.location.y) < 32 {
-                    onSelect(nearest.0.id)
-                }
-            })
-            .accessibilityElement()
-            .accessibilityLabel("Map of \(nodes.count) passages")
-        }
-        .padding(12)
-        .background(Color(.secondarySystemBackground))
-    }
 }
 
 struct BookReaderView: View {

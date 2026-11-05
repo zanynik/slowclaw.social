@@ -34,7 +34,7 @@ Read `README.md` first.
   - `Shortcuts.swift` — "Record a journal" App Intent (Siri, Action Button, Shortcuts).
   - `MiniLM.swift` (sentence embeddings, same model as the prototype), `BookOrganizer.swift`
     (pure rules: segments, passages, repeats, themes, order, keyphrases), `BookEngine.swift` (vectors,
-    words, PCA map), `Book.swift` (store, layout, background polish, sync rows), `BookViews.swift`.
+    words), `Book.swift` (store, layout, background polish, sync rows), `BookViews.swift`.
     See `docs/book.md`.
   - `Discover.swift` (theme searches, relevance), `News.swift` (Google News RSS, reading history),
     `Videos.swift` (channel feeds), `NewsViews.swift`, `VideosViews.swift`. See `docs/discover.md`.

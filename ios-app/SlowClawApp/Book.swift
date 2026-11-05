@@ -314,16 +314,14 @@ final class BookStore: ObservableObject {
             let keptIndices = items.indices.filter { !lonely.contains($0) }
             let kept = keptIndices.map { items[$0] }
             let chapters = BookOrganizer.organize(kept).map { $0.map { keptIndices[$0] } }
-            let (xy, axes) = BookEngine.project(items.map(\.vector), previousAxes: previousAxes)
-            return (chapters, lonely, xy, axes)
+            return (chapters, lonely, [(Double, Double)](), previousAxes)
         }.value
 
         let keyphrases = BookOrganizer.keyphrases(groups: chapters.map { $0.map { live[$0].source ?? live[$0].text } })
         var position = 0.0
         for (c, members) in chapters.enumerated() {
-            let key = members.map { live[$0].id }.sorted().joined(separator: ",")
-            let title = titleCache[key] ?? Self.reuseTitle(Set(members.map { live[$0].id }), titleCache)
-                ?? Self.labelTitle(keyphrases[c], fallback: members.map { live[$0].text })
+            // Named after the phrases the chapter keeps returning to: the author's own words, instantly.
+            let title = Self.labelTitle(keyphrases[c], fallback: members.map { live[$0].text })
             for m in members {
                 position += 10
                 update(live[m].id) { $0.chapter = c; $0.chapterTitle = title; $0.position = position }
@@ -335,7 +333,7 @@ final class BookStore: ObservableObject {
         }
         axes = newAxes
         projectedCount = live.count
-        for (n, p) in zip(live, xy) { update(n.id) { $0.x = p.0; $0.y = p.1 } }
+        _ = xy
         needsPolish = true
         scheduleSave()
     }
@@ -361,17 +359,6 @@ final class BookStore: ObservableObject {
         guard needsPolish else { return }
         defer { scheduleSave() }
         guard OnDeviceAI.isAvailable else { needsPolish = false; return }
-
-        for chapter in chapters where !chapter.isLooseEnds {
-            let members = chapter.nodes.filter { $0.kind == .passage }
-            let key = members.map(\.id).sorted().joined(separator: ",")
-            guard titleCache[key] == nil else { continue }
-            if shouldStop() { return }
-            let title = await Self.chapterTitle(members.map(\.text))
-            titleCache[key] = title
-            for m in members { update(m.id) { $0.chapterTitle = title } }
-            changed()
-        }
 
         let todo = passages.filter { !$0.polished }
         progress = todo.isEmpty ? nil : (0, todo.count)
