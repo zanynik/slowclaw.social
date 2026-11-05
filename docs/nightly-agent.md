@@ -47,8 +47,8 @@ run without asking each time. Edit this file to change how it behaves.
        Co-Authored-By: Claude <noreply@anthropic.com>
 
    Then `git push -u origin nightly/YYYY-MM-DD`.
-9. **Watch the gate.** Follow the `Nightly release` run for the branch
-   (`gh run list --branch nightly/YYYY-MM-DD`). If it fails, read the log, fix the cause and push
+9. **Watch the gate.** Follow the `Nightly release` run for the branch with the GitHub MCP actions
+   tools (list workflow runs for the branch, read failing job logs). If it fails, read the log, fix the cause and push
    again: at most three attempts. If it still fails, leave the branch for the owner and stop.
 10. **Report.** Finish with a short summary for the owner: which ideas (in product terms), the build
     result, and anything skipped and why.
