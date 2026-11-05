@@ -77,7 +77,7 @@ enum LegacyImport {
 
             var j = Journal(id: key, title: title == placeholder ? "" : title,
                             body: pending ? "" : body, transcript: nil,
-                            audioPath: hasAudio ? media : nil, spaceID: nil,
+                            audioPath: hasAudio ? media : nil, moreAudio: nil, spaceID: nil,
                             createdAt: created, updatedAt: updated,
                             status: .ready, organized: false, deleted: false, dirty: true)
             if pending {

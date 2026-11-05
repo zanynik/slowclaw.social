@@ -15,9 +15,35 @@ import UIKit
 
 struct NewsTopic: Codable, Identifiable, Hashable {
     var id: String { name.lowercased() }
+    /// Short label shown on cards ("Zero-profit food").
     var name: String
+    /// The specific search actually sent ("community supermarket returning profits to shoppers").
+    var query: String
     var fromJournal: Bool
     var enabled: Bool
+
+    init(name: String, query: String? = nil, fromJournal: Bool, enabled: Bool) {
+        self.name = name; self.query = query ?? name; self.fromJournal = fromJournal; self.enabled = enabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        query = try c.decodeIfPresent(String.self, forKey: .query) ?? name
+        fromJournal = try c.decode(Bool.self, forKey: .fromJournal)
+        enabled = try c.decode(Bool.self, forKey: .enabled)
+    }
+}
+
+/// An article opened from News, kept so nothing read is lost (with time spent reading).
+struct ReadRecord: Codable, Identifiable, Hashable {
+    var id: String { url }
+    var url: String
+    var title: String
+    var source: String
+    var topic: String
+    var openedAt: Date
+    var seconds: Int
 }
 
 struct NewsArticle: Codable, Hashable, Identifiable {
@@ -50,6 +76,30 @@ struct NewsCard: Codable, Identifiable, Hashable {
 // MARK: - Pure helpers (tested)
 
 enum NewsTopics {
+    /// A specific search phrase: 2–10 words, the same rules as topics otherwise.
+    static func sanitizeQuery(_ raw: String) -> String? {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        guard (4...90).contains(t.count), !t.contains("@"), !t.contains("http") else { return nil }
+        guard (2...10).contains(t.split(separator: " ").count) else { return nil }
+        guard t.range(of: #"\d{3,}"#, options: .regularExpression) == nil else { return nil }
+        guard t.allSatisfy({ $0.isLetter || $0.isNumber || " &-'".contains($0) }) else { return nil }
+        return t
+    }
+
+    /// Fallback without Apple Intelligence: the most repeated two-word phrases of content words.
+    static func frequentPhrases(in texts: [String], limit: Int = 6) -> [String] {
+        var counts: [String: Int] = [:]
+        for text in texts {
+            let words = text.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init)
+            for (a, b) in zip(words, words.dropFirst()) where a.count >= 4 && b.count >= 4
+                && BookEngine.contentWords(a).count == 1 && BookEngine.contentWords(b).count == 1 {
+                counts[a + " " + b, default: 0] += 1
+            }
+        }
+        return counts.filter { $0.value >= 3 }.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
+            .prefix(limit).map(\.key)
+    }
+
     /// Keeps a topic only if it looks like a public subject, not a private detail.
     static func sanitize(_ raw: String) -> String? {
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
@@ -175,8 +225,16 @@ final class RSSParser: NSObject, XMLParserDelegate {
 
 @Generable
 struct NewsInterests {
-    @Guide(description: "Up to 6 public news topics of 1 to 3 words, such as 'electric cars' or 'marathon training'. General subjects only: no names of private people, no places where the author lives, no health or money details.")
-    var topics: [String]
+    @Guide(description: "Up to 6 specific things this person would want news about")
+    var interests: [NewsInterest]
+}
+
+@Generable
+struct NewsInterest {
+    @Guide(description: "A short label of 1 to 3 words, such as 'Zero-profit food'")
+    var label: String
+    @Guide(description: "A specific news search of 4 to 9 words naming the actual subject, such as 'cooperative supermarkets returning profits to shoppers' or 'open source AI coding agents'. Public subjects only: no names of private people, no places where the author lives, no health or money details about them.")
+    var query: String
 }
 
 @Generable
@@ -192,12 +250,14 @@ final class NewsStore: ObservableObject {
     static let shared = NewsStore()
 
     @Published private(set) var topics: [NewsTopic] = []
+    @Published private(set) var history: [ReadRecord] = []
     @Published private(set) var cards: [NewsCard] = []
     @Published private(set) var updatedAt: Date?
     @Published private(set) var loading = false
     @Published var error: String?
 
     private struct Snapshot: Codable {
+        var history: [ReadRecord]?
         var topics: [NewsTopic]
         var cards: [NewsCard]
         var updatedAt: Date?
@@ -220,14 +280,47 @@ final class NewsStore: ObservableObject {
     init() {
         if let data = try? Data(contentsOf: Self.fileURL), let s = try? JSONDecoder().decode(Snapshot.self, from: data) {
             topics = s.topics; cards = s.cards; updatedAt = s.updatedAt; topicsUpdatedAt = s.topicsUpdatedAt
+            history = s.history ?? []
         }
     }
 
     private func save() {
-        let snap = Snapshot(topics: topics, cards: cards, updatedAt: updatedAt, topicsUpdatedAt: topicsUpdatedAt)
+        let snap = Snapshot(history: history, topics: topics, cards: cards, updatedAt: updatedAt, topicsUpdatedAt: topicsUpdatedAt)
         guard let data = try? JSONEncoder().encode(snap) else { return }
         try? FileManager.default.createDirectory(at: Self.directory, withIntermediateDirectories: true)
         try? data.write(to: Self.fileURL, options: .atomic)
+    }
+
+    // MARK: Reading history
+
+    /// Records an article read from News (time counted while it was open).
+    func recordRead(_ article: NewsArticle, topic: String, openedAt: Date) {
+        let seconds = max(0, Int(Date().timeIntervalSince(openedAt)))
+        if let i = history.firstIndex(where: { $0.url == article.url }) {
+            history[i].seconds += seconds
+            history[i].openedAt = openedAt
+        } else {
+            history.insert(ReadRecord(url: article.url, title: article.title, source: article.source, topic: topic,
+                                      openedAt: openedAt, seconds: seconds), at: 0)
+            if history.count > 500 { history.removeLast(history.count - 500) }
+        }
+        history.sort { $0.openedAt > $1.openedAt }
+        save()
+    }
+
+    func isRead(_ card: NewsCard) -> Bool {
+        card.articles.contains { a in history.contains { $0.url == a.url } }
+    }
+
+    func forget(_ record: ReadRecord) {
+        history.removeAll { $0.url == record.url }
+        save()
+    }
+
+    func setQuery(_ topic: NewsTopic, _ query: String) {
+        guard let i = topics.firstIndex(of: topic), let q = NewsTopics.sanitizeQuery(query) ?? NewsTopics.sanitize(query) else { return }
+        topics[i].query = q
+        save()
     }
 
     // MARK: Topics
@@ -249,8 +342,11 @@ final class NewsStore: ObservableObject {
     }
 
     func add(_ raw: String) {
-        guard let name = NewsTopics.sanitize(raw), !topics.contains(where: { $0.id == name.lowercased() }) else { return }
-        topics.append(NewsTopic(name: name, fromJournal: false, enabled: true))
+        let words = raw.split(separator: " ")
+        // Long entries become the search; the first words become the label.
+        let label = words.count > 4 ? words.prefix(3).joined(separator: " ") : raw
+        guard let name = NewsTopics.sanitize(label), !topics.contains(where: { $0.id == name.lowercased() }) else { return }
+        topics.append(NewsTopic(name: name, query: NewsTopics.sanitizeQuery(raw) ?? name, fromJournal: false, enabled: true))
         save()
     }
 
@@ -259,25 +355,33 @@ final class NewsStore: ObservableObject {
         let recent = journals.filter { $0.status == .ready && !$0.deleted && $0.createdAt > Date().addingTimeInterval(-30 * 86_400) }
         let pool = recent.isEmpty ? Array(journals.filter { $0.status == .ready }.prefix(20)) : recent
         guard !pool.isEmpty else { return }
-        var suggested: [String] = []
+        var suggested: [(label: String, query: String)] = []
         if OnDeviceAI.isAvailable {
             var context = ""
-            for j in pool where context.count < 5000 { context += "- " + j.displayTitle + ": " + String(j.body.prefix(400)) + "\n" }
+            for j in pool where context.count < 5000 { context += "- " + j.displayTitle + ": " + String(j.body.prefix(500)) + "\n" }
             if let r = try? await LanguageModelSession(instructions: """
-            You suggest public news topics for a reader, based on what they write about. \
-            Use general subjects that newspapers cover. Never include private details.
+            You find what a reader actually cares about in their journal and turn it into precise news \
+            searches. Prefer the specific subject they keep returning to over a broad category: \
+            "cooperative supermarkets returning profits" rather than "food". Never include private details.
             """).respond(to: "Recent journal entries:\n" + context, generating: NewsInterests.self).content {
-                suggested = r.topics
+                suggested = r.interests.map { ($0.label, $0.query) }
             }
         }
-        if suggested.isEmpty { suggested = NewsTopics.frequentNouns(in: pool.map(\.body)) }
+        if suggested.isEmpty {
+            suggested = NewsTopics.frequentPhrases(in: pool.map(\.body)).map { ($0.capitalized, $0) }
+            if suggested.isEmpty { suggested = NewsTopics.frequentNouns(in: pool.map(\.body)).map { ($0.capitalized, $0) } }
+        }
         let hidden = Set(UserDefaults.standard.stringArray(forKey: "slowclaw.news.hidden") ?? [])
-        let clean = suggested.compactMap(NewsTopics.sanitize).filter { !hidden.contains($0.lowercased()) }
+        let clean = suggested.compactMap { s -> (String, String)? in
+            guard let label = NewsTopics.sanitize(s.label), let query = NewsTopics.sanitizeQuery(s.query) ?? NewsTopics.sanitize(s.label),
+                  !hidden.contains(label.lowercased()) else { return nil }
+            return (label, query)
+        }
         // Keep manual topics and switched-off choices; replace the journal-derived ones.
         var next = topics.filter { !$0.fromJournal }
         let previous = Dictionary(topics.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        for name in clean.prefix(6) where !next.contains(where: { $0.id == name.lowercased() }) {
-            next.append(NewsTopic(name: name, fromJournal: true, enabled: previous[name.lowercased()]?.enabled ?? true))
+        for (name, query) in clean.prefix(6) where !next.contains(where: { $0.id == name.lowercased() }) {
+            next.append(NewsTopic(name: name, query: query, fromJournal: true, enabled: previous[name.lowercased()]?.enabled ?? true))
         }
         topics = next
         topicsUpdatedAt = Date()
@@ -306,7 +410,15 @@ final class NewsStore: ObservableObject {
         var fetched: [(String, [NewsArticle])] = []
         await withTaskGroup(of: (String, [NewsArticle]).self) { group in
             for t in active {
-                group.addTask { (t.name, await Self.search(t.name)) }
+                group.addTask {
+                    // The specific search first; the short label too if it finds too little.
+                    var found = await Self.search(t.query, days: 7)
+                    if found.count < 3 && t.query != t.name {
+                        let broad = await Self.search(t.name, days: 3)
+                        found += broad.filter { b in !found.contains { $0.url == b.url } }
+                    }
+                    return (t.name, found)
+                }
             }
             for await r in group { fetched.append(r) }
         }
@@ -414,12 +526,12 @@ final class NewsStore: ObservableObject {
     // MARK: Feed
 
     /// The only network request with your interests in it: the topic as a search query.
-    nonisolated static func searchURL(_ topic: String, locale: Locale = .current) -> URL? {
+    nonisolated static func searchURL(_ topic: String, days: Int = 3, locale: Locale = .current) -> URL? {
         let lang = locale.language.languageCode?.identifier ?? "en"
         let region = locale.region?.identifier ?? "US"
         var c = URLComponents(string: "https://news.google.com/rss/search")
         c?.queryItems = [
-            URLQueryItem(name: "q", value: topic + " when:3d"),
+            URLQueryItem(name: "q", value: topic + " when:\(days)d"),
             URLQueryItem(name: "hl", value: "\(lang)-\(region)"),
             URLQueryItem(name: "gl", value: region),
             URLQueryItem(name: "ceid", value: "\(region):\(lang)"),
@@ -427,8 +539,8 @@ final class NewsStore: ObservableObject {
         return c?.url
     }
 
-    nonisolated static func search(_ topic: String) async -> [NewsArticle] {
-        guard let url = searchURL(topic) else { return [] }
+    nonisolated static func search(_ topic: String, days: Int = 3) async -> [NewsArticle] {
+        guard let url = searchURL(topic, days: days) else { return [] }
         var r = URLRequest(url: url, timeoutInterval: 15)
         r.setValue("SlowClaw", forHTTPHeaderField: "User-Agent")
         let config = URLSessionConfiguration.ephemeral

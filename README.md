@@ -30,8 +30,8 @@ audio stays on the phone                      owner-only RLS                  st
 | --- | --- |
 | Journal | All entries by day, search, big record button, write button. Tap an entry to edit it, move it to another space, replay its audio or see the original transcript. |
 | To-dos | Every open to-do from every space in one list. Check things off, or add one and pick its space. |
-| Book | A living book grown from your journal: a map of passages (the table of contents), chapters, and a reader. See below. |
-| News | Story cards on topics found in your journal, summarized on the phone. Only topic words are sent to Google News. |
+| Book | A living book grown from your journal, in your own words: chapters by theme, a map of passages (the table of contents) and a reader. See below. |
+| Discover | **News**: story cards for specific searches worked out from your journal, summarized on the phone, with a reading history. **Videos**: explanations for what your journal says you want to understand. Only the searches you can see are sent (to Google News / YouTube). |
 | Spaces | Your areas of life. Each space has an on-device overview, to-dos (with checkboxes), ideas, questions, notes and its journal entries. "Organize unsorted" files older entries in one go. |
 | Settings (gear on Journal) | Sync (with this iPhone's key or email), sign a browser in by QR, the local view, Nostr identity backup, capture options, export. |
 
@@ -43,13 +43,18 @@ The website has the same To-dos page, and journal edits there save automatically
 
 ### The living book
 
-Each node is a short passage plus an on-device sentence vector. The book is a graph with one
-reading path through it. A new passage joins only if it **attaches** (it is about as close to
-its nearest passage as the book's passages usually are to each other) and **adds information**
-(at least 30% of its content words are new to that neighbourhood). Near-repeats are refused.
-Refused passages wait and are retried as the book grows; you can also add them anyway.
-Passages join the path where they fit best, chapters break where the thread changes, and a 2D
-projection of the vectors is the map you navigate by. Vectors never leave the phone.
+Passages are **your own words**, lightly edited: Apple Intelligence may remove fillers and false
+starts and fix grammar, and an edit that keeps less than 85% of what you said is replaced by the
+original. Repeats are dropped (the same recording imported twice, or a passage that says what the
+book already says). A passage joins when it connects to the book, or to other waiting passages
+that together start a new theme. The whole book is then organised: themes become chapters (about
+√(n/2) of them), chapters follow each other by closeness, and inside a chapter the order follows
+the thread while moving forward in time. Where the thread jumps, a short connecting line is
+written on the phone, and each chapter gets a one- or two-line opening; these are shown in italics
+so you always know which words are yours. A 2D projection of the vectors is the map. Vectors
+(Apple's on-device contextual embedding) never leave the phone.
+
+Continue any entry with **Continue recording**: the new words are added to the same entry.
 
 ### Signing in a browser
 

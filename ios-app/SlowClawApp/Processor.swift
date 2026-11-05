@@ -48,6 +48,36 @@ final class Processor: ObservableObject {
         kick()
     }
 
+    /// Adds a new recording to an existing entry, so one topic stays in one place.
+    /// The audio is kept with the entry; the words are transcribed, cleaned and appended.
+    func appendRecording(to id: String, transcript: String, audioURL: URL?) {
+        let path = audioURL.flatMap { AudioRecorder.documentsRelativePath(for: $0) }
+        if let path { store.updateJournal(id) { $0.moreAudio = ($0.moreAudio ?? []) + [path] } }
+        let live = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        store.saveNow()
+        Task {
+            var raw = live
+            if raw.isEmpty, let audioURL {
+                activity = "Transcribing…"
+                raw = await Task.detached(priority: .userInitiated) { await Transcriber.transcribe(url: audioURL) }.value
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard !raw.isEmpty else { activity = nil; return }
+            activity = "Cleaning up transcript…"
+            let cleaned = await OnDeviceAI.cleanTranscript(raw)
+            let stamp = Date().formatted(date: .abbreviated, time: .shortened)
+            store.updateJournal(id) {
+                $0.body += "\n\n— Continued \(stamp) —\n\n" + cleaned
+                $0.transcript = ($0.transcript ?? "") + "\n\n" + raw
+            }
+            // New words may hold new to-dos and new passages for the book.
+            BookStore.shared.reread(id)
+            await organize(id)
+            activity = nil
+            kick()
+        }
+    }
+
     func saveText(title: String, body: String) {
         let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !title.isEmpty else { return }
@@ -79,6 +109,14 @@ final class Processor: ObservableObject {
                 // Oldest first, so the book grows in the order life happened.
                 activity = "Reading into your book…"
                 await BookStore.shared.read(j)
+            } else if BookStore.shared.needsPolish {
+                activity = "Writing chapter titles…"
+                let store = self.store
+                await BookStore.shared.polish {
+                    // Hand back as soon as a recording needs work.
+                    store.visibleJournals.contains { $0.status != .ready }
+                }
+                if BookStore.shared.needsPolish { continue }
             } else {
                 break
             }

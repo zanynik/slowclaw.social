@@ -44,7 +44,7 @@ struct SettingsView: View {
                 Section("On this iPhone") {
                     LabeledContent("Journal entries", value: "\(store.visibleJournals.count)")
                     LabeledContent("Spaces", value: "\(store.visibleSpaces.count)")
-                    LabeledContent("Book passages", value: "\(BookStore.shared.path.count)")
+                    LabeledContent("Book passages", value: "\(BookStore.shared.passages.count)")
                     LabeledContent("Open to-dos", value: "\(store.items.filter { !$0.deleted && $0.kind == .todo && !$0.done }.count)")
                     ShareLink(item: exportText()) {
                         Label("Export all journals as text", systemImage: "square.and.arrow.up")

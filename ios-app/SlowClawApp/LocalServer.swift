@@ -60,7 +60,7 @@ struct HTTPResponse {
                       404: "Not Found", 405: "Method Not Allowed", 413: "Payload Too Large", 429: "Too Many Requests"][status] ?? "Error"
         var head = "HTTP/1.1 \(status) \(reason)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.count)\r\n"
         head += "Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
-        head += "Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'\r\n"
+        head += "Content-Security-Policy: default-src 'self'; img-src 'self' data: https://i.ytimg.com; style-src 'self' 'unsafe-inline'; connect-src 'self'\r\n"
         for (k, v) in extraHeaders { head += "\(k): \(v)\r\n" }
         return Data((head + "\r\n").utf8) + body
     }
@@ -257,6 +257,12 @@ final class LocalServer: ObservableObject {
                 "space_items": store.items.filter { !$0.deleted }.map { CloudSync.row(from: $0, user: nil) },
                 "book_nodes": book,
                 "news": news,
+                "videos": VideoStore.shared.goals.filter(\.enabled).map { g -> [String: Any] in
+                    ["label": g.label, "why": g.why, "query": g.query,
+                     "videos": VideoStore.shared.videos.filter { $0.goal == g.label }.map {
+                        ["id": $0.id, "title": $0.title, "channel": $0.channel, "duration": $0.duration, "published": $0.published]
+                     }]
+                },
                 "device": UIDeviceName.current,
             ])
         case ("POST", "/api/save"):

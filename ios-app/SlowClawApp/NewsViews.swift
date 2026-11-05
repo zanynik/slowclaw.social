@@ -4,6 +4,7 @@ import SafariServices
 struct NewsView: View {
     @EnvironmentObject private var news: NewsStore
     @EnvironmentObject private var store: Store
+    @Binding var section: DiscoverSection
     @State private var showTopics = false
 
     var body: some View {
@@ -30,16 +31,21 @@ struct NewsView: View {
                             .buttonStyle(.plain)
                     }
                     if !news.cards.isEmpty {
-                        Text("Only your topic words were sent to Google News. Summaries were written on this iPhone.")
+                        Text("Only your topic searches were sent to Google News. Summaries were written on this iPhone.")
                             .font(.caption2).foregroundStyle(.secondary).padding(.top, 8)
                     }
                 }
                 .padding()
             }
-            .navigationTitle("News")
+            .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: String.self) { id in NewsDetailView(cardID: id) }
             .refreshable { await news.refresh(journals: store.visibleJournals) }
             .toolbar {
+                ToolbarItem(placement: .principal) { DiscoverPicker(section: $section) }
+                ToolbarItem(placement: .topBarLeading) {
+                    NavigationLink { ReadingHistoryView() } label: { Image(systemName: "clock.arrow.circlepath") }
+                        .accessibilityLabel("Reading history")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showTopics = true } label: { Image(systemName: "slider.horizontal.3") }
                         .accessibilityLabel("Topics")
@@ -72,6 +78,7 @@ struct NewsView: View {
 }
 
 struct NewsCardView: View {
+    @EnvironmentObject private var news: NewsStore
     let card: NewsCard
 
     var body: some View {
@@ -91,6 +98,7 @@ struct NewsCardView: View {
                         Text(newest, format: .relative(presentation: .named))
                     }
                     Spacer()
+                    if news.isRead(card) { Label("Read", systemImage: "checkmark.circle").font(.caption2).labelStyle(.titleAndIcon) }
                     if card.summarized { Image(systemName: "sparkles").font(.caption2) }
                 }
                 .font(.caption).foregroundStyle(.secondary)
@@ -130,6 +138,7 @@ struct NewsDetailView: View {
     @EnvironmentObject private var store: Store
     let cardID: String
     @State private var reading: URL?
+    @State private var opened: (article: NewsArticle, at: Date)?
 
     var body: some View {
         if let card = news.cards.first(where: { $0.id == cardID }) {
@@ -173,9 +182,16 @@ struct NewsDetailView: View {
                     ForEach(card.articles) { a in
                         Button {
                             reading = URL(string: a.url)
+                            opened = (a, Date())
                         } label: {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(a.title).foregroundStyle(.primary)
+                                HStack(alignment: .firstTextBaseline) {
+                                    Text(a.title).foregroundStyle(.primary)
+                                    if news.history.contains(where: { $0.url == a.url }) {
+                                        Image(systemName: "checkmark.circle.fill").font(.caption).foregroundStyle(.green)
+                                            .accessibilityLabel("Read")
+                                    }
+                                }
                                 HStack {
                                     Text(a.source)
                                     if let p = a.published { Text("·"); Text(p, format: .relative(presentation: .named)) }
@@ -188,7 +204,10 @@ struct NewsDetailView: View {
             }
             .navigationTitle(card.topic)
             .navigationBarTitleDisplayMode(.inline)
-            .sheet(item: $reading) { url in SafariView(url: url).ignoresSafeArea() }
+            .sheet(item: $reading, onDismiss: {
+                if let o = opened { news.recordRead(o.article, topic: card.topic, openedAt: o.at) }
+                opened = nil
+            }) { url in SafariView(url: url).ignoresSafeArea() }
         } else {
             ContentUnavailableView("Story no longer available", systemImage: "newspaper")
         }
@@ -211,6 +230,8 @@ struct TopicsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var newTopic = ""
     @State private var working = false
+    @State private var editing: NewsTopic?
+    @State private var editText = ""
 
     var body: some View {
         NavigationStack {
@@ -218,9 +239,15 @@ struct TopicsView: View {
                 Section {
                     ForEach(news.topics) { t in
                         Toggle(isOn: Binding(get: { t.enabled }, set: { news.setEnabled(t, $0) })) {
-                            VStack(alignment: .leading) {
+                            VStack(alignment: .leading, spacing: 2) {
                                 Text(t.name)
-                                Text(t.fromJournal ? "From your journal" : "Added by you").font(.caption).foregroundStyle(.secondary)
+                                Button {
+                                    editing = t; editText = t.query
+                                } label: {
+                                    Text("Searches: “\(t.query)”").font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.leading)
+                                }
+                                .buttonStyle(.plain)
+                                Text(t.fromJournal ? "From your journal" : "Added by you").font(.caption2).foregroundStyle(.tertiary)
                             }
                         }
                     }
@@ -229,14 +256,14 @@ struct TopicsView: View {
                         for i in offsets { news.remove(list[i]) }
                     }
                     HStack {
-                        TextField("Add a topic", text: $newTopic)
+                        TextField("Add a topic or a specific search", text: $newTopic)
                             .onSubmit(add)
                         Button("Add", action: add).disabled(NewsTopics.sanitize(newTopic) == nil)
                     }
                 } header: {
                     Text("Topics")
                 } footer: {
-                    Text("Topics are worked out on this iPhone from your recent entries. Only these words are sent to Google News as a search. Your journal text never leaves the phone.")
+                    Text("Topics are worked out on this iPhone from your recent entries. Only the search shown under each topic is sent to Google News. Your journal text never leaves the phone. Tap a search to change it.")
                 }
 
                 Section {
@@ -251,6 +278,13 @@ struct TopicsView: View {
                     }
                     .disabled(working)
                 }
+            }
+            .alert("Search for \(editing?.name ?? "")", isPresented: Binding(get: { editing != nil }, set: { if !$0 { editing = nil } })) {
+                TextField("Search", text: $editText)
+                Button("Save") { if let t = editing { news.setQuery(t, editText) }; editing = nil }
+                Button("Cancel", role: .cancel) { editing = nil }
+            } message: {
+                Text("Only this text is sent to Google News.")
             }
             .navigationTitle("News topics")
             .navigationBarTitleDisplayMode(.inline)
@@ -268,5 +302,40 @@ struct TopicsView: View {
     private func add() {
         news.add(newTopic)
         newTopic = ""
+    }
+}
+
+/// Everything opened from News, newest first, with the time it stayed open.
+struct ReadingHistoryView: View {
+    @EnvironmentObject private var news: NewsStore
+    @State private var reading: URL?
+
+    var body: some View {
+        List {
+            if news.history.isEmpty {
+                ContentUnavailableView("Nothing read yet", systemImage: "clock", description: Text("Articles you open from News are kept here, with how long you read them."))
+            }
+            ForEach(news.history) { r in
+                Button { reading = URL(string: r.url) } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(r.title).foregroundStyle(.primary)
+                        HStack(spacing: 6) {
+                            Text(r.source)
+                            Text("·")
+                            Text(r.openedAt, format: .relative(presentation: .named))
+                            if r.seconds >= 5 { Text("·"); Text(Self.duration(r.seconds)) }
+                        }
+                        .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .swipeActions { Button("Forget", role: .destructive) { news.forget(r) } }
+            }
+        }
+        .navigationTitle("Reading history")
+        .sheet(item: $reading) { url in SafariView(url: url).ignoresSafeArea() }
+    }
+
+    static func duration(_ s: Int) -> String {
+        s < 60 ? "\(s)s read" : "\(s / 60) min read"
     }
 }

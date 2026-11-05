@@ -1,4 +1,5 @@
 import SwiftUI
+import NaturalLanguage
 
 @main
 struct SlowClawApp: App {
@@ -8,6 +9,7 @@ struct SlowClawApp: App {
     @StateObject private var recorder = AudioRecorder()
     @StateObject private var book = BookStore.shared
     @StateObject private var news = NewsStore.shared
+    @StateObject private var videos = VideoStore.shared
     @StateObject private var local = LocalServer.shared
     @Environment(\.scenePhase) private var scenePhase
 
@@ -20,11 +22,14 @@ struct SlowClawApp: App {
                 .environmentObject(recorder)
                 .environmentObject(book)
                 .environmentObject(news)
+                .environmentObject(videos)
                 .environmentObject(local)
                 .task {
                     LegacyImport.runIfNeeded(store: store)
                     book.onLocalChange = { CloudSync.shared.schedulePush() }
                     processor.start()
+                    // The better embedding model downloads once, in the background.
+                    Task.detached(priority: .utility) { await Embedder.prepare(for: [.english, NLLanguage(rawValue: Locale.current.language.languageCode?.identifier ?? "en")]) }
                     if local.enabled { local.start() }
                     await cloud.sync()
                 }
@@ -47,7 +52,7 @@ struct SlowClawApp: App {
     }
 }
 
-enum AppTab: Hashable { case journal, todos, spaces, book, news }
+enum AppTab: Hashable { case journal, todos, spaces, book, discover }
 
 struct RootView: View {
     @EnvironmentObject private var store: Store
@@ -72,9 +77,9 @@ struct RootView: View {
             BookView()
                 .tabItem { Label("Book", systemImage: "book") }
                 .tag(AppTab.book)
-            NewsView()
-                .tabItem { Label("News", systemImage: "newspaper") }
-                .tag(AppTab.news)
+            DiscoverView()
+                .tabItem { Label("Discover", systemImage: "sparkle.magnifyingglass") }
+                .tag(AppTab.discover)
         }
         .fullScreenCover(isPresented: $showRecorder) {
             RecordView()

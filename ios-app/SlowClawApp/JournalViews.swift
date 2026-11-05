@@ -161,6 +161,7 @@ struct JournalDetailView: View {
     @State private var loaded = false
     @State private var showOriginal = false
     @State private var working = false
+    @State private var continuing = false
     @StateObject private var player = AudioPlayer()
 
     private var journal: Journal? { store.journal(journalID) }
@@ -203,14 +204,19 @@ struct JournalDetailView: View {
                         }
                     }
 
-                    if let path = j.audioPath, let url = AudioRecorder.absoluteURL(forMediaRelativePath: path),
-                       FileManager.default.fileExists(atPath: url.path) {
-                        Section("Recording") {
-                            Button {
-                                player.toggle(url)
-                            } label: {
-                                Label(player.playing ? "Pause" : "Play recording",
-                                      systemImage: player.playing ? "pause.circle" : "play.circle")
+                    let parts = ([j.audioPath].compactMap { $0 } + (j.moreAudio ?? []))
+                        .compactMap { AudioRecorder.absoluteURL(forMediaRelativePath: $0) }
+                        .filter { FileManager.default.fileExists(atPath: $0.path) }
+                    if !parts.isEmpty {
+                        Section(parts.count == 1 ? "Recording" : "Recordings") {
+                            ForEach(Array(parts.enumerated()), id: \.offset) { index, url in
+                                Button {
+                                    player.toggle(url)
+                                } label: {
+                                    let playingThis = player.playing && player.current == url
+                                    Label(playingThis ? "Pause" : (parts.count == 1 ? "Play recording" : "Play part \(index + 1)"),
+                                          systemImage: playingThis ? "pause.circle" : "play.circle")
+                                }
                             }
                             Text("Audio stays on this iPhone and is not synced.")
                                 .font(.caption).foregroundStyle(.secondary)
@@ -228,6 +234,11 @@ struct JournalDetailView: View {
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) {
                         Menu {
+                            if j.status == .ready {
+                                Button {
+                                    save(); continuing = true
+                                } label: { Label("Continue recording", systemImage: "mic.badge.plus") }
+                            }
                             Button {
                                 Task { working = true; save(); await processor.organize(journalID); working = false }
                             } label: { Label("Organize again", systemImage: "sparkles") }
@@ -264,6 +275,7 @@ struct JournalDetailView: View {
             }
         }
         .navigationBarTitleDisplayMode(.inline)
+        .fullScreenCover(isPresented: $continuing) { RecordView(continuing: journalID) }
     }
 
     private func save() {
@@ -291,10 +303,12 @@ struct JournalDetailView: View {
 @MainActor
 final class AudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private(set) var playing = false
+    @Published private(set) var current: URL?
     private var player: AVAudioPlayer?
 
     func toggle(_ url: URL) {
-        if playing { player?.pause(); playing = false; return }
+        if playing && player?.url == url { player?.pause(); playing = false; return }
+        if playing { player?.stop(); playing = false }
         do {
             if player?.url != url {
                 try AVAudioSession.sharedInstance().setCategory(.playback)
@@ -304,6 +318,7 @@ final class AudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             }
             player?.play()
             playing = true
+            current = url
         } catch {
             playing = false
         }

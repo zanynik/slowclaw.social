@@ -29,9 +29,12 @@ Read `README.md` first.
   - `AudioRecorder.swift`, `SpeechTranscriber.swift`, `TimedTranscript.swift`,
     `RecordingSilence.swift` — proven capture/transcription code; change with care.
   - `Shortcuts.swift` — "Record a journal" App Intent (Siri, Action Button, Shortcuts).
-  - `BookEngine.swift` (pure rules: gate, insertion, chapters, PCA map), `Book.swift` (store,
-    embeddings, passages, sync rows), `BookViews.swift`.
-  - `News.swift` (topics, RSS, clustering, summaries), `NewsViews.swift`.
+  - `BookOrganizer.swift` (pure rules: repeats, own-voice check, admission, themes, reading
+    order, connecting-line spots), `BookEngine.swift` (vectors, words, PCA map), `Book.swift`
+    (store, embeddings, passages, AI lines, sync rows), `BookViews.swift`.
+  - `News.swift` (topics + specific searches, RSS, clustering, summaries, reading history),
+    `NewsViews.swift`; `Videos.swift` (learning goals, YouTube results), `VideosViews.swift`
+    (Discover tab: News | Videos).
   - `Nostr.swift` (Keychain key, BIP-340 signing, NIP-19/NIP-98), `QRScanner.swift`
     (browser codes), `LocalServer.swift` (Wi-Fi web server + JSON API for the local view).
   - Views: `JournalViews.swift`, `RecordView.swift`, `TodosView.swift`, `SpacesViews.swift`,
@@ -44,6 +47,10 @@ Read `README.md` first.
 - `supabase/migrations/` — never edit an applied migration; add a new one.
 
 ## Workflow
+
+- A nightly agent turns the owner's journal ideas into small changes: see `docs/nightly-agent.md`.
+  It pushes `nightly/*` branches; `nightly-release.yml` promotes them to `main` only after the
+  build and unit tests pass.
 
 - Work on a branch, open a PR. The PR runs an unsigned iOS compile check on macOS.
 - Merging to `main` publishes: `ios-app/**` → TestFlight, `web/**` → Pages.

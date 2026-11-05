@@ -4,6 +4,9 @@ import SwiftUI
 struct RecordView: View {
     @EnvironmentObject private var recorder: AudioRecorder
     @EnvironmentObject private var processor: Processor
+    @EnvironmentObject private var store: Store
+    /// When set, the recording is added to this entry instead of starting a new one.
+    var continuing: String? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var title = ""
     @State private var saving = false
@@ -13,10 +16,17 @@ struct RecordView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 20) {
-                TextField("Title (optional)", text: $title)
-                    .font(.title3.weight(.semibold))
-                    .textFieldStyle(.plain)
-                    .padding(.horizontal)
+                if let id = continuing {
+                    Label("Continuing “\(store.journal(id)?.displayTitle ?? "entry")”", systemImage: "arrow.turn.down.right")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal)
+                } else {
+                    TextField("Title (optional)", text: $title)
+                        .font(.title3.weight(.semibold))
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal)
+                }
 
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -109,7 +119,11 @@ struct RecordView: View {
     private func finish() async {
         saving = true
         await recorder.finishRecording()
-        processor.saveRecording(title: title, transcript: recorder.transcript, audioURL: recorder.recordedFileURL)
+        if let id = continuing {
+            processor.appendRecording(to: id, transcript: recorder.transcript, audioURL: recorder.recordedFileURL)
+        } else {
+            processor.saveRecording(title: title, transcript: recorder.transcript, audioURL: recorder.recordedFileURL)
+        }
         recorder.recordedFileURL = nil
         recorder.transcript = ""
         dismiss()

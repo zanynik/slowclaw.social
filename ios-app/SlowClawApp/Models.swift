@@ -16,6 +16,8 @@ struct Journal: Codable, Identifiable, Hashable {
     var transcript: String?
     /// Documents-relative audio path. Audio stays on the phone and is never synced.
     var audioPath: String?
+    /// Later recordings that continued this entry (also phone-only).
+    var moreAudio: [String]?
     var spaceID: String?
     var createdAt: Date
     var updatedAt: Date
