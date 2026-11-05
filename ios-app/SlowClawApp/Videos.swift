@@ -221,7 +221,7 @@ final class VideoStore: ObservableObject {
     }
 
     /// "How does X work?" style sentences, reduced to their content words.
-    static func questions(in texts: [String]) -> [String] {
+    nonisolated static func questions(in texts: [String]) -> [String] {
         var out: [String] = []
         for t in texts {
             for s in BookOrganizer.sentences(t) where s.hasSuffix("?") {
