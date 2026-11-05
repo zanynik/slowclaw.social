@@ -1,0 +1,79 @@
+name: Nightly release
+
+# The nightly agent (docs/nightly-agent.md) pushes its work to a nightly/* branch. This workflow is
+# the gate: the app must build and every unit test must pass on the simulator, and the website's
+# JavaScript must parse. Only then is the branch fast-forwarded onto main and TestFlight and Pages
+# are started. A failing branch never reaches main or your phone.
+
+on:
+    push:
+        branches:
+            - "nightly/**"
+
+concurrency:
+    group: nightly-release
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+jobs:
+    verify:
+        name: Build and test
+        runs-on: macos-26
+        timeout-minutes: 45
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Website syntax
+              run: node --check web/app.js
+            - name: Install XcodeGen
+              run: command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+            - name: Generate Xcode project
+              working-directory: ios-app
+              run: xcodegen generate
+            - name: Build without signing
+              working-directory: ios-app
+              run: |
+                  set -euo pipefail
+                  xcodebuild build -project SlowClaw.xcodeproj -scheme SlowClaw -configuration Release \
+                    -destination "generic/platform=iOS" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+            - name: Unit tests (simulator)
+              working-directory: ios-app
+              run: |
+                  set -euo pipefail
+                  DEVICE="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for k,v in sorted(d.items(), reverse=True) if "iOS" in k for x in v if x["name"].startswith("iPhone")))')"
+                  xcodebuild test -project SlowClaw.xcodeproj -scheme SlowClaw -destination "id=${DEVICE}" \
+                    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
+    release:
+        name: Promote to main and publish
+        needs: verify
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        permissions:
+            contents: write
+            actions: write
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+            - name: Fast-forward main
+              run: |
+                  set -euo pipefail
+                  git fetch origin main
+                  # Only a branch built on top of the current main may be promoted (no rewrites, no merges here).
+                  if ! git merge-base --is-ancestor origin/main HEAD; then
+                    echo "::error::${GITHUB_REF_NAME} is not based on the current main. Rebase it and push again."
+                    exit 1
+                  fi
+                  git push origin "HEAD:refs/heads/main"
+            # Pushes made with the workflow token do not start other workflows, so start them directly.
+            - name: Start TestFlight and Pages
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  gh workflow run pub-testflight.yml --ref main --repo "${GITHUB_REPOSITORY}"
+                  gh workflow run pages.yml --ref main --repo "${GITHUB_REPOSITORY}"
