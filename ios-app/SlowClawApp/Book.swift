@@ -1,13 +1,12 @@
 import Foundation
-import NaturalLanguage
 import FoundationModels
 
 enum BookNodeKind: String, Codable {
-    /// The author's own words, lightly edited.
+    /// The author's words (cleaned, later condensed on the phone).
     case passage
-    /// A short connecting line written on the phone where the thread jumps.
+    /// Kept for rows written by 0.5 (connecting lines); no longer created.
     case bridge
-    /// One or two lines written on the phone that open a chapter.
+    /// Kept for rows written by 0.5 (chapter openings); no longer created.
     case intro
 }
 
@@ -15,15 +14,18 @@ struct BookNode: Codable, Identifiable, Hashable {
     var id: String
     var kind: BookNodeKind
     var journalID: String?
+    /// What the book shows: the cleaned excerpt, replaced by a condensed version once polished.
     var text: String
-    /// Unit-length vector (passages only), little-endian Float32 bytes. Never synced.
+    /// The cleaned segment the passage came from (input for condensing, and the voice check).
+    var source: String?
+    var polished: Bool
+    /// Unit-length MiniLM vector of the excerpt, little-endian Float32. Never synced.
     var vectorData: Data
-    /// Which embedding model made the vector, e.g. "ctx-en" or "sent-en".
+    /// Which model made the vector ("minilm"); others are remade.
     var language: String
     /// Journal date as yyyymmdd and order within the journal, for reading order.
     var day: Int
     var seq: Int
-    /// For bridges and intros: what they were written for, so they are rewritten only when that changes.
     var key: String?
     var position: Double
     var chapter: Int
@@ -38,25 +40,27 @@ struct BookNode: Codable, Identifiable, Hashable {
     var vector: [Float] { BookVectors.decode(vectorData) }
 
     enum CodingKeys: String, CodingKey {
-        case id, kind, journalID, text, vectorData, language, day, seq, key, position, chapter, chapterTitle, x, y, createdAt, updatedAt, deleted, dirty
+        case id, kind, journalID, text, source, polished, vectorData, language, day, seq, key, position, chapter, chapterTitle, x, y,
+             createdAt, updatedAt, deleted, dirty
     }
 
-    init(id: String, kind: BookNodeKind, journalID: String?, text: String, vectorData: Data, language: String,
-         day: Int, seq: Int, key: String?, position: Double, chapter: Int, chapterTitle: String,
-         x: Double, y: Double, createdAt: Date, updatedAt: Date, deleted: Bool, dirty: Bool) {
-        self.id = id; self.kind = kind; self.journalID = journalID; self.text = text; self.vectorData = vectorData
-        self.language = language; self.day = day; self.seq = seq; self.key = key; self.position = position
-        self.chapter = chapter; self.chapterTitle = chapterTitle; self.x = x; self.y = y
-        self.createdAt = createdAt; self.updatedAt = updatedAt; self.deleted = deleted; self.dirty = dirty
+    init(id: String, kind: BookNodeKind = .passage, journalID: String?, text: String, source: String?, vectorData: Data,
+         language: String, day: Int, seq: Int, position: Double, createdAt: Date) {
+        self.id = id; self.kind = kind; self.journalID = journalID; self.text = text; self.source = source; self.polished = false
+        self.vectorData = vectorData; self.language = language; self.day = day; self.seq = seq; self.key = nil
+        self.position = position; self.chapter = 0; self.chapterTitle = ""; self.x = 0.5; self.y = 0.5
+        self.createdAt = createdAt; self.updatedAt = createdAt; self.deleted = false; self.dirty = true
     }
 
-    /// Reads books saved by 0.4 too (no kind/day/seq/key), so their rows can be retired cleanly.
+    /// Reads books saved by earlier versions too, so their rows can be retired cleanly.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         kind = try c.decodeIfPresent(BookNodeKind.self, forKey: .kind) ?? .passage
         journalID = try c.decodeIfPresent(String.self, forKey: .journalID)
         text = try c.decode(String.self, forKey: .text)
+        source = try c.decodeIfPresent(String.self, forKey: .source)
+        polished = try c.decodeIfPresent(Bool.self, forKey: .polished) ?? false
         vectorData = try c.decodeIfPresent(Data.self, forKey: .vectorData) ?? Data()
         language = try c.decodeIfPresent(String.self, forKey: .language) ?? ""
         day = try c.decodeIfPresent(Int.self, forKey: .day) ?? 0
@@ -74,42 +78,6 @@ struct BookNode: Codable, Identifiable, Hashable {
     }
 }
 
-/// A passage the book did not take yet, with the reason. Retried as the book grows.
-struct BookCandidate: Codable, Identifiable, Hashable {
-    var id: String
-    var journalID: String?
-    var text: String
-    var vectorData: Data
-    var language: String
-    var day: Int
-    var seq: Int
-    var reason: String
-    var createdAt: Date
-    var attempts: Int
-
-    enum CodingKeys: String, CodingKey { case id, journalID, text, vectorData, language, day, seq, reason, createdAt, attempts }
-
-    init(id: String, journalID: String?, text: String, vectorData: Data, language: String, day: Int, seq: Int,
-         reason: String, createdAt: Date, attempts: Int) {
-        self.id = id; self.journalID = journalID; self.text = text; self.vectorData = vectorData; self.language = language
-        self.day = day; self.seq = seq; self.reason = reason; self.createdAt = createdAt; self.attempts = attempts
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(String.self, forKey: .id)
-        journalID = try c.decodeIfPresent(String.self, forKey: .journalID)
-        text = try c.decode(String.self, forKey: .text)
-        vectorData = try c.decodeIfPresent(Data.self, forKey: .vectorData) ?? Data()
-        language = try c.decodeIfPresent(String.self, forKey: .language) ?? ""
-        day = try c.decodeIfPresent(Int.self, forKey: .day) ?? 0
-        seq = try c.decodeIfPresent(Int.self, forKey: .seq) ?? 0
-        reason = try c.decodeIfPresent(String.self, forKey: .reason) ?? ""
-        createdAt = try c.decode(Date.self, forKey: .createdAt)
-        attempts = try c.decodeIfPresent(Int.self, forKey: .attempts) ?? 0
-    }
-}
-
 enum BookVectors {
     static func encode(_ v: [Float]) -> Data { v.withUnsafeBufferPointer { Data(buffer: $0) } }
     static func decode(_ d: Data) -> [Float] {
@@ -119,80 +87,20 @@ enum BookVectors {
     }
 }
 
-/// On-device text vectors. Prefers Apple's contextual (transformer) embedding, averaged over
-/// tokens; falls back to the older sentence embedding while its model downloads.
+/// On-device text vectors: the bundled MiniLM (the same model the book and Discover were tuned with).
 enum Embedder {
-    nonisolated(unsafe) private static var contextual: [String: NLContextualEmbedding] = [:]
-    nonisolated(unsafe) private static var sentence: [String: NLEmbedding] = [:]
-    private static let lock = NSLock()
+    static let tag = "minilm"
+    static var isAvailable: Bool { MiniLM.shared != nil }
 
-    static func language(of text: String) -> NLLanguage {
-        NLLanguageRecognizer.dominantLanguage(for: text) ?? .english
+    static func vector(for text: String) -> [Float]? { MiniLM.shared?.embed(text) }
+
+    /// Embeds many texts off the main thread.
+    static func vectors(for texts: [String]) async -> [[Float]]? {
+        await Task.detached(priority: .utility) { () -> [[Float]]? in
+            guard let m = MiniLM.shared else { return nil }
+            return texts.map { m.embed($0) }
+        }.value
     }
-
-    /// The tag a vector made now would carry; vectors with another tag get remade.
-    static func tag(for text: String) -> String {
-        let lang = language(of: text)
-        return contextualModel(for: lang) != nil ? "ctx-" + lang.rawValue : "sent-" + lang.rawValue
-    }
-
-    static func vector(for text: String) -> (vector: [Float], language: String)? {
-        let lang = language(of: text)
-        if let model = contextualModel(for: lang), let v = meanPooled(model, text: text, language: lang) {
-            return (v, "ctx-" + lang.rawValue)
-        }
-        guard let e = sentenceModel(for: lang) ?? sentenceModel(for: .english),
-              let raw = e.vector(for: text) else { return nil }
-        let v = BookEngine.normalized(raw.map(Float.init))
-        guard v.contains(where: { $0 != 0 }) else { return nil }
-        return (v, "sent-" + (e.language ?? lang).rawValue)
-    }
-
-    private static func meanPooled(_ model: NLContextualEmbedding, text: String, language: NLLanguage) -> [Float]? {
-        guard let result = try? model.embeddingResult(for: text, language: language) else { return nil }
-        var sum = [Double](repeating: 0, count: model.dimension)
-        var count = 0
-        result.enumerateTokenVectors(in: text.startIndex..<text.endIndex) { vector, _ in
-            for i in 0..<min(vector.count, sum.count) { sum[i] += vector[i] }
-            count += 1
-            return true
-        }
-        guard count > 0 else { return nil }
-        let v = BookEngine.normalized(sum.map { Float($0 / Double(count)) })
-        return v.contains(where: { $0 != 0 }) ? v : nil
-    }
-
-    private static func contextualModel(for lang: NLLanguage) -> NLContextualEmbedding? {
-        lock.lock(); defer { lock.unlock() }
-        if let m = contextual[lang.rawValue] { return m }
-        guard let m = NLContextualEmbedding(language: lang), m.hasAvailableAssets, (try? m.load()) != nil else { return nil }
-        contextual[lang.rawValue] = m
-        return m
-    }
-
-    private static func sentenceModel(for lang: NLLanguage) -> NLEmbedding? {
-        lock.lock(); defer { lock.unlock() }
-        if let e = sentence[lang.rawValue] { return e }
-        guard let e = NLEmbedding.sentenceEmbedding(for: lang) else { return nil }
-        sentence[lang.rawValue] = e
-        return e
-    }
-
-    /// Asks iOS to download the contextual model (a one-off, in the background).
-    static func prepare(for languages: [NLLanguage] = [.english]) async {
-        for lang in languages {
-            guard let m = NLContextualEmbedding(language: lang), !m.hasAvailableAssets else { continue }
-            _ = try? await m.requestAssets()
-        }
-    }
-
-    static var isAvailable: Bool { NLEmbedding.sentenceEmbedding(for: .english) != nil || NLContextualEmbedding(language: .english) != nil }
-}
-
-@Generable
-struct BookExcerpts {
-    @Guide(description: "Passages copied from the entry in the author's own words: each 2 to 5 consecutive sentences. Empty when nothing is worth keeping.")
-    var excerpts: [String]
 }
 
 @Generable
@@ -202,28 +110,29 @@ struct ChapterTitle {
 }
 
 @Generable
-struct BookLine {
-    @Guide(description: "The line, in the author's first-person voice")
+struct CondensedPassage {
+    @Guide(description: "The passage: 2 to 4 sentences in the speaker's first-person voice")
     var text: String
 }
 
 @MainActor
 final class BookStore: ObservableObject {
     static let shared = BookStore()
-    /// 2 = own-voice passages, whole-book organisation, bridges.
-    static let bookVersion = 2
+    /// 3 = MiniLM, segment passages, whole-book layout, background condensing.
+    static let bookVersion = 3
+    static let looseEndsChapter = 999
 
     @Published private(set) var nodes: [BookNode] = []
-    @Published private(set) var waiting: [BookCandidate] = []
     @Published private(set) var lastEvent: String?
-    /// Titles, chapter openings and connecting lines still to be written (done when idle).
+    @Published private(set) var progress: (done: Int, total: Int)?
+    /// Layout or condensing still to do (done when the phone is idle).
     @Published private(set) var needsPolish = false
+    private(set) var layoutDirty = false
 
     private var processed: [String: Date] = [:]
     private var axes: [[Float]] = []
     private var projectedCount = 0
     private var titleCache: [String: String] = [:]
-    private var lineCache: [String: String] = [:]
     private var version = BookStore.bookVersion
     private var saveTask: Task<Void, Never>?
     var onLocalChange: (@MainActor () -> Void)?
@@ -231,13 +140,12 @@ final class BookStore: ObservableObject {
     private struct Snapshot: Codable {
         var version: Int
         var nodes: [BookNode]
-        var waiting: [BookCandidate]
         var processed: [String: Date]
         var axes: [[Float]]
         var projectedCount: Int
         var titleCache: [String: String]
-        var lineCache: [String: String]?
         var needsPolish: Bool?
+        var layoutDirty: Bool?
     }
 
     private static var fileURL: URL {
@@ -249,14 +157,13 @@ final class BookStore: ObservableObject {
     init() {
         let d = JSONDecoder(); d.dateDecodingStrategy = .secondsSince1970
         if let data = try? Data(contentsOf: Self.fileURL), let s = try? d.decode(Snapshot.self, from: data) {
-            nodes = s.nodes; waiting = s.waiting; processed = s.processed
-            axes = s.axes; projectedCount = s.projectedCount; titleCache = s.titleCache
-            lineCache = s.lineCache ?? [:]; needsPolish = s.needsPolish ?? false; version = s.version
+            nodes = s.nodes; processed = s.processed; axes = s.axes; projectedCount = s.projectedCount
+            titleCache = s.titleCache; needsPolish = s.needsPolish ?? false; layoutDirty = s.layoutDirty ?? false
+            version = s.version
+        } else if FileManager.default.fileExists(atPath: Self.fileURL.path) {
+            version = 0   // unreadable older format: start over
         }
-        if version < Self.bookVersion {
-            // Books from 0.4 were AI summaries in one voice. Start again from the journals.
-            rebuild()
-        }
+        if version < Self.bookVersion { rebuild() }
     }
 
     private func scheduleSave() {
@@ -270,8 +177,8 @@ final class BookStore: ObservableObject {
 
     func saveNow() {
         let e = JSONEncoder(); e.dateEncodingStrategy = .secondsSince1970
-        let snap = Snapshot(version: version, nodes: nodes, waiting: waiting, processed: processed, axes: axes,
-                            projectedCount: projectedCount, titleCache: titleCache, lineCache: lineCache, needsPolish: needsPolish)
+        let snap = Snapshot(version: version, nodes: nodes, processed: processed, axes: axes, projectedCount: projectedCount,
+                            titleCache: titleCache, needsPolish: needsPolish, layoutDirty: layoutDirty)
         guard let data = try? e.encode(snap) else { return }
         try? FileManager.default.createDirectory(at: Self.fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: Self.fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
@@ -284,9 +191,7 @@ final class BookStore: ObservableObject {
 
     // MARK: - Reading order
 
-    /// Everything in reading order: passages, chapter openings and connecting lines.
     var path: [BookNode] { nodes.filter { !$0.deleted }.sorted { $0.position < $1.position } }
-    /// Passages only (the map and counts use these).
     var passages: [BookNode] { path.filter { $0.kind == .passage } }
 
     struct Chapter: Identifiable {
@@ -294,16 +199,14 @@ final class BookStore: ObservableObject {
         var title: String
         var nodes: [BookNode]
         var passageCount: Int { nodes.filter { $0.kind == .passage }.count }
+        var isLooseEnds: Bool { id == BookStore.looseEndsChapter }
     }
 
     var chapters: [Chapter] {
         var out: [Chapter] = []
         for n in path {
-            if let last = out.last, last.id == n.chapter {
-                out[out.count - 1].nodes.append(n)
-            } else {
-                out.append(Chapter(id: n.chapter, title: n.chapterTitle, nodes: [n]))
-            }
+            if let last = out.last, last.id == n.chapter { out[out.count - 1].nodes.append(n) }
+            else { out.append(Chapter(id: n.chapter, title: n.chapterTitle, nodes: [n])) }
         }
         return out
     }
@@ -320,304 +223,195 @@ final class BookStore: ObservableObject {
         return (c.year ?? 2000) * 10000 + (c.month ?? 1) * 100 + (c.day ?? 1)
     }
 
-    /// Reads one journal: picks passages in the author's words and lets each one in, keeps it
-    /// waiting, or drops it as a repeat. Then reorganises the book.
-    func read(_ j: Journal) async {
+    /// Reads one journal into the book: no language model involved, just MiniLM vectors.
+    func read(_ j: Journal, remaining: Int = 0) async {
         processed[j.id] = j.updatedAt
         defer { scheduleSave() }
         guard Embedder.isAvailable else { return }
-        // The same recording imported twice: read it once.
         let others = processed.keys.filter { $0 != j.id }.compactMap { Store.shared.journal($0) }.filter { !$0.deleted }
         if others.contains(where: { BookOrganizer.isRepeatJournal(j.body, of: $0.body) }) { return }
 
-        let excerpts = await Self.passages(from: j)
+        let sentences = BookOrganizer.bookSentences(j.body)
+        guard sentences.count >= 3, let vectors = await Embedder.vectors(for: sentences) else { return }
+        let found = BookOrganizer.passages(sentences: sentences, vectors: vectors, journalLength: j.body.count)
+        guard !found.isEmpty, let passageVectors = await Embedder.vectors(for: found.map(\.text)) else { return }
+
         let day = Self.dayNumber(j.createdAt)
-        var joined = 0
-        for (seq, text) in excerpts.enumerated() {
-            guard let e = Embedder.vector(for: text) else { continue }
-            if consider(text: text, vector: e.vector, language: e.language, journalID: j.id, day: day, seq: seq, candidateID: nil) {
-                joined += 1
-            }
+        let existing = passages
+        var added = 0
+        for (p, v) in zip(found, passageVectors) {
+            let repeats = existing.contains { BookOrganizer.isRepeatPassage(p.text, vector: v, of: $0.text, otherVector: $0.vector) }
+                || nodes.suffix(added).contains { BookOrganizer.isRepeatPassage(p.text, vector: v, of: $0.text, otherVector: $0.vector) }
+            if repeats { continue }
+            let context = String(sentences[p.range].joined(separator: " ").prefix(1500))
+            nodes.append(BookNode(id: newID("node"), journalID: j.id, text: String(p.text.prefix(4000)), source: context,
+                                  vectorData: BookVectors.encode(v), language: Embedder.tag, day: day, seq: p.start,
+                                  position: Double(nodes.count + 1) * 10, createdAt: Date()))
+            added += 1
         }
-        if joined > 0 {
-            joined += retryWaiting()
-            reorganize()
-            lastEvent = joined == 1 ? "1 passage joined your book." : "\(joined) passages joined your book."
+        if added > 0 {
+            layoutDirty = true
+            needsPolish = true
+            lastEvent = added == 1 ? "1 passage joined your book." : "\(added) passages joined your book."
+            // While many journals are being read, lay the book out every 8 journals.
+            if remaining == 0 || processed.count % 8 == 0 { await layout() }
             changed()
         }
     }
 
-    @discardableResult
-    private func consider(text: String, vector: [Float], language: String, journalID: String?, day: Int, seq: Int,
-                          candidateID: String?) -> Bool {
-        let book = passages.filter { $0.language == language }
-        let waitingVectors = waiting.filter { $0.id != candidateID && $0.language == language }.map { BookVectors.decode($0.vectorData) }
-        switch BookOrganizer.admit(vector: vector, text: text, bookVectors: book.map(\.vector), bookTexts: book.map(\.text),
-                                   waitingVectors: waitingVectors) {
-        case .join:
-            let now = Date()
-            nodes.append(BookNode(id: newID("node"), kind: .passage, journalID: journalID, text: String(text.prefix(4000)),
-                                  vectorData: BookVectors.encode(vector), language: language, day: day, seq: seq, key: nil,
-                                  position: Double(nodes.count + 1), chapter: 0, chapterTitle: "", x: 0.5, y: 0.5,
-                                  createdAt: now, updatedAt: now, deleted: false, dirty: true))
-            if let candidateID { waiting.removeAll { $0.id == candidateID } }
-            return true
-        case let .wait(reason):
-            if let candidateID, let i = waiting.firstIndex(where: { $0.id == candidateID }) {
-                waiting[i].reason = reason; waiting[i].attempts += 1
-            } else if candidateID == nil {
-                waiting.append(BookCandidate(id: newID("cand"), journalID: journalID, text: text, vectorData: BookVectors.encode(vector),
-                                             language: language, day: day, seq: seq, reason: reason, createdAt: Date(), attempts: 1))
-                if waiting.count > 300 { waiting.removeFirst(waiting.count - 300) }
-            }
-            return false
-        case .drop:
-            if let candidateID { waiting.removeAll { $0.id == candidateID } }
-            return false
-        }
-    }
-
-    /// Waiting passages may connect now that the book has grown.
-    private func retryWaiting() -> Int {
-        var joined = 0
-        for c in waiting.filter({ $0.attempts < 20 }) {
-            if consider(text: c.text, vector: BookVectors.decode(c.vectorData), language: c.language,
-                        journalID: c.journalID, day: c.day, seq: c.seq, candidateID: c.id) { joined += 1 }
-        }
-        return joined
-    }
-
-    /// The user's choice wins: put a waiting passage into the book.
-    func addAnyway(_ id: String) {
-        guard let c = waiting.first(where: { $0.id == id }) else { return }
-        let now = Date()
-        nodes.append(BookNode(id: newID("node"), kind: .passage, journalID: c.journalID, text: c.text, vectorData: c.vectorData,
-                              language: c.language, day: c.day, seq: c.seq, key: nil, position: Double(nodes.count + 1),
-                              chapter: 0, chapterTitle: "", x: 0.5, y: 0.5, createdAt: now, updatedAt: now, deleted: false, dirty: true))
-        waiting.removeAll { $0.id == id }
-        reorganize()
-        changed()
-    }
-
-    /// Reads a journal again after it grew (passages already in the book are recognised as repeats).
     func reread(_ journalID: String) {
         processed[journalID] = nil
-        scheduleSave()
-    }
-
-    func dismiss(_ id: String) {
-        waiting.removeAll { $0.id == id }
         scheduleSave()
     }
 
     func remove(_ nodeID: String) {
         guard let i = nodes.firstIndex(where: { $0.id == nodeID }) else { return }
         retire(i)
-        reorganize()
-        changed()
+        layoutDirty = true
+        Task { await layout(); changed() }
     }
 
     private func retire(_ i: Int) {
-        nodes[i].deleted = true; nodes[i].text = ""; nodes[i].updatedAt = Date(); nodes[i].dirty = true
+        nodes[i].deleted = true; nodes[i].text = ""; nodes[i].source = nil; nodes[i].updatedAt = Date(); nodes[i].dirty = true
     }
 
     func journalDeleted(_ journalID: String) {
         var touched = false
         for i in nodes.indices where nodes[i].journalID == journalID && !nodes[i].deleted { retire(i); touched = true }
-        waiting.removeAll { $0.journalID == journalID }
-        if touched { reorganize(); changed() } else { scheduleSave() }
+        if touched { layoutDirty = true; Task { await layout(); changed() } } else { scheduleSave() }
     }
 
     /// Starts the book over from all journals.
     func rebuild() {
         for i in nodes.indices where !nodes[i].deleted { retire(i) }
-        waiting = []; processed = [:]; axes = []; projectedCount = 0; titleCache = [:]; lineCache = [:]
-        needsPolish = false
+        processed = [:]; axes = []; projectedCount = 0; titleCache = [:]
+        needsPolish = false; layoutDirty = false
         version = Self.bookVersion
         changed()
     }
 
-    // MARK: - Organising
+    // MARK: - Layout
 
-    /// Re-makes vectors made by an older model so all passages are comparable.
-    private func refreshVectors() {
-        for i in nodes.indices where nodes[i].kind == .passage && !nodes[i].deleted {
-            guard nodes[i].language != Embedder.tag(for: nodes[i].text), let e = Embedder.vector(for: nodes[i].text) else { continue }
-            nodes[i].vectorData = BookVectors.encode(e.vector)
-            nodes[i].language = e.language
+    /// Chapters, order, positions and the map, for the whole book. Heavy maths runs off the main thread.
+    func layout() async {
+        guard layoutDirty else { return }
+        layoutDirty = false
+        // Vectors from another model are remade so everything is comparable.
+        for i in nodes.indices where nodes[i].kind == .passage && !nodes[i].deleted && nodes[i].language != Embedder.tag {
+            if let v = Embedder.vector(for: nodes[i].source ?? nodes[i].text) {
+                nodes[i].vectorData = BookVectors.encode(v); nodes[i].language = Embedder.tag
+            }
         }
-    }
+        // Lines from 0.5 are retired.
+        for i in nodes.indices where nodes[i].kind != .passage && !nodes[i].deleted { retire(i) }
 
-    /// Lays out the whole book: chapters, order, positions and the map. Writing (titles,
-    /// openings, connecting lines) is left for `polish()` when the phone is idle.
-    private func reorganize() {
-        refreshVectors()
         let live = nodes.filter { !$0.deleted && $0.kind == .passage }
         guard !live.isEmpty else { return }
-        let chapters = BookOrganizer.organize(live.map { OrgPassage(vector: $0.vector, day: $0.day, journal: $0.journalID ?? $0.id, seq: $0.seq) })
+        let items = live.map { OrgPassage(vector: $0.vector, day: $0.day, journal: $0.journalID ?? $0.id, seq: $0.seq) }
+        let previousAxes = axes
+        let (chapters, loners, xy, newAxes) = await Task.detached(priority: .utility) { () -> ([[Int]], Set<Int>, [(Double, Double)], [[Float]]) in
+            let lonely = BookOrganizer.loners(items.map(\.vector))
+            let keptIndices = items.indices.filter { !lonely.contains($0) }
+            let kept = keptIndices.map { items[$0] }
+            let chapters = BookOrganizer.organize(kept).map { $0.map { keptIndices[$0] } }
+            return (chapters, lonely, [(Double, Double)](), previousAxes)
+        }.value
 
+        let keyphrases = BookOrganizer.keyphrases(groups: chapters.map { $0.map { live[$0].source ?? live[$0].text } })
         var position = 0.0
         for (c, members) in chapters.enumerated() {
-            let ids = Set(members.map { live[$0].id })
-            let title = titleCache[ids.sorted().joined(separator: ",")]
-                ?? BookOrganizer.reuseTitle(for: ids, cache: titleCache.map { (ids: Set($0.key.split(separator: ",").map(String.init)), title: $0.value) })
-                ?? BookEngine.keywordTitle(members.map { live[$0].text })
+            // Named after the phrases the chapter keeps returning to: the author's own words, instantly.
+            let title = Self.labelTitle(keyphrases[c], fallback: members.map { live[$0].text })
             for m in members {
                 position += 10
                 update(live[m].id) { $0.chapter = c; $0.chapterTitle = title; $0.position = position }
             }
         }
-        // Lines written for an older layout are kept only while their place still exists.
-        let wanted = Set(wantedLines(chapters: chapters, live: live).map(\.key))
-        for i in nodes.indices where nodes[i].kind != .passage && !nodes[i].deleted && !wanted.contains(nodes[i].key ?? "") { retire(i) }
-        placeLines(chapters: chapters, live: live)
+        for m in loners.sorted(by: { live[$0].day < live[$1].day }) {
+            position += 10
+            update(live[m].id) { $0.chapter = Self.looseEndsChapter; $0.chapterTitle = "Loose ends"; $0.position = position }
+        }
+        axes = newAxes
+        projectedCount = live.count
+        _ = xy
         needsPolish = true
-
-        // Redraw the map while the book is small, then every 10% of growth.
-        let ordered = passages
-        if ordered.count < 20 || Double(ordered.count) >= Double(projectedCount) * 1.1 || ordered.contains(where: { $0.x == 0.5 && $0.y == 0.5 }) {
-            let (xy, newAxes) = BookEngine.project(ordered.map(\.vector), previousAxes: axes)
-            axes = newAxes
-            projectedCount = ordered.count
-            for (n, p) in zip(ordered, xy) { update(n.id) { $0.x = p.0; $0.y = p.1 } }
-        }
+        scheduleSave()
     }
 
-    private struct LineSpot { var key: String; var kind: BookNodeKind; var chapter: Int; var before: String; var after: String? }
-
-    /// Where an opening or a connecting line belongs in the current layout.
-    private func wantedLines(chapters: [[Int]], live: [BookNode]) -> [LineSpot] {
-        var out: [LineSpot] = []
-        let vectors = live.map(\.vector)
-        for (c, members) in chapters.enumerated() {
-            guard let first = members.first else { continue }
-            if members.count >= 3 {
-                out.append(LineSpot(key: "intro:" + members.map { live[$0].id }.sorted().joined(separator: ","),
-                                    kind: .intro, chapter: c, before: live[first].id, after: nil))
-            }
-            for gap in BookOrganizer.bridgeGaps(members, vectors: vectors) {
-                let a = live[members[gap - 1]].id, b = live[members[gap]].id
-                out.append(LineSpot(key: "bridge:" + a + ">" + b, kind: .bridge, chapter: c, before: b, after: a))
-            }
-        }
-        return out
+    static func labelTitle(_ phrases: [String], fallback: [String]) -> String {
+        let picked = phrases.prefix(2).map { $0.split(separator: " ").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ") }
+        return picked.isEmpty ? BookEngine.keywordTitle(fallback) : picked.joined(separator: " & ")
     }
 
-    /// Positions existing lines just before the passage they lead into.
-    private func placeLines(chapters: [[Int]], live: [BookNode]) {
-        for spot in wantedLines(chapters: chapters, live: live) {
-            guard let i = nodes.firstIndex(where: { !$0.deleted && $0.key == spot.key }),
-                  let target = nodes.first(where: { $0.id == spot.before }) else { continue }
-            let pos = target.position - (spot.kind == .intro ? 6 : 3)
-            let title = target.chapterTitle
-            update(nodes[i].id) { $0.position = pos; $0.chapter = spot.chapter; $0.chapterTitle = title }
-        }
+    /// A cached title still fits when the chapter keeps most of the same passages.
+    static func reuseTitle(_ ids: Set<String>, _ cache: [String: String]) -> String? {
+        cache.first { key, _ in
+            let old = Set(key.split(separator: ",").map(String.init))
+            let union = old.union(ids).count
+            return union > 0 && Double(old.intersection(ids).count) / Double(union) >= 0.6
+        }?.value
     }
 
-    /// Writes chapter titles, openings and connecting lines with Apple Intelligence. Runs when
-    /// nothing else is waiting; stops early if new work arrives.
+    /// Titles and condensed passages, written with Apple Intelligence when the phone is idle.
+    /// Stops early when other work arrives; picks up where it left off next time.
     func polish(shouldStop: () -> Bool = { false }) async {
+        if layoutDirty { await layout() }
         guard needsPolish else { return }
         defer { scheduleSave() }
-        let live = nodes.filter { !$0.deleted && $0.kind == .passage }
-        guard OnDeviceAI.isAvailable, !live.isEmpty else { needsPolish = false; return }
-        let byChapter = Dictionary(grouping: live, by: \.chapter)
+        guard OnDeviceAI.isAvailable else { needsPolish = false; return }
 
-        // Titles.
-        for (_, members) in byChapter.sorted(by: { $0.key < $1.key }) {
-            let key = members.map(\.id).sorted().joined(separator: ",")
-            guard titleCache[key] == nil else { continue }
-            if shouldStop() { return }
-            let ordered = members.sorted { $0.position < $1.position }
-            let title = await Self.chapterTitle(ordered.map(\.text))
-            titleCache[key] = title
-            for m in members { update(m.id) { $0.chapterTitle = title } }
-        }
-
-        // Openings and connecting lines.
-        let chapters = byChapter.keys.sorted().map { c in byChapter[c]!.sorted { $0.position < $1.position } }
-        let indexOf = Dictionary(uniqueKeysWithValues: live.enumerated().map { ($1.id, $0) })
-        let layout = chapters.map { $0.compactMap { indexOf[$0.id] } }
-        for spot in wantedLines(chapters: layout, live: live) {
-            if nodes.contains(where: { !$0.deleted && $0.key == spot.key }) { continue }
-            if shouldStop() { return }
-            let text: String?
-            if let cached = lineCache[spot.key] { text = cached } else {
-                switch spot.kind {
-                case .intro:
-                    let members = live.filter { $0.chapter == spot.chapter }.sorted { $0.position < $1.position }
-                    text = await Self.opening(title: members.first?.chapterTitle ?? "", passages: members.map(\.text))
-                case .bridge:
-                    let a = live.first { $0.id == spot.after }?.text ?? "", b = live.first { $0.id == spot.before }?.text ?? ""
-                    text = await Self.bridge(from: a, to: b)
-                case .passage:
-                    text = nil
-                }
-                if let text { lineCache[spot.key] = text }
+        let todo = passages.filter { !$0.polished }
+        progress = todo.isEmpty ? nil : (0, todo.count)
+        for (i, n) in todo.enumerated() {
+            if shouldStop() { progress = nil; return }
+            let source = n.source ?? n.text
+            if let condensed = await Self.condense(source),
+               BookOrganizer.voiceKept(edited: condensed, source: source) >= 0.6 {
+                update(n.id) { $0.text = condensed; $0.polished = true }
+            } else {
+                update(n.id) { $0.polished = true }
             }
-            guard let text, let target = nodes.first(where: { $0.id == spot.before }) else { continue }
-            let now = Date()
-            nodes.append(BookNode(id: newID("line"), kind: spot.kind, journalID: nil, text: text, vectorData: Data(), language: "",
-                                  day: target.day, seq: 0, key: spot.key,
-                                  position: target.position - (spot.kind == .intro ? 6 : 3),
-                                  chapter: spot.chapter, chapterTitle: target.chapterTitle, x: target.x, y: target.y,
-                                  createdAt: now, updatedAt: now, deleted: false, dirty: true))
+            progress = (i + 1, todo.count)
+            if (i + 1) % 10 == 0 { changed() }
         }
-        if lineCache.count > 2000 { lineCache = [:] }
+        progress = nil
+        if titleCache.count > 500 { titleCache = [:] }
         needsPolish = false
         changed()
     }
 
-    /// Mutates a node; marks it for sync only when something visible changed.
     private func update(_ id: String, _ mutate: (inout BookNode) -> Void) {
         guard let i = nodes.firstIndex(where: { $0.id == id }) else { return }
         var n = nodes[i]
         mutate(&n)
         let moved = abs(n.x - nodes[i].x) > 0.01 || abs(n.y - nodes[i].y) > 0.01
-        let visible = moved || n.chapter != nodes[i].chapter || n.chapterTitle != nodes[i].chapterTitle || n.position != nodes[i].position
+        let visible = moved || n.chapter != nodes[i].chapter || n.chapterTitle != nodes[i].chapterTitle
+            || n.position != nodes[i].position || n.text != nodes[i].text
         guard visible || n != nodes[i] else { return }
         if visible { n.updatedAt = Date(); n.dirty = true }
         nodes[i] = n
     }
 
-    // MARK: - On-device AI
+    // MARK: - On-device AI (polish only)
 
-    /// Excerpts in the author's own words. Apple Intelligence chooses and tidies them; any
-    /// excerpt that drifts from what was said is replaced by a plain cleaned excerpt.
-    static func passages(from j: Journal) async -> [String] {
-        let body = j.body
-        let budget = max(1, min(8, body.count / 1800 + 1))
-        if OnDeviceAI.isAvailable {
-            var kept: [String] = []
-            for chunk in OnDeviceAI.chunks(of: body, limit: 6000) {
-                let n = max(1, min(4, chunk.count / 1800 + 1))
-                do {
-                    let session = LanguageModelSession(instructions: """
-                    You help build a book from someone's journal, in their own words. From the entry, copy up to \
-                    \(n) passages worth keeping: insights, decisions, questions, vivid moments. Each passage is 2 to 5 \
-                    consecutive sentences copied from the entry. You may only remove filler words, false starts and \
-                    repetitions, fix grammar and punctuation, and replace a vague "it" or "this" with what it refers \
-                    to. Do not paraphrase, summarize, or add words such as "I realized". Skip logistics and small talk.
-                    """)
-                    let r = try await session.respond(to: "Journal entry:\n" + chunk, generating: BookExcerpts.self).content
-                    for e in r.excerpts.prefix(n) {
-                        let t = e.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if BookEngine.wordCount(t) >= 25, BookOrganizer.voiceKept(edited: t, source: chunk) >= 0.85 { kept.append(t) }
-                    }
-                } catch {
-                    continue
-                }
-            }
-            if !kept.isEmpty { return Array(kept.prefix(budget)) }
-        }
-        return BookOrganizer.extractPassages(body)
+    /// Turns a spoken segment into a clean passage in the speaker's voice. Small input, one call.
+    static func condense(_ source: String) async -> String? {
+        let r = try? await LanguageModelSession(instructions: """
+        You edit excerpts from someone's spoken journal into clear passages for a book of their own \
+        thinking. Write 2 to 4 sentences in their first-person voice. Keep their own words, names and \
+        specific details; remove filler, false starts and repetition. Do not add conclusions, advice or \
+        feelings they did not say, and do not begin with "I realized".
+        """).respond(to: "Excerpt:\n" + source, generating: CondensedPassage.self).content
+        guard let t = r?.text.trimmingCharacters(in: .whitespacesAndNewlines), BookEngine.wordCount(t) >= 12,
+              BookEngine.wordCount(t) <= 110 else { return nil }
+        return t
     }
 
     static func chapterTitle(_ texts: [String]) async -> String {
         if OnDeviceAI.isAvailable {
             var context = ""
-            for t in texts where context.count < 2500 { context += "- " + String(t.prefix(400)) + "\n" }
-            if let r = try? await LanguageModelSession(instructions: "You title chapters of a personal book.")
+            for t in texts where context.count < 2500 { context += "- " + String(t.prefix(300)) + "\n" }
+            if let r = try? await LanguageModelSession(instructions: "You title chapters of a personal book. Name the shared subject plainly.")
                 .respond(to: "Passages:\n" + context, generating: ChapterTitle.self).content {
                 let t = r.title.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"“”")))
                 if !t.isEmpty && t.count <= 60 { return t }
@@ -626,30 +420,20 @@ final class BookStore: ObservableObject {
         return BookEngine.keywordTitle(texts)
     }
 
-    static func opening(title: String, passages: [String]) async -> String? {
-        var context = ""
-        for t in passages where context.count < 2500 { context += "- " + String(t.prefix(350)) + "\n" }
-        let r = try? await LanguageModelSession(instructions: """
-        You write the opening lines of chapters in a personal book, in the author's first-person voice. \
-        One or two plain sentences that name the thread running through the passages. Add no new facts, \
-        events or advice, and no flourishes.
-        """).respond(to: "Chapter: \(title)\nPassages:\n\(context)", generating: BookLine.self).content
-        return clean(r?.text, maxWords: 45)
+    // MARK: - Themes for Discover
+
+    struct Theme {
+        var title: String
+        var vectors: [[Float]]
+        var texts: [String]
     }
 
-    static func bridge(from a: String, to b: String) async -> String? {
-        let r = try? await LanguageModelSession(instructions: """
-        You write connecting lines in a personal book, in the author's first-person voice. Write one short \
-        sentence, under 20 words, that leads the reader from the first passage to the second. Only connect \
-        the ideas; add no new facts, events or advice.
-        """).respond(to: "First passage:\n\(a.prefix(700))\n\nSecond passage:\n\(b.prefix(700))", generating: BookLine.self).content
-        return clean(r?.text, maxWords: 28)
-    }
-
-    private static func clean(_ text: String?, maxWords: Int) -> String? {
-        guard let t = text?.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"“”"))),
-              !t.isEmpty, BookEngine.wordCount(t) <= maxWords else { return nil }
-        return t
+    /// The book's chapters as themes (passage vectors and the text they came from).
+    var themes: [Theme] {
+        chapters.filter { !$0.isLooseEnds }.map { c in
+            let ps = c.nodes.filter { $0.kind == .passage }
+            return Theme(title: c.title, vectors: ps.map(\.vector), texts: ps.map { $0.source ?? $0.text })
+        }.filter { !$0.vectors.isEmpty }
     }
 
     // MARK: - Sync
@@ -679,7 +463,6 @@ final class BookStore: ObservableObject {
 
     /// Restores a book from the cloud this phone does not have (e.g. after reinstalling).
     func applyRemote(rows: [[String: Any]]) {
-        var added = false
         for r in rows {
             guard let id = r["id"] as? String, let updated = CloudDates.parse(r["updated_at"] as? String) else { continue }
             if let i = nodes.firstIndex(where: { $0.id == id }) {
@@ -689,25 +472,20 @@ final class BookStore: ObservableObject {
                 nodes[i].dirty = false
                 continue
             }
-            let kind = BookNodeKind(rawValue: r["kind"] as? String ?? "passage") ?? .passage
-            guard r["deleted"] as? Bool != true, let text = r["text"] as? String, !text.isEmpty else { continue }
-            var vector = Data(), language = ""
-            if kind == .passage {
-                guard let e = Embedder.vector(for: text) else { continue }
-                vector = BookVectors.encode(e.vector); language = e.language
-            }
+            guard r["deleted"] as? Bool != true, (r["kind"] as? String ?? "passage") == "passage",
+                  let text = r["text"] as? String, !text.isEmpty, let v = Embedder.vector(for: text) else { continue }
             let journalID = r["journal_id"] as? String
             if let journalID { processed[journalID] = processed[journalID] ?? updated }
             let created = CloudDates.parse(r["created_at"] as? String) ?? updated
-            nodes.append(BookNode(id: id, kind: kind, journalID: journalID, text: text, vectorData: vector, language: language,
-                                  day: Self.dayNumber(created), seq: 0, key: nil,
-                                  position: (r["position"] as? NSNumber)?.doubleValue ?? 0,
-                                  chapter: (r["chapter"] as? NSNumber)?.intValue ?? 0,
-                                  chapterTitle: r["chapter_title"] as? String ?? "",
-                                  x: (r["x"] as? NSNumber)?.doubleValue ?? 0.5, y: (r["y"] as? NSNumber)?.doubleValue ?? 0.5,
-                                  createdAt: created, updatedAt: updated, deleted: false, dirty: false))
-            added = true
+            var node = BookNode(id: id, journalID: journalID, text: text, source: nil, vectorData: BookVectors.encode(v),
+                                language: Embedder.tag, day: Self.dayNumber(created), seq: 0,
+                                position: (r["position"] as? NSNumber)?.doubleValue ?? 0, createdAt: created)
+            node.updatedAt = updated; node.dirty = false; node.polished = true
+            node.chapter = (r["chapter"] as? NSNumber)?.intValue ?? 0
+            node.chapterTitle = r["chapter_title"] as? String ?? ""
+            node.x = (r["x"] as? NSNumber)?.doubleValue ?? 0.5; node.y = (r["y"] as? NSNumber)?.doubleValue ?? 0.5
+            nodes.append(node)
         }
-        if added || !rows.isEmpty { scheduleSave() }
+        if !rows.isEmpty { scheduleSave() }
     }
 }

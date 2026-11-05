@@ -61,8 +61,8 @@ struct NewsView: View {
     private var topicStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(news.topics.filter(\.enabled)) { t in
-                    Text(t.name).font(.caption.weight(.medium))
+                ForEach(news.themeSearches.map(\.theme) + news.topics.filter { $0.enabled && !$0.fromJournal }.map(\.name), id: \.self) { name in
+                    Text(name).font(.caption.weight(.medium))
                         .padding(.horizontal, 10).padding(.vertical, 6)
                         .background(Capsule().fill(Color.accentColor.opacity(0.12)))
                 }
@@ -88,8 +88,10 @@ struct NewsCardView: View {
                 Text(card.topic.uppercased()).font(.caption2.weight(.semibold)).foregroundStyle(Color.accentColor)
                 Text(card.headline).font(.title3.weight(.semibold)).foregroundStyle(.primary)
                     .multilineTextAlignment(.leading)
-                Text(card.summary).font(.subheadline).foregroundStyle(.secondary).lineLimit(3)
-                    .multilineTextAlignment(.leading)
+                if !card.summary.isEmpty {
+                    Text(card.summary).font(.subheadline).foregroundStyle(.secondary).lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                }
                 HStack(spacing: 6) {
                     Image(systemName: "newspaper").font(.caption2)
                     Text(card.sourcesLabel)
@@ -147,7 +149,7 @@ struct NewsDetailView: View {
                     NewsImage(card: card).frame(height: 200).clipped().listRowInsets(EdgeInsets())
                     VStack(alignment: .leading, spacing: 10) {
                         Text(card.headline).font(.title2.weight(.semibold))
-                        Text(card.summary)
+                        if !card.summary.isEmpty { Text(card.summary) }
                         if card.summarized {
                             Label("Summarized on this iPhone from the headlines below.", systemImage: "sparkles")
                                 .font(.caption).foregroundStyle(.secondary)
@@ -237,7 +239,7 @@ struct TopicsView: View {
         NavigationStack {
             Form {
                 Section {
-                    ForEach(news.topics) { t in
+                    ForEach(news.topics.filter { !$0.fromJournal }) { t in
                         Toggle(isOn: Binding(get: { t.enabled }, set: { news.setEnabled(t, $0) })) {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(t.name)
@@ -247,12 +249,11 @@ struct TopicsView: View {
                                     Text("Searches: “\(t.query)”").font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.leading)
                                 }
                                 .buttonStyle(.plain)
-                                Text(t.fromJournal ? "From your journal" : "Added by you").font(.caption2).foregroundStyle(.tertiary)
                             }
                         }
                     }
                     .onDelete { offsets in
-                        let list = news.topics
+                        let list = news.topics.filter { !$0.fromJournal }
                         for i in offsets { news.remove(list[i]) }
                     }
                     HStack {
@@ -261,22 +262,25 @@ struct TopicsView: View {
                         Button("Add", action: add).disabled(NewsTopics.sanitize(newTopic) == nil)
                     }
                 } header: {
-                    Text("Topics")
+                    Text("Your topics")
                 } footer: {
-                    Text("Topics are worked out on this iPhone from your recent entries. Only the search shown under each topic is sent to Google News. Your journal text never leaves the phone. Tap a search to change it.")
+                    Text("Your own topics, searched as written. Only these searches and the ones below are sent to Google News. Your journal text never leaves the phone.")
                 }
 
                 Section {
-                    Button {
-                        Task {
-                            working = true
-                            await news.refreshTopics(from: store.visibleJournals)
-                            working = false
-                        }
-                    } label: {
-                        HStack { Text("Suggest topics from my journal"); if working { Spacer(); ProgressView() } }
+                    if news.themeSearches.isEmpty {
+                        Text("Searches appear once your book has chapters.").foregroundStyle(.secondary)
                     }
-                    .disabled(working)
+                    ForEach(news.themeSearches) { t in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(t.theme)
+                            Text(t.searches.map { "“\($0)”" }.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("From your book's chapters")
+                } footer: {
+                    Text("Made on this iPhone from the named things and phrases each chapter keeps returning to; never people or places. Stories are kept only if they are close to what you wrote.")
                 }
             }
             .alert("Search for \(editing?.name ?? "")", isPresented: Binding(get: { editing != nil }, set: { if !$0 { editing = nil } })) {

@@ -612,24 +612,11 @@ function bookView() {
   const { path, chapters } = bookChapters();
   if (!path.length) return h('div', {}, h('h1', {}, 'Book'),
     h('p', { class: 'muted' }, 'Your book grows on your iPhone as you journal. Passages join only when they connect to what is already there and add something new.'));
-  const W = 600, H = 380;
-  const pt = n => [n.x * W, (1 - n.y) * H];
   const jump = id => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  const map = svg('svg', { viewBox: `0 0 ${W} ${H}`, class: 'book-map', role: 'img', 'aria-label': `Map of ${path.length} passages` },
-    svg('polyline', { points: path.map(n => pt(n).join(',')).join(' '), class: 'book-path' }),
-    ...path.map(n => {
-      const [x, y] = pt(n);
-      const dot = svg('circle', { cx: x, cy: y, r: 6, fill: chapterColor(n.chapter), tabindex: 0 },
-        svg('title', {}, (n.chapter_title ? n.chapter_title + ': ' : '') + n.text.slice(0, 120)));
-      dot.addEventListener('click', () => jump('p-' + n.id));
-      dot.addEventListener('keydown', e => { if (e.key === 'Enter') jump('p-' + n.id); });
-      return dot;
-    }));
   const journal = id => state.journals.find(j => j.id === id);
   return h('div', { class: 'book' },
     h('h1', {}, 'Book'),
-    h('p', { class: 'muted small' }, `${path.length} passages in ${chapters.length} chapters, in your own words. Each dot is a passage placed by meaning; the line is the reading path. Italic lines connect passages and were written on your iPhone.`),
-    h('div', { class: 'card map-card' }, map),
+    h('p', { class: 'muted small' }, `${path.length} passages in ${chapters.length} chapters: grouped by theme on your iPhone, in the order you lived them.`),
     h('div', { class: 'card' }, h('h2', {}, 'Contents'),
       h('ol', { class: 'toc' }, chapters.map(c => h('li', {},
         h('button', { class: 'link', onclick: () => jump('c-' + c.id) },
