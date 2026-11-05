@@ -143,3 +143,11 @@ canvas.qr { width: 240px; height: 240px; image-rendering: pixelated; border-radi
 .news-body p { margin: 0; font-size: 14px; }
 .sources { padding-left: 18px; margin: 6px 0 0; font-size: 14px; }
 .sources a { color: var(--text); }
+
+.book-line { font: italic 15px/1.6 Georgia, "Iowan Old Style", serif; color: var(--muted); border-left: 2px solid var(--line); padding-left: 12px; margin: 0 0 16px; }
+.book-line.intro { font-size: 17px; }
+
+.video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
+.video { display: grid; gap: 4px; color: var(--text); text-decoration: none; }
+.video img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 10px; }
+.video .v-title { font-weight: 600; font-size: 14px; line-height: 1.35; }

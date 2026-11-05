@@ -14,7 +14,7 @@ const KINDS = [
   { id: 'note', label: 'Notes', one: 'note' },
 ];
 
-const state = { session: null, journals: [], spaces: [], items: [], book: [], news: null, loading: false, error: null, status: '' };
+const state = { session: null, journals: [], spaces: [], items: [], book: [], news: null, videos: null, loading: false, error: null, status: '' };
 const app = document.getElementById('app');
 
 // ---------- tiny DOM helper (text is always set via textContent) ----------
@@ -139,7 +139,7 @@ async function loadAll() {
   try {
     if (MODE === 'local') {
       const d = await phone('GET', 'api/data');
-      Object.assign(state, { journals: d.journals, spaces: d.spaces, items: d.space_items, book: d.book_nodes, news: d.news });
+      Object.assign(state, { journals: d.journals, spaces: d.spaces, items: d.space_items, book: d.book_nodes, news: d.news, videos: d.videos || null });
     } else {
       if (!state.session.email) {
         const res = await fetch(SUPABASE_URL + '/auth/v1/user', { headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + (await token()) } });
@@ -388,8 +388,9 @@ function shell() {
     h('ul', { class: 'nav' },
       navItem('All journals', '#/journals', state.journals.length, r.view === 'journals'),
       navItem('To-dos', '#/todos', state.items.filter(i => i.kind === 'todo' && !i.done && spaceById(i.space_id)).length, r.view === 'todos'),
-      navItem('Book', '#/book', state.book.length, r.view === 'book'),
+      navItem('Book', '#/book', state.book.filter(n => (n.kind || 'passage') === 'passage').length, r.view === 'book'),
       state.news ? navItem('News', '#/news', state.news.length, r.view === 'news') : null,
+      state.videos ? navItem('Videos', '#/videos', state.videos.reduce((n, g) => n + g.videos.length, 0), r.view === 'videos') : null,
       navItem('Unsorted', '#/unsorted', unsorted.length, r.view === 'unsorted')),
     h('div', { class: 'nav-title' }, 'Spaces'),
     h('ul', { class: 'nav' },
@@ -408,6 +409,7 @@ function shell() {
   else if (r.view === 'todos') content = todosView();
   else if (r.view === 'book') content = bookView(r.id);
   else if (r.view === 'news' && state.news) content = newsView();
+  else if (r.view === 'videos' && state.videos) content = videosView();
   else if (r.view === 'unsorted') content = journalsView('Unsorted', unsorted, 'Journals the phone has not filed yet. Open one to choose a space.');
   else content = journalsView('Journal', state.journals);
 
@@ -588,9 +590,10 @@ const PALETTE = ['#2563eb', '#ea580c', '#16a34a', '#db2777', '#9333ea', '#0d9488
 const chapterColor = n => PALETTE[Math.abs(n) % PALETTE.length];
 
 function bookChapters() {
-  const path = [...state.book].filter(n => !n.deleted).sort((a, b) => a.position - b.position);
+  const all = [...state.book].filter(n => !n.deleted).sort((a, b) => a.position - b.position);
+  const path = all.filter(n => (n.kind || 'passage') === 'passage');
   const chapters = [];
-  for (const n of path) {
+  for (const n of all) {
     const last = chapters[chapters.length - 1];
     if (last && last.id === n.chapter) last.nodes.push(n);
     else chapters.push({ id: n.chapter, title: n.chapter_title, nodes: [n] });
@@ -625,17 +628,19 @@ function bookView() {
   const journal = id => state.journals.find(j => j.id === id);
   return h('div', { class: 'book' },
     h('h1', {}, 'Book'),
-    h('p', { class: 'muted small' }, `${path.length} passages in ${chapters.length} chapters. Each dot is a passage placed by meaning; the line is the reading path. Click a dot to read from there.`),
+    h('p', { class: 'muted small' }, `${path.length} passages in ${chapters.length} chapters, in your own words. Each dot is a passage placed by meaning; the line is the reading path. Italic lines connect passages and were written on your iPhone.`),
     h('div', { class: 'card map-card' }, map),
     h('div', { class: 'card' }, h('h2', {}, 'Contents'),
       h('ol', { class: 'toc' }, chapters.map(c => h('li', {},
         h('button', { class: 'link', onclick: () => jump('c-' + c.id) },
           h('span', { class: 'dot', style: 'background:' + chapterColor(c.id) }), c.title || 'Chapter ' + (c.id + 1)),
-        h('span', { class: 'muted small' }, ' · ' + c.nodes.length))))),
+        h('span', { class: 'muted small' }, ' · ' + c.nodes.filter(n => (n.kind || 'passage') === 'passage').length))))),
     chapters.map(c => h('section', { class: 'chapter', id: 'c-' + c.id },
       h('div', { class: 'muted small caps' }, 'Chapter ' + (c.id + 1)),
       h('h2', {}, c.title || 'Untitled'),
       c.nodes.map(n => {
+        // Lines written on the phone to connect passages: shown as such, never as the author's words.
+        if ((n.kind || 'passage') !== 'passage') return h('p', { class: 'book-line ' + n.kind, title: 'Connecting line written on the iPhone' }, n.text);
         const j = n.journal_id && journal(n.journal_id);
         return h('div', { class: 'passage', id: 'p-' + n.id },
           h('p', {}, n.text),
@@ -661,6 +666,24 @@ function newsView() {
           h('ul', { class: 'sources' }, c.articles.map(a => h('li', {},
             h('a', { href: a.url, target: '_blank', rel: 'noopener noreferrer' }, a.title), h('span', { class: 'muted small' }, ' · ' + a.source)))))))))
       : h('p', { class: 'muted' }, 'No stories yet. Open the News tab on your iPhone to fetch some.'));
+}
+
+// ---------- videos (local view only: chosen on the iPhone) ----------
+function videosView() {
+  const goals = state.videos || [];
+  return h('div', {},
+    h('h1', {}, 'Videos'),
+    h('p', { class: 'muted small' }, 'Explanations for what your journal says you want to understand. Only the searches were sent to YouTube; the reasons were worked out on your iPhone.'),
+    goals.length ? goals.map(g => h('div', { class: 'card' },
+      h('h2', {}, g.label),
+      h('p', { class: 'muted small' }, g.why),
+      g.videos.length
+        ? h('div', { class: 'video-grid' }, g.videos.map(v => h('a', { class: 'video', href: 'https://www.youtube.com/watch?v=' + encodeURIComponent(v.id), target: '_blank', rel: 'noopener noreferrer' },
+            h('img', { src: 'https://i.ytimg.com/vi/' + encodeURIComponent(v.id) + '/hqdefault.jpg', alt: '', loading: 'lazy' }),
+            h('span', { class: 'v-title' }, v.title),
+            h('span', { class: 'muted small' }, [v.channel, v.duration].filter(Boolean).join(' · ')))))
+        : h('a', { href: 'https://www.youtube.com/results?search_query=' + encodeURIComponent(g.query), target: '_blank', rel: 'noopener noreferrer' }, 'Search “' + g.query + '” on YouTube')))
+      : h('p', { class: 'muted' }, 'No suggestions yet. Open Discover → Videos on your iPhone.'));
 }
 
 // ---------- actions ----------

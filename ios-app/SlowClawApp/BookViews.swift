@@ -15,10 +15,10 @@ struct BookView: View {
                 if chapters.isEmpty {
                     ContentUnavailableView("Your book is empty",
                                            systemImage: "book",
-                                           description: Text("As you journal, the passages worth keeping join a living book. Each one has to connect to what is already there and add something new."))
+                                           description: Text("As you journal, the passages worth keeping join a living book in your own words. Each one has to connect to what is already there and add something new."))
                 } else {
                     Section {
-                        BookMapView(nodes: book.path) { id in
+                        BookMapView(nodes: book.passages) { id in
                             openNode = id
                             openChapter = nil
                             reading = true
@@ -43,7 +43,7 @@ struct BookView: View {
                                     Circle().fill(BookPalette.color(c.id)).frame(width: 8, height: 8)
                                     Text(c.title.isEmpty ? "Chapter \(c.id + 1)" : c.title).foregroundStyle(.primary)
                                     Spacer()
-                                    Text("\(c.nodes.count)").font(.caption).foregroundStyle(.secondary)
+                                    Text("\(c.passageCount)").font(.caption).foregroundStyle(.secondary)
                                 }
                             }
                         }
@@ -57,7 +57,7 @@ struct BookView: View {
                         LabeledContent("Waiting to fit", value: "\(book.waiting.count)")
                     }
                 } footer: {
-                    Text("Passages that were too far from the book's threads, or added too little, wait here and are tried again as the book grows.")
+                    Text("Passages that don't connect to the book's themes yet wait here, and join once related passages arrive. Italic lines in the book are connecting lines written on this iPhone; everything else is in your own words.")
                 }
             }
             .navigationTitle("Book")
@@ -67,7 +67,7 @@ struct BookView: View {
                         Button {
                             openChapter = 0; openNode = nil; reading = true
                         } label: { Label("Read from the start", systemImage: "book.pages") }
-                        .disabled(book.path.isEmpty)
+                        .disabled(book.passages.isEmpty)
                         Button(role: .destructive) { confirmRebuild = true } label: {
                             Label("Rebuild from all journals", systemImage: "arrow.triangle.2.circlepath")
                         }
@@ -178,6 +178,20 @@ struct PassageView: View {
     let node: BookNode
 
     var body: some View {
+        if node.kind != .passage {
+            // Lines written on the phone to carry the reader along: visibly not the author's own words.
+            Text(node.text)
+                .font(.system(node.kind == .intro ? .callout : .footnote, design: .serif).italic())
+                .foregroundStyle(.secondary)
+                .padding(.leading, 12)
+                .overlay(alignment: .leading) { Rectangle().fill(Color.secondary.opacity(0.3)).frame(width: 2) }
+                .accessibilityLabel("Connecting line: \(node.text)")
+        } else {
+            passage
+        }
+    }
+
+    private var passage: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(node.text)
                 .font(.system(.body, design: .serif))
@@ -193,7 +207,7 @@ struct PassageView: View {
             }
         }
         .contextMenu {
-            Button(role: .destructive) { Task { await book.remove(node.id) } } label: {
+            Button(role: .destructive) { book.remove(node.id) } label: {
                 Label("Remove from book", systemImage: "minus.circle")
             }
         }
@@ -213,7 +227,7 @@ struct WaitingRoomView: View {
                     Text(c.text).font(.system(.callout, design: .serif))
                     Text(c.reason).font(.caption).foregroundStyle(.orange)
                     HStack {
-                        Button("Add to book anyway") { Task { await book.addAnyway(c.id) } }
+                        Button("Add to book anyway") { book.addAnyway(c.id) }
                         Spacer()
                         Button("Dismiss", role: .destructive) { book.dismiss(c.id) }
                     }

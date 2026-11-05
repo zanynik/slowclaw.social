@@ -148,7 +148,7 @@ final class Store: ObservableObject {
                     status: JournalStatus = .ready, createdAt: Date = Date(), id: String? = nil) -> Journal {
         let now = Date()
         let j = Journal(id: id ?? newID("journal"), title: title, body: body, transcript: transcript,
-                        audioPath: audioPath, spaceID: nil, createdAt: createdAt, updatedAt: now,
+                        audioPath: audioPath, moreAudio: nil, spaceID: nil, createdAt: createdAt, updatedAt: now,
                         status: status, organized: false, deleted: false, dirty: true)
         journals.append(j)
         changed()

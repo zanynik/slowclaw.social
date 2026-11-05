@@ -416,7 +416,7 @@ final class CloudSync: ObservableObject {
               let updated = CloudDates.parse(r["updated_at"] as? String) else { return nil }
         let spaceID = r["space_id"] as? String
         return Journal(id: id, title: r["title"] as? String ?? "", body: r["body"] as? String ?? "",
-                       transcript: nil, audioPath: nil, spaceID: spaceID, createdAt: created, updatedAt: updated,
+                       transcript: nil, audioPath: nil, moreAudio: nil, spaceID: spaceID, createdAt: created, updatedAt: updated,
                        status: .ready, organized: spaceID != nil, deleted: r["deleted"] as? Bool ?? false, dirty: false)
     }
 

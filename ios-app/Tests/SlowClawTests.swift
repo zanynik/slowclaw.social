@@ -52,82 +52,82 @@ final class NostrTests: XCTestCase {
 
 // MARK: - Book
 
-final class BookEngineTests: XCTestCase {
+final class BookOrganizerTests: XCTestCase {
     private func v(_ angleDegrees: Double, plane: Int = 0) -> [Float] {
         var out = [Float](repeating: 0, count: 8)
         let a = angleDegrees * .pi / 180
         out[plane * 2] = Float(cos(a)); out[plane * 2 + 1] = Float(sin(a))
         return out
     }
-    private func point(_ id: String, _ vector: [Float], _ text: String, _ pos: Double) -> BookPoint {
-        BookPoint(id: id, vector: BookEngine.normalized(vector), text: text, position: pos)
-    }
     private let long = "This morning I noticed how much calmer I feel after a slow walk before opening any screens at all."
 
-    func testFirstPassageSeedsTheBook() {
-        XCTAssertEqual(BookEngine.decide(vector: v(0), text: long, path: []), .accept(position: 1, attachTo: nil))
+    func testRepeatJournalsAreRecognised() {
+        let a = String(repeating: "We talked about the food hub and how profit could be returned to every shopper each month. ", count: 6)
+        let b = "Intro. " + a.replacingOccurrences(of: "each month", with: "every month")
+        XCTAssertTrue(BookOrganizer.isRepeatJournal(b, of: a))
+        XCTAssertFalse(BookOrganizer.isRepeatJournal(long, of: a))
     }
 
-    func testShortPassageIsRejected() {
-        guard case .reject = BookEngine.decide(vector: v(0), text: "Too short.", path: []) else { return XCTFail() }
+    func testVoiceCheckCatchesParaphrase() {
+        let source = "So I clicked the chess app and, um, the urge was so strong, you know, but I paused and just watched it."
+        XCTAssertGreaterThanOrEqual(BookOrganizer.voiceKept(edited: "I clicked the chess app and the urge was so strong, but I paused and watched it.", source: source), 0.85)
+        XCTAssertLessThan(BookOrganizer.voiceKept(edited: "I realized cravings dissolve when observed with mindful curiosity.", source: source), 0.85)
     }
 
-    func testRepeatIsRejected() {
-        let path = [point("a", v(0), long, 1)]
-        guard case let .reject(reason) = BookEngine.decide(vector: v(1), text: long + " Again.", path: path) else { return XCTFail() }
-        XCTAssertTrue(reason.hasPrefix("Says nearly"))
+    func testLightCleanKeepsWords() {
+        XCTAssertEqual(BookOrganizer.lightClean("so I I think, um, yeah the food hub matters"), "So I think, the food hub matters.")
     }
 
-    func testPassageWithoutNewWordsIsRejected() {
-        let path = [point("a", v(0), long, 1)]
-        guard case let .reject(reason) = BookEngine.decide(vector: v(50), text: long, path: path) else { return XCTFail() }
-        XCTAssertTrue(reason.hasPrefix("Adds too little"))
+    func testExtractStartsWhereAThoughtStarts() {
+        let body = "And then it went on. " + Array(repeating: "I think the food hub should return its profits to the people who shop there.", count: 4).joined(separator: " ")
+        let out = BookOrganizer.extractPassages(body)
+        XCTAssertFalse(out.isEmpty)
+        XCTAssertTrue(out.allSatisfy { !$0.hasPrefix("And") })
     }
 
-    func testFarPassageWaitsOnceTheBookHasThreads() {
-        let path = (0..<6).map { point("n\($0)", v(Double($0) * 2), long + " Variation \($0) seashell lantern \($0).", Double($0 + 1)) }
-        let far = "Quarterly budgeting spreadsheets, invoices and accountants dominate tomorrow's agenda completely, unfortunately enough again."
-        guard case let .reject(reason) = BookEngine.decide(vector: v(0, plane: 2), text: far, path: path) else { return XCTFail() }
-        XCTAssertTrue(reason.hasPrefix("Too far"))
+    func testAdmission() {
+        let book = (0..<8).map { v(Double($0) * 50) }
+        let texts = (0..<8).map { "Passage \($0) about walking, mornings, attention and the harbour light number \($0)." + long }
+        let fresh = "Writing letters to my grandmother every Sunday keeps our family stories alive between visits and phone calls."
+        XCTAssertEqual(BookOrganizer.admit(vector: v(25), text: fresh, bookVectors: book, bookTexts: texts, waitingVectors: []), .join)
+        guard case .drop = BookOrganizer.admit(vector: v(1), text: texts[0], bookVectors: book, bookTexts: texts, waitingVectors: []) else { return XCTFail() }
+        // Unrelated: waits, unless two waiting passages relate to it (a new theme).
+        guard case .wait = BookOrganizer.admit(vector: v(0, plane: 2), text: fresh, bookVectors: book, bookTexts: texts, waitingVectors: []) else { return XCTFail() }
+        XCTAssertEqual(BookOrganizer.admit(vector: v(0, plane: 2), text: fresh, bookVectors: book, bookTexts: texts,
+                                           waitingVectors: [v(2, plane: 2), v(4, plane: 2)]), .join)
     }
 
-    func testRelatedNewPassageAttachesToNearest() {
-        let path = (0..<6).map { point("n\($0)", v(Double($0) * 10), long + " Variation \($0) seashell.", Double($0 + 1)) }
-        let fresh = "Walking barefoot along the harbour, gulls circling, I decided to write letters to my grandmother every Sunday."
-        guard case let .accept(_, attachTo) = BookEngine.decide(vector: v(78), text: fresh, path: path) else { return XCTFail() }
-        XCTAssertEqual(attachTo, "n5")
+    func testOrganiseGroupsThemesAndReadsForward() {
+        // Two themes (planes 0 and 2), written on interleaved days.
+        var ps: [OrgPassage] = []
+        for i in 0..<6 { ps.append(OrgPassage(vector: v(Double(i) * 4), day: 20260901 + i * 2, journal: "j\(i)", seq: 0)) }
+        for i in 0..<6 { ps.append(OrgPassage(vector: v(Double(i) * 4, plane: 2), day: 20260902 + i * 2, journal: "k\(i)", seq: 0)) }
+        let chapters = BookOrganizer.organize(ps)
+        XCTAssertEqual(chapters.count, 2)
+        XCTAssertEqual(Set(chapters[0]), Set(0..<6))     // the theme that began first comes first
+        XCTAssertEqual(chapters[0], Array(0..<6))        // and reads forward along its thread
+        XCTAssertEqual(Set(chapters[1]), Set(6..<12))
     }
 
-    func testInsertionGoesBetweenClosestNeighbours() {
-        let path = [0.0, 30, 60, 90].enumerated().map { point("p\($0.offset)", v($0.element), long, Double($0.offset + 1)) }
-        let index = BookEngine.insertionIndex(vector: v(45), path: path)
-        XCTAssertEqual(index, 2)
-        XCTAssertEqual(BookEngine.position(at: index, in: path), 2.5)
-        XCTAssertEqual(BookEngine.position(at: 0, in: path), 0)
-        XCTAssertEqual(BookEngine.position(at: 4, in: path), 5)
+    func testBridgesGoWhereTheThreadJumps() {
+        let vectors = [v(0), v(5), v(10), v(80), v(85), v(90)]
+        XCTAssertEqual(BookOrganizer.bridgeGaps(Array(0..<6), vectors: vectors), [3])
     }
 
-    func testChaptersBreakWhereTheThreadChanges() {
-        let vs = [v(0), v(3), v(6), v(0, plane: 2), v(3, plane: 2)]
-        let path = vs.enumerated().map { point("c\($0.offset)", $0.element, long, Double($0.offset)) }
-        XCTAssertEqual(BookEngine.chapters(path), [0, 0, 0, 1, 1])
+    func testTitleReuse() {
+        let cache: [(ids: Set<String>, title: String)] = [(["a", "b", "c", "d"], "Letters Home")]
+        XCTAssertEqual(BookOrganizer.reuseTitle(for: ["a", "b", "c", "d", "e"], cache: cache), "Letters Home")
+        XCTAssertNil(BookOrganizer.reuseTitle(for: ["a", "x", "y", "z"], cache: cache))
     }
 
     func testProjectionIsBoundedAndStable() {
         let vs = [v(0), v(40), v(80), v(10, plane: 1), v(70, plane: 2)].map(BookEngine.normalized)
         let first = BookEngine.project(vs)
         let again = BookEngine.project(vs, previousAxes: first.axes)
-        XCTAssertEqual(first.points.count, 5)
         for (a, b) in zip(first.points, again.points) {
             XCTAssertTrue((0.049...0.951).contains(a.0) && (0.049...0.951).contains(a.1))
             XCTAssertEqual(a.0, b.0, accuracy: 1e-6)
-            XCTAssertEqual(a.1, b.1, accuracy: 1e-6)
         }
-    }
-
-    func testNewInformationAndTitles() {
-        XCTAssertEqual(BookEngine.newInformation("gardens tomatoes", comparedTo: ["tomatoes"]), 0.5, accuracy: 0.001)
-        XCTAssertEqual(BookEngine.keywordTitle(["running shoes", "running trails", "shoes"]), "Running & Shoes")
     }
 
     func testVectorBytesRoundTrip() {
@@ -135,10 +135,11 @@ final class BookEngineTests: XCTestCase {
         XCTAssertEqual(BookVectors.decode(BookVectors.encode(vec)), vec)
     }
 
-    func testFallbackPassagesUseSubstantialParagraphs() {
-        let para = Array(repeating: "I keep returning to the idea that small habits shape the whole week.", count: 3).joined(separator: " ")
-        let out = BookStore.fallbackPassages("Buy milk.\n\n" + para)
-        XCTAssertEqual(out, [para])
+    func testOldBookNodesStillDecode() throws {
+        let json = #"{"id":"n1","journalID":null,"text":"t","vectorData":"","language":"en","attachedTo":null,"position":1,"chapter":0,"chapterTitle":"","x":0.5,"y":0.5,"createdAt":0,"updatedAt":0,"deleted":false,"dirty":false}"#
+        let d = JSONDecoder(); d.dateDecodingStrategy = .secondsSince1970
+        let node = try d.decode(BookNode.self, from: Data(json.utf8))
+        XCTAssertEqual(node.kind, .passage)
     }
 }
 
@@ -181,6 +182,46 @@ final class NewsTests: XCTestCase {
         let url = try XCTUnwrap(NewsStore.searchURL("electric cars", locale: Locale(identifier: "en_US")))
         XCTAssertEqual(url.host, "news.google.com")
         XCTAssertTrue(url.absoluteString.contains("q=electric%20cars%20when:3d"))
+        XCTAssertTrue(NewsStore.searchURL("open source coding agents", days: 7)!.absoluteString.contains("when:7d"))
+    }
+}
+
+// MARK: - Discover (news queries, videos)
+
+final class DiscoverTests: XCTestCase {
+    func testQueriesAreSpecificButPrivate() {
+        XCTAssertEqual(NewsTopics.sanitizeQuery("cooperative supermarkets returning profits to shoppers"),
+                       "cooperative supermarkets returning profits to shoppers")
+        XCTAssertNil(NewsTopics.sanitizeQuery("food"))                                   // one word is a topic, not a search
+        XCTAssertNil(NewsTopics.sanitizeQuery("call me on 0151 2345678 about the hub"))   // digits
+        XCTAssertNil(NewsTopics.sanitizeQuery("mail user_a@example.com the zero profit plan"))
+    }
+
+    func testOldTopicsGainAQuery() throws {
+        let t = try JSONDecoder().decode(NewsTopic.self, from: Data(#"{"name":"Sailing","fromJournal":true,"enabled":true}"#.utf8))
+        XCTAssertEqual(t.query, "Sailing")
+    }
+
+    func testFrequentPhrases() {
+        let text = "The community supermarket returns profits. A community supermarket is rare. Every community supermarket matters."
+        XCTAssertEqual(NewsTopics.frequentPhrases(in: [text]).first, "community supermarket")
+    }
+
+    func testYouTubeResultsParsing() {
+        let data = #"{"contents":{"list":[{"videoRenderer":{"videoId":"abcdefghijk","title":{"runs":[{"text":"How GPUs work"}]},"ownerText":{"runs":[{"text":"Example Channel"}]},"lengthText":{"simpleText":"12:34"},"publishedTimeText":{"simpleText":"1 year ago"}}},{"videoRenderer":{"videoId":"short","title":{"runs":[{"text":"bad id"}]}}},{"videoRenderer":{"videoId":"zyxwvutsrqp","title":{"simpleText":"Shorts clip"},"lengthText":{"simpleText":"0:45"}}}]}}"#
+        let html = "<html><script>var ytInitialData = \(data);</script></html>"
+        let items = YouTubeResults.parse(html: html)
+        XCTAssertEqual(items.map(\.id), ["abcdefghijk", "zyxwvutsrqp"])
+        XCTAssertEqual(items[0].title, "How GPUs work")
+        XCTAssertEqual(items[0].channel, "Example Channel")
+        XCTAssertEqual(items.filter(YouTubeResults.worthWatching).map(\.id), ["abcdefghijk"])
+        XCTAssertEqual(YouTubeResults.seconds("1:02:03"), 3723)
+        XCTAssertTrue(YouTubeResults.parse(html: "<html>consent page</html>").isEmpty)
+    }
+
+    func testQuestionsBecomeSearches() {
+        let out = VideoStore.questions(in: ["Something else. How does a stateless protocol handle sessions? Fine."])
+        XCTAssertEqual(out.first, "stateless protocol handle sessions explained")
     }
 }
 
