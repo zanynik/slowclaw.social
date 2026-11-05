@@ -31,7 +31,7 @@ audio stays on the phone                      owner-only RLS                  st
 | Journal | All entries by day, search, big record button, write button. Tap an entry to edit it, move it to another space, replay its audio or see the original transcript. |
 | To-dos | Every open to-do from every space in one list. Check things off, or add one and pick its space. |
 | Book | A living book grown from your journal, in your own words: chapters by theme, a map of passages (the table of contents) and a reader. See below. |
-| Discover | **News**: story cards for specific searches worked out from your journal, summarized on the phone, with a reading history. **Videos**: explanations for what your journal says you want to understand. Only the searches you can see are sent (to Google News / YouTube). |
+| Discover | **News** and **Videos** for the chapters of your book: results are scored on the phone against what you wrote and only close ones are shown. News searches are shown in Topics; videos come from public channel feeds you choose. Reading history included. See `docs/discover.md`. |
 | Spaces | Your areas of life. Each space has an on-device overview, to-dos (with checkboxes), ideas, questions, notes and its journal entries. "Organize unsorted" files older entries in one go. |
 | Settings (gear on Journal) | Sync (with this iPhone's key or email), sign a browser in by QR, the local view, Nostr identity backup, capture options, export. |
 
@@ -43,16 +43,12 @@ The website has the same To-dos page, and journal edits there save automatically
 
 ### The living book
 
-Passages are **your own words**, lightly edited: Apple Intelligence may remove fillers and false
-starts and fix grammar, and an edit that keeps less than 85% of what you said is replaced by the
-original. Repeats are dropped (the same recording imported twice, or a passage that says what the
-book already says). A passage joins when it connects to the book, or to other waiting passages
-that together start a new theme. The whole book is then organised: themes become chapters (about
-√(n/2) of them), chapters follow each other by closeness, and inside a chapter the order follows
-the thread while moving forward in time. Where the thread jumps, a short connecting line is
-written on the phone, and each chapter gets a one- or two-line opening; these are shown in italics
-so you always know which words are yours. A 2D projection of the vectors is the map. Vectors
-(Apple's on-device contextual embedding) never leave the phone.
+Your journals become a book of themes. A small sentence-embedding model bundled in the app
+(MiniLM, the same one used to tune this on real journals) splits each entry into topics, keeps the
+most substantial passage of each in your own words, drops repeats, groups passages into chapters by
+theme and orders each chapter by date. It appears right away; when the phone is idle Apple
+Intelligence titles the chapters and tidies each passage (keeping your words). Details in
+`docs/book.md`.
 
 Continue any entry with **Continue recording**: the new words are added to the same entry.
 

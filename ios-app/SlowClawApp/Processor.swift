@@ -107,10 +107,11 @@ final class Processor: ObservableObject {
                 await organize(j.id)
             } else if let j = store.visibleJournals.last(where: { BookStore.shared.needsReading($0) }) {
                 // Oldest first, so the book grows in the order life happened.
-                activity = "Reading into your book…"
-                await BookStore.shared.read(j)
+                let remaining = store.visibleJournals.filter { BookStore.shared.needsReading($0) }.count - 1
+                activity = remaining > 0 ? "Reading journals into your book (\(remaining) to go)…" : "Reading into your book…"
+                await BookStore.shared.read(j, remaining: remaining)
             } else if BookStore.shared.needsPolish {
-                activity = "Writing chapter titles…"
+                activity = "Polishing your book…"
                 let store = self.store
                 await BookStore.shared.polish {
                     // Hand back as soon as a recording needs work.

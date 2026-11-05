@@ -1,17 +1,16 @@
 import CryptoKit
 import Foundation
-import FoundationModels
 import LinkPresentation
 import NaturalLanguage
 import UIKit
 
-// News that follows what you journal about, without your journal leaving the phone.
+// News for the themes of your book, without your journal leaving the phone.
 //
-//   1. Topics are worked out on the iPhone from recent entries (Apple Intelligence, or word
-//      counts as a fallback). You can see, switch off, add and remove every topic.
-//   2. Only the topic words are sent, as a search, to Google News' public RSS feed.
-//   3. Headlines are grouped into stories and summarized on the iPhone. The link back to
-//      the entries that made a topic relevant is worked out locally and never sent.
+//   1. The book's chapters are your themes. Each gets a few searches made from the named things
+//      and concept phrases it keeps returning to (never people or places). You can see them all.
+//   2. Only those searches are sent, to Google News' public RSS feed.
+//   3. Every headline is scored on the phone against the passages of its theme (MiniLM); only
+//      clearly close ones are kept. Tuned on real journals first (docs/discover.md).
 
 struct NewsTopic: Codable, Identifiable, Hashable {
     var id: String { name.lowercased() }
@@ -146,30 +145,6 @@ enum NewsTopics {
     }
 }
 
-enum NewsClustering {
-    /// Groups headlines about the same story by shared words.
-    static func stories(_ articles: [NewsArticle], threshold: Double = 0.34) -> [[NewsArticle]] {
-        var groups: [(words: Set<String>, items: [NewsArticle])] = []
-        for a in articles {
-            let w = BookEngine.contentWords(a.title)
-            if let i = groups.firstIndex(where: { jaccard($0.words, w) >= threshold }) {
-                groups[i].items.append(a)
-                groups[i].words.formUnion(w)
-            } else {
-                groups.append((w, [a]))
-            }
-        }
-        return groups.map(\.items).sorted {
-            $0.count == $1.count ? ($0.first?.published ?? .distantPast) > ($1.first?.published ?? .distantPast) : $0.count > $1.count
-        }
-    }
-
-    static func jaccard(_ a: Set<String>, _ b: Set<String>) -> Double {
-        let union = a.union(b).count
-        return union == 0 ? 0 : Double(a.intersection(b).count) / Double(union)
-    }
-}
-
 /// Parses Google News RSS (`<item><title>Headline - Source</title><link/><pubDate/><source url/></item>`).
 final class RSSParser: NSObject, XMLParserDelegate {
     private var items: [NewsArticle] = []
@@ -223,28 +198,6 @@ final class RSSParser: NSObject, XMLParserDelegate {
 
 // MARK: - Store
 
-@Generable
-struct NewsInterests {
-    @Guide(description: "Up to 6 specific things this person would want news about")
-    var interests: [NewsInterest]
-}
-
-@Generable
-struct NewsInterest {
-    @Guide(description: "A short label of 1 to 3 words, such as 'Zero-profit food'")
-    var label: String
-    @Guide(description: "A specific news search of 4 to 9 words naming the actual subject, such as 'cooperative supermarkets returning profits to shoppers' or 'open source AI coding agents'. Public subjects only: no names of private people, no places where the author lives, no health or money details about them.")
-    var query: String
-}
-
-@Generable
-struct NewsSummary {
-    @Guide(description: "A clear, neutral headline for the story, under 12 words")
-    var headline: String
-    @Guide(description: "Two or three neutral sentences summarizing what is happening, using only the headlines given")
-    var summary: String
-}
-
 @MainActor
 final class NewsStore: ObservableObject {
     static let shared = NewsStore()
@@ -279,7 +232,8 @@ final class NewsStore: ObservableObject {
 
     init() {
         if let data = try? Data(contentsOf: Self.fileURL), let s = try? JSONDecoder().decode(Snapshot.self, from: data) {
-            topics = s.topics; cards = s.cards; updatedAt = s.updatedAt; topicsUpdatedAt = s.topicsUpdatedAt
+            // Topics suggested by 0.5's language model are retired; your own topics stay.
+            topics = s.topics.filter { !$0.fromJournal }; cards = s.cards; updatedAt = s.updatedAt; topicsUpdatedAt = s.topicsUpdatedAt
             history = s.history ?? []
         }
     }
@@ -350,102 +304,69 @@ final class NewsStore: ObservableObject {
         save()
     }
 
-    /// Works out topics from the last month of entries, on this iPhone.
-    func refreshTopics(from journals: [Journal]) async {
-        let recent = journals.filter { $0.status == .ready && !$0.deleted && $0.createdAt > Date().addingTimeInterval(-30 * 86_400) }
-        let pool = recent.isEmpty ? Array(journals.filter { $0.status == .ready }.prefix(20)) : recent
-        guard !pool.isEmpty else { return }
-        var suggested: [(label: String, query: String)] = []
-        if OnDeviceAI.isAvailable {
-            var context = ""
-            for j in pool where context.count < 5000 { context += "- " + j.displayTitle + ": " + String(j.body.prefix(500)) + "\n" }
-            if let r = try? await LanguageModelSession(instructions: """
-            You find what a reader actually cares about in their journal and turn it into precise news \
-            searches. Prefer the specific subject they keep returning to over a broad category: \
-            "cooperative supermarkets returning profits" rather than "food". Never include private details.
-            """).respond(to: "Recent journal entries:\n" + context, generating: NewsInterests.self).content {
-                suggested = r.interests.map { ($0.label, $0.query) }
-            }
-        }
-        if suggested.isEmpty {
-            suggested = NewsTopics.frequentPhrases(in: pool.map(\.body)).map { ($0.capitalized, $0) }
-            if suggested.isEmpty { suggested = NewsTopics.frequentNouns(in: pool.map(\.body)).map { ($0.capitalized, $0) } }
-        }
-        let hidden = Set(UserDefaults.standard.stringArray(forKey: "slowclaw.news.hidden") ?? [])
-        let clean = suggested.compactMap { s -> (String, String)? in
-            guard let label = NewsTopics.sanitize(s.label), let query = NewsTopics.sanitizeQuery(s.query) ?? NewsTopics.sanitize(s.label),
-                  !hidden.contains(label.lowercased()) else { return nil }
-            return (label, query)
-        }
-        // Keep manual topics and switched-off choices; replace the journal-derived ones.
-        var next = topics.filter { !$0.fromJournal }
-        let previous = Dictionary(topics.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        for (name, query) in clean.prefix(6) where !next.contains(where: { $0.id == name.lowercased() }) {
-            next.append(NewsTopic(name: name, query: query, fromJournal: true, enabled: previous[name.lowercased()]?.enabled ?? true))
-        }
-        topics = next
-        topicsUpdatedAt = Date()
-        save()
-    }
-
     // MARK: Stories
+
+    /// Searches made from the book's themes (shown in the Topics screen).
+    struct ThemeSearch: Identifiable { var theme: String; var searches: [String]; var id: String { theme } }
+    @Published private(set) var themeSearches: [ThemeSearch] = []
 
     var isStale: Bool { (updatedAt ?? .distantPast) < Date().addingTimeInterval(-3 * 3600) }
 
+    /// Finds news for the book's themes and your own topics, keeping only stories that are
+    /// clearly close to what you wrote (scored with MiniLM against your passages).
     func refresh(journals: [Journal]) async {
         guard !loading else { return }
         loading = true
         error = nil
         defer { loading = false }
-        if topics.isEmpty || (topicsUpdatedAt ?? .distantPast) < Date().addingTimeInterval(-86_400) {
-            await refreshTopics(from: journals)
+        await BookStore.shared.layout()
+        let themes = BookStore.shared.themes.prefix(10).map { $0 }
+        let searches = ThemeSearches.searches(for: themes)
+        themeSearches = zip(themes, searches).map { ThemeSearch(theme: $0.title, searches: $1) }
+
+        // Each theme, plus each topic you added yourself (scored against its own words).
+        struct Lane { var title: String; var searches: [String]; var vectors: [[Float]]; var manual: Bool }
+        var lanes = zip(themes, searches).map { Lane(title: $0.title, searches: $1, vectors: $0.vectors, manual: false) }
+        for t in topics where t.enabled && !t.fromJournal {
+            if let v = Embedder.vector(for: t.query) { lanes.append(Lane(title: t.name, searches: [t.query], vectors: [v], manual: true)) }
         }
-        let active = topics.filter(\.enabled)
-        guard !active.isEmpty else {
-            cards = []
-            save()
-            return
+        guard !lanes.isEmpty else {
+            error = journals.isEmpty ? nil : "Your book is still being written. News appears once it has chapters."
+            cards = []; save(); return
         }
 
-        var fetched: [(String, [NewsArticle])] = []
+        let allSearches = Array(Set(lanes.flatMap(\.searches)))
+        var results: [String: [NewsArticle]] = [:]
         await withTaskGroup(of: (String, [NewsArticle]).self) { group in
-            for t in active {
-                group.addTask {
-                    // The specific search first; the short label too if it finds too little.
-                    var found = await Self.search(t.query, days: 7)
-                    if found.count < 3 && t.query != t.name {
-                        let broad = await Self.search(t.name, days: 3)
-                        found += broad.filter { b in !found.contains { $0.url == b.url } }
-                    }
-                    return (t.name, found)
-                }
-            }
-            for await r in group { fetched.append(r) }
+            for q in allSearches { group.addTask { (q, Array(await Self.search(q, days: 14).prefix(15))) } }
+            for await (q, items) in group { results[q] = items }
         }
-        guard fetched.contains(where: { !$0.1.isEmpty }) else {
+        guard results.values.contains(where: { !$0.isEmpty }) else {
             error = "Could not load news. Check your connection and pull to refresh."
             return
         }
 
         var next: [NewsCard] = []
-        for t in active {
-            guard let articles = fetched.first(where: { $0.0 == t.name })?.1, !articles.isEmpty else { continue }
-            for story in NewsClustering.stories(articles).prefix(3) {
-                let top = story[0]
-                let id = "card_" + String(Hex.string(Array(SHA256.hash(data: Data(top.url.utf8)))).prefix(24))
+        var seen = Set<String>()
+        for lane in lanes {
+            var pool: [NewsArticle] = []
+            for q in lane.searches { for a in results[q] ?? [] where !pool.contains(where: { $0.title == a.title }) { pool.append(a) } }
+            guard !pool.isEmpty, let vectors = await Embedder.vectors(for: pool.map(\.title)) else { continue }
+            let centroid = Relevance.centroid(lane.vectors)
+            let scores = vectors.map { Relevance.score($0, passages: lane.vectors, centroid: centroid) }
+            for i in Relevance.keep(scores: scores, minimum: lane.manual ? 0.35 : 0.48, limit: lane.manual ? 5 : 4) {
+                let a = pool[i]
+                guard seen.insert(a.url).inserted else { continue }
+                let id = "card_" + String(Hex.string(Array(SHA256.hash(data: Data(a.url.utf8)))).prefix(24))
                 let old = cards.first { $0.id == id }
-                next.append(old ?? NewsCard(id: id, topic: t.name, headline: top.title,
-                                            summary: Self.fallbackSummary(story), articles: Array(story.prefix(8)),
-                                            summarized: false, hasImage: false,
-                                            newest: story.compactMap(\.published).max()))
+                next.append(NewsCard(id: id, topic: lane.title, headline: a.title, summary: "", articles: [a],
+                                     summarized: false, hasImage: old?.hasImage ?? false, newest: a.published))
             }
         }
-        // Interleave topics so one subject does not fill the screen.
         cards = Self.interleave(next)
         updatedAt = Date()
+        if cards.isEmpty { error = "Nothing new close to your themes right now." }
         save()
-
-        for card in cards where !card.summarized { await summarize(card.id) }
         for card in cards.prefix(12) where !card.hasImage { await loadImage(card.id) }
     }
 
@@ -463,30 +384,6 @@ final class NewsStore: ObservableObject {
             round += 1
         }
         return out
-    }
-
-    static func fallbackSummary(_ story: [NewsArticle]) -> String {
-        let sources = Array(NSOrderedSet(array: story.map(\.source))) as? [String] ?? []
-        if story.count == 1 { return "Reported by \(story[0].source)." }
-        let others = story.dropFirst().prefix(2).map { "“\($0.title)”" }.joined(separator: " and ")
-        return "Covered by \(sources.prefix(3).joined(separator: ", "))\(sources.count > 3 ? " and others" : ""). Also: \(others)."
-    }
-
-    private func summarize(_ id: String) async {
-        guard OnDeviceAI.isAvailable, let i = cards.firstIndex(where: { $0.id == id }) else { return }
-        let card = cards[i]
-        let lines = card.articles.prefix(8).map { "- \($0.title) (\($0.source))" }.joined(separator: "\n")
-        guard let r = try? await LanguageModelSession(instructions: """
-        You write short, neutral news briefs from headlines only. Do not speculate or add facts \
-        that are not in the headlines. If the headlines disagree, say so.
-        """).respond(to: "Topic: \(card.topic)\nHeadlines:\n\(lines)", generating: NewsSummary.self).content,
-              let j = cards.firstIndex(where: { $0.id == id }) else { return }
-        let headline = r.headline.trimmingCharacters(in: .whitespacesAndNewlines)
-        let summary = r.summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !headline.isEmpty { cards[j].headline = String(headline.prefix(140)) }
-        if !summary.isEmpty { cards[j].summary = String(summary.prefix(600)) }
-        cards[j].summarized = true
-        save()
     }
 
     /// Picture for a card from the article's own link preview. Skipped when the preview

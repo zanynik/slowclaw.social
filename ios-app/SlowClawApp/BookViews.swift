@@ -15,7 +15,7 @@ struct BookView: View {
                 if chapters.isEmpty {
                     ContentUnavailableView("Your book is empty",
                                            systemImage: "book",
-                                           description: Text("As you journal, the passages worth keeping join a living book in your own words. Each one has to connect to what is already there and add something new."))
+                                           description: Text("As you journal, the passages worth keeping join a living book: grouped into chapters by theme, in the order you lived them."))
                 } else {
                     Section {
                         BookMapView(nodes: book.passages) { id in
@@ -39,9 +39,9 @@ struct BookView: View {
                                 reading = true
                             } label: {
                                 HStack(alignment: .firstTextBaseline) {
-                                    Text("\(c.id + 1)").font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 24, alignment: .leading)
+                                    Text(c.isLooseEnds ? "" : "\(c.id + 1)").font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 24, alignment: .leading)
                                     Circle().fill(BookPalette.color(c.id)).frame(width: 8, height: 8)
-                                    Text(c.title.isEmpty ? "Chapter \(c.id + 1)" : c.title).foregroundStyle(.primary)
+                                    Text(c.title.isEmpty ? "Chapter \(c.id + 1)" : c.title).foregroundStyle(c.isLooseEnds ? .secondary : .primary)
                                     Spacer()
                                     Text("\(c.passageCount)").font(.caption).foregroundStyle(.secondary)
                                 }
@@ -50,17 +50,18 @@ struct BookView: View {
                     }
                 }
 
-                Section {
-                    NavigationLink {
-                        WaitingRoomView()
-                    } label: {
-                        LabeledContent("Waiting to fit", value: "\(book.waiting.count)")
+                if let p = book.progress {
+                    Section {
+                        ProgressView(value: Double(p.done), total: Double(max(1, p.total))) {
+                            Text("Polishing passages \(p.done) of \(p.total)").font(.footnote)
+                        }
+                    } footer: {
+                        Text("Passages are shown in your own words right away and tidied up on this iPhone in the background.")
                     }
-                } footer: {
-                    Text("Passages that don't connect to the book's themes yet wait here, and join once related passages arrive. Italic lines in the book are connecting lines written on this iPhone; everything else is in your own words.")
                 }
             }
             .navigationTitle("Book")
+            .task { await book.layout() }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
@@ -147,7 +148,7 @@ struct BookReaderView: View {
                 LazyVStack(alignment: .leading, spacing: 18) {
                     ForEach(book.chapters) { c in
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Chapter \(c.id + 1)").font(.caption).foregroundStyle(.secondary).textCase(.uppercase)
+                            Text(c.isLooseEnds ? "Not yet part of a theme" : "Chapter \(c.id + 1)").font(.caption).foregroundStyle(.secondary).textCase(.uppercase)
                             Text(c.title.isEmpty ? "Untitled" : c.title).font(.system(.title2, design: .serif).weight(.semibold))
                         }
                         .padding(.top, 24)
@@ -211,32 +212,5 @@ struct PassageView: View {
                 Label("Remove from book", systemImage: "minus.circle")
             }
         }
-    }
-}
-
-struct WaitingRoomView: View {
-    @EnvironmentObject private var book: BookStore
-
-    var body: some View {
-        List {
-            if book.waiting.isEmpty {
-                Text("Nothing is waiting.").foregroundStyle(.secondary)
-            }
-            ForEach(book.waiting.sorted { $0.createdAt > $1.createdAt }) { c in
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(c.text).font(.system(.callout, design: .serif))
-                    Text(c.reason).font(.caption).foregroundStyle(.orange)
-                    HStack {
-                        Button("Add to book anyway") { book.addAnyway(c.id) }
-                        Spacer()
-                        Button("Dismiss", role: .destructive) { book.dismiss(c.id) }
-                    }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-                }
-                .padding(.vertical, 4)
-            }
-        }
-        .navigationTitle("Waiting to fit")
     }
 }

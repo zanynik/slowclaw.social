@@ -35,7 +35,9 @@ run without asking each time. Edit this file to change how it behaves.
    `not deleted` and `updated_at > now() - interval '7 days'`, newest first. Read them in full.
 4. **Collect ideas for the app.** Note every concrete improvement the owner asks for or wishes for.
    Rank by how clearly it was asked for, how often it comes up, and how small and testable it is.
-5. **Review the book (optional, read-only).** Look at `public.book_nodes` in `position` order for
+5. **Review the book (optional, read-only).** For book or Discover ideas, try the change with
+   `tools/prototype` on the journals first (save them to a temporary file outside the repository and
+   delete it afterwards), and port it only if the output reads better. Look at `public.book_nodes` in `position` order for
    the owner. If something reads badly in a way the code can fix (repeats, a jarring jump, generic
    titles), you may count that as one of tonight's ideas.
 6. **If nothing qualifies, stop here.** No branch, no build. Say so in your final message.

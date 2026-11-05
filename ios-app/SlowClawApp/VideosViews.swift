@@ -30,28 +30,42 @@ struct DiscoverPicker: View {
 
 struct VideosView: View {
     @EnvironmentObject private var videos: VideoStore
-    @EnvironmentObject private var store: Store
     @Environment(\.openURL) private var openURL
     @Binding var section: DiscoverSection
-    @State private var showGoals = false
+    @State private var showChannels = false
+
+    private var themes: [String] {
+        var seen: [String] = []
+        for v in videos.videos where !seen.contains(v.theme) { seen.append(v.theme) }
+        return seen
+    }
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 20) {
+                LazyVStack(alignment: .leading, spacing: 22) {
                     if let error = videos.error { Text(error).font(.footnote).foregroundStyle(.orange) }
-                    if videos.goals.isEmpty {
-                        if videos.loading { ProgressView("Reading your journal…").frame(maxWidth: .infinity).padding(.top, 60) }
-                        else {
-                            ContentUnavailableView("No suggestions yet", systemImage: "play.rectangle",
-                                                   description: Text("SlowClaw reads your recent entries on this iPhone and suggests videos for what you want to understand better. Pull down to start."))
+                    if videos.videos.isEmpty {
+                        if videos.loading { ProgressView("Finding videos for your themes…").frame(maxWidth: .infinity).padding(.top, 60) }
+                        else if videos.error == nil {
+                            ContentUnavailableView("No videos yet", systemImage: "play.rectangle",
+                                                   description: Text("Recent videos from educational channels, matched on this iPhone to the chapters of your book. Pull down to look."))
                         }
                     }
-                    ForEach(videos.goals.filter(\.enabled)) { goal in
-                        goalSection(goal)
+                    ForEach(themes, id: \.self) { theme in
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(theme).font(.headline)
+                            ForEach(videos.videos.filter { $0.theme == theme }) { v in
+                                Button {
+                                    videos.markWatched(v)
+                                    openURL(v.url)
+                                } label: { VideoCard(video: v, watched: videos.watched.contains(v.id)) }
+                                .buttonStyle(.plain)
+                            }
+                        }
                     }
-                    if !videos.goals.isEmpty {
-                        Text("Only the searches shown were sent to YouTube. The reasons were worked out on this iPhone and stay here.")
+                    if !videos.videos.isEmpty {
+                        Text("Matched on this iPhone to the chapters of your book. Nothing about you was sent: channel feeds are the same for everyone.")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
@@ -61,37 +75,13 @@ struct VideosView: View {
             .toolbar {
                 ToolbarItem(placement: .principal) { DiscoverPicker(section: $section) }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { showGoals = true } label: { Image(systemName: "slider.horizontal.3") }
-                        .accessibilityLabel("Learning goals")
+                    Button { showChannels = true } label: { Image(systemName: "slider.horizontal.3") }
+                        .accessibilityLabel("Channels")
                 }
             }
-            .refreshable { await videos.refresh(journals: store.visibleJournals) }
-            .sheet(isPresented: $showGoals) { LearningGoalsView() }
-            .task { if videos.isStale { await videos.refresh(journals: store.visibleJournals) } }
-        }
-    }
-
-    @ViewBuilder private func goalSection(_ goal: LearningGoal) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
-                Image(systemName: goal.kind == "gap" ? "questionmark.circle" : "sparkle.magnifyingglass")
-                Text(goal.label).font(.headline)
-            }
-            Text(goal.why).font(.subheadline).foregroundStyle(.secondary)
-            let items = videos.videos.filter { $0.goal == goal.label }
-            if items.isEmpty || videos.unreadable.contains(goal.label) {
-                if let url = YouTubeResults.searchURL(goal.query) {
-                    Button { openURL(url) } label: { Label("Search “\(goal.query)” on YouTube", systemImage: "arrow.up.right.square") }
-                        .font(.callout)
-                }
-            }
-            ForEach(items) { v in
-                Button {
-                    videos.markWatched(v)
-                    openURL(v.url)
-                } label: { VideoCard(video: v, watched: videos.watched.contains(v.id)) }
-                .buttonStyle(.plain)
-            }
+            .refreshable { await videos.refresh() }
+            .sheet(isPresented: $showChannels) { ChannelsView() }
+            .task { if videos.isStale { await videos.refresh() } }
         }
     }
 }
@@ -102,25 +92,19 @@ struct VideoCard: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            ZStack(alignment: .bottomTrailing) {
-                AsyncImage(url: video.thumbnail) { image in
-                    image.resizable().scaledToFill()
-                } placeholder: {
-                    Rectangle().fill(Color(.tertiarySystemFill))
-                }
-                .frame(width: 150, height: 84)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-                if !video.duration.isEmpty {
-                    Text(video.duration).font(.caption2.monospacedDigit()).padding(.horizontal, 5).padding(.vertical, 2)
-                        .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 4)).foregroundStyle(.white).padding(4)
-                }
+            AsyncImage(url: video.thumbnail) { image in
+                image.resizable().scaledToFill()
+            } placeholder: {
+                Rectangle().fill(Color(.tertiarySystemFill))
             }
+            .frame(width: 150, height: 84)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
             .opacity(watched ? 0.55 : 1)
             VStack(alignment: .leading, spacing: 4) {
                 Text(video.title).font(.subheadline.weight(.semibold)).lineLimit(3).foregroundStyle(.primary)
                 Text(video.channel).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 HStack(spacing: 4) {
-                    if !video.published.isEmpty { Text(video.published) }
+                    if let p = video.published { Text(p, format: .relative(presentation: .named)) }
                     if watched { Label("Watched", systemImage: "checkmark.circle").labelStyle(.titleAndIcon) }
                 }
                 .font(.caption2).foregroundStyle(.secondary)
@@ -130,69 +114,56 @@ struct VideoCard: View {
     }
 }
 
-struct LearningGoalsView: View {
+struct ChannelsView: View {
     @EnvironmentObject private var videos: VideoStore
-    @EnvironmentObject private var store: Store
     @Environment(\.dismiss) private var dismiss
-    @State private var newQuery = ""
-    @State private var working = false
-    @State private var editing: LearningGoal?
-    @State private var editText = ""
+    @State private var link = ""
+    @State private var adding = false
+    @State private var message: String?
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    ForEach(videos.goals) { g in
-                        Toggle(isOn: Binding(get: { g.enabled }, set: { videos.setEnabled(g, $0) })) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(g.label)
-                                Button { editing = g; editText = g.query } label: {
-                                    Text("Searches: “\(g.query)”").font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.leading)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
+                    ForEach(videos.channels) { c in
+                        Toggle(c.name, isOn: Binding(get: { c.enabled }, set: { videos.setEnabled(c, $0) }))
                     }
                     .onDelete { offsets in
-                        let list = videos.goals
+                        let list = videos.channels
                         for i in offsets { videos.remove(list[i]) }
                     }
-                    HStack {
-                        TextField("Something you want to understand", text: $newQuery).onSubmit(add)
-                        Button("Add", action: add).disabled(NewsTopics.sanitizeQuery(newQuery) == nil)
-                    }
                 } header: {
-                    Text("Learning goals")
+                    Text("Channels")
                 } footer: {
-                    Text("Found on this iPhone in your recent entries. Only the search under each goal is sent to YouTube; your journal and the reasons stay on the phone. Tap a search to change it.")
+                    Text("Their latest videos are matched to your book's chapters on this iPhone. Only clearly related ones are shown.")
                 }
                 Section {
+                    TextField("youtube.com/channel/UC…", text: $link)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
                     Button {
-                        Task { working = true; await videos.refreshGoals(from: store.visibleJournals); working = false }
+                        Task {
+                            adding = true
+                            let ok = await videos.addChannel(link)
+                            message = ok ? "Channel added." : "Paste a link that contains the channel id (it starts with UC)."
+                            if ok { link = "" }
+                            adding = false
+                        }
                     } label: {
-                        HStack { Text("Suggest goals from my journal"); if working { Spacer(); ProgressView() } }
+                        HStack { Text("Add channel"); if adding { Spacer(); ProgressView() } }
                     }
-                    .disabled(working)
+                    .disabled(adding || link.isEmpty)
+                    if let message { Text(message).font(.footnote).foregroundStyle(.secondary) }
+                } header: {
+                    Text("Add a channel")
                 }
             }
-            .navigationTitle("Learning goals")
+            .navigationTitle("Video channels")
             .navigationBarTitleDisplayMode(.inline)
-            .alert("Search for \(editing?.label ?? "")", isPresented: Binding(get: { editing != nil }, set: { if !$0 { editing = nil } })) {
-                TextField("Search", text: $editText)
-                Button("Save") { if let g = editing { videos.setQuery(g, editText) }; editing = nil }
-                Button("Cancel", role: .cancel) { editing = nil }
-            } message: { Text("Only this text is sent to YouTube.") }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss(); Task { await videos.refresh(journals: store.visibleJournals) } }
+                    Button("Done") { dismiss(); Task { await videos.refresh() } }
                 }
             }
         }
-    }
-
-    private func add() {
-        videos.add(newQuery)
-        newQuery = ""
     }
 }

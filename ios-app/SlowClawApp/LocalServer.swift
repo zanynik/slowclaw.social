@@ -257,11 +257,9 @@ final class LocalServer: ObservableObject {
                 "space_items": store.items.filter { !$0.deleted }.map { CloudSync.row(from: $0, user: nil) },
                 "book_nodes": book,
                 "news": news,
-                "videos": VideoStore.shared.goals.filter(\.enabled).map { g -> [String: Any] in
-                    ["label": g.label, "why": g.why, "query": g.query,
-                     "videos": VideoStore.shared.videos.filter { $0.goal == g.label }.map {
-                        ["id": $0.id, "title": $0.title, "channel": $0.channel, "duration": $0.duration, "published": $0.published]
-                     }]
+                "videos": Dictionary(grouping: VideoStore.shared.videos, by: \.theme).map { theme, vs -> [String: Any] in
+                    ["label": theme, "why": "Recent videos close to this chapter of your book.", "query": "",
+                     "videos": vs.map { ["id": $0.id, "title": $0.title, "channel": $0.channel, "duration": "", "published": ""] }]
                 },
                 "device": UIDeviceName.current,
             ])

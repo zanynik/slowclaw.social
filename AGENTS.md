@@ -15,7 +15,10 @@ Read `README.md` first.
 4. **Audio stays on the phone.** Only text rows sync. Book vectors stay on the phone too.
 5. **Journal text never leaves for third parties.** News sends only topic words. Anything sent
    to a service other than the user's own Supabase rows must be shown to the user first.
-6. **One package.** `libsecp256k1` (pinned) is the only dependency; prefer Apple frameworks.
+6. **One package.** `libsecp256k1` (pinned) is the only dependency; prefer Apple frameworks. The
+   bundled MiniLM (`Model/`, Apache-2.0) runs on Accelerate, not a package.
+7. **Prototype on real data first.** Book and Discover changes are tried with `tools/prototype` on the
+   owner's journals (never committed) and ported only when the output reads better.
 
 ## Code map
 
@@ -29,12 +32,12 @@ Read `README.md` first.
   - `AudioRecorder.swift`, `SpeechTranscriber.swift`, `TimedTranscript.swift`,
     `RecordingSilence.swift` — proven capture/transcription code; change with care.
   - `Shortcuts.swift` — "Record a journal" App Intent (Siri, Action Button, Shortcuts).
-  - `BookOrganizer.swift` (pure rules: repeats, own-voice check, admission, themes, reading
-    order, connecting-line spots), `BookEngine.swift` (vectors, words, PCA map), `Book.swift`
-    (store, embeddings, passages, AI lines, sync rows), `BookViews.swift`.
-  - `News.swift` (topics + specific searches, RSS, clustering, summaries, reading history),
-    `NewsViews.swift`; `Videos.swift` (learning goals, YouTube results), `VideosViews.swift`
-    (Discover tab: News | Videos).
+  - `MiniLM.swift` (sentence embeddings, same model as the prototype), `BookOrganizer.swift`
+    (pure rules: segments, passages, repeats, themes, order, keyphrases), `BookEngine.swift` (vectors,
+    words, PCA map), `Book.swift` (store, layout, background polish, sync rows), `BookViews.swift`.
+    See `docs/book.md`.
+  - `Discover.swift` (theme searches, relevance), `News.swift` (Google News RSS, reading history),
+    `Videos.swift` (channel feeds), `NewsViews.swift`, `VideosViews.swift`. See `docs/discover.md`.
   - `Nostr.swift` (Keychain key, BIP-340 signing, NIP-19/NIP-98), `QRScanner.swift`
     (browser codes), `LocalServer.swift` (Wi-Fi web server + JSON API for the local view).
   - Views: `JournalViews.swift`, `RecordView.swift`, `TodosView.swift`, `SpacesViews.swift`,

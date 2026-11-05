@@ -28,8 +28,6 @@ struct SlowClawApp: App {
                     LegacyImport.runIfNeeded(store: store)
                     book.onLocalChange = { CloudSync.shared.schedulePush() }
                     processor.start()
-                    // The better embedding model downloads once, in the background.
-                    Task.detached(priority: .utility) { await Embedder.prepare(for: [.english, NLLanguage(rawValue: Locale.current.language.languageCode?.identifier ?? "en")]) }
                     if local.enabled { local.start() }
                     await cloud.sync()
                 }
