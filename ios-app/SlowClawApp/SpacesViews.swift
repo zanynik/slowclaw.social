@@ -230,6 +230,7 @@ struct ItemRow: View {
     let item: SpaceItem
     @State private var editing = false
     @State private var text = ""
+    @FocusState private var focused: Bool
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -247,17 +248,25 @@ struct ItemRow: View {
             }
             if editing {
                 TextField("", text: $text, axis: .vertical)
+                    .focused($focused)
+                    .onAppear { focused = true }
                     .onSubmit { commit() }
+                    .onChange(of: focused) { _, isFocused in if !isFocused { commit() } }
                 Button("Done") { commit() }.font(.caption)
             } else {
+                // A single tap on the text edits it in place.
                 Text(item.text)
                     .strikethrough(item.done)
                     .foregroundStyle(item.done ? .secondary : .primary)
-                    .onTapGesture(count: 2) { text = item.text; editing = true }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .onTapGesture { startEditing() }
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityHint("Edit")
             }
         }
         .contextMenu {
-            Button { text = item.text; editing = true } label: { Label("Edit", systemImage: "pencil") }
+            Button { startEditing() } label: { Label("Edit", systemImage: "pencil") }
             if let jid = item.journalID, store.journal(jid) != nil {
                 Text("From: \(store.journal(jid)?.displayTitle ?? "")")
             }
@@ -265,7 +274,13 @@ struct ItemRow: View {
         }
     }
 
+    private func startEditing() {
+        text = item.text
+        editing = true
+    }
+
     private func commit() {
+        guard editing else { return }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !t.isEmpty { store.updateItem(item.id) { $0.text = t } }
         editing = false
