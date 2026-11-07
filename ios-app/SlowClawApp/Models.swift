@@ -27,6 +27,16 @@ struct Journal: Codable, Identifiable, Hashable {
     /// True when this record has local changes the cloud has not seen yet.
     var dirty: Bool
 
+    /// Audio journals imported from older builds kept their raw transcript as the body and were
+    /// never cleaned. The old web view showed a cleaned copy; now the phone cleans them once,
+    /// keeps the raw words in `transcript`, and syncs the cleaned body like any new recording.
+    var needsLegacyCleanup: Bool {
+        guard status == .ready, !deleted, transcript == nil, audioPath != nil else { return false }
+        let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Placeholders such as "(No speech was recognized…)" are not transcripts.
+        return !text.isEmpty && !text.hasPrefix("(")
+    }
+
     var displayTitle: String {
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if !t.isEmpty { return t }

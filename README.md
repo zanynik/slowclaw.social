@@ -39,7 +39,14 @@ Say "Record a journal in SlowClaw" to Siri, or put the **Record journal** shortc
 Button or Lock Screen, to start recording without tapping through the app. Leaving a recording
 takes a confirmation once it is longer than a few seconds.
 
-The website has the same To-dos page, and journal edits there save automatically.
+The website opens on **Today**: your journal streak, this week against last, a calendar of the
+last 30 weeks (click a day to see what you wrote and finished), what is next, the to-do waiting
+longest, and an older idea or question worth another look. **Ideas**, **Questions** and **Notes**
+collect every item from every entry, grouped by space or month. **To-dos → Done** is the log of
+what you finished, with a weekly chart (a done to-do's last update counts as when it was done).
+The editor uses the full width; select words in an entry to keep them as a to-do, idea, question
+or note. Click any item to edit it. Keys: `N` new entry, `/` search, `Ctrl/⌘ + Enter` done.
+Journal edits save automatically.
 
 ### The living book
 
