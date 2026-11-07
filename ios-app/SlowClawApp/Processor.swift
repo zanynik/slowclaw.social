@@ -105,6 +105,11 @@ final class Processor: ObservableObject {
             } else if autoOrganize,
                       let j = store.visibleJournals.last(where: { $0.status == .ready && !$0.organized && $0.createdAt >= autoOrganizeSince && $0.spaceID == nil }) {
                 await organize(j.id)
+            } else if let j = store.visibleJournals.first(where: \.needsLegacyCleanup) {
+                // Newest first, so the entries read most on the web are clean soonest.
+                let remaining = store.visibleJournals.filter(\.needsLegacyCleanup).count - 1
+                activity = remaining > 0 ? "Cleaning up older transcripts (\(remaining) to go)…" : "Cleaning up older transcripts…"
+                await cleanLegacy(j)
             } else if let j = store.visibleJournals.last(where: { BookStore.shared.needsReading($0) }) {
                 // Oldest first, so the book grows in the order life happened.
                 let remaining = store.visibleJournals.filter { BookStore.shared.needsReading($0) }.count - 1
@@ -155,6 +160,18 @@ final class Processor: ObservableObject {
             // Respect edits the user made while cleanup was running.
             if $0.body == source || $0.body.isEmpty { $0.body = cleaned }
             $0.status = .ready
+        }
+    }
+
+    /// One-time cleanup of an imported audio journal. The raw words move to `transcript`
+    /// (phone-only, shown as "Original transcript"); the cleaned body syncs.
+    private func cleanLegacy(_ j: Journal) async {
+        let source = j.body
+        let cleaned = await OnDeviceAI.cleanTranscript(source)
+        store.updateJournal(j.id) {
+            $0.transcript = source
+            // Respect edits made while cleanup was running.
+            if $0.body == source { $0.body = cleaned }
         }
     }
 

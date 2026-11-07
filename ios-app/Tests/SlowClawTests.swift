@@ -276,3 +276,24 @@ final class LocalServerTests: XCTestCase {
         XCTAssertEqual(LocalServer.shared.handle(escape).status, 404)
     }
 }
+
+// MARK: - Legacy transcript cleanup
+
+final class LegacyCleanupTests: XCTestCase {
+    private func journal(body: String, transcript: String? = nil, audio: String? = "audio/a.m4a",
+                         status: JournalStatus = .ready) -> Journal {
+        Journal(id: "memory_1", title: "", body: body, transcript: transcript, audioPath: audio, moreAudio: nil,
+                spaceID: nil, createdAt: Date(), updatedAt: Date(), status: status, organized: false,
+                deleted: false, dirty: false)
+    }
+
+    func testOnlyImportedAudioTranscriptsAreCleaned() {
+        XCTAssertTrue(journal(body: "um so I went to the shop").needsLegacyCleanup)
+        // Already cleaned: the raw words are kept in `transcript`.
+        XCTAssertFalse(journal(body: "I went to the shop.", transcript: "um so I went to the shop").needsLegacyCleanup)
+        // Typed entries and synced copies have no audio on this phone.
+        XCTAssertFalse(journal(body: "Typed entry", audio: nil).needsLegacyCleanup)
+        XCTAssertFalse(journal(body: "(No speech was recognized. The audio is still saved on this phone.)").needsLegacyCleanup)
+        XCTAssertFalse(journal(body: "", status: .transcribing).needsLegacyCleanup)
+    }
+}
