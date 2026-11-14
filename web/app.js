@@ -14,7 +14,7 @@ const KINDS = [
   { id: 'note', label: 'Notes', one: 'note' },
 ];
 
-const state = { session: null, journals: [], spaces: [], items: [], book: [], news: null, videos: null, loading: false, error: null, status: '' };
+const state = { session: null, journals: [], spaces: [], items: [], book: [], news: null, videos: null, reads: null, loading: false, error: null, query: '' };
 const app = document.getElementById('app');
 
 // ---------- tiny DOM helper (text is always set via textContent) ----------
@@ -116,7 +116,7 @@ async function phone(method, path, body) {
 function signOut() {
   if (MODE === 'local' && state.session) phone('POST', 'api/signout').catch(() => {});
   saveSession(null);
-  Object.assign(state, { journals: [], spaces: [], items: [], book: [], news: null });
+  Object.assign(state, { journals: [], spaces: [], items: [], book: [], news: null, videos: null, reads: null, error: null, query: '' });
   render();
 }
 
@@ -139,7 +139,7 @@ async function loadAll() {
   try {
     if (MODE === 'local') {
       const d = await phone('GET', 'api/data');
-      Object.assign(state, { journals: d.journals, spaces: d.spaces, items: d.space_items, book: d.book_nodes, news: d.news, videos: d.videos || null });
+      Object.assign(state, { journals: d.journals, spaces: d.spaces, items: d.space_items, book: d.book_nodes, news: d.news, videos: d.videos || null, reads: d.reads || null });
     } else {
       if (!state.session.email) {
         const res = await fetch(SUPABASE_URL + '/auth/v1/user', { headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + (await token()) } });
@@ -156,7 +156,7 @@ async function loadAll() {
   renderUnlessEditing();
 }
 
-async function save(table, row, { quiet = false } = {}) {
+async function save(table, row, { quiet = false, done = 'Saved', undo = null } = {}) {
   const now = new Date().toISOString();
   const full = { ...row, updated_at: now };
   flash('Saving…');
@@ -169,9 +169,9 @@ async function save(table, row, { quiet = false } = {}) {
     const i = list.findIndex(r => r.id === saved.id);
     if (saved.deleted || row.deleted) { if (i >= 0) list.splice(i, 1); }
     else if (i >= 0) list[i] = saved; else list.unshift(saved);
-    flash('Saved');
+    flash(done, { undo });
   } catch (e) {
-    flash(e.message, true);
+    flash(e.message, { sticky: true });
     return false;
   }
   if (!quiet) render();
@@ -181,13 +181,15 @@ async function save(table, row, { quiet = false } = {}) {
 const uid = prefix => prefix + '_' + (crypto.randomUUID ? crypto.randomUUID()
   : Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join(''));
 
+// One small message in the corner. `undo` adds a button and keeps the message up a little longer.
 let flashTimer;
-function flash(text, sticky) {
-  state.status = text;
-  const el = document.querySelector('.status');
-  if (el) el.textContent = text; else if (text) document.body.append(h('div', { class: 'status' }, text));
+function flash(text, { sticky = false, undo = null } = {}) {
+  const el = document.getElementById('status');
   clearTimeout(flashTimer);
-  if (!sticky) flashTimer = setTimeout(() => { state.status = ''; document.querySelector('.status')?.remove(); }, 1500);
+  const hide = () => { el.hidden = true; el.replaceChildren(); };
+  el.replaceChildren(text, undo ? h('button', { class: 'link', onclick: () => { hide(); undo(); } }, 'Undo') : '');
+  el.hidden = !text;
+  if (!sticky) flashTimer = setTimeout(hide, undo ? 6000 : 1500);
 }
 
 // ---------- routing ----------
@@ -201,6 +203,8 @@ window.addEventListener('hashchange', () => { document.querySelector('.side')?.c
 // ---------- helpers ----------
 const spaceById = id => state.spaces.find(s => s.id === id);
 const sortedSpaces = () => [...state.spaces].sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name));
+const words = text => (text.trim().match(/\S+/g) || []).length;
+const typing = () => /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '');
 const journalTitle = j => (j.title || '').trim() || (j.body || '').split('\n')[0].slice(0, 60) || 'Untitled';
 function dayLabel(iso) {
   const d = new Date(iso), today = new Date();
@@ -211,9 +215,23 @@ function dayLabel(iso) {
 }
 
 // ---------- views ----------
+const TITLES = { journals: 'Journal', todos: 'To-dos', book: 'Book', news: 'News', videos: 'Videos', reads: 'Reads', unsorted: 'Unsorted', new: 'New entry' };
+function pageTitle() {
+  const r = route();
+  if (!state.session) return 'SlowClaw';
+  const name = r.view === 'space' ? spaceById(r.id)?.name
+    : r.view === 'journal' ? (j => j && journalTitle(j))(state.journals.find(j => j.id === r.id))
+    : TITLES[r.view];
+  return name ? name + ' · SlowClaw' : 'SlowClaw';
+}
+
 function render() {
   stopPairing();
+  // Adding several things in a row: the box you typed in keeps the cursor after the redraw.
+  const focused = document.activeElement?.dataset?.add;
   app.replaceChildren(state.session ? shell() : MODE === 'local' ? pairView() : authView());
+  document.title = pageTitle();
+  if (focused) app.querySelector(`[data-add="${CSS.escape(focused)}"]`)?.focus();
 }
 
 // ---------- QR sign-in ----------
@@ -384,13 +402,14 @@ function shell() {
     h('li', {}, h('button', { class: active ? 'active' : '', onclick: () => go(hash) }, h('span', {}, label), count ? h('span', { class: 'count' }, count) : null));
   const unsorted = state.journals.filter(j => !spaceById(j.space_id));
   side.append(
-    h('div', { class: 'brand' }, 'SlowClaw', h('button', { class: 'icon', title: 'Refresh', onclick: loadAll }, '↻')),
+    h('div', { class: 'brand' }, 'SlowClaw', h('button', { class: 'icon', title: 'Refresh', 'aria-label': 'Refresh', onclick: loadAll }, '↻')),
     h('ul', { class: 'nav' },
       navItem('All journals', '#/journals', state.journals.length, r.view === 'journals'),
       navItem('To-dos', '#/todos', state.items.filter(i => i.kind === 'todo' && !i.done && spaceById(i.space_id)).length, r.view === 'todos'),
-      navItem('Book', '#/book', state.book.filter(n => (n.kind || 'passage') === 'passage').length, r.view === 'book'),
+      navItem('Book', '#/book', state.book.filter(isPassage).length, r.view === 'book'),
       state.news ? navItem('News', '#/news', state.news.length, r.view === 'news') : null,
       state.videos ? navItem('Videos', '#/videos', state.videos.reduce((n, g) => n + g.videos.length, 0), r.view === 'videos') : null,
+      state.reads ? navItem('Reads', '#/reads', state.reads.reduce((n, g) => n + g.articles.length, 0), r.view === 'reads') : null,
       navItem('Unsorted', '#/unsorted', unsorted.length, r.view === 'unsorted')),
     h('div', { class: 'nav-title' }, 'Spaces'),
     h('ul', { class: 'nav' },
@@ -410,32 +429,35 @@ function shell() {
   else if (r.view === 'book') content = bookView(r.id);
   else if (r.view === 'news' && state.news) content = newsView();
   else if (r.view === 'videos' && state.videos) content = videosView();
+  else if (r.view === 'reads' && state.reads) content = readsView();
   else if (r.view === 'unsorted') content = journalsView('Unsorted', unsorted, 'Journals the phone has not filed yet. Open one to choose a space.');
   else content = journalsView('Journal', state.journals);
 
+  const backdrop = h('div', { class: 'backdrop', onclick: () => side.classList.remove('open') });
   const main = h('main', {},
-    h('button', { class: 'menu-btn', onclick: () => side.classList.toggle('open') }, '☰ Spaces'),
-    state.error ? h('div', { class: 'notice' }, state.error) : null,
+    h('button', { class: 'menu-btn', 'aria-label': 'Open menu', onclick: () => side.classList.add('open') }, '☰ Menu'),
+    state.error ? h('div', { class: 'notice', role: 'alert' }, state.error, ' ', h('button', { class: 'link', onclick: loadAll }, 'Try again')) : null,
     content);
-  return h('div', { class: 'shell' }, side, main);
+  return h('div', { class: 'shell' }, side, backdrop, main);
 }
 
 function journalsView(title, journals, hint) {
-  const search = h('input', { type: 'text', placeholder: 'Search', value: state.query || '' });
+  const search = h('input', { type: 'search', class: 'search', placeholder: 'Search  ( / )', 'aria-label': 'Search journals', value: state.query || '' });
   const list = h('div');
   const draw = () => {
     const q = (state.query || '').toLowerCase();
     const shown = [...journals]
-      .filter(j => !q || (j.title + ' ' + j.body).toLowerCase().includes(q))
+      .filter(j => !q || (j.title + ' ' + j.body + ' ' + (spaceById(j.space_id)?.name || '')).toLowerCase().includes(q))
       .sort((a, b) => b.created_at.localeCompare(a.created_at));
     let lastDay = '';
     const nodes = [];
     for (const j of shown) {
       const day = dayLabel(j.created_at);
-      if (day !== lastDay) { nodes.push(h('div', { class: 'day' }, day)); lastDay = day; }
+      if (day !== lastDay) { nodes.push(h('li', { class: 'day' }, day)); lastDay = day; }
       nodes.push(journalRow(j));
     }
-    list.replaceChildren(shown.length ? h('ul', { class: 'journals' }, nodes) : h('p', { class: 'muted' }, q ? 'No matches.' : 'Nothing here yet. Record a journal on your iPhone and it shows up here.'));
+    list.replaceChildren(shown.length ? h('ul', { class: 'journals' }, nodes)
+      : h('p', { class: 'muted empty' }, q ? `Nothing matches “${state.query.trim()}”.` : 'Nothing here yet. Record a journal on your iPhone and it shows up here.'));
   };
   search.addEventListener('input', () => { state.query = search.value; draw(); });
   draw();
@@ -446,14 +468,61 @@ function journalsView(title, journals, hint) {
     list);
 }
 
-function journalRow(j) {
+// `withDay` is for lists that are not grouped under day headings.
+function journalRow(j, withDay = false) {
   const space = spaceById(j.space_id);
   return h('li', {}, h('button', { onclick: () => go('#/journal/' + encodeURIComponent(j.id)) },
     h('span', { class: 'title' }, journalTitle(j)),
     j.body ? h('span', { class: 'snippet' }, j.body) : null,
     h('span', { class: 'small muted' },
+      withDay ? dayLabel(j.created_at) + ', ' : '',
       new Date(j.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), ' ',
-      space ? h('span', { class: 'chip' }, space.name) : null)));
+      space && !withDay ? h('span', { class: 'chip' }, space.name) : null)));
+}
+
+// One line of a list: tick it (to-dos), click the text to edit it, or remove it.
+function itemRow(item) {
+  const text = h('span', { class: 'text', tabindex: '0', role: 'button', title: 'Click to edit' }, item.text);
+  const edit = () => {
+    const input = h('input', { type: 'text', class: 'text', value: item.text, 'aria-label': 'Edit' });
+    let finished = false;
+    const finish = (keep) => {
+      if (finished) return;
+      finished = true;
+      const next = input.value.trim();
+      if (keep && next && next !== item.text) save('space_items', { ...item, text: next });
+      else input.replaceWith(text);
+    };
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') finish(true); if (e.key === 'Escape') finish(false); });
+    input.addEventListener('blur', () => finish(true));
+    text.replaceWith(input);
+    input.focus();
+  };
+  text.addEventListener('click', edit);
+  text.addEventListener('keydown', e => { if (e.key === 'Enter') edit(); });
+  const toggle = done => save('space_items', { ...item, done }, done
+    ? { done: 'Done', undo: () => save('space_items', { ...state.items.find(i => i.id === item.id) || item, done: false }) } : {});
+  const remove = () => save('space_items', { ...item, deleted: true }, { done: 'Removed', undo: () => save('space_items', { ...item, deleted: false }) });
+  return h('li', { class: item.done ? 'done' : '' },
+    item.kind === 'todo' ? h('input', { type: 'checkbox', checked: item.done, 'aria-label': 'Done: ' + item.text, onchange: e => toggle(e.target.checked) }) : null,
+    text,
+    item.journal_id && state.journals.some(j => j.id === item.journal_id)
+      ? h('button', { class: 'icon', title: 'Open the entry this came from', 'aria-label': 'Open the entry this came from', onclick: () => go('#/journal/' + encodeURIComponent(item.journal_id)) }, '↗')
+      : null,
+    h('button', { class: 'icon', title: 'Remove', 'aria-label': 'Remove: ' + item.text, onclick: remove }, '×'));
+}
+
+// The text box that adds to a list. `key` lets render() give it the cursor back.
+function addBox(key, placeholder, make) {
+  const input = h('input', { type: 'text', placeholder, 'data-add': key, 'aria-label': placeholder });
+  const add = () => {
+    const text = input.value.trim();
+    if (!text) return input.focus();
+    input.value = '';
+    save('space_items', { id: uid('item'), journal_id: null, text, done: false, created_at: new Date().toISOString(), deleted: false, ...make() });
+  };
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
+  return { input, button: h('button', { onclick: add }, 'Add') };
 }
 
 function spaceView(id) {
@@ -470,34 +539,18 @@ function spaceView(id) {
     KINDS.map(k => itemsCard(space, k, items.filter(i => i.kind === k.id))),
     h('div', { class: 'card' },
       h('h2', {}, `Journal entries (${journals.length})`),
-      journals.length ? h('ul', { class: 'journals' }, journals.map(journalRow)) : h('p', { class: 'muted small' }, 'No entries yet.')));
+      journals.length ? h('ul', { class: 'journals' }, journals.map(j => journalRow(j, true))) : h('p', { class: 'muted small' }, 'No entries yet.')));
 }
 
 function itemsCard(space, kind, items) {
   const open = items.filter(i => !i.done).sort((a, b) => b.created_at.localeCompare(a.created_at));
   const done = items.filter(i => i.done);
-  const input = h('input', { type: 'text', placeholder: `Add ${kind.one}…` });
-  const add = () => {
-    const text = input.value.trim();
-    if (!text) return;
-    const now = new Date().toISOString();
-    save('space_items', { id: uid('item'), space_id: space.id, journal_id: null, kind: kind.id, text, done: false, created_at: now, deleted: false });
-  };
-  input.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
-  const row = (item) => h('li', { class: item.done ? 'done' : '' },
-    kind.id === 'todo'
-      ? h('input', { type: 'checkbox', checked: item.done, 'aria-label': 'Done', onchange: e => save('space_items', { ...item, done: e.target.checked }) })
-      : null,
-    h('span', { class: 'text' }, item.text),
-    item.journal_id && state.journals.some(j => j.id === item.journal_id)
-      ? h('button', { class: 'icon', title: 'Open source journal', onclick: () => go('#/journal/' + encodeURIComponent(item.journal_id)) }, '↗')
-      : null,
-    h('button', { class: 'icon', title: 'Delete', onclick: () => save('space_items', { ...item, deleted: true }) }, '×'));
+  const add = addBox(kind.id + ':' + space.id, `Add ${kind.one}…`, () => ({ space_id: space.id, kind: kind.id }));
   return h('div', { class: 'card' },
     h('h2', {}, kind.label, done.length && kind.id === 'todo' ? h('span', { class: 'small muted' }, `${done.length} done`) : null),
-    open.length ? h('ul', { class: 'items' }, open.map(row)) : h('p', { class: 'muted small' }, `No ${kind.label.toLowerCase()} yet.`),
-    kind.id === 'todo' && done.length ? h('details', {}, h('summary', { class: 'small muted' }, 'Show done'), h('ul', { class: 'items' }, done.map(row))) : null,
-    h('div', { class: 'add-row' }, input, h('button', { onclick: add }, 'Add')));
+    open.length ? h('ul', { class: 'items' }, open.map(itemRow)) : h('p', { class: 'muted small' }, `No ${kind.label.toLowerCase()} yet.`),
+    kind.id === 'todo' && done.length ? h('details', {}, h('summary', { class: 'small muted' }, 'Show done'), h('ul', { class: 'items' }, done.map(itemRow))) : null,
+    h('div', { class: 'add-row' }, add.input, add.button));
 }
 
 function journalView(id) {
@@ -507,8 +560,16 @@ function journalView(id) {
   const isNew = !j;
   if (isNew) j = { id: uid('journal'), title: '', body: '', space_id: null, created_at: new Date().toISOString(), deleted: false };
   let stored = !isNew;
-  const title = h('input', { class: 'title-input', type: 'text', value: j.title, placeholder: 'Title' });
-  const body = h('textarea', { value: j.body, placeholder: isNew ? 'Write…' : null });
+  const title = h('input', { class: 'title-input', type: 'text', value: j.title, placeholder: 'Title', 'aria-label': 'Title' });
+  const body = h('textarea', { value: j.body, placeholder: isNew ? 'Write…' : null, 'aria-label': 'Entry text' });
+  const count = h('span', {});
+  const fit = () => {
+    body.style.height = 'auto';
+    body.style.height = Math.max(220, body.scrollHeight + 2) + 'px';
+    const n = words(body.value);
+    count.textContent = n ? ` · ${n} ${n === 1 ? 'word' : 'words'}` : '';
+  };
+  setTimeout(fit, 0);
   const select = h('select', {},
     h('option', { value: '' }, 'Unsorted'),
     sortedSpaces().map(s => h('option', { value: s.id }, s.name)));
@@ -516,33 +577,37 @@ function journalView(id) {
   const current = () => ({ ...j, title: title.value.trim(), body: body.value, space_id: select.value || null });
   const dirty = () => { const c = current(); return c.title !== j.title || c.body !== j.body || c.space_id !== (j.space_id || null); };
 
-  // Autosave quietly a moment after typing stops, and when leaving the page.
-  let timer, closed = false;
-  const persist = async (quiet = true) => {
+  // Autosave quietly a moment after typing stops, and when leaving the page. Saves run one
+  // after another, so a blur and a page change at the same moment cannot store the entry twice.
+  let timer, closed = false, left = false, queue = Promise.resolve();
+  const persist = () => queue = queue.then(async () => {
     clearTimeout(timer);
     if (closed || !dirty()) return;
     const next = current();
     if (!stored && !next.title && !next.body.trim()) return;
-    if (await save('journals', next, { quiet })) {
-      j = state.journals.find(x => x.id === next.id) || next;
-      if (!stored) { stored = true; history.replaceState(null, '', '#/journal/' + encodeURIComponent(next.id)); }
+    if (!(await save('journals', next, { quiet: true }))) return;
+    j = state.journals.find(x => x.id === next.id) || next;
+    if (!stored) {
+      stored = true;
+      if (!left) history.replaceState(null, '', '#/journal/' + encodeURIComponent(next.id));
     }
-  };
+    // Already on another page: redraw it with the text that was just saved.
+    if (left) renderUnlessEditing();
+  });
   const later = () => { clearTimeout(timer); timer = setTimeout(persist, 1200); };
   title.addEventListener('input', later);
-  body.addEventListener('input', later);
+  body.addEventListener('input', () => { later(); fit(); });
   select.addEventListener('change', () => persist());
   title.addEventListener('blur', () => persist());
   body.addEventListener('blur', () => persist());
-  // Leaving the editor: save and redraw the page we moved to with the new text.
-  window.addEventListener('hashchange', () => persist(false), { once: true });
+  window.addEventListener('hashchange', () => { left = true; persist(); }, { once: true });
 
   const fromThis = isNew ? [] : state.items.filter(i => i.journal_id === id);
   if (isNew) setTimeout(() => body.focus(), 0);
   return h('div', { class: 'editor' },
     h('button', { class: 'link', onclick: () => history.back() }, '← Back'),
     title,
-    h('div', { class: 'small muted' }, new Date(j.created_at).toLocaleString(), ' · saves automatically'),
+    h('div', { class: 'small muted' }, new Date(j.created_at).toLocaleString([], { dateStyle: 'full', timeStyle: 'short' }), count, ' · saves automatically'),
     h('label', { class: 'small muted' }, 'Space', select),
     body,
     h('div', { class: 'toolbar' },
@@ -557,41 +622,31 @@ function todosView() {
   if (!spaces.length) return h('div', {}, h('h1', {}, 'To-dos'), h('p', { class: 'muted' }, 'Create a space first.'));
   let last = '';
   try { last = localStorage.getItem('slowclaw.todos.space') || ''; } catch {}
-  const select = h('select', {}, spaces.map(s => h('option', { value: s.id }, s.name)));
+  const select = h('select', { 'aria-label': 'Space for the new to-do' }, spaces.map(s => h('option', { value: s.id }, s.name)));
   select.value = spaceById(last) ? last : spaces[0].id;
-  const input = h('input', { type: 'text', placeholder: 'Add a to-do…' });
-  const add = () => {
-    const text = input.value.trim();
-    if (!text) return;
-    try { localStorage.setItem('slowclaw.todos.space', select.value); } catch {}
-    save('space_items', { id: uid('item'), space_id: select.value, journal_id: null, kind: 'todo', text, done: false, created_at: new Date().toISOString(), deleted: false });
-  };
-  input.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
+  select.addEventListener('change', () => { try { localStorage.setItem('slowclaw.todos.space', select.value); } catch {} });
+  const add = addBox('todo', 'Add a to-do…', () => ({ space_id: select.value, kind: 'todo' }));
   const groups = spaces.map(s => [s, state.items.filter(i => i.space_id === s.id && i.kind === 'todo' && !i.done)
     .sort((a, b) => b.created_at.localeCompare(a.created_at))]).filter(([, list]) => list.length);
-  const row = item => h('li', {},
-    h('input', { type: 'checkbox', 'aria-label': 'Done', onchange: () => save('space_items', { ...item, done: true }) }),
-    h('span', { class: 'text' }, item.text),
-    item.journal_id && state.journals.some(j => j.id === item.journal_id)
-      ? h('button', { class: 'icon', title: 'Open source journal', onclick: () => go('#/journal/' + encodeURIComponent(item.journal_id)) }, '↗')
-      : null);
   return h('div', {},
     h('h1', {}, 'To-dos'),
-    h('div', { class: 'add-row' }, input, select, h('button', { onclick: add }, 'Add')),
+    h('div', { class: 'add-row' }, add.input, select, add.button),
     groups.length
       ? groups.map(([s, list]) => h('div', { class: 'card' },
           h('h2', {}, h('button', { class: 'link', onclick: () => go('#/space/' + encodeURIComponent(s.id)) }, s.name)),
-          h('ul', { class: 'items' }, list.map(row))))
-      : h('p', { class: 'muted' }, 'Nothing to do. To-dos from your recordings show up here.'));
+          h('ul', { class: 'items' }, list.map(itemRow))))
+      : h('p', { class: 'muted empty' }, 'Nothing to do. To-dos from your recordings show up here.'));
 }
 
 // ---------- book ----------
 const PALETTE = ['#2563eb', '#ea580c', '#16a34a', '#db2777', '#9333ea', '#0d9488', '#dc2626', '#4f46e5', '#a16207', '#059669'];
 const chapterColor = n => PALETTE[Math.abs(n) % PALETTE.length];
 
+const isPassage = n => (n.kind || 'passage') === 'passage';
+
 function bookChapters() {
   const all = [...state.book].filter(n => !n.deleted).sort((a, b) => a.position - b.position);
-  const path = all.filter(n => (n.kind || 'passage') === 'passage');
+  const path = all.filter(isPassage);
   const chapters = [];
   for (const n of all) {
     const last = chapters[chapters.length - 1];
@@ -601,17 +656,10 @@ function bookChapters() {
   return { path, chapters };
 }
 
-function svg(tag, attrs = {}, ...children) {
-  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
-  for (const [k, v] of Object.entries(attrs)) if (v != null) el.setAttribute(k, v);
-  for (const c of children) el.append(c instanceof Node ? c : document.createTextNode(String(c)));
-  return el;
-}
-
 function bookView() {
   const { path, chapters } = bookChapters();
   if (!path.length) return h('div', {}, h('h1', {}, 'Book'),
-    h('p', { class: 'muted' }, 'Your book grows on your iPhone as you journal. Passages join only when they connect to what is already there and add something new.'));
+    h('p', { class: 'muted empty' }, 'Your book grows on your iPhone as you journal: the passages worth keeping, grouped into chapters by theme.'));
   const jump = id => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   const journal = id => state.journals.find(j => j.id === id);
   return h('div', { class: 'book' },
@@ -621,13 +669,13 @@ function bookView() {
       h('ol', { class: 'toc' }, chapters.map(c => h('li', {},
         h('button', { class: 'link', onclick: () => jump('c-' + c.id) },
           h('span', { class: 'dot', style: 'background:' + chapterColor(c.id) }), c.title || 'Chapter ' + (c.id + 1)),
-        h('span', { class: 'muted small' }, ' · ' + c.nodes.filter(n => (n.kind || 'passage') === 'passage').length))))),
+        h('span', { class: 'muted small' }, ' · ' + c.nodes.filter(isPassage).length))))),
     chapters.map(c => h('section', { class: 'chapter', id: 'c-' + c.id },
       h('div', { class: 'muted small caps' }, 'Chapter ' + (c.id + 1)),
       h('h2', {}, c.title || 'Untitled'),
       c.nodes.map(n => {
         // Lines written on the phone to connect passages: shown as such, never as the author's words.
-        if ((n.kind || 'passage') !== 'passage') return h('p', { class: 'book-line ' + n.kind, title: 'Connecting line written on the iPhone' }, n.text);
+        if (!isPassage(n)) return h('p', { class: 'book-line ' + n.kind, title: 'Connecting line written on the iPhone' }, n.text);
         const j = n.journal_id && journal(n.journal_id);
         return h('div', { class: 'passage', id: 'p-' + n.id },
           h('p', {}, n.text),
@@ -641,36 +689,49 @@ function newsView() {
   const cards = state.news || [];
   return h('div', {},
     h('h1', {}, 'News'),
-    h('p', { class: 'muted small' }, 'Stories on topics your iPhone found in your journal. Only the topic words were sent to Google News; summaries were written on the phone.'),
+    h('p', { class: 'muted small' }, 'Stories for the chapters of your book. Only topic searches were sent to Google News; the phone kept the ones close to what you wrote.'),
     cards.length ? h('div', { class: 'news-grid' }, cards.map(c => h('article', { class: 'news-card' },
       c.has_image ? h('img', { src: 'news-image/' + encodeURIComponent(c.id), alt: '', loading: 'lazy' })
                   : h('div', { class: 'news-fallback', style: 'background:' + chapterColor(c.topic.length) }, c.topic.slice(0, 1).toUpperCase()),
       h('div', { class: 'news-body' },
         h('div', { class: 'caps small accent' }, c.topic),
         h('h2', {}, c.headline),
-        h('p', { class: 'muted' }, c.summary),
+        c.summary ? h('p', { class: 'muted' }, c.summary) : null,
         h('details', {}, h('summary', { class: 'small muted' }, c.sources || 'Sources'),
           h('ul', { class: 'sources' }, c.articles.map(a => h('li', {},
             h('a', { href: a.url, target: '_blank', rel: 'noopener noreferrer' }, a.title), h('span', { class: 'muted small' }, ' · ' + a.source)))))))))
       : h('p', { class: 'muted' }, 'No stories yet. Open the News tab on your iPhone to fetch some.'));
 }
 
-// ---------- videos (local view only: chosen on the iPhone) ----------
+// ---------- videos and reads (local view only: matched on the iPhone) ----------
 function videosView() {
-  const goals = state.videos || [];
+  const groups = state.videos || [];
   return h('div', {},
     h('h1', {}, 'Videos'),
-    h('p', { class: 'muted small' }, 'Explanations for what your journal says you want to understand. Only the searches were sent to YouTube; the reasons were worked out on your iPhone.'),
-    goals.length ? goals.map(g => h('div', { class: 'card' },
+    h('p', { class: 'muted small' }, 'Recent videos from your channels, matched on your iPhone to the chapters of your book. Nothing about you was sent.'),
+    groups.length ? groups.map(g => h('div', { class: 'card' },
       h('h2', {}, g.label),
-      h('p', { class: 'muted small' }, g.why),
-      g.videos.length
-        ? h('div', { class: 'video-grid' }, g.videos.map(v => h('a', { class: 'video', href: 'https://www.youtube.com/watch?v=' + encodeURIComponent(v.id), target: '_blank', rel: 'noopener noreferrer' },
-            h('img', { src: 'https://i.ytimg.com/vi/' + encodeURIComponent(v.id) + '/hqdefault.jpg', alt: '', loading: 'lazy' }),
-            h('span', { class: 'v-title' }, v.title),
-            h('span', { class: 'muted small' }, [v.channel, v.duration].filter(Boolean).join(' · ')))))
-        : h('a', { href: 'https://www.youtube.com/results?search_query=' + encodeURIComponent(g.query), target: '_blank', rel: 'noopener noreferrer' }, 'Search “' + g.query + '” on YouTube')))
-      : h('p', { class: 'muted' }, 'No suggestions yet. Open Discover → Videos on your iPhone.'));
+      h('div', { class: 'video-grid' }, g.videos.map(v => h('a', { class: 'video', href: 'https://www.youtube.com/watch?v=' + encodeURIComponent(v.id), target: '_blank', rel: 'noopener noreferrer' },
+        h('img', { src: 'https://i.ytimg.com/vi/' + encodeURIComponent(v.id) + '/hqdefault.jpg', alt: '', loading: 'lazy' }),
+        h('span', { class: 'v-title' }, v.title),
+        h('span', { class: 'muted small' }, v.channel))))))
+      : h('p', { class: 'muted empty' }, 'No videos yet. Open Discover → Videos on your iPhone.'));
+}
+
+function readsView() {
+  const groups = state.reads || [];
+  // Only http(s) links are followed; anything else stays plain text.
+  const safe = url => /^https?:\/\//.test(url || '') ? url : null;
+  return h('div', {},
+    h('h1', {}, 'Reads'),
+    h('p', { class: 'muted small' }, 'Long essays from writers you chose, published on Nostr and matched on your iPhone to the chapters of your book.'),
+    groups.length ? groups.map(g => h('div', { class: 'card' },
+      h('h2', {}, g.label),
+      h('ul', { class: 'reads' }, g.articles.map(a => h('li', {},
+        safe(a.url) ? h('a', { class: 'read-title', href: safe(a.url), target: '_blank', rel: 'noopener noreferrer' }, a.title) : h('span', { class: 'read-title' }, a.title),
+        a.summary ? h('p', { class: 'muted' }, a.summary) : null,
+        h('span', { class: 'muted small' }, [a.author, a.minutes ? a.minutes + ' min read' : '', a.published ? dayLabel(a.published) : ''].filter(Boolean).join(' · ')))))))
+      : h('p', { class: 'muted empty' }, 'No essays yet. Open Discover → Reads on your iPhone.'));
 }
 
 // ---------- actions ----------
@@ -698,6 +759,14 @@ async function deleteSpace(space) {
   for (const i of state.items.filter(i => i.space_id === space.id)) await save('space_items', { ...i, deleted: true });
   go('#/');
 }
+
+// ---------- keyboard ----------
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.querySelector('.side.open')?.classList.remove('open');
+  if (!state.session || typing() || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === '/') { const box = document.querySelector('input.search'); if (box) { e.preventDefault(); box.focus(); } }
+  if (e.key === 'n') { e.preventDefault(); newJournal(); }
+});
 
 // ---------- start ----------
 (function start() {

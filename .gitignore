@@ -27,3 +27,7 @@ credentials.json
 
 # Worktrees
 .worktrees/
+
+# Local tooling for the website smoke test (tools/web-dev)
+node_modules/
+package-lock.json

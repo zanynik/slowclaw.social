@@ -102,6 +102,9 @@ struct RecordView: View {
                 Button("Keep recording", role: .cancel) {}
             }
             .interactiveDismissDisabled()
+            .sensoryFeedback(.start, trigger: recorder.isRecording) { _, recording in recording }
+            .sensoryFeedback(.selection, trigger: recorder.isPaused)
+            .sensoryFeedback(.success, trigger: saving) { _, saving in saving }
             .task {
                 guard !started else { return }
                 started = true

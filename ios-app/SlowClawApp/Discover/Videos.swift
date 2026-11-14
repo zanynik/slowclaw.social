@@ -180,14 +180,7 @@ final class VideoStore: ObservableObject {
         guard !all.isEmpty else { error = "Could not load videos. Check your connection and pull to refresh."; return }
         guard let vectors = await Embedder.vectors(for: all.map { $0.title + ". " + String($0.summary.prefix(300)) }) else { return }
 
-        let centroids = themes.map { Relevance.centroid($0.vectors) }
-        var best = [(theme: Int, score: Float)](repeating: (0, -1), count: all.count)
-        for (i, v) in vectors.enumerated() {
-            for (t, theme) in themes.enumerated() {
-                let s = Relevance.score(v, passages: theme.vectors, centroid: centroids[t])
-                if s > best[i].score { best[i] = (t, s) }
-            }
-        }
+        let best = Relevance.best(vectors, themes: themes)
         var next: [VideoItem] = []
         for (t, theme) in themes.enumerated() {
             let mine = all.indices.filter { best[$0].theme == t }
