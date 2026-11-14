@@ -3,12 +3,7 @@
 
 # Force LF for scripts and build-critical files
 *.sh text eol=lf
-*.zig text eol=lf
 *.swift text eol=lf
-*.h text eol=lf
-*.c text eol=lf
-*.cpp text eol=lf
-*.toml text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.json text eol=lf
@@ -32,8 +27,5 @@ ios-app/project.yml text eol=lf
 *.gz binary
 *.7z binary
 
-# Compiled artifacts
-*.so binary
-*.dll binary
-*.exe binary
-*.a binary
+# Bundled model (binary weights)
+*.weights binary

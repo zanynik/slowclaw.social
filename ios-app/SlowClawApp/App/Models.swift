@@ -136,17 +136,24 @@ extension Date {
         let cal = Calendar.current
         if cal.isDateInToday(self) { return "Today" }
         if cal.isDateInYesterday(self) { return "Yesterday" }
-        let f = DateFormatter()
-        f.dateFormat = cal.isDate(self, equalTo: Date(), toGranularity: .year) ? "EEEE, d MMM" : "d MMM yyyy"
-        return f.string(from: self)
+        let thisYear = cal.isDate(self, equalTo: Date(), toGranularity: .year)
+        return (thisYear ? Formatters.dayThisYear : Formatters.dayOtherYear).string(from: self)
     }
 
-    var timeLabel: String {
-        let f = DateFormatter()
-        f.timeStyle = .short
-        f.dateStyle = .none
-        return f.string(from: self)
-    }
+    var timeLabel: String { Formatters.time.string(from: self) }
+}
+
+/// Date formatters are costly to create and lists ask for them on every row.
+private enum Formatters {
+    static let dayThisYear: DateFormatter = {
+        let f = DateFormatter(); f.setLocalizedDateFormatFromTemplate("EEEEdMMM"); return f
+    }()
+    static let dayOtherYear: DateFormatter = {
+        let f = DateFormatter(); f.setLocalizedDateFormatFromTemplate("dMMMyyyy"); return f
+    }()
+    static let time: DateFormatter = {
+        let f = DateFormatter(); f.timeStyle = .short; f.dateStyle = .none; return f
+    }()
 }
 
 func newID(_ prefix: String) -> String {

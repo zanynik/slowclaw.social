@@ -9,12 +9,18 @@ struct JournalListView: View {
     @State private var search = ""
     @State private var showWriter = false
     @State private var showSettings = false
+    @State private var pendingDelete: Journal?
 
+    /// Matches titles, text and space names ("health" finds everything filed under Health).
     private var filtered: [Journal] {
         let all = store.visibleJournals
         let q = search.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return all }
-        return all.filter { $0.title.localizedCaseInsensitiveContains(q) || $0.body.localizedCaseInsensitiveContains(q) }
+        let spaces = Set(store.visibleSpaces.filter { $0.name.localizedCaseInsensitiveContains(q) }.map(\.id))
+        return all.filter { j in
+            j.title.localizedCaseInsensitiveContains(q) || j.body.localizedCaseInsensitiveContains(q)
+                || (j.spaceID.map { spaces.contains($0) } ?? false)
+        }
     }
 
     private struct DayGroup: Identifiable {
@@ -45,15 +51,18 @@ struct JournalListView: View {
                     ContentUnavailableView("Start journaling",
                                            systemImage: "mic",
                                            description: Text("Tap the red button and just talk. SlowClaw transcribes, tidies up and files it for you."))
+                } else if grouped.isEmpty {
+                    ContentUnavailableView.search(text: search)
                 }
                 ForEach(grouped) { group in
-                    let journals = group.journals
                     Section(group.id) {
-                        ForEach(journals) { j in
+                        ForEach(group.journals) { j in
                             NavigationLink(value: j.id) { JournalRow(journal: j) }
-                        }
-                        .onDelete { offsets in
-                            for i in offsets { store.deleteJournal(journals[i].id) }
+                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                    // Not a destructive role: the row must stay until the delete is confirmed.
+                                    Button("Delete", systemImage: "trash") { pendingDelete = j }.tint(.red)
+                                }
+                                .contextMenu { rowMenu(j) }
                         }
                     }
                 }
@@ -86,7 +95,35 @@ struct JournalListView: View {
                 .padding(.bottom, 12)
             }
             .sheet(isPresented: $showWriter) { WriteView() }
+            .sensoryFeedback(.impact, trigger: showRecorder) { _, opening in opening }
+            .confirmationDialog("Delete this entry?",
+                                isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
+                                titleVisibility: .visible, presenting: pendingDelete) { j in
+                Button("Delete entry", role: .destructive) { store.deleteJournal(j.id) }
+                Button("Keep", role: .cancel) {}
+            } message: { j in
+                Text(j.audioPath == nil ? "“\(j.displayTitle)” will be removed from this iPhone and from sync."
+                                        : "“\(j.displayTitle)” and its recording will be removed from this iPhone and from sync.")
+            }
         }
+    }
+
+    /// Long-press a row: file it, share it or delete it without opening it.
+    @ViewBuilder
+    private func rowMenu(_ j: Journal) -> some View {
+        if j.status == .ready {
+            Menu {
+                ForEach(store.visibleSpaces) { s in
+                    Button { store.moveJournal(j.id, toSpace: s.id) } label: {
+                        Label(s.name, systemImage: j.spaceID == s.id ? "checkmark" : s.icon)
+                    }
+                }
+            } label: { Label("Move to space", systemImage: "square.grid.2x2") }
+            ShareLink(item: [j.displayTitle, j.body].filter { !$0.isEmpty }.joined(separator: "\n\n")) {
+                Label("Share", systemImage: "square.and.arrow.up")
+            }
+        }
+        Button(role: .destructive) { pendingDelete = j } label: { Label("Delete", systemImage: "trash") }
     }
 }
 
@@ -135,8 +172,15 @@ struct WriteView: View {
             VStack(alignment: .leading, spacing: 8) {
                 TextField("Title (optional)", text: $title).font(.title3.weight(.semibold))
                 TextEditor(text: $text).focused($focused)
+                    .overlay(alignment: .topLeading) {
+                        if text.isEmpty {
+                            Text("What's on your mind?").foregroundStyle(.tertiary)
+                                .padding(.top, 8).padding(.leading, 5).allowsHitTesting(false)
+                        }
+                    }
             }
             .padding()
+            .interactiveDismissDisabled(!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .navigationTitle("New entry")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -162,6 +206,8 @@ struct JournalDetailView: View {
     @State private var showOriginal = false
     @State private var working = false
     @State private var continuing = false
+    @State private var confirmDelete = false
+    @FocusState private var typing: Bool
     @StateObject private var player = AudioPlayer()
 
     private var journal: Journal? { store.journal(journalID) }
@@ -173,21 +219,25 @@ struct JournalDetailView: View {
                     Section {
                         TextField("Title", text: $title, axis: .vertical)
                             .font(.title3.weight(.semibold))
+                            .focused($typing)
                         if j.status == .ready {
                             TextEditor(text: $bodyText)
                                 .frame(minHeight: 240)
+                                .focused($typing)
                         } else {
                             Label(j.status == .transcribing ? "Transcribing…" : "Cleaning up…", systemImage: "hourglass")
                                 .foregroundStyle(.secondary)
                         }
                     } footer: {
-                        Text(j.createdAt.formatted(date: .complete, time: .shortened))
+                        let words = BookEngine.wordCount(bodyText)
+                        Text(j.createdAt.formatted(date: .complete, time: .shortened)
+                             + (words > 0 ? " · \(words) \(words == 1 ? "word" : "words")" : ""))
                     }
 
                     Section {
                         Picker(selection: Binding(
                             get: { j.spaceID ?? "" },
-                            set: { newValue in moveToSpace(newValue.isEmpty ? nil : newValue) })) {
+                            set: { newValue in store.moveJournal(journalID, toSpace: newValue.isEmpty ? nil : newValue) })) {
                             Text("Unsorted").tag("")
                             ForEach(store.visibleSpaces) { s in
                                 Label(s.name, systemImage: s.icon).tag(s.id)
@@ -249,12 +299,25 @@ struct JournalDetailView: View {
                             }
                             ShareLink(item: shareText(j)) { Label("Share", systemImage: "square.and.arrow.up") }
                             Button(role: .destructive) {
-                                store.deleteJournal(journalID); dismiss()
+                                confirmDelete = true
                             } label: { Label("Delete", systemImage: "trash") }
                         } label: {
                             if working { ProgressView() } else { Image(systemName: "ellipsis.circle") }
                         }
+                        .accessibilityLabel("More")
                     }
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button("Done") { typing = false }
+                    }
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .confirmationDialog("Delete this entry?", isPresented: $confirmDelete, titleVisibility: .visible) {
+                    Button("Delete entry", role: .destructive) { store.deleteJournal(journalID); dismiss() }
+                    Button("Keep", role: .cancel) {}
+                } message: {
+                    Text(j.audioPath == nil ? "It will be removed from this iPhone and from sync."
+                                            : "The entry and its recording will be removed from this iPhone and from sync.")
                 }
                 .onAppear {
                     guard !loaded else { return }
@@ -283,14 +346,6 @@ struct JournalDetailView: View {
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if t != j.title || bodyText != j.body {
             store.updateJournal(journalID) { $0.title = t; $0.body = bodyText }
-        }
-    }
-
-    private func moveToSpace(_ id: String?) {
-        store.updateJournal(journalID) { $0.spaceID = id; $0.organized = true }
-        // Items extracted from this entry follow it.
-        if let id {
-            for item in store.items(fromJournal: journalID) { store.updateItem(item.id) { $0.spaceID = id } }
         }
     }
 
