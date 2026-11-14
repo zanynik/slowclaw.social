@@ -7,6 +7,7 @@ struct TodosView: View {
     @AppStorage("slowclaw.todos.last-space") private var targetSpaceID = ""
     @State private var newText = ""
     @FocusState private var addFocused: Bool
+    @State private var showDone = false
 
     private var openBySpace: [(Space, [SpaceItem])] {
         store.visibleSpaces.compactMap { space in
@@ -46,8 +47,9 @@ struct TodosView: View {
                 }
 
                 let groups = openBySpace
+                let doneToday = store.todosDoneToday
                 if groups.isEmpty {
-                    ContentUnavailableView("Nothing to do",
+                    ContentUnavailableView(doneToday.isEmpty ? "Nothing to do" : "All done",
                                            systemImage: "checkmark.circle",
                                            description: Text("To-dos you mention in a recording show up here, sorted by space."))
                 }
@@ -61,7 +63,17 @@ struct TodosView: View {
                         Label(space.name, systemImage: space.icon)
                     }
                 }
+                if !doneToday.isEmpty {
+                    // Checked something by mistake? It stays here for the day.
+                    Section {
+                        DisclosureGroup("Done today (\(doneToday.count))", isExpanded: $showDone) {
+                            ForEach(doneToday) { item in ItemRow(item: item) }
+                        }
+                    }
+                }
             }
+            .animation(.default, value: store.items)
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle("To-dos")
             .refreshable { await cloud.sync() }
         }

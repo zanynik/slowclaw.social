@@ -151,16 +151,6 @@ final class BookOrganizerTests: XCTestCase {
         XCTAssertEqual(k[1].first, "meditation")
     }
 
-    func testProjectionIsBoundedAndStable() {
-        let vs = [v(0), v(40), v(80), v(10, plane: 1), v(70, plane: 2)].map(BookEngine.normalized)
-        let first = BookEngine.project(vs)
-        let again = BookEngine.project(vs, previousAxes: first.axes)
-        for (a, b) in zip(first.points, again.points) {
-            XCTAssertTrue((0.049...0.951).contains(a.0) && (0.049...0.951).contains(a.1))
-            XCTAssertEqual(a.0, b.0, accuracy: 1e-6)
-        }
-    }
-
     func testOldBookNodesStillDecode() throws {
         let json = #"{"id":"n1","journalID":null,"text":"t","vectorData":"","language":"en","position":1,"chapter":0,"chapterTitle":"","x":0.5,"y":0.5,"createdAt":0,"updatedAt":0,"deleted":false,"dirty":false}"#
         let d = JSONDecoder(); d.dateDecodingStrategy = .secondsSince1970
@@ -274,5 +264,106 @@ final class LocalServerTests: XCTestCase {
         XCTAssertTrue(String(decoding: LocalServer.shared.handle(mode).body, as: UTF8.self).contains("local"))
         let escape = HTTPRequest(method: "GET", path: "/../Info.plist", query: [:], headers: [:], body: Data())
         XCTAssertEqual(LocalServer.shared.handle(escape).status, 404)
+    }
+}
+
+// MARK: - Reads (Nostr long-form)
+
+final class ReadsTests: XCTestCase {
+    private let pubkey = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+
+    /// The id relays and other clients compute for the same event (NIP-01 serialization).
+    func testEventIDMatchesOtherClients() {
+        let one = "0000000000000000000000000000000000000000000000000000000000000001"
+        let id = NostrIdentity.eventID(pubkey: one, createdAt: 1700000000, kind: 30023,
+                                       tags: [["d", "a/b"], ["title", "Ünï \"quoted\""]],
+                                       content: "Line one\nTab\there / slash \\ back — “curly” 日本")
+        XCTAssertEqual(Hex.string(id), "9396de54995037faa969ce45187466ee1dd2339ae1e763e120daa85cd6bd695b")
+    }
+
+    func testOnlyCorrectlySignedEventsAreValid() throws {
+        let secret: [UInt8] = Array(repeating: 0, count: 31) + [3]
+        let tags = [["d", "slow-essay"], ["title", "On going slowly"]]
+        let hash = NostrIdentity.eventID(pubkey: pubkey, createdAt: 1793800000, kind: 30023, tags: tags, content: "Body")
+        let sig = try NostrIdentity.sign(hash: hash, secret: secret)
+        let event = NostrEvent(id: Hex.string(hash), pubkey: pubkey, createdAt: 1793800000, kind: 30023, tags: tags, content: "Body", sig: sig)
+        XCTAssertTrue(event.isValid)
+        var edited = event
+        edited.content = "Other words"
+        XCTAssertFalse(edited.isValid)
+    }
+
+    func testParsesRelayEvent() {
+        let json: [String: Any] = ["id": "a", "pubkey": pubkey, "created_at": 1793800000, "kind": 30023,
+                                   "tags": [["d", "x"], ["title", "T"]], "content": "c", "sig": "s"]
+        let event = NostrEvent(json: json)
+        XCTAssertEqual(event?.tag("title"), "T")
+        XCTAssertNil(event?.tag("summary"))
+        XCTAssertNil(NostrEvent(json: ["id": "a"]))
+    }
+
+    func testLinksAndKeys() {
+        XCTAssertEqual(NostrLink.naddr(kind: 30023, pubkey: pubkey, identifier: "slow-essay"),
+                       "naddr1qq98xmr0wukk2umnv9usyg8exz9qryjccvgyjdz0shuf653fk5cus3vrd7vmppsp7yfmecpklypsgqqqw4rsyz883s")
+        let npub = "npub1lycg5qvjtrp3qjf5f7zl382j9x6nrjz9sdhenvyxq8c3808qxmus6gq266"
+        XCTAssertEqual(NostrLink.publicKey(from: " nostr:" + npub + " "), pubkey)
+        XCTAssertEqual(NostrLink.publicKey(from: pubkey.uppercased()), pubkey)
+        XCTAssertNil(NostrLink.publicKey(from: "npub1lycg5qvjtrp3qjf5f7zl382j9x6nrjz9sdhenvyxq8c3808qxmus6gq267"))
+        XCTAssertNil(NostrLink.publicKey(from: "example.com"))
+    }
+
+    func testEssayFromEvent() {
+        let body = "# Heading\n\n" + String(repeating: "A slow sentence about attention. ", count: 60)
+        func event(_ tags: [[String]], content: String = body, kind: Int = 30023) -> NostrEvent {
+            NostrEvent(id: "id", pubkey: pubkey, createdAt: 1793800000, kind: kind, tags: tags, content: content, sig: "sig")
+        }
+        let essay = ReadArticle(event: event([["d", "slow"], ["title", " On attention "], ["published_at", "1793000000"]]), author: "user_a")
+        XCTAssertEqual(essay?.title, "On attention")
+        XCTAssertEqual(essay?.id, pubkey + ":slow")
+        XCTAssertEqual(essay?.published, Date(timeIntervalSince1970: 1793000000))
+        XCTAssertEqual(essay?.summary.hasPrefix("A slow sentence about attention."), true)
+        XCTAssertEqual(essay?.link?.host, "njump.me")
+        XCTAssertNil(ReadArticle(event: event([["d", "slow"]]), author: "user_a"), "no title")
+        XCTAssertNil(ReadArticle(event: event([["d", "slow"], ["title", "T"]], content: "Too short."), author: "user_a"))
+        XCTAssertNil(ReadArticle(event: event([["d", "slow"], ["title", "T"]], kind: 1), author: "user_a"))
+    }
+
+    func testNewestProfileNameWins() {
+        func profile(_ content: String, at: Int) -> NostrEvent {
+            NostrEvent(id: "p\(at)", pubkey: pubkey, createdAt: at, kind: 0, tags: [], content: content, sig: "")
+        }
+        let name = ReadsStore.profileName([profile(#"{"name":"old"}"#, at: 1), profile(#"{"display_name":" New Name ","name":"n"}"#, at: 2)])
+        XCTAssertEqual(name, "New Name")
+        XCTAssertNil(ReadsStore.profileName([profile("not json", at: 3)]))
+    }
+
+    func testMarkdownBlocks() {
+        let md = """
+        # Title #
+        First line
+        continues here.
+
+        ![cover](https://example.com/a.png)
+        > quoted
+        > words
+        - one
+        2. two
+        ```
+        let x = 1
+        ```
+        ---
+        See nostr:npub1lycg5qvjtrp3qjf5f7zl382j9x6nrjz9sdhenvyxq8c3808qxmus6gq266 <br>today.
+        """
+        XCTAssertEqual(ArticleMarkdown.blocks(md), [
+            .heading(1, "Title"),
+            .paragraph("First line continues here."),
+            .quote("quoted words"),
+            .bullet("one"),
+            .numbered("2", "two"),
+            .code("let x = 1"),
+            .rule,
+            .paragraph("See npub1lycg5q… today."),
+        ])
+        XCTAssertEqual(ArticleMarkdown.plain("## H\n\nSome **bold** [link](https://example.com) text."), "Some bold link text.")
     }
 }

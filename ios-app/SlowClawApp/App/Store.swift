@@ -133,6 +133,13 @@ final class Store: ObservableObject {
         items.filter { $0.journalID == journalID && !$0.deleted }
     }
 
+    /// To-dos checked off today, so a slip of the thumb can be undone.
+    var todosDoneToday: [SpaceItem] {
+        items.filter { $0.kind == .todo && $0.done && !$0.deleted && space($0.spaceID) != nil
+            && Calendar.current.isDateInToday($0.updatedAt) }
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
     func openTodoCount(_ spaceID: String) -> Int {
         items.filter { $0.spaceID == spaceID && !$0.deleted && $0.kind == .todo && !$0.done }.count
     }
@@ -164,6 +171,13 @@ final class Store: ObservableObject {
         j.dirty = true
         journals[i] = j
         changed()
+    }
+
+    /// Files a journal under a space (nil = unsorted). Items taken from it follow.
+    func moveJournal(_ id: String, toSpace spaceID: String?) {
+        updateJournal(id) { $0.spaceID = spaceID; $0.organized = true }
+        guard let spaceID else { return }
+        for item in items(fromJournal: id) { updateItem(item.id) { $0.spaceID = spaceID } }
     }
 
     func deleteJournal(_ id: String) {

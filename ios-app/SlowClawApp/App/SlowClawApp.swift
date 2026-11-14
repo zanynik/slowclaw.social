@@ -10,6 +10,7 @@ struct SlowClawApp: App {
     @StateObject private var book = BookStore.shared
     @StateObject private var news = NewsStore.shared
     @StateObject private var videos = VideoStore.shared
+    @StateObject private var reads = ReadsStore.shared
     @StateObject private var local = LocalServer.shared
     @Environment(\.scenePhase) private var scenePhase
 
@@ -23,6 +24,7 @@ struct SlowClawApp: App {
                 .environmentObject(book)
                 .environmentObject(news)
                 .environmentObject(videos)
+                .environmentObject(reads)
                 .environmentObject(local)
                 .task {
                     LegacyImport.runIfNeeded(store: store)

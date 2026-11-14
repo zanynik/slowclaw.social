@@ -1,11 +1,11 @@
 import SwiftUI
 
 enum DiscoverSection: String, CaseIterable, Identifiable {
-    case news = "News", videos = "Videos"
+    case news = "News", videos = "Videos", reads = "Reads"
     var id: String { rawValue }
 }
 
-/// News and Videos share a tab; the switcher sits in the navigation bar.
+/// News, Videos and Reads share a tab; the switcher sits in the navigation bar.
 struct DiscoverView: View {
     @AppStorage("slowclaw.discover.section") private var section: DiscoverSection = .news
 
@@ -13,6 +13,7 @@ struct DiscoverView: View {
         switch section {
         case .news: NewsView(section: $section)
         case .videos: VideosView(section: $section)
+        case .reads: ReadsView(section: $section)
         }
     }
 }
@@ -24,7 +25,7 @@ struct DiscoverPicker: View {
             ForEach(DiscoverSection.allCases) { Text($0.rawValue).tag($0) }
         }
         .pickerStyle(.segmented)
-        .frame(width: 200)
+        .frame(width: 250)
     }
 }
 

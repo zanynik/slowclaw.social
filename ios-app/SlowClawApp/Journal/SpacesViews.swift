@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SpacesView: View {
     @EnvironmentObject private var store: Store
@@ -6,6 +7,7 @@ struct SpacesView: View {
     @EnvironmentObject private var cloud: CloudSync
     @State private var newSpaceName = ""
     @State private var showNewSpace = false
+    @State private var pendingDelete: Space?
 
     var body: some View {
         NavigationStack {
@@ -47,7 +49,7 @@ struct SpacesView: View {
                     .onMove { store.moveSpace(from: $0, to: $1) }
                     .onDelete { offsets in
                         let list = store.visibleSpaces
-                        for i in offsets { store.deleteSpace(list[i].id) }
+                        if let i = offsets.first, list.indices.contains(i) { pendingDelete = list[i] }
                     }
                 } footer: {
                     Text("New journals are filed into a space automatically. To-dos, ideas and questions from them collect here.")
@@ -71,6 +73,14 @@ struct SpacesView: View {
                     newSpaceName = ""
                 }
                 Button("Cancel", role: .cancel) { newSpaceName = "" }
+            }
+            .confirmationDialog("Delete this space?",
+                                isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
+                                titleVisibility: .visible, presenting: pendingDelete) { space in
+                Button("Delete “\(space.name)”", role: .destructive) { store.deleteSpace(space.id) }
+                Button("Keep", role: .cancel) {}
+            } message: { _ in
+                Text("Its journal entries are kept and become unsorted. Its to-dos, ideas, questions and notes are removed.")
             }
         }
     }
@@ -145,8 +155,10 @@ struct SpaceDetailView: View {
                         } label: { Label("Icon", systemImage: space.icon) }
                         Button { store.clearDone(in: spaceID) } label: { Label("Clear done to-dos", systemImage: "checkmark.circle.badge.xmark") }
                     } label: { Image(systemName: "ellipsis.circle") }
+                    .accessibilityLabel("More")
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
             .alert("Rename space", isPresented: $renaming) {
                 TextField("Name", text: $newName)
                 Button("Save") {
@@ -180,6 +192,7 @@ struct SpaceDetailView: View {
                     Button {
                         Task { await processor.refreshSummary(spaceID: spaceID) }
                     } label: { Image(systemName: "arrow.clockwise") }
+                    .accessibilityLabel("Refresh overview")
                     .disabled(processor.summarizing.contains(spaceID) || store.journals(in: spaceID).isEmpty)
                 }
             }
@@ -213,7 +226,7 @@ struct SpaceDetailView: View {
                 Button {
                     if adding == kind { commitAdd(kind) } else { adding = kind; newText = ""; addFocused = true }
                 } label: { Image(systemName: "plus") }
-                .accessibilityLabel("Add \(kind.singular)")
+                .accessibilityLabel("Add \(kind.singular.lowercased())")
             }
         }
     }
@@ -236,13 +249,16 @@ struct ItemRow: View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             if item.kind == .todo {
                 Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     store.updateItem(item.id) { $0.done.toggle() }
                 } label: {
                     Image(systemName: item.done ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(item.done ? Color.green : Color.secondary)
                         .font(.title3)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(item.done ? "Mark as not done" : "Mark as done")
             } else {
                 Image(systemName: item.kind.symbol).foregroundStyle(.secondary)
             }

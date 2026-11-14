@@ -1,0 +1,39 @@
+name: Website check
+
+# Pull requests that touch the website: syntax check, then click through it in a real browser
+# against the sample-data server (tools/web-dev). No secrets, nothing is deployed.
+
+on:
+    pull_request:
+        paths:
+            - "web/**"
+            - "tools/web-dev/**"
+            - ".github/workflows/web-check.yml"
+
+concurrency:
+    group: web-check-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+jobs:
+    smoke:
+        runs-on: ubuntu-24.04
+        timeout-minutes: 10
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Syntax check
+              run: |
+                  node --check web/app.js
+                  node --check tools/web-dev/server.mjs
+
+            - name: Install a browser
+              run: |
+                  npm install --no-save playwright@1.56.1
+                  npx playwright install --with-deps chromium
+
+            - name: Click through the website
+              run: node tools/web-dev/smoke.mjs

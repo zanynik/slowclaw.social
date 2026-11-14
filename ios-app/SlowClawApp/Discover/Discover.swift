@@ -1,7 +1,7 @@
 import Foundation
 import NaturalLanguage
 
-// Shared by News and Videos (prototyped on real journals with the same MiniLM; see docs/discover.md).
+// Shared by News, Videos and Reads (prototyped on real journals with the same MiniLM; see docs/discover.md).
 //
 // The book's chapters are the reader's themes. Each theme gets a few searches built from the
 // organisations, products and concepts it keeps naming (never people or places). Results from
@@ -86,6 +86,19 @@ enum Relevance {
         var m = [Float](repeating: 0, count: first.count)
         for v in vs { for i in m.indices { m[i] += v[i] } }
         return BookEngine.normalized(m)
+    }
+
+    /// For each result, the theme it fits best and how well.
+    static func best(_ vectors: [[Float]], themes: [BookStore.Theme]) -> [(theme: Int, score: Float)] {
+        let centroids = themes.map { centroid($0.vectors) }
+        return vectors.map { v in
+            var top: (theme: Int, score: Float) = (0, -1)
+            for (t, theme) in themes.enumerated() {
+                let s = score(v, passages: theme.vectors, centroid: centroids[t])
+                if s > top.score { top = (t, s) }
+            }
+            return top
+        }
     }
 
     /// Indices worth showing: above the bar, near the theme's best, at most `limit`.

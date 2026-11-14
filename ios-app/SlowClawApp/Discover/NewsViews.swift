@@ -31,7 +31,7 @@ struct NewsView: View {
                             .buttonStyle(.plain)
                     }
                     if !news.cards.isEmpty {
-                        Text("Only your topic searches were sent to Google News. Summaries were written on this iPhone.")
+                        Text("Only your topic searches were sent to Google News. Stories were ranked on this iPhone against what you wrote.")
                             .font(.caption2).foregroundStyle(.secondary).padding(.top, 8)
                     }
                 }
@@ -48,7 +48,7 @@ struct NewsView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showTopics = true } label: { Image(systemName: "slider.horizontal.3") }
-                        .accessibilityLabel("Topics")
+                        .accessibilityLabel("News topics")
                 }
             }
             .sheet(isPresented: $showTopics) { TopicsView() }

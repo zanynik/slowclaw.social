@@ -1,7 +1,7 @@
 # Prototype tools
 
 The book and Discover were tuned here, on the owner's real journals, with the **same MiniLM model the
-iPhone runs** (`minilm.py` mirrors `ios-app/SlowClawApp/MiniLM.swift`; `parity.py` checks it against the
+iPhone runs** (`minilm.py` mirrors `ios-app/SlowClawApp/Book/MiniLM.swift`; `parity.py` checks it against the
 official ONNX export, `export.py` writes the app's weights and the golden vectors its unit test uses).
 
 Journal data never goes into this repository. Export journals to a private file outside it (for
@@ -19,6 +19,7 @@ python3 tools/prototype/book_v3.py /private/journals.json ./minilm --cache=/tmp/
 python3 tools/prototype/queries_v3.py book_v3.json /private/journals.json /tmp/emb.pkl      # writes queries_v3.json
 python3 tools/prototype/pool_v3.py book_v3.json queries_v3.json ./minilm --source=news --min=0.48
 python3 tools/prototype/videos_v3.py book_v3.json ./minilm 0.45
+python3 tools/prototype/reads_v3.py book_v3.json ./minilm 0.45       # needs: pip install websockets
 ```
 
 Change a rule here first, read the output, then port it. See `docs/book.md` and `docs/discover.md`.

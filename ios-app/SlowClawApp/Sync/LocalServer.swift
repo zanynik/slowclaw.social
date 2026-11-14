@@ -258,8 +258,13 @@ final class LocalServer: ObservableObject {
                 "book_nodes": book,
                 "news": news,
                 "videos": Dictionary(grouping: VideoStore.shared.videos, by: \.theme).map { theme, vs -> [String: Any] in
-                    ["label": theme, "why": "Recent videos close to this chapter of your book.", "query": "",
-                     "videos": vs.map { ["id": $0.id, "title": $0.title, "channel": $0.channel, "duration": "", "published": ""] }]
+                    ["label": theme, "videos": vs.map { ["id": $0.id, "title": $0.title, "channel": $0.channel] }]
+                },
+                "reads": Dictionary(grouping: ReadsStore.shared.articles, by: \.theme).map { theme, list -> [String: Any] in
+                    ["label": theme,
+                     "articles": list.map { ["id": $0.id, "title": $0.title, "author": $0.author, "summary": $0.summary,
+                                             "minutes": $0.minutes, "published": CloudDates.format($0.published),
+                                             "url": $0.link?.absoluteString ?? ""] as [String: Any] }]
                 },
                 "device": UIDeviceName.current,
             ])

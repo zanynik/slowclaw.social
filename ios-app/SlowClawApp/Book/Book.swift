@@ -104,12 +104,6 @@ enum Embedder {
 }
 
 @Generable
-struct ChapterTitle {
-    @Guide(description: "A short, evocative chapter title of 2 to 5 words, in the language of the passages")
-    var title: String
-}
-
-@Generable
 struct CondensedPassage {
     @Guide(description: "The passage: 2 to 4 sentences in the speaker's first-person voice")
     var text: String
@@ -405,19 +399,6 @@ final class BookStore: ObservableObject {
         guard let t = r?.text.trimmingCharacters(in: .whitespacesAndNewlines), BookEngine.wordCount(t) >= 12,
               BookEngine.wordCount(t) <= 110 else { return nil }
         return t
-    }
-
-    static func chapterTitle(_ texts: [String]) async -> String {
-        if OnDeviceAI.isAvailable {
-            var context = ""
-            for t in texts where context.count < 2500 { context += "- " + String(t.prefix(300)) + "\n" }
-            if let r = try? await LanguageModelSession(instructions: "You title chapters of a personal book. Name the shared subject plainly.")
-                .respond(to: "Passages:\n" + context, generating: ChapterTitle.self).content {
-                let t = r.title.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"“”")))
-                if !t.isEmpty && t.count <= 60 { return t }
-            }
-        }
-        return BookEngine.keywordTitle(texts)
     }
 
     // MARK: - Themes for Discover

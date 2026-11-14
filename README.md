@@ -3,7 +3,8 @@
 Open the app, tap the red button, talk. SlowClaw transcribes on the iPhone, cleans the
 transcript up, and files the entry into a **space** (Work, Health, Ideas…) together with the
 **to-dos, ideas, questions and notes** it contains. The passages worth keeping grow into a
-**living book**, and a **news** tab follows the topics you write about. Everything syncs as text
+**living book**, and **Discover** brings news, videos and long essays for the themes you write
+about. Everything syncs as text
 to [slowclaw.social](https://slowclaw.social), or stays on your Wi-Fi with the local view.
 
 ## How it fits together
@@ -28,10 +29,10 @@ audio stays on the phone                      owner-only RLS                  st
 
 | Tab | What it does |
 | --- | --- |
-| Journal | All entries by day, search, big record button, write button. Tap an entry to edit it, move it to another space, replay its audio or see the original transcript. |
-| To-dos | Every open to-do from every space in one list. Check things off, or add one and pick its space. |
-| Book | A living book grown from your journal, in your own words: chapters by theme, a map of passages (the table of contents) and a reader. See below. |
-| Discover | **News** and **Videos** for the chapters of your book: results are scored on the phone against what you wrote and only close ones are shown. News searches are shown in Topics; videos come from public channel feeds you choose. Reading history included. See `docs/discover.md`. |
+| Journal | All entries by day, search (text, titles and space names), big record button, write button. Tap an entry to edit it, move it to another space, replay its audio or see the original transcript. Long-press an entry to file, share or delete it. |
+| To-dos | Every open to-do from every space in one list. Check things off (today's stay under "Done today" in case of a slip), or add one and pick its space. |
+| Book | A living book grown from your journal, in your own words: a table of contents of chapters by theme, and a reader. See below. |
+| Discover | **News**, **Videos** and **Reads** for the chapters of your book: results are scored on the phone against what you wrote and only close ones are shown. News searches are shown in Topics; videos come from public channel feeds you choose; reads are long essays published on Nostr by writers you choose, opened in a quiet in-app reader. See `docs/discover.md`. |
 | Spaces | Your areas of life. Each space has an on-device overview, to-dos (with checkboxes), ideas, questions, notes and its journal entries. "Organize unsorted" files older entries in one go. |
 | Settings (gear on Journal) | Sync (with this iPhone's key or email), sign a browser in by QR, the local view, Nostr identity backup, capture options, export. |
 
@@ -39,16 +40,18 @@ Say "Record a journal in SlowClaw" to Siri, or put the **Record journal** shortc
 Button or Lock Screen, to start recording without tapping through the app. Leaving a recording
 takes a confirmation once it is longer than a few seconds.
 
-The website has the same To-dos page, and journal edits there save automatically.
+The website has the same To-dos page, and journal edits there save automatically. Click any
+to-do, idea, question or note to edit it; checking off or removing one offers Undo. `/` jumps to
+search and `n` starts a new entry.
 
 ### The living book
 
 Your journals become a book of themes. A small sentence-embedding model bundled in the app
 (MiniLM, the same one used to tune this on real journals) splits each entry into topics, keeps the
 most substantial passage of each in your own words, drops repeats, groups passages into chapters by
-theme and orders each chapter by date. It appears right away; when the phone is idle Apple
-Intelligence titles the chapters and tidies each passage (keeping your words). Details in
-`docs/book.md`.
+theme and orders each chapter by date. Chapters are named after their own most distinctive
+phrases. It appears right away; when the phone is idle Apple Intelligence tidies each passage
+(keeping your words). Details in `docs/book.md`.
 
 Continue any entry with **Continue recording**: the new words are added to the same entry.
 
@@ -71,11 +74,14 @@ the old database and recordings are left in place).
 
 | Path | Contents |
 | --- | --- |
-| `ios-app/` | SwiftUI app. `project.yml` is the XcodeGen spec. One package: `libsecp256k1` for Nostr signatures. `Tests/` runs on the simulator in the PR check. |
+| `ios-app/` | SwiftUI app. `project.yml` is the XcodeGen spec. Sources are grouped by area under `SlowClawApp/` (`App`, `Capture`, `Journal`, `Book`, `Discover`, `Sync`; see `AGENTS.md`). One package: `libsecp256k1` for Nostr signatures. `Tests/` runs on the simulator in the PR check. |
 | `web/` | Static website (`index.html`, `app.js`, `style.css`). No build step. `mode.js` picks cloud or local; the app bundles this folder and serves it for the local view. |
+| `tools/web-dev/` | Work on the website without an iPhone: a sample-data server and a browser smoke test. |
+| `tools/prototype/` | Where book and Discover rules are tried on real journals before they are ported. |
+| `docs/` | How the book and Discover work and what was measured; the nightly agent's instructions. |
 | `supabase/migrations/` | Database history. `20261103094822_simple_journal_sync.sql` and `20261104090000_book_and_nostr_links.sql` define the current tables. |
 | `supabase/functions/` | `cloud-login` (Nostr-proof sign-in and key linking) and `cloud-qr` (two-minute relay for sealed browser sessions). |
-| `.github/workflows/` | `pub-testflight.yml` (PR compile check; TestFlight upload on `main`), `pages.yml` (website deploy). |
+| `.github/workflows/` | `pub-testflight.yml` (PR compile check and unit tests; TestFlight upload on `main`), `web-check.yml` (PR website smoke test), `pages.yml` (website deploy), `nightly-release.yml` (gate for `nightly/*` branches), `workflow-sanity.yml`. |
 
 ## Building
 
@@ -84,7 +90,14 @@ brew install xcodegen
 cd ios-app && xcodegen generate && open SlowClaw.xcodeproj
 ```
 
-Run the website locally with any static server, e.g. `cd web && python3 -m http.server`.
+Work on the website with sample data, no iPhone or account needed:
+
+```sh
+node tools/web-dev/server.mjs      # http://localhost:8787, local mode
+node tools/web-dev/smoke.mjs       # clicks through it in a browser (needs playwright)
+```
+
+For the cloud sign-in page, any static server works: `cd web && python3 -m http.server`.
 
 ## Releasing
 

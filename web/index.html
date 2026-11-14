@@ -5,11 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SlowClaw</title>
   <meta name="description" content="Your journals, organized into spaces with to-dos, ideas and questions.">
+  <meta name="theme-color" content="#faf8f5" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#161514" media="(prefers-color-scheme: dark)">
+  <meta name="referrer" content="no-referrer">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div id="app" aria-live="polite"></div>
+  <div id="app"></div>
+  <div id="status" class="status" role="status" aria-live="polite" hidden></div>
   <noscript>SlowClaw needs JavaScript.</noscript>
   <script src="mode.js"></script>
   <script src="vendor/qrcode.js"></script>

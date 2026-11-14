@@ -14,6 +14,8 @@ struct SettingsView: View {
     @State private var busy = false
     @State private var message: String?
     @State private var scanning = false
+    @State private var confirmSignOut = false
+    @State private var copied: String?
 
     var body: some View {
         NavigationStack {
@@ -38,7 +40,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Capture")
                 } footer: {
-                    Text(OnDeviceAI.unavailableReason ?? "Cleanup, organizing, the book and news summaries run on this iPhone with Apple Intelligence.")
+                    Text(OnDeviceAI.unavailableReason ?? "Cleanup, organizing and space overviews run on this iPhone with Apple Intelligence.")
                 }
 
                 Section("On this iPhone") {
@@ -83,7 +85,13 @@ struct SettingsView: View {
                     Text(status).font(.footnote).foregroundStyle(.orange)
                 }
                 Link("Open slowclaw.social", destination: URL(string: "https://slowclaw.social")!)
-                Button("Sign out", role: .destructive) { cloud.signOut() }
+                Button("Sign out", role: .destructive) { confirmSignOut = true }
+                    .confirmationDialog("Sign out of sync?", isPresented: $confirmSignOut, titleVisibility: .visible) {
+                        Button("Sign out", role: .destructive) { cloud.signOut() }
+                        Button("Stay signed in", role: .cancel) {}
+                    } message: {
+                        Text("Your journals stay on this iPhone. They stop syncing to slowclaw.social until you sign in again.")
+                    }
             } else {
                 Button {
                     run { try await cloud.signInWithKey() }
@@ -152,9 +160,13 @@ struct SettingsView: View {
                         HStack {
                             Text(url).font(.callout.monospaced()).textSelection(.enabled)
                             Spacer()
-                            Button { UIPasteboard.general.string = url } label: { Image(systemName: "doc.on.doc") }
+                            Button {
+                                UIPasteboard.general.string = url
+                                copied = url
+                            } label: { Image(systemName: copied == url ? "checkmark" : "doc.on.doc") }
                                 .buttonStyle(.borderless)
-                                .accessibilityLabel("Copy address")
+                                .accessibilityLabel(copied == url ? "Copied" : "Copy address")
+                                .sensoryFeedback(.success, trigger: copied)
                         }
                     }
                 } else if let error = local.error {
