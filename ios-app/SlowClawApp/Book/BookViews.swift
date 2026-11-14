@@ -15,7 +15,7 @@ struct BookView: View {
                 if chapters.isEmpty {
                     ContentUnavailableView("Your book is empty",
                                            systemImage: "book",
-                                           description: Text("As you journal, the passages worth keeping join a living book: grouped into chapters by theme, in the order you lived them."))
+                                           description: Text("As you journal, the passages worth keeping join a living book, arranged so that each one leads to the next."))
                 } else {
                     Section("Contents") {
                         ForEach(chapters) { c in
@@ -98,8 +98,8 @@ struct BookReaderView: View {
                         }
                         .padding(.top, 24)
                         .id("chapter-\(c.id)")
-                        ForEach(c.nodes) { n in
-                            PassageView(node: n).id(n.id)
+                        ForEach(Array(c.nodes.enumerated()), id: \.element.id) { index, n in
+                            PassageView(node: n, showSource: Self.endsRun(c.nodes, index)).id(n.id)
                         }
                     }
                 }
@@ -116,18 +116,28 @@ struct BookReaderView: View {
         .navigationTitle("Your book")
         .navigationBarTitleDisplayMode(.inline)
     }
+
+    /// Passages said in one sitting read as one stretch: the source is named once, after the last.
+    static func endsRun(_ nodes: [BookNode], _ index: Int) -> Bool {
+        guard index + 1 < nodes.count else { return true }
+        let next = nodes[index + 1]
+        return next.kind != .passage || next.journalID == nil || next.journalID != nodes[index].journalID
+    }
 }
 
 struct PassageView: View {
     @EnvironmentObject private var book: BookStore
     @EnvironmentObject private var store: Store
     let node: BookNode
+    var showSource = true
 
     var body: some View {
-        if node.kind != .passage {
-            // Lines written on the phone to carry the reader along: visibly not the author's own words.
+        if node.kind == .bridge {
+            gap
+        } else if node.kind != .passage {
+            // Lines from older versions: visibly not the author's own words.
             Text(node.text)
-                .font(.system(node.kind == .intro ? .callout : .footnote, design: .serif).italic())
+                .font(.system(.callout, design: .serif).italic())
                 .foregroundStyle(.secondary)
                 .padding(.leading, 12)
                 .overlay(alignment: .leading) { Rectangle().fill(Color.secondary.opacity(0.3)).frame(width: 2) }
@@ -137,13 +147,33 @@ struct PassageView: View {
         }
     }
 
+    /// Where the book jumps: an invitation to say the missing piece. One tap starts a recording.
+    private var gap: some View {
+        VStack(spacing: 6) {
+            Text("· · ·").font(.system(.title3, design: .serif)).foregroundStyle(.tertiary)
+            Text(node.text)
+                .font(.system(.footnote, design: .serif).italic())
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button {
+                RecordRequest.shared.pending = true
+            } label: {
+                Label("Record the missing piece", systemImage: "mic")
+            }
+            .font(.footnote)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .combine)
+    }
+
     private var passage: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(node.text)
                 .font(.system(.body, design: .serif))
                 .lineSpacing(4)
                 .textSelection(.enabled)
-            if let jid = node.journalID, let j = store.journal(jid), !j.deleted {
+            if showSource, let jid = node.journalID, let j = store.journal(jid), !j.deleted {
                 NavigationLink {
                     JournalDetailView(journalID: jid)
                 } label: {

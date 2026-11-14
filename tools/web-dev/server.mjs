@@ -39,6 +39,7 @@ const data = {
   book_nodes: [
     row({ id: 'node_1', journal_id: 'journal_1', kind: 'passage', text: 'The draft is the one I keep avoiding. Three things matter this week, and it is the only one that scares me.', position: 1, chapter: 0, chapter_title: 'Draft & Week' }, 0),
     row({ id: 'node_2', journal_id: 'journal_2', kind: 'passage', text: 'Slept badly, but the morning walk helped. I want to keep the walks even when it rains.', position: 2, chapter: 1, chapter_title: 'Morning walk' }, 0),
+    row({ id: 'gap_node_3', journal_id: null, kind: 'bridge', text: 'The book jumps here. What connects these two thoughts?', position: 2.5, chapter: 1, chapter_title: 'Morning walk' }, 0),
     row({ id: 'node_3', journal_id: 'journal_3', kind: 'passage', text: 'What if the reading group met every second week and each person brought one page they loved?', position: 3, chapter: 1, chapter_title: 'Morning walk' }, 1),
   ],
   news: [

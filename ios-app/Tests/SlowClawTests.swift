@@ -124,16 +124,102 @@ final class BookOrganizerTests: XCTestCase {
         XCTAssertFalse(p!.text.hasPrefix("And"))
     }
 
-    func testThemesSeparateAndReadByDate() {
+    // MARK: Arrangement (expected values come from tools/prototype/arrange.py on the same inputs)
+
+    private func costs(_ vectors: [[Float]]) -> BookOrganizer.Matrix {
+        let sim = BookOrganizer.similarityMatrix(vectors)
+        var cost = BookOrganizer.Matrix(n: vectors.count)
+        for a in vectors.indices {
+            for b in vectors.indices where a != b {
+                let s: Float = sim[a, b]
+                cost[a, b] = 1 - s
+            }
+        }
+        return cost
+    }
+
+    func testShortestPathPutsALineBackInOrder() {
+        let angles: [Double] = [0, 50, 10, 40, 20, 30, 60]
+        let line: [[Float]] = angles.map { v($0) }
+        let path: [Int] = BookOrganizer.shortestPath(costs(line))
+        XCTAssertTrue(path == [0, 2, 4, 5, 3, 1, 6] || path == [6, 1, 3, 5, 4, 2, 0], "\(path)")
+    }
+
+    func testShortestPathMatchesBruteForceAndRespectsTheBound() {
+        var points: [[Float]] = []
+        for i in 0..<7 {
+            var point: [Float] = []
+            for d in 0..<4 {
+                let angle: Double = Double(i) * Double(d + 2) * 1.3 + Double(d)
+                point.append(Float(sin(angle)))
+            }
+            points.append(BookEngine.normalized(point))
+        }
+        let cost = costs(points)
+        var best = Float.infinity
+        func permute(_ chosen: [Int], _ left: [Int]) {
+            if left.isEmpty { best = min(best, BookOrganizer.pathCost(chosen, cost)); return }
+            for (k, x) in left.enumerated() {
+                var rest = left
+                rest.remove(at: k)
+                permute(chosen + [x], rest)
+            }
+        }
+        permute([], Array(0..<7))
+        let path = BookOrganizer.shortestPath(cost)
+        XCTAssertEqual(Set(path), Set(0..<7))
+        XCTAssertEqual(BookOrganizer.pathCost(path, cost), best, accuracy: 1e-4)   // 3.6176; the next best path is 3.84
+        XCTAssertEqual(best, 3.6176, accuracy: 1e-3)
+        XCTAssertLessThanOrEqual(BookOrganizer.lowerBound(cost), best + 1e-4)     // 3.5351
+    }
+
+    func testChapterCutsAreTheBestAllowedOnes() {
+        var vectors: [[Float]] = []
+        for i in 0..<6 { vectors.append(v(Double(i) * 3)) }
+        for i in 0..<6 { vectors.append(v(Double(i) * 3, plane: 1)) }
+        let sim = BookOrganizer.similarityMatrix(vectors)
+        let order: [Int] = Array(0..<12)
+        let everywhere: Set<Int> = Set(1..<12)
+        let firstHalf: [Int] = Array(0..<6), secondHalf: [Int] = Array(6..<12)
+        XCTAssertEqual(BookOrganizer.cutChapters(order, sim, k: 2, allowed: everywhere, lo: 4, hi: 12), [firstHalf, secondHalf])
+        // The natural cut is not allowed: the best remaining one is used.
+        let fewCuts: Set<Int> = [5, 9]
+        let shortStart: [Int] = Array(0..<5), longEnd: [Int] = Array(5..<12)
+        XCTAssertEqual(BookOrganizer.cutChapters(order, sim, k: 2, allowed: fewCuts, lo: 4, hi: 12), [shortStart, longEnd])
+        // Three chapters are impossible with one allowed cut: as many as fit.
+        let oneCut: Set<Int> = [6]
+        XCTAssertEqual(BookOrganizer.cutChapters(order, sim, k: 3, allowed: oneCut, lo: 4, hi: 12), [firstHalf, secondHalf])
+    }
+
+    func testBookKeepsThemesApartAndSpokenThoughtsTogether() {
         var ps: [OrgPassage] = []
-        // Two themes written on alternating days; 8 passages → about √(8/2) = 2 chapters.
-        for i in 0..<4 { ps.append(OrgPassage(vector: v(Double(3 - i) * 3), day: 20260901 + i * 2, journal: "j\(i)", seq: 0)) }
-        for i in 0..<4 { ps.append(OrgPassage(vector: v(Double(i) * 3, plane: 2), day: 20260902 + i * 2, journal: "k\(i)", seq: 0)) }
+        for i in 0..<4 { ps.append(OrgPassage(vector: v(Double(3 - i) * 3), day: 20260901 + i, journal: "j\(i)", seq: 0)) }
+        for i in 0..<4 { ps.append(OrgPassage(vector: v(Double(i) * 3, plane: 2), day: 20260902 + i, journal: "k\(i)", seq: 0)) }
+        // Passage 3 was said right after passage 0, in the same sitting.
+        ps[0].journal = "a"; ps[3].journal = "a"; ps[3].seq = 1
         let chapters = BookOrganizer.organize(ps)
-        XCTAssertEqual(chapters.count, 2)
-        XCTAssertEqual(chapters[0], Array(0..<4))      // the theme that began first, in date order
-        XCTAssertEqual(Set(chapters[1]), Set(4..<8))
-        XCTAssertEqual(BookOrganizer.organize(ps), chapters)   // same book, same chapters
+        let found: Set<Set<Int>> = Set(chapters.map { Set($0) })
+        let expected: Set<Set<Int>> = [Set(0..<4), Set(4..<8)]
+        XCTAssertEqual(found, expected)
+        let order: [Int] = chapters.flatMap { $0 }
+        let first: Int = order.firstIndex(of: 0) ?? -1
+        let second: Int = order.firstIndex(of: 3) ?? -1
+        XCTAssertEqual(second, first + 1)
+        XCTAssertEqual(BookOrganizer.organize(ps), chapters)   // same passages, same book
+    }
+
+    func testGapsAreJumpsThatWereNotSpokenThrough() {
+        let angles: [Double] = [0, 2, 4, 6, 8, 88, 90, 92, 94, 96]
+        var ps: [OrgPassage] = []
+        for (i, angle) in angles.enumerated() { ps.append(OrgPassage(vector: v(angle), day: 20260901, journal: "j\(i)", seq: 0)) }
+        let all: [Int] = Array(0..<10)
+        let found = BookOrganizer.gaps([all], ps)
+        XCTAssertEqual(found.count, 1)
+        XCTAssertEqual(found.first?.before, 4)
+        XCTAssertEqual(found.first?.after, 5)
+        // The same jump inside one sitting is how the thought was spoken: not a gap.
+        ps[4].journal = "a"; ps[5].journal = "a"; ps[5].seq = 1
+        XCTAssertTrue(BookOrganizer.gaps([all], ps).isEmpty)
     }
 
     func testLonersWait() {

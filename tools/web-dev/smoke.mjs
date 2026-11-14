@@ -87,6 +87,10 @@ try {
     check(name + ' page', true);
   }
 
+  await nav('Book');
+  await page.waitForSelector('.chapter .passage');
+  check('book marks a gap, between passages', (await page.locator('.chapter .book-line.bridge + .passage').count()) === 1);
+
   await page.setViewportSize({ width: 390, height: 780 });
   await page.click('.menu-btn');
   check('phone: menu opens', await page.locator('.side.open').isVisible());

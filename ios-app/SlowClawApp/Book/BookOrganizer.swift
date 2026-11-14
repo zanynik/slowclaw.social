@@ -1,11 +1,11 @@
 import Foundation
 
-// Book v3 rules, ported from the Python prototype that was tuned on real journals with the
+// The book's rules, ported from the Python prototypes that were tuned on real journals with the
 // same MiniLM vectors (see docs/book.md). No language model is needed to build the book:
 //
 //   journal → sentences → topic segments (where meaning turns) → the most central 3–5
-//   sentences of each substantial segment → drop repeats → themes (spherical k-means,
-//   about √(n/2)) → chapters in order of closeness, passages in date order.
+//   sentences of each substantial segment → drop repeats → one reading path through every
+//   passage (neighbours alike, spoken continuations together) → cut into about √(n/2) chapters.
 
 struct OrgPassage {
     var vector: [Float]
@@ -167,77 +167,271 @@ enum BookOrganizer {
         return found.sorted { $0.sub > $1.sub }.prefix(budget).sorted { $0.start < $1.start }.map { ($0.text, $0.start, $0.range) }
     }
 
-    // MARK: - Themes
+    // MARK: - Arrangement (v4): one reading path, then the best cuts
+    //
+    // Mirrors tools/prototype/arrange.py line by line (see docs/book.md for what was measured).
+    // The book is one path through every passage that keeps neighbours as alike as possible and
+    // keeps a thought next to the one spoken right after it; chapters are the best places to cut
+    // that path. The path is found by local search and can be checked against a lower bound; the
+    // cuts are exactly optimal for the path.
 
-    /// Spherical k-means with k-means++ starts (fixed seeds, so the same book gives the same chapters).
-    static func themes(_ vectors: [[Float]], k: Int, restarts: Int = 8, iterations: Int = 40) -> [[Int]] {
-        let n = vectors.count
-        guard n > 0 else { return [] }
-        let k = max(1, min(k, n))
-        var best: (score: Float, labels: [Int])?
-        for r in 0..<restarts {
-            var rng = SeededRandom(seed: UInt64(r + 1))
-            var centers = [vectors[Int(rng.next() % UInt64(n))]]
-            while centers.count < k {
-                let d = vectors.map { v in max(0, 1 - centers.map { BookEngine.similarity(v, $0) }.max()!) }
-                let weights = d.map { $0 * $0 }
-                let total = weights.reduce(0, +)
-                if total <= 0 { centers.append(vectors[Int(rng.next() % UInt64(n))]); continue }
-                var pick = Float(Double(rng.next() % 1_000_000) / 1_000_000) * total
-                var chosen = n - 1
-                for (i, wgt) in weights.enumerated() { pick -= wgt; if pick <= 0 { chosen = i; break } }
-                centers.append(vectors[chosen])
+    /// What "this was said right after that" is worth, in similarity units.
+    static let spokenBonus: Float = 0.15
+    static let minChapter = 4
+
+    /// A square matrix stored row by row.
+    struct Matrix {
+        let n: Int
+        var values: [Float]
+        init(n: Int) { self.n = n; values = [Float](repeating: 0, count: n * n) }
+        subscript(a: Int, b: Int) -> Float {
+            get { values[a * n + b] }
+            set { values[a * n + b] = newValue }
+        }
+    }
+
+    static func similarityMatrix(_ vectors: [[Float]]) -> Matrix {
+        var m = Matrix(n: vectors.count)
+        for a in vectors.indices {
+            m[a, a] = 1
+            for b in vectors.indices where b > a {
+                let s = BookEngine.similarity(vectors[a], vectors[b])
+                m[a, b] = s; m[b, a] = s
             }
-            var labels = [Int](repeating: 0, count: n)
-            for _ in 0..<iterations {
-                let newLabels = vectors.map { v in centers.indices.max { BookEngine.similarity(v, centers[$0]) < BookEngine.similarity(v, centers[$1]) }! }
-                if newLabels == labels && centers.count == k { labels = newLabels; break }
-                labels = newLabels
-                for c in centers.indices {
-                    let members = vectors.indices.filter { labels[$0] == c }
-                    if !members.isEmpty { centers[c] = mean(ArraySlice(members.map { vectors[$0] })) }
+        }
+        return m
+    }
+
+    static func pathCost(_ order: [Int], _ cost: Matrix) -> Float {
+        var total: Float = 0
+        for (a, b) in zip(order, order.dropFirst()) { total += cost[a, b] }
+        return total
+    }
+
+    /// Weight of the minimum spanning tree: no path through all points can be shorter.
+    static func lowerBound(_ cost: Matrix) -> Float {
+        let n = cost.n
+        guard n >= 2 else { return 0 }
+        var done = [Bool](repeating: false, count: n)
+        var dist = (0..<n).map { cost[0, $0] }
+        done[0] = true
+        var total: Float = 0
+        for _ in 1..<n {
+            var j = -1
+            for x in 0..<n where !done[x] && (j < 0 || dist[x] < dist[j]) { j = x }
+            total += dist[j]; done[j] = true
+            for x in 0..<n where !done[x] && cost[j, x] < dist[x] { dist[x] = cost[j, x] }
+        }
+        return total
+    }
+
+    /// Local search on a tour whose first stop is a dummy at distance 0 from everything (so the
+    /// tour is really an open path). Reverses stretches (symmetric costs only) and relocates runs
+    /// of one to three stops, until no move shortens it.
+    private static func improve(_ start: [Int], _ x: Matrix, symmetric: Bool) -> [Int] {
+        var o = start
+        let count = o.count
+        var improved = true
+        while improved {
+            improved = false
+            if symmetric {
+                for i in 0..<(count - 1) {
+                    var j = i + 2
+                    while j < count {
+                        let a = o[i], b = o[i + 1], c = o[j], d = o[(j + 1) % count]
+                        if x[a, c] + x[b, d] - x[a, b] - x[c, d] < -1e-5 {
+                            o[(i + 1)...j].reverse()
+                            improved = true
+                        }
+                        j += 1
+                    }
                 }
             }
-            let score = vectors.indices.reduce(Float(0)) { $0 + BookEngine.similarity(vectors[$1], centers[labels[$1]]) }
-            if best == nil || score > best!.score { best = (score, labels) }
+            for length in 1...3 {
+                var i = 1
+                while i + length <= count {
+                    let p = o[i - 1], s0 = o[i], s1 = o[i + length - 1], q = o[(i + length) % count]
+                    let gain = x[p, s0] + x[s1, q] - x[p, q]
+                    var best = gain - 1e-5
+                    var at = -1
+                    var flip = false
+                    for k in 0..<count where k < i - 1 || k > i + length - 1 {
+                        let a = o[k], b = o[(k + 1) % count]
+                        let forward = x[a, s0] + x[s1, b] - x[a, b]
+                        if forward < best { best = forward; at = k; flip = false }
+                        if symmetric {
+                            let backward = x[a, s1] + x[s0, b] - x[a, b]
+                            if backward < best { best = backward; at = k; flip = true }
+                        }
+                    }
+                    if at >= 0 {
+                        var segment = Array(o[i..<(i + length)])
+                        if flip { segment.reverse() }
+                        let anchor = o[at]
+                        o.removeSubrange(i..<(i + length))
+                        let k = o.firstIndex(of: anchor) ?? 0
+                        o.insert(contentsOf: segment, at: k + 1)
+                        improved = true
+                    } else {
+                        i += 1
+                    }
+                }
+            }
         }
-        var groups = (0..<k).map { c in best!.labels.indices.filter { best!.labels[$0] == c } }.filter { !$0.isEmpty }
-        // Fold themes of one or two passages into their closest theme.
-        let small = groups.filter { $0.count < 3 }
-        groups = groups.filter { $0.count >= 3 }
-        if groups.isEmpty { return [Array(0..<n)] }
-        for g in small { for i in g {
-            let target = groups.indices.max { avgSim(i, groups[$0], vectors) < avgSim(i, groups[$1], vectors) }!
-            groups[target].append(i)
-        } }
-        return groups
+        return o
     }
 
-    private static func avgSim(_ i: Int, _ group: [Int], _ vs: [[Float]]) -> Float {
-        group.reduce(0) { $0 + BookEngine.similarity(vs[i], vs[$1]) } / Float(max(1, group.count))
+    /// `cost` with one more row and column of zeros: the dummy stop that opens the tour into a path.
+    private static func withDummy(_ cost: Matrix) -> Matrix {
+        let n = cost.n
+        var x = Matrix(n: n + 1)
+        for a in 0..<n { for b in 0..<n { x[a, b] = cost[a, b] } }
+        return x
     }
 
-    /// Chapters as lists of passage indices, in reading order: the theme that began earliest
-    /// first, then the closest remaining theme; inside a chapter, by date.
+    /// Order of all rows of the symmetric `cost` that makes neighbours as close as possible.
+    static func shortestPath(_ cost: Matrix, starts: Int = 4) -> [Int] {
+        let n = cost.n
+        guard n > 2 else { return Array(0..<n) }
+        let x = withDummy(cost)
+        var best: [Int] = []
+        var bestCost = Float.infinity
+        let tries = min(starts, n)
+        for t in 0..<tries {
+            let s = t * (n - 1) / max(1, tries - 1)
+            var o = [n, s]
+            var left = Array(0..<n)
+            left.remove(at: s)
+            while !left.isEmpty {
+                let last = o[o.count - 1]
+                var pick = 0
+                for k in left.indices where x[last, left[k]] < x[last, left[pick]] { pick = k }
+                o.append(left.remove(at: pick))
+            }
+            o = improve(o, x, symmetric: true)
+            let path = Array(o.dropFirst())
+            let c = pathCost(path, cost)
+            if c < bestCost - 1e-5 { best = path; bestCost = c }
+        }
+        return best
+    }
+
+    /// The same search for costs that depend on direction: runs are relocated, never reversed.
+    static func directedRefine(_ order: [Int], _ cost: Matrix) -> [Int] {
+        let n = cost.n
+        guard n > 2, order.count == n else { return order }
+        return Array(improve([n] + order, withDummy(cost), symmetric: false).dropFirst())
+    }
+
+    /// Exact best split of `order` into at most `k` chapters of `lo...hi` passages, cutting only
+    /// before the positions in `allowed`. Maximises, summed over chapters, the pairwise similarity
+    /// inside a chapter divided by its size (dynamic programming over prefix sums).
+    static func cutChapters(_ order: [Int], _ sim: Matrix, k: Int, allowed: Set<Int>, lo: Int, hi: Int) -> [[Int]] {
+        let m = order.count
+        guard m > 0 else { return [] }
+        let w = m + 1
+        var p = [Double](repeating: 0, count: w * w)
+        for a in 0..<m {
+            var row = 0.0
+            for b in 0..<m {
+                row += Double(sim[order[a], order[b]])
+                p[(a + 1) * w + b + 1] = p[a * w + b + 1] + row
+            }
+        }
+        func score(_ a: Int, _ b: Int) -> Double {
+            (p[b * w + b] - p[a * w + b] - p[b * w + a] + p[a * w + a]) / Double(b - a)
+        }
+        let points = [0] + (1..<m).filter { allowed.contains($0) } + [m]
+        let none = -Double.infinity
+        var best = [[Double]](repeating: [Double](repeating: none, count: points.count), count: k + 1)
+        var arg = [[Int]](repeating: [Int](repeating: 0, count: points.count), count: k + 1)
+        best[0][0] = 0
+        if k >= 1 {
+            for q in 1...k {
+                for bi in 1..<points.count {
+                    for ai in 0..<bi {
+                        let size = points[bi] - points[ai]
+                        guard size >= lo, size <= hi, best[q - 1][ai] > none else { continue }
+                        let v = best[q - 1][ai] + score(points[ai], points[bi])
+                        if v > best[q][bi] { best[q][bi] = v; arg[q][bi] = ai }
+                    }
+                }
+            }
+        }
+        var q = k
+        while q > 0 && best[q][points.count - 1] == none { q -= 1 }
+        guard q > 0 else { return [order] }
+        var out: [[Int]] = []
+        var bi = points.count - 1
+        while q > 0 {
+            let ai = arg[q][bi]
+            out.append(Array(order[points[ai]..<points[bi]]))
+            bi = ai
+            q -= 1
+        }
+        return out.reversed()
+    }
+
+    /// Pairs "a then b" (as `a * count + b`) where passage b was said right after passage a.
+    static func spokenNext(_ passages: [OrgPassage]) -> Set<Int> {
+        let n = passages.count
+        var bySitting: [String: [Int]] = [:]
+        for (i, p) in passages.enumerated() { bySitting[p.journal, default: []].append(i) }
+        var pairs = Set<Int>()
+        for ids in bySitting.values {
+            let sorted = ids.sorted { passages[$0].seq == passages[$1].seq ? $0 < $1 : passages[$0].seq < passages[$1].seq }
+            for (a, b) in zip(sorted, sorted.dropFirst()) { pairs.insert(a * n + b) }
+        }
+        return pairs
+    }
+
+    /// Chapters as lists of passage indices, in reading order.
     static func organize(_ passages: [OrgPassage]) -> [[Int]] {
         let n = passages.count
         guard n > 0 else { return [] }
-        let vectors = passages.map(\.vector)
-        let k = max(1, min(14, Int((Double(n) / 2).squareRoot().rounded())))
-        let groups = n < 6 ? [Array(0..<n)] : themes(vectors, k: k)
-        let centroids = groups.map { mean(ArraySlice($0.map { vectors[$0] })) }
-        func earliest(_ g: [Int]) -> Int { g.map { passages[$0].day }.min() ?? 0 }
-        var order = [groups.indices.min { earliest(groups[$0]) < earliest(groups[$1]) }!]
-        var left = Set(groups.indices).subtracting(order)
-        while !left.isEmpty {
-            let last = centroids[order.last!]
-            let next = left.max { BookEngine.similarity(last, centroids[$0]) < BookEngine.similarity(last, centroids[$1]) }!
-            order.append(next); left.remove(next)
+        guard n >= 6 else {
+            // Too few to arrange: one chapter, as it was lived.
+            return [passages.indices.sorted { a, b in
+                let pa = passages[a], pb = passages[b]
+                return pa.day == pb.day ? (pa.journal == pb.journal ? pa.seq < pb.seq : pa.journal < pb.journal) : pa.day < pb.day
+            }]
         }
-        return order.map { groups[$0].sorted { a, b in
-            let pa = passages[a], pb = passages[b]
-            return pa.day == pb.day ? (pa.journal == pb.journal ? pa.seq < pb.seq : pa.journal < pb.journal) : pa.day < pb.day
-        } }
+        let sim = similarityMatrix(passages.map(\.vector))
+        let next = spokenNext(passages)
+        var symmetric = Matrix(n: n), directed = Matrix(n: n)
+        for a in 0..<n {
+            for b in 0..<n where a != b {
+                let forward = next.contains(a * n + b)
+                symmetric[a, b] = 1 - sim[a, b] + (forward || next.contains(b * n + a) ? 0 : spokenBonus)
+                directed[a, b] = 1 - sim[a, b] - (forward ? spokenBonus : 0)
+            }
+        }
+        let path = shortestPath(symmetric)
+        let forward = directedRefine(path, directed), backward = directedRefine(path.reversed(), directed)
+        let order = pathCost(backward, directed) < pathCost(forward, directed) - 1e-5 ? backward : forward
+        // A chapter never breaks between a thought and the one spoken right after it.
+        let allowed = Set((1..<n).filter { !next.contains(order[$0 - 1] * n + order[$0]) })
+        let k = max(1, min(14, Int((Double(n) / 2).squareRoot().rounded())))
+        let hi = max(3 * minChapter, Int((2 * Double(n) / Double(k)).rounded(.up)))
+        return cutChapters(order, sim, k: k, allowed: allowed, lo: minChapter, hi: hi)
+    }
+
+    /// Joins where the book jumps: far below the book's usual closeness, and not a spoken
+    /// continuation. Each is a pair of neighbouring passage indices.
+    static func gaps(_ chapters: [[Int]], _ passages: [OrgPassage]) -> [(before: Int, after: Int)] {
+        let n = passages.count
+        let next = spokenNext(passages)
+        var joins: [(before: Int, after: Int, sim: Float)] = []
+        for chapter in chapters {
+            for (a, b) in zip(chapter, chapter.dropFirst()) {
+                joins.append((a, b, BookEngine.similarity(passages[a].vector, passages[b].vector)))
+            }
+        }
+        guard joins.count >= 8 else { return [] }
+        let mean = joins.reduce(Float(0)) { $0 + $1.sim } / Float(joins.count)
+        let variance = joins.reduce(Float(0)) { $0 + ($1.sim - mean) * ($1.sim - mean) } / Float(joins.count)
+        let bar = min(0.25, mean - 1.5 * variance.squareRoot())
+        return joins.filter { $0.sim < bar && !next.contains($0.before * n + $0.after) }.map { (before: $0.before, after: $0.after) }
     }
 
     /// Loners: passages whose nearest neighbour is further than almost every other passage's.
@@ -282,18 +476,5 @@ enum BookOrganizer {
             }
             return out
         }
-    }
-}
-
-/// Small deterministic generator (SplitMix64) so chapters do not change between launches.
-struct SeededRandom {
-    private var state: UInt64
-    init(seed: UInt64) { state = seed }
-    mutating func next() -> UInt64 {
-        state &+= 0x9E3779B97F4A7C15
-        var z = state
-        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
-        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
-        return z ^ (z >> 31)
     }
 }
