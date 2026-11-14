@@ -659,12 +659,12 @@ function bookChapters() {
 function bookView() {
   const { path, chapters } = bookChapters();
   if (!path.length) return h('div', {}, h('h1', {}, 'Book'),
-    h('p', { class: 'muted empty' }, 'Your book grows on your iPhone as you journal: the passages worth keeping, grouped into chapters by theme.'));
+    h('p', { class: 'muted empty' }, 'Your book grows on your iPhone as you journal: the passages worth keeping, arranged so that each one leads to the next.'));
   const jump = id => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   const journal = id => state.journals.find(j => j.id === id);
   return h('div', { class: 'book' },
     h('h1', {}, 'Book'),
-    h('p', { class: 'muted small' }, `${path.length} passages in ${chapters.length} chapters: grouped by theme on your iPhone, in the order you lived them.`),
+    h('p', { class: 'muted small' }, `${path.length} passages in ${chapters.length} chapters, arranged on your iPhone so that each passage leads to the next.`),
     h('div', { class: 'card' }, h('h2', {}, 'Contents'),
       h('ol', { class: 'toc' }, chapters.map(c => h('li', {},
         h('button', { class: 'link', onclick: () => jump('c-' + c.id) },
@@ -673,11 +673,14 @@ function bookView() {
     chapters.map(c => h('section', { class: 'chapter', id: 'c-' + c.id },
       h('div', { class: 'muted small caps' }, 'Chapter ' + (c.id + 1)),
       h('h2', {}, c.title || 'Untitled'),
-      c.nodes.map(n => {
-        // Lines written on the phone to connect passages: shown as such, never as the author's words.
-        if (!isPassage(n)) return h('p', { class: 'book-line ' + n.kind, title: 'Connecting line written on the iPhone' }, n.text);
-        const j = n.journal_id && journal(n.journal_id);
-        return h('div', { class: 'passage', id: 'p-' + n.id },
+      c.nodes.map((n, i) => {
+        // A gap marker from the iPhone: the book jumps here. Never shown as the author's words.
+        if (!isPassage(n)) return h('p', { class: 'book-line ' + n.kind }, n.text);
+        // Passages said in one sitting read as one stretch: the source is named once, after the last.
+        const next = c.nodes[i + 1];
+        const endsRun = !next || !isPassage(next) || next.journal_id !== n.journal_id;
+        const j = endsRun && n.journal_id && journal(n.journal_id);
+        return h('div', { class: 'passage' + (endsRun ? '' : ' run'), id: 'p-' + n.id },
           h('p', {}, n.text),
           j ? h('button', { class: 'link small', onclick: () => go('#/journal/' + encodeURIComponent(j.id)) },
             'From “' + journalTitle(j) + '”, ' + dayLabel(j.created_at)) : null);

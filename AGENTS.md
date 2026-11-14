@@ -35,7 +35,8 @@ Read `README.md` first.
     `RecordingSilence.swift` — change with care.
   - `Journal/` — `JournalViews.swift`, `TodosView.swift`, `SpacesViews.swift`.
   - `Book/` — `MiniLM.swift` (sentence embeddings, same model as the prototype),
-    `BookOrganizer.swift` (pure rules: segments, passages, repeats, themes, order, keyphrases),
+    `BookOrganizer.swift` (pure rules: segments, passages, repeats, the reading path and chapter
+    cuts, gaps, keyphrases; the arrangement mirrors `tools/prototype/arrange.py` line by line),
     `BookEngine.swift` (vectors, words), `Book.swift` (store, layout, background polish, sync
     rows), `BookViews.swift`. See `docs/book.md`.
   - `Discover/` — `Discover.swift` (theme searches, relevance), `News.swift` (Google News RSS,

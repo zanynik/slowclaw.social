@@ -48,8 +48,10 @@ search and `n` starts a new entry.
 
 Your journals become a book of themes. A small sentence-embedding model bundled in the app
 (MiniLM, the same one used to tune this on real journals) splits each entry into topics, keeps the
-most substantial passage of each in your own words, drops repeats, groups passages into chapters by
-theme and orders each chapter by date. Chapters are named after their own most distinctive
+most substantial passage of each in your own words, drops repeats, and lays them out as one
+reading path in which each passage leads to the next and thoughts said back to back stay together;
+chapters are the best places to cut that path. Where the book jumps, a quiet marker invites you to
+record the missing piece. Chapters are named after their own most distinctive
 phrases. It appears right away; when the phone is idle Apple Intelligence tidies each passage
 (keeping your words). Details in `docs/book.md`.
 

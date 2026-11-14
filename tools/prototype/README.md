@@ -16,6 +16,9 @@ python3 -m venv /tmp/proto && /tmp/proto/bin/pip install numpy onnxruntime token
 # model files: config.json, vocab.txt, tokenizer.json, model.safetensors, model.onnx from
 # huggingface.co/sentence-transformers/all-MiniLM-L6-v2 into ./minilm
 python3 tools/prototype/book_v3.py /private/journals.json ./minilm --cache=/tmp/emb.pkl      # writes book_v3.json
+python3 tools/prototype/arrange.py                                                          # self-check of the path solver
+python3 tools/prototype/book_v4.py book_v3.json [--print]                                   # v3 vs v4 arrangement, writes book_v4.json
+python3 tools/prototype/reassemble.py essays.json ./minilm                                  # shuffled real essays, known truth
 python3 tools/prototype/queries_v3.py book_v3.json /private/journals.json /tmp/emb.pkl      # writes queries_v3.json
 python3 tools/prototype/pool_v3.py book_v3.json queries_v3.json ./minilm --source=news --min=0.48
 python3 tools/prototype/videos_v3.py book_v3.json ./minilm 0.45

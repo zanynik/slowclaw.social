@@ -4,7 +4,8 @@ import FoundationModels
 enum BookNodeKind: String, Codable {
     /// The author's words (cleaned, later condensed on the phone).
     case passage
-    /// Kept for rows written by 0.5 (connecting lines); no longer created.
+    /// A line between two passages that is not the author's words. Today only the gap marker
+    /// (`BookStore.gapText`): the book jumps here and a recording could fill it.
     case bridge
     /// Kept for rows written by 0.5 (chapter openings); no longer created.
     case intro
@@ -114,6 +115,10 @@ final class BookStore: ObservableObject {
     static let shared = BookStore()
     /// 3 = MiniLM, segment passages, whole-book layout, background condensing.
     static let bookVersion = 3
+    /// 4 = one reading path cut into chapters, with gap markers. A book arranged by an older
+    /// version is laid out again (its passages are kept).
+    static let arrangementVersion = 4
+    static let gapText = "The book jumps here. What connects these two thoughts?"
     static let looseEndsChapter = 999
 
     @Published private(set) var nodes: [BookNode] = []
@@ -128,6 +133,7 @@ final class BookStore: ObservableObject {
     private var projectedCount = 0
     private var titleCache: [String: String] = [:]
     private var version = BookStore.bookVersion
+    private var arrangement = 0
     private var saveTask: Task<Void, Never>?
     var onLocalChange: (@MainActor () -> Void)?
 
@@ -140,6 +146,7 @@ final class BookStore: ObservableObject {
         var titleCache: [String: String]
         var needsPolish: Bool?
         var layoutDirty: Bool?
+        var arrangement: Int?
     }
 
     private static var fileURL: URL {
@@ -154,6 +161,8 @@ final class BookStore: ObservableObject {
             nodes = s.nodes; processed = s.processed; axes = s.axes; projectedCount = s.projectedCount
             titleCache = s.titleCache; needsPolish = s.needsPolish ?? false; layoutDirty = s.layoutDirty ?? false
             version = s.version
+            arrangement = s.arrangement ?? 0
+            if arrangement < Self.arrangementVersion { layoutDirty = true }
         } else if FileManager.default.fileExists(atPath: Self.fileURL.path) {
             version = 0   // unreadable older format: start over
         }
@@ -172,7 +181,7 @@ final class BookStore: ObservableObject {
     func saveNow() {
         let e = JSONEncoder(); e.dateEncodingStrategy = .secondsSince1970
         let snap = Snapshot(version: version, nodes: nodes, processed: processed, axes: axes, projectedCount: projectedCount,
-                            titleCache: titleCache, needsPolish: needsPolish, layoutDirty: layoutDirty)
+                            titleCache: titleCache, needsPolish: needsPolish, layoutDirty: layoutDirty, arrangement: arrangement)
         guard let data = try? e.encode(snap) else { return }
         try? FileManager.default.createDirectory(at: Self.fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: Self.fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
@@ -286,7 +295,7 @@ final class BookStore: ObservableObject {
 
     // MARK: - Layout
 
-    /// Chapters, order, positions and the map, for the whole book. Heavy maths runs off the main thread.
+    /// Chapters, reading order and gap markers for the whole book. Heavy maths runs off the main thread.
     func layout() async {
         guard layoutDirty else { return }
         layoutDirty = false
@@ -296,28 +305,30 @@ final class BookStore: ObservableObject {
                 nodes[i].vectorData = BookVectors.encode(v); nodes[i].language = Embedder.tag
             }
         }
-        // Lines from 0.5 are retired.
-        for i in nodes.indices where nodes[i].kind != .passage && !nodes[i].deleted { retire(i) }
-
         let live = nodes.filter { !$0.deleted && $0.kind == .passage }
-        guard !live.isEmpty else { return }
+        guard !live.isEmpty else {
+            for i in nodes.indices where nodes[i].kind != .passage && !nodes[i].deleted { retire(i) }
+            return
+        }
         let items = live.map { OrgPassage(vector: $0.vector, day: $0.day, journal: $0.journalID ?? $0.id, seq: $0.seq) }
-        let previousAxes = axes
-        let (chapters, loners, xy, newAxes) = await Task.detached(priority: .utility) { () -> ([[Int]], Set<Int>, [(Double, Double)], [[Float]]) in
+        let (chapters, loners, gaps) = await Task.detached(priority: .utility) { () -> ([[Int]], Set<Int>, [(before: Int, after: Int)]) in
             let lonely = BookOrganizer.loners(items.map(\.vector))
             let keptIndices = items.indices.filter { !lonely.contains($0) }
             let kept = keptIndices.map { items[$0] }
-            let chapters = BookOrganizer.organize(kept).map { $0.map { keptIndices[$0] } }
-            return (chapters, lonely, [(Double, Double)](), previousAxes)
+            let arranged = BookOrganizer.organize(kept)
+            let jumps = BookOrganizer.gaps(arranged, kept).map { (before: keptIndices[$0.before], after: keptIndices[$0.after]) }
+            return (arranged.map { $0.map { keptIndices[$0] } }, lonely, jumps)
         }.value
 
         let keyphrases = BookOrganizer.keyphrases(groups: chapters.map { $0.map { live[$0].source ?? live[$0].text } })
         var position = 0.0
+        var placed: [String: (position: Double, chapter: Int, title: String)] = [:]
         for (c, members) in chapters.enumerated() {
             // Named after the phrases the chapter keeps returning to: the author's own words, instantly.
             let title = Self.labelTitle(keyphrases[c], fallback: members.map { live[$0].text })
             for m in members {
                 position += 10
+                placed[live[m].id] = (position, c, title)
                 update(live[m].id) { $0.chapter = c; $0.chapterTitle = title; $0.position = position }
             }
         }
@@ -325,9 +336,27 @@ final class BookStore: ObservableObject {
             position += 10
             update(live[m].id) { $0.chapter = Self.looseEndsChapter; $0.chapterTitle = "Loose ends"; $0.position = position }
         }
-        axes = newAxes
-        projectedCount = live.count
-        _ = xy
+
+        // Gap markers sit just before the passage they lead to. Their ids are stable, so a gap that
+        // stays is not written again, and one that closes is retired.
+        let gapIDs = Set(gaps.map { "gap_" + live[$0.after].id })
+        for i in nodes.indices where nodes[i].kind != .passage && !nodes[i].deleted && !gapIDs.contains(nodes[i].id) { retire(i) }
+        for gap in gaps {
+            let id = "gap_" + live[gap.after].id
+            guard let spot = placed[live[gap.after].id] else { continue }
+            if let i = nodes.firstIndex(where: { $0.id == id }) {
+                if nodes[i].deleted || nodes[i].text != Self.gapText {
+                    nodes[i].deleted = false; nodes[i].text = Self.gapText; nodes[i].updatedAt = Date(); nodes[i].dirty = true
+                }
+                update(id) { $0.chapter = spot.chapter; $0.chapterTitle = spot.title; $0.position = spot.position - 5 }
+            } else {
+                var node = BookNode(id: id, kind: .bridge, journalID: nil, text: Self.gapText, source: nil, vectorData: Data(),
+                                    language: Embedder.tag, day: 0, seq: 0, position: spot.position - 5, createdAt: Date())
+                node.chapter = spot.chapter; node.chapterTitle = spot.title; node.polished = true
+                nodes.append(node)
+            }
+        }
+        arrangement = Self.arrangementVersion
         needsPolish = true
         scheduleSave()
     }
